@@ -343,9 +343,9 @@ where
 
     rebuild_stale_offchain_order_projection(pool, &offchain_order_projection).await?;
 
-    // Startup recovery runs before any job worker starts, so no in-process
-    // placement can race its broker re-drive -- it runs without
-    // `counter_trade_submission_lock` (which the builder constructs later). A
+    // Startup recovery runs before any job worker starts or the process-tx
+    // route is published, so no in-process placement can race its broker
+    // re-drive and it does not need `counter_trade_submission_lock`. A
     // standalone process-tx CLI can still be mid placement, holding only the
     // file lock between recording its `Pending` intent and calling the broker,
     // so take the file lock: without it the replay would race that broker
@@ -849,14 +849,16 @@ pub(crate) type HttpProvider = FillProvider<
     RootProvider,
 >;
 
-/// Bounds for the primary chain RPC transport. A hung endpoint that accepts
-/// the connection and never responds otherwise parks every await that runs
+/// Bounds for the primary chain RPC transport.
+///
+/// A hung endpoint that accepts the connection and never responds otherwise
+/// parks every await that runs
 /// through this provider (the fill poll loop, backfill, and all read-only
 /// contract calls) with no error surfaced (RAI-2218). 30s accommodates the
 /// heavy eth_getLogs range scans backfill issues; the wallet transport uses
 /// 20s for its smaller payloads.
-const RPC_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
-const RPC_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+pub const RPC_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+pub const RPC_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The hedged chains beyond the primary: the ones needing their own
 /// providers, watchers, and accounting entries.
@@ -5147,7 +5149,7 @@ pub async fn account_for_fill_excluded_from_hedging(
 
 /// Accounts and hedges a fill on an asset whose trading is enabled on the
 /// fill's own chain. Fills on a disabled asset never reach here: they go
-/// through [`account_for_fill_excluded_from_hedging`].
+/// through `account_for_fill_excluded_from_hedging`.
 #[tracing::instrument(skip_all, level = tracing::Level::DEBUG)]
 pub async fn process_queued_trade<E: Executor>(
     executor: &E,

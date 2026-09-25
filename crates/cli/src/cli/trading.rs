@@ -735,7 +735,7 @@ fn render_process_tx_outcome<W: Write>(
         ProcessTxOutcome::AlreadyAccounted => {
             writeln!(
                 stdout,
-                "Fill is already fully accounted. Nothing to do; the normal pipeline will hedge any unhedged position exposure."
+                "Fill is already fully accounted. Nothing to do; the periodic position check hedges any unhedged exposure while trading is enabled for the symbol."
             )?;
         }
         ProcessTxOutcome::PendingHedgeInFlight => {
@@ -747,7 +747,7 @@ fn render_process_tx_outcome<W: Write>(
         ProcessTxOutcome::BelowExecutionThreshold => {
             writeln!(
                 stdout,
-                "Trade accumulated but did not trigger execution yet (waiting to accumulate enough shares for a whole share execution)."
+                "Trade accumulated but the position is not ready for execution yet (below the execution threshold, held by an equity transfer, or capped by the operational limit)."
             )?;
         }
         ProcessTxOutcome::ExcludedFromHedging {
@@ -769,7 +769,7 @@ fn render_process_tx_outcome<W: Write>(
         ProcessTxOutcome::PlacementRejected { symbol } => {
             writeln!(
                 stdout,
-                "Placement for {symbol} was rejected by domain state; a concurrent placement already claimed the position. Settled the fill."
+                "Placement for {symbol} was rejected by the position's current state (a pending order, an equity transfer, or a changed net). Settled the fill."
             )?;
         }
         ProcessTxOutcome::PreflightDeferred { symbol } => {
@@ -2907,7 +2907,7 @@ mod tests {
                     outcome: ProcessTxOutcome::AlreadyAccounted,
                 },
                 format!(
-                    "{fill_summary}Fill is already fully accounted. Nothing to do; the normal pipeline will hedge any unhedged position exposure.\n"
+                    "{fill_summary}Fill is already fully accounted. Nothing to do; the periodic position check hedges any unhedged exposure while trading is enabled for the symbol.\n"
                 ),
             ),
             (
@@ -2925,7 +2925,7 @@ mod tests {
                     outcome: ProcessTxOutcome::BelowExecutionThreshold,
                 },
                 format!(
-                    "{fill_summary}Trade accumulated but did not trigger execution yet (waiting to accumulate enough shares for a whole share execution).\n"
+                    "{fill_summary}Trade accumulated but the position is not ready for execution yet (below the execution threshold, held by an equity transfer, or capped by the operational limit).\n"
                 ),
             ),
             (
@@ -2959,7 +2959,7 @@ mod tests {
                     outcome: ProcessTxOutcome::PlacementRejected { symbol: symbol() },
                 },
                 format!(
-                    "{fill_summary}Placement for {} was rejected by domain state; a concurrent placement already claimed the position. Settled the fill.\n",
+                    "{fill_summary}Placement for {} was rejected by the position's current state (a pending order, an equity transfer, or a changed net). Settled the fill.\n",
                     symbol()
                 ),
             ),

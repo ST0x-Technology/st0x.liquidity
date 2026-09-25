@@ -119,7 +119,7 @@ static ANCHOR_RECOVERY_JOB_PUSH_LOCK: Mutex<()> = Mutex::const_new(());
 ///
 /// The daemon's Tokio mutex serializes its own tasks; this file lock also
 /// serializes operator CLI processes attached to `pool`'s database.
-pub async fn acquire_counter_trade_submission_file_lock(
+pub(crate) async fn acquire_counter_trade_submission_file_lock(
     pool: &SqlitePool,
 ) -> Result<DatabaseFileGuard, DatabaseFileLockError> {
     acquire_database_file_lock(pool, DatabaseFileLock::CounterTradeSubmission).await

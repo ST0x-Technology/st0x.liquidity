@@ -392,14 +392,17 @@ pub enum Commands {
         symbol: Symbol,
     },
     /// Account a missed onchain fill by its transaction hash, then place the
-    /// opposite-side hedge.
+    /// opposite side hedge.
     ///
-    /// Recovery tool for fills the bot never recorded: it refuses a fill the bot
-    /// has already witnessed in the OnChainTrade log (re-applying would
-    /// double-count the position). Run it only when the bot is NOT concurrently
-    /// processing the same symbol -- the CLI and the bot run in separate
-    /// processes and cannot be serialized by a lock, so a concurrent bot could
-    /// still double-account the fill.
+    /// Recovery tool for fills the bot never recorded. A fill already
+    /// acknowledged is reported as already accounted and changes nothing; a
+    /// fill witnessed but not yet acknowledged is resumed. Fill accounting and
+    /// broker submission take database file locks shared with the bot, so a
+    /// concurrent run cannot count a fill twice. Run this direct database path
+    /// only while the bot is stopped anyway: its writes reach none of the bot's
+    /// live reactors, and its orders are enrolled for status polling only at
+    /// the next bot startup. Against a running bot, use the process-tx route of
+    /// `st0x-liquidity-client` instead.
     ProcessTx {
         /// Transaction hash (0x prefixed, 64 hex characters)
         #[arg(long = "tx-hash")]
@@ -2116,12 +2119,12 @@ async fn run_provider_command<W: Write + Send>(
                 anyhow::anyhow!("process-tx chain {chain} is not configured as a hedged chain")
             })?;
             // Bound the RPC transport so a hung endpoint surfaces as an error
-            // instead of parking the process-tx call indefinitely,
-            // mirroring the ops-API provider in src/api.rs.
+            // instead of parking the process-tx call indefinitely, with the
+            // same timeouts as the bot's own chain providers.
             let rpc_url = trading_chain.rpc_url.clone();
             let http_client = reqwest::Client::builder()
-                .connect_timeout(std::time::Duration::from_secs(10))
-                .timeout(std::time::Duration::from_secs(30))
+                .connect_timeout(st0x_hedge::operator::conductor::RPC_CONNECT_TIMEOUT)
+                .timeout(st0x_hedge::operator::conductor::RPC_REQUEST_TIMEOUT)
                 .build()?;
             let is_local = alloy::transports::utils::guess_local_url(rpc_url.as_str());
             let transport = alloy::transports::http::Http::with_client(http_client, rpc_url);
@@ -2867,6 +2870,7 @@ mod tests {
             Ok(_) => panic!("expected provider command classification"),
         }
     }
+
     #[test]
     fn process_tx_command_parses_optional_chain() {
         let tx_hash = TxHash::repeat_byte(0x11);

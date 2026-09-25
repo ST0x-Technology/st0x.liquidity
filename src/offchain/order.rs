@@ -2787,7 +2787,7 @@ pub struct BrokerOrderPlacement {
 /// Type-erased order placement capability.
 ///
 /// Used by the durable placement path
-/// ([`place_offchain_order_at_broker`]) -- the trade-processing context, the
+/// (`place_offchain_order_at_broker`) -- the trade-processing context, the
 /// hedge job, and the CLI each hold one. The `OffchainOrder` aggregate keeps
 /// this as its service type for cancel pre-reconciliation and placement-adjacent
 /// recovery paths, while `Place` itself remains a pure intent-recording command.

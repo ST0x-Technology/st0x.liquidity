@@ -35,7 +35,7 @@ impl DatabaseFileLock {
 }
 
 /// Held for the critical section; dropping it releases the lock.
-pub struct DatabaseFileGuard {
+pub(crate) struct DatabaseFileGuard {
     _file: Option<File>,
 }
 

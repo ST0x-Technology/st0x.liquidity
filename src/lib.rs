@@ -22,6 +22,7 @@ use tokio::net::TcpListener;
 use tokio::sync::broadcast;
 use tokio::task::{AbortHandle, JoinError, JoinHandle};
 use tokio_util::sync::CancellationToken;
+use tokio_util::task::TaskTracker;
 use tracing::{debug, error, info, warn};
 use tracing_subscriber::Layer;
 
@@ -178,6 +179,10 @@ pub(crate) struct AppState {
     pub(crate) pnl_ledger: Arc<dashboard::pnl::PnlLedger>,
     pub(crate) metrics_handle: PrometheusHandle,
     pub(crate) health: startup::HealthGate,
+    /// Request work that must outlive its request, such as a process-tx whose
+    /// broker placement has begun. Shutdown waits for it, up to the drain
+    /// timeout, before exiting.
+    pub(crate) detached_tasks: TaskTracker,
 }
 
 #[tracing::instrument(skip_all, target = "startup", level = tracing::Level::INFO)]
@@ -293,6 +298,7 @@ async fn run_bot_session_inner(
     let pnl_ledger = Arc::new(dashboard::pnl::PnlLedger::new(pools.cqrs.clone()));
 
     let health = startup::HealthGate::default();
+    let detached_tasks = TaskTracker::new();
     let state = AppState {
         ctx: ctx.clone(),
         pool: pools.cqrs.clone(),
@@ -307,6 +313,7 @@ async fn run_bot_session_inner(
         pnl_ledger: pnl_ledger.clone(),
         metrics_handle,
         health: health.clone(),
+        detached_tasks: detached_tasks.clone(),
     };
     let startup_barrier = startup::StartupBarrier::new();
     let equity_price_task = equity_price_monitor.map(|task| startup::StartupTask {
@@ -408,6 +415,7 @@ async fn run_bot_session_inner(
                     server_supervisor,
                     equity_price_supervisor,
                     bot_task,
+                    &detached_tasks,
                     shutdown_token,
                     shutdown_signal,
                     GRACEFUL_SHUTDOWN_TIMEOUT,
@@ -419,6 +427,7 @@ async fn run_bot_session_inner(
                 drain_for_shutdown_signal(
                     &server_supervisor,
                     bot_task,
+                    &detached_tasks,
                     shutdown_token,
                     GRACEFUL_SHUTDOWN_TIMEOUT,
                 )
@@ -616,6 +625,7 @@ async fn await_shutdown<S>(
     server_supervisor: SupervisorHandle,
     equity_price_supervisor: Option<SupervisorHandle>,
     mut bot_task: JoinHandle<anyhow::Result<()>>,
+    detached_tasks: &TaskTracker,
     shutdown_token: CancellationToken,
     shutdown_signal: S,
     drain_timeout: Duration,
@@ -634,18 +644,29 @@ where
 
     match trigger {
         ShutdownTrigger::Signal => {
-            drain_for_shutdown_signal(&server_supervisor, bot_task, shutdown_token, drain_timeout)
-                .await
+            drain_for_shutdown_signal(
+                &server_supervisor,
+                bot_task,
+                detached_tasks,
+                shutdown_token,
+                drain_timeout,
+            )
+            .await
         }
         ShutdownTrigger::ServerExit(result) => {
             info!(target: "shutdown", "Server supervisor exited, draining bot");
             shutdown_token.cancel();
             let bot_abort = bot_task.abort_handle();
-            drain_bot_with_timeout(bot_task, bot_abort, drain_timeout).await?;
+            let (bot_drained, ()) = tokio::join!(
+                drain_bot_with_timeout(bot_task, bot_abort, drain_timeout),
+                drain_detached_tasks(detached_tasks, drain_timeout),
+            );
+            bot_drained?;
             check_server_result(result)
         }
         ShutdownTrigger::BotExit(result) => {
             shutdown_supervisor(&server_supervisor);
+            drain_detached_tasks(detached_tasks, drain_timeout).await;
             check_bot_result(result)
         }
     }
@@ -654,6 +675,7 @@ where
 async fn drain_for_shutdown_signal(
     server_supervisor: &SupervisorHandle,
     bot_task: JoinHandle<anyhow::Result<()>>,
+    detached_tasks: &TaskTracker,
     shutdown_token: CancellationToken,
     drain_timeout: Duration,
 ) -> anyhow::Result<()> {
@@ -661,7 +683,40 @@ async fn drain_for_shutdown_signal(
     shutdown_token.cancel();
     shutdown_supervisor(server_supervisor);
     let bot_abort = bot_task.abort_handle();
-    drain_bot_with_timeout(bot_task, bot_abort, drain_timeout).await
+    let (bot_drained, ()) = tokio::join!(
+        drain_bot_with_timeout(bot_task, bot_abort, drain_timeout),
+        drain_detached_tasks(detached_tasks, drain_timeout),
+    );
+    bot_drained
+}
+
+/// Closes the detached request tracker and waits up to `timeout` for its work
+/// to finish. A request that arrives after the close refuses instead of
+/// spawning (see `spawn_and_join_process_tx`), so nothing starts that this
+/// drain misses. The runtime drops whatever still runs when the process exits,
+/// so a process-tx mid placement would otherwise be cut between the broker
+/// call and its `Submitted` event.
+async fn drain_detached_tasks(detached_tasks: &TaskTracker, timeout: Duration) {
+    detached_tasks.close();
+    if detached_tasks.is_empty() {
+        return;
+    }
+    info!(
+        target: "shutdown",
+        running = detached_tasks.len(),
+        "Waiting up to {}s for detached request tasks",
+        timeout.as_secs()
+    );
+    if tokio::time::timeout(timeout, detached_tasks.wait())
+        .await
+        .is_err()
+    {
+        warn!(
+            target: "shutdown",
+            running = detached_tasks.len(),
+            "Detached request tasks did not finish before the drain timeout"
+        );
+    }
 }
 
 async fn report_when_started(
@@ -1240,6 +1295,7 @@ mod tests {
             supervisor,
             Some(equity_price_supervisor),
             bot_task,
+            &TaskTracker::new(),
             shutdown_token,
             signal_fut,
             Duration::from_secs(5),
@@ -1282,6 +1338,7 @@ mod tests {
             supervisor,
             None,
             bot_task,
+            &TaskTracker::new(),
             shutdown_token,
             signal_fut,
             Duration::from_secs(5),
@@ -1323,6 +1380,7 @@ mod tests {
             supervisor,
             None,
             bot_task,
+            &TaskTracker::new(),
             shutdown_token,
             signal_fut,
             Duration::from_secs(5),
@@ -1334,6 +1392,53 @@ mod tests {
             drained.load(Ordering::SeqCst),
             "bot drain did not run after server-exit-triggered shutdown"
         );
+    }
+
+    /// Shutdown must not return while detached request work (a
+    /// process-tx mid placement) is still running: returning lets the runtime
+    /// drop it between the broker call and its `Submitted` event.
+    #[tokio::test]
+    async fn shutdown_waits_for_detached_request_tasks() {
+        let detached_tasks = TaskTracker::new();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        let finished = Arc::new(AtomicBool::new(false));
+        detached_tasks.spawn({
+            let finished = Arc::clone(&finished);
+            async move {
+                let _ = release_rx.await;
+                finished.store(true, Ordering::SeqCst);
+            }
+        });
+
+        let shutdown = tokio::spawn({
+            let detached_tasks = detached_tasks.clone();
+            async move {
+                await_shutdown(
+                    SupervisorBuilder::default().build().run(),
+                    None,
+                    tokio::spawn(async { Ok(()) }),
+                    &detached_tasks,
+                    CancellationToken::new(),
+                    std::future::ready(()),
+                    Duration::from_secs(5),
+                )
+                .await
+            }
+        });
+
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            !shutdown.is_finished(),
+            "shutdown must wait for the detached task"
+        );
+
+        release_tx.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), shutdown)
+            .await
+            .expect("shutdown must finish once the detached task does")
+            .unwrap()
+            .unwrap();
+        assert!(finished.load(Ordering::SeqCst));
     }
 
     #[tokio::test]
@@ -1358,6 +1463,7 @@ mod tests {
             supervisor,
             None,
             bot_task,
+            &TaskTracker::new(),
             shutdown_token,
             signal_fut,
             Duration::from_millis(50),

@@ -33,7 +33,10 @@ first.
 
 `process-tx` asks the order placer for admission (`prepare_placement`) after the
 placement preflight and before claiming the position, while holding the same
-submission guards as the claim and the placement.
+submission guards as the claim and the placement. Admission is the placer's: the
+in bot REST route's placer applies the trading schedule, while the standalone
+CLI placer has no admission gate and always admits, so only the REST route can
+defer.
 
 - **Deferred:** the verb writes no claim, no `Pending` intent, and no anchor for
   this placement; it settles the accounted fill and reports
@@ -61,9 +64,9 @@ still reports `HedgePlacementDeferred`.
   run before admission. Either way the next hedge is sized by a fresh preflight.
 - No new persisted fields, projection columns, or migrations are needed, and
   trade history, reliability, and latency projections are untouched.
-- Admission runs twice on the admitted path, adding one broker lookup by client
-  order id and one market session read to each `process-tx` placement while the
-  schedule is enabled.
+- Admission runs twice on the admitted path of the REST route, adding one broker
+  lookup by client order id and one market session read to each placement while
+  the schedule is enabled. The CLI's admission is a no op.
 - A deferral that only appears after the claim is recorded as an ordinary failed
   placement, so it counts as a hedge failure in the reliability report. It
   requires the session boundary to fall between two checks made moments apart
@@ -73,8 +76,9 @@ still reports `HedgePlacementDeferred`.
   `Pending` already carries. Closing that for every placement path is left to a
   separate change.
 - Recovery that drives a `Pending` through the broker again holds the cross
-  process submission file lock, so it never races a placement a standalone
-  `process-tx` CLI still has in flight.
+  process submission file lock, so even a standalone `process-tx` CLI run
+  against a live bot, which the operator procedure forbids, cannot race its
+  placement. The lock is defense in depth, not a supported concurrent mode.
 
 ## Alternatives considered
 

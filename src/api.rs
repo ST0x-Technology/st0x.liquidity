@@ -20,6 +20,7 @@ use rain_math_float::Float;
 use serde::ser::{SerializeSeq, SerializeStruct};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
+use tokio_util::task::TaskTracker;
 use tracing::{debug, error, info, warn};
 
 use st0x_config::{BrokerCtx, Ctx, HedgedChain, OpsApiConfig};
@@ -2779,13 +2780,29 @@ async fn spawn_and_join_process_tx<ChainProvider: alloy::providers::Provider + C
     provider: ChainProvider,
     cache: SymbolCache,
     handle: &ProcessTxHandle,
+    detached_tasks: &TaskTracker,
 ) -> Result<ProcessTxReport, (StatusCode, Json<ErrorResponse>)> {
     let stores = handle.stores.clone();
     let order_placer = Arc::clone(&handle.order_placer);
     let counter_trade_submission_lock = Arc::clone(&handle.counter_trade_submission_lock);
     let poll_status_queue = handle.poll_status_queue.clone();
     let poll_interval = handle.poll_interval;
-    tokio::spawn(async move {
+    // Tracked so graceful shutdown waits for a placement already under way
+    // instead of dropping it with the runtime. The token is taken before the
+    // closed check: the drain closes the tracker and then checks it is empty,
+    // so either the drain sees this request as running or the request sees the
+    // tracker closed and refuses. Spawning into a drained tracker would let the
+    // task be dropped at exit.
+    let admission = detached_tasks.token();
+    if detached_tasks.is_closed() {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ErrorResponse {
+                error: "process-tx is unavailable while the bot shuts down".to_string(),
+            }),
+        ));
+    }
+    let task = detached_tasks.spawn(async move {
         let result = process_tx::process_tx(
             tx_hash,
             &ctx,
@@ -2802,21 +2819,25 @@ async fn spawn_and_join_process_tx<ChainProvider: alloy::providers::Provider + C
         // it is rendered into a response.
         match &result {
             Ok(report) => debug!(%tx_hash, outcome = ?report.outcome, "process-tx finished"),
+            Err(OperatorError::Rejected(reason)) => {
+                warn!(%tx_hash, %reason, "process-tx rejected");
+            }
             Err(error) => error!(%tx_hash, %error, "process-tx failed"),
         }
         result
-    })
-    .await
-    .map_err(|error| {
-        error!(%error, "process-tx worker task failed");
-        (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse {
-                error: format!("process-tx worker task failed: {error}"),
-            }),
-        )
-    })?
-    .map_err(ops_operator_error)
+    });
+    drop(admission);
+    task.await
+        .map_err(|error| {
+            error!(%error, "process-tx worker task failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: format!("process-tx worker task failed: {error}"),
+                }),
+            )
+        })?
+        .map_err(ops_operator_error)
 }
 
 /// Accounts a missed on-chain fill and places the opposite hedge inside the
@@ -2884,6 +2905,7 @@ async fn process_transaction(
         provider,
         SymbolCache::default(),
         handle,
+        &state.detached_tasks,
     )
     .await?;
 
@@ -3282,6 +3304,7 @@ mod tests {
             pnl_report_admission: crate::dashboard::pnl::pnl_report_admission(),
             metrics_handle: crate::metrics::setup().expect("metrics setup"),
             health: crate::startup::HealthGate::default(),
+            detached_tasks: TaskTracker::new(),
         }
     }
 
@@ -7960,12 +7983,12 @@ mod tests {
     /// Aborting the HTTP request future after the broker placement has begun
     /// must NOT cancel that placement: `process_transaction` runs the process-tx
     /// workload on a detached task, so a live broker order completes even when
-    /// nobody awaits the response. This drives the real handler path
-    /// -- a mocked provider decodes a tradeable fill, and the published
-    /// `ProcessTxHandle` carries an `OrderPlacer` parked on a `Notify` -- aborts
+    /// nobody awaits the response. This drives the `spawn_and_join_process_tx`
+    /// seam (a mocked provider decodes a tradeable fill, and the
+    /// `ProcessTxHandle` carries an `OrderPlacer` parked on a `Notify`), aborts
     /// the request once placement has begun, and asserts the placement still
     /// finishes and that the detached task records its own outcome. Awaiting
-    /// the workload inline instead of the detached `tokio::spawn(...).await`
+    /// the workload inline instead of the tracked `detached_tasks.spawn(...).await`
     /// would cancel the parked placement and hang `finished`, which is the
     /// regression this test guards.
     #[tracing_test::traced_test]
@@ -8002,8 +8025,17 @@ mod tests {
         };
 
         let request = tokio::spawn(async move {
-            spawn_and_join_process_tx(tx_hash, ctx, pool, trading_chain, provider, cache, &handle)
-                .await
+            spawn_and_join_process_tx(
+                tx_hash,
+                ctx,
+                pool,
+                trading_chain,
+                provider,
+                cache,
+                &handle,
+                &TaskTracker::new(),
+            )
+            .await
         });
 
         tokio::time::timeout(Duration::from_secs(5), started.notified())
@@ -8062,12 +8094,62 @@ mod tests {
             provider,
             SymbolCache::default(),
             &handle,
+            &TaskTracker::new(),
         )
         .await
         else {
             panic!("a failing RPC endpoint must surface as an error");
         };
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    /// Once shutdown closed the detached task tracker, a process-tx request must
+    /// refuse with 503 instead of spawning work the drain already stopped
+    /// waiting for. The mocked RPC would fail the run with a 500, so a 503 also
+    /// proves the workload never started.
+    #[tokio::test]
+    async fn spawn_and_join_process_tx_refuses_after_the_shutdown_drain_closed() {
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let ctx = create_test_ctx_with_order_owner(Address::ZERO);
+        let trading_chain = ctx.chains.primary().clone();
+        let asserter = Asserter::new();
+        asserter.push_failure_msg("connection reset by peer");
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+
+        let order_placer: Arc<dyn OrderPlacer> = crate::offchain::order::noop_order_placer();
+        let stores = ProcessTxStores::standalone(&pool, &ctx, Arc::clone(&order_placer))
+            .await
+            .expect("standalone stores must build");
+        let handle = ProcessTxHandle {
+            order_placer,
+            counter_trade_submission_lock: Arc::new(Mutex::new(())),
+            stores,
+            poll_status_queue: PollOrderStatusJobQueue::new(&apalis_pool),
+            poll_interval: TEST_POLL_INTERVAL,
+            providers: std::collections::BTreeMap::new(),
+        };
+        let detached_tasks = TaskTracker::new();
+        detached_tasks.close();
+
+        let Err((status, Json(body))) = spawn_and_join_process_tx(
+            TxHash::repeat_byte(0x34),
+            ctx,
+            pool,
+            trading_chain,
+            provider,
+            SymbolCache::default(),
+            &handle,
+            &detached_tasks,
+        )
+        .await
+        else {
+            panic!("a closed tracker must refuse the request");
+        };
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{}", body.error);
+        assert!(
+            detached_tasks.is_empty(),
+            "nothing may be spawned after the close"
+        );
     }
 
     /// A domain rejection from the process-tx workload maps to a 400 through the
@@ -8121,9 +8203,17 @@ mod tests {
             providers: std::collections::BTreeMap::new(),
         };
 
-        let Err((status, Json(body))) =
-            spawn_and_join_process_tx(tx_hash, ctx, pool, trading_chain, provider, cache, &handle)
-                .await
+        let Err((status, Json(body))) = spawn_and_join_process_tx(
+            tx_hash,
+            ctx,
+            pool,
+            trading_chain,
+            provider,
+            cache,
+            &handle,
+            &TaskTracker::new(),
+        )
+        .await
         else {
             panic!("a schedule-disabled retained Pending must surface as a rejection");
         };
@@ -8209,9 +8299,17 @@ mod tests {
             providers: std::collections::BTreeMap::new(),
         };
 
-        let Err((status, Json(body))) =
-            spawn_and_join_process_tx(tx_hash, ctx, pool, trading_chain, provider, cache, &handle)
-                .await
+        let Err((status, Json(body))) = spawn_and_join_process_tx(
+            tx_hash,
+            ctx,
+            pool,
+            trading_chain,
+            provider,
+            cache,
+            &handle,
+            &TaskTracker::new(),
+        )
+        .await
         else {
             panic!("a sell that received a buying power reservation must fail closed");
         };

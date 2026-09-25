@@ -5,7 +5,6 @@
 //! implementation modules themselves private.
 
 use chrono::{DateTime, NaiveDate, Utc};
-use st0x_evm::Chain;
 use st0x_execution::{ExecutorOrderId, FractionalShares, Symbol};
 
 use crate::offchain::order::OffchainOrderId;
@@ -131,14 +130,10 @@ pub enum RejectionReason {
         executor_order_id: ExecutorOrderId,
     },
     #[error(
-        "process-tx decoded a fill on {decoded}, but the request selected {requested}; refusing \
-         to hedge a fill from a chain other than the one requested"
-    )]
-    DecodedChainMismatch { requested: Chain, decoded: Chain },
-    #[error(
-        "position {symbol} holds pending offchain order {offchain_order_id} that was never sent \
-         to the broker, and the trading schedule is disabled so it is not a deferred retry; \
-         refusing to place over it and preserving the claim for reconciliation"
+        "position {symbol} holds offchain order {offchain_order_id} still Pending (its broker \
+         outcome was never recorded), and the trading schedule is disabled so it is not a \
+         deferred retry; refusing to place over it and preserving the claim. Check the broker \
+         for the order's client order id before reconciling it"
     )]
     RetainedPendingWithoutSchedule {
         offchain_order_id: OffchainOrderId,
@@ -180,9 +175,7 @@ pub mod bot_gas {
 
 pub mod conductor {
     pub use crate::conductor::{
-        ExcludedFillOutcome, FillAccountingOutcome, account_for_fill_excluded_from_hedging,
-        account_for_onchain_fill, configured_equity_symbols, execute_mark_acknowledged,
-        execute_settle_fill, is_expected_place_offchain_order_rejection,
+        RPC_CONNECT_TIMEOUT, RPC_REQUEST_TIMEOUT, configured_equity_symbols,
     };
 
     #[cfg(feature = "test-support")]
@@ -637,10 +630,7 @@ pub mod offchain {
     pub mod order {
         pub use crate::offchain::order::{
             BrokerOrderPlacement, OffchainOrder, OffchainOrderCommand, OffchainOrderError,
-            OffchainOrderId, OffchainOrderPlacement, OrderPlacementResult, OrderPlacer,
-            TerminalPositionFinalization, client_order_id_for_placement,
-            place_offchain_order_at_broker, position_command_for_finalization,
-            terminal_position_finalization,
+            OffchainOrderId, OrderPlacementResult, OrderPlacer,
         };
 
         #[cfg(feature = "test-support")]
@@ -649,23 +639,13 @@ pub mod offchain {
             noop_order_placer,
         };
     }
-
-    pub use crate::trading::offchain::hedge::{
-        acquire_counter_trade_submission_file_lock, live_buying_power_reservations,
-    };
 }
 
 pub mod onchain {
-    pub use crate::onchain::{OnChainError, OnchainTrade, TradeValidationError, raindex_contracts};
+    pub use crate::onchain::raindex_contracts;
 
-    pub mod accumulator {
-        pub use crate::onchain::accumulator::check_execution_readiness;
-    }
-
+    #[cfg(feature = "test-support")]
     pub mod trade {
-        pub use crate::onchain::trade::{BotOperator, RecoveryActors};
-
-        #[cfg(feature = "test-support")]
         pub use crate::onchain::trade::RaindexTradeEvent;
     }
 
@@ -676,7 +656,7 @@ pub mod onchain {
 }
 
 pub mod onchain_trade {
-    pub use crate::onchain_trade::{OnChainTrade, OnChainTradeId};
+    pub use crate::onchain_trade::OnChainTrade;
 
     #[cfg(feature = "test-support")]
     pub use crate::onchain_trade::{InventoryVenue, OnChainTradeCommand, OnChainTradeSource};
@@ -1577,7 +1557,9 @@ pub mod process_tx {
         /// The live pipeline deferred its own placement and is holding the order
         /// Pending with the claim set until admission permits its retry. Only the
         /// gate before placement returns this; process-tx settles its fill against
-        /// that retained intent and reports the deferral without placing over it.
+        /// that retained intent without placing over it, and reports the deferral
+        /// when the schedule is enabled or rejects it as
+        /// `RetainedPendingWithoutSchedule` when it is not.
         Deferred,
     }
 
@@ -1634,8 +1616,10 @@ pub mod process_tx {
         /// An existing pending hedge is in flight, so the fill was settled
         /// without placing a new hedge.
         PendingHedgeInFlight,
-        /// The fill was accounted but net exposure is below the execution
-        /// threshold, so no hedge was placed yet.
+        /// The fill was accounted but the position is not ready for execution:
+        /// net exposure is below the execution threshold, an equity transfer
+        /// holds the symbol, or the operational limit leaves nothing to hedge.
+        /// No hedge was placed yet.
         BelowExecutionThreshold,
         /// Trading is disabled for the symbol on the fill's chain, so this run
         /// kept the fill out of the hedged position and recorded it in
@@ -1651,8 +1635,9 @@ pub mod process_tx {
         /// since. The pipeline will not hedge it; `detail` is the recorded
         /// delta and cover side.
         AlreadyExcluded { detail: String },
-        /// A concurrent placement already claimed the position, so the fill was
-        /// settled without placing a hedge.
+        /// The position refused the claim in its current state (a pending
+        /// order, an equity transfer, or a changed net), so the fill was settled
+        /// without placing a hedge.
         PlacementRejected { symbol: Symbol },
         /// The fill was accounted, but the placement preflight deferred the
         /// hedge: buying power could not cover a buy, or the equity reservation
@@ -1781,12 +1766,25 @@ pub mod process_tx {
     fn ensure_decoded_chain_matches(
         decoded: Chain,
         requested: Chain,
-    ) -> Result<(), RejectionReason> {
+    ) -> Result<(), DecodedChainMismatch> {
         if decoded == requested {
             Ok(())
         } else {
-            Err(RejectionReason::DecodedChainMismatch { requested, decoded })
+            Err(DecodedChainMismatch { requested, decoded })
         }
+    }
+
+    /// The decoder returned a fill on a chain other than the one it was fed.
+    /// A server side invariant break, not a caller error, so it surfaces as an
+    /// operational failure.
+    #[derive(Debug, thiserror::Error)]
+    #[error(
+        "process-tx decoded a fill on {decoded}, but the request selected {requested}; refusing \
+         to hedge a fill from a chain other than the one requested"
+    )]
+    pub struct DecodedChainMismatch {
+        requested: Chain,
+        decoded: Chain,
     }
 
     /// Accounts a missed on-chain fill from `tx_hash` and, when the resulting
@@ -1801,8 +1799,10 @@ pub mod process_tx {
     /// tick from double-placing the hedge, and passes `Some` poll enrollment so
     /// a newly submitted hedge is enqueued for status polling under the guards,
     /// mirroring the live placement path. The CLI runs in a separate process
-    /// with standalone stores, no shared lock, and passes `None` for both,
-    /// relying on startup recovery to enrol its submitted orders.
+    /// with standalone stores and passes `None` for both, relying on startup
+    /// recovery to enrol its submitted orders. It still takes the database
+    /// file locks shared with the bot: the fill accounting lock and the counter
+    /// trade submission lock.
     pub async fn process_tx<P: Provider + Clone + 'static>(
         tx_hash: TxHash,
         ctx: &Ctx,
@@ -1830,7 +1830,8 @@ pub mod process_tx {
                 // The decoder is fed the requested chain, so a decoded fill on a
                 // different chain is an invariant break: refuse rather than hedge
                 // a fill from a chain the operator did not select.
-                ensure_decoded_chain_matches(onchain_trade.chain, trading_chain.chain)?;
+                ensure_decoded_chain_matches(onchain_trade.chain, trading_chain.chain)
+                    .map_err(|mismatch| OperatorError::Operational(mismatch.into()))?;
                 let fill = ProcessTxFill::from(&onchain_trade);
                 let outcome = process_found_trade(
                     onchain_trade,
@@ -1965,9 +1966,10 @@ pub mod process_tx {
         // The in-process mutex only serializes within this process, and the CLI
         // passes `None`. The pool-scoped file lock is the only guard that crosses
         // process boundaries; the bot's own `process_queued_trade` and
-        // `PlaceHedge` worker take it in the same mutex-then-file order, so an
-        // operator running process-tx against a live bot cannot submit inside the
-        // window between the bot's preflight and its `Placed` event.
+        // `PlaceHedge` worker take it in the same mutex-then-file order, so even a
+        // CLI run against a live bot, which the operating procedure forbids,
+        // cannot submit inside the window between the bot's preflight and its
+        // `Placed` event.
         let _file_submission_guard = acquire_counter_trade_submission_file_lock(pool)
             .await
             .context("failed to acquire the counter-trade submission file lock")?;
@@ -2003,10 +2005,11 @@ pub mod process_tx {
     /// Places the hedge for a fill the gate marked ready: reconciles a preserved
     /// failed-order anchor, runs the placement preflight, claims the position,
     /// places the order at the broker, and resolves the post-placement
-    /// disposition. Each early exit settles the fill; the in-flight success path
-    /// enrolls the poll job before settling so a failed enqueue leaves the fill
-    /// unsettled for a retry. Runs under the caller's still-held submission
-    /// guards.
+    /// disposition. An `Ok` outcome settles the fill and a typed rejection
+    /// settles it before surfacing; an operational failure leaves it unsettled
+    /// for a retry. The in-flight success path enrolls the poll job before
+    /// settling so a failed enqueue leaves the fill unsettled too. Runs under
+    /// the caller's still-held submission guards.
     async fn place_ready_hedge(
         ctx: &Ctx,
         pool: &SqlitePool,
@@ -2285,11 +2288,12 @@ pub mod process_tx {
         Ready(ExecutionCtx),
     }
 
-    /// Gates a decoded fill before placement: reconciles any live pending hedge,
-    /// honours the trading-enabled flag, and checks execution readiness. Each
-    /// gate settles the fill and reports its terminal outcome; a ready position
-    /// yields the placement parameters. Runs under the caller's submission
-    /// guards so the readiness decision cannot race the live trading loop.
+    /// Gates a decoded fill before placement: reconciles any live pending hedge
+    /// and checks execution readiness. A gate that ends the run settles the
+    /// fill before reporting its outcome or typed rejection; an operational
+    /// failure leaves it unsettled for a retry. A ready position yields the
+    /// placement parameters. Runs under the caller's submission guards so the
+    /// readiness decision cannot race the live trading loop.
     async fn gate_fill_for_placement(
         ctx: &Ctx,
         stores: &ProcessTxStores,
@@ -2375,7 +2379,7 @@ pub mod process_tx {
                 // operational failure and leaves the fill unacknowledged for a
                 // retry; only after the settle succeeds does the rejection
                 // surface, preserving the claim instead of placing a second
-                // hedge over an order that was never sent.
+                // hedge over an order whose broker outcome was never recorded.
                 mark_and_settle_fill(onchain_trade_store, position_store, trade_id, onchain_trade)
                     .await?;
                 return Err(RejectionReason::RetainedPendingWithoutSchedule {
@@ -5109,9 +5113,10 @@ pub mod process_tx {
             );
         }
 
-        /// A resolved pending placement failure must allow process-tx to continue.
+        /// A pending order that failed before placement is cleared for a retry
+        /// and its id is preserved as the idempotency anchor.
         #[tokio::test]
-        async fn existing_pending_cleanup_reports_process_tx_continues_this_run() {
+        async fn failed_pending_order_clears_the_claim_and_preserves_the_anchor() {
             let pool = setup_test_db().await;
             let symbol = Symbol::new("AAPL").unwrap();
             let offchain_order_id = OffchainOrderId::new();
@@ -5194,7 +5199,7 @@ pub mod process_tx {
 
         /// Post-placement failures with broker IDs must preserve the retry anchor.
         #[tokio::test]
-        async fn reconcile_loaded_post_place_state_failed_with_executor_id_preserves_the_anchor() {
+        async fn failed_order_with_an_executor_id_after_placement_preserves_the_anchor() {
             let pool = setup_test_db().await;
             let symbol = Symbol::new("AAPL").unwrap();
             let offchain_order_id = OffchainOrderId::new();
@@ -7668,11 +7673,8 @@ pub mod process_tx {
                 .expect("a matching chain must pass the guard");
 
             let error = ensure_decoded_chain_matches(Chain::Ethereum, Chain::Base).unwrap_err();
-            let RejectionReason::DecodedChainMismatch { requested, decoded } = &error else {
-                panic!("a divergent chain must be a DecodedChainMismatch, got: {error:?}");
-            };
-            assert_eq!(*requested, Chain::Base);
-            assert_eq!(*decoded, Chain::Ethereum);
+            assert_eq!(error.requested, Chain::Base);
+            assert_eq!(error.decoded, Chain::Ethereum);
             let rendered = error.to_string();
             assert!(
                 rendered.contains("base") && rendered.contains("ethereum"),
