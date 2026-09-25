@@ -208,12 +208,12 @@ chain's signing wallet, orderbook, `redemption_wallet` and
   chain head that restart reads: fills up to and including that head stay
   excluded, and fills from the next block on are hedged. List excluded fills
   with
-  `st0x-liquidity-client read resource skipped-fills --param
-  reason=trading_disabled --param covered=false`,
+  `st0x-liquidity-client --env <production|staging> read resource
+  skipped-fills --param reason=trading_disabled --param covered=false`,
   and once a fill's whole amount is covered at the broker, record it with
-  `st0x-liquidity-client debug
-  cover-excluded-fill <chain> <tx> <log_index> --shares <amount> --price-usdc
-  <price> --covered-at <time>`
+  `st0x-liquidity-client --env <production|staging> debug cover-excluded-fill
+  <chain> <tx> <log_index> --shares <amount> --price-usdc <price> --covered-at
+  <time>`
   so the PnL ledger books it.
 - `rebalancing`: Whether the bot auto-rebalances this asset between venues.
   Usually `"disabled"` at first.

@@ -142,7 +142,9 @@ pub async fn exclusion_cause(
 /// # Errors
 ///
 /// Fails when a hedged chain has no head in `heads`, or the enablement tables
-/// cannot be read or written.
+/// cannot be read or written. The whole observation commits in one
+/// transaction, so a failure records nothing and the next restart observes
+/// every symbol against the same head again.
 pub(crate) async fn record_trading_enablement(
     pool: &SqlitePool,
     chains: &ChainRegistry,
@@ -150,6 +152,11 @@ pub(crate) async fn record_trading_enablement(
     now: DateTime<Utc>,
 ) -> Result<(), ExclusionError> {
     let now_text = now.to_rfc3339();
+    // Reads then writes in one transaction while the telemetry writer is
+    // already running: reserve the writer first, so a concurrent commit waits
+    // out the busy timeout instead of failing the read to write upgrade
+    // (docs/cqrs.md).
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
 
     for hedged in chains.hedged() {
         let head = *heads
@@ -172,7 +179,7 @@ pub(crate) async fn record_trading_enablement(
             "SELECT symbol FROM trading_enablement WHERE chain = ? AND trading_enabled = 1",
             chain,
         )
-        .fetch_all(pool)
+        .fetch_all(&mut *tx)
         .await?;
         for symbol in recorded_enabled {
             if !observed.iter().any(|(configured, _)| *configured == symbol) {
@@ -181,15 +188,17 @@ pub(crate) async fn record_trading_enablement(
         }
 
         for (symbol, enabled) in observed {
-            record_symbol_enablement(pool, &chain, &symbol, enabled, next_block, &now_text).await?;
+            record_symbol_enablement(&mut tx, &chain, &symbol, enabled, next_block, &now_text)
+                .await?;
         }
     }
+    tx.commit().await?;
 
     Ok(())
 }
 
 async fn record_symbol_enablement(
-    pool: &SqlitePool,
+    tx: &mut sqlx::SqliteConnection,
     chain: &str,
     symbol: &str,
     enabled: bool,
@@ -202,11 +211,10 @@ async fn record_symbol_enablement(
         chain,
         symbol,
     )
-    .fetch_optional(pool)
+    .fetch_optional(&mut *tx)
     .await?;
     let enabled_flag = i64::from(enabled);
 
-    let mut tx = pool.begin().await?;
     match previous {
         Some(row) if row.trading_enabled == enabled_flag => {
             sqlx::query!(
@@ -288,7 +296,6 @@ async fn record_symbol_enablement(
             .await?;
         }
     }
-    tx.commit().await?;
 
     Ok(())
 }
@@ -440,6 +447,30 @@ mod tests {
 
         assert_eq!(cause_for(&pool, &enabled, 50).await, None);
         assert!(cause_for(&pool, &enabled, 150).await.is_some());
+    }
+
+    /// A failure partway through an observation records none of it: the
+    /// chains observed before the failure must not keep boundaries from this
+    /// restart while the rest get the next restart's.
+    #[tokio::test]
+    async fn a_failed_observation_records_nothing() {
+        let (pool, _apalis) = setup_test_pools().await;
+        let mut chains = chains_with(Some(OperationMode::Enabled));
+        let mut secondary = chains.primary().clone();
+        secondary.chain = Chain::Ethereum;
+        chains.insert_secondary(secondary);
+        let heads = BTreeMap::from([(chains.primary().chain, 100)]);
+
+        let error = record_trading_enablement(&pool, &chains, &heads, Utc::now())
+            .await
+            .unwrap_err();
+        assert!(matches!(error, ExclusionError::MissingChainHead { .. }));
+
+        let (recorded,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM trading_enablement")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(recorded, 0);
     }
 
     #[tokio::test]

@@ -480,9 +480,12 @@ async fn load_position_rows(
          executed_at FROM pnl_excluded_fill AS excluded_fill \
          WHERE NOT EXISTS (SELECT 1 FROM pnl_onchain_fill AS hedged \
            WHERE hedged.chain = excluded_fill.chain AND hedged.tx_hash = excluded_fill.tx_hash \
-           AND hedged.log_index = excluded_fill.log_index) \
-         AND event_rowid <= ",
+           AND hedged.log_index = excluded_fill.log_index AND hedged.event_rowid <= ",
     );
+    // A hedged row after the watermark did not exist at it, so it must not
+    // hide an exclusion from a report at that watermark.
+    excluded.push_bind(as_of_rowid);
+    excluded.push(") AND event_rowid <= ");
     excluded.push_bind(as_of_rowid);
     push_symbol_filter(&mut excluded, symbols);
     for (
@@ -530,9 +533,12 @@ async fn load_position_rows(
          executed_at FROM pnl_excluded_fill_cover AS cover \
          WHERE NOT EXISTS (SELECT 1 FROM pnl_onchain_fill AS hedged \
            WHERE hedged.chain = cover.chain AND hedged.tx_hash = cover.tx_hash \
-           AND hedged.log_index = cover.log_index) \
-         AND event_rowid <= ",
+           AND hedged.log_index = cover.log_index AND hedged.event_rowid <= ",
     );
+    // A hedged row after the watermark did not exist at it, so it must not
+    // hide an exclusion from a report at that watermark.
+    covers.push_bind(as_of_rowid);
+    covers.push(") AND event_rowid <= ");
     covers.push_bind(as_of_rowid);
     push_symbol_filter(&mut covers, symbols);
     for (

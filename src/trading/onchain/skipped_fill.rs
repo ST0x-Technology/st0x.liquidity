@@ -12,6 +12,7 @@ use alloy::primitives::TxHash;
 use chrono::Utc;
 use sqlx::SqlitePool;
 
+use st0x_event_sorcery::EventSourced;
 use st0x_evm::Chain;
 
 /// Why the accountant skipped a fill instead of hedging it.
@@ -252,41 +253,54 @@ pub(crate) async fn uncovered_excluded_fills(
     let chain = chain.to_string();
     let reason = SkipReason::TradingDisabled.as_str();
 
-    let rows = sqlx::query!(
-        r#"SELECT
-             json_extract(trade_view.payload, '$.Live.direction') AS "direction!: String",
-             json_extract(trade_view.payload, '$.Live.amount') AS "amount!: String"
-           FROM skipped_fills AS skipped
-           JOIN onchain_trade_view AS trade_view
-             ON trade_view.view_id = skipped.chain || ':' || skipped.tx_hash || ':' || skipped.log_index
-           WHERE skipped.chain = ? AND skipped.reason = ?
-             AND json_extract(trade_view.payload, '$.Live.symbol') = ?
-             AND json_extract(trade_view.payload, '$.Live.exclusion') IS NOT NULL
-             AND json_extract(trade_view.payload, '$.Live.exclusion.cover') IS NULL
-             AND NOT EXISTS (
-               SELECT 1 FROM events AS position_event
-               WHERE position_event.aggregate_type = 'Position'
-                 AND position_event.event_type = 'PositionEvent::OnChainOrderFilled'
-                 AND json_extract(position_event.payload, '$.OnChainOrderFilled.trade_id.chain')
-                   = skipped.chain
-                 AND json_extract(position_event.payload, '$.OnChainOrderFilled.trade_id.tx_hash')
-                   = skipped.tx_hash
-                 AND CAST(json_extract(position_event.payload,
-                   '$.OnChainOrderFilled.trade_id.log_index') AS INTEGER) = skipped.log_index)"#,
-        chain,
-        reason,
-        symbol,
-    )
-    .fetch_all(pool)
-    .await?;
+    let mut query = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
+        "SELECT json_extract(trade_view.payload, '$.Live.direction') AS direction, \
+         json_extract(trade_view.payload, '$.Live.amount') AS amount \
+         FROM skipped_fills AS skipped \
+         JOIN onchain_trade_view AS trade_view \
+           ON trade_view.view_id = skipped.chain || ':' || skipped.tx_hash || ':' || skipped.log_index \
+         WHERE skipped.chain = ",
+    );
+    query
+        .push_bind(chain)
+        .push(" AND skipped.reason = ")
+        .push_bind(reason)
+        .push(" AND json_extract(trade_view.payload, '$.Live.symbol') = ")
+        .push_bind(symbol.to_owned())
+        .push(
+            " AND json_extract(trade_view.payload, '$.Live.exclusion') IS NOT NULL \
+             AND json_extract(trade_view.payload, '$.Live.exclusion.cover') IS NULL AND NOT ",
+        );
+    push_fill_in_position(&mut query);
+    let rows: Vec<(String, String)> = query.build_query_as().fetch_all(pool).await?;
 
     Ok(rows
         .into_iter()
-        .map(|row| UncoveredExcludedFill {
-            direction: row.direction,
-            amount: row.amount,
-        })
+        .map(|(direction, amount)| UncoveredExcludedFill { direction, amount })
         .collect())
+}
+
+/// Pushes an `EXISTS` test that `Position` holds the skipped fill (alias
+/// `skipped`), bound to the same aggregate and event type as
+/// [`crate::conductor::position_fill_already_recorded`]: such a fill is hedged
+/// by the bot, so it is never owed a manual cover.
+fn push_fill_in_position(query: &mut sqlx::QueryBuilder<sqlx::Sqlite>) {
+    query
+        .push(
+            "EXISTS (SELECT 1 FROM events AS position_event \
+             WHERE position_event.aggregate_type = ",
+        )
+        .push_bind(crate::position::Position::AGGREGATE_TYPE)
+        .push(" AND position_event.event_type = ")
+        .push_bind(crate::position::PositionEvent::ON_CHAIN_ORDER_FILLED_EVENT_TYPE)
+        .push(
+            " AND json_extract(position_event.payload, '$.OnChainOrderFilled.trade_id.chain') \
+               = skipped.chain \
+             AND json_extract(position_event.payload, '$.OnChainOrderFilled.trade_id.tx_hash') \
+               = skipped.tx_hash \
+             AND CAST(json_extract(position_event.payload, \
+               '$.OnChainOrderFilled.trade_id.log_index') AS INTEGER) = skipped.log_index)",
+        );
 }
 
 /// Filters for [`list_skipped_fills`]. Every filter is optional.
@@ -361,14 +375,11 @@ pub(crate) async fn list_skipped_fills(
          json_extract(trade_view.payload, '$.Live.exclusion.cover.price_usdc') AS cover_price_usdc, \
          json_extract(trade_view.payload, '$.Live.exclusion.cover.broker_order_id') \
            AS cover_broker_order_id, \
-         json_extract(trade_view.payload, '$.Live.exclusion.cover.covered_at') AS covered_at, \
-         EXISTS ( \
-           SELECT 1 FROM events AS position_event \
-           WHERE position_event.aggregate_type = 'Position' \
-             AND position_event.event_type = 'PositionEvent::OnChainOrderFilled' \
-             AND json_extract(position_event.payload, '$.OnChainOrderFilled.trade_id.chain') = skipped.chain \
-             AND json_extract(position_event.payload, '$.OnChainOrderFilled.trade_id.tx_hash') = skipped.tx_hash \
-             AND CAST(json_extract(position_event.payload, '$.OnChainOrderFilled.trade_id.log_index') AS INTEGER) = skipped.log_index) AS in_position \
+         json_extract(trade_view.payload, '$.Live.exclusion.cover.covered_at') AS covered_at, ",
+    );
+    push_fill_in_position(&mut query);
+    query.push(
+        " AS in_position \
          FROM skipped_fills AS skipped \
          LEFT JOIN onchain_trade_view AS trade_view \
            ON trade_view.view_id = skipped.chain || ':' || skipped.tx_hash || ':' || skipped.log_index \
@@ -398,15 +409,9 @@ pub(crate) async fn list_skipped_fills(
         Some(false) => {
             query.push(
                 " AND json_extract(trade_view.payload, '$.Live.exclusion') IS NOT NULL \
-                 AND json_extract(trade_view.payload, '$.Live.exclusion.cover') IS NULL \
-                 AND NOT EXISTS ( \
-           SELECT 1 FROM events AS position_event \
-           WHERE position_event.aggregate_type = 'Position' \
-             AND position_event.event_type = 'PositionEvent::OnChainOrderFilled' \
-             AND json_extract(position_event.payload, '$.OnChainOrderFilled.trade_id.chain') = skipped.chain \
-             AND json_extract(position_event.payload, '$.OnChainOrderFilled.trade_id.tx_hash') = skipped.tx_hash \
-             AND CAST(json_extract(position_event.payload, '$.OnChainOrderFilled.trade_id.log_index') AS INTEGER) = skipped.log_index)",
+                 AND json_extract(trade_view.payload, '$.Live.exclusion.cover') IS NULL AND NOT ",
             );
+            push_fill_in_position(&mut query);
         }
         None => {}
     }

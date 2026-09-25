@@ -7416,6 +7416,54 @@ mod tests {
         assert_eq!(cover.broker_order_id.as_deref(), Some("order-1"));
     }
 
+    /// A fill classified both ways (excluded, and also in `Position` from a
+    /// concurrent hedged run) is hedged by the bot: the listing flags it, it is
+    /// never listed as uncovered, and it cannot take a manual cover.
+    #[tokio::test]
+    async fn fill_also_in_position_is_flagged_and_cannot_be_covered() {
+        let state = empty_app_state(create_test_ctx_with_order_owner(Address::ZERO)).await;
+        let trade = seed_excluded_fill(&state.pool).await;
+        let (position, _) = StoreBuilder::<crate::position::Position>::new(state.pool.clone())
+            .build(())
+            .await
+            .unwrap();
+        crate::conductor::execute_acknowledge_fill(
+            &position,
+            &trade,
+            state.ctx.execution_threshold,
+            trade.block_timestamp.unwrap(),
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            list(&state, Some(false)).await.is_empty(),
+            "a fill the bot hedges is never owed a cover"
+        );
+        let listed = list(&state, None).await;
+        assert_eq!(listed.len(), 1);
+        assert!(listed[0].in_position);
+
+        let (status, Json(error)) = cover_excluded_fill(
+            State(state),
+            Path(format!("base:{}:{}", trade.tx_hash, trade.log_index)),
+            Json(CoverExcludedFillRequest {
+                shares: "1".to_owned(),
+                price_usdc: "151".to_owned(),
+                covered_at: Utc::now().to_rfc3339(),
+                broker_order_id: None,
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(
+            error.error.contains("also in the hedged position"),
+            "{}",
+            error.error
+        );
+    }
+
     /// A hedged fill already has the bot's own hedge, so it cannot take a
     /// manual cover.
     #[tokio::test]

@@ -494,9 +494,10 @@ impl AccountForDexTrade {
             "Fill on DISABLED asset {symbol} (chain {chain}, tx {tx}) kept out of the hedged \
              position and recorded in skipped_fills. As of this page: {detail}. {uncovered} \
              Before covering anything, recheck what is still uncovered with \
-             st0x-liquidity-client read resource skipped-fills --param covered=false, since a \
-             cover may have been recorded since. Cover only what is listed, then record each \
-             fill's cover with st0x-liquidity-client debug cover-excluded-fill {chain} {tx} \
+             st0x-liquidity-client --env <production|staging> read resource skipped-fills \
+             --param covered=false, since a cover may have been recorded since. Cover only \
+             what is listed, then record each fill's cover with st0x-liquidity-client --env \
+             <production|staging> debug cover-excluded-fill {chain} {tx} \
              {log_index} --shares {amount} --price-usdc <broker price> --covered-at <RFC 3339 \
              execution time>.",
             amount = trade.amount,

@@ -1195,6 +1195,99 @@ async fn cover_closes_its_own_excluded_fill_not_the_oldest() {
     assert_eq!(report.summary.open_short_shares, "1");
 }
 
+/// A fill classified both ways is booked once, through `Position`, at every
+/// watermark from the hedged event on; before that event it is the exclusion
+/// it was, open and then covered.
+#[tokio::test]
+async fn fill_also_in_position_is_booked_once_from_the_hedged_event_on() {
+    let tx_hash = TxHash::repeat_byte(0x55);
+    let hedged = PositionEvent::OnChainOrderFilled {
+        trade_id: TradeId {
+            chain: Chain::Base,
+            tx_hash,
+            log_index: 5,
+        },
+        amount: FractionalShares::new(float!(3)),
+        direction: exec_direction(Direction::Sell),
+        price_usdc: float!(150),
+        block_timestamp: parse_timestamp("2026-05-15T13:00:00Z").unwrap(),
+        block_number: None,
+        seen_at: parse_timestamp("2026-05-15T13:00:00Z").unwrap(),
+    };
+    let cover = SeedEvent::OnChainTrade(
+        EXCLUDED_TRADE_ID.to_owned(),
+        OnChainTradeEvent::ExclusionCovered {
+            symbol: Symbol::new("AAPL").unwrap(),
+            shares: float!(3),
+            direction: exec_direction(Direction::Buy),
+            price_usdc: float!(140),
+            broker_order_id: None,
+            covered_at: parse_timestamp("2026-05-15T14:00:00Z").unwrap(),
+            recorded_at: parse_timestamp("2026-05-15T14:05:00Z").unwrap(),
+        },
+    );
+    let pool = pnl_test_pool(
+        vec![
+            excluded_sell_event(),
+            cover,
+            SeedEvent::Position("AAPL", hedged),
+        ],
+        vec![position_row("AAPL", "-3")],
+    )
+    .await;
+
+    let current = build_pnl_report(&pool, &query(), Vec::new(), Utc::now())
+        .await
+        .unwrap();
+    assert_eq!(
+        current.summary.open_short_shares, "3",
+        "booked once, not twice"
+    );
+    assert!(
+        current
+            .warnings
+            .iter()
+            .all(|warning| !warning.contains("not yet covered")),
+        "{:?}",
+        current.warnings
+    );
+
+    assert_eq!(
+        current.summary.gross_realized_pnl_usd, "0",
+        "the cover of a fill the bot hedges is not booked either"
+    );
+
+    let before_cover = PnlQuery {
+        as_of_rowid: Some(1),
+        ..query()
+    };
+    let excluded = build_pnl_report(&pool, &before_cover, Vec::new(), Utc::now())
+        .await
+        .unwrap();
+    assert_eq!(excluded.summary.open_short_shares, "3");
+    assert!(
+        excluded
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("not yet covered")),
+        "before the hedged event the fill was an open exclusion: {:?}",
+        excluded.warnings
+    );
+
+    let before_hedge = PnlQuery {
+        as_of_rowid: Some(2),
+        ..query()
+    };
+    let covered = build_pnl_report(&pool, &before_hedge, Vec::new(), Utc::now())
+        .await
+        .unwrap();
+    assert_eq!(
+        covered.summary.gross_realized_pnl_usd, "30",
+        "at the cover's watermark the exclusion and its cover are booked"
+    );
+    assert_eq!(covered.summary.open_short_shares, "0");
+}
+
 /// Until the cover is recorded the excluded fill is open exposure, and the
 /// report says so.
 #[tokio::test]
