@@ -974,7 +974,9 @@ impl<
     /// Re-polls Circle for an `Attested` transfer that predates envelope
     /// persistence.
     ///
-    /// A timeout retries (see [`Self::continue_from_attested`]). A hard error
+    /// A timeout retries while the nonce reads unused (see
+    /// [`Self::continue_from_attested`]); on a used or unreadable nonce it
+    /// redrives via `MintRecoveryInconclusive`. A hard error
     /// latches `BridgingFailed` once the destination chain reads the recorded
     /// `cctp_nonce` unused across a probe window, so one lagging node cannot
     /// fail a landed mint. When the mint has landed, an error that repeats
@@ -994,9 +996,10 @@ impl<
             .await
         {
             Ok(response) => return Ok(response),
-            Err(CctpError::AttestationTimeout { attempts, source }) => {
-                warn!(target: "rebalance", %id, attempts, ?source, "Circle attestation re-poll timed out");
-                return Err(UsdcTransferError::AttestationTimedOut { id: id.clone() });
+            Err(error @ CctpError::AttestationTimeout { .. }) => {
+                return Err(self
+                    .repoll_timed_out(id, mint_direction, cctp_nonce, initiated_at, error)
+                    .await);
             }
             Err(error) => error,
         };
@@ -1052,6 +1055,61 @@ impl<
                     initiated_at,
                     source: Box::new(error),
                 })
+            }
+        }
+    }
+
+    /// A timed-out legacy re-poll retries on the attestation cadence only
+    /// while the nonce reads unused. A used or unreadable nonce redrives via
+    /// `MintRecoveryInconclusive`, whose deadline alert pages if Circle never
+    /// answers.
+    async fn repoll_timed_out(
+        &self,
+        id: &UsdcRebalanceId,
+        mint_direction: BridgeDirection,
+        cctp_nonce: B256,
+        initiated_at: DateTime<Utc>,
+        error: CctpError,
+    ) -> UsdcTransferError {
+        match self
+            .cctp_bridge
+            .mint_nonce_consumed(mint_direction, cctp_nonce)
+            .await
+        {
+            Ok(false) => {
+                warn!(target: "rebalance", %id, ?error, "Circle attestation re-poll timed out");
+                UsdcTransferError::AttestationTimedOut { id: id.clone() }
+            }
+            Ok(true) => {
+                warn!(
+                    target: "rebalance",
+                    %id,
+                    %cctp_nonce,
+                    ?error,
+                    "Circle re-poll timed out, but the recorded nonce is consumed; redriving \
+                     to adopt its mint"
+                );
+                UsdcTransferError::MintRecoveryInconclusive {
+                    id: id.clone(),
+                    initiated_at,
+                    source: Box::new(error),
+                }
+            }
+            Err(nonce_error) => {
+                warn!(
+                    target: "rebalance",
+                    %id,
+                    %cctp_nonce,
+                    ?error,
+                    ?nonce_error,
+                    "Circle re-poll timed out and the recorded nonce could not be read; \
+                     redriving"
+                );
+                UsdcTransferError::MintRecoveryInconclusive {
+                    id: id.clone(),
+                    initiated_at,
+                    source: Box::new(error),
+                }
             }
         }
     }

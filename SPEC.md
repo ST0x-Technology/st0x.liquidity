@@ -4203,7 +4203,10 @@ enum BridgeStage { Burn, Attestation, Mint }
   message cannot mint on Base". Transfers whose `BridgeAttestationReceived`
   predates the `message` field carry `None` and fall back to re-polling Circle:
   the attestation is permanently retrievable, so a timeout there retries until
-  success rather than failing (bounding it would strand recoverable funds). The
+  success rather than failing (bounding it would strand recoverable funds) while
+  the destination chain reads the recorded nonce unused. When the nonce reads
+  consumed, or the read fails, a timeout redrives via `MintRecoveryInconclusive`
+  instead, so its 4-hour deadline alert pages if Circle never answers. The
   re-polled nonce is cross-checked against the recorded `cctp_nonce` the same
   way, and the BaseToAlpaca `BridgingFailed` recovery checks it again before it
   mints, so a mismatch stays failed for operator reconciliation. A hard re-poll
