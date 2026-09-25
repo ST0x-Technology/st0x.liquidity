@@ -6199,6 +6199,11 @@ mod tests {
         let recipient = address!("0x000000000000000000000000000000000000bEEF");
         let amount = U256::from(7_000_000u64);
         let send_tx = send_usdc(&bridge, recipient, amount).await;
+        assert_eq!(
+            bridge.confirm_usdc_on_ethereum(send_tx).await.unwrap(),
+            UsdcTransferStatus::Confirmed,
+            "the operator supplies a mined send",
+        );
 
         assert_eq!(
             bridge
