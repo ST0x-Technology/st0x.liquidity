@@ -3988,11 +3988,14 @@ treats a recorded transfer on another corridor as permanent for the build: its
 job ends without a retry, startup recovery (even while a job is live) and the
 timeout sweep never re-arm it, and its guard stays held. A fresh job asking for
 another corridor has no transfer to hold: it retries, dead-letters, and its
-dead-letter alert pages once. The operator is paged once per transfer per run
+dead-letter alert pages once. Startup recovery pages once per transfer per run
 (the record is kept in memory) with "USDC transfer corridor mismatch: transfer
-{id} runs on the {corridor} corridor, which this build does not serve", and a
-manual `transfer resume` is refused (422). The way out is a build that serves
-that corridor.
+{id} runs on the {corridor} corridor, which this build does not serve"; the
+timeout sweep retries that page until it is delivered and raises no other stall
+alert for the transfer. An operator reconcile of such a transfer in a
+reconcilable state releases its guard on the next sweep. A manual
+`transfer resume` is refused (422). The way out is a build that serves that
+corridor.
 
 - `WithdrawalSubmitting`: scan the source chain for an already-mined withdrawal
   (`find_recent_withdrawal`) from the captured head and adopt it. An empty mined

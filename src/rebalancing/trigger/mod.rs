@@ -211,7 +211,7 @@ pub(crate) enum UsdcResumeError {
     #[error("USDC rebalancing stores are not wired yet (conductor still starting)")]
     NotReady,
     #[error(
-        "USDC transfer corridor mismatch: rebalance {id} runs on the {recorded} corridor, \
+        "USDC transfer corridor mismatch: transfer {id} runs on the {recorded} corridor, \
          this build serves {served}; nothing was enqueued"
     )]
     CorridorNotServed {
