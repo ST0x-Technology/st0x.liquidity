@@ -10790,7 +10790,7 @@ mod tests {
         id: &RedemptionAggregateId,
         prepared: PreparedTransaction,
     ) -> AppState {
-        let state = signed_withdrawal_ready_state(bot_wallet, raindex).await;
+        let state = Box::pin(signed_withdrawal_ready_state(bot_wallet, raindex)).await;
         seed_redemption_submitted(&state.pool, id, prepared).await;
         state
     }
