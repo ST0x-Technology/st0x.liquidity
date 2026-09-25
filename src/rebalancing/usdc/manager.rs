@@ -20,6 +20,7 @@ use uuid::Uuid;
 use st0x_bridge::cctp::{
     AttestationResponse, CctpBridge, CctpError, MinedTx, MintScanFloorCheck, UsdcTransferStatus,
 };
+use st0x_bridge::corridor::UsdcCorridor;
 use st0x_bridge::{Attestation, Bridge, BridgeDirection, BurnReceipt, BurnTxStatus, MintReceipt};
 use st0x_config::{ALPACA_MINIMUM_WITHDRAWAL, ALPACA_TO_BASE_MINIMUM_TRANSFER, ChainRegistry};
 use st0x_event_sorcery::Store;
@@ -117,19 +118,25 @@ pub struct UsdcSettlementParams {
 
 /// Identifies the market-making endpoints for bridged USDC.
 ///
-/// `wallet` receives or sends the bridged funds. `vault_id` identifies the
-/// Raindex vault used for inventory, which managed-inventory deployments may
-/// own through a separate inventory contract.
+/// `corridor` is the one cash corridor these endpoints serve. `wallet`
+/// receives or sends the bridged funds. `vault_id` identifies the Raindex
+/// vault used for inventory, which managed-inventory deployments may own
+/// through a separate inventory contract.
 #[derive(Debug, Clone, Copy)]
 pub struct MarketMakingUsdcEndpoints {
+    corridor: UsdcCorridor,
     wallet: Address,
     vault_id: RaindexVaultId,
 }
 
 impl MarketMakingUsdcEndpoints {
     #[must_use]
-    pub const fn new(wallet: Address, vault_id: RaindexVaultId) -> Self {
-        Self { wallet, vault_id }
+    pub const fn new(corridor: UsdcCorridor, wallet: Address, vault_id: RaindexVaultId) -> Self {
+        Self {
+            corridor,
+            wallet,
+            vault_id,
+        }
     }
 }
 
@@ -388,6 +395,9 @@ pub struct CrossVenueCashTransfer<Signer: Wallet, B = CctpBridge<Signer, Signer>
     cctp_bridge: Arc<B>,
     raindex: Arc<RaindexService<Signer>>,
     cqrs: Arc<Store<UsdcRebalance>>,
+    /// The corridor this service moves cash on; a transfer recorded on
+    /// another is refused before any send.
+    corridor: UsdcCorridor,
     market_maker_wallet: Address,
     vault_id: RaindexVaultId,
     attestation_retry_deadline: Duration,
@@ -700,6 +710,7 @@ impl<
             cctp_bridge,
             raindex,
             cqrs,
+            corridor: market_making_endpoints.corridor,
             market_maker_wallet: market_making_endpoints.wallet,
             vault_id: market_making_endpoints.vault_id,
             attestation_retry_deadline: settlement.attestation_retry_deadline,
@@ -1477,6 +1488,7 @@ impl<
                 id,
                 UsdcRebalanceCommand::InitiateConversion {
                     direction: RebalanceDirection::AlpacaToBase,
+                    corridor: self.corridor,
                     amount,
                     order_id: correlation_id.clone(),
                 },
@@ -2849,6 +2861,7 @@ impl<
                 id,
                 UsdcRebalanceCommand::Initiate {
                     direction: RebalanceDirection::AlpacaToBase,
+                    corridor: self.corridor,
                     amount,
                     withdrawal: TransferRef::AlpacaId(transfer.id),
                 },
@@ -5057,6 +5070,7 @@ impl<
                 id,
                 UsdcRebalanceCommand::BeginWithdrawal {
                     direction: RebalanceDirection::BaseToAlpaca,
+                    corridor: self.corridor,
                     amount,
                     from_block,
                 },
@@ -5142,6 +5156,7 @@ impl<
                 id,
                 UsdcRebalanceCommand::Initiate {
                     direction: RebalanceDirection::BaseToAlpaca,
+                    corridor: self.corridor,
                     amount,
                     withdrawal: TransferRef::OnchainTx(existing_tx),
                 },
@@ -5187,6 +5202,7 @@ impl<
                 id,
                 UsdcRebalanceCommand::Initiate {
                     direction: RebalanceDirection::BaseToAlpaca,
+                    corridor: self.corridor,
                     amount,
                     withdrawal: TransferRef::OnchainTx(withdraw_tx),
                 },
@@ -7770,6 +7786,7 @@ mod tests {
         cqrs.send(
             id,
             UsdcRebalanceCommand::Initiate {
+                corridor: UsdcCorridor::BASE_CCTP,
                 direction: RebalanceDirection::BaseToAlpaca,
                 amount,
                 withdrawal: TransferRef::OnchainTx(burn_tx),
@@ -7854,6 +7871,7 @@ mod tests {
         cqrs.send(
             id,
             InitiateConversion {
+                corridor: UsdcCorridor::BASE_CCTP,
                 direction: RebalanceDirection::AlpacaToBase,
                 amount,
                 order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
@@ -7872,6 +7890,7 @@ mod tests {
         cqrs.send(
             id,
             Initiate {
+                corridor: UsdcCorridor::BASE_CCTP,
                 direction: RebalanceDirection::AlpacaToBase,
                 amount,
                 withdrawal: TransferRef::AlpacaId(AlpacaTransferId::from(Uuid::new_v4())),
@@ -7950,6 +7969,7 @@ mod tests {
         cqrs.send(
             id,
             InitiateConversion {
+                corridor: UsdcCorridor::BASE_CCTP,
                 direction: RebalanceDirection::AlpacaToBase,
                 amount,
                 order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
@@ -7968,6 +7988,7 @@ mod tests {
         cqrs.send(
             id,
             Initiate {
+                corridor: UsdcCorridor::BASE_CCTP,
                 direction: RebalanceDirection::AlpacaToBase,
                 amount,
                 withdrawal: TransferRef::AlpacaId(AlpacaTransferId::from(Uuid::new_v4())),
@@ -8505,6 +8526,7 @@ mod tests {
             Arc::new(vault_service),
             cqrs.clone(),
             MarketMakingUsdcEndpoints::new(
+                UsdcCorridor::BASE_CCTP,
                 address!("0x1111111111111111111111111111111111111111"),
                 TEST_VAULT_ID,
             ),
@@ -8708,7 +8730,11 @@ mod tests {
             Arc::new(cctp_bridge),
             Arc::new(vault_service),
             cqrs,
-            MarketMakingUsdcEndpoints::new(market_maker_wallet, TEST_VAULT_ID),
+            MarketMakingUsdcEndpoints::new(
+                UsdcCorridor::BASE_CCTP,
+                market_maker_wallet,
+                TEST_VAULT_ID,
+            ),
             &test_settlement_params(),
             BotGasReceiptCostEnqueuer::Disabled,
         );
@@ -8756,7 +8782,11 @@ mod tests {
             Arc::new(cctp_bridge),
             Arc::new(vault_service),
             cqrs,
-            MarketMakingUsdcEndpoints::new(market_maker_wallet, TEST_VAULT_ID),
+            MarketMakingUsdcEndpoints::new(
+                UsdcCorridor::BASE_CCTP,
+                market_maker_wallet,
+                TEST_VAULT_ID,
+            ),
             &test_settlement_params(),
             BotGasReceiptCostEnqueuer::Disabled,
         );
@@ -8799,7 +8829,11 @@ mod tests {
             Arc::new(cctp_bridge),
             Arc::new(vault_service),
             cqrs,
-            MarketMakingUsdcEndpoints::new(market_maker_wallet, TEST_VAULT_ID),
+            MarketMakingUsdcEndpoints::new(
+                UsdcCorridor::BASE_CCTP,
+                market_maker_wallet,
+                TEST_VAULT_ID,
+            ),
             &test_settlement_params(),
             BotGasReceiptCostEnqueuer::Disabled,
         );
@@ -8850,6 +8884,7 @@ mod tests {
             Arc::new(vault_service),
             Arc::clone(&cqrs),
             MarketMakingUsdcEndpoints::new(
+                UsdcCorridor::BASE_CCTP,
                 address!("0x1111111111111111111111111111111111111111"),
                 TEST_VAULT_ID,
             ),
@@ -9270,6 +9305,7 @@ mod tests {
         cqrs.send(
             &id,
             UsdcRebalanceCommand::Initiate {
+                corridor: UsdcCorridor::BASE_CCTP,
                 direction: RebalanceDirection::AlpacaToBase,
                 amount: received,
                 withdrawal: TransferRef::AlpacaId(AlpacaTransferId::from(Uuid::new_v4())),
@@ -9304,6 +9340,7 @@ mod tests {
             Arc::new(vault_service),
             cqrs,
             MarketMakingUsdcEndpoints::new(
+                UsdcCorridor::BASE_CCTP,
                 address!("0x1111111111111111111111111111111111111111"),
                 TEST_VAULT_ID,
             ),
@@ -9380,6 +9417,7 @@ mod tests {
             Arc::new(vault_service),
             Arc::clone(&cqrs),
             MarketMakingUsdcEndpoints::new(
+                UsdcCorridor::BASE_CCTP,
                 address!("0x1111111111111111111111111111111111111111"),
                 TEST_VAULT_ID,
             ),
@@ -9446,7 +9484,11 @@ mod tests {
             Arc::new(cctp_bridge),
             Arc::new(vault_service),
             cqrs,
-            MarketMakingUsdcEndpoints::new(market_maker_wallet, TEST_VAULT_ID),
+            MarketMakingUsdcEndpoints::new(
+                UsdcCorridor::BASE_CCTP,
+                market_maker_wallet,
+                TEST_VAULT_ID,
+            ),
             &test_settlement_params(),
             BotGasReceiptCostEnqueuer::Disabled,
         );
@@ -9504,7 +9546,11 @@ mod tests {
             Arc::new(cctp_bridge),
             Arc::new(vault_service),
             cqrs,
-            MarketMakingUsdcEndpoints::new(market_maker_wallet, TEST_VAULT_ID),
+            MarketMakingUsdcEndpoints::new(
+                UsdcCorridor::BASE_CCTP,
+                market_maker_wallet,
+                TEST_VAULT_ID,
+            ),
             &test_settlement_params(),
             BotGasReceiptCostEnqueuer::Disabled,
         );
@@ -9553,7 +9599,11 @@ mod tests {
             Arc::new(cctp_bridge),
             Arc::new(vault_service),
             cqrs,
-            MarketMakingUsdcEndpoints::new(market_maker_wallet, TEST_VAULT_ID),
+            MarketMakingUsdcEndpoints::new(
+                UsdcCorridor::BASE_CCTP,
+                market_maker_wallet,
+                TEST_VAULT_ID,
+            ),
             &test_settlement_params(),
             BotGasReceiptCostEnqueuer::Disabled,
         );
@@ -9616,6 +9666,7 @@ mod tests {
         cqrs.send(
             &id,
             UsdcRebalanceCommand::Initiate {
+                corridor: UsdcCorridor::BASE_CCTP,
                 direction: RebalanceDirection::BaseToAlpaca,
                 amount,
                 withdrawal: TransferRef::OnchainTx(burn_tx),
@@ -9679,7 +9730,11 @@ mod tests {
             Arc::new(cctp_bridge),
             Arc::new(vault_service),
             cqrs,
-            MarketMakingUsdcEndpoints::new(market_maker_wallet, TEST_VAULT_ID),
+            MarketMakingUsdcEndpoints::new(
+                UsdcCorridor::BASE_CCTP,
+                market_maker_wallet,
+                TEST_VAULT_ID,
+            ),
             &test_settlement_params(),
             BotGasReceiptCostEnqueuer::Disabled,
         );
@@ -9735,7 +9790,11 @@ mod tests {
             Arc::new(cctp_bridge),
             Arc::new(vault_service),
             Arc::clone(&cqrs),
-            MarketMakingUsdcEndpoints::new(market_maker_wallet, TEST_VAULT_ID),
+            MarketMakingUsdcEndpoints::new(
+                UsdcCorridor::BASE_CCTP,
+                market_maker_wallet,
+                TEST_VAULT_ID,
+            ),
             &test_settlement_params(),
             BotGasReceiptCostEnqueuer::Disabled,
         );
@@ -9761,6 +9820,7 @@ mod tests {
             .send(
                 &id,
                 UsdcRebalanceCommand::InitiateConversion {
+                    corridor: UsdcCorridor::BASE_CCTP,
                     direction: RebalanceDirection::AlpacaToBase,
                     amount,
                     order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
@@ -9813,7 +9873,11 @@ mod tests {
             Arc::new(cctp_bridge),
             Arc::new(vault_service),
             Arc::clone(&cqrs),
-            MarketMakingUsdcEndpoints::new(market_maker_wallet, TEST_VAULT_ID),
+            MarketMakingUsdcEndpoints::new(
+                UsdcCorridor::BASE_CCTP,
+                market_maker_wallet,
+                TEST_VAULT_ID,
+            ),
             &test_settlement_params(),
             BotGasReceiptCostEnqueuer::Disabled,
         );
@@ -9897,7 +9961,11 @@ mod tests {
             Arc::new(cctp_bridge),
             Arc::new(vault_service),
             Arc::clone(&cqrs),
-            MarketMakingUsdcEndpoints::new(market_maker_wallet, TEST_VAULT_ID),
+            MarketMakingUsdcEndpoints::new(
+                UsdcCorridor::BASE_CCTP,
+                market_maker_wallet,
+                TEST_VAULT_ID,
+            ),
             &test_settlement_params(),
             BotGasReceiptCostEnqueuer::Disabled,
         );
@@ -10029,7 +10097,11 @@ mod tests {
             Arc::new(cctp_bridge),
             Arc::new(vault_service),
             Arc::clone(&cqrs),
-            MarketMakingUsdcEndpoints::new(market_maker_wallet, TEST_VAULT_ID),
+            MarketMakingUsdcEndpoints::new(
+                UsdcCorridor::BASE_CCTP,
+                market_maker_wallet,
+                TEST_VAULT_ID,
+            ),
             &test_settlement_params(),
             BotGasReceiptCostEnqueuer::Disabled,
         );
@@ -10103,7 +10175,11 @@ mod tests {
             Arc::new(cctp_bridge),
             Arc::new(vault_service),
             cqrs,
-            MarketMakingUsdcEndpoints::new(market_maker_wallet, TEST_VAULT_ID),
+            MarketMakingUsdcEndpoints::new(
+                UsdcCorridor::BASE_CCTP,
+                market_maker_wallet,
+                TEST_VAULT_ID,
+            ),
             &test_settlement_params(),
             BotGasReceiptCostEnqueuer::Disabled,
         );
@@ -10168,6 +10244,7 @@ mod tests {
         cqrs.send(
             &id,
             UsdcRebalanceCommand::InitiateConversion {
+                corridor: UsdcCorridor::BASE_CCTP,
                 direction: RebalanceDirection::AlpacaToBase,
                 amount,
                 order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
@@ -10182,7 +10259,11 @@ mod tests {
             Arc::new(cctp_bridge),
             Arc::new(vault_service),
             cqrs,
-            MarketMakingUsdcEndpoints::new(market_maker_wallet, TEST_VAULT_ID),
+            MarketMakingUsdcEndpoints::new(
+                UsdcCorridor::BASE_CCTP,
+                market_maker_wallet,
+                TEST_VAULT_ID,
+            ),
             &test_settlement_params(),
             BotGasReceiptCostEnqueuer::Disabled,
         );
@@ -10252,7 +10333,11 @@ mod tests {
             Arc::new(cctp_bridge),
             Arc::new(vault_service),
             Arc::clone(&cqrs),
-            MarketMakingUsdcEndpoints::new(market_maker_wallet, TEST_VAULT_ID),
+            MarketMakingUsdcEndpoints::new(
+                UsdcCorridor::BASE_CCTP,
+                market_maker_wallet,
+                TEST_VAULT_ID,
+            ),
             &test_settlement_params(),
             BotGasReceiptCostEnqueuer::Disabled,
         );
@@ -10275,6 +10360,7 @@ mod tests {
             .send(
                 &id,
                 UsdcRebalanceCommand::InitiateConversion {
+                    corridor: UsdcCorridor::BASE_CCTP,
                     direction: RebalanceDirection::AlpacaToBase,
                     amount,
                     order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
@@ -10319,7 +10405,11 @@ mod tests {
             Arc::new(cctp_bridge),
             Arc::new(vault_service),
             Arc::clone(&cqrs),
-            MarketMakingUsdcEndpoints::new(market_maker_wallet, TEST_VAULT_ID),
+            MarketMakingUsdcEndpoints::new(
+                UsdcCorridor::BASE_CCTP,
+                market_maker_wallet,
+                TEST_VAULT_ID,
+            ),
             &test_settlement_params(),
             BotGasReceiptCostEnqueuer::Disabled,
         );
@@ -10344,6 +10434,7 @@ mod tests {
             .send(
                 &id,
                 UsdcRebalanceCommand::Initiate {
+                    corridor: UsdcCorridor::BASE_CCTP,
                     direction: RebalanceDirection::AlpacaToBase,
                     amount,
                     withdrawal: TransferRef::AlpacaId(AlpacaTransferId::from(Uuid::new_v4())),
@@ -10377,7 +10468,11 @@ mod tests {
             Arc::new(cctp_bridge),
             Arc::new(vault_service),
             cqrs,
-            MarketMakingUsdcEndpoints::new(market_maker_wallet, TEST_VAULT_ID),
+            MarketMakingUsdcEndpoints::new(
+                UsdcCorridor::BASE_CCTP,
+                market_maker_wallet,
+                TEST_VAULT_ID,
+            ),
             &test_settlement_params(),
             BotGasReceiptCostEnqueuer::Disabled,
         );
@@ -10432,7 +10527,11 @@ mod tests {
             Arc::new(cctp_bridge),
             Arc::new(vault_service),
             Arc::clone(&cqrs),
-            MarketMakingUsdcEndpoints::new(market_maker_wallet, TEST_VAULT_ID),
+            MarketMakingUsdcEndpoints::new(
+                UsdcCorridor::BASE_CCTP,
+                market_maker_wallet,
+                TEST_VAULT_ID,
+            ),
             &test_settlement_params(),
             BotGasReceiptCostEnqueuer::Disabled,
         );
@@ -10500,7 +10599,11 @@ mod tests {
             Arc::new(cctp_bridge),
             Arc::new(vault_service),
             Arc::clone(&cqrs),
-            MarketMakingUsdcEndpoints::new(market_maker_wallet, TEST_VAULT_ID),
+            MarketMakingUsdcEndpoints::new(
+                UsdcCorridor::BASE_CCTP,
+                market_maker_wallet,
+                TEST_VAULT_ID,
+            ),
             &test_settlement_params(),
             BotGasReceiptCostEnqueuer::Disabled,
         );
@@ -10574,7 +10677,11 @@ mod tests {
             Arc::new(cctp_bridge),
             Arc::new(vault_service),
             Arc::clone(&cqrs),
-            MarketMakingUsdcEndpoints::new(market_maker_wallet, TEST_VAULT_ID),
+            MarketMakingUsdcEndpoints::new(
+                UsdcCorridor::BASE_CCTP,
+                market_maker_wallet,
+                TEST_VAULT_ID,
+            ),
             &test_settlement_params(),
             BotGasReceiptCostEnqueuer::Disabled,
         );
@@ -10634,7 +10741,11 @@ mod tests {
             Arc::new(cctp_bridge),
             Arc::new(vault_service),
             Arc::clone(&cqrs),
-            MarketMakingUsdcEndpoints::new(market_maker_wallet, TEST_VAULT_ID),
+            MarketMakingUsdcEndpoints::new(
+                UsdcCorridor::BASE_CCTP,
+                market_maker_wallet,
+                TEST_VAULT_ID,
+            ),
             &test_settlement_params(),
             BotGasReceiptCostEnqueuer::Disabled,
         );
@@ -10719,7 +10830,11 @@ mod tests {
             Arc::new(cctp_bridge),
             Arc::new(vault_service),
             Arc::clone(&cqrs),
-            MarketMakingUsdcEndpoints::new(market_maker_wallet, TEST_VAULT_ID),
+            MarketMakingUsdcEndpoints::new(
+                UsdcCorridor::BASE_CCTP,
+                market_maker_wallet,
+                TEST_VAULT_ID,
+            ),
             &test_settlement_params(),
             BotGasReceiptCostEnqueuer::Disabled,
         );
@@ -10794,7 +10909,11 @@ mod tests {
             Arc::new(cctp_bridge),
             Arc::new(vault_service),
             Arc::clone(&cqrs),
-            MarketMakingUsdcEndpoints::new(market_maker_wallet, TEST_VAULT_ID),
+            MarketMakingUsdcEndpoints::new(
+                UsdcCorridor::BASE_CCTP,
+                market_maker_wallet,
+                TEST_VAULT_ID,
+            ),
             &test_settlement_params(),
             BotGasReceiptCostEnqueuer::Disabled,
         );
@@ -10867,7 +10986,11 @@ mod tests {
             Arc::new(cctp_bridge),
             Arc::new(vault_service),
             Arc::clone(&cqrs),
-            MarketMakingUsdcEndpoints::new(market_maker_wallet, TEST_VAULT_ID),
+            MarketMakingUsdcEndpoints::new(
+                UsdcCorridor::BASE_CCTP,
+                market_maker_wallet,
+                TEST_VAULT_ID,
+            ),
             &test_settlement_params(),
             BotGasReceiptCostEnqueuer::Disabled,
         );
@@ -10940,7 +11063,11 @@ mod tests {
             Arc::new(cctp_bridge),
             Arc::new(vault_service),
             cqrs.clone(),
-            MarketMakingUsdcEndpoints::new(market_maker_wallet, TEST_VAULT_ID),
+            MarketMakingUsdcEndpoints::new(
+                UsdcCorridor::BASE_CCTP,
+                market_maker_wallet,
+                TEST_VAULT_ID,
+            ),
             &test_settlement_params(),
             BotGasReceiptCostEnqueuer::Disabled,
         );
@@ -10979,7 +11106,11 @@ mod tests {
             Arc::new(cctp_bridge),
             Arc::new(vault_service),
             cqrs.clone(),
-            MarketMakingUsdcEndpoints::new(market_maker_wallet, TEST_VAULT_ID),
+            MarketMakingUsdcEndpoints::new(
+                UsdcCorridor::BASE_CCTP,
+                market_maker_wallet,
+                TEST_VAULT_ID,
+            ),
             &test_settlement_params(),
             BotGasReceiptCostEnqueuer::Disabled,
         );
@@ -11001,6 +11132,7 @@ mod tests {
         cqrs.send(
             id,
             UsdcRebalanceCommand::Initiate {
+                corridor: UsdcCorridor::BASE_CCTP,
                 direction: RebalanceDirection::BaseToAlpaca,
                 amount,
                 withdrawal: TransferRef::OnchainTx(burn_tx),
@@ -11048,6 +11180,7 @@ mod tests {
         cqrs.send(
             id,
             UsdcRebalanceCommand::Initiate {
+                corridor: UsdcCorridor::BASE_CCTP,
                 direction: RebalanceDirection::BaseToAlpaca,
                 amount,
                 withdrawal: TransferRef::OnchainTx(burn_tx),
@@ -11088,6 +11221,7 @@ mod tests {
         cqrs.send(
             id,
             UsdcRebalanceCommand::InitiateConversion {
+                corridor: UsdcCorridor::BASE_CCTP,
                 direction: RebalanceDirection::AlpacaToBase,
                 amount,
                 order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
@@ -11106,6 +11240,7 @@ mod tests {
         cqrs.send(
             id,
             UsdcRebalanceCommand::Initiate {
+                corridor: UsdcCorridor::BASE_CCTP,
                 direction: RebalanceDirection::AlpacaToBase,
                 amount,
                 withdrawal: TransferRef::AlpacaId(AlpacaTransferId::from(Uuid::new_v4())),
@@ -11408,6 +11543,7 @@ mod tests {
         cqrs.send(
             id,
             UsdcRebalanceCommand::Initiate {
+                corridor: UsdcCorridor::BASE_CCTP,
                 direction: RebalanceDirection::BaseToAlpaca,
                 amount,
                 withdrawal: TransferRef::OnchainTx(burn_tx),
@@ -11888,6 +12024,7 @@ mod tests {
         cqrs.send(
             &id,
             UsdcRebalanceCommand::Initiate {
+                corridor: UsdcCorridor::BASE_CCTP,
                 direction: RebalanceDirection::BaseToAlpaca,
                 amount,
                 withdrawal: TransferRef::OnchainTx(withdraw_tx),
@@ -11949,6 +12086,7 @@ mod tests {
         cqrs.send(
             &id,
             UsdcRebalanceCommand::InitiateConversion {
+                corridor: UsdcCorridor::BASE_CCTP,
                 direction: RebalanceDirection::AlpacaToBase,
                 amount,
                 order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
@@ -12021,6 +12159,7 @@ mod tests {
         cqrs.send(
             &id,
             UsdcRebalanceCommand::InitiateConversion {
+                corridor: UsdcCorridor::BASE_CCTP,
                 direction: RebalanceDirection::AlpacaToBase,
                 amount: requested,
                 order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
@@ -12039,6 +12178,7 @@ mod tests {
         cqrs.send(
             &id,
             UsdcRebalanceCommand::Initiate {
+                corridor: UsdcCorridor::BASE_CCTP,
                 direction: RebalanceDirection::AlpacaToBase,
                 amount,
                 withdrawal: TransferRef::AlpacaId(AlpacaTransferId::from(Uuid::new_v4())),
@@ -12090,6 +12230,7 @@ mod tests {
         cqrs.send(
             &id,
             UsdcRebalanceCommand::InitiateConversion {
+                corridor: UsdcCorridor::BASE_CCTP,
                 direction: RebalanceDirection::AlpacaToBase,
                 amount: usdc("9794.02"),
                 order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
@@ -12280,6 +12421,7 @@ mod tests {
         cqrs.send(
             &id,
             UsdcRebalanceCommand::InitiateConversion {
+                corridor: UsdcCorridor::BASE_CCTP,
                 direction: RebalanceDirection::AlpacaToBase,
                 amount,
                 order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
@@ -13607,6 +13749,7 @@ mod tests {
         cqrs.send(
             &id,
             UsdcRebalanceCommand::InitiateConversion {
+                corridor: UsdcCorridor::BASE_CCTP,
                 direction: RebalanceDirection::AlpacaToBase,
                 amount,
                 order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
@@ -13860,7 +14003,11 @@ mod tests {
             Arc::clone(&cctp_bridge),
             Arc::new(vault_service),
             cqrs.clone(),
-            MarketMakingUsdcEndpoints::new(market_maker_wallet, TEST_VAULT_ID),
+            MarketMakingUsdcEndpoints::new(
+                UsdcCorridor::BASE_CCTP,
+                market_maker_wallet,
+                TEST_VAULT_ID,
+            ),
             &test_settlement_params(),
             BotGasReceiptCostEnqueuer::Disabled,
         );
@@ -13871,6 +14018,7 @@ mod tests {
         cqrs.send(
             &id,
             UsdcRebalanceCommand::Initiate {
+                corridor: UsdcCorridor::BASE_CCTP,
                 direction: RebalanceDirection::BaseToAlpaca,
                 amount,
                 withdrawal: TransferRef::OnchainTx(burn_receipt.tx),
@@ -14016,7 +14164,11 @@ mod tests {
             Arc::clone(&cctp_bridge),
             Arc::new(vault_service),
             cqrs.clone(),
-            MarketMakingUsdcEndpoints::new(market_maker_wallet, TEST_VAULT_ID),
+            MarketMakingUsdcEndpoints::new(
+                UsdcCorridor::BASE_CCTP,
+                market_maker_wallet,
+                TEST_VAULT_ID,
+            ),
             &test_settlement_params(),
             BotGasReceiptCostEnqueuer::Disabled,
         );
@@ -14025,6 +14177,7 @@ mod tests {
         cqrs.send(
             &id,
             UsdcRebalanceCommand::Initiate {
+                corridor: UsdcCorridor::BASE_CCTP,
                 direction: RebalanceDirection::BaseToAlpaca,
                 amount,
                 withdrawal: TransferRef::OnchainTx(own_burn.tx),
@@ -14177,7 +14330,11 @@ mod tests {
             Arc::new(bridge_with_circle_api(circle.base_url()).with_fast_mint_recovery_policy()),
             Arc::new(vault_service),
             cqrs.clone(),
-            MarketMakingUsdcEndpoints::new(market_maker_wallet, TEST_VAULT_ID),
+            MarketMakingUsdcEndpoints::new(
+                UsdcCorridor::BASE_CCTP,
+                market_maker_wallet,
+                TEST_VAULT_ID,
+            ),
             &test_settlement_params(),
             BotGasReceiptCostEnqueuer::Disabled,
         );
@@ -14186,6 +14343,7 @@ mod tests {
         cqrs.send(
             &id,
             UsdcRebalanceCommand::Initiate {
+                corridor: UsdcCorridor::BASE_CCTP,
                 direction: RebalanceDirection::BaseToAlpaca,
                 amount,
                 withdrawal: TransferRef::OnchainTx(burn.tx),
@@ -14561,7 +14719,11 @@ mod tests {
             Arc::clone(&cctp_bridge),
             Arc::new(vault_service),
             cqrs.clone(),
-            MarketMakingUsdcEndpoints::new(market_maker_wallet, TEST_VAULT_ID),
+            MarketMakingUsdcEndpoints::new(
+                UsdcCorridor::BASE_CCTP,
+                market_maker_wallet,
+                TEST_VAULT_ID,
+            ),
             &test_settlement_params(),
             BotGasReceiptCostEnqueuer::Disabled,
         );
@@ -14571,6 +14733,7 @@ mod tests {
         cqrs.send(
             &id,
             UsdcRebalanceCommand::Initiate {
+                corridor: UsdcCorridor::BASE_CCTP,
                 direction: RebalanceDirection::BaseToAlpaca,
                 amount,
                 withdrawal: TransferRef::OnchainTx(burn_receipt.tx),
@@ -14733,7 +14896,11 @@ mod tests {
             Arc::clone(&cctp_bridge),
             Arc::new(vault_service),
             cqrs.clone(),
-            MarketMakingUsdcEndpoints::new(market_maker_wallet, TEST_VAULT_ID),
+            MarketMakingUsdcEndpoints::new(
+                UsdcCorridor::BASE_CCTP,
+                market_maker_wallet,
+                TEST_VAULT_ID,
+            ),
             &test_settlement_params(),
             BotGasReceiptCostEnqueuer::Disabled,
         );
@@ -14746,6 +14913,7 @@ mod tests {
         cqrs.send(
             &id,
             UsdcRebalanceCommand::Initiate {
+                corridor: UsdcCorridor::BASE_CCTP,
                 direction: RebalanceDirection::BaseToAlpaca,
                 amount,
                 withdrawal: TransferRef::OnchainTx(burn_receipt.tx),
@@ -14905,7 +15073,11 @@ mod tests {
                 chains.bot_address,
             )),
             cqrs.clone(),
-            MarketMakingUsdcEndpoints::new(chains.bot_address, TEST_VAULT_ID),
+            MarketMakingUsdcEndpoints::new(
+                UsdcCorridor::BASE_CCTP,
+                chains.bot_address,
+                TEST_VAULT_ID,
+            ),
             &test_settlement_params(),
             BotGasReceiptCostEnqueuer::Disabled,
         );
@@ -14913,6 +15085,7 @@ mod tests {
         for command in [
             UsdcRebalanceCommand::Initiate {
                 direction: RebalanceDirection::BaseToAlpaca,
+                corridor: UsdcCorridor::BASE_CCTP,
                 amount,
                 withdrawal: TransferRef::OnchainTx(burn_receipt.tx),
             },
@@ -15114,7 +15287,11 @@ mod tests {
             Arc::new(cctp_bridge),
             Arc::new(vault_service),
             cqrs.clone(),
-            MarketMakingUsdcEndpoints::new(market_maker_wallet, TEST_VAULT_ID),
+            MarketMakingUsdcEndpoints::new(
+                UsdcCorridor::BASE_CCTP,
+                market_maker_wallet,
+                TEST_VAULT_ID,
+            ),
             &test_settlement_params(),
             BotGasReceiptCostEnqueuer::Disabled,
         );
@@ -15172,7 +15349,11 @@ mod tests {
             Arc::new(cctp_bridge),
             Arc::new(vault_service),
             cqrs.clone(),
-            MarketMakingUsdcEndpoints::new(market_maker_wallet, TEST_VAULT_ID),
+            MarketMakingUsdcEndpoints::new(
+                UsdcCorridor::BASE_CCTP,
+                market_maker_wallet,
+                TEST_VAULT_ID,
+            ),
             &test_settlement_params(),
             BotGasReceiptCostEnqueuer::Disabled,
         );
@@ -15324,6 +15505,7 @@ mod tests {
         cqrs.send(
             &id,
             UsdcRebalanceCommand::InitiateConversion {
+                corridor: UsdcCorridor::BASE_CCTP,
                 direction: RebalanceDirection::AlpacaToBase,
                 amount,
                 order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
@@ -15342,6 +15524,7 @@ mod tests {
         cqrs.send(
             &id,
             UsdcRebalanceCommand::Initiate {
+                corridor: UsdcCorridor::BASE_CCTP,
                 direction: RebalanceDirection::AlpacaToBase,
                 amount,
                 withdrawal: TransferRef::AlpacaId(AlpacaTransferId::from(Uuid::new_v4())),
@@ -15489,7 +15672,11 @@ mod tests {
             Arc::new(cctp_bridge),
             Arc::new(vault_service),
             cqrs,
-            MarketMakingUsdcEndpoints::new(chain.bot_address, TEST_VAULT_ID),
+            MarketMakingUsdcEndpoints::new(
+                UsdcCorridor::BASE_CCTP,
+                chain.bot_address,
+                TEST_VAULT_ID,
+            ),
             settlement,
             BotGasReceiptCostEnqueuer::Disabled,
         )
@@ -16647,7 +16834,7 @@ mod tests {
             bridge,
             Arc::new(vault_service),
             cqrs,
-            MarketMakingUsdcEndpoints::new(recipient, TEST_VAULT_ID),
+            MarketMakingUsdcEndpoints::new(UsdcCorridor::BASE_CCTP, recipient, TEST_VAULT_ID),
             &test_settlement_params(),
             BotGasReceiptCostEnqueuer::Disabled,
         );
@@ -17492,6 +17679,7 @@ mod tests {
         cqrs.send(
             id,
             UsdcRebalanceCommand::Initiate {
+                corridor: UsdcCorridor::BASE_CCTP,
                 direction: RebalanceDirection::BaseToAlpaca,
                 amount,
                 withdrawal: TransferRef::OnchainTx(burn_tx),
@@ -17628,7 +17816,11 @@ mod tests {
             Arc::new(cctp_bridge),
             Arc::new(vault_service),
             cqrs.clone(),
-            MarketMakingUsdcEndpoints::new(market_maker_wallet, TEST_VAULT_ID),
+            MarketMakingUsdcEndpoints::new(
+                UsdcCorridor::BASE_CCTP,
+                market_maker_wallet,
+                TEST_VAULT_ID,
+            ),
             &test_settlement_params(),
             BotGasReceiptCostEnqueuer::Disabled,
         );
@@ -17686,7 +17878,11 @@ mod tests {
             Arc::new(cctp_bridge),
             Arc::new(vault_service),
             cqrs.clone(),
-            MarketMakingUsdcEndpoints::new(market_maker_wallet, TEST_VAULT_ID),
+            MarketMakingUsdcEndpoints::new(
+                UsdcCorridor::BASE_CCTP,
+                market_maker_wallet,
+                TEST_VAULT_ID,
+            ),
             &test_settlement_params(),
             BotGasReceiptCostEnqueuer::Disabled,
         );
@@ -17724,6 +17920,7 @@ mod tests {
         cqrs.send(
             id,
             InitiateConversion {
+                corridor: UsdcCorridor::BASE_CCTP,
                 direction: RebalanceDirection::AlpacaToBase,
                 amount,
                 order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
@@ -17742,6 +17939,7 @@ mod tests {
         cqrs.send(
             id,
             Initiate {
+                corridor: UsdcCorridor::BASE_CCTP,
                 direction: RebalanceDirection::AlpacaToBase,
                 amount,
                 withdrawal: TransferRef::AlpacaId(AlpacaTransferId::from(transfer_uuid)),
@@ -18330,7 +18528,11 @@ mod tests {
             }),
             Arc::new(vault_service),
             cqrs.clone(),
-            MarketMakingUsdcEndpoints::new(market_maker_wallet, TEST_VAULT_ID),
+            MarketMakingUsdcEndpoints::new(
+                UsdcCorridor::BASE_CCTP,
+                market_maker_wallet,
+                TEST_VAULT_ID,
+            ),
             &test_settlement_params(),
             BotGasReceiptCostEnqueuer::Disabled,
         );
@@ -18417,7 +18619,11 @@ mod tests {
                 }),
                 Arc::new(vault_service),
                 cqrs.clone(),
-                MarketMakingUsdcEndpoints::new(market_maker_wallet, TEST_VAULT_ID),
+                MarketMakingUsdcEndpoints::new(
+                    UsdcCorridor::BASE_CCTP,
+                    market_maker_wallet,
+                    TEST_VAULT_ID,
+                ),
                 &test_settlement_params(),
                 BotGasReceiptCostEnqueuer::Disabled,
             );
@@ -18541,7 +18747,11 @@ mod tests {
             Arc::new(cctp_bridge),
             Arc::new(vault_service),
             cqrs.clone(),
-            MarketMakingUsdcEndpoints::new(market_maker_wallet, TEST_VAULT_ID),
+            MarketMakingUsdcEndpoints::new(
+                UsdcCorridor::BASE_CCTP,
+                market_maker_wallet,
+                TEST_VAULT_ID,
+            ),
             &test_settlement_params(),
             BotGasReceiptCostEnqueuer::Disabled,
         )
@@ -18599,7 +18809,11 @@ mod tests {
             Arc::new(cctp_bridge),
             Arc::new(vault_service),
             cqrs.clone(),
-            MarketMakingUsdcEndpoints::new(market_maker_wallet, TEST_VAULT_ID),
+            MarketMakingUsdcEndpoints::new(
+                UsdcCorridor::BASE_CCTP,
+                market_maker_wallet,
+                TEST_VAULT_ID,
+            ),
             &test_settlement_params(),
             BotGasReceiptCostEnqueuer::Disabled,
         )
@@ -18704,6 +18918,7 @@ mod tests {
         cqrs.send(
             &id,
             UsdcRebalanceCommand::InitiateConversion {
+                corridor: UsdcCorridor::BASE_CCTP,
                 direction: RebalanceDirection::AlpacaToBase,
                 amount,
                 order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
@@ -18722,6 +18937,7 @@ mod tests {
         cqrs.send(
             &id,
             UsdcRebalanceCommand::Initiate {
+                corridor: UsdcCorridor::BASE_CCTP,
                 direction: RebalanceDirection::AlpacaToBase,
                 amount,
                 withdrawal: TransferRef::AlpacaId(withdrawal_id),
@@ -18807,7 +19023,11 @@ mod tests {
             Arc::new(cctp_bridge),
             Arc::new(vault_service),
             cqrs.clone(),
-            MarketMakingUsdcEndpoints::new(market_maker_wallet, TEST_VAULT_ID),
+            MarketMakingUsdcEndpoints::new(
+                UsdcCorridor::BASE_CCTP,
+                market_maker_wallet,
+                TEST_VAULT_ID,
+            ),
             &test_settlement_params(),
             BotGasReceiptCostEnqueuer::Disabled,
         )
@@ -18841,7 +19061,11 @@ mod tests {
             Arc::new(cctp_bridge),
             Arc::new(vault_service),
             cqrs.clone(),
-            MarketMakingUsdcEndpoints::new(market_maker_wallet, TEST_VAULT_ID),
+            MarketMakingUsdcEndpoints::new(
+                UsdcCorridor::BASE_CCTP,
+                market_maker_wallet,
+                TEST_VAULT_ID,
+            ),
             &test_settlement_params(),
             BotGasReceiptCostEnqueuer::Disabled,
         )
@@ -18892,7 +19116,11 @@ mod tests {
             Arc::new(cctp_bridge),
             Arc::new(vault_service),
             cqrs.clone(),
-            MarketMakingUsdcEndpoints::new(market_maker_wallet, TEST_VAULT_ID),
+            MarketMakingUsdcEndpoints::new(
+                UsdcCorridor::BASE_CCTP,
+                market_maker_wallet,
+                TEST_VAULT_ID,
+            ),
             &test_settlement_params(),
             BotGasReceiptCostEnqueuer::Disabled,
         )
@@ -18948,7 +19176,11 @@ mod tests {
             Arc::new(cctp_bridge),
             Arc::new(vault_service),
             cqrs.clone(),
-            MarketMakingUsdcEndpoints::new(market_maker_wallet, TEST_VAULT_ID),
+            MarketMakingUsdcEndpoints::new(
+                UsdcCorridor::BASE_CCTP,
+                market_maker_wallet,
+                TEST_VAULT_ID,
+            ),
             &test_settlement_params(),
             BotGasReceiptCostEnqueuer::Disabled,
         )
@@ -19047,7 +19279,11 @@ mod tests {
             Arc::new(cctp_bridge),
             Arc::new(vault_service),
             cqrs.clone(),
-            MarketMakingUsdcEndpoints::new(market_maker_wallet, TEST_VAULT_ID),
+            MarketMakingUsdcEndpoints::new(
+                UsdcCorridor::BASE_CCTP,
+                market_maker_wallet,
+                TEST_VAULT_ID,
+            ),
             &test_settlement_params(),
             BotGasReceiptCostEnqueuer::Disabled,
         )
@@ -19130,7 +19366,11 @@ mod tests {
             Arc::new(cctp_bridge),
             Arc::new(vault_service),
             cqrs.clone(),
-            MarketMakingUsdcEndpoints::new(market_maker_wallet, TEST_VAULT_ID),
+            MarketMakingUsdcEndpoints::new(
+                UsdcCorridor::BASE_CCTP,
+                market_maker_wallet,
+                TEST_VAULT_ID,
+            ),
             &test_settlement_params(),
             BotGasReceiptCostEnqueuer::Disabled,
         )
@@ -19407,6 +19647,7 @@ mod tests {
         cqrs.send(
             &id,
             UsdcRebalanceCommand::InitiateConversion {
+                corridor: UsdcCorridor::BASE_CCTP,
                 direction: RebalanceDirection::AlpacaToBase,
                 amount,
                 order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
@@ -19425,6 +19666,7 @@ mod tests {
         cqrs.send(
             &id,
             UsdcRebalanceCommand::Initiate {
+                corridor: UsdcCorridor::BASE_CCTP,
                 direction: RebalanceDirection::AlpacaToBase,
                 amount,
                 withdrawal: TransferRef::AlpacaId(withdrawal_id),
@@ -19493,6 +19735,7 @@ mod tests {
         cqrs.send(
             &id,
             UsdcRebalanceCommand::InitiateConversion {
+                corridor: UsdcCorridor::BASE_CCTP,
                 direction: RebalanceDirection::AlpacaToBase,
                 amount,
                 order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
@@ -19511,6 +19754,7 @@ mod tests {
         cqrs.send(
             &id,
             UsdcRebalanceCommand::Initiate {
+                corridor: UsdcCorridor::BASE_CCTP,
                 direction: RebalanceDirection::AlpacaToBase,
                 amount,
                 withdrawal: TransferRef::AlpacaId(withdrawal_id),
@@ -19586,6 +19830,7 @@ mod tests {
         cqrs.send(
             &id,
             UsdcRebalanceCommand::InitiateConversion {
+                corridor: UsdcCorridor::BASE_CCTP,
                 direction: RebalanceDirection::AlpacaToBase,
                 amount,
                 order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
@@ -19604,6 +19849,7 @@ mod tests {
         cqrs.send(
             &id,
             UsdcRebalanceCommand::Initiate {
+                corridor: UsdcCorridor::BASE_CCTP,
                 direction: RebalanceDirection::AlpacaToBase,
                 amount,
                 withdrawal: TransferRef::AlpacaId(withdrawal_id),
@@ -19677,6 +19923,7 @@ mod tests {
         cqrs.send(
             &id,
             UsdcRebalanceCommand::InitiateConversion {
+                corridor: UsdcCorridor::BASE_CCTP,
                 direction: RebalanceDirection::AlpacaToBase,
                 amount,
                 order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
@@ -19695,6 +19942,7 @@ mod tests {
         cqrs.send(
             &id,
             UsdcRebalanceCommand::Initiate {
+                corridor: UsdcCorridor::BASE_CCTP,
                 direction: RebalanceDirection::AlpacaToBase,
                 amount,
                 withdrawal: TransferRef::AlpacaId(withdrawal_id),
@@ -19746,6 +19994,7 @@ mod tests {
         cqrs.send(
             &id,
             UsdcRebalanceCommand::InitiateConversion {
+                corridor: UsdcCorridor::BASE_CCTP,
                 direction: RebalanceDirection::AlpacaToBase,
                 amount,
                 order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
@@ -19764,6 +20013,7 @@ mod tests {
         cqrs.send(
             &id,
             UsdcRebalanceCommand::Initiate {
+                corridor: UsdcCorridor::BASE_CCTP,
                 direction: RebalanceDirection::AlpacaToBase,
                 amount,
                 withdrawal: TransferRef::AlpacaId(withdrawal_id),
@@ -19825,6 +20075,7 @@ mod tests {
         cqrs.send(
             &id,
             UsdcRebalanceCommand::InitiateConversion {
+                corridor: UsdcCorridor::BASE_CCTP,
                 direction: RebalanceDirection::AlpacaToBase,
                 amount,
                 order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
@@ -19843,6 +20094,7 @@ mod tests {
         cqrs.send(
             &id,
             UsdcRebalanceCommand::Initiate {
+                corridor: UsdcCorridor::BASE_CCTP,
                 direction: RebalanceDirection::AlpacaToBase,
                 amount,
                 withdrawal: TransferRef::AlpacaId(withdrawal_id),
@@ -19913,6 +20165,7 @@ mod tests {
         cqrs.send(
             &id,
             UsdcRebalanceCommand::InitiateConversion {
+                corridor: UsdcCorridor::BASE_CCTP,
                 direction: RebalanceDirection::AlpacaToBase,
                 amount,
                 order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
@@ -19931,6 +20184,7 @@ mod tests {
         cqrs.send(
             &id,
             UsdcRebalanceCommand::Initiate {
+                corridor: UsdcCorridor::BASE_CCTP,
                 direction: RebalanceDirection::AlpacaToBase,
                 amount,
                 withdrawal: TransferRef::AlpacaId(withdrawal_id),
@@ -20006,6 +20260,7 @@ mod tests {
         cqrs.send(
             &id,
             UsdcRebalanceCommand::InitiateConversion {
+                corridor: UsdcCorridor::BASE_CCTP,
                 direction: RebalanceDirection::AlpacaToBase,
                 amount,
                 order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
@@ -20024,6 +20279,7 @@ mod tests {
         cqrs.send(
             &id,
             UsdcRebalanceCommand::Initiate {
+                corridor: UsdcCorridor::BASE_CCTP,
                 direction: RebalanceDirection::AlpacaToBase,
                 amount,
                 withdrawal: TransferRef::AlpacaId(withdrawal_id),
@@ -20108,6 +20364,7 @@ mod tests {
         cqrs.send(
             &id,
             UsdcRebalanceCommand::InitiateConversion {
+                corridor: UsdcCorridor::BASE_CCTP,
                 direction: RebalanceDirection::AlpacaToBase,
                 amount,
                 order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
@@ -20126,6 +20383,7 @@ mod tests {
         cqrs.send(
             &id,
             UsdcRebalanceCommand::Initiate {
+                corridor: UsdcCorridor::BASE_CCTP,
                 direction: RebalanceDirection::AlpacaToBase,
                 amount,
                 withdrawal: TransferRef::AlpacaId(withdrawal_id),
@@ -20208,6 +20466,7 @@ mod tests {
         cqrs.send(
             &id,
             UsdcRebalanceCommand::InitiateConversion {
+                corridor: UsdcCorridor::BASE_CCTP,
                 direction: RebalanceDirection::AlpacaToBase,
                 amount,
                 order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
@@ -20226,6 +20485,7 @@ mod tests {
         cqrs.send(
             &id,
             UsdcRebalanceCommand::Initiate {
+                corridor: UsdcCorridor::BASE_CCTP,
                 direction: RebalanceDirection::AlpacaToBase,
                 amount,
                 withdrawal: TransferRef::AlpacaId(withdrawal_id),
@@ -20304,6 +20564,7 @@ mod tests {
         cqrs.send(
             &id,
             UsdcRebalanceCommand::InitiateConversion {
+                corridor: UsdcCorridor::BASE_CCTP,
                 direction: RebalanceDirection::AlpacaToBase,
                 amount,
                 order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
@@ -20322,6 +20583,7 @@ mod tests {
         cqrs.send(
             &id,
             UsdcRebalanceCommand::Initiate {
+                corridor: UsdcCorridor::BASE_CCTP,
                 direction: RebalanceDirection::AlpacaToBase,
                 amount,
                 withdrawal: TransferRef::AlpacaId(withdrawal_id),
@@ -20390,6 +20652,7 @@ mod tests {
         cqrs.send(
             &id,
             UsdcRebalanceCommand::InitiateConversion {
+                corridor: UsdcCorridor::BASE_CCTP,
                 direction: RebalanceDirection::AlpacaToBase,
                 amount,
                 order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
@@ -20408,6 +20671,7 @@ mod tests {
         cqrs.send(
             &id,
             UsdcRebalanceCommand::Initiate {
+                corridor: UsdcCorridor::BASE_CCTP,
                 direction: RebalanceDirection::AlpacaToBase,
                 amount,
                 withdrawal: TransferRef::AlpacaId(withdrawal_id),
@@ -20523,6 +20787,7 @@ mod tests {
         cqrs.send(
             &id,
             UsdcRebalanceCommand::InitiateConversion {
+                corridor: UsdcCorridor::BASE_CCTP,
                 direction: RebalanceDirection::AlpacaToBase,
                 amount,
                 order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
@@ -20541,6 +20806,7 @@ mod tests {
         cqrs.send(
             &id,
             UsdcRebalanceCommand::Initiate {
+                corridor: UsdcCorridor::BASE_CCTP,
                 direction: RebalanceDirection::AlpacaToBase,
                 amount,
                 withdrawal: TransferRef::AlpacaId(withdrawal_id),
@@ -20797,6 +21063,7 @@ mod tests {
         cqrs.send(
             id,
             UsdcRebalanceCommand::Initiate {
+                corridor: UsdcCorridor::BASE_CCTP,
                 direction: RebalanceDirection::BaseToAlpaca,
                 amount,
                 withdrawal: TransferRef::OnchainTx(burn_tx),
@@ -21151,6 +21418,7 @@ mod tests {
         cqrs.send(
             &id,
             InitiateConversion {
+                corridor: UsdcCorridor::BASE_CCTP,
                 direction: RebalanceDirection::AlpacaToBase,
                 amount,
                 order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
@@ -21169,6 +21437,7 @@ mod tests {
         cqrs.send(
             &id,
             Initiate {
+                corridor: UsdcCorridor::BASE_CCTP,
                 direction: RebalanceDirection::AlpacaToBase,
                 amount,
                 withdrawal: TransferRef::AlpacaId(AlpacaTransferId::from(Uuid::new_v4())),
@@ -21384,7 +21653,11 @@ mod tests {
             Arc::clone(&cctp_bridge),
             Arc::new(vault_service),
             cqrs.clone(),
-            MarketMakingUsdcEndpoints::new(chains.bot_address, TEST_VAULT_ID),
+            MarketMakingUsdcEndpoints::new(
+                UsdcCorridor::BASE_CCTP,
+                chains.bot_address,
+                TEST_VAULT_ID,
+            ),
             &test_settlement_params(),
             BotGasReceiptCostEnqueuer::Disabled,
         );
@@ -21803,7 +22076,7 @@ mod tests {
             Arc::clone(&mock_bridge),
             Arc::new(vault_service),
             cqrs.clone(),
-            MarketMakingUsdcEndpoints::new(recipient, TEST_VAULT_ID),
+            MarketMakingUsdcEndpoints::new(UsdcCorridor::BASE_CCTP, recipient, TEST_VAULT_ID),
             &test_settlement_params(),
             BotGasReceiptCostEnqueuer::Disabled,
         );
@@ -21883,6 +22156,7 @@ mod tests {
             Arc::new(vault_service),
             cqrs.clone(),
             MarketMakingUsdcEndpoints::new(
+                UsdcCorridor::BASE_CCTP,
                 address!("0x2222222222222222222222222222222222222222"),
                 TEST_VAULT_ID,
             ),
@@ -21967,6 +22241,7 @@ mod tests {
             Arc::new(vault_service),
             cqrs.clone(),
             MarketMakingUsdcEndpoints::new(
+                UsdcCorridor::BASE_CCTP,
                 address!("0x2222222222222222222222222222222222222222"),
                 TEST_VAULT_ID,
             ),
@@ -22049,6 +22324,7 @@ mod tests {
         cqrs.send(
             &id,
             UsdcRebalanceCommand::Initiate {
+                corridor: UsdcCorridor::BASE_CCTP,
                 direction: RebalanceDirection::BaseToAlpaca,
                 amount,
                 withdrawal: TransferRef::OnchainTx(burn_tx),
@@ -22087,6 +22363,7 @@ mod tests {
             Arc::new(vault_service),
             cqrs.clone(),
             MarketMakingUsdcEndpoints::new(
+                UsdcCorridor::BASE_CCTP,
                 address!("0x2222222222222222222222222222222222222222"),
                 TEST_VAULT_ID,
             ),
@@ -22168,6 +22445,7 @@ mod tests {
         cqrs.send(
             &id,
             UsdcRebalanceCommand::Initiate {
+                corridor: UsdcCorridor::BASE_CCTP,
                 direction: RebalanceDirection::BaseToAlpaca,
                 amount,
                 withdrawal: TransferRef::OnchainTx(burn_tx),
@@ -22205,6 +22483,7 @@ mod tests {
             Arc::new(vault_service),
             cqrs.clone(),
             MarketMakingUsdcEndpoints::new(
+                UsdcCorridor::BASE_CCTP,
                 address!("0x2222222222222222222222222222222222222222"),
                 TEST_VAULT_ID,
             ),
@@ -22415,6 +22694,7 @@ mod tests {
             Arc::new(vault_service),
             cqrs.clone(),
             MarketMakingUsdcEndpoints::new(
+                UsdcCorridor::BASE_CCTP,
                 address!("0x2222222222222222222222222222222222222222"),
                 TEST_VAULT_ID,
             ),
@@ -23081,7 +23361,7 @@ mod tests {
             Arc::new(bridge),
             Arc::new(vault_service),
             cqrs,
-            MarketMakingUsdcEndpoints::new(recipient, TEST_VAULT_ID),
+            MarketMakingUsdcEndpoints::new(UsdcCorridor::BASE_CCTP, recipient, TEST_VAULT_ID),
             &test_settlement_params(),
             BotGasReceiptCostEnqueuer::Enabled(queue),
         );
@@ -23284,6 +23564,7 @@ mod tests {
         cqrs.send(
             &id,
             UsdcRebalanceCommand::BeginWithdrawal {
+                corridor: UsdcCorridor::BASE_CCTP,
                 direction: RebalanceDirection::BaseToAlpaca,
                 amount,
                 from_block: 0,
@@ -23325,6 +23606,7 @@ mod tests {
         cqrs.send(
             &id,
             UsdcRebalanceCommand::BeginWithdrawal {
+                corridor: UsdcCorridor::BASE_CCTP,
                 direction: RebalanceDirection::BaseToAlpaca,
                 amount,
                 from_block: 0,
@@ -23375,6 +23657,7 @@ mod tests {
         cqrs.send(
             &id,
             UsdcRebalanceCommand::BeginWithdrawal {
+                corridor: UsdcCorridor::BASE_CCTP,
                 direction: RebalanceDirection::BaseToAlpaca,
                 amount: requested,
                 from_block: 0,
@@ -23446,6 +23729,7 @@ mod tests {
         cqrs.send(
             &id,
             UsdcRebalanceCommand::BeginWithdrawal {
+                corridor: UsdcCorridor::BASE_CCTP,
                 direction: RebalanceDirection::BaseToAlpaca,
                 amount: requested,
                 from_block: 0,
@@ -23639,7 +23923,11 @@ mod tests {
             Arc::clone(&cctp_bridge),
             Arc::new(vault_service),
             cqrs.clone(),
-            MarketMakingUsdcEndpoints::new(chains.bot_address, TEST_VAULT_ID),
+            MarketMakingUsdcEndpoints::new(
+                UsdcCorridor::BASE_CCTP,
+                chains.bot_address,
+                TEST_VAULT_ID,
+            ),
             &test_settlement_params(),
             BotGasReceiptCostEnqueuer::Disabled,
         );
@@ -24016,7 +24304,11 @@ mod tests {
             Arc::clone(&cctp_bridge),
             Arc::new(vault_service),
             cqrs.clone(),
-            MarketMakingUsdcEndpoints::new(chains.bot_address, TEST_VAULT_ID),
+            MarketMakingUsdcEndpoints::new(
+                UsdcCorridor::BASE_CCTP,
+                chains.bot_address,
+                TEST_VAULT_ID,
+            ),
             &test_settlement_params(),
             BotGasReceiptCostEnqueuer::Disabled,
         );
@@ -24156,7 +24448,11 @@ mod tests {
             Arc::clone(&cctp_bridge),
             Arc::new(vault_service),
             cqrs.clone(),
-            MarketMakingUsdcEndpoints::new(chains.bot_address, TEST_VAULT_ID),
+            MarketMakingUsdcEndpoints::new(
+                UsdcCorridor::BASE_CCTP,
+                chains.bot_address,
+                TEST_VAULT_ID,
+            ),
             &test_settlement_params(),
             BotGasReceiptCostEnqueuer::Disabled,
         );
@@ -24383,7 +24679,11 @@ mod tests {
             Arc::clone(&cctp_bridge),
             Arc::new(vault_service),
             cqrs.clone(),
-            MarketMakingUsdcEndpoints::new(chains.bot_address, TEST_VAULT_ID),
+            MarketMakingUsdcEndpoints::new(
+                UsdcCorridor::BASE_CCTP,
+                chains.bot_address,
+                TEST_VAULT_ID,
+            ),
             &test_settlement_params(),
             BotGasReceiptCostEnqueuer::Disabled,
         );
@@ -24467,7 +24767,11 @@ mod tests {
             Arc::new(cctp_bridge),
             Arc::new(vault_service),
             cqrs.clone(),
-            MarketMakingUsdcEndpoints::new(market_maker_wallet, TEST_VAULT_ID),
+            MarketMakingUsdcEndpoints::new(
+                UsdcCorridor::BASE_CCTP,
+                market_maker_wallet,
+                TEST_VAULT_ID,
+            ),
             &test_settlement_params(),
             BotGasReceiptCostEnqueuer::Disabled,
         );
@@ -24572,7 +24876,11 @@ mod tests {
             Arc::clone(&cctp_bridge),
             Arc::new(vault_service),
             cqrs.clone(),
-            MarketMakingUsdcEndpoints::new(chains.bot_address, TEST_VAULT_ID),
+            MarketMakingUsdcEndpoints::new(
+                UsdcCorridor::BASE_CCTP,
+                chains.bot_address,
+                TEST_VAULT_ID,
+            ),
             &test_settlement_params(),
             BotGasReceiptCostEnqueuer::Disabled,
         );
@@ -24674,7 +24982,11 @@ mod tests {
             Arc::new(cctp_bridge),
             Arc::new(vault_service),
             cqrs.clone(),
-            MarketMakingUsdcEndpoints::new(market_maker_wallet, TEST_VAULT_ID),
+            MarketMakingUsdcEndpoints::new(
+                UsdcCorridor::BASE_CCTP,
+                market_maker_wallet,
+                TEST_VAULT_ID,
+            ),
             &test_settlement_params(),
             BotGasReceiptCostEnqueuer::Disabled,
         );
@@ -24731,7 +25043,11 @@ mod tests {
             Arc::new(cctp_bridge),
             Arc::new(vault_service),
             cqrs.clone(),
-            MarketMakingUsdcEndpoints::new(market_maker_wallet, TEST_VAULT_ID),
+            MarketMakingUsdcEndpoints::new(
+                UsdcCorridor::BASE_CCTP,
+                market_maker_wallet,
+                TEST_VAULT_ID,
+            ),
             &test_settlement_params(),
             BotGasReceiptCostEnqueuer::Disabled,
         );
@@ -24849,7 +25165,11 @@ mod tests {
             Arc::clone(&cctp_bridge),
             Arc::new(vault_service),
             cqrs.clone(),
-            MarketMakingUsdcEndpoints::new(chains.bot_address, TEST_VAULT_ID),
+            MarketMakingUsdcEndpoints::new(
+                UsdcCorridor::BASE_CCTP,
+                chains.bot_address,
+                TEST_VAULT_ID,
+            ),
             &test_settlement_params(),
             BotGasReceiptCostEnqueuer::Disabled,
         );
@@ -24977,7 +25297,11 @@ mod tests {
             Arc::clone(&cctp_bridge),
             Arc::new(vault_service),
             cqrs.clone(),
-            MarketMakingUsdcEndpoints::new(chains.bot_address, TEST_VAULT_ID),
+            MarketMakingUsdcEndpoints::new(
+                UsdcCorridor::BASE_CCTP,
+                chains.bot_address,
+                TEST_VAULT_ID,
+            ),
             &test_settlement_params(),
             BotGasReceiptCostEnqueuer::Disabled,
         );
@@ -25117,7 +25441,11 @@ mod tests {
             Arc::clone(&cctp_bridge),
             Arc::new(vault_service),
             cqrs.clone(),
-            MarketMakingUsdcEndpoints::new(chains.bot_address, TEST_VAULT_ID),
+            MarketMakingUsdcEndpoints::new(
+                UsdcCorridor::BASE_CCTP,
+                chains.bot_address,
+                TEST_VAULT_ID,
+            ),
             &test_settlement_params(),
             BotGasReceiptCostEnqueuer::Disabled,
         );
@@ -25206,7 +25534,11 @@ mod tests {
             Arc::new(cctp_bridge),
             Arc::new(vault_service),
             cqrs.clone(),
-            MarketMakingUsdcEndpoints::new(market_maker_wallet, TEST_VAULT_ID),
+            MarketMakingUsdcEndpoints::new(
+                UsdcCorridor::BASE_CCTP,
+                market_maker_wallet,
+                TEST_VAULT_ID,
+            ),
             &test_settlement_params(),
             BotGasReceiptCostEnqueuer::Disabled,
         );
@@ -25338,7 +25670,11 @@ mod tests {
             Arc::clone(&cctp_bridge),
             Arc::new(vault_service),
             cqrs.clone(),
-            MarketMakingUsdcEndpoints::new(chains.bot_address, TEST_VAULT_ID),
+            MarketMakingUsdcEndpoints::new(
+                UsdcCorridor::BASE_CCTP,
+                chains.bot_address,
+                TEST_VAULT_ID,
+            ),
             &test_settlement_params(),
             BotGasReceiptCostEnqueuer::Disabled,
         );
@@ -25444,7 +25780,11 @@ mod tests {
             Arc::new(cctp_bridge),
             Arc::new(vault_service),
             cqrs.clone(),
-            MarketMakingUsdcEndpoints::new(wallet.address(), TEST_VAULT_ID),
+            MarketMakingUsdcEndpoints::new(
+                UsdcCorridor::BASE_CCTP,
+                wallet.address(),
+                TEST_VAULT_ID,
+            ),
             &test_settlement_params(),
             BotGasReceiptCostEnqueuer::Disabled,
         );
@@ -25565,6 +25905,7 @@ mod tests {
         cqrs.send(
             &id,
             UsdcRebalanceCommand::InitiateConversion {
+                corridor: UsdcCorridor::BASE_CCTP,
                 direction: RebalanceDirection::AlpacaToBase,
                 amount,
                 order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
@@ -25583,6 +25924,7 @@ mod tests {
         cqrs.send(
             &id,
             UsdcRebalanceCommand::Initiate {
+                corridor: UsdcCorridor::BASE_CCTP,
                 direction: RebalanceDirection::AlpacaToBase,
                 amount,
                 withdrawal: TransferRef::AlpacaId(withdrawal_id),

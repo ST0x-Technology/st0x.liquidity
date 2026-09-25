@@ -7899,6 +7899,7 @@ mod tests {
     use futures_util::poll;
     use rain_math_float::Float;
     use sqlx::SqlitePool;
+    use st0x_bridge::corridor::UsdcCorridor;
     use st0x_config::{
         ChainCashAsset, ChainEquities, ChainEquityAsset, ExecutionThreshold, OperationMode,
     };
@@ -16811,6 +16812,7 @@ mod tests {
             .send(
                 &id,
                 UsdcRebalanceCommand::InitiateConversion {
+                    corridor: UsdcCorridor::BASE_CCTP,
                     direction: RebalanceDirection::AlpacaToBase,
                     amount: usdc(400),
                     order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
@@ -16885,6 +16887,7 @@ mod tests {
         let id = UsdcRebalanceId(Uuid::new_v4());
         for command in [
             UsdcRebalanceCommand::Initiate {
+                corridor: UsdcCorridor::BASE_CCTP,
                 direction: RebalanceDirection::BaseToAlpaca,
                 amount: usdc(400),
                 withdrawal: TransferRef::OnchainTx(burn_tx),
@@ -16967,6 +16970,7 @@ mod tests {
         let other = UsdcRebalanceId(Uuid::new_v4());
         for command in [
             UsdcRebalanceCommand::Initiate {
+                corridor: UsdcCorridor::BASE_CCTP,
                 direction: RebalanceDirection::BaseToAlpaca,
                 amount: usdc(400),
                 withdrawal: TransferRef::OnchainTx(burn_tx),
@@ -17078,6 +17082,7 @@ mod tests {
             .send(
                 &id,
                 UsdcRebalanceCommand::Initiate {
+                    corridor: UsdcCorridor::BASE_CCTP,
                     direction: RebalanceDirection::BaseToAlpaca,
                     amount: usdc(400),
                     withdrawal: TransferRef::OnchainTx(fixed_bytes!(
@@ -17849,6 +17854,7 @@ mod tests {
             .send(
                 &id,
                 UsdcRebalanceCommand::Initiate {
+                    corridor: UsdcCorridor::BASE_CCTP,
                     direction: RebalanceDirection::BaseToAlpaca,
                     amount: usdc(400),
                     withdrawal: TransferRef::OnchainTx(burn_tx),
@@ -19205,6 +19211,7 @@ mod tests {
 
     fn make_usdc_initiated(direction: RebalanceDirection, amount: Usdc) -> UsdcRebalanceEvent {
         UsdcRebalanceEvent::Initiated {
+            corridor: UsdcCorridor::BASE_CCTP,
             direction,
             amount,
             withdrawal_ref: TransferRef::OnchainTx(TxHash::random()),
@@ -19217,6 +19224,7 @@ mod tests {
         amount: Usdc,
     ) -> UsdcRebalanceEvent {
         UsdcRebalanceEvent::ConversionInitiated {
+            corridor: UsdcCorridor::BASE_CCTP,
             direction,
             amount,
             order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
@@ -20317,6 +20325,7 @@ mod tests {
             .send(
                 id,
                 UsdcRebalanceCommand::Initiate {
+                    corridor: UsdcCorridor::BASE_CCTP,
                     direction: RebalanceDirection::BaseToAlpaca,
                     amount: usdc(100),
                     withdrawal: TransferRef::OnchainTx(TxHash::default()),
@@ -20341,6 +20350,7 @@ mod tests {
             .send(
                 id,
                 UsdcRebalanceCommand::Initiate {
+                    corridor: UsdcCorridor::BASE_CCTP,
                     direction: RebalanceDirection::BaseToAlpaca,
                     amount: usdc(100),
                     withdrawal: TransferRef::OnchainTx(TxHash::default()),
@@ -24160,6 +24170,7 @@ mod tests {
             .send(
                 &id,
                 UsdcRebalanceCommand::Initiate {
+                    corridor: UsdcCorridor::BASE_CCTP,
                     direction: RebalanceDirection::BaseToAlpaca,
                     amount: usdc(400),
                     withdrawal: TransferRef::OnchainTx(burn_tx),
@@ -24354,6 +24365,7 @@ mod tests {
             .send(
                 &id,
                 UsdcRebalanceCommand::Initiate {
+                    corridor: UsdcCorridor::BASE_CCTP,
                     direction: RebalanceDirection::AlpacaToBase,
                     amount: usdc(400),
                     withdrawal: TransferRef::OnchainTx(burn_tx),
@@ -24692,6 +24704,7 @@ mod tests {
             .send(
                 &id,
                 UsdcRebalanceCommand::Initiate {
+                    corridor: UsdcCorridor::BASE_CCTP,
                     direction: RebalanceDirection::BaseToAlpaca,
                     amount: usdc(400),
                     withdrawal: TransferRef::OnchainTx(burn_tx),
@@ -24753,6 +24766,7 @@ mod tests {
             .send(
                 &id,
                 UsdcRebalanceCommand::Initiate {
+                    corridor: UsdcCorridor::BASE_CCTP,
                     direction: RebalanceDirection::BaseToAlpaca,
                     amount: usdc(400),
                     withdrawal: TransferRef::OnchainTx(burn_tx),
@@ -24803,6 +24817,7 @@ mod tests {
             .send(
                 id,
                 UsdcRebalanceCommand::Initiate {
+                    corridor: UsdcCorridor::BASE_CCTP,
                     direction: RebalanceDirection::BaseToAlpaca,
                     amount,
                     withdrawal: TransferRef::OnchainTx(burn_tx),
@@ -24845,6 +24860,7 @@ mod tests {
             .send(
                 id,
                 UsdcRebalanceCommand::BeginWithdrawal {
+                    corridor: UsdcCorridor::BASE_CCTP,
                     direction: RebalanceDirection::BaseToAlpaca,
                     amount,
                     from_block: 10,
@@ -24866,6 +24882,7 @@ mod tests {
             .send(
                 id,
                 UsdcRebalanceCommand::InitiateConversion {
+                    corridor: UsdcCorridor::BASE_CCTP,
                     direction: RebalanceDirection::AlpacaToBase,
                     amount,
                     order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
@@ -24886,6 +24903,7 @@ mod tests {
             .send(
                 id,
                 UsdcRebalanceCommand::BeginWithdrawal {
+                    corridor: UsdcCorridor::BASE_CCTP,
                     direction: RebalanceDirection::AlpacaToBase,
                     amount,
                     from_block: 10,
@@ -24911,6 +24929,7 @@ mod tests {
             .send(
                 id,
                 UsdcRebalanceCommand::InitiateConversion {
+                    corridor: UsdcCorridor::BASE_CCTP,
                     direction: RebalanceDirection::AlpacaToBase,
                     amount,
                     order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
@@ -24931,6 +24950,7 @@ mod tests {
             .send(
                 id,
                 UsdcRebalanceCommand::Initiate {
+                    corridor: UsdcCorridor::BASE_CCTP,
                     direction: RebalanceDirection::AlpacaToBase,
                     amount,
                     withdrawal: TransferRef::AlpacaId(transfer_id),
@@ -25408,6 +25428,7 @@ mod tests {
             .send(
                 id,
                 UsdcRebalanceCommand::InitiateConversion {
+                    corridor: UsdcCorridor::BASE_CCTP,
                     direction: RebalanceDirection::AlpacaToBase,
                     amount,
                     order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
@@ -25428,6 +25449,7 @@ mod tests {
             .send(
                 id,
                 UsdcRebalanceCommand::BeginWithdrawal {
+                    corridor: UsdcCorridor::BASE_CCTP,
                     direction: RebalanceDirection::AlpacaToBase,
                     amount,
                     from_block: 10,
@@ -25439,6 +25461,7 @@ mod tests {
             .send(
                 id,
                 UsdcRebalanceCommand::Initiate {
+                    corridor: UsdcCorridor::BASE_CCTP,
                     direction: RebalanceDirection::AlpacaToBase,
                     amount,
                     withdrawal: TransferRef::OnchainTx(withdrawal_tx),
@@ -25897,6 +25920,7 @@ mod tests {
             .send(
                 id,
                 UsdcRebalanceCommand::Initiate {
+                    corridor: UsdcCorridor::BASE_CCTP,
                     direction,
                     amount,
                     withdrawal: TransferRef::OnchainTx(burn_tx),
@@ -25947,6 +25971,7 @@ mod tests {
             .send(
                 id,
                 UsdcRebalanceCommand::Initiate {
+                    corridor: UsdcCorridor::BASE_CCTP,
                     direction,
                     amount,
                     withdrawal: TransferRef::OnchainTx(burn_tx),
@@ -26023,6 +26048,7 @@ mod tests {
             .send(
                 id,
                 UsdcRebalanceCommand::Initiate {
+                    corridor: UsdcCorridor::BASE_CCTP,
                     direction,
                     amount,
                     withdrawal: TransferRef::OnchainTx(burn_tx),
@@ -26502,6 +26528,7 @@ mod tests {
             .send(
                 &id,
                 UsdcRebalanceCommand::Initiate {
+                    corridor: UsdcCorridor::BASE_CCTP,
                     direction: RebalanceDirection::BaseToAlpaca,
                     amount: usdc(400),
                     withdrawal: TransferRef::OnchainTx(withdrawal),
@@ -26652,6 +26679,7 @@ mod tests {
             .receive::<UsdcRebalance>(
                 id.clone(),
                 UsdcRebalanceEvent::ConversionInitiated {
+                    corridor: UsdcCorridor::BASE_CCTP,
                     direction: RebalanceDirection::BaseToAlpaca,
                     amount: usdc(400),
                     order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
@@ -26709,6 +26737,7 @@ mod tests {
             .receive::<UsdcRebalance>(
                 id.clone(),
                 UsdcRebalanceEvent::ConversionInitiated {
+                    corridor: UsdcCorridor::BASE_CCTP,
                     direction: RebalanceDirection::AlpacaToBase,
                     amount: usdc(400),
                     order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
@@ -26778,6 +26807,7 @@ mod tests {
             .send(
                 &id,
                 UsdcRebalanceCommand::InitiateConversion {
+                    corridor: UsdcCorridor::BASE_CCTP,
                     direction: RebalanceDirection::AlpacaToBase,
                     amount: usdc(400),
                     order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
@@ -26846,6 +26876,7 @@ mod tests {
         // and deposit all completed; the USDC->USD conversion failed last.
         for command in [
             UsdcRebalanceCommand::Initiate {
+                corridor: UsdcCorridor::BASE_CCTP,
                 direction: RebalanceDirection::BaseToAlpaca,
                 amount: usdc(400),
                 withdrawal: TransferRef::OnchainTx(burn_tx),
@@ -27268,6 +27299,7 @@ mod tests {
             .send(
                 &id,
                 UsdcRebalanceCommand::Initiate {
+                    corridor: UsdcCorridor::BASE_CCTP,
                     direction: RebalanceDirection::BaseToAlpaca,
                     amount: Usdc::new(float!(500)),
                     withdrawal: TransferRef::OnchainTx(tx_hash),
@@ -27361,6 +27393,7 @@ mod tests {
             .send(
                 &id,
                 UsdcRebalanceCommand::Initiate {
+                    corridor: UsdcCorridor::BASE_CCTP,
                     direction: RebalanceDirection::AlpacaToBase,
                     amount: Usdc::new(float!(1000)),
                     withdrawal: TransferRef::AlpacaId(transfer_id),
@@ -27450,6 +27483,7 @@ mod tests {
             .send(
                 &id,
                 UsdcRebalanceCommand::Initiate {
+                    corridor: UsdcCorridor::BASE_CCTP,
                     direction: RebalanceDirection::AlpacaToBase,
                     amount: Usdc::new(float!(100)),
                     withdrawal: TransferRef::AlpacaId(transfer_id),
@@ -27493,6 +27527,7 @@ mod tests {
             .send(
                 &id,
                 UsdcRebalanceCommand::Initiate {
+                    corridor: UsdcCorridor::BASE_CCTP,
                     direction: RebalanceDirection::AlpacaToBase,
                     amount: Usdc::new(float!(100)),
                     withdrawal: TransferRef::AlpacaId(transfer_id),
@@ -27551,6 +27586,7 @@ mod tests {
             .send(
                 &id,
                 UsdcRebalanceCommand::InitiateConversion {
+                    corridor: UsdcCorridor::BASE_CCTP,
                     direction: RebalanceDirection::AlpacaToBase,
                     amount: Usdc::new(float!(100)),
                     order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
@@ -27625,6 +27661,7 @@ mod tests {
             .receive::<UsdcRebalance>(
                 id.clone(),
                 UsdcRebalanceEvent::Initiated {
+                    corridor: UsdcCorridor::BASE_CCTP,
                     direction: RebalanceDirection::AlpacaToBase,
                     amount: Usdc::new(float!(1000)),
                     withdrawal_ref: TransferRef::OnchainTx(tx_hash),
@@ -27678,6 +27715,7 @@ mod tests {
             .send(
                 &id,
                 UsdcRebalanceCommand::Initiate {
+                    corridor: UsdcCorridor::BASE_CCTP,
                     direction: RebalanceDirection::BaseToAlpaca,
                     amount: Usdc::new(float!(500)),
                     withdrawal: TransferRef::OnchainTx(tx_hash),
@@ -30105,6 +30143,7 @@ mod tests {
             .on_usdc_rebalance(
                 id.clone(),
                 UsdcRebalanceEvent::ConversionInitiated {
+                    corridor: UsdcCorridor::BASE_CCTP,
                     direction: RebalanceDirection::BaseToAlpaca,
                     amount: usdc(700),
                     order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
@@ -30195,6 +30234,7 @@ mod tests {
                 .on_usdc_rebalance(
                     task_id,
                     UsdcRebalanceEvent::ConversionInitiated {
+                        corridor: UsdcCorridor::BASE_CCTP,
                         direction: RebalanceDirection::BaseToAlpaca,
                         amount: usdc(700),
                         order_id: ClientOrderId::from_uuid(Uuid::new_v4()),

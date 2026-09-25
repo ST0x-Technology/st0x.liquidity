@@ -2964,6 +2964,7 @@ mod tests {
     use uuid::uuid;
 
     use st0x_bridge::cctp::CctpError;
+    use st0x_bridge::corridor::UsdcCorridor;
     use st0x_config::{
         BrokerCtx, Ctx, ExecutionThreshold, FileLogging, HedgedChain, LogLevel, RestApiCtx,
         create_test_ctx_with_order_owner,
@@ -5106,6 +5107,7 @@ mod tests {
             .receive::<UsdcRebalance>(
                 operation_id,
                 UsdcRebalanceEvent::WithdrawalSubmitting {
+                    corridor: UsdcCorridor::BASE_CCTP,
                     direction: RebalanceDirection::BaseToAlpaca,
                     amount: st0x_finance::Usdc::new(float!(500)),
                     from_block: 1,
@@ -6376,6 +6378,7 @@ mod tests {
             .send(
                 id,
                 UsdcRebalanceCommand::BeginWithdrawal {
+                    corridor: UsdcCorridor::BASE_CCTP,
                     direction: RebalanceDirection::BaseToAlpaca,
                     amount,
                     from_block: 1,
@@ -6387,6 +6390,7 @@ mod tests {
             .send(
                 id,
                 UsdcRebalanceCommand::Initiate {
+                    corridor: UsdcCorridor::BASE_CCTP,
                     direction: RebalanceDirection::BaseToAlpaca,
                     amount,
                     withdrawal: TransferRef::OnchainTx(TxHash::repeat_byte(0x22)),
@@ -6481,6 +6485,7 @@ mod tests {
             .send(
                 id,
                 UsdcRebalanceCommand::BeginWithdrawal {
+                    corridor: UsdcCorridor::BASE_CCTP,
                     direction: RebalanceDirection::BaseToAlpaca,
                     amount,
                     from_block: 1,
@@ -6492,6 +6497,7 @@ mod tests {
             .send(
                 id,
                 UsdcRebalanceCommand::Initiate {
+                    corridor: UsdcCorridor::BASE_CCTP,
                     direction: RebalanceDirection::BaseToAlpaca,
                     amount,
                     withdrawal: TransferRef::OnchainTx(TxHash::repeat_byte(0x22)),

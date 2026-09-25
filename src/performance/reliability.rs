@@ -711,6 +711,7 @@ mod tests {
     use serde_json::json;
     use uuid::Uuid;
 
+    use st0x_bridge::corridor::UsdcCorridor;
     use st0x_event_sorcery::{DomainEvent, ReactorHarness, RetryOnBusy, test_store};
     use st0x_execution::Symbol;
     use st0x_finance::Usdc;
@@ -855,6 +856,7 @@ mod tests {
             .send(
                 &id,
                 UsdcRebalanceCommand::Initiate {
+                    corridor: UsdcCorridor::BASE_CCTP,
                     direction: RebalanceDirection::BaseToAlpaca,
                     amount: Usdc::new(float!(400)),
                     withdrawal: TransferRef::OnchainTx(TxHash::repeat_byte(1)),

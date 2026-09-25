@@ -985,7 +985,11 @@ async fn run_usdc_transfer<Writer: Write>(
         bridge,
         vault_service,
         usdc_store,
-        MarketMakingUsdcEndpoints::new(owner, RaindexVaultId(usdc_vault_id)),
+        MarketMakingUsdcEndpoints::new(
+            ctx.rebalancing.cctp_corridor.usdc_corridor(),
+            owner,
+            RaindexVaultId(usdc_vault_id),
+        ),
         &UsdcSettlementParams {
             attestation_retry_deadline: rebalancing_ctx.attestation_retry_deadline,
             settlement_retry_deadline: rebalancing_ctx.settlement_retry_deadline,
@@ -2175,6 +2179,7 @@ mod tests {
     use uuid::uuid;
 
     use st0x_bridge::cctp::CctpError;
+    use st0x_bridge::corridor::UsdcCorridor;
     use st0x_config::AlertsCtx;
     use st0x_config::ChainRegistry;
     use st0x_config::CtxError;
@@ -3187,6 +3192,7 @@ mod tests {
             .send(
                 &UsdcRebalanceId(id),
                 UsdcRebalanceCommand::Initiate {
+                    corridor: UsdcCorridor::BASE_CCTP,
                     direction: RebalanceDirection::BaseToAlpaca,
                     amount: Usdc::new(Float::parse("100".to_string()).unwrap()),
                     withdrawal: TransferRef::OnchainTx(b256!(
@@ -3249,6 +3255,7 @@ mod tests {
         let amount = Usdc::new(Float::parse("100".to_string()).unwrap());
         for command in [
             UsdcRebalanceCommand::InitiateConversion {
+                corridor: UsdcCorridor::BASE_CCTP,
                 direction: RebalanceDirection::AlpacaToBase,
                 amount,
                 order_id: ClientOrderId::from_uuid(Uuid::from_u128(0xB0B1)),
@@ -3257,6 +3264,7 @@ mod tests {
                 conversion: ConversionAmounts::new(amount, amount),
             },
             UsdcRebalanceCommand::Initiate {
+                corridor: UsdcCorridor::BASE_CCTP,
                 direction: RebalanceDirection::AlpacaToBase,
                 amount,
                 withdrawal: TransferRef::OnchainTx(b256!(
@@ -4265,6 +4273,7 @@ mod tests {
             .send(
                 &usdc_id,
                 UsdcRebalanceCommand::Initiate {
+                    corridor: UsdcCorridor::BASE_CCTP,
                     direction: RebalanceDirection::BaseToAlpaca,
                     amount,
                     withdrawal: TransferRef::OnchainTx(b256!(
@@ -4451,6 +4460,7 @@ mod tests {
             .send(
                 &UsdcRebalanceId(id),
                 UsdcRebalanceCommand::InitiateConversion {
+                    corridor: UsdcCorridor::BASE_CCTP,
                     direction: RebalanceDirection::AlpacaToBase,
                     amount: Usdc::new(Float::parse("100".to_string()).unwrap()),
                     order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
@@ -5197,6 +5207,7 @@ mod tests {
             .send(
                 &UsdcRebalanceId(id),
                 UsdcRebalanceCommand::InitiateConversion {
+                    corridor: UsdcCorridor::BASE_CCTP,
                     direction: RebalanceDirection::AlpacaToBase,
                     amount: Usdc::new(Float::parse("100".to_string()).unwrap()),
                     order_id: ClientOrderId::from_uuid(Uuid::from_u128(0xC01D_0001)),
@@ -5252,6 +5263,7 @@ mod tests {
             .send(
                 &usdc_id,
                 UsdcRebalanceCommand::Initiate {
+                    corridor: UsdcCorridor::BASE_CCTP,
                     direction: RebalanceDirection::BaseToAlpaca,
                     amount: Usdc::new(Float::parse("100".to_string()).unwrap()),
                     withdrawal: TransferRef::OnchainTx(b256!(

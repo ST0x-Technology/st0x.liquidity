@@ -576,6 +576,7 @@ mod tests {
     use tempfile::TempDir;
     use uuid::Uuid;
 
+    use st0x_bridge::corridor::UsdcCorridor;
     use st0x_config::{DeploymentSymbolPolicy, ExecutionThreshold};
     use st0x_dto::Direction;
     use st0x_event_sorcery::StoreBuilder;
@@ -1026,6 +1027,7 @@ mod tests {
             "UsdcRebalanceEvent::ConversionInitiated",
             "2.0",
             serde_json::to_value(&UsdcRebalanceEvent::ConversionInitiated {
+                corridor: UsdcCorridor::BASE_CCTP,
                 direction: RebalanceDirection::BaseToAlpaca,
                 amount: Usdc::new(float!(1082.711862)),
                 order_id: ClientOrderId::from_uuid(Uuid::from_u128(1)),
