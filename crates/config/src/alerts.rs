@@ -1,11 +1,11 @@
 //! Operational alerting configuration: low-gas balance monitoring thresholds
-//! and intervals.
+//! and intervals, and the optional hedge-stall monitor's timings.
 //!
 //! Alerts themselves are emitted as structured ERROR logs (see the binary
 //! crate's `alerts` module); delivery to humans happens downstream, via the
 //! log pipeline (Cloud Logging -> Grafana alert rules). This section therefore
 //! carries no delivery-channel settings and no secrets -- it only gates and
-//! tunes the gas monitor.
+//! tunes the gas monitor and the hedge-stall monitor.
 //!
 //! The plaintext `[alerts]` section is required because its thresholds gate
 //! fresh transfers. A hedged HyperEVM or Robinhood additionally requires its
@@ -62,6 +62,50 @@ pub struct AlertsConfig {
     pub chat_id: Option<i64>,
     /// MIGRATION SHIM, removed next release: see [`AlertsConfig::chat_id`].
     pub message_thread_id: Option<i64>,
+    /// `[alerts.hedge_stall]`. Absent means the hedge-stall monitor does not
+    /// run; present means every field is required.
+    pub hedge_stall: Option<HedgeStallConfig>,
+}
+
+/// `[alerts.hedge_stall]`: how long hedging may make no progress on standing
+/// exposure before the hedge-stall monitor alerts. All values are seconds.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HedgeStallConfig {
+    /// Seconds between hedge-stall evaluations.
+    pub poll_interval: u64,
+    /// Seconds a stall condition must hold without progress before it alerts.
+    pub stall_after: u64,
+    /// Minimum seconds between repeated alerts while a stall persists.
+    pub realert_interval: u64,
+}
+
+/// Validated `[alerts.hedge_stall]` timings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HedgeStallCtx {
+    pub poll_interval: std::time::Duration,
+    pub stall_after: std::time::Duration,
+    pub realert_interval: std::time::Duration,
+}
+
+impl HedgeStallCtx {
+    fn new(config: &HedgeStallConfig) -> Result<Self, AlertsAssemblyError> {
+        for (field, value) in [
+            ("hedge_stall.poll_interval", config.poll_interval),
+            ("hedge_stall.stall_after", config.stall_after),
+            ("hedge_stall.realert_interval", config.realert_interval),
+        ] {
+            if value == 0 {
+                return Err(AlertsAssemblyError::ZeroInterval { field });
+            }
+        }
+
+        Ok(Self {
+            poll_interval: std::time::Duration::from_secs(config.poll_interval),
+            stall_after: std::time::Duration::from_secs(config.stall_after),
+            realert_interval: std::time::Duration::from_secs(config.realert_interval),
+        })
+    }
 }
 
 /// Runtime alerting context assembled from the `[alerts]` config section.
@@ -75,6 +119,7 @@ pub struct AlertsCtx {
     low_balance_thresholds_wei: BTreeMap<Chain, U256>,
     pub poll_interval: std::time::Duration,
     pub realert_interval: std::time::Duration,
+    hedge_stall: Option<HedgeStallCtx>,
 }
 
 impl AlertsCtx {
@@ -83,6 +128,12 @@ impl AlertsCtx {
     /// [`Self::new`] refuses a config that omits one.
     pub fn low_balance_threshold_wei(&self, chain: Chain) -> Option<U256> {
         self.low_balance_thresholds_wei.get(&chain).copied()
+    }
+
+    /// The hedge-stall monitor's timings, or `None` when
+    /// `[alerts.hedge_stall]` is absent and the monitor does not run.
+    pub const fn hedge_stall(&self) -> Option<HedgeStallCtx> {
+        self.hedge_stall
     }
 
     /// An alerts context with the given per-chain thresholds, for tests and
@@ -98,7 +149,17 @@ impl AlertsCtx {
             low_balance_thresholds_wei,
             poll_interval,
             realert_interval,
+            hedge_stall: None,
         }
+    }
+
+    /// This context with the given hedge-stall timings, for tests and
+    /// fixtures.
+    #[cfg(any(test, feature = "test-support"))]
+    #[must_use]
+    pub const fn with_hedge_stall(mut self, hedge_stall: HedgeStallCtx) -> Self {
+        self.hedge_stall = Some(hedge_stall);
+        self
     }
 
     pub fn new(
@@ -125,7 +186,8 @@ impl AlertsCtx {
             }
 
             startup_notices.push(StartupNotice::info(
-                "[alerts] config section absent; the gas monitor will not run",
+                "[alerts] config section absent; the gas monitor and the hedge-stall \
+                 monitor will not run",
             ));
             return Ok(None);
         };
@@ -181,10 +243,21 @@ impl AlertsCtx {
             })
             .collect::<Result<BTreeMap<_, _>, AlertsAssemblyError>>()?;
 
+        let hedge_stall = if let Some(hedge_stall) = &config.hedge_stall {
+            Some(HedgeStallCtx::new(hedge_stall)?)
+        } else {
+            startup_notices.push(StartupNotice::info(
+                "[alerts.hedge_stall] config section absent; the hedge-stall monitor \
+                 will not run",
+            ));
+            None
+        };
+
         Ok(Some(Self {
             low_balance_thresholds_wei,
             poll_interval: std::time::Duration::from_secs(config.poll_interval),
             realert_interval: std::time::Duration::from_secs(config.realert_interval),
+            hedge_stall,
         }))
     }
 }
@@ -264,6 +337,7 @@ mod tests {
     use proptest::prelude::*;
 
     use super::*;
+    use crate::loader::StartupNoticeLevel;
 
     fn secondary_config(
         chain: Chain,
@@ -509,6 +583,7 @@ order_fill_poll_interval_secs = 1
             realert_interval: 3600,
             chat_id: None,
             message_thread_id: None,
+            hedge_stall: None,
         }
     }
 
@@ -607,13 +682,17 @@ order_fill_poll_interval_secs = 1
             Some(U256::from(50_000_000_000_000_000_u64)),
             "the live fields must still load normally alongside the ignored ones"
         );
-        assert_eq!(notices.len(), 1, "exactly one deprecation notice");
+        let warnings: Vec<_> = notices
+            .iter()
+            .filter(|notice| notice.level == StartupNoticeLevel::Warn)
+            .collect();
+        assert_eq!(warnings.len(), 1, "exactly one deprecation notice");
         assert!(
-            notices[0]
+            warnings[0]
                 .message
                 .contains("chat_id/message_thread_id deprecated"),
             "the notice must name exactly the retired fields seen, got: {}",
-            notices[0].message
+            warnings[0].message
         );
     }
 
@@ -629,7 +708,9 @@ order_fill_poll_interval_secs = 1
             "the absent section must be noticed, not silently skipped"
         );
         assert!(
-            notices[0].message.contains("gas monitor will not run"),
+            notices[0]
+                .message
+                .contains("the gas monitor and the hedge-stall monitor will not run"),
             "the notice must say what the absence means, got: {}",
             notices[0].message
         );
@@ -816,5 +897,122 @@ order_fill_poll_interval_secs = 1
             ),
             "expected ZeroInterval for realert_interval, got: {error}"
         );
+    }
+
+    fn with_hedge_stall(
+        poll_interval: u64,
+        stall_after: u64,
+        realert_interval: u64,
+    ) -> AlertsConfig {
+        AlertsConfig {
+            hedge_stall: Some(HedgeStallConfig {
+                poll_interval,
+                stall_after,
+                realert_interval,
+            }),
+            ..valid_config()
+        }
+    }
+
+    #[test]
+    fn absent_hedge_stall_table_disables_the_monitor_with_a_notice() {
+        let mut notices = Vec::new();
+
+        let ctx = AlertsCtx::new(Some(valid_config()), &BTreeMap::new(), &mut notices)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(ctx.hedge_stall(), None);
+        assert!(
+            notices
+                .iter()
+                .any(|notice| notice.message.contains("hedge-stall monitor will not run")),
+            "{notices:?}"
+        );
+    }
+
+    #[test]
+    fn hedge_stall_table_parses_to_durations() {
+        let config = toml::from_str::<AlertsConfig>(
+            r#"
+            poll_interval = 300
+            realert_interval = 3600
+            [low_balance_thresholds]
+            base = "0.05"
+            ethereum = "0.01"
+            [hedge_stall]
+            poll_interval = 60
+            stall_after = 900
+            realert_interval = 1
+            "#,
+        )
+        .unwrap();
+
+        let ctx = AlertsCtx::new(Some(config), &BTreeMap::new(), &mut Vec::new())
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            ctx.hedge_stall(),
+            Some(HedgeStallCtx {
+                poll_interval: std::time::Duration::from_secs(60),
+                stall_after: std::time::Duration::from_secs(900),
+                realert_interval: std::time::Duration::from_secs(1),
+            })
+        );
+    }
+
+    #[test]
+    fn hedge_stall_table_requires_every_field() {
+        let error = toml::from_str::<AlertsConfig>(
+            r#"
+            poll_interval = 300
+            realert_interval = 3600
+            [low_balance_thresholds]
+            base = "0.05"
+            [hedge_stall]
+            poll_interval = 60
+            realert_interval = 1
+            "#,
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("stall_after"), "{error}");
+    }
+
+    #[test]
+    fn hedge_stall_table_rejects_unknown_fields() {
+        let error = toml::from_str::<AlertsConfig>(
+            r#"
+            poll_interval = 300
+            realert_interval = 3600
+            [low_balance_thresholds]
+            base = "0.05"
+            [hedge_stall]
+            poll_interval = 60
+            stall_after = 900
+            realert_interval = 1
+            stall_afer = 900
+            "#,
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("stall_afer"), "{error}");
+    }
+
+    #[test]
+    fn hedge_stall_rejects_zero_intervals() {
+        for (config, expected) in [
+            (with_hedge_stall(0, 900, 1), "hedge_stall.poll_interval"),
+            (with_hedge_stall(60, 0, 1), "hedge_stall.stall_after"),
+            (with_hedge_stall(60, 900, 0), "hedge_stall.realert_interval"),
+        ] {
+            let error =
+                AlertsCtx::new(Some(config), &BTreeMap::new(), &mut Vec::new()).unwrap_err();
+            assert!(
+                matches!(error, AlertsAssemblyError::ZeroInterval { field } if field == expected),
+                "expected ZeroInterval for {expected}, got: {error}"
+            );
+        }
     }
 }

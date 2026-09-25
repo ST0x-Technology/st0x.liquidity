@@ -2,5 +2,6 @@
 
 pub(crate) mod executor_maintenance;
 pub(crate) mod gas;
+pub(crate) mod hedge_stall;
 pub(crate) mod inventory;
 pub(crate) mod order_fills;

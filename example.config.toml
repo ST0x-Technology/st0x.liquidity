@@ -419,3 +419,17 @@ realert_interval = 43200
 base = "0.05"
 ethereum = "0.05"
 robinhood = "0.001"
+
+# Optional hedge-stall monitor. Absent: the monitor does not run. Present:
+# every field is required. Alerts when counter-trading makes no progress on
+# standing exposure during a session that can hedge it, or when the position
+# sweep stops completing. All values are seconds.
+[alerts.hedge_stall]
+# Seconds between hedge-stall evaluations.
+poll_interval = 60
+# Seconds a stall must last before it alerts. At least three
+# position_check_interval_secs intervals, plus
+# [broker] extended_hours_reprice_timeout_secs when that is set.
+stall_after = 900
+# Minimum seconds between repeated alerts while a stall lasts.
+realert_interval = 1

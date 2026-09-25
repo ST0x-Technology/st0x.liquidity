@@ -6780,20 +6780,86 @@ transport-only. Automatic funding from another wallet is not part of this
 behavior; prolonged low balances continue to use the monitor's repeated
 operational alerts.
 
+### Hedge-stall monitoring
+
+The dead-letter and worker-failure alerts cover hedges that fail loudly. The
+hedge-stall monitor covers counter-trading that stops quietly: an idle hedge
+worker, a position sweep that no longer reschedules, or a broker order that
+never completes. It runs only when `[alerts.hedge_stall]` is configured, reads
+the `Position` projection and an in-memory record of the last completed full
+position sweep, and never changes hedging.
+
+**Conditions.** Every `poll_interval` seconds the monitor observes the position
+sweep and each symbol, each with a progress marker. A stall alerts when it has
+been observed on every poll for `stall_after` seconds with an unchanged marker.
+The sweep's marker is its last completion, and it is observed in every session.
+A symbol's marker is its net shares minus onchain fills, which moves only when a
+hedge fills. A symbol is observed while one of these conditions holds, and the
+alert names the one that holds at the time:
+
+| Condition            | Observed when                                                       |
+| -------------------- | ------------------------------------------------------------------- |
+| order not completing | position has a pending offchain order                               |
+| anchored too long    | position ready to hedge but blocked by a failed-order anchor        |
+| exposure not placed  | position ready to hedge, not held by the last sweep, no dead-letter |
+
+One clock covers all three conditions, so a symbol that alternates between them
+(an order rejected and re-placed, a limit order repriced repeatedly) still
+alerts when nothing fills.
+
+"Ready to hedge" is `Position::is_ready_for_execution` with the operational
+limit of the hedged chain that sizes the sweep's hedge; symbols no hedged chain
+enables are ignored. The last sweep holds a symbol on purpose for an active
+equity transfer, a broker preflight skip (hedge floor, buying power, inventory),
+or a reference-price failure that already paged; a transient failure such as a
+broker 5xx or 429 is not a hold. A symbol with a placement dead-letter is left
+to that alert; a residual-after-close alert does not suppress it.
+
+**Quiet guard.** The three per-symbol conditions count only while the market
+session can hedge the symbol (regular hours, or extended hours when enabled for
+it); "exposure not placed" and "anchored too long" also need the trading
+schedule to admit a new order. Outside that, the condition is not observed and
+its clock resets, so a closed market or a flat book never alerts and an alert
+comes no sooner than `stall_after` after the open. If the session read fails,
+the last known session stands until its own close time, then counts as closed.
+"scan not running" applies in every session.
+
+**De-duplication and recovery.** Same as the gas monitor: alert on the
+transition into the stalled state, re-alert at most once per `realert_interval`,
+and log recovery at `info!` (target `hedge`) without notifying. State is in
+memory; after a restart no condition can alert before `stall_after` has passed,
+so a restart during a stall stops the alert lines and Grafana reports it
+resolved until the monitor alerts again.
+
+**Alert text.** The downstream classifier matches on the message, so these
+phrases are a contract:
+
+- `Hedge stalled: scan not running for <minutes>m`
+- `Hedge stalled: exposure not placed for <SYMBOL>, net <n> shares, <minutes>m (session <session>)`
+- `Hedge stalled: order not completing for <SYMBOL>, net <n> shares, <minutes>m (session <session>)`
+- `Hedge stalled: anchored too long for <SYMBOL>, net <n> shares, <minutes>m (session <session>)`
+
+**Config.** `[alerts.hedge_stall]` takes `poll_interval`, `stall_after` and
+`realert_interval` in seconds, all required and non-zero. `stall_after` must be
+at least three `position_check_interval_secs` intervals, plus
+`[broker] extended_hours_reprice_timeout_secs` when that is set, so a late scan
+or a resting extended-hours limit order waiting for its reprice and replacement
+does not alert.
+
 ### Structured log channel
 
 Alerts are emitted as structured ERROR logs: target `operational_alert`, an
 `alert = true` marker field, and the human-readable alert text in the `message`
 field. Delivery to humans happens downstream in the log pipeline (Cloud Logging
--> Grafana alert rules, maintained in t0.devops), so the bot holds no delivery
+-> Grafana alert rules, maintained in t0.grafana), so the bot holds no delivery
 credentials and in-process delivery cannot fail. The non-secret `[alerts]`
-config supplies only the gas-monitor thresholds and intervals; the encrypted
-secrets carry nothing for alerting. (Migration note: the retired Telegram fields
-are accepted and ignored with a deprecation warning for one release, then
-rejected -- `chat_id`/`message_thread_id` in the `[alerts]` config section, and
-a leftover `[alerts]` table (`bot_token`) in the secrets file. Deployed config
-versions still carry the former, deployed secret versions the latter, and the
-previous build required them.)
+config supplies only the gas-monitor and hedge-stall-monitor thresholds and
+intervals; the encrypted secrets carry nothing for alerting. (Migration note:
+the retired Telegram fields are accepted and ignored with a deprecation warning
+for one release, then rejected -- `chat_id`/`message_thread_id` in the
+`[alerts]` config section, and a leftover `[alerts]` table (`bot_token`) in the
+secrets file. Deployed config versions still carry the former, deployed secret
+versions the latter, and the previous build required them.)
 
 ### BaseToAlpaca deposit send
 
