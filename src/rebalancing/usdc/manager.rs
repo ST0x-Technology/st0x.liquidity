@@ -15746,6 +15746,59 @@ mod tests {
         );
     }
 
+    /// A same-amount send that another transfer persisted is that transfer's
+    /// send, not an unrecorded one of this transfer, so resume still sends.
+    #[tokio::test]
+    async fn resume_base_to_alpaca_from_bridged_sends_past_another_transfers_deposit_send() {
+        let chain = deploy_ethereum_usdc_chain().await;
+        let server = MockServer::start();
+        let _address_mock = mock_alpaca_deposit_address(&server);
+        let pool = SqlitePool::connect(":memory:").await.unwrap();
+        sqlx::migrate!().run(&pool).await.unwrap();
+        let cqrs = Arc::new(test_store(pool.clone(), ()));
+        let manager = build_deposit_manager(
+            &chain,
+            &server,
+            Arc::new(create_short_poll_wallet_service(&server)),
+            cqrs.clone(),
+        )
+        .await
+        .with_credit_ledger(pool);
+
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let amount = usdc("100");
+        let amount_received = usdc("99.99");
+        let amount_u256 = usdc_to_u256(amount_received).unwrap();
+        stage_bridged_with_mint_tx(&cqrs, &id, amount, amount_received, chain.mint_tx).await;
+
+        let other = UsdcRebalanceId(Uuid::new_v4());
+        stage_bridged_with_mint_tx(&cqrs, &other, amount, amount_received, chain.mint_tx).await;
+        let bridge_wallet = create_test_wallet(&chain.endpoint, &chain.bot_key);
+        let other_send = sign_usdc_to_alpaca(&bridge_wallet, amount_u256).await;
+        broadcast_signed(&bridge_wallet, &other_send).await;
+        let other_send_tx = other_send.tx_hash();
+        record_signed_deposit_send(&cqrs, &other, other_send).await;
+
+        // No deposit transfer is mocked, so the leg sends, then fails at the
+        // Alpaca poll.
+        let error = manager
+            .resume_base_to_alpaca(&id, amount)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, UsdcTransferError::AlpacaWallet(_)),
+            "another transfer's send must not fail this deposit, got: {error:?}",
+        );
+
+        assert_eq!(
+            usdc_balance_of(&chain, ALPACA_DEPOSIT_ADDRESS).await,
+            amount_u256 * U256::from(2),
+            "this transfer sends its own USDC after the other transfer's send",
+        );
+        let state = cqrs.load(&id).await.unwrap().expect("aggregate exists");
+        assert_ne!(deposit_ref_tx(&state), other_send_tx);
+    }
+
     /// Mocks Alpaca's transfer list with one completed incoming deposit for
     /// `send_tx`, plus the USDC->USD conversion that follows its recovery.
     fn mock_completed_alpaca_deposit(server: &MockServer, from: Address, send_tx: TxHash) {
