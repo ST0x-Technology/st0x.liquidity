@@ -103,11 +103,14 @@ with a `PreparedTransaction`, RAI-2485):
 1. The bot signs the transfer without broadcasting it
    (`Wallet::prepare_pending`, which reserves its nonce) and persists the signed
    bytes on `Bridged` (`PrepareDepositSend` -> `DepositSendPrepared`, refused if
-   a send was already signed). Sign and persist run on a detached task. If the
-   write fails and a reload shows no signed send, or another attempt's signed
-   send (two prepares raced), the nonce is released (`discard_prepared`). If the
-   reload fails, the nonce stays reserved and the bot pages: releasing a nonce
-   whose bytes may be persisted could send two txs at it.
+   a send was already signed). Sign and persist run on a detached task, under
+   one lock per manager and after a reload: a redrive that overlaps a timed-out
+   attempt waits for it and takes its persisted send instead of signing at the
+   next nonce, which could leave a nonce gap. If the write fails and a reload
+   shows no signed send, or another signed send, the nonce is released
+   (`discard_prepared`). If the reload fails, the nonce stays reserved and the
+   bot pages: releasing a nonce whose bytes may be persisted could send two txs
+   at it.
 2. The persisted bytes are broadcast (`broadcast_prepared`; "already known" is
    success), the hash is recorded (`RecordPendingDeposit` ->
    `PendingDepositRecorded`, which must equal the signed send's hash), and the
