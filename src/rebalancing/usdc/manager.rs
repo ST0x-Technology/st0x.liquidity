@@ -15169,7 +15169,7 @@ mod tests {
         // No Alpaca deposit is mocked, so the leg fails at the Alpaca poll,
         // after its own send is recorded.
         manager
-            .resume_base_to_alpaca(&id, amount)
+            .resume_base_to_alpaca(&id, amount, UsdcCorridor::BASE_CCTP)
             .await
             .unwrap_err();
 
