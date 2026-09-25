@@ -133,7 +133,9 @@ with a `PreparedTransaction`, RAI-2485):
    holds. A failure to read them pages and does not stop startup. A failed
    rebroadcast pages. A restored send with no receipt after the rebroadcast, or
    whose rebroadcast failed, skips the Ethereum startup approvals and revokes on
-   that start, with a warning; wraps and deposits still approve on demand.
+   that start, with a warning; wraps and deposits still approve on demand. A
+   failure to list or load the signed sends, or an unparseable transfer id,
+   skips them the same way, since a send it hides has no reserved nonce.
 5. Resume with no signed send still scans from the mint block (for transfers
    that reached `Bridged` before this change), but a match is never adopted: it
    fails the transfer for reconciliation. An empty scan signs and sends.

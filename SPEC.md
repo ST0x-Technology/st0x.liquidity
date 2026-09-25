@@ -712,7 +712,10 @@ possibly at too low a fee to confirm) gets neither its approvals nor its revokes
 on that start: startup logs a warning and continues, since an approval there
 would wait behind that nonce until its confirmation timeout and fail every
 restart. Wraps and deposits there still approve on demand. Only a chain whose
-restored sends are all mined gets its startup approvals.
+restored sends are all mined gets its startup approvals. A failure to list or
+load the signed Alpaca deposit sends, or one with an unparseable transfer id,
+defers Ethereum the same way: a send it hides has no reserved nonce, so an
+approval could take that nonce and leave the send unable to mine.
 
 The per-symbol equity lock is re-armed at startup from every open mint and
 redemption aggregate, and the transfer job row plus the transfer's first event
