@@ -35230,4 +35230,68 @@ mod tests {
             notifier.messages()
         );
     }
+
+    /// An operator failing a held unserved-corridor transfer before its burn
+    /// leaves a state that holds no guard and cannot be reconciled: the next
+    /// sweep releases the guard instead of re-latching it or paging a stall.
+    #[tokio::test]
+    async fn failed_pre_burn_unserved_corridor_transfer_releases_the_guard_on_the_next_sweep() {
+        let pool = crate::test_utils::setup_test_db().await;
+        let store = Arc::new(test_store::<UsdcRebalance>(pool.clone(), ()));
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let amount = usdc(400);
+        for command in [
+            UsdcRebalanceCommand::BeginWithdrawal {
+                direction: RebalanceDirection::BaseToAlpaca,
+                corridor: ROBINHOOD_RELAY,
+                amount,
+                from_block: 1,
+            },
+            UsdcRebalanceCommand::Initiate {
+                direction: RebalanceDirection::BaseToAlpaca,
+                corridor: ROBINHOOD_RELAY,
+                amount,
+                withdrawal: TransferRef::OnchainTx(B256::repeat_byte(0x0a)),
+            },
+            UsdcRebalanceCommand::ConfirmWithdrawal {
+                withdrawal_tx: None,
+            },
+            UsdcRebalanceCommand::BeginBridging {
+                from_block: 2,
+                burn_amount: None,
+            },
+        ] {
+            store.send(&id, command).await.unwrap();
+        }
+        let notifier = Arc::new(CapturingNotifier::default());
+        let trigger = make_unserved_corridor_trigger(&pool, store.clone(), notifier.clone()).await;
+        trigger.recover_usdc_guard(&pool, &store).await.unwrap();
+        assert!(trigger.usdc_in_progress.load(Ordering::SeqCst));
+
+        store
+            .send(
+                &id,
+                UsdcRebalanceCommand::FailBridging {
+                    reason: "operator failed the pre-burn transfer".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+        trigger
+            .expire_stuck_usdc_rebalances(Utc::now() + ChronoDuration::hours(2))
+            .await
+            .unwrap();
+
+        assert!(
+            !trigger.usdc_in_progress.load(Ordering::SeqCst),
+            "a transfer that no longer holds the guard must release it"
+        );
+        assert!(!trigger.usdc_tracking.read().await.contains_key(&id));
+        assert_eq!(
+            notifier.messages().len(),
+            1,
+            "only the startup corridor page: {:?}",
+            notifier.messages()
+        );
+    }
 }
