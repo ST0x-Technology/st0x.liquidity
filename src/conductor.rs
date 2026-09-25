@@ -125,7 +125,8 @@ use crate::rebalancing::equity::{
 use crate::rebalancing::trigger::{GUARD_GENERATION, GuardGeneration, GuardState};
 use crate::rebalancing::usdc::{
     RecheckUsdcDeposit, TransferUsdcToHedging, TransferUsdcToHedgingCtx,
-    TransferUsdcToMarketMaking, TransferUsdcToMarketMakingCtx, UsdcSettlementParams,
+    TransferUsdcToMarketMaking, TransferUsdcToMarketMakingCtx, UsdcDriverPause,
+    UsdcSettlementParams,
 };
 use crate::rebalancing::{
     BaseWallet, ChainRebalancingConfig, ChainWallets, EthereumWallet, RebalancerServices,
@@ -987,6 +988,7 @@ fn publish_recovery_handle(
     redemption_store: Arc<Store<EquityRedemption>>,
     rebalancing_service: Arc<RebalancingService>,
     usdc_recheck: Arc<dyn RecheckUsdcDeposit>,
+    usdc_driver_pause: Arc<UsdcDriverPause>,
 ) {
     let _ = recovery_cell.set(crate::api::RecoveryHandle {
         transfer,
@@ -994,6 +996,7 @@ fn publish_recovery_handle(
         redemption_store,
         rebalancing_service,
         usdc_recheck,
+        usdc_driver_pause,
     });
 }
 
@@ -1145,6 +1148,7 @@ impl Conductor {
             service: rebalancing_service,
             recovery_transfer,
             usdc_recheck,
+            usdc_driver_pause,
             wrapped_equity_recovery_store,
             unwrapped_equity_recovery_store,
             mint_store,
@@ -1360,6 +1364,7 @@ impl Conductor {
             recovery_redemption_store,
             recovery_service,
             usdc_recheck,
+            usdc_driver_pause,
         );
 
         publish_process_tx_handle(
@@ -1939,6 +1944,9 @@ struct RebalancingInfrastructure {
     /// Operator `transfer recheck` entry point for a failed USDC deposit,
     /// published on the recovery handle.
     usdc_recheck: Arc<dyn RecheckUsdcDeposit>,
+    /// Operator pause control for the USDC driver, published on the recovery
+    /// handle so a write route can quiesce the workers before it mutates.
+    usdc_driver_pause: Arc<UsdcDriverPause>,
     wrapped_equity_recovery_store: Arc<Store<WrappedEquityRecovery>>,
     unwrapped_equity_recovery_store: Arc<Store<UnwrappedEquityRecovery>>,
     mint_store: Arc<Store<TokenizedEquityMint>>,
@@ -1983,6 +1991,7 @@ struct PositionAndRebalancing {
     service: Arc<RebalancingService>,
     recovery_transfer: Arc<CrossVenueEquityTransfer>,
     usdc_recheck: Arc<dyn RecheckUsdcDeposit>,
+    usdc_driver_pause: Arc<UsdcDriverPause>,
     wrapped_equity_recovery_store: Arc<Store<WrappedEquityRecovery>>,
     unwrapped_equity_recovery_store: Arc<Store<UnwrappedEquityRecovery>>,
     mint_store: Arc<Store<TokenizedEquityMint>>,
@@ -2195,6 +2204,7 @@ impl PositionAndRebalancing {
             service: infra.service,
             recovery_transfer: infra.recovery_transfer,
             usdc_recheck: infra.usdc_recheck,
+            usdc_driver_pause: infra.usdc_driver_pause,
             wrapped_equity_recovery_store: infra.wrapped_equity_recovery_store,
             unwrapped_equity_recovery_store: infra.unwrapped_equity_recovery_store,
             mint_store: infra.mint_store,
@@ -3136,7 +3146,9 @@ fn build_transfer_gas_readiness<Signer: Wallet + Clone>(
 
 /// Builds the trigger service from the validated rebalancing config plus the
 /// conductor-owned dependencies (the trigger config is the runtime projection
-/// of `RebalancingCtx` onto every hedged chain's asset table).
+/// of `RebalancingCtx` onto every hedged chain's asset table). The service owns
+/// the USDC driver pause: its gate is shared with the USDC workers and its
+/// controller is published for operator write routes.
 fn build_rebalancing_service(
     rebalancing_ctx: &RebalancingCtx,
     deps: &RebalancingDeps,
@@ -3325,6 +3337,89 @@ fn build_hedged_equity_services<Signer: Wallet + Clone + 'static>(
     })
 }
 
+/// The primary chain's rebalancing services, and the shared handles the rest
+/// of the rebalancing wiring hangs off, once the startup preflights have
+/// passed.
+struct PrimaryRebalancingServices<Signer: Wallet> {
+    primary_chain: Chain,
+    market_maker_wallet: Address,
+    gas_readiness: Arc<GasReadiness>,
+    bot_gas_enqueuer: BotGasReceiptCostEnqueuer,
+    raindex_service: Arc<RaindexService<Signer>>,
+    tokenizer: Arc<dyn Tokenizer>,
+    mint_authorization: MintAuthorizationInfra,
+}
+
+/// Resolves the primary chain's equity leg -- the rebalancer, the recovery
+/// jobs and the resume paths all run on it -- builds the handles the rest of
+/// the rebalancing wiring shares, and runs the startup preflights that gate
+/// them: inventory access, the stale-allowance revoke and tokenization.
+/// Nothing downstream is built until those pass.
+async fn build_primary_rebalancing_services<Signer: Wallet + Clone>(
+    deps: &RebalancingDeps,
+    tokenizations: &BTreeMap<Chain, ChainTokenization<Signer>>,
+    wallets: &ChainWallets<Signer>,
+) -> anyhow::Result<PrimaryRebalancingServices<Signer>> {
+    let primary_chain = deps.ctx.chains.primary().chain;
+    let primary = tokenizations.get(&primary_chain).with_context(|| {
+        format!("no tokenization services were built for the primary chain {primary_chain}")
+    })?;
+    let primary_equity = match &primary.equity {
+        EquityTokenization::Rebalancing(equity) => equity,
+        EquityTokenization::HedgeOnly => anyhow::bail!(
+            "the primary chain {primary_chain} was built hedge-only, but the rebalancer \
+             runs on its equity leg"
+        ),
+    };
+    info!(
+        chain = %primary.chain,
+        "Initializing rebalancing infrastructure on the primary chain's tokenization services"
+    );
+    let market_maker_wallet = primary.wallet.address();
+    let gas_readiness = build_transfer_gas_readiness(wallets, &deps.ctx)?;
+
+    // The worker consuming this queue is always registered
+    // (`build_record_bot_gas_receipt_cost_ctx` fails startup when its
+    // config is missing), so the enqueuer and the worker can never
+    // disagree: every enqueued row has a consumer.
+    let bot_gas_enqueuer =
+        BotGasReceiptCostEnqueuer::Enabled(deps.record_bot_gas_receipt_cost_queue.clone());
+
+    let raindex_service = build_rebalancing_raindex_service(
+        &primary.wallet,
+        deps.ctx.chains.primary(),
+        market_maker_wallet,
+    );
+
+    // One issuance client serves the tokenization preflight's vault-mode
+    // reads and both mint-authorization consumers (the saga's vault-mode
+    // read and the delivery job), from the same `[issuance]` credentials
+    // as the freeze guard's own instance.
+    let issuance_client = Arc::new(IssuanceClient::new(
+        deps.ctx.issuance.base_url.clone(),
+        deps.ctx.issuance.api_key.header_value(),
+    )?);
+
+    preflight_inventory_access(&raindex_service, &deps.ctx).await?;
+    revoke_stale_orderbook_allowances(&deps.ctx, tokenizations).await;
+    preflight_tokenization(&deps.ctx, tokenizations, issuance_client.as_ref()).await?;
+
+    let tokenizer = primary_equity.tokenizer.clone();
+
+    let mint_authorization =
+        build_mint_authorization_infra(issuance_client, &deps.apalis_pool).await?;
+
+    Ok(PrimaryRebalancingServices {
+        primary_chain,
+        market_maker_wallet,
+        gas_readiness,
+        bot_gas_enqueuer,
+        raindex_service,
+        tokenizer,
+        mint_authorization,
+    })
+}
+
 /// The rebalancer, the recovery jobs and the resume paths run on the primary
 /// chain's [`ChainTokenization`] until chain selection moves into the global
 /// rebalancer; the other hedged chains' services are built and preflighted
@@ -3345,54 +3440,15 @@ fn spawn_rebalancing_infrastructure<Signer: Wallet + Clone>(
 
         let BrokerCtx::AlpacaBrokerApi(alpaca_auth) = &deps.ctx.broker;
 
-        let primary_chain = deps.ctx.chains.primary().chain;
-        let primary = tokenizations.get(&primary_chain).with_context(|| {
-            format!("no tokenization services were built for the primary chain {primary_chain}")
-        })?;
-        let primary_equity = match &primary.equity {
-            EquityTokenization::Rebalancing(equity) => equity,
-            EquityTokenization::HedgeOnly => anyhow::bail!(
-                "the primary chain {primary_chain} was built hedge-only, but the rebalancer \
-                 runs on its equity leg"
-            ),
-        };
-        info!(
-            chain = %primary.chain,
-            "Initializing rebalancing infrastructure on the primary chain's tokenization services"
-        );
-        let market_maker_wallet = primary.wallet.address();
-        let gas_readiness = build_transfer_gas_readiness(&wallets, &deps.ctx)?;
-
-        // The worker consuming this queue is always registered
-        // (`build_record_bot_gas_receipt_cost_ctx` fails startup when its
-        // config is missing), so the enqueuer and the worker can never
-        // disagree: every enqueued row has a consumer.
-        let bot_gas_enqueuer =
-            BotGasReceiptCostEnqueuer::Enabled(deps.record_bot_gas_receipt_cost_queue.clone());
-
-        let raindex_service = build_rebalancing_raindex_service(
-            &primary.wallet,
-            deps.ctx.chains.primary(),
+        let PrimaryRebalancingServices {
+            primary_chain,
             market_maker_wallet,
-        );
-
-        // One issuance client serves the tokenization preflight's vault-mode
-        // reads and both mint-authorization consumers (the saga's vault-mode
-        // read and the delivery job), from the same `[issuance]` credentials
-        // as the freeze guard's own instance.
-        let issuance_client = Arc::new(IssuanceClient::new(
-            deps.ctx.issuance.base_url.clone(),
-            deps.ctx.issuance.api_key.header_value(),
-        )?);
-
-        preflight_inventory_access(&raindex_service, &deps.ctx).await?;
-        revoke_stale_orderbook_allowances(&deps.ctx, &tokenizations).await;
-        preflight_tokenization(&deps.ctx, &tokenizations, issuance_client.as_ref()).await?;
-
-        let tokenizer = primary_equity.tokenizer.clone();
-
-        let mint_authorization =
-            build_mint_authorization_infra(issuance_client, &deps.apalis_pool).await?;
+            gas_readiness,
+            bot_gas_enqueuer,
+            raindex_service,
+            tokenizer,
+            mint_authorization,
+        } = build_primary_rebalancing_services(&deps, &tokenizations, &wallets).await?;
 
         let HedgedEquityServices {
             chains: chain_services,
@@ -3415,6 +3471,8 @@ fn spawn_rebalancing_infrastructure<Signer: Wallet + Clone>(
 
         let rebalancing_service =
             build_rebalancing_service(&rebalancing_ctx, &deps, registry_ids, wrappers.clone());
+        let usdc_driver_gate = rebalancing_service.usdc_driver_gate();
+        let usdc_driver_pause = rebalancing_service.usdc_driver_pause();
 
         wire_transfer_admission_guards(
             &rebalancing_service,
@@ -3517,6 +3575,7 @@ fn spawn_rebalancing_infrastructure<Signer: Wallet + Clone>(
             job_queue: deps.schedulers.transfer_usdc_to_market_making.clone(),
             max_burn_revert_redrives: rebalancing_ctx.max_burn_revert_redrives,
             notifier: deps.notifier.clone(),
+            driver_gate: usdc_driver_gate.clone(),
         });
 
         let transfer_usdc_to_hedging_ctx = Arc::new(TransferUsdcToHedgingCtx {
@@ -3525,6 +3584,7 @@ fn spawn_rebalancing_infrastructure<Signer: Wallet + Clone>(
             job_queue: deps.schedulers.transfer_usdc_to_hedging.clone(),
             max_burn_revert_redrives: rebalancing_ctx.max_burn_revert_redrives,
             notifier: deps.notifier.clone(),
+            driver_gate: usdc_driver_gate,
         });
 
         let transfer_equity_to_market_making_ctx = Arc::new(TransferEquityToMarketMakingCtx {
@@ -3555,6 +3615,7 @@ fn spawn_rebalancing_infrastructure<Signer: Wallet + Clone>(
             service: rebalancing_service,
             recovery_transfer,
             usdc_recheck: usdc_handles.recheck_deposit,
+            usdc_driver_pause,
             wrapped_equity_recovery_store,
             unwrapped_equity_recovery_store,
             mint_store: built.mint,
@@ -18779,6 +18840,7 @@ mod tests {
             redemption_store.clone(),
             rebalancing_service.clone(),
             usdc_recheck,
+            Arc::new(crate::rebalancing::usdc::usdc_driver_pause().0),
         );
 
         let handle = recovery_cell

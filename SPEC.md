@@ -5725,7 +5725,11 @@ named exemptions defined after the list:**
   `not_detected_yet`, changes nothing, and the operator retries later. Other
   USDC states keep their existing paths (`resume` while non-terminal,
   `reconcile` for funds handled out-of-band rather than settled by the
-  provider).
+  provider). Because the USDC recheck sends from the rebalancing wallet and
+  advances the aggregate on the request task, it first quiesces the USDC
+  rebalancing driver and holds it paused for the whole recheck, refusing with
+  `503` when the driver cannot quiesce (see "Both bot-routed USDC recovery
+  routes quiesce the rebalancing driver first" below).
 - `fail` -- force a stuck non-terminal operation to its clean `Failed` terminal
   so the system stops waiting on it; `--reason` required.
 - `reconcile` -- declare an already-terminal-failed operation resolved
@@ -5789,21 +5793,41 @@ effect rather than a generic intent:
   posts to `POST /transfers/usdc/resume/{direction}/{id}`. The endpoint
   validates server-side (unknown id refuses -- a mistyped id must never start a
   fresh burn; a direction mismatch refuses; a clean terminal refuses), then
-  applies the single-flight gates before it enqueues a transfer job keyed by the
-  EXISTING id for the apalis worker to drive: any live or retryable USDC job row
-  in either direction refuses with 409 (a terminal `Failed` row does NOT --
-  re-enqueueing it is the recovery case), and a durable guard holder other than
-  the requested id refuses with 409. The worker uses the aggregate's persisted
-  amount. Routing through the bot closes the CLI-vs-server race: the CLI process
-  never drives an aggregate the bot's worker may also drive. The manual
-  `transfer-usdc` command still starts a fresh transfer directly, but hands off
-  to this endpoint at the FIRST bot-resumable wait (attestation timeout,
-  settlement lag, inconclusive poll); when the bot is unreachable, the transfer
-  is durable -- a bot restart re-arms it automatically. Like the whole
-  `server_port` recovery surface (`/transfers/resume`, `/transfers/recheck`,
-  `/transfers/fail`), its bare path is restricted to loopback callers for the
-  in-container CLI. Network operators use the IAP-verified
-  `/liquidity-write/transfers/*` mounts.
+  quiesces the USDC rebalancing driver (see "Both bot-routed USDC recovery
+  routes quiesce the rebalancing driver first" below) and holds it paused for
+  the whole operation before it applies the single-flight gates and enqueues a
+  transfer job keyed by the EXISTING id for the apalis worker to drive: any live
+  or retryable USDC job row in either direction refuses with 409 (a terminal
+  `Failed` row does NOT -- re-enqueueing it is the recovery case), and a durable
+  guard holder other than the requested id refuses with 409. The worker uses the
+  aggregate's persisted amount. Routing through the bot closes the CLI-vs-server
+  race: the CLI process never drives an aggregate the bot's worker may also
+  drive. The manual `transfer-usdc` command still starts a fresh transfer
+  directly, but hands off to this endpoint at the FIRST bot-resumable wait
+  (attestation timeout, settlement lag, inconclusive poll); when the bot is
+  unreachable, the transfer is durable -- a bot restart re-arms it
+  automatically. Like the whole `server_port` recovery surface
+  (`/transfers/resume`, `/transfers/recheck`, `/transfers/fail`), its bare path
+  is restricted to loopback callers for the in-container CLI. Network operators
+  use the IAP-verified `/liquidity-write/transfers/*` mounts.
+- **Both bot-routed USDC recovery routes quiesce the rebalancing driver first.**
+  `transfer resume --kind usdc` and `transfer recheck --kind usdc` send
+  transactions from the rebalancing wallet or advance the `UsdcRebalance`
+  aggregate on the request task, so before either mutates, it pauses the USDC
+  rebalancing driver -- the two apalis workers (`TransferUsdcToHedging`,
+  `TransferUsdcToMarketMaking`) plus the trigger's own queued USDC check and
+  inline stuck-transfer sweep -- meaning every worker execution already in
+  flight has finished and none can start, and holds it paused for the whole
+  operation, resuming it on every exit path (success, error, or panic). The
+  pause waits up to a 5-second quiesce window; if a transfer is still executing
+  when that window elapses, the route refuses with `503` ("A USDC transfer is
+  executing; retry once it is not in flight") and leaves the driver running.
+  This `503` sits AFTER the shared resume/recheck single-in-progress lock
+  (`409`) and the conductor-not-ready gate (`503`) but BEFORE the single-flight
+  job-row and guard-holder gates (`409`): the driver is quiesced before those
+  gates read the job rows and the durable guard, so their reads and the
+  subsequent enqueue or aggregate command cannot straddle a live worker
+  execution driving the same aggregate.
 - **`--reason` MUST be required, with no default, on every event-emitting
   destructive verb** (`fail`, `reconcile`, `set`, and `position release-hedge`).
   A defaulted reason is an audit-hostile record and violates the
