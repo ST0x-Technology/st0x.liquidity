@@ -5806,10 +5806,54 @@ effect rather than a generic intent:
 - **Execution mode is part of each command's contract.** Help text states which
   mode the command uses: direct-DB (the operator must ensure the bot is not
   concurrently driving the same id); direct-DB plus a live RPC provider; live
-  RPC only (`cctp complete-mint` touches no database state -- the caveat is the
-  bot concurrently driving the same on-chain mint); or the running bot (REST).
-  `fail`, `recheck`, `transfer resume --kind equity`, and
-  `transfer resume --kind usdc` require the bot.
+  RPC only (the `stox cctp complete-mint` CLI touches no database state -- the
+  caveat is the bot concurrently driving the same on-chain mint); or the running
+  bot (REST). `fail`, `recheck`, `transfer resume --kind equity`, and
+  `transfer resume --kind usdc` require the bot. `cctp complete-mint`,
+  `process-tx`, and `view rebuild` also have running bot routes under the
+  IAP-verified `/liquidity-write/` prefix (client: `st0x-liquidity-client`),
+  which remove the stop the bot precondition of their direct paths; their
+  contracts are the next three bullets and the `process-tx` bullet below.
+- **`cctp complete-mint` through the running bot is two phase and never waits on
+  Circle.** `POST /liquidity-write/cctp/complete-mint` fetches the burn's
+  attestation with a single request, holding no lock: a burn Circle has not
+  attested yet, or a transient transport error, returns a retryable `502` at
+  once instead of polling inside the request, so the route cannot keep working
+  or submit a mint long after the client or IAP timed out. Only with a complete
+  attestation does it take the recovery lock (`409` when another recovery
+  operation holds it) and quiesce the USDC rebalancing driver (`503` when a
+  transfer is executing), holding both only around the `receiveMessage`
+  submission and the bot gas enqueue. The response reports `gasEnqueued`: the
+  gas ledger job was queued, not that the ledger entry exists. Its `amounts` are
+  either `decoded` (net amount received and fee) or `undecodable`: the mint is
+  final but its onchain values did not convert to USDC, so the raw values and
+  the conversion error are reported instead of absent amounts. Rerunning is
+  always safe: a consumed CCTP nonce cannot be minted twice, and a rerun whose
+  mint already landed adopts that mint. A mint whose outcome could not be
+  confirmed is an explicit retryable `502` telling the operator to verify
+  onchain; a complete but malformed attestation or a deterministic mint failure
+  is a `500`. The route touches no aggregate; bring the stuck `UsdcRebalance`
+  back in sync afterwards with `resume` or `reconcile`.
+- **`view rebuild` through the running bot pauses every projection writer.**
+  `POST /liquidity-write/views/{view}/rebuild` refuses with `503` until startup
+  completes and fully validates the request first (an unknown view, a malformed
+  id, or an id with no event stream is a `400`), so a bad request never pauses
+  anything. It then pauses projection maintenance, the one gate every in process
+  projection writer enters: apalis jobs, the inventory monitor, the detached
+  CCTP burn, and the HTTP write routes. The pause waits up to 30 seconds for
+  writers already in flight to finish and refuses with `503` if they do not,
+  leaving them running. Held, it blocks new writers for the whole rebuild. Row
+  deletion and event replay run in one `BEGIN IMMEDIATE` SQLite transaction, so
+  a failed replay keeps the previous rows. An aggregate whose events fold to a
+  failed lifecycle is rebuilt as failed, not repaired: the rebuild logs a
+  warning and lists it under `failed` in the response. Work a job spawns and
+  awaits continues the job's own slot rather than claiming a second one, so a
+  pause can never wait on a job that is itself waiting on its spawned work.
+  Recovery routes that also take the recovery lock enter the projection gate
+  first, so a request parked behind a rebuild holds no lock. The
+  `stox view
+  rebuild` CLI runs the same rebuild direct-DB and must run only
+  while the bot is stopped.
 - **`transfer resume --kind usdc` routes through the running bot.** The CLI
   posts to `POST /transfers/usdc/resume/{direction}/{id}`. The endpoint
   validates server-side (unknown id refuses -- a mistyped id must never start a

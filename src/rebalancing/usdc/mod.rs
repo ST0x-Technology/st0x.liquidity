@@ -17,8 +17,13 @@ pub(crate) use job::{
     TransferUsdcToHedgingJobQueue, TransferUsdcToMarketMaking, TransferUsdcToMarketMakingCtx,
     TransferUsdcToMarketMakingJobQueue,
 };
+#[cfg(test)]
+pub(crate) use manager::RecoveredCctpMint;
+pub(crate) use manager::{
+    CctpMintRecoveryError, RecheckUsdcDeposit, RecoverCctpMint, RecoveredMintAmounts,
+    UsdcRecheckError, u256_to_usdc,
+};
 pub use manager::{CrossVenueCashTransfer, MarketMakingUsdcEndpoints, UsdcSettlementParams};
-pub(crate) use manager::{RecheckUsdcDeposit, UsdcRecheckError, u256_to_usdc};
 
 use std::time::Duration;
 

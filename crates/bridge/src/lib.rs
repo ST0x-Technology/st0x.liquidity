@@ -148,6 +148,15 @@ pub trait Bridge: Send + Sync + 'static {
         burn_tx: TxHash,
     ) -> Result<Self::Attestation, Self::Error>;
 
+    /// Fetches the attestation once, without waiting for it: a burn not
+    /// attested yet is a retryable error. For callers bounded by a request
+    /// deadline, which must not keep polling after their caller gave up.
+    async fn fetch_attestation(
+        &self,
+        direction: BridgeDirection,
+        burn_tx: TxHash,
+    ) -> Result<Self::Attestation, Self::Error>;
+
     /// Mints USDC on the destination chain using the attestation.
     async fn mint(
         &self,

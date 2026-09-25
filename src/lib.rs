@@ -82,6 +82,7 @@ mod unwrapped_equity_recovery;
 mod usdc_rebalance;
 mod vault_lookup;
 mod vault_registry;
+mod view_rebuild;
 mod wrapped_equity_recovery;
 
 pub use st0x_config::{
@@ -176,6 +177,7 @@ pub(crate) struct AppState {
     pub(crate) recovery: Arc<tokio::sync::OnceCell<api::RecoveryHandle>>,
     pub(crate) process_tx: Arc<tokio::sync::OnceCell<api::ProcessTxHandle>>,
     pub(crate) resume_lock: Arc<api::ResumeLock>,
+    pub(crate) projection_maintenance: Arc<conductor::projection_pause::ProjectionMaintenance>,
     pub(crate) pnl_report_admission: dashboard::pnl::PnlReportAdmission,
     pub(crate) pnl_ledger: Arc<dashboard::pnl::PnlLedger>,
     pub(crate) metrics_handle: PrometheusHandle,
@@ -298,6 +300,9 @@ async fn run_bot_session_inner(
     // ingestion mutex instead of racing as separate ingesters.
     let pnl_ledger = Arc::new(dashboard::pnl::PnlLedger::new(pools.cqrs.clone()));
 
+    // Built before the conductor and HTTP server start, so every worker and
+    // write route is gated from its first execution.
+    let projection_maintenance = conductor::projection_pause::init_projection_maintenance();
     let health = startup::HealthGate::default();
     let detached_tasks = TaskTracker::new();
     let state = AppState {
@@ -310,6 +315,7 @@ async fn run_bot_session_inner(
         recovery: recovery_cell.clone(),
         process_tx: process_tx_cell.clone(),
         resume_lock,
+        projection_maintenance: projection_maintenance.clone(),
         pnl_report_admission: dashboard::pnl::pnl_report_admission(),
         pnl_ledger: pnl_ledger.clone(),
         metrics_handle,
@@ -349,6 +355,7 @@ async fn run_bot_session_inner(
             recovery_cell,
             process_tx_cell,
             pnl_ledger,
+            projection_maintenance,
         },
         shutdown_token.clone(),
         ConductorStartupTokens {
@@ -1554,6 +1561,9 @@ mod tests {
                 recovery_cell: Arc::new(tokio::sync::OnceCell::new()),
                 process_tx_cell: Arc::new(tokio::sync::OnceCell::new()),
                 pnl_ledger: Arc::new(dashboard::pnl::PnlLedger::new(pool)),
+                projection_maintenance: Arc::new(
+                    conductor::projection_pause::ProjectionMaintenance::for_test(),
+                ),
             },
             tokio_util::sync::CancellationToken::new(),
             create_test_startup_tokens(),
@@ -1591,6 +1601,9 @@ mod tests {
                 recovery_cell: Arc::new(tokio::sync::OnceCell::new()),
                 process_tx_cell: Arc::new(tokio::sync::OnceCell::new()),
                 pnl_ledger: Arc::new(dashboard::pnl::PnlLedger::new(pool)),
+                projection_maintenance: Arc::new(
+                    conductor::projection_pause::ProjectionMaintenance::for_test(),
+                ),
             },
             tokio_util::sync::CancellationToken::new(),
             create_test_startup_tokens(),

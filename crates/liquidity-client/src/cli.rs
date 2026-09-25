@@ -168,6 +168,12 @@ pub(crate) enum Debug {
         #[arg(long, value_enum)]
         chain: Option<HedgedChain>,
     },
+    /// Rebuild a materialized view by replaying events.
+    #[command(subcommand)]
+    View(View),
+    /// Recover stuck cross-chain USDC transfers.
+    #[command(subcommand)]
+    Cctp(Cctp),
 }
 
 /// A hedged chain, spelled as the bot's `chain` query value (the `Chain` wire
@@ -198,6 +204,62 @@ pub(crate) enum UsdcDirection {
     BaseToAlpaca,
 }
 
+#[derive(Subcommand)]
+pub(crate) enum View {
+    /// Rebuild a view or read model from scratch; the escape hatch for a view
+    /// corrupted by a lost update.
+    Rebuild(RebuildViewArgs),
+}
+
+#[derive(Args)]
+pub(crate) struct RebuildViewArgs {
+    /// View to rebuild.
+    #[arg(value_enum)]
+    pub(crate) view: RebuildableView,
+    /// One aggregate's view (for example AAPL for position). The read models
+    /// replay the whole model and take --all only.
+    #[arg(long, conflicts_with = "all", required_unless_present = "all")]
+    pub(crate) id: Option<String>,
+    /// Every row of the view.
+    #[arg(long, conflicts_with = "id", required_unless_present = "id")]
+    pub(crate) all: bool,
+}
+
+/// The bot's rebuildable views, spelled as the route's path segment.
+#[derive(Clone, Copy, ValueEnum)]
+pub(crate) enum RebuildableView {
+    Position,
+    OffchainOrder,
+    VaultRegistry,
+    RebalanceTiming,
+    EquityTiming,
+    LifecycleFailure,
+    PortfolioSnapshot,
+}
+
+#[derive(Subcommand)]
+pub(crate) enum Cctp {
+    /// Complete the destination mint of a CCTP burn whose mint never landed.
+    /// A burn Circle has not attested yet fails at once as retryable; rerun it
+    /// later. Rerunning is always safe: a mint that already landed is adopted.
+    /// Afterwards bring the stuck rebalance back in sync with resume-usdc or
+    /// reconcile-usdc.
+    CompleteMint {
+        /// Transaction hash of the burn on the source chain.
+        #[arg(long)]
+        burn_tx: String,
+        /// Chain the burn happened on; the mint lands on the other one.
+        #[arg(long, value_enum)]
+        source_chain: CctpSourceChain,
+    },
+}
+
+/// The burn's chain, spelled as the bot's wire value.
+#[derive(Clone, Copy, ValueEnum)]
+pub(crate) enum CctpSourceChain {
+    Ethereum,
+    Base,
+}
 /// Equity transfer kind, spelled as the bot's reconcile path segment.
 #[derive(Clone, Copy, ValueEnum)]
 pub(crate) enum EquityTransferKind {
