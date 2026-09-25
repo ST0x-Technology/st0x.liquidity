@@ -15703,6 +15703,58 @@ mod tests {
         );
     }
 
+    /// A fee-bumped copy of the send is a different tx from the bot wallet
+    /// at the send's nonce, but it paid the Alpaca deposit address, so the
+    /// deposit went through and reconciling would move the USDC twice.
+    #[tokio::test]
+    async fn deposit_send_is_not_superseded_by_a_fee_bumped_copy_of_it() {
+        let chain = deploy_ethereum_usdc_chain().await;
+        let server = MockServer::start();
+        let manager = build_deposit_manager(
+            &chain,
+            &server,
+            Arc::new(create_short_poll_wallet_service(&server)),
+            create_test_store_instance().await,
+        )
+        .await;
+        let wallet = create_test_wallet(&chain.endpoint, &chain.bot_key);
+        let amount = usdc_to_u256(usdc("99.99")).unwrap();
+        let prepared = sign_usdc_to_alpaca(&wallet, amount).await;
+        let bot_provider = bot_provider(&chain).await;
+
+        let fee_bumped = bot_provider
+            .send_transaction(
+                TransactionRequest::default()
+                    .to(USDC_ADDRESS)
+                    .input(
+                        Bytes::from(
+                            IERC20::transferCall {
+                                to: ALPACA_DEPOSIT_ADDRESS,
+                                amount,
+                            }
+                            .abi_encode(),
+                        )
+                        .into(),
+                    )
+                    .nonce(prepared.nonce())
+                    .max_priority_fee_per_gas(1_234_567)
+                    .max_fee_per_gas(100_000_000_000),
+            )
+            .await
+            .unwrap()
+            .get_receipt()
+            .await
+            .unwrap()
+            .transaction_hash;
+        bot_provider.anvil_mine(Some(2), None).await.unwrap();
+        assert_ne!(fee_bumped, prepared.tx_hash());
+
+        manager
+            .verify_deposit_send_superseded(&prepared, Some(fee_bumped))
+            .await
+            .expect_err("a tx that paid the Alpaca deposit address does not supersede the send");
+    }
+
     /// Connects a provider that signs with the bot wallet's key.
     async fn bot_provider(chain: &EthereumUsdcChain) -> impl Provider + use<> {
         ProviderBuilder::new()
