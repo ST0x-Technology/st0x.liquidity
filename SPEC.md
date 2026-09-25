@@ -3800,7 +3800,11 @@ enum UsdcRebalance {
         // AttestationResponse and mints without re-polling Circle. None for
         // transfers whose BridgeAttestationReceived predates this field.
         message: Option<Vec<u8>>,
-        mint_scan_from_block: u64,
+        // Destination chain head captured before the mint: the resume lookup
+        // for this nonce's mint starts at the lower of it less a small margin
+        // and a fixed lookback from the head. None for transfers whose
+        // BridgeAttestationReceived predates this field.
+        mint_scan_from_block: Option<u64>,
         initiated_at: DateTime<Utc>,
         attested_at: DateTime<Utc>,
     },
@@ -3883,12 +3887,46 @@ already-submitted action instead of re-issuing it:
   and adopt it rather than burning twice.
 - `Attested`: the CCTP mint is irreversible -- re-calling `receiveMessage`
   reverts on the already-used nonce, which would otherwise turn a successfully
-  minted transfer into a terminal `BridgingFailed`. Resume must scan the
-  destination chain for the already-submitted mint (`find_recent_mint`, matching
-  the `MintAndWithdraw` event) and adopt it -- recording `ConfirmBridging` with
-  the existing mint tx, amount, and fee -- before attempting a fresh mint. The
-  destination chain head is captured when the attestation is recorded so the
-  scan is bounded.
+  minted transfer into a terminal `BridgingFailed`. Resume must first ask the
+  destination chain whether this transfer's own CCTP nonce is consumed
+  (`usedNonces`) and, if so, adopt the mint that consumed it (the
+  `MessageReceived` log carrying that nonce, and the `MintAndWithdraw` of the
+  same call) -- recording `ConfirmBridging` with that mint tx, amount, and fee
+  -- before attempting a fresh mint. The match is by nonce, never by recipient
+  or amount: other transfers mint to the same wallet, possibly the same amount.
+  The log scan is bounded: it starts at the lower of the destination head
+  captured when the attestation is recorded, less a margin of a few minutes of
+  blocks, and a fixed lookback from the current head (a relayer can mint before
+  that head is captured), or at the fixed lookback alone for a transfer recorded
+  before that head was captured. The bot never scans back to genesis. A consumed
+  nonce whose log is not found in that window is placed by a `usedNonces` read
+  at the block below the floor: unused there, the window covers the mint and the
+  missing log is index lag, so resume redrives like any other lookup failure
+  (deadline-gated alert); used there, the mint lies below the floor. When that
+  read fails (for example a node without state that old), the floor block's
+  timestamp decides instead: a mint lands after its transfer starts, so a floor
+  mined before the transfer started covers the mint (redrive), and a newer floor
+  can have the mint below it. For a mint below the floor, or one that can lie
+  below it, resume marks `BridgingFailed` (keeping the burn tx and nonce), so
+  `transfer reconcile --kind usdc` can settle it; a message that can never mint
+  on the destination chain does the same. So does a used nonce whose mint is
+  found but cannot be adopted: its `MessageReceived` body differs from the
+  recorded message (for example a relayer minted a re-attested fast-transfer
+  body with a new `expirationBlock`), its tx reverted, or it has no
+  `MintAndWithdraw`. Every redrive would get the same answer, and the log is
+  never matched on less than the full body. Such a mint pages the operator in
+  both directions with "the CCTP mint cannot be resolved automatically": only
+  the operator can find that mint. A BaseToAlpaca job ends there, since its
+  post-burn `BridgingFailed` recovery scans no wider; if that recovery runs
+  again (a restart) and cannot find the mint of a used nonce, it applies the
+  same floor rule: it redrives when the rule places the mint inside its scan,
+  and otherwise pages the same way and stops. A message that can never mint
+  pages only for AlpacaToBase, with "the recorded CCTP message cannot mint on
+  Base" (the nonce is not read, so the operator gets the attestation for the
+  burn tx and mints it); an AlpacaToBase retry finds the transfer failed and
+  does not alert. That BaseToAlpaca latch does not page: its recovery re-polls
+  Circle and may still mint and send the deposit, and the job's dead-letter
+  alert covers a give-up. Other lookup failures redrive.
 
 ##### Commands
 
@@ -3982,7 +4020,8 @@ enum UsdcRebalanceEvent {
         // Circle. Option: None for events serialized before this field existed
         // (those resume via the legacy re-poll fallback).
         message: Option<Vec<u8>>,
-        mint_scan_from_block: u64,
+        // None for events serialized before this field existed.
+        mint_scan_from_block: Option<u64>,
         attested_at: DateTime<Utc>,
     },
     Bridged {
@@ -4143,11 +4182,13 @@ enum BridgeStage { Burn, Attestation, Mint }
   checked between polls, so it can overshoot by up to one poll window plus the
   redrive delay. Structural failures detected _after_ a `complete` attestation
   is fetched (e.g. an all-zero placeholder nonce) fail the bridge immediately.
-  Failures _within_ the poll loop (HTTP errors, a still-`pending` or malformed
-  `complete` response) are retried and, once the per-poll attempts exhaust,
-  surface as the same retryable timeout -- so a malformed response is bounded by
-  the deadline rather than failing fast. (Failing fast on a definitively
-  malformed `complete` response is a tracked follow-up.)
+  For AlpacaToBase, whose retry then finds the transfer failed and does not
+  alert, this latch (and a legacy re-poll failure with the nonce unused) pages
+  the operator with "the burned USDC cannot be minted automatically". Failures
+  _within_ the poll loop (HTTP errors, a still-`pending` response) are retried
+  and, once the per-poll attempts exhaust, surface as the same retryable
+  timeout. A malformed `complete` response fails at once, like the placeholder
+  nonce.
 - **Attested resume reconstructs the mint offline (no Circle re-poll)**: the
   mint needs the full CCTP message envelope, which `BridgeAttestationReceived`
   persists (the `message` field) alongside the attestation. Resuming from
@@ -4156,12 +4197,24 @@ enum BridgeStage { Burn, Attestation, Mint }
   `cctp_nonce` -- and mints with no Circle call. A reconstruction failure
   (corrupt envelope, placeholder nonce, or nonce mismatch) marks
   `BridgingFailed` for operator reconciliation, since the USDC is already
-  burned. Transfers whose `BridgeAttestationReceived` predates the `message`
-  field carry `None` and fall back to re-polling Circle: the attestation is
-  permanently retrievable, so a timeout there retries until success rather than
-  failing (bounding it would strand recoverable funds). The
-  `attestation_retry_deadline` bounds only the `AwaitingAttestation` wait (where
-  the attestation may never arrive).
+  burned; for AlpacaToBase an unusable envelope pages with "the recorded CCTP
+  message cannot mint on Base". Transfers whose `BridgeAttestationReceived`
+  predates the `message` field carry `None` and fall back to re-polling Circle:
+  the attestation is permanently retrievable, so a timeout there retries until
+  success rather than failing (bounding it would strand recoverable funds). The
+  re-polled nonce is cross-checked against the recorded `cctp_nonce` the same
+  way, and the BaseToAlpaca `BridgingFailed` recovery checks it again before it
+  mints, so a mismatch stays failed for operator reconciliation. A hard re-poll
+  error marks `BridgingFailed` only when the destination chain reads the
+  recorded nonce unused on every read over the mint recovery probe window (one
+  read can come from a node behind the mint). When the nonce reads consumed (the
+  mint landed), an error that repeats on every re-poll (a malformed complete
+  answer, a placeholder nonce, a truncated message) marks the same reconcilable
+  `BridgingFailed` (paging the operator for AlpacaToBase), since adopting the
+  mint needs the re-polled message; any other error, or a failed nonce read,
+  redrives so a later attempt adopts the mint. The `attestation_retry_deadline`
+  bounds only the `AwaitingAttestation` wait (where the attestation may never
+  arrive).
 - Bridge mint transaction requires valid attestation
 - Bridge mint transaction must be confirmed before destination deposit
 - A `receiveMessage()` revert because the CCTP nonce was already used is
@@ -4188,24 +4241,34 @@ enum BridgeStage { Burn, Attestation, Mint }
   expensive log scan and receipt reconstruction described above run only once
   per recovery attempt, after a read confirms the nonce consumed, not on every
   probe, and are themselves bounded to a handful of recent chunks rather than a
-  full-chain walk back to genesis. The burn is irreversible and the attestation
-  is valid, so any party -- including a third-party relayer -- may deliver the
-  mint moments after our own submission failed; a mint that lands inside the
-  window is recovered per the log checks above and the transfer proceeds to the
-  destination deposit. If the window expires WITHOUT ever getting a conclusive
-  `usedNonces()` read (every remaining probe itself failed transiently), OR the
-  nonce is confirmed consumed but its receipt could not be reconstructed (a
-  lagging log scan, a mismatched log, a reverted mint transaction), the transfer
-  is NOT marked `BridgingFailed` -- declaring a terminal failure on unobserved
-  state, or on funds already known to have moved, would strand the rebalancing
-  guard on a false negative. The transfer instead stays in whatever
-  non-terminal-for-this-purpose state it was already in when recovery ran:
-  `Attested` (or the Ethereum-direction equivalent) for a first mint attempt,
-  whose resume adopts an already-landed mint via a bounded scan before minting
-  again; or `BridgingFailed` when recovering an already-failed post-burn
-  transfer, whose next redrive re-attempts the mint directly instead
+  full-chain walk back to genesis; when the head read that sets this floor
+  fails, recovery is inconclusive (below) and never scans without a floor. The
+  burn is irreversible and the attestation is valid, so any party -- including a
+  third-party relayer -- may deliver the mint moments after our own submission
+  failed; a mint that lands inside the window is recovered per the log checks
+  above and the transfer proceeds to the destination deposit. A declared mint
+  failure marks `BridgingFailed`; for AlpacaToBase, whose retry then finds the
+  transfer failed and does not alert, it pages the operator with "the CCTP mint
+  on Base did not complete". If the window expires WITHOUT ever getting a
+  conclusive `usedNonces()` read (every remaining probe itself failed
+  transiently), OR the nonce is confirmed consumed but its receipt could not be
+  reconstructed (a lagging log scan, a mismatched log, a reverted mint
+  transaction), the transfer is NOT marked `BridgingFailed` -- declaring a
+  terminal failure on unobserved state, or on funds already known to have moved,
+  would strand the rebalancing guard on a false negative. The transfer instead
+  stays in whatever non-terminal-for-this-purpose state it was already in when
+  recovery ran: `Attested` (or the Ethereum-direction equivalent) for a first
+  mint attempt, whose resume adopts an already-landed mint via a bounded scan
+  before minting again; or `BridgingFailed` when recovering an already-failed
+  post-burn transfer, whose next redrive re-attempts the mint directly instead
   (idempotency there comes from CCTP's nonce being authoritative, not from that
-  bounded scan).
+  bounded scan). The exception is a `BaseToAlpaca` `BridgingFailed` recovery
+  that reads the nonce used but finds no `MessageReceived` log in its scan, when
+  the floor rule of the `Attested` resume above says the mint can lie below that
+  scan: no redrive scans wider, so it pages "the CCTP mint cannot be resolved
+  automatically" and parks the transfer for reconciliation. When the floor rule
+  places the mint inside the scan, the missing log is index lag and the recovery
+  redrives.
 - **Inconclusive mint recovery: redrive and operator alert**: the job layer
   schedules an unbounded delayed redrive (like the settlement-phase
   RPC-transient case above) rather than consuming the apalis retry budget, since

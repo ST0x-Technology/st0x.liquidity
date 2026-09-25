@@ -178,22 +178,44 @@ pub trait Bridge: Send + Sync + 'static {
         from_block: u64,
     ) -> Result<Option<TxHash>, Self::Error>;
 
-    /// Scans the mint destination chain for an already-submitted mint to
-    /// `recipient` strictly after `from_block`, for crash-safe resume. Returns
-    /// the receipt so the caller can adopt the existing mint instead of
-    /// re-minting, which reverts on the already-used CCTP nonce and otherwise
-    /// fails the transfer for USDC that was in fact minted.
-    async fn find_recent_mint(
+    /// Returns the mint that consumed `attestation`'s nonce on the destination
+    /// chain, or `None` while that nonce is unused, for crash-safe resume. The
+    /// match is by nonce, so another transfer's mint to the same recipient is
+    /// never returned.
+    ///
+    /// The log scan for a consumed nonce starts at the lower of
+    /// `scan_from_block` (the [`Bridge::destination_block`] captured before the
+    /// mint) less a small margin and a fixed lookback from the head, since a
+    /// relayer can mint before that head is captured. `None`, for a transfer
+    /// that predates it, scans the lookback alone. A consumed nonce whose mint
+    /// is not found in that window is an error, never a scan to genesis. The
+    /// error carries a `usedNonces` read at the block below the floor: unused
+    /// there means the mint is in the window and the log is lagging; used means
+    /// the mint lies below the floor. Only when that read fails does it carry
+    /// the floor block's timestamp instead: a floor mined before the transfer
+    /// started covers its mint; a later floor may be above it.
+    async fn find_attested_mint(
         &self,
         direction: BridgeDirection,
-        recipient: Address,
-        from_block: u64,
+        attestation: &Self::Attestation,
+        scan_from_block: Option<u64>,
     ) -> Result<Option<MintReceipt>, Self::Error>;
 
+    /// Returns whether `nonce` is consumed (`usedNonces`) on the mint
+    /// destination chain for `direction`: `true` once its mint has landed.
+    /// Needs only the nonce, for a resume that has no message envelope yet.
+    /// `false` means every read over a probe window found the nonce unused, so
+    /// one lagging node cannot hide a landed mint.
+    async fn mint_nonce_consumed(
+        &self,
+        direction: BridgeDirection,
+        nonce: B256,
+    ) -> Result<bool, Self::Error>;
+
     /// Returns the current head of the mint destination chain for `direction`.
-    /// Captured when the attestation is recorded -- before the mint -- so the
-    /// crash-safe resume scan in [`Bridge::find_recent_mint`] is bounded to
-    /// blocks mined strictly after it.
+    /// Captured when the attestation is recorded -- before the mint -- as the
+    /// `scan_from_block` of [`Bridge::find_attested_mint`], whose scan starts
+    /// at the lower of it less a small margin and a fixed lookback from the head.
     async fn destination_block(&self, direction: BridgeDirection) -> Result<u64, Self::Error>;
 
     /// Returns the current head of the burn source chain for `direction`.

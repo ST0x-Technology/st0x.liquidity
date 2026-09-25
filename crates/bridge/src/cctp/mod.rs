@@ -404,6 +404,21 @@ pub struct CctpBridge<EthWallet: Wallet, BaseWallet: Wallet> {
     circle_api_base: String,
 }
 
+/// Where a consumed nonce's mint lies relative to a mint scan's floor block,
+/// read from `usedNonces()` at the block below the floor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MintScanFloorCheck {
+    /// Unused below the floor (or the floor is genesis): the mint is in the
+    /// scan window, so a missing log is index lag.
+    MintInScanWindow,
+    /// Already used below the floor: the mint is below the scan window.
+    MintBelowScanFloor,
+    /// The read failed (e.g. a node without state that old). Only the floor
+    /// block's timestamp (unix seconds) is known: a floor mined before the
+    /// transfer started covers every block its mint can be in.
+    Unverified { from_block_timestamp: u64 },
+}
+
 /// Errors that can occur during CCTP bridge operations.
 #[derive(Debug, thiserror::Error)]
 pub enum CctpError {
@@ -462,6 +477,22 @@ pub enum CctpError {
     MessageDestinationDomainMismatch { expected: u32, actual: u32 },
     #[error("already-minted CCTP nonce {nonce} had no matching MessageReceived log")]
     AlreadyMintedMessageNotFound { nonce: B256 },
+    /// The nonce is consumed on chain but its mint is not in the bounded
+    /// scan: it landed below the floor, or the node's log index lags.
+    /// `floor_check` tells them apart where it can.
+    #[error(
+        "CCTP nonce {nonce} is consumed but no matching MessageReceived log was found at \
+         or after block {from_block} ({floor_check:?})"
+    )]
+    MintNotFoundInScanWindow {
+        nonce: B256,
+        from_block: u64,
+        floor_check: MintScanFloorCheck,
+    },
+    /// The node returned no header for the mint scan's floor block, which is
+    /// below the head it reported. Retryable.
+    #[error("mint scan floor block {block} is missing from the node")]
+    MintScanFloorBlockMissing { block: u64 },
     #[error(
         "recovered CCTP MessageReceived log for nonce {nonce} did not match the attested message"
     )]
@@ -577,6 +608,8 @@ impl CctpError {
             | Self::MessageTooShortForRecovery { .. }
             | Self::MessageDestinationDomainMismatch { .. }
             | Self::AlreadyMintedMessageNotFound { .. }
+            | Self::MintNotFoundInScanWindow { .. }
+            | Self::MintScanFloorBlockMissing { .. }
             | Self::RecoveredMintMessageMismatch { .. }
             | Self::RecoveredMintLogMissingTxHash { .. }
             | Self::RecoveredMintReceiptReverted { .. }
@@ -718,6 +751,21 @@ impl<EthWallet: Wallet, BaseWallet: Wallet> CctpBridge<EthWallet, BaseWallet> {
             .ethereum
             .with_burn_drop_config(evm::BurnDropConfig::fast());
         self.base = self.base.with_burn_drop_config(evm::BurnDropConfig::fast());
+        self
+    }
+
+    /// Shortens both endpoints' `usedNonces()` probe window to two probes
+    /// 10 ms apart. Test-only seam, like
+    /// [`with_fast_burn_drop_policy`](Self::with_fast_burn_drop_policy).
+    #[cfg(any(test, feature = "test-support"))]
+    #[must_use]
+    pub fn with_fast_mint_recovery_policy(mut self) -> Self {
+        self.ethereum = self
+            .ethereum
+            .with_mint_recovery_config(evm::MintRecoveryConfig::fast());
+        self.base = self
+            .base
+            .with_mint_recovery_config(evm::MintRecoveryConfig::fast());
         self
     }
 
@@ -1086,20 +1134,34 @@ impl<EthWallet: Wallet, BaseWallet: Wallet> CctpBridge<EthWallet, BaseWallet> {
     /// a pre-attestation envelope must handle this case deliberately (e.g. by
     /// re-polling the attestation) rather than treating it as "not yet
     /// minted".
+    ///
+    /// The log scan for a consumed nonce starts at the lower of
+    /// `scan_from_block` less a small margin and a fixed lookback from the
+    /// head; `None` scans the lookback alone (see
+    /// [`crate::Bridge::find_attested_mint`]).
     pub async fn find_existing_mint(
         &self,
         direction: BridgeDirection,
         message: &[u8],
+        scan_from_block: Option<u64>,
     ) -> Result<Option<crate::MintReceipt>, CctpError> {
         let receipt = match direction {
             BridgeDirection::EthereumToBase => {
                 self.base
-                    .find_existing_mint::<OpenChainErrorRegistry>(direction, message)
+                    .find_existing_mint::<OpenChainErrorRegistry>(
+                        direction,
+                        message,
+                        scan_from_block,
+                    )
                     .await?
             }
             BridgeDirection::BaseToEthereum => {
                 self.ethereum
-                    .find_existing_mint::<OpenChainErrorRegistry>(direction, message)
+                    .find_existing_mint::<OpenChainErrorRegistry>(
+                        direction,
+                        message,
+                        scan_from_block,
+                    )
                     .await?
             }
         };
@@ -1357,31 +1419,35 @@ where
         }
     }
 
-    /// Scans the mint destination chain for an already-submitted mint to
-    /// `recipient` strictly after `from_block`, for crash-safe resume. Delegates
-    /// to the destination endpoint for the given direction.
-    async fn find_recent_mint(
+    async fn find_attested_mint(
         &self,
         direction: BridgeDirection,
-        recipient: Address,
-        from_block: u64,
+        attestation: &Self::Attestation,
+        scan_from_block: Option<u64>,
     ) -> Result<Option<crate::MintReceipt>, Self::Error> {
-        let receipt = match direction {
+        self.find_existing_mint(direction, &attestation.message, scan_from_block)
+            .await
+    }
+
+    async fn mint_nonce_consumed(
+        &self,
+        direction: BridgeDirection,
+        nonce: B256,
+    ) -> Result<bool, Self::Error> {
+        let consumed = match direction {
             BridgeDirection::EthereumToBase => {
-                self.base.find_recent_mint(recipient, from_block).await?
+                self.base
+                    .is_nonce_used_across_probes::<OpenChainErrorRegistry>(nonce)
+                    .await?
             }
             BridgeDirection::BaseToEthereum => {
                 self.ethereum
-                    .find_recent_mint(recipient, from_block)
+                    .is_nonce_used_across_probes::<OpenChainErrorRegistry>(nonce)
                     .await?
             }
         };
 
-        Ok(receipt.map(|receipt| crate::MintReceipt {
-            tx: receipt.tx,
-            amount: receipt.amount,
-            fee: receipt.fee_collected,
-        }))
+        Ok(consumed)
     }
 
     async fn destination_block(&self, direction: BridgeDirection) -> Result<u64, Self::Error> {
@@ -1405,11 +1471,13 @@ mod tests {
     use alloy::network::EthereumWallet;
     use alloy::node_bindings::{Anvil, AnvilInstance};
     use alloy::primitives::address;
-    use alloy::primitives::{B256, Bytes, b256, keccak256};
+    use alloy::primitives::{B256, BlockNumber, Bytes, U64, b256, keccak256};
+    use alloy::providers::EthGetBlock;
     use alloy::providers::ext::AnvilApi as _;
-    use alloy::providers::{Provider, ProviderBuilder};
+    use alloy::providers::{Provider, ProviderBuilder, ProviderCall};
+    use alloy::rpc::client::NoParams;
     use alloy::rpc::json_rpc::ErrorPayload;
-    use alloy::rpc::types::TransactionReceipt;
+    use alloy::rpc::types::{BlockNumberOrTag, TransactionReceipt};
     use alloy::signers::Signer;
     use alloy::signers::local::PrivateKeySigner;
     use alloy::sol_types::{SolCall, SolEvent};
@@ -1422,7 +1490,7 @@ mod tests {
     use std::borrow::Cow;
     use std::num::NonZeroU32;
     use std::sync::Arc;
-    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
     use std::time::Duration;
 
     use st0x_evm::local::RawPrivateKeyWallet;
@@ -1693,22 +1761,69 @@ mod tests {
     /// `usedNonces()` already reports the nonce consumed but the
     /// `MessageReceived` log has not yet been indexed by the queried node.
     /// Wrapped by [`FlakyProbeWallet`], never constructed directly by tests.
+    /// Records the lowest `from_block` any scan asked for, so a test can
+    /// assert how far back a scan walked, and reports the chain `head_offset`
+    /// blocks above the real one (head and block reads alike), standing in for
+    /// a long chain that anvil would take minutes to mine.
     #[derive(Clone)]
     struct FlakyGetLogsProvider<InnerProvider> {
         inner: InnerProvider,
         remaining_empty_scans: Arc<AtomicU32>,
+        lowest_from_block: Arc<AtomicU64>,
+        head_offset: u64,
+        remaining_failing_head_reads: Arc<AtomicU32>,
     }
 
     #[async_trait]
-    impl<InnerProvider: Provider + Clone> Provider for FlakyGetLogsProvider<InnerProvider> {
+    impl<InnerProvider: Provider + Clone + 'static> Provider for FlakyGetLogsProvider<InnerProvider> {
         fn root(&self) -> &alloy::providers::RootProvider {
             self.inner.root()
+        }
+
+        fn get_block_number(&self) -> ProviderCall<NoParams, U64, BlockNumber> {
+            let inner = self.inner.clone();
+            let head_offset = self.head_offset;
+            let should_fail = self
+                .remaining_failing_head_reads
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                    remaining.checked_sub(1)
+                })
+                .is_ok();
+
+            ProviderCall::BoxedFuture(Box::pin(async move {
+                if should_fail {
+                    return Err(TransportErrorKind::custom_str(
+                        "synthetic head read failure",
+                    ));
+                }
+
+                Ok(inner.get_block_number().await? + head_offset)
+            }))
+        }
+
+        fn get_block_by_number(
+            &self,
+            number: BlockNumberOrTag,
+        ) -> EthGetBlock<alloy::rpc::types::Block> {
+            let real_number = match number {
+                BlockNumberOrTag::Number(reported) => {
+                    BlockNumberOrTag::Number(reported.saturating_sub(self.head_offset))
+                }
+                other => other,
+            };
+
+            self.inner.get_block_by_number(real_number)
         }
 
         async fn get_logs(
             &self,
             filter: &alloy::rpc::types::Filter,
         ) -> alloy::transports::TransportResult<Vec<alloy::rpc::types::Log>> {
+            if let Some(from_block) = filter.get_from_block() {
+                self.lowest_from_block
+                    .fetch_min(from_block, Ordering::SeqCst);
+            }
+
             let should_return_empty = self
                 .remaining_empty_scans
                 .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
@@ -1743,6 +1858,11 @@ mod tests {
         provider: FlakyGetLogsProvider<InnerWallet::Provider>,
         remaining_revert_failures: AtomicU32,
         remaining_call_failures: AtomicU32,
+        remaining_stale_unused_reads: AtomicU32,
+        fail_historical_reads: bool,
+        historical_read_block: Option<u64>,
+        historical_read_offset: Option<u64>,
+        requested_historical_block: Arc<AtomicU64>,
         call_count: Arc<AtomicU32>,
     }
 
@@ -1771,12 +1891,20 @@ mod tests {
             let provider = FlakyGetLogsProvider {
                 inner: inner.provider().clone(),
                 remaining_empty_scans: Arc::new(AtomicU32::new(failures.empty_log_scans)),
+                lowest_from_block: Arc::new(AtomicU64::new(u64::MAX)),
+                head_offset: 0,
+                remaining_failing_head_reads: Arc::new(AtomicU32::new(0)),
             };
             Self {
                 inner,
                 provider,
                 remaining_revert_failures: AtomicU32::new(0),
                 remaining_call_failures: AtomicU32::new(failures.call_failures),
+                remaining_stale_unused_reads: AtomicU32::new(0),
+                fail_historical_reads: false,
+                historical_read_block: None,
+                historical_read_offset: None,
+                requested_historical_block: Arc::new(AtomicU64::new(u64::MAX)),
                 call_count,
             }
         }
@@ -1798,6 +1926,59 @@ mod tests {
         /// consumed (not merely that recovery happened to succeed anyway).
         fn remaining_empty_log_scans(&self) -> Arc<AtomicU32> {
             Arc::clone(&self.provider.remaining_empty_scans)
+        }
+
+        /// Answers the first `stale_unused_reads` `usedNonces()` calls with
+        /// zero (unused), as a node behind the block holding the mint would.
+        fn with_stale_unused_reads(mut self, stale_unused_reads: u32) -> Self {
+            self.remaining_stale_unused_reads = AtomicU32::new(stale_unused_reads);
+            self
+        }
+
+        /// Reports the chain `head_offset` blocks above the real one.
+        fn with_reported_head_offset(mut self, head_offset: u64) -> Self {
+            self.provider.head_offset = head_offset;
+            self
+        }
+
+        /// Fails every `call_at`, as a node without state that old would.
+        fn with_failing_historical_reads(mut self) -> Self {
+            self.fail_historical_reads = true;
+            self
+        }
+
+        /// Answers every `call_at` from the real block `real_block`, standing in
+        /// for the state of a long chain that anvil would take minutes to mine.
+        fn with_historical_reads_at(mut self, real_block: u64) -> Self {
+            self.historical_read_block = Some(real_block);
+            self
+        }
+
+        /// Answers every `call_at` from the real block `offset` below the one
+        /// asked for, apart from the reported head's offset.
+        fn with_historical_reads_shifted_by(mut self, offset: u64) -> Self {
+            self.historical_read_offset = Some(offset);
+            self
+        }
+
+        /// Returns a handle to the block the last `call_at` asked for
+        /// (`u64::MAX` until the first one).
+        fn requested_historical_block(&self) -> Arc<AtomicU64> {
+            Arc::clone(&self.requested_historical_block)
+        }
+
+        /// Fails the first `failing_head_reads` `get_block_number` calls.
+        fn with_failing_head_reads(self, failing_head_reads: u32) -> Self {
+            self.provider
+                .remaining_failing_head_reads
+                .store(failing_head_reads, Ordering::SeqCst);
+            self
+        }
+
+        /// Returns a handle to the lowest `from_block` any `get_logs` scan
+        /// asked for (`u64::MAX` until the first scan).
+        fn lowest_scanned_block(&self) -> Arc<AtomicU64> {
+            Arc::clone(&self.provider.lowest_from_block)
         }
     }
 
@@ -1855,7 +2036,54 @@ mod tests {
                 )));
             }
 
+            let should_answer_stale = self
+                .remaining_stale_unused_reads
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                    remaining.checked_sub(1)
+                })
+                .is_ok();
+
+            if should_answer_stale {
+                return Ok(Call::abi_decode_returns(&[0u8; 32]).unwrap());
+            }
+
             self.inner.call::<Registry, Call>(contract, call).await
+        }
+
+        /// Reads the real block `head_offset` below `block_number`, matching
+        /// the provider's shifted head, unless pinned to one real block.
+        async fn call_at<Registry: IntoErrorRegistry, Call: SolCall + Send>(
+            &self,
+            contract: Address,
+            call: Call,
+            block_number: u64,
+        ) -> Result<Call::Return, EvmError>
+        where
+            Self: Sized,
+        {
+            self.requested_historical_block
+                .store(block_number, Ordering::SeqCst);
+
+            if self.fail_historical_reads {
+                return Err(EvmError::Contract(ContractError::TransportError(
+                    RpcError::ErrorResp(ErrorPayload {
+                        code: -32000,
+                        message: Cow::Borrowed("missing trie node (synthetic pruned state)"),
+                        data: None,
+                    }),
+                )));
+            }
+
+            let offset = self
+                .historical_read_offset
+                .unwrap_or(self.provider.head_offset);
+            let real_block = self
+                .historical_read_block
+                .unwrap_or_else(|| block_number.saturating_sub(offset));
+
+            self.inner
+                .call_at::<Registry, Call>(contract, call, real_block)
+                .await
         }
     }
 
@@ -3645,7 +3873,7 @@ mod tests {
 
         // Before the mint the nonce is unconsumed, so there is nothing to recover.
         let before = bridge
-            .find_existing_mint(BridgeDirection::EthereumToBase, &message_with_nonce)
+            .find_existing_mint(BridgeDirection::EthereumToBase, &message_with_nonce, None)
             .await
             .unwrap();
         assert_eq!(
@@ -3665,7 +3893,7 @@ mod tests {
         // After the mint the nonce is consumed; recovery reconstructs the exact
         // receipt (tx + net amount + fee) from the on-chain events without re-minting.
         let recovered = bridge
-            .find_existing_mint(BridgeDirection::EthereumToBase, &message_with_nonce)
+            .find_existing_mint(BridgeDirection::EthereumToBase, &message_with_nonce, None)
             .await
             .unwrap()
             .expect("consumed nonce must report the existing mint");
@@ -3690,6 +3918,7 @@ mod tests {
             .find_existing_mint::<NoOpErrorRegistry>(
                 BridgeDirection::BaseToEthereum,
                 &message_with_nonce,
+                None,
             )
             .await
             .unwrap_err();
@@ -3719,6 +3948,7 @@ mod tests {
             .find_existing_mint::<NoOpErrorRegistry>(
                 BridgeDirection::EthereumToBase,
                 &mismatched_message,
+                None,
             )
             .await
             .unwrap_err();
@@ -4365,7 +4595,7 @@ mod tests {
     /// never be reconstructed (the `MessageReceived` log scan stays empty
     /// well past `SCAN_ATTEMPTS`) must still surface as
     /// `CctpError::MintRecoveryInconclusive`, not the raw
-    /// `AlreadyMintedMessageNotFound` that `reconstruct_existing_mint`
+    /// `MintNotFoundInScanWindow` that `reconstruct_existing_mint`
     /// produces once its own retries are exhausted. The mint is known to
     /// have landed -- the authoritative `usedNonces()` read already proved
     /// it -- so anything other than `MintRecoveryInconclusive` here would
@@ -4403,7 +4633,7 @@ mod tests {
         // MessageReceived backward scan) answers empty every time. 10 empty
         // scans exceeds evm.rs's SCAN_ATTEMPTS (5), so
         // reconstruct_existing_mint exhausts its own retries and returns
-        // AlreadyMintedMessageNotFound instead of ever finding the log.
+        // MintNotFoundInScanWindow instead of ever finding the log.
         let flaky_provider = ProviderBuilder::new()
             .connect(&cctp.base_endpoint)
             .await
@@ -4445,10 +4675,598 @@ mod tests {
         assert!(
             matches!(
                 *recovery_error,
-                CctpError::AlreadyMintedMessageNotFound { .. }
+                CctpError::MintNotFoundInScanWindow { from_block: 0, .. }
             ),
             "the wrapped recovery_error must be the exhausted-retries \
-             AlreadyMintedMessageNotFound; got: {recovery_error:?}"
+             MintNotFoundInScanWindow; got: {recovery_error:?}"
+        );
+    }
+
+    /// A nonce the chain reports consumed whose `MessageReceived` log the
+    /// queried node never returns (log-index lag, pruned logs) must not send
+    /// the resume lookup walking back to genesis on every redrive. The node
+    /// has no state at the floor, so the error falls back to its timestamp.
+    #[tokio::test]
+    async fn find_existing_mint_scan_stays_bounded_when_the_used_nonce_log_is_invisible() {
+        let cctp = LocalCctp::new().await.unwrap();
+        let bridge = cctp.create_bridge().await.unwrap();
+
+        let recipient = bridge.base.owner();
+        let amount = U256::from(1_300_000u64);
+
+        let burn_receipt = bridge
+            .burn_internal::<NoOpErrorRegistry>(BridgeDirection::EthereumToBase, amount, recipient)
+            .await
+            .unwrap();
+        let message = cctp
+            .extract_message_from_burn_tx(burn_receipt.tx, true)
+            .await
+            .unwrap();
+        let (attestation, message_with_nonce) = cctp.sign_message(&message).await.unwrap();
+
+        bridge
+            .mint_internal::<NoOpErrorRegistry>(
+                BridgeDirection::EthereumToBase,
+                message_with_nonce.clone(),
+                attestation,
+            )
+            .await
+            .unwrap();
+
+        // Three 20_000-block chunks of lookback; the reported head sits far
+        // above it, as on a real chain.
+        let lookback = 60_000;
+        let head_offset = 1_000_000;
+        let base_provider = ProviderBuilder::new()
+            .connect(&cctp.base_endpoint)
+            .await
+            .unwrap();
+        let real_head = base_provider.get_block_number().await.unwrap();
+        let head = real_head + head_offset;
+        // The provider reads a shifted block as the real one `head_offset`
+        // below it, down to genesis.
+        let floor_timestamp = base_provider
+            .get_block_by_number((head - lookback).saturating_sub(head_offset).into())
+            .await
+            .unwrap()
+            .unwrap()
+            .header
+            .timestamp;
+
+        let flaky_wallet = FlakyProbeWallet::new(
+            RawPrivateKeyWallet::new(&cctp.deployer_key, base_provider, 1).unwrap(),
+            FlakyProbeFailures {
+                call_failures: 0,
+                empty_log_scans: u32::MAX,
+            },
+            Arc::new(AtomicU32::new(0)),
+        )
+        .with_reported_head_offset(head_offset)
+        .with_failing_historical_reads();
+        let lowest_scanned_block = flaky_wallet.lowest_scanned_block();
+        let flaky_endpoint = CctpEndpoint::new(
+            cctp.base.usdc,
+            cctp.base.token_messenger,
+            cctp.base.message_transmitter,
+            flaky_wallet,
+        )
+        .with_node_sync_poll_interval(Duration::ZERO);
+
+        // No captured floor: a transfer attested before the floor existed.
+        let error = flaky_endpoint
+            .find_existing_mint::<NoOpErrorRegistry>(
+                BridgeDirection::EthereumToBase,
+                &message_with_nonce,
+                None,
+            )
+            .await
+            .unwrap_err();
+
+        let lowest = lowest_scanned_block.load(Ordering::SeqCst);
+        assert!(
+            lowest >= head - lookback,
+            "the scan must stop at the lookback floor {}, but it reached block {lowest}",
+            head - lookback,
+        );
+
+        let nonce = extract_nonce_from_message(&message_with_nonce).unwrap();
+        let CctpError::MintNotFoundInScanWindow {
+            nonce: error_nonce,
+            from_block,
+            floor_check,
+        } = error
+        else {
+            panic!("a consumed nonce outside the window must fail for reconciliation: {error:?}");
+        };
+        assert_eq!(error_nonce, nonce);
+        assert_eq!(from_block, head - lookback);
+        assert_eq!(
+            floor_check,
+            MintScanFloorCheck::Unverified {
+                from_block_timestamp: floor_timestamp
+            }
+        );
+
+        // A captured floor above the lookback floor scans down to the lookback
+        // floor, no further.
+        let captured_error = flaky_endpoint
+            .find_existing_mint::<NoOpErrorRegistry>(
+                BridgeDirection::EthereumToBase,
+                &message_with_nonce,
+                Some(head),
+            )
+            .await
+            .unwrap_err();
+
+        let CctpError::MintNotFoundInScanWindow { from_block, .. } = captured_error else {
+            panic!("a consumed nonce outside the window must fail: {captured_error:?}");
+        };
+        assert_eq!(from_block, head - lookback);
+        assert!(lowest_scanned_block.load(Ordering::SeqCst) >= head - lookback);
+
+        // A captured floor below the lookback floor wins, less its 300-block
+        // margin: a transfer older than the lookback can still find its own mint.
+        let old_floor = head - lookback - 10_000;
+        let old_floor_error = flaky_endpoint
+            .find_existing_mint::<NoOpErrorRegistry>(
+                BridgeDirection::EthereumToBase,
+                &message_with_nonce,
+                Some(old_floor),
+            )
+            .await
+            .unwrap_err();
+
+        let CctpError::MintNotFoundInScanWindow { from_block, .. } = old_floor_error else {
+            panic!("a consumed nonce outside the window must fail: {old_floor_error:?}");
+        };
+        assert_eq!(from_block, old_floor - 300);
+        assert_eq!(lowest_scanned_block.load(Ordering::SeqCst), old_floor - 300);
+    }
+
+    /// A transfer older than the lookback has a floor mined after it started,
+    /// so the floor's age cannot place its mint. The nonce read unused below
+    /// the floor does: the mint is in the window and the missing log is lag.
+    #[tokio::test]
+    async fn find_existing_mint_places_the_mint_in_the_window_when_unused_below_the_floor() {
+        let cctp = LocalCctp::new().await.unwrap();
+        let bridge = cctp.create_bridge().await.unwrap();
+
+        let recipient = bridge.base.owner();
+        let amount = U256::from(1_900_000u64);
+        let before_burn = bridge.base.current_block().await.unwrap();
+
+        let burn_receipt = bridge
+            .burn_internal::<NoOpErrorRegistry>(BridgeDirection::EthereumToBase, amount, recipient)
+            .await
+            .unwrap();
+        let message = cctp
+            .extract_message_from_burn_tx(burn_receipt.tx, true)
+            .await
+            .unwrap();
+        let (attestation, message_with_nonce) = cctp.sign_message(&message).await.unwrap();
+
+        bridge
+            .mint_internal::<NoOpErrorRegistry>(
+                BridgeDirection::EthereumToBase,
+                message_with_nonce.clone(),
+                attestation,
+            )
+            .await
+            .unwrap();
+
+        // The floor block's state is the real one before the burn, where the
+        // contracts exist and the nonce is unused.
+        let head_offset = 1_000_000;
+        let base_provider = ProviderBuilder::new()
+            .connect(&cctp.base_endpoint)
+            .await
+            .unwrap();
+        let head = base_provider.get_block_number().await.unwrap() + head_offset;
+        let flaky_wallet = FlakyProbeWallet::new(
+            RawPrivateKeyWallet::new(&cctp.deployer_key, base_provider, 1).unwrap(),
+            FlakyProbeFailures {
+                call_failures: 0,
+                empty_log_scans: u32::MAX,
+            },
+            Arc::new(AtomicU32::new(0)),
+        )
+        .with_reported_head_offset(head_offset)
+        .with_historical_reads_at(before_burn);
+        let requested_historical_block = flaky_wallet.requested_historical_block();
+        let flaky_endpoint = CctpEndpoint::new(
+            cctp.base.usdc,
+            cctp.base.token_messenger,
+            cctp.base.message_transmitter,
+            flaky_wallet,
+        )
+        .with_node_sync_poll_interval(Duration::ZERO);
+
+        let error = flaky_endpoint
+            .find_existing_mint::<NoOpErrorRegistry>(
+                BridgeDirection::EthereumToBase,
+                &message_with_nonce,
+                None,
+            )
+            .await
+            .unwrap_err();
+
+        let CctpError::MintNotFoundInScanWindow {
+            from_block,
+            floor_check,
+            ..
+        } = error
+        else {
+            panic!("a consumed nonce with no visible log must name its floor: {error:?}");
+        };
+        assert_eq!(from_block, head - 60_000);
+        assert_eq!(floor_check, MintScanFloorCheck::MintInScanWindow);
+        assert_eq!(
+            requested_historical_block.load(Ordering::SeqCst),
+            from_block - 1,
+            "the nonce must be read at the block below the floor"
+        );
+    }
+
+    /// A nonce already used below the floor places the mint below the scan
+    /// window, which no redrive widens.
+    #[tokio::test]
+    async fn find_existing_mint_places_the_mint_below_the_floor_when_used_below_it() {
+        let cctp = LocalCctp::new().await.unwrap();
+        let bridge = cctp.create_bridge().await.unwrap();
+
+        let recipient = bridge.base.owner();
+        let amount = U256::from(2_100_000u64);
+
+        let burn_receipt = bridge
+            .burn_internal::<NoOpErrorRegistry>(BridgeDirection::EthereumToBase, amount, recipient)
+            .await
+            .unwrap();
+        let message = cctp
+            .extract_message_from_burn_tx(burn_receipt.tx, true)
+            .await
+            .unwrap();
+        let (attestation, message_with_nonce) = cctp.sign_message(&message).await.unwrap();
+
+        bridge
+            .mint_internal::<NoOpErrorRegistry>(
+                BridgeDirection::EthereumToBase,
+                message_with_nonce.clone(),
+                attestation,
+            )
+            .await
+            .unwrap();
+
+        // The floor block's state is the real one after the mint, which the
+        // lookback leaves below the scan.
+        let base_provider = ProviderBuilder::new()
+            .connect(&cctp.base_endpoint)
+            .await
+            .unwrap();
+        let after_mint = base_provider.get_block_number().await.unwrap();
+
+        let flaky_wallet = FlakyProbeWallet::new(
+            RawPrivateKeyWallet::new(&cctp.deployer_key, base_provider, 1).unwrap(),
+            FlakyProbeFailures {
+                call_failures: 0,
+                empty_log_scans: u32::MAX,
+            },
+            Arc::new(AtomicU32::new(0)),
+        )
+        .with_reported_head_offset(1_000_000)
+        .with_historical_reads_at(after_mint);
+        let flaky_endpoint = CctpEndpoint::new(
+            cctp.base.usdc,
+            cctp.base.token_messenger,
+            cctp.base.message_transmitter,
+            flaky_wallet,
+        )
+        .with_node_sync_poll_interval(Duration::ZERO);
+
+        let error = flaky_endpoint
+            .find_existing_mint::<NoOpErrorRegistry>(
+                BridgeDirection::EthereumToBase,
+                &message_with_nonce,
+                None,
+            )
+            .await
+            .unwrap_err();
+
+        let CctpError::MintNotFoundInScanWindow { floor_check, .. } = error else {
+            panic!("a mint below the lookback must name its floor: {error:?}");
+        };
+        assert_eq!(floor_check, MintScanFloorCheck::MintBelowScanFloor);
+    }
+
+    /// Burns name no destination caller, so a relayer can mint between Circle
+    /// completing the attestation and the bot capturing its scan floor.
+    #[tokio::test]
+    async fn find_existing_mint_finds_a_mint_that_landed_below_the_captured_floor() {
+        let cctp = LocalCctp::new().await.unwrap();
+        let bridge = cctp.create_bridge().await.unwrap();
+
+        let recipient = bridge.base.owner();
+        let amount = U256::from(1_700_000u64);
+
+        let burn_receipt = bridge
+            .burn_internal::<NoOpErrorRegistry>(BridgeDirection::EthereumToBase, amount, recipient)
+            .await
+            .unwrap();
+        let message = cctp
+            .extract_message_from_burn_tx(burn_receipt.tx, true)
+            .await
+            .unwrap();
+        let (attestation, message_with_nonce) = cctp.sign_message(&message).await.unwrap();
+
+        let mint_receipt = bridge
+            .mint_internal::<NoOpErrorRegistry>(
+                BridgeDirection::EthereumToBase,
+                message_with_nonce.clone(),
+                attestation,
+            )
+            .await
+            .unwrap();
+
+        let base_provider = ProviderBuilder::new()
+            .connect(&cctp.base_endpoint)
+            .await
+            .unwrap();
+        base_provider.anvil_mine(Some(5), None).await.unwrap();
+        let floor_above_mint = bridge.base.current_block().await.unwrap();
+
+        let recovered = bridge
+            .base
+            .find_existing_mint::<NoOpErrorRegistry>(
+                BridgeDirection::EthereumToBase,
+                &message_with_nonce,
+                Some(floor_above_mint),
+            )
+            .await
+            .unwrap()
+            .expect("a consumed nonce minted just below the floor must be found");
+
+        assert_eq!(recovered.tx, mint_receipt.tx);
+        assert_eq!(recovered.amount, mint_receipt.amount);
+    }
+
+    /// A relayer can mint just before the bot captures its floor. A transfer
+    /// resumed after the lookback has passed that floor must still place the
+    /// mint in the scan window, not below it.
+    #[tokio::test]
+    async fn find_existing_mint_places_a_mint_just_below_an_old_captured_floor_in_the_window() {
+        let cctp = LocalCctp::new().await.unwrap();
+        let bridge = cctp.create_bridge().await.unwrap();
+
+        let recipient = bridge.base.owner();
+        let amount = U256::from(1_800_000u64);
+
+        // Room below the burn for a real block that holds the contracts.
+        let base_provider = ProviderBuilder::new()
+            .connect(&cctp.base_endpoint)
+            .await
+            .unwrap();
+        base_provider.anvil_mine(Some(400), None).await.unwrap();
+
+        let burn_receipt = bridge
+            .burn_internal::<NoOpErrorRegistry>(BridgeDirection::EthereumToBase, amount, recipient)
+            .await
+            .unwrap();
+        let message = cctp
+            .extract_message_from_burn_tx(burn_receipt.tx, true)
+            .await
+            .unwrap();
+        let (attestation, message_with_nonce) = cctp.sign_message(&message).await.unwrap();
+
+        bridge
+            .mint_internal::<NoOpErrorRegistry>(
+                BridgeDirection::EthereumToBase,
+                message_with_nonce.clone(),
+                attestation,
+            )
+            .await
+            .unwrap();
+        let after_mint = base_provider.get_block_number().await.unwrap();
+
+        // The captured floor sits below the three 20_000-block lookback chunks,
+        // and the block just below it reads as the real block holding the mint.
+        let head_offset = 1_000_000;
+        let head = after_mint + head_offset;
+        let captured = head - 60_000 - 10_000;
+        let flaky_wallet = FlakyProbeWallet::new(
+            RawPrivateKeyWallet::new(&cctp.deployer_key, base_provider, 1).unwrap(),
+            FlakyProbeFailures {
+                call_failures: 0,
+                empty_log_scans: u32::MAX,
+            },
+            Arc::new(AtomicU32::new(0)),
+        )
+        .with_reported_head_offset(head_offset)
+        .with_historical_reads_shifted_by(captured - 1 - after_mint);
+        let requested_historical_block = flaky_wallet.requested_historical_block();
+        let flaky_endpoint = CctpEndpoint::new(
+            cctp.base.usdc,
+            cctp.base.token_messenger,
+            cctp.base.message_transmitter,
+            flaky_wallet,
+        )
+        .with_node_sync_poll_interval(Duration::ZERO);
+
+        let error = flaky_endpoint
+            .find_existing_mint::<NoOpErrorRegistry>(
+                BridgeDirection::EthereumToBase,
+                &message_with_nonce,
+                Some(captured),
+            )
+            .await
+            .unwrap_err();
+
+        let CctpError::MintNotFoundInScanWindow {
+            from_block,
+            floor_check,
+            ..
+        } = error
+        else {
+            panic!("a consumed nonce with no visible log must name its floor: {error:?}");
+        };
+        assert_eq!(from_block, captured - 300);
+        assert_eq!(floor_check, MintScanFloorCheck::MintInScanWindow);
+        assert_eq!(
+            requested_historical_block.load(Ordering::SeqCst),
+            captured - 301
+        );
+    }
+
+    /// One `usedNonces()` read can come from a node behind the block that holds
+    /// the mint, so a single "unused" answer must not decide the nonce is
+    /// unused: that answer latches `BridgingFailed` on funds already minted.
+    #[tokio::test]
+    async fn mint_nonce_consumed_reads_past_a_lagging_unused_answer() {
+        let cctp = LocalCctp::new().await.unwrap();
+        let bridge = cctp.create_bridge().await.unwrap();
+
+        let recipient = bridge.base.owner();
+        let amount = U256::from(1_400_000u64);
+
+        let burn_receipt = bridge
+            .burn_internal::<NoOpErrorRegistry>(BridgeDirection::EthereumToBase, amount, recipient)
+            .await
+            .unwrap();
+        let message = cctp
+            .extract_message_from_burn_tx(burn_receipt.tx, true)
+            .await
+            .unwrap();
+        let (attestation, message_with_nonce) = cctp.sign_message(&message).await.unwrap();
+
+        bridge
+            .mint_internal::<NoOpErrorRegistry>(
+                BridgeDirection::EthereumToBase,
+                message_with_nonce.clone(),
+                attestation,
+            )
+            .await
+            .unwrap();
+
+        let ethereum_provider = ProviderBuilder::new()
+            .connect(&cctp.ethereum_endpoint)
+            .await
+            .unwrap();
+        let ethereum = CctpEndpoint::new(
+            cctp.ethereum.usdc,
+            cctp.ethereum.token_messenger,
+            cctp.ethereum.message_transmitter,
+            RawPrivateKeyWallet::new(&cctp.deployer_key, ethereum_provider, 1).unwrap(),
+        )
+        .with_node_sync_poll_interval(Duration::ZERO);
+        let base_provider = ProviderBuilder::new()
+            .connect(&cctp.base_endpoint)
+            .await
+            .unwrap();
+        let lagging_base = CctpEndpoint::new(
+            cctp.base.usdc,
+            cctp.base.token_messenger,
+            cctp.base.message_transmitter,
+            FlakyProbeWallet::new(
+                RawPrivateKeyWallet::new(&cctp.deployer_key, base_provider, 1).unwrap(),
+                FlakyProbeFailures::default(),
+                Arc::new(AtomicU32::new(0)),
+            )
+            .with_stale_unused_reads(1),
+        )
+        .with_node_sync_poll_interval(Duration::ZERO)
+        .with_mint_recovery_config(MintRecoveryConfig {
+            probe_interval: Duration::from_millis(5),
+            probes: NonZeroU32::new(3).unwrap(),
+        });
+        let lagging_bridge = CctpBridge::new(ethereum, lagging_base).unwrap();
+
+        let nonce = extract_nonce_from_message(&message_with_nonce).unwrap();
+        let consumed = lagging_bridge
+            .mint_nonce_consumed(BridgeDirection::EthereumToBase, nonce)
+            .await
+            .unwrap();
+
+        assert!(
+            consumed,
+            "a lagging node's unused answer must not hide a landed mint"
+        );
+    }
+
+    /// A failed head read leaves the reconstruction scan without a floor, so
+    /// it must redrive instead of walking the log index back to genesis.
+    #[tokio::test]
+    async fn recover_already_minted_never_scans_without_a_floor_when_the_head_read_fails() {
+        let cctp = LocalCctp::new().await.unwrap();
+        let bridge = cctp.create_bridge().await.unwrap();
+
+        let recipient = bridge.base.owner();
+        let amount = U256::from(1_200_000u64);
+
+        let burn_receipt = bridge
+            .burn_internal::<NoOpErrorRegistry>(BridgeDirection::EthereumToBase, amount, recipient)
+            .await
+            .unwrap();
+        let message = cctp
+            .extract_message_from_burn_tx(burn_receipt.tx, true)
+            .await
+            .unwrap();
+        let (attestation, message_with_nonce) = cctp.sign_message(&message).await.unwrap();
+
+        bridge
+            .mint_internal::<NoOpErrorRegistry>(
+                BridgeDirection::EthereumToBase,
+                message_with_nonce.clone(),
+                attestation,
+            )
+            .await
+            .unwrap();
+
+        let flaky_provider = ProviderBuilder::new()
+            .connect(&cctp.base_endpoint)
+            .await
+            .unwrap();
+        let flaky_wallet = FlakyProbeWallet::new(
+            RawPrivateKeyWallet::new(&cctp.deployer_key, flaky_provider, 1).unwrap(),
+            FlakyProbeFailures {
+                call_failures: 0,
+                empty_log_scans: u32::MAX,
+            },
+            Arc::new(AtomicU32::new(0)),
+        )
+        .with_failing_head_reads(1);
+        let lowest_scanned_block = flaky_wallet.lowest_scanned_block();
+        let flaky_endpoint = CctpEndpoint::new(
+            cctp.base.usdc,
+            cctp.base.token_messenger,
+            cctp.base.message_transmitter,
+            flaky_wallet,
+        )
+        .with_node_sync_poll_interval(Duration::ZERO)
+        .with_mint_recovery_config(MintRecoveryConfig {
+            probe_interval: Duration::from_millis(5),
+            probes: NonZeroU32::new(1).unwrap(),
+        });
+
+        let error = flaky_endpoint
+            .recover_already_minted::<NoOpErrorRegistry>(
+                BridgeDirection::EthereumToBase,
+                &message_with_nonce,
+                EvmError::Reverted {
+                    tx_hash: TxHash::repeat_byte(0xEE),
+                },
+            )
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            lowest_scanned_block.load(Ordering::SeqCst),
+            u64::MAX,
+            "no log scan may run without a floor"
+        );
+        let CctpError::MintRecoveryInconclusive { recovery_error } = error else {
+            panic!("a failed head read must redrive; got: {error:?}");
+        };
+        assert!(
+            matches!(*recovery_error, CctpError::RpcTransport(_)),
+            "got: {recovery_error:?}"
         );
     }
 
@@ -4574,7 +5392,11 @@ mod tests {
 
         let error = bridge
             .base
-            .find_existing_mint::<NoOpErrorRegistry>(BridgeDirection::EthereumToBase, &raw_message)
+            .find_existing_mint::<NoOpErrorRegistry>(
+                BridgeDirection::EthereumToBase,
+                &raw_message,
+                None,
+            )
             .await
             .unwrap_err();
 
@@ -5102,117 +5924,76 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn find_recent_mint_returns_receipt_of_real_mint() {
+    async fn find_attested_mint_returns_only_the_mint_of_its_own_nonce() {
         let cctp = LocalCctp::new().await.unwrap();
         let bridge = cctp.create_bridge().await.unwrap();
 
         let recipient = bridge.ethereum.owner();
         let burn_amount = U256::from(5_000_000u64);
 
-        // Capture the destination (Ethereum) head before minting, exactly as the
-        // resume path does via `Bridge::destination_block`.
-        let from_block = bridge
+        let mut attestations = Vec::new();
+        for _ in 0..2 {
+            let burn_receipt = bridge
+                .burn_internal::<NoOpErrorRegistry>(
+                    BridgeDirection::BaseToEthereum,
+                    burn_amount,
+                    recipient,
+                )
+                .await
+                .unwrap();
+            let message = cctp
+                .extract_message_from_burn_tx(burn_receipt.tx, false)
+                .await
+                .unwrap();
+            let (attestation, message_with_nonce) = cctp.sign_message(&message).await.unwrap();
+            attestations
+                .push(AttestationResponse::from_parts(message_with_nonce, attestation).unwrap());
+        }
+        let [minted, unminted] = <[AttestationResponse; 2]>::try_from(attestations).unwrap();
+
+        let scan_from_block = bridge
             .destination_block(BridgeDirection::BaseToEthereum)
             .await
             .unwrap();
 
-        let burn_receipt = bridge
-            .burn_internal::<NoOpErrorRegistry>(
-                BridgeDirection::BaseToEthereum,
-                burn_amount,
-                recipient,
-            )
-            .await
-            .unwrap();
-
-        let message = cctp
-            .extract_message_from_burn_tx(burn_receipt.tx, false)
-            .await
-            .unwrap();
-
-        let (attestation, message_with_nonce) = cctp.sign_message(&message).await.unwrap();
-
         let mint_receipt = bridge
             .mint_internal::<NoOpErrorRegistry>(
                 BridgeDirection::BaseToEthereum,
-                message_with_nonce,
-                attestation,
+                minted.message.clone(),
+                minted.attestation.clone(),
             )
             .await
             .unwrap();
 
         let found = bridge
-            .find_recent_mint(BridgeDirection::BaseToEthereum, recipient, from_block)
+            .find_attested_mint(
+                BridgeDirection::BaseToEthereum,
+                &minted,
+                Some(scan_from_block),
+            )
             .await
             .unwrap()
-            .expect("scan must find the submitted mint");
+            .expect("the minted nonce must resolve to its mint");
+        assert_eq!(found.tx, mint_receipt.tx);
+        assert_eq!(found.amount, mint_receipt.amount);
+        assert_eq!(found.fee, mint_receipt.fee_collected);
 
-        assert_eq!(
-            found.tx, mint_receipt.tx,
-            "scan must return the real mint's tx"
-        );
-        assert_eq!(
-            found.amount, mint_receipt.amount,
-            "adopted amount must match the mint",
-        );
-        assert_eq!(
-            found.fee, mint_receipt.fee_collected,
-            "adopted fee must match the mint",
-        );
-    }
-
-    #[tokio::test]
-    async fn find_recent_mint_returns_none_for_wrong_recipient_or_below_scan_bound() {
-        let cctp = LocalCctp::new().await.unwrap();
-        let bridge = cctp.create_bridge().await.unwrap();
-
-        let recipient = bridge.ethereum.owner();
-        let burn_amount = U256::from(5_000_000u64);
-
-        let from_block = bridge
-            .destination_block(BridgeDirection::BaseToEthereum)
-            .await
-            .unwrap();
-
-        let burn_receipt = bridge
-            .burn_internal::<NoOpErrorRegistry>(
-                BridgeDirection::BaseToEthereum,
-                burn_amount,
-                recipient,
-            )
-            .await
-            .unwrap();
-
-        let message = cctp
-            .extract_message_from_burn_tx(burn_receipt.tx, false)
-            .await
-            .unwrap();
-
-        let (attestation, message_with_nonce) = cctp.sign_message(&message).await.unwrap();
-
-        bridge
-            .mint_internal::<NoOpErrorRegistry>(
-                BridgeDirection::BaseToEthereum,
-                message_with_nonce,
-                attestation,
-            )
-            .await
-            .unwrap();
-
-        let other_recipient = address!("0x000000000000000000000000000000000000dEaD");
-
+        // Same recipient, same amount, later block: still not this nonce's mint.
         assert_eq!(
             bridge
-                .find_recent_mint(BridgeDirection::BaseToEthereum, other_recipient, from_block)
+                .find_attested_mint(
+                    BridgeDirection::BaseToEthereum,
+                    &unminted,
+                    Some(scan_from_block),
+                )
                 .await
                 .unwrap(),
             None,
-            "a mint to a different recipient must not be adopted",
         );
 
-        // Advance the Ethereum head past the mint with an unrelated burn, then
-        // scan from the new head: the mint now sits below the scan bound and must
-        // not be adopted (as a prior transfer's mint would be excluded on resume).
+        // A relayer can mint before the floor is captured: advance the Ethereum
+        // head past the mint and scan from it; the bounded lookback still
+        // reaches the mint.
         bridge
             .burn_internal::<NoOpErrorRegistry>(
                 BridgeDirection::EthereumToBase,
@@ -5221,20 +6002,21 @@ mod tests {
             )
             .await
             .unwrap();
-
         let head_above_mint = bridge
             .destination_block(BridgeDirection::BaseToEthereum)
             .await
             .unwrap();
 
-        assert_eq!(
-            bridge
-                .find_recent_mint(BridgeDirection::BaseToEthereum, recipient, head_above_mint)
-                .await
-                .unwrap(),
-            None,
-            "a mint below the scan bound must not be adopted",
-        );
+        let found_below_floor = bridge
+            .find_attested_mint(
+                BridgeDirection::BaseToEthereum,
+                &minted,
+                Some(head_above_mint),
+            )
+            .await
+            .unwrap()
+            .expect("a mint below the captured floor but inside the lookback must be found");
+        assert_eq!(found_below_floor.tx, mint_receipt.tx);
     }
 
     #[tokio::test]
@@ -5312,9 +6094,8 @@ mod tests {
             "a transfer whose value differs must not be adopted",
         );
 
-        // Scanning from a bound above the send's block excludes it (mirroring the
-        // find_recent_mint below-bound exclusion); the head is already far enough
-        // past `above_block` for the absence to resolve to None.
+        // Scanning from a bound above the send's block excludes it; the head is
+        // already far enough past `above_block` for the absence to resolve to None.
         assert_eq!(
             bridge
                 .find_recent_usdc_transfer(sender, recipient, amount, above_block)
