@@ -3920,13 +3920,15 @@ already-submitted action instead of re-issuing it:
   post-burn `BridgingFailed` recovery scans no wider; if that recovery runs
   again (a restart) and cannot find the mint of a used nonce, it applies the
   same floor rule: it redrives when the rule places the mint inside its scan,
-  and otherwise pages the same way and stops. A message that can never mint
-  pages only for AlpacaToBase, with "the recorded CCTP message cannot mint on
-  Base" (the nonce is not read, so the operator gets the attestation for the
-  burn tx and mints it); an AlpacaToBase retry finds the transfer failed and
-  does not alert. That BaseToAlpaca latch does not page: its recovery re-polls
-  Circle and may still mint and send the deposit, and the job's dead-letter
-  alert covers a give-up. Other lookup failures redrive.
+  and otherwise pages the same way and stops. A recovery that finds the mint but
+  cannot adopt it pages the same way and stops too, so a later re-poll cannot
+  adopt a relayer mint and send the USDC to Alpaca after the operator did. A
+  message that can never mint pages only for AlpacaToBase, with "the recorded
+  CCTP message cannot mint on Base" (the nonce is not read, so the operator gets
+  the attestation for the burn tx and mints it); an AlpacaToBase retry finds the
+  transfer failed and does not alert. That BaseToAlpaca latch does not page: its
+  recovery re-polls Circle and may still mint and send the deposit, and the
+  job's dead-letter alert covers a give-up. Other lookup failures redrive.
 
 ##### Commands
 

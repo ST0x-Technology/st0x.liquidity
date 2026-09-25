@@ -671,11 +671,15 @@ stox transfer reconcile --kind redemption --id <redemption-aggregate-id> \
   reconcile with `--kind usdc`. A BaseToAlpaca `BridgingFailed` recovery (for
   example after a restart) that reads the nonce used but cannot find its mint
   applies the same floor rule: it redrives while the rule places the mint inside
-  its scan, and otherwise pages the same way and stops. The legacy re-poll latch
-  pages with the same text for AlpacaToBase only. A BaseToAlpaca latch for the
-  legacy re-poll, or for a message that can never mint, does not page: its retry
-  may still adopt or mint and send the deposit, so do not move the funds by hand
-  while it retries; the job's dead-letter alert says when it gave up.
+  its scan, and otherwise pages the same way and stops. One that finds the mint
+  but cannot adopt it also pages the same way and stops, so it never adopts a
+  relayer mint and sends the USDC to Alpaca after you did. After a manual send
+  to Alpaca, run `transfer reconcile --kind usdc` right away: until then every
+  restart re-runs the recovery. The legacy re-poll latch pages with the same
+  text for AlpacaToBase only. A BaseToAlpaca latch for the legacy re-poll, or
+  for a message that can never mint, does not page: its retry may still adopt or
+  mint and send the deposit, so do not move the funds by hand while it retries;
+  the job's dead-letter alert says when it gave up.
 - An `AlpacaToBase` transfer whose Circle attestation poll fails hard (or, for a
   legacy `Attested` transfer, whose re-poll fails with the nonce unused) is
   marked `BridgingFailed` and pages with "the burned USDC cannot be minted

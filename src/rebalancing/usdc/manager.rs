@@ -512,15 +512,23 @@ fn repeating_mint_failure(
     }
 }
 
-/// Whether an inconclusive mint recovery read the nonce used but found no
-/// `MessageReceived` log in a bounded scan whose floor the mint can lie
-/// below. No retry scans wider, so the caller parks; every other cause may
-/// clear on a redrive.
-fn recovery_mint_outside_scan(recovery_error: &CctpError, initiated_at: DateTime<Utc>) -> bool {
+/// Why an inconclusive mint recovery parks instead of redriving: the nonce
+/// reads used, but its mint is outside the bounded scan (no retry scans
+/// wider) or cannot be adopted (a later re-poll could adopt a relayer mint
+/// after the operator settled by hand). Every other cause may clear on a
+/// redrive.
+fn recovery_park_reason(
+    recovery_error: &CctpError,
+    initiated_at: DateTime<Utc>,
+) -> Option<&'static str> {
     match repeating_mint_failure(recovery_error, initiated_at) {
-        Some(RepeatingMintFailure::MintOutsideScanWindow) => true,
-        Some(RepeatingMintFailure::MessageCannotMint | RepeatingMintFailure::MintNotAdoptable)
-        | None => false,
+        Some(RepeatingMintFailure::MintOutsideScanWindow) => {
+            Some("nonce used, mint outside the recovery scan")
+        }
+        Some(RepeatingMintFailure::MintNotAdoptable) => {
+            Some("nonce used, its mint cannot be adopted")
+        }
+        Some(RepeatingMintFailure::MessageCannotMint) | None => None,
     }
 }
 
@@ -3846,8 +3854,9 @@ impl<
     /// `BridgingFailed` is still surfaced for manual reconciliation. When an
     /// attestation was recorded, the re-polled nonce must be `cctp_nonce`: a
     /// mismatch is refused on every retry, never minted. A used nonce whose mint
-    /// can lie below the recovery scan's floor pages and parks for
-    /// reconciliation; under a floor that covers the transfer it redrives.
+    /// can lie below the recovery scan's floor, or cannot be adopted, pages and
+    /// parks for reconciliation; under a floor that covers the transfer a
+    /// missing log redrives.
     async fn recover_from_bridging_failed(
         &self,
         id: &UsdcRebalanceId,
@@ -3919,11 +3928,11 @@ impl<
             .await
         {
             Ok(receipt) => receipt,
-            // The nonce is used but its mint is not in the scan after the lag
-            // retries, and the floor was mined after the transfer started:
-            // the Attested resume's out-of-window case. No retry scans wider,
-            // so page once per run and park instead of redriving. Under an
-            // older floor the log is index lag and redrives below.
+            // The nonce is used but its mint is outside the scan (floor mined
+            // after the transfer started) or cannot be adopted: the Attested
+            // resume's latch cases. Page once per run and park; a redrive
+            // could adopt a relayer mint after the operator settled by hand.
+            // Under an older floor a missing log is index lag and redrives.
             //
             // Any other inconclusive recovery mirrors the same arm in
             // `execute_cctp_mint`/`execute_cctp_mint_on_ethereum`: whether/how
@@ -3941,14 +3950,11 @@ impl<
             // scan is bounded by `RECONSTRUCTION_SCAN_LOOKBACK_CHUNKS` on the
             // bridge side.
             Err(CctpError::MintRecoveryInconclusive { recovery_error }) => {
-                let outside_scan = recovery_mint_outside_scan(&recovery_error, initiated_at);
+                let park_reason = recovery_park_reason(&recovery_error, initiated_at);
                 let error = CctpError::MintRecoveryInconclusive { recovery_error };
-                if outside_scan {
-                    warn!(target: "rebalance", %id, "Mint of the used nonce is outside the recovery scan; parking for operator reconciliation: {error}");
-                    alert_unresolvable_mint(
-                        id,
-                        &format!("nonce used, mint outside the recovery scan: {error}"),
-                    );
+                if let Some(park_reason) = park_reason {
+                    warn!(target: "rebalance", %id, "{park_reason}; parking for operator reconciliation: {error}");
+                    alert_unresolvable_mint(id, &format!("{park_reason}: {error}"));
                     return Err(UsdcTransferError::PreviouslyFailedAggregate { id: id.clone() });
                 }
 
