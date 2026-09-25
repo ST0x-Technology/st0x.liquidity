@@ -5028,10 +5028,25 @@ pub async fn account_for_onchain_fill(
             }
         };
 
+    let in_position = position_fill_already_recorded(pool, trade.symbol.base(), &trade_id).await?;
+
     // Excluded while trading was disabled, then interrupted before its
     // marker: the `skipped_fills` record already tells the operator to cover
     // the delta by hand, so finish the exclusion instead of hedging it too.
+    // Unless a concurrent hedged run already put the fill in `Position`: then
+    // it is hedged, and excluding it too would classify it both ways. Finish
+    // it as hedged and log the conflict, like a later delivery does, rather
+    // than failing every redelivery of a fill that is never acknowledged.
     if let Some(detail) = recorded_trading_disabled_detail(pool, trade).await? {
+        if in_position {
+            error!(
+                ?trade_id,
+                %detail,
+                "Fill is both in the hedged position and recorded as excluded from hedging; \
+                 finishing it as hedged, so it must not also be covered by hand. Reconcile it"
+            );
+            return Ok(FillAccountingOutcome::Accounted { trade_id });
+        }
         execute_mark_excluded(onchain_trade, &trade_id).await?;
         warn!(
             ?trade_id,
@@ -5042,7 +5057,7 @@ pub async fn account_for_onchain_fill(
         return Ok(FillAccountingOutcome::ExcludedFromHedging { detail });
     }
 
-    if !position_fill_already_recorded(pool, trade.symbol.base(), &trade_id).await? {
+    if !in_position {
         execute_acknowledge_fill(position, trade, threshold, block_timestamp).await?;
     }
 
@@ -12187,6 +12202,80 @@ mod tests {
             uncovered.is_empty(),
             "a fill the bot hedges must not be listed as owed a cover"
         );
+    }
+
+    /// A hedged run applied the fill to `Position` and crashed before its
+    /// marker while a concurrent excluded run recorded it as trading disabled:
+    /// the redrive finishes it as hedged instead of also excluding it, and
+    /// does not apply it twice.
+    #[tokio::test]
+    async fn unmarked_fill_in_position_with_a_disabled_record_finishes_as_hedged() {
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let (frameworks, _offchain_order_projection) = create_cqrs_frameworks(&pool).await;
+        let (cqrs, _assets) = trade_processing_cqrs_with_threshold(
+            &frameworks,
+            &pool,
+            ExecutionThreshold::whole_share(),
+            &apalis_pool,
+        );
+        let trade_event = make_trade_event(60);
+        let trade = test_trade_with_amount(float!(1.5), 60);
+        let trade_id = OnChainTradeId {
+            chain: trade.chain,
+            tx_hash: trade.tx_hash,
+            log_index: trade.log_index,
+        };
+        execute_witness_trade(
+            &cqrs.onchain_trade,
+            &trade,
+            trade_event.block_number,
+            trade.block_timestamp.unwrap(),
+        )
+        .await
+        .unwrap();
+        execute_acknowledge_fill(
+            &cqrs.position,
+            &trade,
+            cqrs.execution_threshold,
+            trade.block_timestamp.unwrap(),
+        )
+        .await
+        .unwrap();
+        record_skipped_fill(
+            &pool,
+            trade.chain,
+            trade.tx_hash,
+            trade.log_index,
+            "ClearV3",
+            SkipReason::TradingDisabled,
+            "cover by SELL 1.5 AAPL",
+        )
+        .await
+        .unwrap();
+
+        let outcome = account_for_onchain_fill(
+            &pool,
+            &cqrs.onchain_trade,
+            &cqrs.position,
+            &trade,
+            trade_event.block_number,
+            cqrs.execution_threshold,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(outcome, FillAccountingOutcome::Accounted { .. }));
+
+        let state = cqrs.onchain_trade.load(&trade_id).await.unwrap().unwrap();
+        assert!(
+            !state.is_excluded(),
+            "a fill in the position must not be excluded too"
+        );
+        let (filled,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM events WHERE event_type = ?")
+            .bind(PositionEvent::ON_CHAIN_ORDER_FILLED_EVENT_TYPE)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(filled, 1, "the fill must not be applied twice");
     }
 
     /// The mirror ordering: a concurrent excluded run marked the fill first,

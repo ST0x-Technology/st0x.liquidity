@@ -281,9 +281,11 @@ pub(crate) async fn uncovered_excluded_fills(
 }
 
 /// Pushes an `EXISTS` test that `Position` holds the skipped fill (alias
-/// `skipped`), bound to the same aggregate and event type as
-/// [`crate::conductor::position_fill_already_recorded`]: such a fill is hedged
-/// by the bot, so it is never owed a manual cover.
+/// `skipped`, joined to its `trade_view`), bound to the same aggregate and
+/// event type as [`crate::conductor::position_fill_already_recorded`]: such a
+/// fill is hedged by the bot, so it is never owed a manual cover. The
+/// aggregate is the fill's symbol, which keeps the lookup on the event store
+/// index; a fill with no trade view has no symbol and so never matches.
 fn push_fill_in_position(query: &mut sqlx::QueryBuilder<sqlx::Sqlite>) {
     query
         .push(
@@ -291,7 +293,11 @@ fn push_fill_in_position(query: &mut sqlx::QueryBuilder<sqlx::Sqlite>) {
              WHERE position_event.aggregate_type = ",
         )
         .push_bind(crate::position::Position::AGGREGATE_TYPE)
-        .push(" AND position_event.event_type = ")
+        .push(
+            " AND position_event.aggregate_id = \
+             json_extract(trade_view.payload, '$.Live.symbol') \
+             AND position_event.event_type = ",
+        )
         .push_bind(crate::position::PositionEvent::ON_CHAIN_ORDER_FILLED_EVENT_TYPE)
         .push(
             " AND json_extract(position_event.payload, '$.OnChainOrderFilled.trade_id.chain') \
