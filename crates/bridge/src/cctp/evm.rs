@@ -19,7 +19,7 @@ use st0x_evm::{
 
 use super::{
     CctpError, CctpReceivedMessage, FAST_TRANSFER_THRESHOLD, MessageTransmitterV2, MintReceipt,
-    TokenMessengerV2, parse_received_message,
+    MintScanFloorCheck, TokenMessengerV2, parse_received_message,
 };
 use crate::BridgeDirection;
 
@@ -1150,7 +1150,9 @@ impl<W: Wallet> CctpEndpoint<W> {
         Err(CctpError::MintNotFoundInScanWindow {
             nonce,
             from_block,
-            from_block_timestamp,
+            floor_check: MintScanFloorCheck::Unverified {
+                from_block_timestamp,
+            },
         })
     }
 

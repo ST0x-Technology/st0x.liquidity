@@ -13,7 +13,7 @@ use std::time::Duration;
 use tracing::{debug, error, info, instrument, warn};
 use uuid::Uuid;
 
-use st0x_bridge::cctp::{AttestationResponse, CctpBridge, CctpError};
+use st0x_bridge::cctp::{AttestationResponse, CctpBridge, CctpError, MintScanFloorCheck};
 use st0x_bridge::{Attestation, Bridge, BridgeDirection, BurnReceipt, BurnTxStatus, MintReceipt};
 use st0x_config::{ALPACA_MINIMUM_WITHDRAWAL, ALPACA_TO_BASE_MINIMUM_TRANSFER};
 use st0x_event_sorcery::Store;
@@ -434,12 +434,22 @@ enum RepeatingMintFailure {
     MintOutsideScanWindow,
 }
 
-/// Whether the mint of a used nonce can lie below a scan floor mined at
-/// `from_block_timestamp` (unix seconds). A mint lands after its transfer
-/// starts, so a floor mined before `initiated_at` covers every block the mint
-/// can be in, and a missing log there is index lag that a redrive outlasts.
-fn mint_can_lie_below_scan_floor(from_block_timestamp: u64, initiated_at: DateTime<Utc>) -> bool {
-    i128::from(from_block_timestamp) >= i128::from(initiated_at.timestamp())
+/// Whether the mint of a used nonce can lie below its scan floor. A missing
+/// log in a window that holds the mint is index lag that a redrive outlasts.
+/// Without the `usedNonces()` read below the floor, the floor's timestamp
+/// decides: a mint lands after its transfer starts, so a floor mined before
+/// `initiated_at` covers every block the mint can be in.
+fn mint_can_lie_below_scan_floor(
+    floor_check: MintScanFloorCheck,
+    initiated_at: DateTime<Utc>,
+) -> bool {
+    match floor_check {
+        MintScanFloorCheck::MintInScanWindow => false,
+        MintScanFloorCheck::MintBelowScanFloor => true,
+        MintScanFloorCheck::Unverified {
+            from_block_timestamp,
+        } => i128::from(from_block_timestamp) >= i128::from(initiated_at.timestamp()),
+    }
 }
 
 /// Classifies a `find_attested_mint` or Circle re-poll failure that recurs on
@@ -458,11 +468,10 @@ fn repeating_mint_failure(
             Some(RepeatingMintFailure::MessageCannotMint)
         }
 
-        CctpError::MintNotFoundInScanWindow {
-            from_block_timestamp,
-            ..
-        } => mint_can_lie_below_scan_floor(*from_block_timestamp, initiated_at)
-            .then_some(RepeatingMintFailure::MintOutsideScanWindow),
+        CctpError::MintNotFoundInScanWindow { floor_check, .. } => {
+            mint_can_lie_below_scan_floor(*floor_check, initiated_at)
+                .then_some(RepeatingMintFailure::MintOutsideScanWindow)
+        }
 
         CctpError::Evm(_)
         | CctpError::Contract(_)
@@ -500,10 +509,9 @@ fn repeating_mint_failure(
 /// clear on a redrive. Exhaustive so a new `CctpError` needs a decision.
 fn recovery_mint_outside_scan(recovery_error: &CctpError, initiated_at: DateTime<Utc>) -> bool {
     match recovery_error {
-        CctpError::MintNotFoundInScanWindow {
-            from_block_timestamp,
-            ..
-        } => mint_can_lie_below_scan_floor(*from_block_timestamp, initiated_at),
+        CctpError::MintNotFoundInScanWindow { floor_check, .. } => {
+            mint_can_lie_below_scan_floor(*floor_check, initiated_at)
+        }
 
         CctpError::Evm(_)
         | CctpError::Contract(_)
@@ -19229,7 +19237,9 @@ mod tests {
             CctpError::MintNotFoundInScanWindow {
                 nonce: B256::repeat_byte(0x07),
                 from_block: 100,
-                from_block_timestamp: u64::MAX,
+                floor_check: MintScanFloorCheck::Unverified {
+                    from_block_timestamp: u64::MAX,
+                },
             }
         })
         .await;
@@ -19267,7 +19277,9 @@ mod tests {
                 CctpError::MintNotFoundInScanWindow {
                     nonce: B256::repeat_byte(0x07),
                     from_block: 0,
-                    from_block_timestamp: 0,
+                    floor_check: MintScanFloorCheck::Unverified {
+                        from_block_timestamp: 0,
+                    },
                 }
             })
             .await;
@@ -19287,6 +19299,66 @@ mod tests {
             "the transfer must stay BridgingFailed; got: {state:?}"
         );
         assert!(!logs_contain("operational_alert"));
+    }
+
+    /// The nonce read unused below the floor places the mint in the recovery
+    /// scan whatever the floor's age, so a missing log is index lag.
+    #[cfg(feature = "test-support")]
+    #[tracing_test::traced_test]
+    #[tokio::test]
+    async fn recover_from_bridging_failed_redrives_a_nonce_unused_below_the_floor() {
+        let (error, id, _, state) = resume_bridging_failed_with_mint_recovery_error(|| {
+            CctpError::MintNotFoundInScanWindow {
+                nonce: B256::repeat_byte(0x07),
+                from_block: 100,
+                floor_check: MintScanFloorCheck::MintInScanWindow,
+            }
+        })
+        .await;
+
+        assert!(
+            matches!(
+                &error,
+                UsdcTransferError::MintRecoveryInconclusive { id: err_id, .. } if *err_id == id
+            ),
+            "a mint inside the recovery scan must redrive; got: {error:?}"
+        );
+        assert!(
+            matches!(state, UsdcRebalance::BridgingFailed { .. }),
+            "the transfer must stay BridgingFailed; got: {state:?}"
+        );
+        assert!(!logs_contain("operational_alert"));
+    }
+
+    /// The nonce read used below the floor places the mint below the recovery
+    /// scan whatever the floor's age, so the recovery pages and parks.
+    #[cfg(feature = "test-support")]
+    #[tracing_test::traced_test]
+    #[tokio::test]
+    async fn recover_from_bridging_failed_parks_a_nonce_used_below_the_floor() {
+        let (error, id, _, state) = resume_bridging_failed_with_mint_recovery_error(|| {
+            CctpError::MintNotFoundInScanWindow {
+                nonce: B256::repeat_byte(0x07),
+                from_block: 0,
+                floor_check: MintScanFloorCheck::MintBelowScanFloor,
+            }
+        })
+        .await;
+
+        assert!(
+            matches!(
+                &error,
+                UsdcTransferError::PreviouslyFailedAggregate { id: failed_id } if *failed_id == id
+            ),
+            "a mint below the recovery scan must park; got: {error:?}"
+        );
+        assert!(
+            matches!(state, UsdcRebalance::BridgingFailed { .. }),
+            "the transfer must stay BridgingFailed; got: {state:?}"
+        );
+        assert!(logs_contain(&format!(
+            "USDC transfer {id}: the CCTP mint cannot be resolved automatically"
+        )));
     }
 
     /// Resumes an `Attested` transfer in `direction` whose pre-mint
@@ -19489,7 +19561,9 @@ mod tests {
             CctpError::MintNotFoundInScanWindow {
                 nonce: B256::repeat_byte(0x07),
                 from_block: 100,
-                from_block_timestamp: u64::MAX,
+                floor_check: MintScanFloorCheck::Unverified {
+                    from_block_timestamp: u64::MAX,
+                },
             }
         })
         .await;
@@ -19591,7 +19665,9 @@ mod tests {
                 CctpError::MintNotFoundInScanWindow {
                     nonce: B256::repeat_byte(0x07),
                     from_block: 0,
-                    from_block_timestamp: 0,
+                    floor_check: MintScanFloorCheck::Unverified {
+                        from_block_timestamp: 0,
+                    },
                 }
             })
             .await;
@@ -19611,6 +19687,66 @@ mod tests {
             "the transfer must stay Attested; got: {state:?}"
         );
         assert!(!logs_contain("operational_alert"));
+    }
+
+    /// The nonce read unused below the floor places the mint in the scan
+    /// window whatever the floor's age, so a missing log is index lag.
+    #[tracing_test::traced_test]
+    #[tokio::test]
+    async fn attested_used_nonce_unused_below_the_floor_redrives() {
+        let (error, id, _, state) =
+            resume_attested_with_failing_mint_lookup(RebalanceDirection::BaseToAlpaca, || {
+                CctpError::MintNotFoundInScanWindow {
+                    nonce: B256::repeat_byte(0x07),
+                    from_block: 100,
+                    floor_check: MintScanFloorCheck::MintInScanWindow,
+                }
+            })
+            .await;
+
+        assert!(
+            matches!(
+                &error,
+                UsdcTransferError::MintRecoveryInconclusive { id: err_id, .. } if *err_id == id
+            ),
+            "a mint inside the scan window must redrive; got: {error:?}"
+        );
+        assert!(
+            matches!(state, UsdcRebalance::Attested { .. }),
+            "the transfer must stay Attested; got: {state:?}"
+        );
+        assert!(!logs_contain("operational_alert"));
+    }
+
+    /// The nonce read used below the floor places the mint below the scan
+    /// window whatever the floor's age: no redrive scans wider, so it latches.
+    #[tracing_test::traced_test]
+    #[tokio::test]
+    async fn attested_used_nonce_used_below_the_floor_latches_for_reconciliation() {
+        let (error, id, _, state) =
+            resume_attested_with_failing_mint_lookup(RebalanceDirection::BaseToAlpaca, || {
+                CctpError::MintNotFoundInScanWindow {
+                    nonce: B256::repeat_byte(0x07),
+                    from_block: 0,
+                    floor_check: MintScanFloorCheck::MintBelowScanFloor,
+                }
+            })
+            .await;
+
+        assert!(
+            matches!(
+                &error,
+                UsdcTransferError::PreviouslyFailedAggregate { id: failed_id } if *failed_id == id
+            ),
+            "a mint below the scan floor must latch; got: {error:?}"
+        );
+        assert!(
+            state.is_reconcilable_failure(),
+            "`transfer reconcile --kind usdc` must accept the latched state, got: {state:?}"
+        );
+        assert!(logs_contain(&format!(
+            "USDC transfer {id}: the CCTP mint cannot be resolved automatically"
+        )));
     }
 
     /// Builds a `CrossVenueCashTransfer` wired to a real (anvil-backed)

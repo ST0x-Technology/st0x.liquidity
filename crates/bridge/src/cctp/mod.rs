@@ -404,6 +404,21 @@ pub struct CctpBridge<EthWallet: Wallet, BaseWallet: Wallet> {
     circle_api_base: String,
 }
 
+/// Where a consumed nonce's mint lies relative to a mint scan's floor block,
+/// read from `usedNonces()` at the block below the floor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MintScanFloorCheck {
+    /// Unused below the floor: the mint is in the scan window, so a missing
+    /// log is index lag.
+    MintInScanWindow,
+    /// Already used below the floor: the mint is below the scan window.
+    MintBelowScanFloor,
+    /// The read failed (e.g. a node without state that old). Only the floor
+    /// block's timestamp (unix seconds) is known: a floor mined before the
+    /// transfer started covers every block its mint can be in.
+    Unverified { from_block_timestamp: u64 },
+}
+
 /// Errors that can occur during CCTP bridge operations.
 #[derive(Debug, thiserror::Error)]
 pub enum CctpError {
@@ -464,16 +479,15 @@ pub enum CctpError {
     AlreadyMintedMessageNotFound { nonce: B256 },
     /// The nonce is consumed on chain but its mint is not in the bounded
     /// scan: it landed below the floor, or the node's log index lags.
-    /// `from_block_timestamp` (unix seconds) tells them apart: a floor mined
-    /// before the transfer started covers every block its mint can be in.
+    /// `floor_check` tells them apart where it can.
     #[error(
         "CCTP nonce {nonce} is consumed but no matching MessageReceived log was found at \
-         or after block {from_block} (mined at unix time {from_block_timestamp})"
+         or after block {from_block} ({floor_check:?})"
     )]
     MintNotFoundInScanWindow {
         nonce: B256,
         from_block: u64,
-        from_block_timestamp: u64,
+        floor_check: MintScanFloorCheck,
     },
     /// The node returned no header for the mint scan's floor block, which is
     /// below the head it reported. Retryable.
@@ -4686,14 +4700,19 @@ mod tests {
         let CctpError::MintNotFoundInScanWindow {
             nonce: error_nonce,
             from_block,
-            from_block_timestamp,
+            floor_check,
         } = error
         else {
             panic!("a consumed nonce outside the window must fail for reconciliation: {error:?}");
         };
         assert_eq!(error_nonce, nonce);
         assert_eq!(from_block, head - lookback);
-        assert_eq!(from_block_timestamp, floor_timestamp);
+        assert_eq!(
+            floor_check,
+            MintScanFloorCheck::Unverified {
+                from_block_timestamp: floor_timestamp
+            }
+        );
 
         // A captured floor above the lookback floor scans down to the lookback
         // floor, no further.
