@@ -34,10 +34,10 @@ use crate::pricing::PricingSecrets;
 use crate::wallet::{SigningChain, SigningChains};
 use crate::{
     AlertsConfig, AlertsCtx, AllocationConfigError, BotGasValuationConfig, ChainConfig,
-    ChainEquityAsset, ChainRegistry, ChainSecrets, ExecutionThreshold, HedgingAssets,
-    InvalidThresholdError, OperationMode, OrchestratorConfig, PricingConfig, PricingCtx,
-    PricingCtxError, RebalancingConfig, RebalancingCtx, RebalancingCtxError, TelemetryConfig,
-    TelemetryCtx,
+    ChainEquityAsset, ChainRegistry, ChainSecrets, ExecutionThreshold, HedgeStallCtx,
+    HedgingAssets, InvalidThresholdError, OperationMode, OrchestratorConfig, PricingConfig,
+    PricingCtx, PricingCtxError, RebalancingConfig, RebalancingCtx, RebalancingCtxError,
+    TelemetryConfig, TelemetryCtx,
 };
 
 /// Alpaca minimum execution threshold: $2.
@@ -1710,6 +1710,46 @@ fn validated_polling_intervals(config: &Config) -> Result<PollingIntervalsSecs, 
     Ok(intervals)
 }
 
+/// Scans run every `position_check_secs`, so a stall window shorter than a
+/// few of them would alert on an ordinary late scan. A resting
+/// extended-hours limit order waits up to the reprice timeout, and its
+/// cancellation and replacement then take a few more scans, so the window
+/// must cover both.
+fn validate_hedge_stall_window(
+    hedge_stall: Option<HedgeStallCtx>,
+    position_check_secs: u64,
+    reprice_timeout_secs: Option<u64>,
+) -> Result<(), CtxError> {
+    let Some(hedge_stall) = hedge_stall else {
+        return Ok(());
+    };
+    let stall_after = hedge_stall.stall_after.as_secs();
+
+    let minimum = position_check_secs.saturating_mul(HEDGE_STALL_MIN_SCAN_INTERVALS);
+    if stall_after < minimum {
+        return Err(CtxError::HedgeStallShorterThanScans {
+            stall_after,
+            position_check_secs,
+            minimum,
+        });
+    }
+
+    if let Some(reprice_timeout_secs) = reprice_timeout_secs {
+        let minimum = reprice_timeout_secs.saturating_add(minimum);
+        if stall_after < minimum {
+            return Err(CtxError::HedgeStallWithinRepriceTimeout {
+                stall_after,
+                reprice_timeout_secs,
+                minimum,
+            });
+        }
+    }
+
+    Ok(())
+}
+
+const HEDGE_STALL_MIN_SCAN_INTERVALS: u64 = 3;
+
 /// What [`validate_config`] built on the way through, handed back so
 /// [`parse_and_validate`] reuses it instead of rebuilding it (and drifting
 /// from it).
@@ -1792,6 +1832,14 @@ fn validate_config(
         .map(LogQueryUrlTemplate::parse)
         .transpose()?;
     let alerts = AlertsCtx::new(config.alerts.clone(), &config.chains, startup_notices)?;
+    validate_hedge_stall_window(
+        alerts.as_ref().and_then(AlertsCtx::hedge_stall),
+        polling_intervals.position_check,
+        config
+            .broker
+            .as_ref()
+            .and_then(|broker| broker.extended_hours_reprice_timeout_secs),
+    )?;
 
     {
         let Some(rebalancing) = &config.rebalancing else {
@@ -2768,6 +2816,26 @@ pub enum CtxError {
     ExtendedHoursWithoutCounterTrading { symbol: Symbol },
     #[error("{field} must be non-zero")]
     ZeroPollingInterval { field: &'static str },
+    #[error(
+        "[alerts.hedge_stall] stall_after ({stall_after}s) must be at least \
+         {minimum}s, three position_check_interval_secs ({position_check_secs}s) \
+         intervals"
+    )]
+    HedgeStallShorterThanScans {
+        stall_after: u64,
+        position_check_secs: u64,
+        minimum: u64,
+    },
+    #[error(
+        "[alerts.hedge_stall] stall_after ({stall_after}s) must be at least {minimum}s: \
+         [broker] extended_hours_reprice_timeout_secs ({reprice_timeout_secs}s) plus \
+         three position-check intervals"
+    )]
+    HedgeStallWithinRepriceTimeout {
+        stall_after: u64,
+        reprice_timeout_secs: u64,
+        minimum: u64,
+    },
     #[error("server_port and board_port must differ; both set to {port}")]
     ServerAndBoardPortsMatch { port: u16 },
     #[error(
@@ -2851,6 +2919,10 @@ impl CtxError {
                 "extended hours enabled without counter-trading"
             }
             Self::ZeroPollingInterval { .. } => "zero polling interval",
+            Self::HedgeStallShorterThanScans { .. } => "hedge-stall window shorter than scans",
+            Self::HedgeStallWithinRepriceTimeout { .. } => {
+                "hedge-stall window within reprice timeout"
+            }
             Self::ServerAndBoardPortsMatch { .. } => "server_port and board_port must differ",
             Self::FloatComparison(_) => "float comparison failed",
             Self::InvalidTravelRule { .. } => "invalid travel rule config",
@@ -4427,6 +4499,33 @@ mod tests {
         assert!(
             matches!(error, CtxError::MissingAlertsForRebalancing),
             "expected MissingAlertsForRebalancing, got {error:?}"
+        );
+    }
+
+    #[test]
+    fn loader_rejects_a_hedge_stall_window_shorter_than_the_default_scans() {
+        let base = alerts_config_toml("0.05", "0.01");
+        let config = toml_file(&format!(
+            "{}\n[alerts.hedge_stall]\npoll_interval = 60\nstall_after = 179\n\
+             realert_interval = 1\n",
+            std::fs::read_to_string(base.path()).unwrap()
+        ));
+        let secrets = alpaca_secrets_toml();
+
+        let Err(error) = parse_and_validate_files(&config, &secrets) else {
+            panic!("expected HedgeStallShorterThanScans, got Ok");
+        };
+
+        assert!(
+            matches!(
+                error,
+                CtxError::HedgeStallShorterThanScans {
+                    stall_after: 179,
+                    position_check_secs: 60,
+                    minimum: 180,
+                }
+            ),
+            "{error:?}"
         );
     }
 
@@ -8734,6 +8833,55 @@ mod tests {
         assert_eq!(error.kind(), "failed to parse secrets");
     }
 
+    fn hedge_stall(stall_after: u64) -> HedgeStallCtx {
+        HedgeStallCtx {
+            poll_interval: std::time::Duration::from_secs(60),
+            stall_after: std::time::Duration::from_secs(stall_after),
+            realert_interval: std::time::Duration::from_secs(1),
+        }
+    }
+
+    #[test]
+    fn hedge_stall_window_must_span_three_scans() {
+        let error = validate_hedge_stall_window(Some(hedge_stall(179)), 60, None).unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                CtxError::HedgeStallShorterThanScans {
+                    stall_after: 179,
+                    position_check_secs: 60,
+                    minimum: 180,
+                }
+            ),
+            "{error:?}"
+        );
+        validate_hedge_stall_window(Some(hedge_stall(180)), 60, None).unwrap();
+    }
+
+    #[test]
+    fn hedge_stall_window_must_outlast_the_reprice_timeout() {
+        let error = validate_hedge_stall_window(Some(hedge_stall(479)), 60, Some(300)).unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                CtxError::HedgeStallWithinRepriceTimeout {
+                    stall_after: 479,
+                    reprice_timeout_secs: 300,
+                    minimum: 480,
+                }
+            ),
+            "{error:?}"
+        );
+        validate_hedge_stall_window(Some(hedge_stall(480)), 60, Some(300)).unwrap();
+    }
+
+    #[test]
+    fn absent_hedge_stall_needs_no_window() {
+        validate_hedge_stall_window(None, 600, Some(3600)).unwrap();
+    }
+
     #[test]
     fn server_config_toml_is_valid() {
         let config_str = include_str!("../../../config/prod/st0x-hedge.toml");
@@ -9374,6 +9522,7 @@ mod tests {
             realert_interval: 3600,
             chat_id: None,
             message_thread_id: None,
+            hedge_stall: None,
         });
         config
     }

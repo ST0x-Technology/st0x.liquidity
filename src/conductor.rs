@@ -188,6 +188,7 @@ pub(crate) struct SupervisorStartupTokens {
     pub(crate) hyperevm_gas_monitor: StartupToken,
     pub(crate) robinhood_gas_monitor: StartupToken,
     pub(crate) trading_schedule_monitor: StartupToken,
+    pub(crate) hedge_stall_monitor: StartupToken,
 }
 
 /// Opens an apalis-side pool (sqlx 0.8) against the same database as the

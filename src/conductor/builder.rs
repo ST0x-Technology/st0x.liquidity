@@ -31,6 +31,7 @@ use super::job::{
 };
 use super::monitor::executor_maintenance::ExecutorMaintenance;
 use super::monitor::gas::GasMonitor;
+use super::monitor::hedge_stall::HedgeStallMonitor;
 use super::monitor::inventory::InventoryMonitor;
 use super::monitor::order_fills::OrderFillMonitor;
 use super::{Conductor, SupervisorStartupTokens};
@@ -65,7 +66,9 @@ use crate::portfolio_snapshot::{
     PortfolioSnapshotJobQueue,
 };
 use crate::position::Position;
-use crate::position_check::{CheckPositions, CheckPositionsCtx, CheckPositionsJobQueue};
+use crate::position_check::{
+    CheckPositions, CheckPositionsCtx, CheckPositionsJobQueue, HedgeScanHeartbeat,
+};
 use crate::rebalancing::equity::{
     DeliverMintAuthorization, DeliverMintAuthorizationCtx, DeliverMintAuthorizationJobQueue,
     ResumeTokenizationAggregate, ResumeTokenizationCtx, ResumeTokenizationJobQueue,
@@ -87,7 +90,8 @@ use crate::trading::offchain::close_flatten::{
 };
 use crate::trading::offchain::hedge::{HedgeCtx, HedgeJobQueue, PlaceHedge};
 use crate::trading::onchain::trade_accountant::{
-    AccountForDexTrade, AccountantCtx, DexTradeAccountingJobQueue, TradeAccountingError,
+    AccountForDexTrade, AccountantCtx, DeadLetterReason, DexTradeAccountingJobQueue,
+    TradeAccountingError,
 };
 use crate::unwrapped_equity_recovery::{
     UnwrappedEquityRecoveryCtx, UnwrappedEquityRecoveryJob, UnwrappedEquityRecoveryJobQueue,
@@ -530,6 +534,20 @@ where
     // placement reaches the broker must clear the scan's entries too.
     let alerted_dead_letters = Arc::new(tokio::sync::Mutex::new(HashSet::new()));
 
+    // One heartbeat, written by the position sweep and read by the
+    // hedge-stall monitor.
+    let hedge_scan_heartbeat = Arc::new(HedgeScanHeartbeat::default());
+
+    let hedge_stall_monitor = build_hedge_stall_monitor(
+        &context.ctx,
+        context.executor.clone(),
+        context.frameworks.position_projection.clone(),
+        hedge_scan_heartbeat.clone(),
+        alerted_dead_letters.clone(),
+        close_flatten_policy.clone(),
+        notifier.clone(),
+    );
+
     let hedge_ctx = Arc::new(HedgeCtx {
         configured_executor: context.executor.to_supported_executor(),
         pool: context.pool.clone(),
@@ -567,6 +585,7 @@ where
         poll_interval,
         notifier: notifier.clone(),
         alerted_dead_letters,
+        heartbeat: hedge_scan_heartbeat,
     });
 
     let portfolio_snapshot_ctx = Arc::new(PortfolioSnapshotCtx {
@@ -657,6 +676,7 @@ where
         hyperevm_gas_monitor: hyperevm_gas_monitor_startup,
         robinhood_gas_monitor: robinhood_gas_monitor_startup,
         trading_schedule_monitor: trading_schedule_monitor_startup,
+        hedge_stall_monitor: hedge_stall_monitor_startup,
     } = context.supervisor_startup;
 
     // Fail-fast: exit if any supervised task dies, relying on systemd restart for recovery.
@@ -772,6 +792,19 @@ where
         );
     } else {
         trading_schedule_monitor_startup.acknowledge();
+    }
+
+    log_optional_task_status("hedge-stall monitor", hedge_stall_monitor.is_some());
+    if let Some(monitor) = hedge_stall_monitor {
+        supervisor_builder = supervisor_builder.with_task(
+            "hedge-stall-monitor",
+            StartupTask {
+                task: monitor,
+                token: hedge_stall_monitor_startup,
+            },
+        );
+    } else {
+        hedge_stall_monitor_startup.acknowledge();
     }
     let supervisor = supervisor_builder.build().run();
 
@@ -1425,6 +1458,30 @@ where
     })
 }
 
+/// `None` unless `[alerts.hedge_stall]` is configured. Gated on that table
+/// alone: unlike the gas monitors, this monitor needs no wallet.
+fn build_hedge_stall_monitor<Exec>(
+    ctx: &Ctx,
+    executor: Exec,
+    position_projection: Arc<Projection<Position>>,
+    heartbeat: Arc<HedgeScanHeartbeat>,
+    alerted_dead_letters: Arc<tokio::sync::Mutex<HashSet<(Symbol, DeadLetterReason)>>>,
+    close_flatten_policy: CloseFlattenPolicy,
+    notifier: Arc<dyn Notifier>,
+) -> Option<HedgeStallMonitor<Exec>> {
+    let timings = ctx.alerts.as_ref()?.hedge_stall()?;
+    Some(HedgeStallMonitor {
+        executor,
+        position_projection,
+        heartbeat,
+        alerted_dead_letters,
+        close_flatten_policy,
+        ctx: ctx.clone(),
+        notifier,
+        timings,
+    })
+}
+
 fn log_optional_task_status(task_name: &str, is_configured: bool) {
     if is_configured {
         info!("Started {task_name} task");
@@ -1950,6 +2007,58 @@ mod tests {
                 (Chain::Ethereum, HashSet::from([secondary_symbol]), false),
             ],
             "each hedged chain contributes the slots its own assets table declares"
+        );
+    }
+
+    #[tokio::test]
+    async fn hedge_stall_monitor_runs_only_with_its_table_and_shares_the_heartbeat() {
+        let pool = crate::test_utils::setup_test_db().await;
+        let (_, position_projection) = st0x_event_sorcery::StoreBuilder::<Position>::new(pool)
+            .build(())
+            .await
+            .unwrap();
+        let heartbeat = Arc::new(HedgeScanHeartbeat::default());
+        let build = |ctx: &Ctx| {
+            build_hedge_stall_monitor(
+                ctx,
+                st0x_execution::MockExecutor::new(),
+                position_projection.clone(),
+                heartbeat.clone(),
+                Arc::new(tokio::sync::Mutex::new(HashSet::new())),
+                CloseFlattenPolicy::from_secs(300).unwrap(),
+                Arc::new(crate::alerts::LogNotifier),
+            )
+        };
+        let gas_only = AlertsCtx::for_test(
+            BTreeMap::from([
+                (Chain::Base, U256::from(100_u64)),
+                (Chain::Ethereum, U256::from(200_u64)),
+            ]),
+            Duration::from_secs(300),
+            Duration::from_secs(3600),
+        );
+        let timings = st0x_config::HedgeStallCtx {
+            poll_interval: Duration::from_secs(60),
+            stall_after: Duration::from_secs(900),
+            realert_interval: Duration::from_secs(1),
+        };
+        let mut ctx = create_test_ctx_with_order_owner(Address::ZERO);
+
+        ctx.alerts = None;
+        assert!(build(&ctx).is_none(), "no [alerts] means no monitor");
+
+        ctx.alerts = Some(gas_only.clone());
+        assert!(
+            build(&ctx).is_none(),
+            "no [alerts.hedge_stall] means no monitor"
+        );
+
+        ctx.alerts = Some(gas_only.with_hedge_stall(timings));
+        let monitor = build(&ctx).expect("a configured table must build the monitor");
+        assert_eq!(monitor.timings, timings);
+        assert!(
+            Arc::ptr_eq(&monitor.heartbeat, &heartbeat),
+            "the monitor must read the heartbeat the sweep writes"
         );
     }
 

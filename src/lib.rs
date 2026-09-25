@@ -364,6 +364,7 @@ async fn run_bot_session_inner(
                 hyperevm_gas_monitor: startup_barrier.token(),
                 robinhood_gas_monitor: startup_barrier.token(),
                 trading_schedule_monitor: startup_barrier.token(),
+                hedge_stall_monitor: startup_barrier.token(),
             },
         },
         #[cfg(any(test, feature = "test-support"))]
@@ -965,6 +966,7 @@ mod tests {
                 hyperevm_gas_monitor: barrier.token(),
                 robinhood_gas_monitor: barrier.token(),
                 trading_schedule_monitor: barrier.token(),
+                hedge_stall_monitor: barrier.token(),
             },
         }
     }

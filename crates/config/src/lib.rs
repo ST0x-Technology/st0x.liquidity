@@ -21,7 +21,10 @@ mod threshold;
 mod trading_schedule;
 mod wallet;
 
-pub use alerts::{AlertsAssemblyError, AlertsConfig, AlertsCtx, LEGACY_GAS_MONITORED_CHAINS};
+pub use alerts::{
+    AlertsAssemblyError, AlertsConfig, AlertsCtx, HedgeStallConfig, HedgeStallCtx,
+    LEGACY_GAS_MONITORED_CHAINS,
+};
 pub use allocation::{
     AllocationConfig, AllocationConfigError, AllocationCtx, DeviationBand, TargetShare,
 };

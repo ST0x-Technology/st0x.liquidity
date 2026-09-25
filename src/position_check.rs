@@ -105,6 +105,57 @@ pub(crate) struct CheckPositionsCtx<E: Executor + Clone + Send + Sync + 'static>
     /// standing delta, so they must not page twice, and the release performed
     /// when one of the symbol's hedges reaches the broker must clear both.
     pub(crate) alerted_dead_letters: Arc<Mutex<HashSet<(Symbol, DeadLetterReason)>>>,
+    /// Stamped after every successful full sweep, so the hedge-stall monitor
+    /// can tell a scan that stopped running from one that ran and chose to
+    /// hold a symbol back.
+    pub(crate) heartbeat: Arc<HedgeScanHeartbeat>,
+}
+
+/// The last full position sweep that completed, as the hedge-stall monitor
+/// reads it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CompletedScan {
+    pub(crate) completed_at: DateTime<Utc>,
+    /// Symbols the sweep held back on purpose: an active equity transfer, a
+    /// preflight skip (hedge floor, buying power, inventory), or a
+    /// reference-price failure that already paged. A transient failure is
+    /// not a hold, because a hedge that keeps failing is the stall to catch.
+    pub(crate) held: HashSet<Symbol>,
+}
+
+/// Shared record of the last completed full sweep. In memory only: after a
+/// restart there is no completed sweep until the first one finishes.
+#[derive(Debug)]
+pub(crate) struct HedgeScanHeartbeat {
+    latest: tokio::sync::watch::Sender<Option<CompletedScan>>,
+}
+
+impl Default for HedgeScanHeartbeat {
+    fn default() -> Self {
+        Self {
+            latest: tokio::sync::watch::Sender::new(None),
+        }
+    }
+}
+
+impl HedgeScanHeartbeat {
+    pub(crate) fn record(&self, scan: CompletedScan) {
+        self.latest.send_replace(Some(scan));
+    }
+
+    pub(crate) fn latest(&self) -> Option<CompletedScan> {
+        self.latest.borrow().clone()
+    }
+}
+
+/// What the scan did with one symbol.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SymbolScanOutcome {
+    Enqueued,
+    /// Held back on purpose; see [`CompletedScan::held`].
+    Held,
+    /// Not ready, or skipped for a reason the next scan may clear.
+    Deferred,
 }
 
 /// Errors surfaced by [`CheckPositions::perform`].
@@ -273,7 +324,7 @@ fn should_page_reference_price_failure(
 /// disables the symbol never reaches the `Position`
 /// ([`crate::conductor::account_for_fill_excluded_from_hedging`]); otherwise
 /// this sweep would counter trade it for the chain that enables the symbol.
-fn backstop_sizing_assets<'registry>(
+pub(crate) fn backstop_sizing_assets<'registry>(
     chains: &'registry ChainRegistry,
     symbol: &Symbol,
 ) -> Option<&'registry ChainAssets> {
@@ -326,6 +377,16 @@ enum CloseFlattenWindowCache {
     Failed,
 }
 
+/// The scan-time preflight of an extended-hours buy.
+enum ExtendedHoursBuyPreflight {
+    Priced(CounterTradePreflight),
+    /// No price to preflight against. A failure that paged is a hold; any
+    /// other is a deferral.
+    Dropped {
+        paged: bool,
+    },
+}
+
 enum CloseFlattenWindowResolutionError<E> {
     Source(E),
     CachedFailure,
@@ -376,8 +437,13 @@ where
         // Enqueue unrelated ready hedges before broker-backed cancellation
         // maintenance. A slow cancellation must not extend the exposure window
         // for another symbol that is already ready to hedge.
-        ctx.scan_and_enqueue(&mut close_flatten_window_cache)
+        let held = ctx
+            .scan_and_enqueue(&mut close_flatten_window_cache)
             .await?;
+        ctx.heartbeat.record(CompletedScan {
+            completed_at: Utc::now(),
+            held,
+        });
 
         if ctx.ctx.assets.any_extended_hours_enabled() {
             match ctx.executor.market_session().await {
@@ -505,10 +571,11 @@ where
         );
         Ok(())
     }
+    /// Returns the symbols the sweep held back on purpose.
     async fn scan_and_enqueue(
         &self,
         close_flatten_window_cache: &mut CloseFlattenWindowCache,
-    ) -> Result<(), CheckPositionsError> {
+    ) -> Result<HashSet<Symbol>, CheckPositionsError> {
         // Reconcile placements stuck between broker acceptance and the outcome
         // commit (ADR 0014). `is_ready_for_execution` skips pending-claimed
         // positions, so the main scan never re-drives these; this periodic sweep
@@ -628,12 +695,17 @@ where
             })
             .collect();
 
+        let mut held = active_transfers;
         for (symbol, assets) in &eligible {
-            self.check_and_enqueue_symbol(symbol, assets, close_flatten_window_cache)
+            let outcome = self
+                .check_and_enqueue_symbol(symbol, assets, close_flatten_window_cache)
                 .await;
+            if outcome == SymbolScanOutcome::Held {
+                held.insert(symbol.clone());
+            }
         }
 
-        Ok(())
+        Ok(held)
     }
 
     async fn enqueue_failed_anchor_recoveries(&self, positions: &[(Symbol, Position)]) {
@@ -720,7 +792,7 @@ where
         symbol: &Symbol,
         assets: &ChainAssets,
         close_flatten_window_cache: &mut CloseFlattenWindowCache,
-    ) {
+    ) -> SymbolScanOutcome {
         let readiness = check_execution_readiness(
             &self.executor,
             &self.position_projection,
@@ -734,14 +806,14 @@ where
 
         let Ok(Some(ready)) = readiness else {
             debug!(%symbol, "Skipping hedge: no execution-ready position");
-            return;
+            return SymbolScanOutcome::Deferred;
         };
 
-        if !self
+        let preflight = self
             .preflight_allows_enqueue(&ready, close_flatten_window_cache)
-            .await
-        {
-            return;
+            .await;
+        if preflight != SymbolScanOutcome::Enqueued {
+            return preflight;
         }
 
         debug!(
@@ -765,7 +837,10 @@ where
         let mut queue = self.hedge_queue.clone();
         if let Err(error) = queue.push(job).await {
             error!(%ready.symbol, %error, "Failed to enqueue hedge job");
+            return SymbolScanOutcome::Deferred;
         }
+
+        SymbolScanOutcome::Enqueued
     }
 
     /// Checks broker inventory before enqueueing a hedge job without persisting
@@ -775,13 +850,13 @@ where
         &self,
         ready: &ExecutionCtx,
         close_flatten_window_cache: &mut CloseFlattenWindowCache,
-    ) -> bool {
+    ) -> SymbolScanOutcome {
         let requested = ready.shares.inner();
         let mut preflight_ready = ready.clone();
-        let enqueue = self
+        let outcome = self
             .preflight_and_clamp(&mut preflight_ready, close_flatten_window_cache)
             .await;
-        let allowed = if enqueue {
+        let allowed = if outcome == SymbolScanOutcome::Enqueued {
             preflight_ready.shares.inner()
         } else {
             FractionalShares::ZERO
@@ -792,14 +867,14 @@ where
             requested,
             allowed,
         );
-        enqueue
+        outcome
     }
 
     async fn preflight_and_clamp(
         &self,
         ready: &mut ExecutionCtx,
         close_flatten_window_cache: &mut CloseFlattenWindowCache,
-    ) -> bool {
+    ) -> SymbolScanOutcome {
         let order = MarketOrder {
             symbol: ready.symbol.clone(),
             shares: ready.shares,
@@ -839,7 +914,7 @@ where
                         symbol = %ready.symbol, %error,
                         "Skipping hedge enqueue: failed to verify close-flatten window status"
                     );
-                    return false;
+                    return SymbolScanOutcome::Deferred;
                 }
                 Err(CloseFlattenWindowResolutionError::CachedFailure) => {
                     counter!(
@@ -853,7 +928,7 @@ where
                         symbol = %ready.symbol,
                         "Skipping hedge enqueue: close-flatten status lookup failed earlier in this scan"
                     );
-                    return false;
+                    return SymbolScanOutcome::Deferred;
                 }
             }
         } else {
@@ -865,10 +940,15 @@ where
                 .preflight_extended_hours_buy(order, close_flatten_window)
                 .await
             {
-                Ok(Some(preflight)) => Ok(preflight),
+                Ok(ExtendedHoursBuyPreflight::Priced(preflight)) => Ok(preflight),
                 // `preflight_extended_hours_buy` counted and logged the cause
                 // it dropped this buy for; the scan just skips the tick.
-                Ok(None) => return false,
+                Ok(ExtendedHoursBuyPreflight::Dropped { paged: true }) => {
+                    return SymbolScanOutcome::Held;
+                }
+                Ok(ExtendedHoursBuyPreflight::Dropped { paged: false }) => {
+                    return SymbolScanOutcome::Deferred;
+                }
                 Err(error) => Err(error),
             }
         } else {
@@ -878,7 +958,7 @@ where
         match preflight {
             Ok(CounterTradePreflight::Allowed { reservation }) => {
                 clamp_shares_to_reservation(ready, reservation.as_ref());
-                true
+                SymbolScanOutcome::Enqueued
             }
             Ok(CounterTradePreflight::Skipped(reason)) => {
                 let blocked_by_close_flatten = self
@@ -908,7 +988,7 @@ where
                         "Skipping hedge enqueue: preflight rejected"
                     );
                 }
-                false
+                SymbolScanOutcome::Held
             }
             Err(error) => {
                 let blocked_by_close_flatten = self
@@ -932,7 +1012,7 @@ where
                     symbol = %ready.symbol, %error,
                     "Preflight check failed during position scan"
                 );
-                false
+                SymbolScanOutcome::Deferred
             }
         }
     }
@@ -993,8 +1073,9 @@ where
     /// band: preflighting against an un-crossed reference would understate the
     /// cash a late-window buy actually needs by the full width of the ramp.
     ///
-    /// `Ok(None)` means the buy has no price to preflight against, which the
-    /// caller treats as "skip this tick" rather than an error. The skip is
+    /// `Dropped` means the buy has no price to preflight against, which the
+    /// caller treats as "skip this tick" rather than an error. It is a hold
+    /// when the failure paged, and deferred otherwise. The skip is
     /// counted with its own cause on `hedge_scan_skipped_total`, since the job
     /// that carries the dead-letter counter is never enqueued for it. A
     /// non-retryable reference-price failure additionally pages the operator
@@ -1006,7 +1087,7 @@ where
         &self,
         order: MarketOrder,
         close_flatten_window: Option<CloseFlattenWindow>,
-    ) -> Result<Option<CounterTradePreflight>, E::Error> {
+    ) -> Result<ExtendedHoursBuyPreflight, E::Error> {
         let reference = match resolve_extended_hours_reference_price(
             self.order_placer.as_ref(),
             &order.symbol,
@@ -1024,10 +1105,11 @@ where
                     ?error,
                     "Skipping hedge enqueue: no reference price to preflight against"
                 );
-                if should_page_reference_price_failure(
+                let paged = should_page_reference_price_failure(
                     &error,
                     self.executor.to_supported_executor(),
-                ) {
+                );
+                if paged {
                     alert_dead_letter(
                         self.notifier.as_ref(),
                         &self.alerted_dead_letters,
@@ -1044,7 +1126,7 @@ where
                     .await;
                 }
 
-                return Ok(None);
+                return Ok(ExtendedHoursBuyPreflight::Dropped { paged });
             }
         };
 
@@ -1080,14 +1162,14 @@ where
                     ),
                 )
                 .await;
-                return Ok(None);
+                return Ok(ExtendedHoursBuyPreflight::Dropped { paged: true });
             }
         };
 
         self.executor
             .preflight_counter_trade_at_price(order, limit_price)
             .await
-            .map(Some)
+            .map(ExtendedHoursBuyPreflight::Priced)
     }
 
     async fn reschedule(&self) -> Result<(), CheckPositionsError> {
@@ -1832,6 +1914,7 @@ mod tests {
             poll_interval: TEST_POLL_INTERVAL,
             notifier: Arc::new(LogNotifier),
             alerted_dead_letters: Arc::new(Mutex::new(HashSet::new())),
+            heartbeat: Arc::new(HedgeScanHeartbeat::default()),
         };
 
         (ctx, position)
@@ -2199,6 +2282,7 @@ mod tests {
             poll_interval: TEST_POLL_INTERVAL,
             notifier: Arc::new(LogNotifier),
             alerted_dead_letters: Arc::new(Mutex::new(HashSet::new())),
+            heartbeat: Arc::new(HedgeScanHeartbeat::default()),
         };
 
         CheckPositions::default().perform(&ctx).await.unwrap();
@@ -2207,6 +2291,12 @@ mod tests {
             count_jobs(&apalis_pool, &hedge_job_type()).await,
             0,
             "No hedge can be enqueued against a dead broker"
+        );
+        assert_eq!(
+            ctx.heartbeat.latest().map(|scan| scan.held),
+            Some(HashSet::new()),
+            "a failing preflight is a stall, not a hold, and the completed sweep \
+             must still advance the heartbeat"
         );
         assert_eq!(
             count_jobs(&apalis_pool, &check_positions_job_type()).await,
@@ -2304,12 +2394,72 @@ mod tests {
         let scheduled_after = chrono::Utc::now().timestamp();
         job.perform(&ctx).await.unwrap();
 
+        assert_eq!(
+            ctx.heartbeat.latest(),
+            None,
+            "a symbol-scoped recalculation is not a full sweep"
+        );
         let (payload, run_at) = load_queued_check_positions(&apalis_pool).await;
         assert_eq!(payload["equity_transfer_retry_attempts"], 6);
         assert!(
             run_at >= scheduled_after + 30,
             "the blocked retry delay must cap at 30 seconds, got run_at={run_at}"
         );
+    }
+
+    #[tokio::test]
+    async fn full_and_one_shot_sweeps_record_active_transfers_as_held() {
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let cfg = dry_run_ctx(&["AAPL"], OperationMode::Disabled);
+        let (ctx, position) =
+            build_ctx(pool, apalis_pool.clone(), cfg, Duration::from_secs(60)).await;
+        let symbol = Symbol::new("AAPL").unwrap();
+        accumulate_position(
+            &position,
+            &symbol,
+            FractionalShares::new(float!(2)),
+            Direction::Buy,
+        )
+        .await;
+        sqlx::query(
+            "INSERT INTO events \
+             (aggregate_type, aggregate_id, sequence, event_type, event_version, payload, metadata) \
+             VALUES ('EquityRedemption', 'active-redemption', 0, \
+             'EquityRedemptionEvent::WithdrawnFromRaindex', '1', ?1, '{}')",
+        )
+        .bind(r#"{"WithdrawnFromRaindex":{"symbol":"AAPL"}}"#)
+        .execute(&ctx.pool)
+        .await
+        .unwrap();
+
+        let before = chrono::Utc::now();
+        CheckPositions::default().perform(&ctx).await.unwrap();
+        let full = ctx.heartbeat.latest().unwrap();
+
+        assert!(full.completed_at >= before, "{full:?}");
+        assert_eq!(full.held, HashSet::from([symbol.clone()]));
+
+        CheckPositions::one_shot().perform(&ctx).await.unwrap();
+        let one_shot = ctx.heartbeat.latest().unwrap();
+
+        assert!(one_shot.completed_at >= full.completed_at, "{one_shot:?}");
+        assert_eq!(one_shot.held, HashSet::from([symbol]));
+    }
+
+    #[tokio::test]
+    async fn failed_sweep_does_not_advance_the_heartbeat() {
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let cfg = dry_run_ctx(&["AAPL"], OperationMode::Disabled);
+        let (ctx, _) = build_ctx(pool, apalis_pool, cfg, Duration::from_secs(60)).await;
+        ctx.pool.close().await;
+
+        let error = CheckPositions::default().perform(&ctx).await.unwrap_err();
+
+        assert!(
+            matches!(error, CheckPositionsError::CounterTradeSubmissionLock(_)),
+            "{error:?}"
+        );
+        assert_eq!(ctx.heartbeat.latest(), None);
     }
 
     #[tokio::test]
@@ -3518,6 +3668,11 @@ mod tests {
         CheckPositions::default().perform(&ctx).await.unwrap();
 
         assert_eq!(count_jobs(&apalis_pool, &hedge_job_type()).await, 0);
+        assert_eq!(
+            ctx.heartbeat.latest().map(|scan| scan.held),
+            Some(HashSet::from([symbol.clone()])),
+            "a preflight skip holds the symbol on purpose"
+        );
         let rendered = metrics_handle.render();
         assert!(
             rendered.contains("close_flatten_blocked_total{")
@@ -4297,7 +4452,10 @@ mod tests {
                 .preflight_extended_hours_buy(order.clone(), None)
                 .await
                 .unwrap();
-            assert!(result.is_none());
+            assert!(matches!(
+                result,
+                ExtendedHoursBuyPreflight::Dropped { paged: true }
+            ));
         }
 
         assert_eq!(

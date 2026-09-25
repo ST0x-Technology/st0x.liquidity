@@ -1545,6 +1545,12 @@ impl Position {
         }
     }
 
+    /// Whether the outstanding net position meets its execution threshold,
+    /// even when a pending order prevents placing another one.
+    pub(crate) fn meets_execution_threshold(&self) -> Result<bool, PositionError> {
+        Ok(self.create_trigger_reason(&self.threshold)?.is_some())
+    }
+
     pub(crate) fn absolute_net_shares(&self) -> Result<FractionalShares, PositionError> {
         Ok(self.net.abs()?)
     }
