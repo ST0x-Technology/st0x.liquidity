@@ -19346,6 +19346,47 @@ mod tests {
         )));
     }
 
+    /// A used nonce whose found mint log differs from the recorded message
+    /// (a relayer minted a re-attested body) can never be adopted. After a
+    /// restart the recovery pages once and parks: redriving could adopt the
+    /// relayer mint later and send the USDC to Alpaca after the operator did.
+    #[cfg(feature = "test-support")]
+    #[tracing_test::traced_test]
+    #[tokio::test]
+    async fn recover_from_bridging_failed_parks_an_unadoptable_mint() {
+        let (error, id, _, state) = resume_bridging_failed_with_mint_recovery_error(|| {
+            CctpError::RecoveredMintMessageMismatch {
+                nonce: B256::repeat_byte(0x07),
+            }
+        })
+        .await;
+
+        assert!(
+            matches!(
+                &error,
+                UsdcTransferError::PreviouslyFailedAggregate { id: failed_id } if *failed_id == id
+            ),
+            "an unadoptable mint must park, not redrive; got: {error:?}"
+        );
+        assert!(
+            matches!(state, UsdcRebalance::BridgingFailed { .. }),
+            "the transfer must stay BridgingFailed, with no deposit send; got: {state:?}"
+        );
+        assert!(logs_contain(&format!(
+            "USDC transfer {id}: the CCTP mint cannot be resolved automatically"
+        )));
+        logs_assert(|lines: &[&str]| {
+            let pages = lines
+                .iter()
+                .filter(|line| line.contains("operational_alert"))
+                .count();
+            match pages {
+                1 => Ok(()),
+                other => Err(format!("expected exactly one page, got {other}")),
+            }
+        });
+    }
+
     /// Resumes an `Attested` transfer in `direction` whose pre-mint
     /// `find_attested_mint` lookup fails with `lookup_error()`. Returns the
     /// resume error, the aggregate id and its `initiated_at`, and the state the
