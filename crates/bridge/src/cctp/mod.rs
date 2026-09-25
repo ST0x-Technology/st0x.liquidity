@@ -1860,6 +1860,7 @@ mod tests {
         remaining_stale_unused_reads: AtomicU32,
         fail_historical_reads: bool,
         historical_read_block: Option<u64>,
+        historical_read_offset: Option<u64>,
         requested_historical_block: Arc<AtomicU64>,
         call_count: Arc<AtomicU32>,
     }
@@ -1901,6 +1902,7 @@ mod tests {
                 remaining_stale_unused_reads: AtomicU32::new(0),
                 fail_historical_reads: false,
                 historical_read_block: None,
+                historical_read_offset: None,
                 requested_historical_block: Arc::new(AtomicU64::new(u64::MAX)),
                 call_count,
             }
@@ -1948,6 +1950,13 @@ mod tests {
         /// for the state of a long chain that anvil would take minutes to mine.
         fn with_historical_reads_at(mut self, real_block: u64) -> Self {
             self.historical_read_block = Some(real_block);
+            self
+        }
+
+        /// Answers every `call_at` from the real block `offset` below the one
+        /// asked for, apart from the reported head's offset.
+        fn with_historical_reads_shifted_by(mut self, offset: u64) -> Self {
+            self.historical_read_offset = Some(offset);
             self
         }
 
@@ -2064,9 +2073,12 @@ mod tests {
                 )));
             }
 
+            let offset = self
+                .historical_read_offset
+                .unwrap_or(self.provider.head_offset);
             let real_block = self
                 .historical_read_block
-                .unwrap_or_else(|| block_number.saturating_sub(self.provider.head_offset));
+                .unwrap_or_else(|| block_number.saturating_sub(offset));
 
             self.inner
                 .call_at::<Registry, Call>(contract, call, real_block)
@@ -5013,6 +5025,93 @@ mod tests {
 
         assert_eq!(recovered.tx, mint_receipt.tx);
         assert_eq!(recovered.amount, mint_receipt.amount);
+    }
+
+    /// A relayer can mint just before the bot captures its floor. A transfer
+    /// resumed after the lookback has passed that floor must still place the
+    /// mint in the scan window, not below it.
+    #[tokio::test]
+    async fn find_existing_mint_places_a_mint_just_below_an_old_captured_floor_in_the_window() {
+        let cctp = LocalCctp::new().await.unwrap();
+        let bridge = cctp.create_bridge().await.unwrap();
+
+        let recipient = bridge.base.owner();
+        let amount = U256::from(1_800_000u64);
+
+        // Room below the burn for a real block that holds the contracts.
+        let base_provider = ProviderBuilder::new()
+            .connect(&cctp.base_endpoint)
+            .await
+            .unwrap();
+        base_provider.anvil_mine(Some(400), None).await.unwrap();
+
+        let burn_receipt = bridge
+            .burn_internal::<NoOpErrorRegistry>(BridgeDirection::EthereumToBase, amount, recipient)
+            .await
+            .unwrap();
+        let message = cctp
+            .extract_message_from_burn_tx(burn_receipt.tx, true)
+            .await
+            .unwrap();
+        let (attestation, message_with_nonce) = cctp.sign_message(&message).await.unwrap();
+
+        bridge
+            .mint_internal::<NoOpErrorRegistry>(
+                BridgeDirection::EthereumToBase,
+                message_with_nonce.clone(),
+                attestation,
+            )
+            .await
+            .unwrap();
+        let after_mint = base_provider.get_block_number().await.unwrap();
+
+        // The captured floor sits below the three 20_000-block lookback chunks,
+        // and the block just below it reads as the real block holding the mint.
+        let head_offset = 1_000_000;
+        let head = after_mint + head_offset;
+        let captured = head - 60_000 - 10_000;
+        let flaky_wallet = FlakyProbeWallet::new(
+            RawPrivateKeyWallet::new(&cctp.deployer_key, base_provider, 1).unwrap(),
+            FlakyProbeFailures {
+                call_failures: 0,
+                empty_log_scans: u32::MAX,
+            },
+            Arc::new(AtomicU32::new(0)),
+        )
+        .with_reported_head_offset(head_offset)
+        .with_historical_reads_shifted_by(captured - 1 - after_mint);
+        let requested_historical_block = flaky_wallet.requested_historical_block();
+        let flaky_endpoint = CctpEndpoint::new(
+            cctp.base.usdc,
+            cctp.base.token_messenger,
+            cctp.base.message_transmitter,
+            flaky_wallet,
+        )
+        .with_node_sync_poll_interval(Duration::ZERO);
+
+        let error = flaky_endpoint
+            .find_existing_mint::<NoOpErrorRegistry>(
+                BridgeDirection::EthereumToBase,
+                &message_with_nonce,
+                Some(captured),
+            )
+            .await
+            .unwrap_err();
+
+        let CctpError::MintNotFoundInScanWindow {
+            from_block,
+            floor_check,
+            ..
+        } = error
+        else {
+            panic!("a consumed nonce with no visible log must name its floor: {error:?}");
+        };
+        assert_eq!(from_block, captured - 300);
+        assert_eq!(floor_check, MintScanFloorCheck::MintInScanWindow);
+        assert_eq!(
+            requested_historical_block.load(Ordering::SeqCst),
+            captured - 301
+        );
     }
 
     /// One `usedNonces()` read can come from a node behind the block that holds
