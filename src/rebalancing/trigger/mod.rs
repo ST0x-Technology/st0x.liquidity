@@ -965,6 +965,17 @@ enum UsdcTimeoutCleanup {
     HeldForUnservedCorridor { corridor: UsdcCorridor },
 }
 
+/// Whether a tracked transfer's durable state lets the sweep release its
+/// guard: `Reconciled`, or a state holding no guard on a corridor this build
+/// does not serve (an operator failed it before its burn, say), which no
+/// other path would ever release.
+fn releases_tracked_guard(state: &UsdcRebalance, served_corridor: UsdcCorridor) -> bool {
+    match state {
+        UsdcRebalance::Reconciled { .. } => true,
+        held => held.corridor() != served_corridor && !held.holds_rebalance_guard(),
+    }
+}
+
 /// Outcome of examining a tracked redemption during the timeout sweep.
 #[derive(Debug)]
 enum RedemptionTimeoutCleanup {
@@ -2307,6 +2318,7 @@ impl RebalancingService {
         };
 
         if tracking.is_post_burn() {
+            let served_corridor = self.config.served_usdc_corridor;
             // Post-burn: check durable state FIRST, regardless of elapsed time.
             // The Reconciled check is always safe: it only fires when the
             // aggregate is actually Reconciled and clearing the guard at that
@@ -2317,8 +2329,10 @@ impl RebalancingService {
             let usdc_store = self.usdc_store.read().await.as_ref().map(Arc::clone);
             if let Some(store) = usdc_store {
                 match store.load(id).await {
-                    Ok(Some(UsdcRebalance::Reconciled { .. })) => {
-                        // Durable state is Reconciled: the CLI's separate-process
+                    Ok(Some(state)) if releases_tracked_guard(&state, served_corridor) => {
+                        // Durable state is Reconciled (or, on a corridor this
+                        // build does not serve, any state that holds no guard):
+                        // the CLI's separate-process
                         // store emitted OperatorReconciled but the live reactor
                         // never saw it. Apply the side-effect here: zero the
                         // source-venue inflight and clear the active rebalance.
@@ -2377,7 +2391,9 @@ impl RebalancingService {
                             .insert(id.clone(), now);
                         return Ok(Some(UsdcTimeoutCleanup::Cleared { tracking, elapsed }));
                     }
-                    Ok(Some(state)) if state.corridor() != self.config.served_usdc_corridor => {
+                    Ok(Some(state))
+                        if state.corridor() != served_corridor && state.holds_rebalance_guard() =>
+                    {
                         return Ok(Some(UsdcTimeoutCleanup::HeldForUnservedCorridor {
                             corridor: state.corridor(),
                         }));
