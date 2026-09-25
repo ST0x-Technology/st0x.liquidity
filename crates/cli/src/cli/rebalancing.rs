@@ -1473,12 +1473,24 @@ pub(super) async fn reconcile_usdc_transfer_command<Writer: Write>(
         )
         .await?;
 
-    writeln!(
-        stdout,
-        "Reconciled USDC transfer {id} (reason: {reason:?}); the in-progress guard will clear \
-         on the next sweep tick (within transfer_timeout) and USDC rebalancing will resume \
-         without a restart."
-    )?;
+    // The running bot keeps a signed send's nonce reserved; only a restart
+    // releases it.
+    if state.has_prepared_deposit_send() {
+        writeln!(
+            stdout,
+            "Reconciled USDC transfer {id} (reason: {reason:?}); the in-progress guard will \
+             clear on the next sweep tick (within transfer_timeout). Restart the bot to \
+             release the signed deposit send's nonce: until then later sends from the \
+             Ethereum wallet wait behind it."
+        )?;
+    } else {
+        writeln!(
+            stdout,
+            "Reconciled USDC transfer {id} (reason: {reason:?}); the in-progress guard will \
+             clear on the next sweep tick (within transfer_timeout) and USDC rebalancing will \
+             resume without a restart."
+        )?;
+    }
 
     Ok(())
 }
