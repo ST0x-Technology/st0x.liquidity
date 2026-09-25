@@ -8226,6 +8226,44 @@ mod tests {
         assert!(unbroadcast.is_empty(), "got {unbroadcast:?}");
     }
 
+    /// A restored withdrawal that is rebroadcast but not mined yet names its
+    /// chain: a startup approval there would wait behind its nonce, and one
+    /// held at too low a fee would time out and fail every restart.
+    #[tokio::test]
+    async fn startup_returns_the_chain_of_a_rebroadcast_withdrawal_not_yet_mined() {
+        let InterruptedAggregateFixture {
+            pool,
+            services,
+            raindex,
+            rebalancing_service,
+            inventory,
+            mut resume_queue,
+            ..
+        } = seed_interrupted_aggregates_and_build_service(6, "unmined-mint", "unmined-redemption")
+            .await;
+
+        let unmined = recover_interrupted_tokenization_aggregates(
+            &pool,
+            &rebalancing_service,
+            inventory.as_ref(),
+            Arc::new(test_store::<TokenizedEquityMint>(
+                pool.clone(),
+                services.clone(),
+            )),
+            Arc::new(test_store::<EquityRedemption>(
+                pool.clone(),
+                services.clone(),
+            )),
+            &services,
+            &mut resume_queue,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(raindex.broadcast_withdrawals().len(), 1);
+        assert_eq!(unmined, BTreeSet::from([Chain::Base]));
+    }
+
     /// A restored withdrawal whose rebroadcast fails pages and names its
     /// chain, so startup skips that wallet's approvals instead of failing.
     #[tokio::test]
