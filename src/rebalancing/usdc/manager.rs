@@ -16057,6 +16057,20 @@ mod tests {
         assert_eq!(restored, vec![prepared_only.tx_hash(), recorded.tx_hash()]);
     }
 
+    /// Passes when one captured log line is an `operational_alert` page
+    /// holding `message`.
+    fn paged(lines: &[&str], message: &str) -> Result<(), String> {
+        lines
+            .iter()
+            .any(|line| {
+                line.contains("operational_alert")
+                    && line.contains("alert=true")
+                    && line.contains(message)
+            })
+            .then_some(())
+            .ok_or_else(|| format!("no operational_alert page holds {message:?}"))
+    }
+
     /// Makes every load of `id` fail: its first event no longer deserializes,
     /// and no snapshot lets the load skip it.
     async fn corrupt_usdc_rebalance(pool: &SqlitePool, id: &UsdcRebalanceId) {
@@ -16094,10 +16108,13 @@ mod tests {
         assert_eq!(manager.restore_prepared_deposit_sends(&pool).await, 0);
 
         assert!(bridge.usdc_restored().is_empty());
-        assert!(logs_contain(
-            "Could not list signed Alpaca deposit sends at startup; their nonces are not \
-             reserved until each transfer resumes"
-        ));
+        logs_assert(|lines| {
+            paged(
+                lines,
+                "Could not list signed Alpaca deposit sends at startup; their nonces are not \
+                 reserved until each transfer resumes",
+            )
+        });
     }
 
     /// A signed send under an unparseable transfer id pages, and the others
@@ -16137,10 +16154,13 @@ mod tests {
         assert_eq!(manager.restore_prepared_deposit_sends(&pool).await, 1);
 
         assert_eq!(bridge.usdc_restored(), vec![signed.tx_hash()]);
-        assert!(logs_contain(
-            "Signed Alpaca deposit sends with unparseable transfer ids were not restored at \
-             startup"
-        ));
+        logs_assert(|lines| {
+            paged(
+                lines,
+                "Signed Alpaca deposit sends with unparseable transfer ids were not restored at \
+                 startup",
+            )
+        });
         assert!(logs_contain("not-a-transfer-id"));
     }
 
@@ -16178,10 +16198,13 @@ mod tests {
         assert_eq!(manager.restore_prepared_deposit_sends(&pool).await, 1);
 
         assert_eq!(bridge.usdc_restored(), vec![loadable_send.tx_hash()]);
-        assert!(logs_contain(
-            "Could not load a transfer with a signed Alpaca deposit send at startup; its nonce \
-             is not reserved until it resumes"
-        ));
+        logs_assert(|lines| {
+            paged(
+                lines,
+                "Could not load a transfer with a signed Alpaca deposit send at startup; its nonce \
+                 is not reserved until it resumes",
+            )
+        });
         assert!(logs_contain(&format!("id={broken}")));
     }
 
@@ -16206,10 +16229,13 @@ mod tests {
             bridge.usdc_discarded().is_empty(),
             "the nonce stays reserved"
         );
-        assert!(logs_contain(
-            "Cannot tell whether a signed Alpaca deposit send was persisted; its nonce stays \
-             reserved and later Ethereum wallet sends wait behind it until a restart"
-        ));
+        logs_assert(|lines| {
+            paged(
+                lines,
+                "Cannot tell whether a signed Alpaca deposit send was persisted; its nonce stays \
+                 reserved and later Ethereum wallet sends wait behind it until a restart",
+            )
+        });
         assert!(logs_contain(&format!("id={id}")));
     }
 
