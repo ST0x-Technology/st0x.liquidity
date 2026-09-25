@@ -2661,10 +2661,12 @@ async fn skipped_fills(
     let since = parse_filter_time(query.since.as_deref(), "since")
         .map_err(|_| ops_precondition_error("since must be an RFC 3339 timestamp"))?
         .map(|since| since.to_rfc3339());
+    // An empty filter value means no filter, as on the trades route.
+    let present = |value: Option<String>| value.filter(|value| !value.is_empty());
     let filter = SkippedFillFilter {
-        reason: query.reason,
-        chain: query.chain,
-        symbol: query.symbol,
+        reason: present(query.reason),
+        chain: present(query.chain),
+        symbol: present(query.symbol),
         since,
         covered: query.covered,
         limit: query.limit.unwrap_or(100).clamp(1, 500),
@@ -7418,6 +7420,26 @@ mod tests {
         let cover = covered[0].cover.as_ref().expect("the recorded cover");
         assert_eq!(cover.price_usdc, "151");
         assert_eq!(cover.broker_order_id.as_deref(), Some("order-1"));
+    }
+
+    /// An empty filter value means no filter, not a match on the empty string.
+    #[tokio::test]
+    async fn empty_skipped_fills_filters_are_ignored() {
+        let state = empty_app_state(create_test_ctx_with_order_owner(Address::ZERO)).await;
+        seed_excluded_fill(&state.pool).await;
+
+        let (_, Json(response)) = skipped_fills(
+            State(state),
+            Query(SkippedFillsQuery {
+                reason: Some(String::new()),
+                chain: Some(String::new()),
+                symbol: Some(String::new()),
+                ..SkippedFillsQuery::default()
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.skipped_fills.len(), 1);
     }
 
     /// A fill classified both ways (excluded, and also in `Position` from a

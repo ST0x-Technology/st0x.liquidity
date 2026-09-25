@@ -97,6 +97,25 @@ pub async fn exclusion_cause(
     let chain = trade.chain.to_string();
     let symbol = trade.symbol().to_string();
     let block = block_to_i64(fill_block)?;
+
+    // The config says enabled, but the last restart recorded the asset
+    // disabled: the config was edited and read by a process (CLI `process-tx`)
+    // before the bot restarted to close the period. A fill from the open
+    // period stays excluded, as the bot will decide once it closes it.
+    let open_period = sqlx::query_scalar!(
+        "SELECT COUNT(*) FROM trading_enablement \
+         WHERE chain = ? AND symbol = ? AND trading_enabled = 0 \
+         AND disabled_from_block <= ?",
+        chain,
+        symbol,
+        block,
+    )
+    .fetch_one(pool)
+    .await?;
+    if open_period > 0 {
+        return Ok(Some(ExclusionCause::TradingDisabled));
+    }
+
     let enabled_from_block = sqlx::query_scalar!(
         "SELECT enabled_from_block FROM trading_disabled_period \
          WHERE chain = ? AND symbol = ? \
@@ -471,6 +490,23 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(recorded, 0);
+    }
+
+    /// A process whose config already enables the asset, before the bot has
+    /// restarted to close the disabled period, still excludes a fill from the
+    /// open period; a fill from before the period is hedged.
+    #[tokio::test]
+    async fn fill_in_an_open_disabled_period_stays_excluded_under_a_newer_config() {
+        let (pool, _apalis) = setup_test_pools().await;
+        restart(&pool, &chains_with(Some(OperationMode::Enabled)), 10).await;
+        restart(&pool, &chains_with(Some(OperationMode::Disabled)), 100).await;
+        let enabled = chains_with(Some(OperationMode::Enabled));
+
+        assert_eq!(
+            cause_for(&pool, &enabled, 150).await,
+            Some(ExclusionCause::TradingDisabled)
+        );
+        assert_eq!(cause_for(&pool, &enabled, 100).await, None);
     }
 
     #[tokio::test]
