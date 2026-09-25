@@ -1747,13 +1747,7 @@ mod tests {
         )
         .await;
         let aggregate_id = redemption_aggregate_id("terminal-redemption-no-defer");
-        seed_redemption_failed(
-            &redemption_pool,
-            &ctx.redemption_store,
-            &aggregate_id,
-            &symbol,
-        )
-        .await;
+        seed_redemption_failed(&redemption_pool, &aggregate_id, &symbol).await;
         ctx.position_authority = Some((position_store, ExecutionThreshold::whole_share()));
 
         let job = TransferEquityToHedging {
@@ -3125,35 +3119,55 @@ mod tests {
         (ctx, pool)
     }
 
-    /// Seeds a fresh redemption into the terminal `Failed` state via a still
-    /// allowed force fail. A broadcast submission can no longer be force failed
-    /// (it may still land, so it must be reconciled), so this inserts a
-    /// `WithdrawnFromRaindex` origin directly (no command reaches it without
-    /// live chain services) and force fails that post confirmation state.
+    /// Seeds a fresh redemption into the terminal `Failed` state entirely
+    /// through the aggregate command path (never a direct `events` insert; see
+    /// docs/cqrs.md): `Redeem` -> `RecordWithdrawSubmission` -> `ConfirmWithdraw`
+    /// (resolved by a confirming mock chain service) -> `FailTransfer`. A
+    /// broadcast submission can no longer be force failed, so the force fail
+    /// runs from `WithdrawnFromRaindex`, the earliest force-failable origin.
     async fn seed_redemption_failed(
         pool: &sqlx::SqlitePool,
-        store: &Store<EquityRedemption>,
         id: &RedemptionAggregateId,
         symbol: &Symbol,
     ) {
-        sqlx::query(
-            "INSERT INTO events \
-             (aggregate_type, aggregate_id, sequence, event_type, \
-              event_version, payload, metadata) \
-             VALUES ('EquityRedemption', ?1, 1, \
-              'EquityRedemptionEvent::WithdrawnFromRaindex', '1', ?2, '{}')",
-        )
-        .bind(id.to_string())
-        .bind(format!(
-            r#"{{"WithdrawnFromRaindex":{{"symbol":"{symbol}","quantity":"10","token":"0x0000000000000000000000000000000000000001","wrapped_amount":"10000000000000000000","raindex_withdraw_tx":"0x0000000000000000000000000000000000000000000000000000000000000001","withdrawn_at":"2026-01-01T00:00:00Z"}}}}"#
-        ))
-        .execute(pool)
-        .await
-        .unwrap();
+        use EquityRedemptionCommand::*;
+
+        let token = Address::ZERO;
+        let amount = U256::from(1_000_000_000_000_000_000_u128);
+        let store = test_store::<EquityRedemption>(
+            pool.clone(),
+            EquityTransferServices::confirming_withdrawal(token, amount),
+        );
         store
             .send(
                 id,
-                EquityRedemptionCommand::FailTransfer {
+                Redeem {
+                    chain: Chain::Base,
+                    symbol: symbol.clone(),
+                    quantity: float!(1),
+                    token,
+                    vault_id: st0x_raindex::RaindexVaultId(alloy::primitives::B256::ZERO),
+                    amount,
+                    from_block: 0,
+                    prepared: crate::equity_redemption::prepared_withdrawal_for_test(),
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .send(
+                id,
+                RecordWithdrawSubmission {
+                    tx_hash: alloy::primitives::TxHash::ZERO,
+                },
+            )
+            .await
+            .unwrap();
+        store.send(id, ConfirmWithdraw).await.unwrap();
+        store
+            .send(
+                id,
+                FailTransfer {
                     reason: "test: forced terminal state".to_string(),
                 },
             )
@@ -3909,13 +3923,7 @@ mod tests {
         // Drive the redemption to a terminal Failed state via a still allowed
         // force fail: a terminal aggregate no longer owns the reservation, so
         // cleanup must release it.
-        seed_redemption_failed(
-            &redemption_pool,
-            &ctx.redemption_store,
-            &aggregate_id,
-            &symbol,
-        )
-        .await;
+        seed_redemption_failed(&redemption_pool, &aggregate_id, &symbol).await;
 
         let position_pool = crate::test_utils::setup_test_db().await;
         let (position_store, position_projection) = StoreBuilder::<Position>::new(position_pool)

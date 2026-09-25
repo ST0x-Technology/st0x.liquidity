@@ -21235,37 +21235,55 @@ mod tests {
             .unwrap();
     }
 
-    /// Drives an `EquityRedemption` aggregate to `Failed` state (terminal).
-    ///
-    /// A broadcast submission can no longer be force failed (it may still land,
-    /// so it must be reconciled), so this inserts a `WithdrawnFromRaindex`
-    /// origin directly (no command reaches it without live chain services) and
-    /// force fails that post confirmation state. `FailTransfer` calls no
-    /// services, so it is safe with panicking services.
+    /// Drives an `EquityRedemption` aggregate to the terminal `Failed` state
+    /// entirely through the aggregate command path (never a direct `events`
+    /// insert; see docs/cqrs.md): `Redeem` -> `RecordWithdrawSubmission` ->
+    /// `ConfirmWithdraw` (resolved by a confirming mock chain service) ->
+    /// `FailTransfer`. A broadcast submission can no longer be force failed, so
+    /// the force fail runs from `WithdrawnFromRaindex`, the earliest
+    /// force-failable origin.
     async fn seed_terminal_redemption_aggregate(
         pool: &SqlitePool,
         redemption_id: &RedemptionAggregateId,
     ) {
-        sqlx::query(
-            "INSERT INTO events \
-             (aggregate_type, aggregate_id, sequence, event_type, \
-              event_version, payload, metadata) \
-             VALUES ('EquityRedemption', ?1, 1, \
-              'EquityRedemptionEvent::WithdrawnFromRaindex', '1', ?2, '{}')",
-        )
-        .bind(redemption_id.to_string())
-        .bind(
-            r#"{"WithdrawnFromRaindex":{"symbol":"tAAPL","quantity":"1","token":"0x0000000000000000000000000000000000000001","wrapped_amount":"1000000000000000000","raindex_withdraw_tx":"0x0000000000000000000000000000000000000000000000000000000000000001","withdrawn_at":"2026-01-01T00:00:00Z"}}"#,
-        )
-        .execute(pool)
-        .await
-        .unwrap();
-        let store =
-            test_store::<EquityRedemption>(pool.clone(), EquityTransferServices::panicking());
+        use EquityRedemptionCommand::*;
+
+        let token = Address::ZERO;
+        let amount = U256::from(1_000_000_000_000_000_000_u128);
+        let store = test_store::<EquityRedemption>(
+            pool.clone(),
+            EquityTransferServices::confirming_withdrawal(token, amount),
+        );
         store
             .send(
                 redemption_id,
-                EquityRedemptionCommand::FailTransfer {
+                Redeem {
+                    chain: Chain::Base,
+                    symbol: Symbol::new("tAAPL").unwrap(),
+                    quantity: float!(1),
+                    token,
+                    vault_id: st0x_raindex::RaindexVaultId(alloy::primitives::B256::ZERO),
+                    amount,
+                    from_block: 0,
+                    prepared: crate::equity_redemption::prepared_withdrawal_for_test(),
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .send(
+                redemption_id,
+                RecordWithdrawSubmission {
+                    tx_hash: alloy::primitives::TxHash::ZERO,
+                },
+            )
+            .await
+            .unwrap();
+        store.send(redemption_id, ConfirmWithdraw).await.unwrap();
+        store
+            .send(
+                redemption_id,
+                FailTransfer {
                     reason: "test: forced redemption failure".to_string(),
                 },
             )
