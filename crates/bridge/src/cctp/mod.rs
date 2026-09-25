@@ -474,6 +474,8 @@ pub enum CctpError {
     MintAndWithdrawEventNotFound,
     #[error("transaction {tx_hash} receipt has no block number")]
     TxReceiptMissingBlock { tx_hash: TxHash },
+    #[error("transaction {tx_hash} is not mined: the hash is unknown or the tx is still pending")]
+    TxNotMined { tx_hash: TxHash },
     #[error("USDC credited by transaction {tx_hash} overflows U256")]
     UsdcCreditOverflow { tx_hash: TxHash },
     #[error("USDC Transfer log in transaction {tx_hash} does not decode: {source}")]
@@ -615,6 +617,7 @@ impl CctpError {
             | Self::MessageSentEventNotFound { .. }
             | Self::MintAndWithdrawEventNotFound
             | Self::TxReceiptMissingBlock { .. }
+            | Self::TxNotMined { .. }
             | Self::UsdcCreditOverflow { .. }
             | Self::UsdcTransferLogDecode { .. }
             | Self::MessageTooShort { .. }
@@ -6210,6 +6213,41 @@ mod tests {
                 .unwrap(),
             U256::ZERO,
             "USDC from another sender does not count",
+        );
+    }
+
+    /// An operator-supplied hash that is not mined is refused at once, not
+    /// after the receipt wait's drop grace or timeout.
+    #[tokio::test]
+    async fn usdc_sent_refuses_an_unmined_tx_hash_without_waiting() {
+        let (_ethereum_anvil, ethereum_endpoint, private_key) = setup_anvil();
+        let (_base_anvil, base_endpoint, _) = setup_anvil();
+
+        let usdc_address = deploy_mock_usdc(&ethereum_endpoint, &private_key)
+            .await
+            .unwrap();
+        let bridge = create_bridge(
+            &ethereum_endpoint,
+            &base_endpoint,
+            &private_key,
+            usdc_address,
+        )
+        .await
+        .unwrap();
+
+        let unknown_tx = TxHash::random();
+        let recipient = address!("0x000000000000000000000000000000000000bEEF");
+        let error = tokio::time::timeout(
+            Duration::from_secs(5),
+            bridge.ethereum_usdc_sent(unknown_tx, recipient, recipient),
+        )
+        .await
+        .expect("an unmined hash must be refused without waiting for a receipt")
+        .unwrap_err();
+
+        assert!(
+            matches!(error, CctpError::TxNotMined { tx_hash } if tx_hash == unknown_tx),
+            "got: {error:?}"
         );
     }
 

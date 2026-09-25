@@ -595,6 +595,7 @@ fn repeating_mint_failure(
         | CctpError::MessageSentEventNotFound { .. }
         | CctpError::MintAndWithdrawEventNotFound
         | CctpError::TxReceiptMissingBlock { .. }
+        | CctpError::TxNotMined { .. }
         | CctpError::UsdcCreditOverflow { .. }
         | CctpError::UsdcTransferLogDecode { .. }
         | CctpError::AlreadyMintedMessageNotFound { .. }
