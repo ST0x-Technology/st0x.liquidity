@@ -513,45 +513,12 @@ fn repeating_mint_failure(
 /// Whether an inconclusive mint recovery read the nonce used but found no
 /// `MessageReceived` log in a bounded scan whose floor the mint can lie
 /// below. No retry scans wider, so the caller parks; every other cause may
-/// clear on a redrive. Exhaustive so a new `CctpError` needs a decision.
+/// clear on a redrive.
 fn recovery_mint_outside_scan(recovery_error: &CctpError, initiated_at: DateTime<Utc>) -> bool {
-    match recovery_error {
-        CctpError::MintNotFoundInScanWindow { floor_check, .. } => {
-            mint_can_lie_below_scan_floor(*floor_check, initiated_at)
-        }
-
-        CctpError::Evm(_)
-        | CctpError::Contract(_)
-        | CctpError::RpcTransport(_)
-        | CctpError::SolType(_)
-        | CctpError::ScanInconclusive { .. }
-        | CctpError::BurnTxPending { .. }
-        | CctpError::Http(_)
-        | CctpError::AttestationTimeout { .. }
-        | CctpError::PlaceholderNonce
-        | CctpError::MalformedAttestation { .. }
-        | CctpError::MessageTooShort { .. }
-        | CctpError::MessageDestinationDomainMismatch { .. }
-        | CctpError::MessageTooShortForRecovery { .. }
-        | CctpError::MintScanFloorBlockMissing { .. }
-        | CctpError::MessageSentEventNotFound { .. }
-        | CctpError::MintAndWithdrawEventNotFound
-        | CctpError::TxReceiptMissingBlock { .. }
-        | CctpError::UsdcCreditOverflow { .. }
-        | CctpError::UsdcTransferLogDecode { .. }
-        | CctpError::AlreadyMintedMessageNotFound { .. }
-        | CctpError::RecoveredMintMessageMismatch { .. }
-        | CctpError::RecoveredMintLogMissingTxHash { .. }
-        | CctpError::RecoveredMintReceiptReverted { .. }
-        | CctpError::RecoveredMintAndWithdrawEventNotFound { .. }
-        | CctpError::MintRecoveryInconclusive { .. }
-        | CctpError::FeeCalculationOverflow
-        | CctpError::Float(_)
-        | CctpError::AmountConversion(_)
-        | CctpError::FastTransferFeeNotAvailable { .. }
-        | CctpError::AmountBelowFastTransferFee { .. }
-        | CctpError::HexDecode(_)
-        | CctpError::FeeValueParse(_) => false,
+    match repeating_mint_failure(recovery_error, initiated_at) {
+        Some(RepeatingMintFailure::MintOutsideScanWindow) => true,
+        Some(RepeatingMintFailure::MessageCannotMint | RepeatingMintFailure::MintNotAdoptable)
+        | None => false,
     }
 }
 
