@@ -1859,6 +1859,8 @@ mod tests {
         remaining_call_failures: AtomicU32,
         remaining_stale_unused_reads: AtomicU32,
         fail_historical_reads: bool,
+        historical_read_block: Option<u64>,
+        requested_historical_block: Arc<AtomicU64>,
         call_count: Arc<AtomicU32>,
     }
 
@@ -1898,6 +1900,8 @@ mod tests {
                 remaining_call_failures: AtomicU32::new(failures.call_failures),
                 remaining_stale_unused_reads: AtomicU32::new(0),
                 fail_historical_reads: false,
+                historical_read_block: None,
+                requested_historical_block: Arc::new(AtomicU64::new(u64::MAX)),
                 call_count,
             }
         }
@@ -1938,6 +1942,19 @@ mod tests {
         fn with_failing_historical_reads(mut self) -> Self {
             self.fail_historical_reads = true;
             self
+        }
+
+        /// Answers every `call_at` from the real block `real_block`, standing in
+        /// for the state of a long chain that anvil would take minutes to mine.
+        fn with_historical_reads_at(mut self, real_block: u64) -> Self {
+            self.historical_read_block = Some(real_block);
+            self
+        }
+
+        /// Returns a handle to the block the last `call_at` asked for
+        /// (`u64::MAX` until the first one).
+        fn requested_historical_block(&self) -> Arc<AtomicU64> {
+            Arc::clone(&self.requested_historical_block)
         }
 
         /// Fails the first `failing_head_reads` `get_block_number` calls.
@@ -2024,7 +2041,7 @@ mod tests {
         }
 
         /// Reads the real block `head_offset` below `block_number`, matching
-        /// the provider's shifted head.
+        /// the provider's shifted head, unless pinned to one real block.
         async fn call_at<Registry: IntoErrorRegistry, Call: SolCall + Send>(
             &self,
             contract: Address,
@@ -2034,6 +2051,9 @@ mod tests {
         where
             Self: Sized,
         {
+            self.requested_historical_block
+                .store(block_number, Ordering::SeqCst);
+
             if self.fail_historical_reads {
                 return Err(EvmError::Contract(ContractError::TransportError(
                     RpcError::ErrorResp(ErrorPayload {
@@ -2044,12 +2064,12 @@ mod tests {
                 )));
             }
 
+            let real_block = self
+                .historical_read_block
+                .unwrap_or_else(|| block_number.saturating_sub(self.provider.head_offset));
+
             self.inner
-                .call_at::<Registry, Call>(
-                    contract,
-                    call,
-                    block_number.saturating_sub(self.provider.head_offset),
-                )
+                .call_at::<Registry, Call>(contract, call, real_block)
                 .await
         }
     }
@@ -4800,6 +4820,7 @@ mod tests {
 
         let recipient = bridge.base.owner();
         let amount = U256::from(1_900_000u64);
+        let before_burn = bridge.base.current_block().await.unwrap();
 
         let burn_receipt = bridge
             .burn_internal::<NoOpErrorRegistry>(BridgeDirection::EthereumToBase, amount, recipient)
@@ -4820,11 +4841,14 @@ mod tests {
             .await
             .unwrap();
 
-        // The floor maps to genesis, where the nonce is unused.
+        // The floor block's state is the real one before the burn, where the
+        // contracts exist and the nonce is unused.
+        let head_offset = 1_000_000;
         let base_provider = ProviderBuilder::new()
             .connect(&cctp.base_endpoint)
             .await
             .unwrap();
+        let head = base_provider.get_block_number().await.unwrap() + head_offset;
         let flaky_wallet = FlakyProbeWallet::new(
             RawPrivateKeyWallet::new(&cctp.deployer_key, base_provider, 1).unwrap(),
             FlakyProbeFailures {
@@ -4833,7 +4857,9 @@ mod tests {
             },
             Arc::new(AtomicU32::new(0)),
         )
-        .with_reported_head_offset(1_000_000);
+        .with_reported_head_offset(head_offset)
+        .with_historical_reads_at(before_burn);
+        let requested_historical_block = flaky_wallet.requested_historical_block();
         let flaky_endpoint = CctpEndpoint::new(
             cctp.base.usdc,
             cctp.base.token_messenger,
@@ -4851,10 +4877,21 @@ mod tests {
             .await
             .unwrap_err();
 
-        let CctpError::MintNotFoundInScanWindow { floor_check, .. } = error else {
+        let CctpError::MintNotFoundInScanWindow {
+            from_block,
+            floor_check,
+            ..
+        } = error
+        else {
             panic!("a consumed nonce with no visible log must name its floor: {error:?}");
         };
+        assert_eq!(from_block, head - 60_000);
         assert_eq!(floor_check, MintScanFloorCheck::MintInScanWindow);
+        assert_eq!(
+            requested_historical_block.load(Ordering::SeqCst),
+            from_block - 1,
+            "the nonce must be read at the block below the floor"
+        );
     }
 
     /// Burns name no destination caller, so a relayer can mint between Circle
