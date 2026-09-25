@@ -4866,10 +4866,12 @@ async fn recorded_trading_disabled_detail(
 ///
 /// A record on a fill that is also in `Position` is a conflict: concurrent
 /// runs classified it both ways, so the bot hedges it while the record tells
-/// the operator to cover it by hand. The run that meets it first fails with
-/// `ExclusionConflict`; every later delivery lands here and reports the fill as
-/// hedged, which is what `Position` does with it, logging the conflict instead
-/// of paging a cover or failing the job again, like startup adoption does.
+/// the operator to cover it by hand. `ExclusionConflict` is raised only when
+/// the two runs' marker writes race; once the fill is acknowledged, every
+/// later delivery lands here and reports it as hedged, which is what
+/// `Position` does with it, logging the conflict instead of paging a cover or
+/// failing the job again, like startup adoption and the hedged path's redrive
+/// of an unmarked fill already in `Position` do.
 async fn acknowledged_exclusion_detail(
     pool: &SqlitePool,
     trade: &OnchainTrade,

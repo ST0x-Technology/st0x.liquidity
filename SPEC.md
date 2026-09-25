@@ -1903,15 +1903,17 @@ event position).
   amount, a time before the fill or in the future, and a second cover. A fill
   whose cover is recorded is not paged, and the page tells the operator to check
   the uncovered list first. A fill found both in `Position` and recorded as
-  excluded (concurrent runs classified it both ways) fails the run that meets it
-  with `ExclusionConflict`; later deliveries treat it as hedged and log the
-  conflict for manual reconciliation, and it is never paged, listed as
-  uncovered, coverable or booked on the excluded PnL book (the listing flags it
-  `inPosition`). The PnL ledger books excluded fills and their recorded covers
-  on their own book per excluded fill, apart from the hedged fills and from each
-  other: an excluded fill without a recorded cover is open exposure and the
-  report warns about it. Rebalancing is governed separately by the asset's
-  `rebalancing` flag.
+  excluded (concurrent runs classified it both ways) is handled by where it
+  stands: when one run writes its acknowledged marker after the other run's
+  marker, that marker write fails with `ExclusionConflict`; a fill already in
+  `Position` whose marker is not written yet, and every later delivery, is
+  finished as hedged and the conflict is logged for manual reconciliation, and
+  it is never paged, listed as uncovered, coverable or booked on the excluded
+  PnL book (the listing flags it `inPosition`). The PnL ledger books excluded
+  fills and their recorded covers on their own book per excluded fill, apart
+  from the hedged fills and from each other: an excluded fill without a recorded
+  cover is open exposure and the report warns about it. Rebalancing is governed
+  separately by the asset's `rebalancing` flag.
 
 ### Infrastructure and Deployment
 
@@ -2634,6 +2636,24 @@ struct OnChainTrade {
     block_timestamp: DateTime<Utc>,
     filled_at: DateTime<Utc>,
     enrichment: Option<Enrichment>,
+    // Set once the fill is fully accounted: applied to `Position`, or
+    // excluded from hedging.
+    acknowledged_at: Option<DateTime<Utc>>,
+    // Set when the fill was excluded from hedging instead of applied to
+    // `Position`, with the operator's manual cover once recorded.
+    exclusion: Option<Exclusion>,
+}
+
+struct Exclusion {
+    excluded_at: DateTime<Utc>,
+    cover: Option<ExclusionCover>,
+}
+
+struct ExclusionCover {
+    price_usdc: Decimal,
+    broker_order_id: Option<String>,
+    covered_at: DateTime<Utc>,
+    recorded_at: DateTime<Utc>,
 }
 
 // Legacy persisted state only. The runtime no longer emits this data.
@@ -2659,6 +2679,17 @@ enum OnChainTradeCommand {
     },
     AttributeSource { source: OnChainTradeSource },
     Acknowledge,
+    // Excludes the fill from hedging; also acknowledges it.
+    Exclude,
+    // Records the exclusion of an acknowledged fill excluded before
+    // exclusions were recorded on the trade.
+    AdoptLegacyExclusion,
+    RecordExclusionCover {
+        shares: Decimal,
+        price_usdc: Decimal,
+        broker_order_id: Option<String>,
+        covered_at: DateTime<Utc>,
+    },
 }
 ```
 
@@ -2682,13 +2713,43 @@ enum OnChainTradeEvent {
         pyth_price: PythPrice,
         enriched_at: DateTime<Utc>,
     },
+    Acknowledged {
+        acknowledged_at: DateTime<Utc>,
+    },
+    // The fill's own terms, so the PnL ledger books it from this event.
+    ExcludedFromHedging {
+        symbol: Symbol,
+        amount: Decimal,
+        direction: Direction,
+        price_usdc: Decimal,
+        block_timestamp: DateTime<Utc>,
+        excluded_at: DateTime<Utc>,
+    },
+    // `direction` is the cover's side, opposite the fill; `shares` is the
+    // fill's amount.
+    ExclusionCovered {
+        symbol: Symbol,
+        shares: Decimal,
+        direction: Direction,
+        price_usdc: Decimal,
+        broker_order_id: Option<String>,
+        covered_at: DateTime<Utc>,
+        recorded_at: DateTime<Utc>,
+    },
 }
 ```
 
 **Business Rules** (enforced in `handle()`):
 
 - Current commands never append `Enriched`; historical events remain replayable
-- A fill can be acknowledged only after it is witnessed
+- A fill can be acknowledged only after it is witnessed, and only once
+- `Exclude` emits `ExcludedFromHedging` then `Acknowledged`, so an excluded fill
+  is also acknowledged; it is refused on an acknowledged fill
+- `AdoptLegacyExclusion` applies only to an acknowledged fill without an
+  exclusion, and emits only `ExcludedFromHedging`
+- A cover applies only to an excluded fill, once: a second cover is rejected
+- A cover must be for the fill's full amount, at a positive price, executed no
+  earlier than the fill's block timestamp and not in the future
 
 #### Position Aggregate
 

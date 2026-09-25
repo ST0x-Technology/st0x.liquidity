@@ -6095,6 +6095,8 @@ mod tests {
             ("POST", "/liquidity-write/positions/x/release-hedge"),
             ("POST", "/liquidity-write/positions/x/set"),
             ("POST", "/liquidity-write/portfolio-snapshot/marks"),
+            ("GET", "/liquidity-read/skipped-fills"),
+            ("POST", "/liquidity-write/excluded-fills/base:0xabc:1/cover"),
         ] {
             let response = app
                 .clone()
@@ -6143,6 +6145,8 @@ mod tests {
             ("POST", "/liquidity-write/positions/x/release-hedge"),
             ("POST", "/liquidity-write/positions/x/set"),
             ("POST", "/liquidity-write/portfolio-snapshot/marks"),
+            ("GET", "/liquidity-read/skipped-fills"),
+            ("POST", "/liquidity-write/excluded-fills/base:0xabc:1/cover"),
         ] {
             let response = app
                 .clone()
