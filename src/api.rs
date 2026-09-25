@@ -1766,9 +1766,10 @@ fn recheck_error_response(error: &RecheckError) -> (StatusCode, String) {
 /// equity recheck contract.
 fn usdc_recheck_error_response(error: &UsdcRecheckError) -> (StatusCode, String) {
     use UsdcRecheckError::{
-        Alpaca, AlpacaToBaseDeposit, DepositTxAmountMismatch, DepositTxConflict, DepositTxLookup,
-        DepositTxNotMined, DepositTxRead, DepositTxRecordedElsewhere, DepositTxUnchecked,
-        NoOnchainDepositRef, NotDepositFailed, NotFound, Transfer,
+        Alpaca, AlpacaToBaseDeposit, DepositTxAmountMismatch, DepositTxBeforeMint,
+        DepositTxConflict, DepositTxLookup, DepositTxNotMined, DepositTxRead,
+        DepositTxRecordedElsewhere, DepositTxUnchecked, NoOnchainDepositRef, NotDepositFailed,
+        NotFound, Transfer,
     };
 
     match error {
@@ -1779,7 +1780,8 @@ fn usdc_recheck_error_response(error: &UsdcRecheckError) -> (StatusCode, String)
         | DepositTxConflict { .. }
         | DepositTxRecordedElsewhere { .. }
         | DepositTxNotMined { .. }
-        | DepositTxAmountMismatch { .. } => (StatusCode::UNPROCESSABLE_ENTITY, error.to_string()),
+        | DepositTxAmountMismatch { .. }
+        | DepositTxBeforeMint { .. } => (StatusCode::UNPROCESSABLE_ENTITY, error.to_string()),
         DepositTxRead { .. } => (
             StatusCode::BAD_GATEWAY,
             "Ethereum RPC unavailable; retry later".to_string(),

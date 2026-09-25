@@ -983,8 +983,9 @@ pub enum TransferCommand {
         id: String,
         /// usdc only: the Alpaca deposit send found on chain for a deposit
         /// that failed with no send recorded. The bot checks it (bot wallet
-        /// to the Alpaca deposit address, the transfer's amount, confirmed,
-        /// not recorded by another transfer) before attaching it.
+        /// to the Alpaca deposit address, the transfer's amount, confirmed, at
+        /// or after the transfer's mint, not recorded by another transfer)
+        /// before attaching it.
         #[arg(long = "deposit-tx")]
         deposit_tx: Option<TxHash>,
     },

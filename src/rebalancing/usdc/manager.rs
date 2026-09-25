@@ -3879,7 +3879,8 @@ impl<
     /// Attaches an operator-supplied deposit send to a BaseToAlpaca
     /// `DepositFailed` with none recorded, after checking that it moved
     /// exactly the transfer's amount from the bot wallet to Alpaca's deposit
-    /// address, is confirmed, and is not recorded by another transfer. Any
+    /// address, is confirmed, is mined at or after the transfer's mint, and is
+    /// not recorded by another transfer. Any
     /// other state is left to `recheck_deposit`'s own classification.
     async fn attach_operator_deposit_tx(
         &self,
@@ -3892,13 +3893,14 @@ impl<
             .await
             .map_err(|error| Box::new(UsdcTransferError::from(error)))?;
 
-        let amount = match state {
+        let (amount, mint_tx) = match state {
             Some(UsdcRebalance::DepositFailed {
                 direction: RebalanceDirection::BaseToAlpaca,
                 deposit_ref: None,
                 amount,
+                mint_tx_hash,
                 ..
-            }) => amount,
+            }) => (amount, mint_tx_hash),
             Some(UsdcRebalance::DepositFailed {
                 direction: RebalanceDirection::BaseToAlpaca,
                 deposit_ref: Some(TransferRef::OnchainTx(recorded)),
@@ -3961,6 +3963,29 @@ impl<
                 tx: send_tx,
                 sent,
                 expected,
+            });
+        }
+
+        // The legacy scan that leads here starts at the mint block; an older
+        // send, such as a manual one recorded nowhere, paid something else.
+        let block = |tx| async move {
+            self.cctp_bridge
+                .ethereum_tx_block(tx)
+                .await
+                .map_err(|source| UsdcRecheckError::DepositTxRead {
+                    id: id.clone(),
+                    tx,
+                    source: Box::new(source),
+                })
+        };
+        let send_block = block(send_tx).await?;
+        let mint_block = block(mint_tx).await?;
+        if send_block < mint_block {
+            return Err(UsdcRecheckError::DepositTxBeforeMint {
+                id: id.clone(),
+                tx: send_tx,
+                send_block,
+                mint_block,
             });
         }
 
@@ -6231,6 +6256,16 @@ pub(crate) enum UsdcRecheckError {
         tx: TxHash,
         sent: U256,
         expected: U256,
+    },
+    #[error(
+        "deposit tx {tx} is in block {send_block}, before rebalance {id}'s mint in \
+         block {mint_block}, so it cannot carry the minted USDC; it is not attached"
+    )]
+    DepositTxBeforeMint {
+        id: UsdcRebalanceId,
+        tx: TxHash,
+        send_block: u64,
+        mint_block: u64,
     },
     /// The event store is not wired, so the deposit tx cannot be checked
     /// against other transfers.
@@ -15730,10 +15765,22 @@ mod tests {
         .await
         .unwrap();
 
-        manager
+        let error = manager
             .recheck_deposit(&id, Some(older_send))
             .await
             .expect_err("a send mined before the mint is not this transfer's");
+
+        let UsdcRecheckError::DepositTxBeforeMint {
+            tx,
+            send_block,
+            mint_block,
+            ..
+        } = error
+        else {
+            panic!("expected DepositTxBeforeMint, got: {error:?}");
+        };
+        assert_eq!(tx, older_send);
+        assert!(send_block < mint_block, "{send_block} < {mint_block}");
 
         let state = cqrs.load(&id).await.unwrap().expect("aggregate exists");
         let UsdcRebalance::DepositFailed { deposit_ref, .. } = state else {

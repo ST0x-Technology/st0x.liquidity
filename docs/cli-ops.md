@@ -837,12 +837,14 @@ before the startup token approvals.
     other transfer recorded it. If Alpaca credited it, run
     `stox transfer recheck --kind usdc --id <id> --deposit-tx <hash>`. The bot
     attaches the tx only if it moved exactly the transfer's amount from the bot
-    wallet to the deposit address, is confirmed, and no other transfer recorded
-    it; then it confirms the deposit and runs the USDC->USD conversion. A hash
-    that is not mined (a typo, or a send still pending) is refused at once with
-    "deposit tx <hash> is not mined on Ethereum"; check the hash. If no send
-    landed, move the USDC by hand and `transfer reconcile --kind usdc`
-    (reconcile does not convert USDC to USD).
+    wallet to the deposit address, is confirmed, is mined at or after the
+    transfer's mint (an older send is refused with "deposit tx <hash> is in
+    block <n>, before ... mint"), and no other transfer recorded it; then it
+    confirms the deposit and runs the USDC->USD conversion. A hash that is not
+    mined (a typo, or a send still pending) is refused at once with "deposit tx
+    <hash> is not mined on Ethereum"; check the hash. If no send landed, move
+    the USDC by hand and `transfer reconcile --kind usdc` (reconcile does not
+    convert USDC to USD).
 - **"withdrawal tx <tx> is already recorded by USDC rebalance <other>"**
   (`WithdrawalTxAlreadyRecorded`, Alpaca->Base): Alpaca reported a withdrawal tx
   that another transfer already recorded, so it did not pay this one. The

@@ -6926,7 +6926,9 @@ settled with `transfer recheck --kind usdc --deposit-tx <hash>` when the
 operator finds this transfer's own send on chain and Alpaca credited it: the bot
 attaches the tx (`AttachDepositSend`) only if it moved exactly the transfer's
 `amount_received` from the bot wallet to Alpaca's deposit address, has the
-required confirmations, and no other `UsdcRebalance` recorded it, then rechecks
-as for a recorded send. A hash with no receipt is refused at once, without the
-receipt wait, so a wrong hash fails within the CLI's request timeout. Otherwise
-`transfer reconcile --kind usdc`, which does not convert the USDC to USD.
+required confirmations, is mined at or after the transfer's mint block (an older
+send, such as a manual one, paid something else), and no other `UsdcRebalance`
+recorded it, then rechecks as for a recorded send. A hash with no receipt is
+refused at once, without the receipt wait, so a wrong hash fails within the
+CLI's request timeout. Otherwise `transfer reconcile --kind usdc`, which does
+not convert the USDC to USD.
