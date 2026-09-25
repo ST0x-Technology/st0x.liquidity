@@ -394,8 +394,9 @@ fn alert_unresolvable_mint(id: &UsdcRebalanceId, reason: &str) {
         alert = true,
         %id,
         "USDC transfer {id}: the CCTP mint cannot be resolved automatically ({reason}). \
-         Bridge marked failed; find the mint of the recorded nonce on chain, then \
-         settle it with `transfer reconcile --kind usdc`."
+         Bridge marked failed; find the mint of the recorded nonce on chain, finish the \
+         funds leg (vault deposit on Base, or send to Alpaca) and verify it, then settle \
+         it with `transfer reconcile --kind usdc`."
     );
 }
 
@@ -411,7 +412,8 @@ fn alert_failed_mint(id: &UsdcRebalanceId, burn_tx: TxHash, reason: &str) {
         "USDC transfer {id}: the CCTP mint on Base did not complete ({reason}). \
          Bridge marked failed; if the recorded nonce is used on Base, find its mint; if \
          not, get the Circle attestation for burn tx {burn_tx} and mint it on Base. Then \
-         settle it with `transfer reconcile --kind usdc`."
+         deposit the minted USDC to the vault, verify it, and settle it with \
+         `transfer reconcile --kind usdc`."
     );
 }
 
@@ -950,8 +952,10 @@ impl<
                 %id,
                 %burn_tx,
                 "USDC transfer {id}: the burned USDC cannot be minted automatically ({reason}). \
-                 Bridge marked failed; get the Circle attestation for burn tx {burn_tx}, mint \
-                 it on Base, then settle it with `transfer reconcile --kind usdc`."
+                 Bridge marked failed; get the Circle attestation for burn tx {burn_tx} and \
+                 check its nonce on Base (a relayer may have minted it); mint it on Base only \
+                 if the nonce is unused. Then deposit the minted USDC to the vault, verify it, \
+                 and settle it with `transfer reconcile --kind usdc`."
             ),
             BridgeDirection::BaseToEthereum => {}
         }
@@ -1224,8 +1228,9 @@ impl<
                 %burn_tx,
                 "USDC transfer {id}: the recorded CCTP message cannot mint on Base ({reason}). \
                  Bridge marked failed; get the Circle attestation for burn tx {burn_tx} and \
-                 mint it on Base (if its nonce is already used, find that mint instead), then \
-                 settle it with `transfer reconcile --kind usdc`."
+                 mint it on Base (if its nonce is already used, find that mint instead). Then \
+                 deposit the minted USDC to the vault, verify it, and settle it with \
+                 `transfer reconcile --kind usdc`."
             ),
             BridgeDirection::BaseToEthereum => {}
         }
@@ -1276,7 +1281,8 @@ impl<
                 "USDC transfer {id}: the attested CCTP message does not match the recorded nonce \
                  (attested {reconstructed}, recorded {cctp_nonce}). Bridge marked failed; check \
                  which message burn tx {burn_tx} produced and whether its nonce was minted on \
-                 Base, then settle it with `transfer reconcile --kind usdc`."
+                 Base (mint it if not). Then deposit the minted USDC to the vault, verify it, \
+                 and settle it with `transfer reconcile --kind usdc`."
             ),
             BridgeDirection::BaseToEthereum => {}
         }
@@ -13242,7 +13248,8 @@ mod tests {
         assert!(logs_contain(&format!(
             "USDC transfer {id}: the CCTP mint cannot be resolved automatically \
              (Circle re-poll failed on a consumed nonce: {}). Bridge marked failed; find \
-             the mint of the recorded nonce on chain, then settle it with \
+             the mint of the recorded nonce on chain, finish the funds leg (vault deposit \
+             on Base, or send to Alpaca) and verify it, then settle it with \
              `transfer reconcile --kind usdc`.",
             CctpError::PlaceholderNonce
         )));
@@ -13296,7 +13303,8 @@ mod tests {
             "USDC transfer {id}: the CCTP mint on Base did not complete (Mint failed: {}). \
              Bridge marked failed; if the recorded nonce is used on Base, find its mint; if \
              not, get the Circle attestation for burn tx {burn_tx} and mint it on Base. Then \
-             settle it with `transfer reconcile --kind usdc`.",
+             deposit the minted USDC to the vault, verify it, and settle it with \
+             `transfer reconcile --kind usdc`.",
             CctpError::Evm(EvmError::Reverted {
                 tx_hash: TxHash::from([9u8; 32]),
             })
@@ -19236,7 +19244,8 @@ mod tests {
             "USDC transfer {id}: the CCTP mint cannot be resolved automatically"
         )));
         assert!(logs_contain(
-            "find the mint of the recorded nonce on chain, then settle it with \
+            "find the mint of the recorded nonce on chain, finish the funds leg (vault \
+             deposit on Base, or send to Alpaca) and verify it, then settle it with \
              `transfer reconcile --kind usdc`"
         ));
     }
@@ -19598,7 +19607,8 @@ mod tests {
             "USDC transfer {id}: the CCTP mint cannot be resolved automatically"
         )));
         assert!(logs_contain(
-            "find the mint of the recorded nonce on chain, then settle it with \
+            "find the mint of the recorded nonce on chain, finish the funds leg (vault \
+             deposit on Base, or send to Alpaca) and verify it, then settle it with \
              `transfer reconcile --kind usdc`"
         ));
     }
