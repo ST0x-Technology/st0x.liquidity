@@ -95,7 +95,12 @@ pub(crate) struct CoverExcludedFillArgs {
     pub(crate) tx_hash: String,
     /// The fill's log index.
     pub(crate) log_index: u64,
-    /// Broker execution price per share, in USD.
+    /// Shares covered: the excluded fill's full amount. Record the cover once
+    /// the whole amount is covered.
+    #[arg(long)]
+    pub(crate) shares: String,
+    /// Broker execution price per share, in USD; the volume weighted price
+    /// when the cover took several broker orders.
     #[arg(long)]
     pub(crate) price_usdc: String,
     /// When the broker trade executed (RFC 3339).

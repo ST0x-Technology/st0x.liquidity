@@ -1866,32 +1866,52 @@ event position).
   net the symbol already accumulated on that chain while it was enabled: that
   net stays in `Position`, and the scan keeps hedging it for as long as any
   hedged chain enables the symbol, so flipping the switch mid incident does not
-  stop the bot hedging exposure it already accounted. Each restart records the
-  flags it observes per chain and symbol in `trading_enablement`, and a restart
-  that sees an asset go from disabled to enabled sets that asset's cutoff to the
-  restart time. A fill that landed before the cutoff stays excluded even when
-  the bot accounts it after trading is enabled (still queued, not yet backfilled
-  past the ingestion cutoff, or landing during the restart itself); fills that
-  land from the restart on are hedged. An asset first seen enabled has no
-  cutoff, since no disabled period is known. An excluded fill is still witnessed
-  on its `OnChainTrade`, which records the exclusion, and it is recorded in
+  stop the bot hedging exposure it already accounted. Each restart reads every
+  hedged chain's head block and records the flags it observes per chain and
+  symbol in `trading_enablement`, before it accounts any fill. A restart that
+  sees an asset disabled opens a disabled period from the block after that head;
+  a restart that sees it enabled again closes the period at the block after its
+  head and keeps it in `trading_disabled_period`. A fill whose block falls
+  inside a closed disabled period landed while trading was disabled and stays
+  excluded even when the bot accounts it after the enable (still queued, not yet
+  backfilled past the ingestion cutoff, or landing during the restart itself);
+  fills from the enabled periods on either side are hedged. An asset first seen
+  disabled is known disabled only from that restart, so fills before it keep the
+  hedged path once it is enabled; an asset first seen enabled has no disabled
+  period. The boundary is the head each restart reads, so a reorg at that exact
+  head can place a fill on the wrong side of it. Fills excluded before
+  exclusions were recorded on `OnChainTrade` are adopted at startup, unless the
+  fill already reached `Position`. An excluded fill is still witnessed on its
+  `OnChainTrade`, which records the exclusion, and it is recorded in
   `skipped_fills` with reason `trading_disabled` and a detail naming its cover
-  side. Each excluded fill raises its own critical operational alert, with the
-  fill, its cover side and the uncovered net on its symbol and chain, so the
-  exposure it leaves is never silent; `skipped_fills.paged_at` makes a
-  redelivery after a crash page a fill that was not paged yet. An operator lists
-  excluded fills with `GET /liquidity-read/skipped-fills`
-  (`st0x-liquidity-client read resource skipped-fills`, filters `reason`,
-  `chain`, `symbol`, `since` and `covered`), covers each delta by hand at the
-  broker, and records the cover with
-  `POST
-  /liquidity-write/excluded-fills/{trade_id}/cover`
-  (`st0x-liquidity-client
-  debug cover-excluded-fill`). The PnL ledger books
-  excluded fills and their recorded covers on their own book per symbol, apart
-  from the hedged fills: an excluded fill without a recorded cover is open
-  exposure and the report warns about it. Rebalancing is governed separately by
-  the asset's `rebalancing` flag.
+  side. Each excluded fill the bot accounts raises its own critical operational
+  alert, with the fill, its cover side and the uncovered net on its symbol and
+  chain, so the exposure it leaves is never silent; `skipped_fills.paged_at`
+  makes a redelivery after a crash page a fill that was not paged yet. A fill
+  excluded through CLI `process-tx` is reported on the command output and stays
+  unpaged until the bot delivers it. An operator lists excluded fills with
+  `GET
+  /liquidity-read/skipped-fills`
+  (`st0x-liquidity-client read resource
+  skipped-fills`, filters `reason`,
+  `chain`, `symbol`, `since` and `covered`, paged newest first with the `before`
+  cursor the previous page returns as `nextBefore`), covers each delta by hand
+  at the broker, and records the cover once the fill's whole amount is covered,
+  at the volume weighted price, with
+  `POST /liquidity-write/excluded-fills/{trade_id}/cover`
+  (`st0x-liquidity-client debug cover-excluded-fill`), which rejects a partial
+  amount, a time before the fill or in the future, and a second cover. A fill
+  whose cover is recorded is not paged, and the page tells the operator to check
+  the uncovered list first. A fill found both in `Position` and recorded as
+  excluded (concurrent runs classified it both ways) fails the run that meets it
+  with `ExclusionConflict`; later deliveries treat it as hedged and log the
+  conflict for manual reconciliation, and it is never paged, listed as
+  uncovered, coverable or booked on the excluded PnL book (the listing flags it
+  `inPosition`). The PnL ledger books excluded fills and their recorded covers
+  on their own book per excluded fill, apart from the hedged fills and from each
+  other: an excluded fill without a recorded cover is open exposure and the
+  report warns about it. Rebalancing is governed separately by the asset's
+  `rebalancing` flag.
 
 ### Infrastructure and Deployment
 

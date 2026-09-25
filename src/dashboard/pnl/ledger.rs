@@ -278,12 +278,15 @@ impl PnlLedger {
     }
 }
 
-/// Doorbell reactor over the four PnL source aggregates: every delivered
+/// Doorbell reactor over the five PnL source aggregates: every delivered
 /// event triggers a [`PnlLedger::catch_up`], and the delivered payload is
 /// deliberately ignored -- it carries no global rowid, and at-most-once
 /// reactor delivery cannot be a source of record. The ingester re-reads the
 /// durable log from its checkpoint, so a swallowed nudge is repaired by the
 /// next one (or by the request path's own catch-up).
+/// Manual covers of excluded fills are appended through the ops API's own
+/// store, which has no reactor, and are ingested by the catch up every
+/// ledger reader runs first.
 pub(crate) struct PnlLedgerReactor {
     ledger: Arc<PnlLedger>,
 }
@@ -294,7 +297,8 @@ deps!(
         Position,
         TokenizedEquityMint,
         UsdcRebalance,
-        BotGasReceiptCost
+        BotGasReceiptCost,
+        OnChainTrade
     ]
 );
 
@@ -314,6 +318,7 @@ impl Reactor for PnlLedgerReactor {
     ) -> Result<(), Self::Error> {
         event
             .on(|_symbol, _event| async move { self.ledger.catch_up().await.map(|_head| ()) })
+            .on(|_id, _event| async move { self.ledger.catch_up().await.map(|_head| ()) })
             .on(|_id, _event| async move { self.ledger.catch_up().await.map(|_head| ()) })
             .on(|_id, _event| async move { self.ledger.catch_up().await.map(|_head| ()) })
             .on(|_id, _event| async move { self.ledger.catch_up().await.map(|_head| ()) })

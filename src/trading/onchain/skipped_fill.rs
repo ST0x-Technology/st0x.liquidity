@@ -168,7 +168,9 @@ pub(crate) async fn trading_disabled_detail(
 
 /// Whether the operational alert for an excluded fill is still owed. Only a
 /// `trading_disabled` row is paged, once: a redelivery after a crash between
-/// the exclusion and the page finds it unpaged and pages it.
+/// the exclusion and the page finds it unpaged and pages it. A fill whose
+/// cover is already recorded is owed no page: telling the operator to cover
+/// it again would double the cover.
 pub(crate) async fn excluded_fill_unpaged(
     pool: &SqlitePool,
     chain: Chain,
@@ -182,9 +184,14 @@ pub(crate) async fn excluded_fill_unpaged(
     let reason = SkipReason::TradingDisabled.as_str();
 
     let unpaged = sqlx::query_scalar!(
-        "SELECT COUNT(*) FROM skipped_fills \
-         WHERE chain = ? AND tx_hash = ? AND log_index = ? AND reason = ? \
-         AND paged_at IS NULL",
+        "SELECT COUNT(*) FROM skipped_fills AS skipped \
+         WHERE skipped.chain = ? AND skipped.tx_hash = ? AND skipped.log_index = ? \
+         AND skipped.reason = ? AND skipped.paged_at IS NULL \
+         AND NOT EXISTS ( \
+           SELECT 1 FROM onchain_trade_view AS trade_view \
+           WHERE trade_view.view_id = \
+             skipped.chain || ':' || skipped.tx_hash || ':' || skipped.log_index \
+           AND json_extract(trade_view.payload, '$.Live.exclusion.cover') IS NOT NULL)",
         chain,
         tx_hash,
         log_index,
@@ -234,7 +241,9 @@ pub(crate) struct UncoveredExcludedFill {
 }
 
 /// Every excluded fill on `symbol` and `chain` still waiting for its manual
-/// cover: the exposure the operator has left to cover by hand.
+/// cover: the exposure the operator has left to cover by hand. A fill also
+/// found in `Position` (concurrent runs classified it both ways) is hedged by
+/// the bot, so it is never listed as owed a cover.
 pub(crate) async fn uncovered_excluded_fills(
     pool: &SqlitePool,
     chain: Chain,
@@ -253,7 +262,17 @@ pub(crate) async fn uncovered_excluded_fills(
            WHERE skipped.chain = ? AND skipped.reason = ?
              AND json_extract(trade_view.payload, '$.Live.symbol') = ?
              AND json_extract(trade_view.payload, '$.Live.exclusion') IS NOT NULL
-             AND json_extract(trade_view.payload, '$.Live.exclusion.cover') IS NULL"#,
+             AND json_extract(trade_view.payload, '$.Live.exclusion.cover') IS NULL
+             AND NOT EXISTS (
+               SELECT 1 FROM events AS position_event
+               WHERE position_event.aggregate_type = 'Position'
+                 AND position_event.event_type = 'PositionEvent::OnChainOrderFilled'
+                 AND json_extract(position_event.payload, '$.OnChainOrderFilled.trade_id.chain')
+                   = skipped.chain
+                 AND json_extract(position_event.payload, '$.OnChainOrderFilled.trade_id.tx_hash')
+                   = skipped.tx_hash
+                 AND CAST(json_extract(position_event.payload,
+                   '$.OnChainOrderFilled.trade_id.log_index') AS INTEGER) = skipped.log_index)"#,
         chain,
         reason,
         symbol,
@@ -278,9 +297,20 @@ pub(crate) struct SkippedFillFilter {
     pub(crate) symbol: Option<String>,
     /// RFC 3339; rows skipped at or after it.
     pub(crate) since: Option<String>,
-    /// `Some(false)` lists only excluded fills still waiting for a cover.
+    /// `Some(false)` lists only excluded fills still waiting for a cover,
+    /// never one also found in `Position`.
     pub(crate) covered: Option<bool>,
     pub(crate) limit: i64,
+    /// Keyset cursor: only rows recorded before the row with this id, the
+    /// `next_before` of the previous page.
+    pub(crate) before: Option<i64>,
+}
+
+/// One page of [`list_skipped_fills`].
+pub(crate) struct SkippedFillPage {
+    pub(crate) rows: Vec<SkippedFillListing>,
+    /// The cursor for the next page, when more rows match past this one.
+    pub(crate) next_before: Option<i64>,
 }
 
 /// A skipped fill with the terms of its `OnChainTrade`, when it was witnessed.
@@ -288,6 +318,8 @@ pub(crate) struct SkippedFillFilter {
 /// only the record's own columns.
 #[derive(Debug, sqlx::FromRow)]
 pub(crate) struct SkippedFillListing {
+    /// Insertion order of the record; the pagination cursor.
+    pub(crate) id: i64,
     pub(crate) chain: String,
     pub(crate) tx_hash: String,
     pub(crate) log_index: i64,
@@ -305,15 +337,20 @@ pub(crate) struct SkippedFillListing {
     pub(crate) cover_price_usdc: Option<String>,
     pub(crate) cover_broker_order_id: Option<String>,
     pub(crate) covered_at: Option<String>,
+    /// The fill is also in `Position`: concurrent runs classified it both
+    /// ways, so the bot hedges it and it must not be covered by hand.
+    pub(crate) in_position: bool,
 }
 
-/// Skipped fills matching `filter`, newest first.
+/// Skipped fills matching `filter`, most recently recorded first, one page of
+/// `limit` rows before the `before` cursor. The order is the record's
+/// insertion order, which rows recorded while paging never shift.
 pub(crate) async fn list_skipped_fills(
     pool: &SqlitePool,
     filter: &SkippedFillFilter,
-) -> Result<Vec<SkippedFillListing>, SkippedFillError> {
+) -> Result<SkippedFillPage, SkippedFillError> {
     let mut query = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
-        "SELECT skipped.chain, skipped.tx_hash, skipped.log_index, skipped.event_type, \
+        "SELECT skipped.rowid AS id, skipped.chain, skipped.tx_hash, skipped.log_index, skipped.event_type, \
          skipped.reason, skipped.detail, skipped.skipped_at, skipped.paged_at, \
          json_extract(trade_view.payload, '$.Live.symbol') AS symbol, \
          json_extract(trade_view.payload, '$.Live.direction') AS direction, \
@@ -324,7 +361,14 @@ pub(crate) async fn list_skipped_fills(
          json_extract(trade_view.payload, '$.Live.exclusion.cover.price_usdc') AS cover_price_usdc, \
          json_extract(trade_view.payload, '$.Live.exclusion.cover.broker_order_id') \
            AS cover_broker_order_id, \
-         json_extract(trade_view.payload, '$.Live.exclusion.cover.covered_at') AS covered_at \
+         json_extract(trade_view.payload, '$.Live.exclusion.cover.covered_at') AS covered_at, \
+         EXISTS ( \
+           SELECT 1 FROM events AS position_event \
+           WHERE position_event.aggregate_type = 'Position' \
+             AND position_event.event_type = 'PositionEvent::OnChainOrderFilled' \
+             AND json_extract(position_event.payload, '$.OnChainOrderFilled.trade_id.chain') = skipped.chain \
+             AND json_extract(position_event.payload, '$.OnChainOrderFilled.trade_id.tx_hash') = skipped.tx_hash \
+             AND CAST(json_extract(position_event.payload, '$.OnChainOrderFilled.trade_id.log_index') AS INTEGER) = skipped.log_index) AS in_position \
          FROM skipped_fills AS skipped \
          LEFT JOIN onchain_trade_view AS trade_view \
            ON trade_view.view_id = skipped.chain || ':' || skipped.tx_hash || ':' || skipped.log_index \
@@ -354,16 +398,32 @@ pub(crate) async fn list_skipped_fills(
         Some(false) => {
             query.push(
                 " AND json_extract(trade_view.payload, '$.Live.exclusion') IS NOT NULL \
-                 AND json_extract(trade_view.payload, '$.Live.exclusion.cover') IS NULL",
+                 AND json_extract(trade_view.payload, '$.Live.exclusion.cover') IS NULL \
+                 AND NOT EXISTS ( \
+           SELECT 1 FROM events AS position_event \
+           WHERE position_event.aggregate_type = 'Position' \
+             AND position_event.event_type = 'PositionEvent::OnChainOrderFilled' \
+             AND json_extract(position_event.payload, '$.OnChainOrderFilled.trade_id.chain') = skipped.chain \
+             AND json_extract(position_event.payload, '$.OnChainOrderFilled.trade_id.tx_hash') = skipped.tx_hash \
+             AND CAST(json_extract(position_event.payload, '$.OnChainOrderFilled.trade_id.log_index') AS INTEGER) = skipped.log_index)",
             );
         }
         None => {}
     }
+    if let Some(before) = filter.before {
+        query.push(" AND skipped.rowid < ").push_bind(before);
+    }
+    // One row past the page tells whether another page follows.
     query
-        .push(" ORDER BY skipped.skipped_at DESC, skipped.rowid DESC LIMIT ")
-        .push_bind(filter.limit);
+        .push(" ORDER BY skipped.rowid DESC LIMIT ")
+        .push_bind(filter.limit.saturating_add(1));
 
-    Ok(query.build_query_as().fetch_all(pool).await?)
+    let mut rows: Vec<SkippedFillListing> = query.build_query_as().fetch_all(pool).await?;
+    let has_more = i64::try_from(rows.len()).is_ok_and(|len| len > filter.limit);
+    rows.truncate(usize::try_from(filter.limit).unwrap_or(0));
+    let next_before = has_more.then(|| rows.last().map(|row| row.id)).flatten();
+
+    Ok(SkippedFillPage { rows, next_before })
 }
 
 #[cfg(test)]
@@ -513,6 +573,45 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].reason, "trading_disabled");
         assert_eq!(rows[0].detail, detail);
+    }
+
+    /// Paging with the cursor reaches every older row exactly once, even when
+    /// newer fills are recorded between pages.
+    #[tokio::test]
+    async fn cursor_pages_are_stable_while_fills_are_recorded() {
+        let (pool, _apalis) = setup_test_pools().await;
+        let tx_hash = b256!("0xbeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee");
+        let record = |log_index| {
+            record_skipped_fill(
+                &pool,
+                Chain::Base,
+                tx_hash,
+                log_index,
+                "ClearV3",
+                SkipReason::NonHedgeablePair,
+                "x",
+            )
+        };
+        for log_index in 1..=3 {
+            record(log_index).await.unwrap();
+        }
+        let page = |before| SkippedFillFilter {
+            limit: 2,
+            before,
+            ..SkippedFillFilter::default()
+        };
+
+        let first = list_skipped_fills(&pool, &page(None)).await.unwrap();
+        let first_logs: Vec<_> = first.rows.iter().map(|row| row.log_index).collect();
+        assert_eq!(first_logs, vec![3, 2]);
+
+        record(4).await.unwrap();
+        let second = list_skipped_fills(&pool, &page(first.next_before))
+            .await
+            .unwrap();
+        let second_logs: Vec<_> = second.rows.iter().map(|row| row.log_index).collect();
+        assert_eq!(second_logs, vec![1], "no row repeats and none is skipped");
+        assert_eq!(second.next_before, None);
     }
 
     #[tokio::test]

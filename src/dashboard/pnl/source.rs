@@ -28,8 +28,9 @@ use super::ledger::{
 use super::query::{PnlError, PnlQuery};
 use super::response::{PnlCapitalSummary, PnlResponse};
 use super::state::{
-    BotGasCostRow, CostLedgerRow, CostSource, Direction, ManualAdjustmentRow, OffchainFillRow,
-    OffchainPlacementRow, OnchainFillRow, PositionLedgerRow, PositionViewRow,
+    BotGasCostRow, CostLedgerRow, CostSource, Direction, ExcludedFillCoverRow, ExcludedFillRow,
+    ManualAdjustmentRow, OffchainFillRow, OffchainPlacementRow, OnchainFillRow, PositionLedgerRow,
+    PositionViewRow,
 };
 use super::{
     ATTRIBUTION_WARNING, BASELINE_WARNING, CAPITAL_AVAILABLE_NOTE, CAPITAL_UNAVAILABLE_NOTE,
@@ -475,32 +476,62 @@ async fn load_position_rows(
     }
 
     let mut excluded = QueryBuilder::<Sqlite>::new(
-        "SELECT event_rowid, symbol, tx_hash, log_index, shares, direction, price_usd, \
-         executed_at FROM pnl_excluded_fill WHERE event_rowid <= ",
+        "SELECT event_rowid, symbol, chain, tx_hash, log_index, shares, direction, price_usd, \
+         executed_at FROM pnl_excluded_fill AS excluded_fill \
+         WHERE NOT EXISTS (SELECT 1 FROM pnl_onchain_fill AS hedged \
+           WHERE hedged.chain = excluded_fill.chain AND hedged.tx_hash = excluded_fill.tx_hash \
+           AND hedged.log_index = excluded_fill.log_index) \
+         AND event_rowid <= ",
     );
     excluded.push_bind(as_of_rowid);
     push_symbol_filter(&mut excluded, symbols);
-    for (event_rowid, symbol, tx_hash, log_index, shares, direction, price_usd, executed_at) in
-        excluded
-            .build_query_as::<(i64, String, String, i64, String, String, String, String)>()
-            .fetch_all(pool)
-            .await?
+    for (
+        event_rowid,
+        symbol,
+        chain,
+        tx_hash,
+        log_index,
+        shares,
+        direction,
+        price_usd,
+        executed_at,
+    ) in excluded
+        .build_query_as::<(
+            i64,
+            String,
+            String,
+            String,
+            i64,
+            String,
+            String,
+            String,
+            String,
+        )>()
+        .fetch_all(pool)
+        .await?
     {
-        rows.push(PositionLedgerRow::ExcludedFill(OnchainFillRow {
-            event_rowid,
-            symbol,
-            tx_hash,
-            log_index,
-            shares,
-            direction: ledger_direction("pnl_excluded_fill", event_rowid, &direction)?,
-            price_usd,
-            executed_at,
+        rows.push(PositionLedgerRow::ExcludedFill(ExcludedFillRow {
+            trade_id: format!("{chain}:{tx_hash}:{log_index}"),
+            fill: OnchainFillRow {
+                event_rowid,
+                symbol,
+                tx_hash,
+                log_index,
+                shares,
+                direction: ledger_direction("pnl_excluded_fill", event_rowid, &direction)?,
+                price_usd,
+                executed_at,
+            },
         }));
     }
 
     let mut covers = QueryBuilder::<Sqlite>::new(
         "SELECT event_rowid, symbol, chain, tx_hash, log_index, shares, direction, price_usd, \
-         executed_at FROM pnl_excluded_fill_cover WHERE event_rowid <= ",
+         executed_at FROM pnl_excluded_fill_cover AS cover \
+         WHERE NOT EXISTS (SELECT 1 FROM pnl_onchain_fill AS hedged \
+           WHERE hedged.chain = cover.chain AND hedged.tx_hash = cover.tx_hash \
+           AND hedged.log_index = cover.log_index) \
+         AND event_rowid <= ",
     );
     covers.push_bind(as_of_rowid);
     push_symbol_filter(&mut covers, symbols);
@@ -529,14 +560,18 @@ async fn load_position_rows(
         .fetch_all(pool)
         .await?
     {
-        rows.push(PositionLedgerRow::ExcludedFillCover(OffchainFillRow {
-            event_rowid,
-            symbol,
-            offchain_order_id: format!("cover:{chain}:{tx_hash}:{log_index}"),
-            shares,
-            direction: ledger_direction("pnl_excluded_fill_cover", event_rowid, &direction)?,
-            price_usd,
-            executed_at,
+        let trade_id = format!("{chain}:{tx_hash}:{log_index}");
+        rows.push(PositionLedgerRow::ExcludedFillCover(ExcludedFillCoverRow {
+            cover: OffchainFillRow {
+                event_rowid,
+                symbol,
+                offchain_order_id: format!("cover:{trade_id}"),
+                shares,
+                direction: ledger_direction("pnl_excluded_fill_cover", event_rowid, &direction)?,
+                price_usd,
+                executed_at,
+            },
+            trade_id,
         }));
     }
 

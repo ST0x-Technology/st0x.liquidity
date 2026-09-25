@@ -336,9 +336,11 @@ impl EventSourced for OnChainTrade {
                 filled_at,
             }]),
 
-            AttributeSource { .. } | Acknowledge | Exclude | RecordExclusionCover { .. } => {
-                Err(OnChainTradeError::NotFilled)
-            }
+            AttributeSource { .. }
+            | Acknowledge
+            | Exclude
+            | AdoptLegacyExclusion
+            | RecordExclusionCover { .. } => Err(OnChainTradeError::NotFilled),
         }
     }
 
@@ -391,21 +393,26 @@ impl EventSourced for OnChainTrade {
 
                 let now = Utc::now();
                 Ok(vec![
-                    ExcludedFromHedging {
-                        symbol: self.symbol.clone(),
-                        amount: self.amount,
-                        direction: self.direction,
-                        price_usdc: self.price_usdc,
-                        block_timestamp: self.block_timestamp,
-                        excluded_at: now,
-                    },
+                    self.excluded_from_hedging(now),
                     Acknowledged {
                         acknowledged_at: now,
                     },
                 ])
             }
 
+            AdoptLegacyExclusion => {
+                if self.is_excluded() {
+                    return Err(OnChainTradeError::AlreadyExcluded);
+                }
+                if !self.is_acknowledged() {
+                    return Err(OnChainTradeError::NotAcknowledged);
+                }
+
+                Ok(vec![self.excluded_from_hedging(Utc::now())])
+            }
+
             RecordExclusionCover {
+                shares,
                 price_usdc,
                 broker_order_id,
                 covered_at,
@@ -416,8 +423,18 @@ impl EventSourced for OnChainTrade {
                 if exclusion.cover.is_some() {
                     return Err(OnChainTradeError::AlreadyCovered);
                 }
+                if !shares.eq(self.amount).unwrap_or(false) {
+                    return Err(OnChainTradeError::CoverSharesMismatch);
+                }
                 if !price_usdc.gt(st0x_float_macro::float!(0)).unwrap_or(false) {
                     return Err(OnChainTradeError::NonPositiveCoverPrice);
+                }
+                let recorded_at = Utc::now();
+                if covered_at < self.block_timestamp {
+                    return Err(OnChainTradeError::CoverBeforeFill);
+                }
+                if covered_at > recorded_at + MAX_COVER_CLOCK_SKEW {
+                    return Err(OnChainTradeError::CoverInFuture);
                 }
 
                 Ok(vec![ExclusionCovered {
@@ -427,7 +444,7 @@ impl EventSourced for OnChainTrade {
                     price_usdc,
                     broker_order_id,
                     covered_at,
-                    recorded_at: Utc::now(),
+                    recorded_at,
                 }])
             }
         }
@@ -446,6 +463,17 @@ impl OnChainTrade {
     /// disabled for it on its chain.
     pub fn is_excluded(&self) -> bool {
         self.exclusion.is_some()
+    }
+
+    fn excluded_from_hedging(&self, excluded_at: DateTime<Utc>) -> OnChainTradeEvent {
+        OnChainTradeEvent::ExcludedFromHedging {
+            symbol: self.symbol.clone(),
+            amount: self.amount,
+            direction: self.direction,
+            price_usdc: self.price_usdc,
+            block_timestamp: self.block_timestamp,
+            excluded_at,
+        }
     }
 
     pub fn source(&self) -> OnChainTradeSource {
@@ -577,7 +605,21 @@ pub enum OnChainTradeError {
     AlreadyCovered,
     #[error("A manual cover must have a positive price")]
     NonPositiveCoverPrice,
+    #[error("The trade is already excluded from hedging")]
+    AlreadyExcluded,
+    #[error("Only an acknowledged trade can be adopted as a legacy exclusion")]
+    NotAcknowledged,
+    #[error("A manual cover must cover the fill's full amount")]
+    CoverSharesMismatch,
+    #[error("A manual cover cannot execute before the fill it covers")]
+    CoverBeforeFill,
+    #[error("A manual cover cannot execute in the future")]
+    CoverInFuture,
 }
+
+/// How far a manual cover's execution time may run ahead of the bot's clock:
+/// broker timestamps and the bot host disagree by seconds, never by more.
+const MAX_COVER_CLOCK_SKEW: chrono::Duration = chrono::Duration::minutes(5);
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum OnChainTradeCommand {
@@ -632,9 +674,20 @@ pub enum OnChainTradeCommand {
     /// `Position` and its delta is covered by hand. Also acknowledges it, so
     /// the dedupe guard treats it as done.
     Exclude,
+    /// Adopts a fill excluded before exclusions were recorded on the trade: it
+    /// is acknowledged and recorded as `trading_disabled` in `skipped_fills`
+    /// but carries no exclusion. The caller has checked it never reached
+    /// `Position`.
+    AdoptLegacyExclusion,
     /// Records the operator's manual broker cover of an excluded fill: its
-    /// full amount on the opposite side of the fill, at `price_usdc`.
+    /// full amount (`shares` must equal it) on the opposite side of the fill,
+    /// at `price_usdc`, executed at `covered_at`.
     RecordExclusionCover {
+        #[serde(
+            serialize_with = "st0x_float_serde::serialize_float_as_string",
+            deserialize_with = "st0x_float_serde::deserialize_float_from_number_or_string"
+        )]
+        shares: Float,
         #[serde(
             serialize_with = "st0x_float_serde::serialize_float_as_string",
             deserialize_with = "st0x_float_serde::deserialize_float_from_number_or_string"
@@ -1090,6 +1143,7 @@ mod tests {
         let events = TestHarness::<OnChainTrade>::with(())
             .given(excluded(now))
             .when(OnChainTradeCommand::RecordExclusionCover {
+                shares: float!(3),
                 price_usdc: float!(151),
                 broker_order_id: Some("order-1".to_owned()),
                 covered_at: now,
@@ -1130,6 +1184,7 @@ mod tests {
         let error = TestHarness::<OnChainTrade>::with(())
             .given(given)
             .when(OnChainTradeCommand::RecordExclusionCover {
+                shares: float!(3),
                 price_usdc: float!(152),
                 broker_order_id: None,
                 covered_at: now,
@@ -1156,6 +1211,7 @@ mod tests {
                 },
             ])
             .when(OnChainTradeCommand::RecordExclusionCover {
+                shares: float!(3),
                 price_usdc: float!(151),
                 broker_order_id: None,
                 covered_at: now,
@@ -1175,6 +1231,7 @@ mod tests {
         let error = TestHarness::<OnChainTrade>::with(())
             .given(excluded(now))
             .when(OnChainTradeCommand::RecordExclusionCover {
+                shares: float!(3),
                 price_usdc: float!(0),
                 broker_order_id: None,
                 covered_at: now,
@@ -1185,6 +1242,78 @@ mod tests {
         assert!(matches!(
             error,
             LifecycleError::Apply(OnChainTradeError::NonPositiveCoverPrice)
+        ));
+    }
+
+    /// The cover must be the fill's full amount, executed after the fill and
+    /// not in the future.
+    #[tokio::test]
+    async fn cover_must_match_the_fill_amount_and_follow_it_in_time() {
+        let now = Utc::now();
+        let cover = |shares, covered_at| OnChainTradeCommand::RecordExclusionCover {
+            shares,
+            price_usdc: float!(151),
+            broker_order_id: None,
+            covered_at,
+        };
+
+        for (command, expected) in [
+            (
+                cover(float!(2), now),
+                OnChainTradeError::CoverSharesMismatch,
+            ),
+            (
+                cover(float!(3), now - chrono::Duration::seconds(1)),
+                OnChainTradeError::CoverBeforeFill,
+            ),
+            (
+                cover(float!(3), now + chrono::Duration::hours(1)),
+                OnChainTradeError::CoverInFuture,
+            ),
+        ] {
+            let error = TestHarness::<OnChainTrade>::with(())
+                .given(excluded(now))
+                .when(command)
+                .await
+                .then_expect_error();
+            assert!(
+                matches!(&error, LifecycleError::Apply(actual) if *actual == expected),
+                "expected {expected:?}, got {error:?}"
+            );
+        }
+    }
+
+    /// A fill excluded before exclusions were recorded is acknowledged with no
+    /// exclusion; adopting it records the exclusion once, without a second
+    /// acknowledgement.
+    #[tokio::test]
+    async fn legacy_exclusion_is_adopted_once() {
+        let now = Utc::now();
+        let legacy = vec![
+            filled_sell(now),
+            OnChainTradeEvent::Acknowledged {
+                acknowledged_at: now,
+            },
+        ];
+
+        let events = TestHarness::<OnChainTrade>::with(())
+            .given(legacy)
+            .when(OnChainTradeCommand::AdoptLegacyExclusion)
+            .await
+            .events();
+        assert!(matches!(
+            events.as_slice(),
+            [OnChainTradeEvent::ExcludedFromHedging { .. }]
+        ));
+
+        let error = TestHarness::<OnChainTrade>::with(())
+            .given(excluded(now))
+            .when(OnChainTradeCommand::AdoptLegacyExclusion)
+            .await
+            .then_expect_error();
+        assert!(matches!(
+            error,
+            LifecycleError::Apply(OnChainTradeError::AlreadyExcluded)
         ));
     }
 

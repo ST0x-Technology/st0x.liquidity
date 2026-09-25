@@ -2,10 +2,14 @@
 //! that decides it for fills accounted after an asset is enabled again.
 //!
 //! A fill is excluded when trading is disabled for its symbol on its own
-//! chain, or when it landed before the restart that enabled trading for that
-//! symbol and chain: it landed while the asset was disabled, so it stays out of
-//! the hedged `Position` even if it is accounted afterwards (still queued, not
-//! yet backfilled, or landing during the restart itself).
+//! chain, or when it landed inside a closed disabled period of that symbol and
+//! chain: it landed while the asset was disabled, so it stays out of the hedged
+//! `Position` even if it is accounted afterwards (still queued, not yet
+//! backfilled, or landing during the restart itself). Period boundaries are
+//! block numbers on the fill's chain, so a fill is placed by its own block and
+//! never against a host clock.
+
+use std::collections::BTreeMap;
 
 use chrono::{DateTime, Utc};
 use sqlx::SqlitePool;
@@ -22,22 +26,52 @@ use crate::onchain::OnchainTrade;
 pub enum ExclusionCause {
     /// Trading is disabled for the symbol on the fill's chain.
     TradingDisabled,
-    /// Trading is enabled, but the fill landed before the restart that
-    /// enabled it, while the asset was still disabled.
-    LandedBeforeEnabled { enabled_since: DateTime<Utc> },
+    /// Trading is enabled, but the fill landed in `fill_block`, inside a
+    /// disabled period that ended when trading was enabled from
+    /// `enabled_from_block`.
+    LandedWhileDisabled {
+        fill_block: u64,
+        enabled_from_block: u64,
+    },
 }
 
 impl std::fmt::Display for ExclusionCause {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::TradingDisabled => write!(formatter, "trading is disabled"),
-            Self::LandedBeforeEnabled { enabled_since } => write!(
+            Self::LandedWhileDisabled {
+                fill_block,
+                enabled_from_block,
+            } => write!(
                 formatter,
-                "the fill landed while trading was disabled, before it was enabled at {}",
-                enabled_since.to_rfc3339()
+                "the fill landed in block {fill_block} while trading was disabled, before it \
+                 was enabled from block {enabled_from_block}"
             ),
         }
     }
+}
+
+/// Failure reading or recording the trading enablement history.
+#[derive(Debug, thiserror::Error)]
+pub enum ExclusionError {
+    #[error("block number {block} exceeds i64::MAX")]
+    BlockOutOfRange { block: u64 },
+    #[error("stored block number {block} for {symbol} on {chain} is negative")]
+    NegativeStoredBlock {
+        chain: Chain,
+        symbol: Symbol,
+        block: i64,
+    },
+    #[error("no chain head was read at startup for hedged chain {chain}")]
+    MissingChainHead { chain: Chain },
+    #[error("{symbol} on {chain} is recorded disabled without the block it was disabled from")]
+    MissingDisabledStart { chain: String, symbol: String },
+    #[error(transparent)]
+    Database(#[from] sqlx::Error),
+}
+
+fn block_to_i64(block: u64) -> Result<i64, ExclusionError> {
+    i64::try_from(block).map_err(|_| ExclusionError::BlockOutOfRange { block })
 }
 
 /// Whether `trade` is excluded from hedging, per its own chain's `assets`.
@@ -49,155 +83,212 @@ pub async fn exclusion_cause(
     pool: &SqlitePool,
     assets: &ChainAssets,
     trade: &OnchainTrade,
-) -> Result<Option<ExclusionCause>, sqlx::Error> {
+) -> Result<Option<ExclusionCause>, ExclusionError> {
     if !assets.is_trading_enabled(trade.symbol()) {
         return Ok(Some(ExclusionCause::TradingDisabled));
     }
 
-    let Some(block_timestamp) = trade.block_timestamp else {
-        // Witnessing rejects a fill without a block timestamp, so it never
-        // gets far enough for the cutoff to matter.
+    let Some(fill_block) = trade.block_number else {
+        // Witnessing rejects a fill without a block number, so it never gets
+        // far enough for the disabled periods to matter.
         return Ok(None);
     };
 
-    let enabled_since = trading_enabled_since(pool, trade.chain, trade.symbol()).await?;
-    Ok(enabled_since
-        .filter(|enabled_since| block_timestamp < *enabled_since)
-        .map(|enabled_since| ExclusionCause::LandedBeforeEnabled { enabled_since }))
-}
-
-/// The restart that observed trading for `symbol` on `chain` go from disabled
-/// to enabled, if it is enabled now and such a transition was observed.
-async fn trading_enabled_since(
-    pool: &SqlitePool,
-    chain: Chain,
-    symbol: &Symbol,
-) -> Result<Option<DateTime<Utc>>, sqlx::Error> {
-    let chain = chain.to_string();
-    let symbol = symbol.to_string();
-    let enabled_since = sqlx::query_scalar!(
-        "SELECT enabled_since FROM trading_enablement \
-         WHERE chain = ? AND symbol = ? AND trading_enabled = 1",
+    let chain = trade.chain.to_string();
+    let symbol = trade.symbol().to_string();
+    let block = block_to_i64(fill_block)?;
+    let enabled_from_block = sqlx::query_scalar!(
+        "SELECT enabled_from_block FROM trading_disabled_period \
+         WHERE chain = ? AND symbol = ? \
+         AND disabled_from_block <= ? AND ? < enabled_from_block \
+         ORDER BY enabled_from_block LIMIT 1",
         chain,
         symbol,
+        block,
+        block,
     )
     .fetch_optional(pool)
-    .await?
-    .flatten();
+    .await?;
 
-    Ok(enabled_since
-        .as_deref()
-        .and_then(|text| DateTime::parse_from_rfc3339(text).ok())
-        .map(|enabled_since| enabled_since.with_timezone(&Utc)))
+    enabled_from_block
+        .map(|enabled_from_block| {
+            u64::try_from(enabled_from_block)
+                .map(|enabled_from_block| ExclusionCause::LandedWhileDisabled {
+                    fill_block,
+                    enabled_from_block,
+                })
+                .map_err(|_| ExclusionError::NegativeStoredBlock {
+                    chain: trade.chain,
+                    symbol: trade.symbol().clone(),
+                    block: enabled_from_block,
+                })
+        })
+        .transpose()
 }
 
 /// Records every hedged chain's configured trading flags as observed by this
-/// restart at `now`, before any fill is accounted.
+/// restart, before any fill is accounted. `heads` is each hedged chain's head
+/// block read by this restart: blocks up to it landed before the restart, and
+/// blocks after it land under the flags observed now.
 ///
-/// An asset seen going from disabled to enabled gets `enabled_since = now`,
-/// the cutoff [`exclusion_cause`] applies to fills that landed before it. An
-/// asset first seen enabled has no cutoff, since no disabled period is known.
-/// Disabling clears the cutoff; the next enable sets a new one.
+/// A disable opens a disabled period from the block after the head. An enable
+/// of a disabled asset closes that period at the block after the head, which
+/// [`exclusion_cause`] applies to fills accounted later. An asset first seen
+/// disabled opens a period from that restart, since it is not known to have
+/// been disabled earlier; an asset first seen enabled has no disabled period.
+/// A symbol dropped from a chain's config trades as disabled, so it opens a
+/// period too.
 ///
 /// # Errors
 ///
-/// Fails when the enablement table cannot be read or written.
+/// Fails when a hedged chain has no head in `heads`, or the enablement tables
+/// cannot be read or written.
 pub(crate) async fn record_trading_enablement(
     pool: &SqlitePool,
     chains: &ChainRegistry,
+    heads: &BTreeMap<Chain, u64>,
     now: DateTime<Utc>,
-) -> Result<(), sqlx::Error> {
+) -> Result<(), ExclusionError> {
     let now_text = now.to_rfc3339();
 
     for hedged in chains.hedged() {
+        let head = *heads
+            .get(&hedged.chain)
+            .ok_or(ExclusionError::MissingChainHead {
+                chain: hedged.chain,
+            })?;
+        let next_block = block_to_i64(head.saturating_add(1))?;
         let chain = hedged.chain.to_string();
-        for symbol in hedged.assets.equities.symbols.keys() {
-            let enabled = hedged.assets.is_trading_enabled(symbol);
-            let symbol_text = symbol.to_string();
 
-            let previous = sqlx::query_scalar!(
-                "SELECT trading_enabled FROM trading_enablement WHERE chain = ? AND symbol = ?",
-                chain,
-                symbol_text,
-            )
-            .fetch_optional(pool)
-            .await?;
-
-            let enabled_flag = i64::from(enabled);
-            if previous == Some(enabled_flag) {
-                continue;
-            }
-
-            if previous == Some(0) && enabled {
-                info!(
-                    %chain,
-                    %symbol,
-                    enabled_since = %now_text,
-                    "Trading enabled again; fills that landed before now stay excluded from hedging"
-                );
-                sqlx::query!(
-                    "UPDATE trading_enablement \
-                     SET trading_enabled = 1, enabled_since = ?, observed_at = ? \
-                     WHERE chain = ? AND symbol = ?",
-                    now_text,
-                    now_text,
-                    chain,
-                    symbol_text,
-                )
-                .execute(pool)
-                .await?;
-                continue;
-            }
-
-            // First observation, or enabled to disabled: no cutoff.
-            sqlx::query!(
-                "INSERT INTO trading_enablement \
-                 (chain, symbol, trading_enabled, enabled_since, observed_at) \
-                 VALUES (?, ?, ?, NULL, ?) \
-                 ON CONFLICT (chain, symbol) DO UPDATE SET \
-                 trading_enabled = excluded.trading_enabled, \
-                 enabled_since = NULL, \
-                 observed_at = excluded.observed_at",
-                chain,
-                symbol_text,
-                enabled_flag,
-                now_text,
-            )
-            .execute(pool)
-            .await?;
-        }
-
-        // A symbol dropped from the chain's config is trading disabled (the
-        // flag fails closed), so re-adding it later is a new enable.
+        let mut observed: Vec<(String, bool)> = hedged
+            .assets
+            .equities
+            .symbols
+            .keys()
+            .map(|symbol| (symbol.to_string(), hedged.assets.is_trading_enabled(symbol)))
+            .collect();
+        // A symbol dropped from the config trades as disabled.
         let recorded_enabled = sqlx::query_scalar!(
             "SELECT symbol FROM trading_enablement WHERE chain = ? AND trading_enabled = 1",
             chain,
         )
         .fetch_all(pool)
         .await?;
-        for symbol_text in recorded_enabled {
-            let still_configured = hedged
-                .assets
-                .equities
-                .symbols
-                .keys()
-                .any(|symbol| symbol.to_string() == symbol_text);
-            if still_configured {
-                continue;
+        for symbol in recorded_enabled {
+            if !observed.iter().any(|(configured, _)| *configured == symbol) {
+                observed.push((symbol, false));
             }
+        }
 
+        for (symbol, enabled) in observed {
+            record_symbol_enablement(pool, &chain, &symbol, enabled, next_block, &now_text).await?;
+        }
+    }
+
+    Ok(())
+}
+
+async fn record_symbol_enablement(
+    pool: &SqlitePool,
+    chain: &str,
+    symbol: &str,
+    enabled: bool,
+    next_block: i64,
+    now_text: &str,
+) -> Result<(), ExclusionError> {
+    let previous = sqlx::query!(
+        "SELECT trading_enabled, disabled_from_block FROM trading_enablement \
+         WHERE chain = ? AND symbol = ?",
+        chain,
+        symbol,
+    )
+    .fetch_optional(pool)
+    .await?;
+    let enabled_flag = i64::from(enabled);
+
+    let mut tx = pool.begin().await?;
+    match previous {
+        Some(row) if row.trading_enabled == enabled_flag => {
+            sqlx::query!(
+                "UPDATE trading_enablement SET observed_at = ? WHERE chain = ? AND symbol = ?",
+                now_text,
+                chain,
+                symbol,
+            )
+            .execute(&mut *tx)
+            .await?;
+        }
+        Some(row) if enabled => {
+            let disabled_from_block =
+                row.disabled_from_block
+                    .ok_or_else(|| ExclusionError::MissingDisabledStart {
+                        chain: chain.to_owned(),
+                        symbol: symbol.to_owned(),
+                    })?;
+            info!(
+                %chain,
+                %symbol,
+                enabled_from_block = next_block,
+                "Trading enabled again; fills that landed while it was disabled stay excluded \
+                 from hedging"
+            );
+            sqlx::query!(
+                "INSERT INTO trading_disabled_period \
+                 (chain, symbol, disabled_from_block, enabled_from_block, enabled_at) \
+                 VALUES (?, ?, ?, ?, ?) \
+                 ON CONFLICT (chain, symbol, enabled_from_block) DO NOTHING",
+                chain,
+                symbol,
+                disabled_from_block,
+                next_block,
+                now_text,
+            )
+            .execute(&mut *tx)
+            .await?;
             sqlx::query!(
                 "UPDATE trading_enablement \
-                 SET trading_enabled = 0, enabled_since = NULL, observed_at = ? \
+                 SET trading_enabled = 1, disabled_from_block = NULL, observed_at = ? \
                  WHERE chain = ? AND symbol = ?",
                 now_text,
                 chain,
-                symbol_text,
+                symbol,
             )
-            .execute(pool)
+            .execute(&mut *tx)
+            .await?;
+        }
+        Some(_) => {
+            sqlx::query!(
+                "UPDATE trading_enablement \
+                 SET trading_enabled = 0, disabled_from_block = ?, observed_at = ? \
+                 WHERE chain = ? AND symbol = ?",
+                next_block,
+                now_text,
+                chain,
+                symbol,
+            )
+            .execute(&mut *tx)
+            .await?;
+        }
+        None => {
+            // First seen: an enabled asset has no known disabled period. A
+            // disabled one is known disabled only from this restart on, so
+            // earlier fills keep the hedged path once it is enabled.
+            let disabled_from_block = (!enabled).then_some(next_block);
+            sqlx::query!(
+                "INSERT INTO trading_enablement \
+                 (chain, symbol, trading_enabled, disabled_from_block, observed_at) \
+                 VALUES (?, ?, ?, ?, ?)",
+                chain,
+                symbol,
+                enabled_flag,
+                disabled_from_block,
+                now_text,
+            )
+            .execute(&mut *tx)
             .await?;
         }
     }
+    tx.commit().await?;
 
     Ok(())
 }
@@ -205,7 +296,6 @@ pub(crate) async fn record_trading_enablement(
 #[cfg(test)]
 mod tests {
     use alloy::primitives::Address;
-    use chrono::Duration;
     use std::collections::HashMap;
 
     use st0x_config::{ChainEquityAsset, OperationMode, create_test_ctx_with_order_owner};
@@ -235,18 +325,23 @@ mod tests {
         ctx.chains
     }
 
-    fn fill_at(block_timestamp: DateTime<Utc>) -> OnchainTrade {
-        OnchainTradeBuilder::new()
-            .with_block_timestamp(Some(block_timestamp))
-            .build()
+    /// A restart that reads `head` on the primary chain.
+    async fn restart(pool: &SqlitePool, chains: &ChainRegistry, head: u64) {
+        let heads = BTreeMap::from([(chains.primary().chain, head)]);
+        record_trading_enablement(pool, chains, &heads, Utc::now())
+            .await
+            .unwrap();
     }
 
     async fn cause_for(
         pool: &SqlitePool,
         chains: &ChainRegistry,
-        block_timestamp: DateTime<Utc>,
+        fill_block: u64,
     ) -> Option<ExclusionCause> {
-        exclusion_cause(pool, &chains.primary().assets, &fill_at(block_timestamp))
+        let fill = OnchainTradeBuilder::new()
+            .with_block_number(fill_block)
+            .build();
+        exclusion_cause(pool, &chains.primary().assets, &fill)
             .await
             .unwrap()
     }
@@ -255,12 +350,10 @@ mod tests {
     async fn fill_on_a_disabled_asset_is_excluded() {
         let (pool, _apalis) = setup_test_pools().await;
         let chains = chains_with(Some(OperationMode::Disabled));
-        record_trading_enablement(&pool, &chains, Utc::now())
-            .await
-            .unwrap();
+        restart(&pool, &chains, 100).await;
 
         assert_eq!(
-            cause_for(&pool, &chains, Utc::now()).await,
+            cause_for(&pool, &chains, 150).await,
             Some(ExclusionCause::TradingDisabled)
         );
     }
@@ -268,85 +361,95 @@ mod tests {
     /// An asset first seen enabled has no known disabled period, so even a fill
     /// that landed long before the restart is hedged.
     #[tokio::test]
-    async fn asset_first_seen_enabled_has_no_cutoff() {
+    async fn asset_first_seen_enabled_has_no_disabled_period() {
         let (pool, _apalis) = setup_test_pools().await;
         let chains = chains_with(Some(OperationMode::Enabled));
-        let restart = Utc::now();
-        record_trading_enablement(&pool, &chains, restart)
-            .await
-            .unwrap();
+        restart(&pool, &chains, 100).await;
 
-        assert_eq!(
-            cause_for(&pool, &chains, restart - Duration::days(1)).await,
-            None
-        );
+        assert_eq!(cause_for(&pool, &chains, 5).await, None);
     }
 
-    /// Enabling a disabled asset keeps every fill that landed before that
-    /// restart excluded, even when it is accounted afterwards, and hedges the
-    /// fills that land from the restart on.
+    /// Enabled, then disabled at head 100, then enabled at head 200: a fill that
+    /// landed in the disabled period stays excluded when accounted later, while
+    /// fills from the enabled periods on either side of it are hedged. The
+    /// block right after each head read belongs to the new flags.
     #[tokio::test]
-    async fn fill_that_landed_before_the_enabling_restart_stays_excluded() {
+    async fn only_fills_inside_the_disabled_period_stay_excluded() {
         let (pool, _apalis) = setup_test_pools().await;
-        let disabled_at = Utc::now() - Duration::hours(2);
-        record_trading_enablement(
-            &pool,
-            &chains_with(Some(OperationMode::Disabled)),
-            disabled_at,
-        )
-        .await
-        .unwrap();
-
         let enabled = chains_with(Some(OperationMode::Enabled));
-        let restart = Utc::now();
-        record_trading_enablement(&pool, &enabled, restart)
-            .await
-            .unwrap();
+        restart(&pool, &enabled, 10).await;
+        restart(&pool, &chains_with(Some(OperationMode::Disabled)), 100).await;
+        restart(&pool, &enabled, 200).await;
 
+        assert_eq!(cause_for(&pool, &enabled, 100).await, None);
         assert_eq!(
-            cause_for(&pool, &enabled, restart - Duration::minutes(1)).await,
-            Some(ExclusionCause::LandedBeforeEnabled {
-                enabled_since: DateTime::parse_from_rfc3339(&restart.to_rfc3339())
-                    .unwrap()
-                    .with_timezone(&Utc)
+            cause_for(&pool, &enabled, 101).await,
+            Some(ExclusionCause::LandedWhileDisabled {
+                fill_block: 101,
+                enabled_from_block: 201,
             })
         );
-        assert_eq!(
-            cause_for(&pool, &enabled, restart + Duration::seconds(1)).await,
-            None
-        );
+        assert!(cause_for(&pool, &enabled, 200).await.is_some());
+        assert_eq!(cause_for(&pool, &enabled, 201).await, None);
 
-        // A later restart with the asset still enabled keeps the same cutoff.
-        record_trading_enablement(&pool, &enabled, restart + Duration::hours(1))
-            .await
-            .unwrap();
-        assert!(matches!(
-            cause_for(&pool, &enabled, restart - Duration::minutes(1)).await,
-            Some(ExclusionCause::LandedBeforeEnabled { .. })
-        ));
+        // A later restart with the asset still enabled keeps the period.
+        restart(&pool, &enabled, 300).await;
+        assert!(cause_for(&pool, &enabled, 150).await.is_some());
+    }
+
+    /// Two disable and enable cycles: each period excludes only its own fills.
+    #[tokio::test]
+    async fn every_disabled_period_is_kept() {
+        let (pool, _apalis) = setup_test_pools().await;
+        let enabled = chains_with(Some(OperationMode::Enabled));
+        let disabled = chains_with(Some(OperationMode::Disabled));
+        restart(&pool, &enabled, 10).await;
+        restart(&pool, &disabled, 100).await;
+        restart(&pool, &enabled, 200).await;
+        restart(&pool, &disabled, 300).await;
+        restart(&pool, &enabled, 400).await;
+
+        assert!(cause_for(&pool, &enabled, 150).await.is_some());
+        assert_eq!(cause_for(&pool, &enabled, 250).await, None);
+        assert!(cause_for(&pool, &enabled, 350).await.is_some());
+    }
+
+    /// An asset first seen disabled is known disabled only from that restart:
+    /// once enabled, fills from before it keep the hedged path.
+    #[tokio::test]
+    async fn asset_first_seen_disabled_is_disabled_from_that_restart() {
+        let (pool, _apalis) = setup_test_pools().await;
+        restart(&pool, &chains_with(Some(OperationMode::Disabled)), 100).await;
+        let enabled = chains_with(Some(OperationMode::Enabled));
+        restart(&pool, &enabled, 200).await;
+
+        assert_eq!(cause_for(&pool, &enabled, 100).await, None);
+        assert!(cause_for(&pool, &enabled, 101).await.is_some());
+        assert_eq!(cause_for(&pool, &enabled, 201).await, None);
     }
 
     /// A symbol dropped from the config trades as disabled, so adding it back
-    /// enabled is a new enable with its own cutoff.
+    /// enabled closes a disabled period starting at the drop.
     #[tokio::test]
-    async fn symbol_dropped_from_config_and_readded_gets_a_cutoff() {
+    async fn symbol_dropped_from_config_and_readded_opens_a_disabled_period() {
         let (pool, _apalis) = setup_test_pools().await;
         let enabled = chains_with(Some(OperationMode::Enabled));
-        record_trading_enablement(&pool, &enabled, Utc::now() - Duration::hours(3))
-            .await
-            .unwrap();
-        record_trading_enablement(&pool, &chains_with(None), Utc::now() - Duration::hours(2))
-            .await
-            .unwrap();
+        restart(&pool, &enabled, 10).await;
+        restart(&pool, &chains_with(None), 100).await;
+        restart(&pool, &enabled, 200).await;
 
-        let readded_at = Utc::now();
-        record_trading_enablement(&pool, &enabled, readded_at)
-            .await
-            .unwrap();
+        assert_eq!(cause_for(&pool, &enabled, 50).await, None);
+        assert!(cause_for(&pool, &enabled, 150).await.is_some());
+    }
 
-        assert!(matches!(
-            cause_for(&pool, &enabled, readded_at - Duration::minutes(1)).await,
-            Some(ExclusionCause::LandedBeforeEnabled { .. })
-        ));
+    #[tokio::test]
+    async fn a_hedged_chain_without_a_head_is_refused() {
+        let (pool, _apalis) = setup_test_pools().await;
+        let error =
+            record_trading_enablement(&pool, &chains_with(None), &BTreeMap::new(), Utc::now())
+                .await
+                .unwrap_err();
+
+        assert!(matches!(error, ExclusionError::MissingChainHead { .. }));
     }
 }

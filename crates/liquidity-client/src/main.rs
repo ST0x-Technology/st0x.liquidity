@@ -176,6 +176,7 @@ async fn dispatch<A: TokenSource + Sync>(
                 .post_json(
                     &format!("/excluded-fills/{trade_id}/cover"),
                     &serde_json::json!({
+                        "shares": args.shares,
                         "price_usdc": args.price_usdc,
                         "covered_at": args.covered_at,
                         "broker_order_id": args.broker_order_id,
@@ -331,6 +332,7 @@ mod tests {
                 chain: "base".to_owned(),
                 tx_hash: "0xabc".to_owned(),
                 log_index: 7,
+                shares: "3".to_owned(),
                 price_usdc: "151".to_owned(),
                 covered_at: "2026-09-24T15:00:00Z".to_owned(),
                 broker_order_id: None,

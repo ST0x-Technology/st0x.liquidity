@@ -1146,6 +1146,55 @@ async fn excluded_fill_and_its_manual_cover_realize_pnl_on_their_own_book() {
     );
 }
 
+/// Two excluded sells on one symbol, the second covered first: each cover
+/// closes its own fill, not the oldest open one. Sell A at 100 and B at 200,
+/// cover B at 190: 10 realized on B, and A stays open.
+#[tokio::test]
+async fn cover_closes_its_own_excluded_fill_not_the_oldest() {
+    let trade_a = "base:0x6666666666666666666666666666666666666666666666666666666666666666:1";
+    let trade_b = "base:0x7777777777777777777777777777777777777777777777777777777777777777:2";
+    let excluded = |trade: &str, price: Float, at: &str| {
+        SeedEvent::OnChainTrade(
+            trade.to_owned(),
+            OnChainTradeEvent::ExcludedFromHedging {
+                symbol: Symbol::new("AAPL").unwrap(),
+                amount: float!(1),
+                direction: exec_direction(Direction::Sell),
+                price_usdc: price,
+                block_timestamp: parse_timestamp(at).unwrap(),
+                excluded_at: parse_timestamp(at).unwrap(),
+            },
+        )
+    };
+    let pool = pnl_test_pool(
+        vec![
+            excluded(trade_a, float!(100), "2026-05-15T13:00:00Z"),
+            excluded(trade_b, float!(200), "2026-05-15T13:10:00Z"),
+            SeedEvent::OnChainTrade(
+                trade_b.to_owned(),
+                OnChainTradeEvent::ExclusionCovered {
+                    symbol: Symbol::new("AAPL").unwrap(),
+                    shares: float!(1),
+                    direction: exec_direction(Direction::Buy),
+                    price_usdc: float!(190),
+                    broker_order_id: None,
+                    covered_at: parse_timestamp("2026-05-15T14:00:00Z").unwrap(),
+                    recorded_at: parse_timestamp("2026-05-15T14:05:00Z").unwrap(),
+                },
+            ),
+        ],
+        vec![position_row("AAPL", "0")],
+    )
+    .await;
+
+    let report = build_pnl_report(&pool, &query(), Vec::new(), Utc::now())
+        .await
+        .unwrap();
+
+    assert_eq!(report.summary.gross_realized_pnl_usd, "10");
+    assert_eq!(report.summary.open_short_shares, "1");
+}
+
 /// Until the cover is recorded the excluded fill is open exposure, and the
 /// report says so.
 #[tokio::test]

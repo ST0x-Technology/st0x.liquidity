@@ -8,18 +8,33 @@
 ALTER TABLE skipped_fills ADD COLUMN paged_at TEXT;
 
 -- The trading flag per hedged chain and symbol as last observed at startup,
--- so a restart can tell when an asset went from disabled to enabled.
--- `enabled_since` is the restart that observed that transition: fills that
--- landed before it, while the asset was disabled, stay excluded from hedging
--- even though they are accounted after trading is enabled. NULL when the
--- asset was first observed enabled, since no disabled period is known.
+-- so a restart can tell when an asset was disabled or enabled. Boundaries are
+-- block numbers on that chain, taken from the chain head each restart reads
+-- before it accounts any fill, so a fill is placed by its own block and never
+-- against a host clock. `disabled_from_block` is the first block of the open
+-- disabled period while `trading_enabled` is 0: the block after the head read
+-- by the restart that saw the disable, or that first saw the asset disabled
+-- (it is not known to have been disabled earlier). NULL while enabled.
 CREATE TABLE trading_enablement (
     chain TEXT NOT NULL,
     symbol TEXT NOT NULL,
     trading_enabled INTEGER NOT NULL CHECK (trading_enabled IN (0, 1)),
-    enabled_since TEXT,
+    disabled_from_block INTEGER,
     observed_at TEXT NOT NULL,
     PRIMARY KEY (chain, symbol)
+) STRICT;
+
+-- One row per closed disabled period, written by the restart that saw the
+-- asset enabled again. A fill in `[disabled_from_block, enabled_from_block)`
+-- landed while trading was disabled and stays excluded from hedging even when
+-- it is accounted after the enable.
+CREATE TABLE trading_disabled_period (
+    chain TEXT NOT NULL,
+    symbol TEXT NOT NULL,
+    disabled_from_block INTEGER NOT NULL,
+    enabled_from_block INTEGER NOT NULL,
+    enabled_at TEXT NOT NULL,
+    PRIMARY KEY (chain, symbol, enabled_from_block)
 ) STRICT;
 
 -- One row per OnChainTradeEvent::ExcludedFromHedging: an onchain fill kept

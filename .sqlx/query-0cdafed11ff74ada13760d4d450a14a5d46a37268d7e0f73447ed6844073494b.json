@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "INSERT INTO trading_enablement (chain, symbol, trading_enabled, disabled_from_block, observed_at) VALUES (?, ?, ?, ?, ?)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 5
+    },
+    "nullable": []
+  },
+  "hash": "0cdafed11ff74ada13760d4d450a14a5d46a37268d7e0f73447ed6844073494b"
+}

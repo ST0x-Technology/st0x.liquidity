@@ -37,7 +37,8 @@ use crate::conductor::job::{
 };
 use crate::conductor::{
     ExcludedFillOutcome, TradeProcessingCqrs, VaultDiscoveryCtx,
-    account_for_fill_excluded_from_hedging, discover_vaults_for_trade, process_queued_trade,
+    account_for_fill_excluded_from_hedging, discover_vaults_for_trade,
+    position_fill_already_recorded, process_queued_trade,
 };
 use crate::offchain::order::PlaceOffchainOrderError;
 use crate::onchain::trade::{RaindexTradeEvent, TradeValidationError};
@@ -445,12 +446,17 @@ impl AccountForDexTrade {
     /// is the per symbol hedge kill switch, so the fill is never counter
     /// traded, but the exposure it leaves must never be silent. `detail`
     /// states the fill's delta and the page adds the uncovered net on its
-    /// symbol and chain, so the operator can cover from the page alone.
+    /// symbol and chain, both as of the page: the operator rechecks the
+    /// uncovered list before covering, since a cover may be recorded meanwhile.
     ///
     /// Paged once per fill, tracked in `skipped_fills.paged_at`: the page
     /// comes before the paged mark, so a crash in between pages twice rather
-    /// than never. A failed delivery leaves the fill unpaged, so its next
-    /// redelivery pages again.
+    /// than never, and a redelivered job pages a fill that was not paged yet.
+    /// A fill whose cover is already recorded is not paged, nor one also found
+    /// in `Position` (concurrent runs classified it both ways, so the bot
+    /// hedges it). The production
+    /// notifier logs the alert and cannot fail; a failed delivery (test
+    /// notifiers only) leaves the fill unpaged without failing the job.
     async fn page_excluded_fill(
         &self,
         pool: &SqlitePool,
@@ -470,16 +476,30 @@ impl AccountForDexTrade {
         {
             return Ok(());
         }
+        if position_fill_already_recorded(pool, trade.symbol.base(), &trade_id).await? {
+            error!(
+                target: "hedge",
+                %trade_id,
+                "Excluded fill is also in the hedged position; not paging a manual cover for a \
+                 fill the bot hedges. Reconcile its conflicting records"
+            );
+            return Ok(());
+        }
 
         let symbol = trade.symbol.base();
         let uncovered = uncovered_excluded_fills(pool, trade.chain, symbol.as_str())
             .await
             .map_err(record_error)?;
         let message = format!(
-            "Fill on DISABLED asset {symbol} (chain {chain}, tx {tx}): {detail}. Kept out \
-             of the hedged position and recorded in skipped_fills; cover the delta by \
-             hand, then record the cover with st0x-liquidity-client debug \
-             cover-excluded-fill {chain} {tx} {log_index}. {uncovered}",
+            "Fill on DISABLED asset {symbol} (chain {chain}, tx {tx}) kept out of the hedged \
+             position and recorded in skipped_fills. As of this page: {detail}. {uncovered} \
+             Before covering anything, recheck what is still uncovered with \
+             st0x-liquidity-client read resource skipped-fills --param covered=false, since a \
+             cover may have been recorded since. Cover only what is listed, then record each \
+             fill's cover with st0x-liquidity-client debug cover-excluded-fill {chain} {tx} \
+             {log_index} --shares {amount} --price-usdc <broker price> --covered-at <RFC 3339 \
+             execution time>.",
+            amount = trade.amount,
             chain = trade.chain,
             tx = trade.tx_hash,
             log_index = trade.log_index,
@@ -667,6 +687,14 @@ pub enum TradeAccountingError {
         trade_id: crate::onchain_trade::OnChainTradeId,
         #[source]
         source: Box<dyn std::error::Error + Send + Sync>,
+    },
+    #[error(
+        "Fill {trade_id} is both in the hedged position and recorded as excluded from \
+         hedging: a concurrent run classified it both ways. Reconcile it by hand before the \
+         operator covers it or the bot hedges it twice"
+    )]
+    ExclusionConflict {
+        trade_id: crate::onchain_trade::OnChainTradeId,
     },
     #[error("Missing block_timestamp for fill {trade_id}; cannot account for it")]
     MissingBlockTimestamp {
@@ -954,6 +982,7 @@ impl TradeAccountingError {
             | Self::EnqueueJob(_)
             | Self::PositionFillLookup(_)
             | Self::ExcludedFillRecord { .. }
+            | Self::ExclusionConflict { .. }
             | Self::MissingBlockTimestamp { .. }
             | Self::UnexpectedPostPlaceState { .. }
             | Self::InconsistentOnChainTradeState { .. }
@@ -2151,8 +2180,8 @@ mod tests {
         };
 
         // decimals() for USDC and wtCOIN, once per perform (the run, the
-        // redrive, and the redelivery after a restart).
-        for _ in 0..3 {
+        // redrive, and two redeliveries of an unpaged fill).
+        for _ in 0..4 {
             asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&6u8));
             asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&18u8));
         }
@@ -2289,6 +2318,41 @@ mod tests {
             messages[1].contains(&recorded[0].detail),
             "the redelivered page must carry the recorded delta: {}",
             messages[1]
+        );
+
+        // Once the operator records the cover, a redelivery of the still
+        // unpaged fill must not tell them to cover it again.
+        let trade_id: crate::onchain_trade::OnChainTradeId =
+            format!("base:{}:{}", recorded[0].tx_hash, recorded[0].log_index)
+                .parse()
+                .unwrap();
+        let amount = accountant_ctx
+            .cqrs
+            .onchain_trade
+            .load(&trade_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .amount;
+        crate::operator::excluded_fill::record_exclusion_cover(
+            &pool,
+            &trade_id,
+            amount,
+            float!(151),
+            None,
+            chrono::Utc::now(),
+        )
+        .await
+        .unwrap();
+        sqlx::query("UPDATE skipped_fills SET paged_at = NULL")
+            .execute(&pool)
+            .await
+            .unwrap();
+        job.perform(&accountant_ctx).await.unwrap();
+        assert_eq!(
+            notifier.messages().len(),
+            2,
+            "a covered fill is owed no page"
         );
     }
 

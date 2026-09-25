@@ -182,19 +182,38 @@ pub(crate) enum PositionLedgerRow {
     OffchainPlacement(OffchainPlacementRow),
     ManualAdjustment(ManualAdjustmentRow),
     /// An onchain fill excluded from hedging because trading was disabled for
-    /// it. Replayed on its own book per symbol, since it never reached
-    /// `Position` and must not net against the hedged fills.
-    ExcludedFill(OnchainFillRow),
-    /// The operator's manual broker cover of an excluded fill, replayed on the
-    /// same excluded book. `offchain_order_id` is `cover:<trade id>`.
-    ExcludedFillCover(OffchainFillRow),
+    /// it. Replayed on its own book, one per excluded fill, since it never
+    /// reached `Position` and must not net against the hedged fills.
+    ExcludedFill(ExcludedFillRow),
+    /// The operator's manual broker cover of an excluded fill, replayed on that
+    /// fill's own book.
+    ExcludedFillCover(ExcludedFillCoverRow),
+}
+
+/// An excluded fill with its chain qualified identity, `chain:tx_hash:log_index`,
+/// which keys its own replay book.
+#[derive(Debug, Clone)]
+pub(crate) struct ExcludedFillRow {
+    pub(crate) trade_id: String,
+    pub(crate) fill: OnchainFillRow,
+}
+
+/// A manual cover with the chain qualified identity of the excluded fill it
+/// covers.
+#[derive(Debug, Clone)]
+pub(crate) struct ExcludedFillCoverRow {
+    pub(crate) trade_id: String,
+    pub(crate) cover: OffchainFillRow,
 }
 
 impl PositionLedgerRow {
     pub(crate) fn event_rowid(&self) -> i64 {
         match self {
-            Self::OnchainFill(row) | Self::ExcludedFill(row) => row.event_rowid,
-            Self::OffchainFill(row) | Self::ExcludedFillCover(row) => row.event_rowid,
+            Self::OnchainFill(row) | Self::ExcludedFill(ExcludedFillRow { fill: row, .. }) => {
+                row.event_rowid
+            }
+            Self::OffchainFill(row)
+            | Self::ExcludedFillCover(ExcludedFillCoverRow { cover: row, .. }) => row.event_rowid,
             Self::OffchainPlacement(row) => row.event_rowid,
             Self::ManualAdjustment(row) => row.event_rowid,
         }
@@ -202,8 +221,11 @@ impl PositionLedgerRow {
 
     pub(crate) fn symbol(&self) -> &str {
         match self {
-            Self::OnchainFill(row) | Self::ExcludedFill(row) => &row.symbol,
-            Self::OffchainFill(row) | Self::ExcludedFillCover(row) => &row.symbol,
+            Self::OnchainFill(row) | Self::ExcludedFill(ExcludedFillRow { fill: row, .. }) => {
+                &row.symbol
+            }
+            Self::OffchainFill(row)
+            | Self::ExcludedFillCover(ExcludedFillCoverRow { cover: row, .. }) => &row.symbol,
             Self::OffchainPlacement(row) => &row.symbol,
             Self::ManualAdjustment(row) => &row.symbol,
         }
@@ -215,8 +237,11 @@ impl PositionLedgerRow {
     /// `position_event_replay_timestamp` made against raw payloads.
     pub(crate) fn replay_timestamp(&self) -> &str {
         match self {
-            Self::OnchainFill(row) | Self::ExcludedFill(row) => &row.executed_at,
-            Self::OffchainFill(row) | Self::ExcludedFillCover(row) => &row.executed_at,
+            Self::OnchainFill(row) | Self::ExcludedFill(ExcludedFillRow { fill: row, .. }) => {
+                &row.executed_at
+            }
+            Self::OffchainFill(row)
+            | Self::ExcludedFillCover(ExcludedFillCoverRow { cover: row, .. }) => &row.executed_at,
             Self::OffchainPlacement(row) => &row.placed_at,
             Self::ManualAdjustment(row) => &row.adjusted_at,
         }

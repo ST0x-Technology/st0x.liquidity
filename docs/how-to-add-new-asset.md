@@ -202,16 +202,19 @@ chain's signing wallet, orderbook, `redemption_wallet` and
 - `trading`: Set to `"disabled"` initially, enable once everything else is
   ready. A fill on this chain that lands while it is disabled is never counter
   traded, not even after trading is enabled: it is recorded in `skipped_fills`
-  with reason `trading_disabled`, paged, and has to be covered by hand. The
-  restart that enables trading is the cutoff: fills that landed before it stay
-  excluded even if the bot accounts them afterwards, and fills from the restart
-  on are hedged. List excluded fills with
-  `st0x-liquidity-client read resource
-  skipped-fills --param reason=trading_disabled --param covered=false`,
-  and record each manual cover with
+  with reason `trading_disabled`, paged, and has to be covered by hand. Fills
+  that land while it is disabled stay excluded even if the bot accounts them
+  after the restart that enables trading; the boundary is the block after the
+  chain head that restart reads: fills up to and including that head stay
+  excluded, and fills from the next block on are hedged. List excluded fills
+  with
+  `st0x-liquidity-client read resource skipped-fills --param
+  reason=trading_disabled --param covered=false`,
+  and once a fill's whole amount is covered at the broker, record it with
   `st0x-liquidity-client debug
-  cover-excluded-fill` so the PnL ledger books
-  it.
+  cover-excluded-fill <chain> <tx> <log_index> --shares <amount> --price-usdc
+  <price> --covered-at <time>`
+  so the PnL ledger books it.
 - `rebalancing`: Whether the bot auto-rebalances this asset between venues.
   Usually `"disabled"` at first.
 - `wrapped_equity_recovery`: Explicit opt-in for recovery of wrapped-equity

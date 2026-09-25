@@ -2560,6 +2560,8 @@ struct SkippedFillsQuery {
     /// `true` only covered ones.
     covered: Option<bool>,
     limit: Option<i64>,
+    /// Keyset cursor: the previous page's `nextBefore`.
+    before: Option<i64>,
 }
 
 /// One skipped fill. The trade terms come from the fill's `OnChainTrade` and
@@ -2586,6 +2588,9 @@ struct SkippedFillResponse {
     cover_direction: Option<st0x_dto::Direction>,
     excluded_at: Option<String>,
     cover: Option<SkippedFillCoverResponse>,
+    /// Also in the hedged `Position`: the bot hedges it, so never cover it by
+    /// hand; reconcile the conflicting records.
+    in_position: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -2600,6 +2605,9 @@ struct SkippedFillCoverResponse {
 #[serde(rename_all = "camelCase")]
 struct SkippedFillsResponse {
     skipped_fills: Vec<SkippedFillResponse>,
+    /// Present when more rows match past this page: pass it as `before` to
+    /// read the next page. Stable while new fills are recorded.
+    next_before: Option<i64>,
 }
 
 impl From<SkippedFillListing> for SkippedFillResponse {
@@ -2635,6 +2643,7 @@ impl From<SkippedFillListing> for SkippedFillResponse {
             cover_direction: direction.map(cover_direction),
             excluded_at: row.excluded_at,
             cover,
+            in_position: row.in_position,
         }
     }
 }
@@ -2659,9 +2668,10 @@ async fn skipped_fills(
         since,
         covered: query.covered,
         limit: query.limit.unwrap_or(100).clamp(1, 500),
+        before: query.before,
     };
 
-    let rows = list_skipped_fills(&state.pool, &filter)
+    let page = list_skipped_fills(&state.pool, &filter)
         .await
         .map_err(|error| {
             error!(?error, "Failed to query skipped fills");
@@ -2676,7 +2686,12 @@ async fn skipped_fills(
     Ok((
         [(CACHE_CONTROL, "no-store")],
         Json(SkippedFillsResponse {
-            skipped_fills: rows.into_iter().map(SkippedFillResponse::from).collect(),
+            skipped_fills: page
+                .rows
+                .into_iter()
+                .map(SkippedFillResponse::from)
+                .collect(),
+            next_before: page.next_before,
         }),
     ))
 }
@@ -2684,7 +2699,10 @@ async fn skipped_fills(
 /// Wire contract for recording the manual cover of an excluded fill.
 #[derive(Deserialize)]
 struct CoverExcludedFillRequest {
-    /// Strictly positive broker execution price per share, in USD.
+    /// Shares covered: must equal the excluded fill's amount.
+    shares: String,
+    /// Strictly positive broker execution price per share, in USD; the volume
+    /// weighted price when the cover took several broker orders.
     price_usdc: String,
     /// When the broker trade executed (RFC 3339).
     covered_at: String,
@@ -2710,6 +2728,7 @@ async fn cover_excluded_fill(
     let trade_id = trade_id
         .parse::<OnChainTradeId>()
         .map_err(ops_precondition_error)?;
+    let shares = Float::parse(request.shares).map_err(ops_precondition_error)?;
     let price_usdc =
         Positive::new(Float::parse(request.price_usdc).map_err(ops_precondition_error)?)
             .map_err(|_| ops_precondition_error("price_usdc must be strictly positive"))?
@@ -2725,6 +2744,7 @@ async fn cover_excluded_fill(
     record_exclusion_cover(
         &state.pool,
         &trade_id,
+        shares,
         price_usdc,
         broker_order_id,
         covered_at,
@@ -7368,8 +7388,9 @@ mod tests {
         assert!(uncovered[0].cover.is_none());
 
         let request = || CoverExcludedFillRequest {
+            shares: "1".to_owned(),
             price_usdc: "151".to_owned(),
-            covered_at: "2026-09-24T15:00:00Z".to_owned(),
+            covered_at: Utc::now().to_rfc3339(),
             broker_order_id: Some("order-1".to_owned()),
         };
         let Json(recorded) = cover_excluded_fill(
@@ -7411,6 +7432,7 @@ mod tests {
             State(state),
             Path(trade_id),
             Json(CoverExcludedFillRequest {
+                shares: "1".to_owned(),
                 price_usdc: "151".to_owned(),
                 covered_at: "2026-09-24T15:00:00Z".to_owned(),
                 broker_order_id: None,

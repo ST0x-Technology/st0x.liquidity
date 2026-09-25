@@ -57,6 +57,29 @@ pub enum RejectionReason {
     #[error("the cover price must be strictly positive")]
     NonPositiveCoverPrice,
     #[error(
+        "fill {trade_id} is also in the hedged position, so the bot hedges it; do not cover it \
+         by hand, reconcile its conflicting records instead"
+    )]
+    ExcludedFillInPosition {
+        trade_id: crate::onchain_trade::OnChainTradeId,
+    },
+    #[error(
+        "the cover must be the full amount of excluded fill {trade_id} ({expected} shares); \
+         record it once the whole amount is covered"
+    )]
+    CoverSharesMismatch {
+        trade_id: crate::onchain_trade::OnChainTradeId,
+        expected: String,
+    },
+    #[error("the cover cannot have executed before the fill it covers")]
+    CoverBeforeFill,
+    #[error("the cover cannot have executed in the future")]
+    CoverInFuture,
+    #[error("another request changed excluded fill {trade_id} concurrently; retry")]
+    ConcurrentCover {
+        trade_id: crate::onchain_trade::OnChainTradeId,
+    },
+    #[error(
         "OffchainOrder {offchain_order_id} belongs to {owner}, not {symbol} -- refusing to \
          repair"
     )]
@@ -844,20 +867,27 @@ pub mod excluded_fill {
     use sqlx::SqlitePool;
     use st0x_event_sorcery::{AggregateError, LifecycleError, StoreBuilder};
 
+    use crate::conductor::position_fill_already_recorded;
     use crate::onchain_trade::{
         OnChainTrade, OnChainTradeCommand, OnChainTradeError, OnChainTradeId,
     };
     use crate::operator::{OperatorError, RejectionReason};
 
     /// Records the operator's manual broker cover of a fill excluded from
-    /// hedging: its full amount on the opposite side of the fill, at
-    /// `price_usdc`. Booked in the PnL ledger against the excluded fill.
+    /// hedging, booked in the PnL ledger against that fill.
+    ///
+    /// The cover is the fill's full amount (`shares` must equal it) on the
+    /// opposite side of the fill, at `price_usdc`. Record it once the whole
+    /// amount is covered, at the volume weighted price when it took several
+    /// broker orders.
     ///
     /// Shared by the ops API. Refuses a fill that was not excluded or already
-    /// has a cover, so a cover is recorded exactly once.
+    /// has a cover, so a cover is recorded exactly once, including when two
+    /// requests race.
     pub async fn record_exclusion_cover(
         pool: &SqlitePool,
         trade_id: &OnChainTradeId,
+        shares: Float,
         price_usdc: Float,
         broker_order_id: Option<String>,
         covered_at: DateTime<Utc>,
@@ -867,10 +897,27 @@ pub mod excluded_fill {
             .await
             .context("failed to build onchain trade store")?;
 
+        // A fill also in `Position` is hedged by the bot; a manual cover would
+        // double it.
+        if let Some(state) = onchain_trade
+            .load(trade_id)
+            .await
+            .context("failed to load the excluded fill")?
+            && position_fill_already_recorded(pool, &state.symbol, trade_id)
+                .await
+                .context("failed to check the fill against the position")?
+        {
+            return Err(RejectionReason::ExcludedFillInPosition {
+                trade_id: trade_id.clone(),
+            }
+            .into());
+        }
+
         let result = onchain_trade
             .send(
                 trade_id,
                 OnChainTradeCommand::RecordExclusionCover {
+                    shares,
                     price_usdc,
                     broker_order_id,
                     covered_at,
@@ -895,6 +942,49 @@ pub mod excluded_fill {
             Err(AggregateError::UserError(LifecycleError::Apply(
                 OnChainTradeError::NonPositiveCoverPrice,
             ))) => Err(RejectionReason::NonPositiveCoverPrice.into()),
+            Err(AggregateError::UserError(LifecycleError::Apply(
+                OnChainTradeError::CoverSharesMismatch,
+            ))) => {
+                let expected = onchain_trade
+                    .load(trade_id)
+                    .await
+                    .context("failed to load the excluded fill")?
+                    .map(|state| state.amount);
+                Err(RejectionReason::CoverSharesMismatch {
+                    trade_id: trade_id.clone(),
+                    expected: expected.map_or_else(
+                        || "unknown".to_owned(),
+                        |amount| st0x_float_serde::format_float_with_fallback(&amount),
+                    ),
+                }
+                .into())
+            }
+            Err(AggregateError::UserError(LifecycleError::Apply(
+                OnChainTradeError::CoverBeforeFill,
+            ))) => Err(RejectionReason::CoverBeforeFill.into()),
+            Err(AggregateError::UserError(LifecycleError::Apply(
+                OnChainTradeError::CoverInFuture,
+            ))) => Err(RejectionReason::CoverInFuture.into()),
+            // Two requests raced on the same fill. Report what the winner did
+            // instead of a bare server error.
+            Err(AggregateError::AggregateConflict) => {
+                let covered = onchain_trade
+                    .load(trade_id)
+                    .await
+                    .context("failed to reload the excluded fill after a conflict")?
+                    .and_then(|state| state.exclusion)
+                    .is_some_and(|exclusion| exclusion.cover.is_some());
+                if covered {
+                    return Err(RejectionReason::ExcludedFillAlreadyCovered {
+                        trade_id: trade_id.clone(),
+                    }
+                    .into());
+                }
+                Err(RejectionReason::ConcurrentCover {
+                    trade_id: trade_id.clone(),
+                }
+                .into())
+            }
             Err(error) => Err(anyhow::Error::new(error)
                 .context("failed to record the excluded fill cover")
                 .into()),
