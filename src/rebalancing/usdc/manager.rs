@@ -6355,6 +6355,9 @@ mod tests {
         // deposit send tests opt in via `with_send_usdc_tx`.
         send_usdc_tx: Option<TxHash>,
         usdc_prepare_calls: AtomicUsize,
+        // Delays only the first `prepare_usdc_on_ethereum`, so a later
+        // prepare can overtake it.
+        first_usdc_prepare_delay: Duration,
         usdc_broadcasts: Mutex<Vec<TxHash>>,
         usdc_broadcast_delay: Duration,
         usdc_broadcast_error: Option<fn() -> CctpError>,
@@ -6391,6 +6394,7 @@ mod tests {
                 burn_status: None,
                 send_usdc_tx: None,
                 usdc_prepare_calls: AtomicUsize::new(0),
+                first_usdc_prepare_delay: Duration::ZERO,
                 usdc_broadcasts: Mutex::new(Vec::new()),
                 usdc_broadcast_delay: Duration::ZERO,
                 usdc_broadcast_error: None,
@@ -6467,6 +6471,11 @@ mod tests {
 
         fn with_send_usdc_tx(mut self, tx_hash: TxHash) -> Self {
             self.send_usdc_tx = Some(tx_hash);
+            self
+        }
+
+        fn with_first_usdc_prepare_delay(mut self, delay: Duration) -> Self {
+            self.first_usdc_prepare_delay = delay;
             self
         }
 
@@ -6701,6 +6710,9 @@ mod tests {
             };
 
             let nonce = self.usdc_prepare_calls.fetch_add(1, Ordering::SeqCst);
+            if nonce == 0 {
+                tokio::time::sleep(self.first_usdc_prepare_delay).await;
+            }
             Ok(PreparedTransaction::for_test(
                 tx_hash,
                 u64::try_from(nonce).unwrap(),
@@ -15926,6 +15938,45 @@ mod tests {
                 .map(|(prepared, _)| prepared.tx_hash()),
             Some(winner.tx_hash())
         );
+    }
+
+    /// A timed-out attempt's prepare is still signing when its redrive
+    /// prepares again. The redrive waits for it and takes its persisted send,
+    /// so one nonce is taken and none is left as a gap.
+    #[tokio::test]
+    async fn overlapping_deposit_send_prepares_sign_once() {
+        let bridge = Arc::new(
+            MockBridge::new()
+                .with_send_usdc_tx(MOCK_DEPOSIT_SEND_TX)
+                .with_first_usdc_prepare_delay(Duration::from_millis(300)),
+        );
+        let cqrs = create_test_store_instance().await;
+        let (manager, _server, _anvil) =
+            deposit_send_manager(cqrs.clone(), Arc::clone(&bridge)).await;
+
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        stage_bridged_with_mint_tx(&cqrs, &id, usdc("100"), usdc("99.99"), TxHash::ZERO).await;
+        let deposit_address = Address::random();
+        let amount = U256::from(99_990_000);
+
+        let (first, redrive) = tokio::join!(
+            manager.prepare_and_persist_deposit_send(&id, deposit_address, amount),
+            async {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                manager
+                    .prepare_and_persist_deposit_send(&id, deposit_address, amount)
+                    .await
+            },
+        );
+
+        let (first, _) = first.expect("the first prepare persists its send");
+        let (redrive, _) = redrive.expect("the redrive takes the persisted send");
+        assert_eq!(bridge.usdc_prepare_calls(), 1, "only one send is signed");
+        assert_eq!(
+            (redrive.tx_hash(), redrive.nonce()),
+            (first.tx_hash(), first.nonce())
+        );
+        assert!(bridge.usdc_discarded().is_empty(), "no nonce is released");
     }
 
     /// Startup restores the nonce of every signed send still on `Bridged`,
