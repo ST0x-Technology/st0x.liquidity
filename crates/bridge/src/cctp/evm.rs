@@ -747,7 +747,7 @@ impl<W: Wallet> CctpEndpoint<W> {
 
     /// Returns the block in which `tx_hash` was mined on this endpoint's chain.
     ///
-    /// Used to derive the lower bound for [`find_recent_usdc_transfer`] from the
+    /// Used to derive the lower bound for [`find_recent_usdc_transfers`] from the
     /// known mint tx: the deposit send to Alpaca lands at or after the mint's
     /// block, so the mint block bounds the transfer scan exactly the way the
     /// captured head bounds [`find_recent_burn`]. Confirmation-aware: it polls via
@@ -921,29 +921,29 @@ impl<W: Wallet> CctpEndpoint<W> {
         }
     }
 
-    /// Scans for a USDC `Transfer(from, to, value == amount)` at or after
-    /// `from_block`, returning the most recent matching transaction hash.
+    /// Scans for USDC `Transfer(from, to, value == amount)` events at or after
+    /// `from_block`, returning every matching transaction hash, newest first.
     ///
     /// Detects a legacy unrecorded deposit send: a BaseToAlpaca transfer that
     /// reached `Bridged` without a persisted signed send may already have sent
-    /// the minted USDC, so resume refuses to send again when this finds a match.
-    /// The send lands at or after the mint, so the match is bounded to
-    /// `from_block` (the mint's block) onward. Matching on `(from, to, value)`
-    /// cannot tell this transfer's send from another transfer's same-amount
-    /// send, so a match is never adopted.
+    /// the minted USDC, so resume refuses to send again when a match is not
+    /// another transfer's send. The send lands at or after the mint, so the
+    /// match is bounded to `from_block` (the mint's block) onward. Matching on
+    /// `(from, to, value)` cannot tell this transfer's send from another
+    /// transfer's same-amount send, so a match is never adopted.
     ///
-    /// Returns `Ok(None)` ONLY when the queried node is confirmations-deep past
+    /// Returns an empty list ONLY when the queried node is confirmations-deep past
     /// `from_block` and repeated scans agree the transfer is absent; a node that
     /// may be lagging (the dRPC load-balancing hazard) yields a retryable
     /// [`CctpError::ScanInconclusive`], so the caller never re-sends off a single
     /// stale empty `eth_getLogs`.
-    pub(super) async fn find_recent_usdc_transfer(
+    pub(super) async fn find_recent_usdc_transfers(
         &self,
         from: Address,
         to: Address,
         amount: U256,
         from_block: u64,
-    ) -> Result<Option<TxHash>, CctpError> {
+    ) -> Result<Vec<TxHash>, CctpError> {
         let from_topic = FixedBytes::<32>::left_padding_from(from.as_slice());
         let to_topic = FixedBytes::<32>::left_padding_from(to.as_slice());
         let filter = Filter::new()
@@ -956,6 +956,7 @@ impl<W: Wallet> CctpEndpoint<W> {
         for attempt in 1..=SCAN_ATTEMPTS {
             let logs = self.wallet.provider().get_logs(&filter).await?;
 
+            let mut matches = Vec::new();
             for log in logs.iter().rev() {
                 let decoded = log.log_decode::<IERC20::Transfer>()?;
                 let event = decoded.data();
@@ -964,9 +965,13 @@ impl<W: Wallet> CctpEndpoint<W> {
                     && log.block_number.is_some_and(|block| block >= from_block)
                     && let Some(tx_hash) = log.transaction_hash
                 {
-                    debug!(target: "bridge", %tx_hash, from_block, "Found existing USDC deposit transfer during resume");
-                    return Ok(Some(tx_hash));
+                    matches.push(tx_hash);
                 }
+            }
+
+            if !matches.is_empty() {
+                debug!(target: "bridge", ?matches, from_block, "Found existing USDC deposit transfers during resume");
+                return Ok(matches);
             }
 
             // A single empty eth_getLogs from a load-balanced node is not
@@ -978,7 +983,7 @@ impl<W: Wallet> CctpEndpoint<W> {
             let caught_up = head >= from_block.saturating_add(SCAN_FINALITY_MARGIN);
 
             if caught_up && attempt == SCAN_ATTEMPTS {
-                return Ok(None);
+                return Ok(Vec::new());
             }
 
             if attempt < SCAN_ATTEMPTS {
@@ -1191,7 +1196,7 @@ impl<W: Wallet> CctpEndpoint<W> {
     /// call already reflects -- up to `SCAN_ATTEMPTS` times spaced
     /// `SCAN_RETRY_BACKOFF` apart, the same dRPC-lag tolerance
     /// [`find_recent_burn`](Self::find_recent_burn) and
-    /// [`find_recent_usdc_transfer`](Self::find_recent_usdc_transfer) already
+    /// [`find_recent_usdc_transfers`](Self::find_recent_usdc_transfers) already
     /// apply to their own `get_logs` scans. This runs at most once per
     /// `recover_already_minted` call (not once per probe). Each retry's scan
     /// is additionally floored at [`RECONSTRUCTION_SCAN_LOOKBACK_CHUNKS`]

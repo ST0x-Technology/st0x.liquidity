@@ -3914,9 +3914,10 @@ already-submitted action instead of re-issuing it:
   `InitiateDeposit` records its hash, which must equal the signed send's. Resume
   broadcasts the persisted bytes again and confirms them: the same tx, so it
   never sends twice and never adopts another send. With no signed send, a
-  same-amount send from the wallet to the deposit address after the mint can
-  belong to another transfer, so resume fails the transfer for reconciliation
-  instead of adopting it (see "BaseToAlpaca deposit send").
+  same-amount send from the wallet to the deposit address after the mint that no
+  other transfer signed, attached or recorded fails the transfer for
+  reconciliation instead of being adopted; a send another transfer claims is
+  skipped (see "BaseToAlpaca deposit send").
 - `Attested`: the CCTP mint is irreversible -- re-calling `receiveMessage`
   reverts on the already-used nonce, which would otherwise turn a successfully
   minted transfer into a terminal `BridgingFailed`. Resume must first ask the
@@ -7008,12 +7009,15 @@ therefore performs an explicit fund-moving send:
      `Bridged` on a build that sent without persisting the signed send first, so
      only a transfer loaded at `Bridged` runs it. A transfer that reaches
      `Bridged` during the resume (an adopted attested mint, or a post-burn
-     `BridgingFailed` recovery) has no send yet and signs and sends at once.
-     None found: sign and send as in step 2. One found: it may be another
-     corridor's send of the same amount through the shared wallet, so the bot
-     never adopts it: it emits `FailDeposit` with no `deposit_ref` and pages
-     (`DepositSendUnresolved`). A scan failure (an RPC error, or an inconclusive
-     finality-gated scan) returns an error and sends NOTHING.
+     `BridgingFailed` recovery) has no send yet and signs and sends at once. A
+     match that another transfer signed, attached or recorded is that transfer's
+     send, so the bot skips it. None found, or every match claimed by another
+     transfer: sign and send as in step 2. An unclaimed match may still be
+     another corridor's send of the same amount through the shared wallet, so
+     the bot never adopts it: it emits `FailDeposit` with no `deposit_ref` and
+     pages (`DepositSendUnresolved`). A scan or event-store lookup failure (an
+     RPC error, an inconclusive finality-gated scan, or a failed read of the
+     other transfers) returns an error and sends NOTHING.
 4. **Record the send.** The send tx (not the mint tx) is recorded as the deposit
    reference via `InitiateDeposit`, advancing the aggregate to
    `DepositInitiated`.

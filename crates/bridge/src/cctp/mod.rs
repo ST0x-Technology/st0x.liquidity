@@ -1249,7 +1249,7 @@ impl<EthWallet: Wallet, BaseWallet: Wallet> CctpBridge<EthWallet, BaseWallet> {
     /// where BaseToEthereum mints land.
     ///
     /// The BaseToAlpaca deposit leg uses this to bound
-    /// [`find_recent_usdc_transfer`](Self::find_recent_usdc_transfer) from the
+    /// [`find_recent_usdc_transfers`](Self::find_recent_usdc_transfers) from the
     /// known mint tx: the deposit send to Alpaca lands at or after the mint, so
     /// the mint's block is the scan lower bound.
     pub async fn ethereum_tx_block(&self, tx_hash: TxHash) -> Result<u64, CctpError> {
@@ -1331,25 +1331,25 @@ impl<EthWallet: Wallet, BaseWallet: Wallet> CctpBridge<EthWallet, BaseWallet> {
             .await
     }
 
-    /// Scans Ethereum for a USDC `Transfer(from, to, value == amount)` at or
-    /// after `from_block`, returning the most recent matching tx hash.
+    /// Scans Ethereum for USDC `Transfer(from, to, value == amount)` events at
+    /// or after `from_block`, returning every matching tx hash, newest first.
     ///
     /// Detects a legacy unrecorded deposit send: a BaseToAlpaca transfer that
     /// reached `Bridged` without a persisted signed send may already have sent,
-    /// so resume refuses to send again when this finds a match. A match can be
-    /// another transfer's same-amount send, so it is never adopted. Returns a
-    /// retryable [`CctpError::ScanInconclusive`] rather than `Ok(None)` when the
+    /// so resume refuses to send again when a match is not another transfer's
+    /// send. A match is never adopted. Returns a retryable
+    /// [`CctpError::ScanInconclusive`] rather than an empty list when the
     /// queried node is not confirmations-deep past `from_block`, so the caller
     /// never sends off a stale empty scan.
-    pub async fn find_recent_usdc_transfer(
+    pub async fn find_recent_usdc_transfers(
         &self,
         from: Address,
         to: Address,
         amount: U256,
         from_block: u64,
-    ) -> Result<Option<TxHash>, CctpError> {
+    ) -> Result<Vec<TxHash>, CctpError> {
         self.ethereum
-            .find_recent_usdc_transfer(from, to, amount, from_block)
+            .find_recent_usdc_transfers(from, to, amount, from_block)
             .await
     }
 }
@@ -6141,29 +6141,29 @@ mod tests {
 
         assert_eq!(
             bridge
-                .find_recent_usdc_transfer(sender, recipient, amount, from_block)
+                .find_recent_usdc_transfers(sender, recipient, amount, from_block)
                 .await
                 .unwrap(),
-            Some(send_tx),
-            "scan must adopt the exact (from, to, value) transfer at/after the bound",
+            vec![send_tx],
+            "scan must match the exact (from, to, value) transfer at/after the bound",
         );
 
         let other_recipient = address!("0x000000000000000000000000000000000000Cafe");
         assert_eq!(
             bridge
-                .find_recent_usdc_transfer(sender, other_recipient, amount, from_block)
+                .find_recent_usdc_transfers(sender, other_recipient, amount, from_block)
                 .await
                 .unwrap(),
-            None,
+            Vec::<TxHash>::new(),
             "a transfer to a different recipient must not be adopted",
         );
 
         assert_eq!(
             bridge
-                .find_recent_usdc_transfer(sender, recipient, amount + U256::from(1), from_block)
+                .find_recent_usdc_transfers(sender, recipient, amount + U256::from(1), from_block)
                 .await
                 .unwrap(),
-            None,
+            Vec::<TxHash>::new(),
             "a transfer whose value differs must not be adopted",
         );
 
@@ -6171,10 +6171,10 @@ mod tests {
         // already far enough past `above_block` for the absence to resolve to None.
         assert_eq!(
             bridge
-                .find_recent_usdc_transfer(sender, recipient, amount, above_block)
+                .find_recent_usdc_transfers(sender, recipient, amount, above_block)
                 .await
                 .unwrap(),
-            None,
+            Vec::<TxHash>::new(),
             "a transfer below the scan bound must not be adopted",
         );
     }

@@ -200,15 +200,15 @@ pub trait UsdcBridgeHelper: Send + Sync + 'static {
         tx_hash: TxHash,
     ) -> Result<UsdcTransferStatus, CctpError>;
 
-    /// Scans Ethereum for a USDC `Transfer(from, to, value == amount)` event
-    /// at or after `from_block`, returning the most recent matching tx hash.
-    async fn find_recent_usdc_transfer(
+    /// Scans Ethereum for USDC `Transfer(from, to, value == amount)` events
+    /// at or after `from_block`, returning every matching tx hash, newest first.
+    async fn find_recent_usdc_transfers(
         &self,
         from: Address,
         to: Address,
         amount: U256,
         from_block: u64,
-    ) -> Result<Option<TxHash>, CctpError>;
+    ) -> Result<Vec<TxHash>, CctpError>;
 }
 
 #[async_trait::async_trait]
@@ -276,14 +276,14 @@ impl<EthWallet: Wallet, BaseWallet: Wallet> UsdcBridgeHelper for CctpBridge<EthW
         self.confirm_usdc_on_ethereum(tx_hash).await
     }
 
-    async fn find_recent_usdc_transfer(
+    async fn find_recent_usdc_transfers(
         &self,
         from: Address,
         to: Address,
         amount: U256,
         from_block: u64,
-    ) -> Result<Option<TxHash>, CctpError> {
-        self.find_recent_usdc_transfer(from, to, amount, from_block)
+    ) -> Result<Vec<TxHash>, CctpError> {
+        self.find_recent_usdc_transfers(from, to, amount, from_block)
             .await
     }
 }
@@ -4885,13 +4885,15 @@ impl<
     }
 
     /// Resume with no signed send: sends unless a same-amount send from the
-    /// wallet to the deposit address landed after the mint.
+    /// wallet to the deposit address landed after the mint and no other
+    /// transfer signed, attached or recorded it.
     ///
     /// Such a send can be this transfer's only if it reached `Bridged` on a
-    /// build that sent without persisting the signed send first; it can as
-    /// well be another transfer's, so it is never adopted and the deposit
-    /// fails for operator reconciliation. A scan failure returns an error
-    /// without sending.
+    /// build that sent without persisting the signed send first. A send no
+    /// other transfer claims is never adopted either: the deposit fails for
+    /// operator reconciliation. With no event store wired no match can be
+    /// attributed, so any match fails the deposit. A scan or lookup failure
+    /// returns an error without sending.
     #[instrument(target = "rebalance", skip(self), fields(%id, %amount_received, %mint_tx), level = tracing::Level::DEBUG)]
     async fn send_unless_an_unrecorded_send_landed(
         &self,
@@ -4908,17 +4910,18 @@ impl<
             .await
             .map_err(|error| UsdcTransferError::Cctp(Box::new(error)))?;
 
-        if let Some(unrecorded_tx) = self
+        let matches = self
             .cctp_bridge
-            .find_recent_usdc_transfer(
+            .find_recent_usdc_transfers(
                 self.market_maker_wallet,
                 deposit_address,
                 usdc_to_u256(amount_received)?,
                 from_block,
             )
             .await
-            .map_err(|error| UsdcTransferError::Cctp(Box::new(error)))?
-        {
+            .map_err(|error| UsdcTransferError::Cctp(Box::new(error)))?;
+
+        if let Some(unrecorded_tx) = self.first_unclaimed_deposit_send(id, matches).await? {
             return Err(self
                 .fail_unresolved_deposit_send(
                     id,
@@ -4929,6 +4932,37 @@ impl<
 
         self.send_alpaca_deposit_to(id, deposit_address, amount_received)
             .await
+    }
+
+    /// The newest of `sends` that no other transfer signed, attached or
+    /// recorded. With no event store wired, the newest of `sends`.
+    async fn first_unclaimed_deposit_send(
+        &self,
+        id: &UsdcRebalanceId,
+        sends: Vec<TxHash>,
+    ) -> Result<Option<TxHash>, UsdcTransferError> {
+        let CreditLedger::Wired(pool) = &self.credit_ledger else {
+            return Ok(sends.first().copied());
+        };
+
+        for send_tx in sends {
+            let recorded_by = deposit_send_recorded_elsewhere(pool, id, send_tx)
+                .await
+                .map_err(|source| UsdcTransferError::DepositSendLookup {
+                    id: id.clone(),
+                    tx: send_tx,
+                    source,
+                })?;
+
+            match recorded_by {
+                Some(recorded_by) => {
+                    info!(target: "rebalance", %id, tx = %send_tx, %recorded_by, "Same-amount Alpaca deposit send belongs to another transfer; not this transfer's");
+                }
+                None => return Ok(Some(send_tx)),
+            }
+        }
+
+        Ok(None)
     }
 
     /// Checks the credit ledger, signs the send and persists it, then
@@ -7143,18 +7177,18 @@ mod tests {
             Ok(UsdcTransferStatus::Confirmed)
         }
 
-        async fn find_recent_usdc_transfer(
+        async fn find_recent_usdc_transfers(
             &self,
             _from: Address,
             _to: Address,
             _amount: U256,
             _from_block: u64,
-        ) -> Result<Option<TxHash>, CctpError> {
+        ) -> Result<Vec<TxHash>, CctpError> {
             if self.empty_usdc_scan {
-                return Ok(None);
+                return Ok(Vec::new());
             }
 
-            unimplemented!("MockBridge: find_recent_usdc_transfer not used in this test")
+            unimplemented!("MockBridge: find_recent_usdc_transfers not used in this test")
         }
     }
 
@@ -7362,15 +7396,15 @@ mod tests {
             self.inner.confirm_usdc_on_ethereum(tx_hash).await
         }
 
-        async fn find_recent_usdc_transfer(
+        async fn find_recent_usdc_transfers(
             &self,
             from: Address,
             to: Address,
             amount: U256,
             from_block: u64,
-        ) -> Result<Option<TxHash>, CctpError> {
+        ) -> Result<Vec<TxHash>, CctpError> {
             self.inner
-                .find_recent_usdc_transfer(from, to, amount, from_block)
+                .find_recent_usdc_transfers(from, to, amount, from_block)
                 .await
         }
     }
@@ -7563,15 +7597,15 @@ mod tests {
             self.inner.confirm_usdc_on_ethereum(tx_hash).await
         }
 
-        async fn find_recent_usdc_transfer(
+        async fn find_recent_usdc_transfers(
             &self,
             from: Address,
             to: Address,
             amount: U256,
             from_block: u64,
-        ) -> Result<Option<TxHash>, CctpError> {
+        ) -> Result<Vec<TxHash>, CctpError> {
             self.inner
-                .find_recent_usdc_transfer(from, to, amount, from_block)
+                .find_recent_usdc_transfers(from, to, amount, from_block)
                 .await
         }
     }
@@ -7763,15 +7797,15 @@ mod tests {
             self.inner.confirm_usdc_on_ethereum(tx_hash).await
         }
 
-        async fn find_recent_usdc_transfer(
+        async fn find_recent_usdc_transfers(
             &self,
             from: Address,
             to: Address,
             amount: U256,
             from_block: u64,
-        ) -> Result<Option<TxHash>, CctpError> {
+        ) -> Result<Vec<TxHash>, CctpError> {
             self.inner
-                .find_recent_usdc_transfer(from, to, amount, from_block)
+                .find_recent_usdc_transfers(from, to, amount, from_block)
                 .await
         }
     }
@@ -15797,6 +15831,60 @@ mod tests {
         );
         let state = cqrs.load(&id).await.unwrap().expect("aggregate exists");
         assert_ne!(deposit_ref_tx(&state), other_send_tx);
+    }
+
+    /// Another transfer's later send does not hide an older unclaimed one:
+    /// resume still fails the deposit on the unclaimed send.
+    #[tokio::test]
+    async fn resume_base_to_alpaca_from_bridged_fails_an_unrecorded_send_behind_another_transfers()
+    {
+        let chain = deploy_ethereum_usdc_chain().await;
+        let server = MockServer::start();
+        let _address_mock = mock_alpaca_deposit_address(&server);
+        let pool = SqlitePool::connect(":memory:").await.unwrap();
+        sqlx::migrate!().run(&pool).await.unwrap();
+        let cqrs = Arc::new(test_store(pool.clone(), ()));
+        let manager = build_deposit_manager(
+            &chain,
+            &server,
+            Arc::new(create_short_poll_wallet_service(&server)),
+            cqrs.clone(),
+        )
+        .await
+        .with_credit_ledger(pool);
+
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let amount = usdc("100");
+        let amount_received = usdc("99.99");
+        let amount_u256 = usdc_to_u256(amount_received).unwrap();
+        stage_bridged_with_mint_tx(&cqrs, &id, amount, amount_received, chain.mint_tx).await;
+
+        let bridge_wallet = create_test_wallet(&chain.endpoint, &chain.bot_key);
+        let unrecorded_send = send_usdc_to_alpaca(&bridge_wallet, amount_u256).await;
+        let other = UsdcRebalanceId(Uuid::new_v4());
+        stage_bridged_with_mint_tx(&cqrs, &other, amount, amount_received, chain.mint_tx).await;
+        let other_send = sign_usdc_to_alpaca(&bridge_wallet, amount_u256).await;
+        broadcast_signed(&bridge_wallet, &other_send).await;
+        record_signed_deposit_send(&cqrs, &other, other_send).await;
+
+        let error = manager
+            .resume_base_to_alpaca(&id, amount)
+            .await
+            .unwrap_err();
+
+        let UsdcTransferError::DepositSendUnresolved {
+            cause: UnresolvedDepositSend::UnrecordedSend { tx },
+            ..
+        } = error
+        else {
+            panic!("expected DepositSendUnresolved for the unrecorded send, got: {error:?}");
+        };
+        assert_eq!(tx, unrecorded_send);
+        assert_eq!(
+            usdc_balance_of(&chain, ALPACA_DEPOSIT_ADDRESS).await,
+            amount_u256 * U256::from(2),
+            "an unclaimed send must not trigger a third send",
+        );
     }
 
     /// Mocks Alpaca's transfer list with one completed incoming deposit for

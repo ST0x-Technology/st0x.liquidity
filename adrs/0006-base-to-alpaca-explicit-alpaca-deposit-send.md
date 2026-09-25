@@ -140,10 +140,14 @@ with a `PreparedTransaction`, RAI-2485):
    skips them the same way, since a send it hides has no reserved nonce.
 5. Resume of a transfer loaded at `Bridged` with no signed send still scans from
    the mint block (for transfers that reached `Bridged` before this change), but
-   a match is never adopted: it fails the transfer for reconciliation. An empty
-   scan signs and sends. A transfer that reaches `Bridged` during the resume (an
-   adopted attested mint, or a post-burn `BridgingFailed` recovery) has no send
-   yet, so it signs and sends with no scan.
+   a match is never adopted. A match another transfer signed, attached or
+   recorded is skipped, since a new transfer also reaches resume with no signed
+   send (a crash right after `Bridged`, or a failed address fetch, signing or
+   persist) and another corridor's send must not fail it. An unclaimed match
+   fails the transfer for reconciliation. An empty scan, or one whose matches
+   are all claimed, signs and sends. A transfer that reaches `Bridged` during
+   the resume (an adopted attested mint, or a post-burn `BridgingFailed`
+   recovery) has no send yet, so it signs and sends with no scan.
 
 `FailDeposit` is now also valid from a BaseToAlpaca `Bridged`, so the failure is
 a reconcilable, guard-holding `DepositFailed` that keeps the signed send as its

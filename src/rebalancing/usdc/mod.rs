@@ -536,6 +536,18 @@ pub enum UsdcTransferError {
     /// and the retry signs one; nothing was broadcast.
     #[error("USDC rebalance {id}: the deposit send prepare task panicked; nothing was broadcast")]
     DepositSendTaskPanicked { id: UsdcRebalanceId },
+    /// The event store could not be read to check whether another transfer
+    /// claims a same-amount send found on resume. Nothing was sent; the retry
+    /// scans again.
+    #[error(
+        "USDC rebalance {id}: could not check whether another transfer claims deposit send {tx}"
+    )]
+    DepositSendLookup {
+        id: UsdcRebalanceId,
+        tx: TxHash,
+        #[source]
+        source: sqlx::Error,
+    },
 }
 
 /// Why a signed Base->Alpaca deposit send is not confirmed yet.
@@ -640,7 +652,8 @@ impl UsdcTransferError {
             | Self::BurnTxDropped { .. }
             | Self::DepositSendUnresolved { .. }
             | Self::DepositSendReconciliationPending { .. }
-            | Self::DepositSendTaskPanicked { .. } => None,
+            | Self::DepositSendTaskPanicked { .. }
+            | Self::DepositSendLookup { .. } => None,
         }
     }
 }
@@ -700,7 +713,8 @@ impl BotGasFailureClassifier for UsdcTransferError {
             | Self::BurnTxDropped { .. }
             | Self::DepositSendUnresolved { .. }
             | Self::DepositSendReconciliationPending { .. }
-            | Self::DepositSendTaskPanicked { .. } => false,
+            | Self::DepositSendTaskPanicked { .. }
+            | Self::DepositSendLookup { .. } => false,
         }
     }
 }

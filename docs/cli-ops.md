@@ -840,8 +840,9 @@ before the startup token approvals.
     transfer that reached `Bridged` before the bot persisted signed sends. The
     transfer has no `deposit_ref`. Find this transfer's own send on chain (from
     the bot wallet to Alpaca's deposit address, `amount_received`, after the
-    mint). A same-amount send can belong to another open transfer: check that no
-    other transfer recorded it. If Alpaca credited it, run
+    mint). The bot already skipped every same-amount send another transfer
+    signed, attached or recorded, but the named send can still belong to another
+    transfer: check that it is this transfer's. If Alpaca credited it, run
     `stox transfer recheck --kind usdc --id <id> --deposit-tx <hash>`. The bot
     attaches the tx only if it moved exactly the transfer's amount from the bot
     wallet to the deposit address, is confirmed, is mined at or after the
