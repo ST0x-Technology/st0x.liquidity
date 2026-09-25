@@ -5895,14 +5895,15 @@ effect rather than a generic intent:
   position check through the exclusion record, so two actors that disagree on
   the trading flag cannot both count the fill and record it as excluded. Every
   accounting caller takes it (the apalis accounting job, the REST route, and the
-  CLI), and the kernel lock also serializes separate processes. Like the bot,
-  process-tx keeps a fill on an asset whose trading is disabled on the fill's
-  chain out of the position (see Risk Management) and reports its cover detail;
-  a fill excluded earlier stays excluded and is reported as such. It is
-  independent of the submission lock, which is taken after accounting and
-  serializes only the position claim and broker placement. **Operational
-  precondition (CLI direct database path)**: stop the live bot; the **in bot
-  REST route** removes that requirement.
+  CLI), and the kernel lock also serializes separate processes. On an in memory
+  database, which only its own process can attach to, a process wide mutex takes
+  the lock file's place. Like the bot, process-tx keeps a fill on an asset whose
+  trading is disabled on the fill's chain out of the position (see Risk
+  Management) and reports its cover detail; a fill excluded earlier stays
+  excluded and is reported as such. It is independent of the submission lock,
+  which is taken after accounting and serializes only the position claim and
+  broker placement. **Operational precondition (CLI direct database path)**:
+  stop the live bot; the **in bot REST route** removes that requirement.
 
 ### Event Processing Flow
 

@@ -3,12 +3,20 @@
 //! each lock serializes its critical section across processes as well as
 //! across tasks within one process. The kernel releases a lock when its process
 //! exits, so a crash cannot strand a lease.
+//!
+//! An in memory database has no file to lock beside, and only the process that
+//! created it can attach to it. Fill accounting then falls back to one process
+//! wide mutex, because two in process callers (the live accounting job and the
+//! process-tx route) share no other guard across the dedup check and the
+//! acknowledge. The submission lock needs no fallback: every in process
+//! placement already holds the shared counter trade submission mutex.
 
 use std::fs::{File, OpenOptions};
 use std::path::PathBuf;
 use std::time::Duration;
 
 use sqlx::SqlitePool;
+use tokio::sync::{Mutex, MutexGuard};
 
 use crate::conductor::job::DEFAULT_PERFORM_TIMEOUT;
 
@@ -34,9 +42,19 @@ impl DatabaseFileLock {
     }
 }
 
+/// Serializes fill accounting on in memory databases, which have no lock file.
+static IN_MEMORY_FILL_ACCOUNTING: Mutex<()> = Mutex::const_new(());
+
 /// Held for the critical section; dropping it releases the lock.
 pub(crate) struct DatabaseFileGuard {
-    _file: Option<File>,
+    _held: Held,
+}
+
+/// Each variant holds its lock only to release it on drop.
+enum Held {
+    File { _file: File },
+    InMemory { _guard: MutexGuard<'static, ()> },
+    Nothing,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -61,9 +79,9 @@ pub enum DatabaseFileLockError {
     TimedOut { path: PathBuf },
 }
 
-/// Acquires `lock` for the database behind `pool`. An in memory database has
-/// no file to lock beside and no other process can attach to it, so it gets a
-/// guard that holds nothing.
+/// Acquires `lock` for the database behind `pool`. On an in memory database,
+/// fill accounting takes the process wide fallback mutex and the submission
+/// lock holds nothing (see the module docs).
 pub(crate) async fn acquire_database_file_lock(
     pool: &SqlitePool,
     lock: DatabaseFileLock,
@@ -84,7 +102,17 @@ async fn acquire_database_file_lock_with_timeout(
             .await
             .map_err(DatabaseFileLockError::ResolveDatabasePath)?;
     if database_path.is_empty() {
-        return Ok(DatabaseFileGuard { _file: None });
+        let held = match lock {
+            DatabaseFileLock::FillAccounting => Held::InMemory {
+                _guard: tokio::time::timeout(timeout, IN_MEMORY_FILL_ACCOUNTING.lock())
+                    .await
+                    .map_err(|_| DatabaseFileLockError::TimedOut {
+                        path: PathBuf::from("<in memory database>"),
+                    })?,
+            },
+            DatabaseFileLock::CounterTradeSubmission => Held::Nothing,
+        };
+        return Ok(DatabaseFileGuard { _held: held });
     }
 
     let mut lock_path = PathBuf::from(database_path).into_os_string();
@@ -129,7 +157,9 @@ async fn acquire_database_file_lock_with_timeout(
         }
     }
 
-    Ok(DatabaseFileGuard { _file: Some(file) })
+    Ok(DatabaseFileGuard {
+        _held: Held::File { _file: file },
+    })
 }
 
 #[cfg(test)]
@@ -157,9 +187,11 @@ mod tests {
                 .await
                 .unwrap();
         let waiter = tokio::spawn(async move {
-            acquire_database_file_lock(&second_pool, DatabaseFileLock::CounterTradeSubmission)
-                .await
-                .unwrap()
+            drop(
+                acquire_database_file_lock(&second_pool, DatabaseFileLock::CounterTradeSubmission)
+                    .await
+                    .unwrap(),
+            );
         });
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert!(
@@ -241,5 +273,42 @@ mod tests {
             .unwrap();
 
         assert!(!lock_path.exists());
+    }
+
+    /// On a shared in memory database there is no lock file, yet the live
+    /// accounting job and the process-tx route still run in one process. Fill
+    /// accounting must still exclude a second holder, and must not leave a lock
+    /// file behind.
+    #[tokio::test]
+    async fn fill_accounting_lock_serializes_on_a_shared_in_memory_database() {
+        let database_name = format!("fill-lock-memory-{}", Uuid::new_v4());
+        let database_url = format!("file:{database_name}?mode=memory&cache=shared");
+        let first_pool = SqlitePool::connect(&database_url).await.unwrap();
+        let second_pool = SqlitePool::connect(&database_url).await.unwrap();
+
+        let first_guard = acquire_database_file_lock(&first_pool, DatabaseFileLock::FillAccounting)
+            .await
+            .unwrap();
+        let Err(error) = acquire_database_file_lock_with_timeout(
+            &second_pool,
+            DatabaseFileLock::FillAccounting,
+            Duration::from_millis(25),
+            Duration::from_millis(5),
+        )
+        .await
+        else {
+            panic!("a second fill accounting holder must wait while the first holds it");
+        };
+        assert!(matches!(error, DatabaseFileLockError::TimedOut { .. }));
+
+        drop(first_guard);
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            acquire_database_file_lock(&second_pool, DatabaseFileLock::FillAccounting),
+        )
+        .await
+        .expect("the lock must be free once the first holder drops it")
+        .unwrap();
+        assert!(!PathBuf::from(format!("file:{database_name}.fill-accounting.lock")).exists());
     }
 }
