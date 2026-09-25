@@ -6528,6 +6528,7 @@ mod tests {
         usdc_discarded: Mutex<Vec<TxHash>>,
         usdc_restored: Mutex<Vec<TxHash>>,
         mined_usdc_sends: Mutex<Vec<TxHash>>,
+        confirmed_nonce: Option<u64>,
         // Opt-in: the mint block lookup and the pre-send scan find nothing,
         // as a scan of mined logs does while a send is still unmined.
         empty_usdc_scan: bool,
@@ -6566,6 +6567,7 @@ mod tests {
                 usdc_discarded: Mutex::new(Vec::new()),
                 usdc_restored: Mutex::new(Vec::new()),
                 mined_usdc_sends: Mutex::new(Vec::new()),
+                confirmed_nonce: None,
                 empty_usdc_scan: false,
                 ledger_probe: None,
                 empty_burn_scan: false,
@@ -6653,6 +6655,12 @@ mod tests {
         /// Reports `tx_hash` as mined to `ethereum_tx_confirmations`.
         fn with_mined_usdc_send(self, tx_hash: TxHash) -> Self {
             self.mined_usdc_sends.lock().unwrap().push(tx_hash);
+            self
+        }
+
+        /// Reports `nonce` as the wallet's confirmed next nonce.
+        fn with_confirmed_nonce(mut self, nonce: u64) -> Self {
+            self.confirmed_nonce = Some(nonce);
             self
         }
 
@@ -6851,7 +6859,11 @@ mod tests {
         }
 
         async fn ethereum_confirmed_nonce(&self, _confirmations: u64) -> Result<u64, CctpError> {
-            unimplemented!("MockBridge: ethereum_confirmed_nonce not used in this test")
+            let Some(nonce) = self.confirmed_nonce else {
+                unimplemented!("MockBridge: ethereum_confirmed_nonce not used in this test")
+            };
+
+            Ok(nonce)
         }
 
         async fn ethereum_usdc_balance(&self, _holder: Address) -> Result<U256, CctpError> {
@@ -15569,6 +15581,19 @@ mod tests {
             .verify_deposit_send_superseded(&prepared)
             .await
             .unwrap();
+    }
+
+    /// A nonce read past the send and no receipt for it can come from two
+    /// nodes at different heights, so they do not prove the send can never
+    /// mine.
+    #[tokio::test]
+    async fn deposit_send_is_not_superseded_by_a_nonce_read_past_it_and_no_receipt() {
+        let bridge = MockBridge::new().with_confirmed_nonce(4);
+        let prepared = PreparedTransaction::for_test(TxHash::repeat_byte(0xA1), 3);
+
+        verify_deposit_send_superseded(&bridge, &prepared, 3)
+            .await
+            .expect_err("a lagging receipt read is no proof that another tx took the nonce");
     }
 
     /// A mined send moved the USDC to Alpaca, so reconciling it would move
