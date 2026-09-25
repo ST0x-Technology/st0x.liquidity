@@ -664,18 +664,20 @@ checkpoint-driven `eth_getLogs` poll rather than a live subscription, no events
 can be missed across downtime: the order fill monitor always resumes from the
 persisted checkpoint and re-scans any gap.
 
-Before any worker or rebalancer runs, and in both modes whenever a signing
-wallet is configured, startup grants the one-time MAX approvals on every hedged
-chain with that chain's wallet: that chain's settlement stable to its deposit
-spender on every hedged chain, and each wrapped equity's underlying to its
-wrapper vault and wrapped to that same deposit spender -- the chain's orderbook
-in legacy inventory mode, its `RaindexInventory` in managed mode: on the primary
-every equity with trading or rebalancing enabled, on a secondary only the
-equities with rebalancing enabled, the same selection its tokenization preflight
-attests (a hedge-only secondary has no wrapper to approve, so its allowance work
-is the settlement-stable grant alone). Only when rebalancing is configured does
-it also revoke any stale orderbook allowance, per chain in managed inventory
-mode, the same way, and a tokenization preflight then runs per hedged chain,
+Before any worker or rebalancer runs, but after startup has reserved the nonces
+of signed sends persisted before the restart (Alpaca deposit sends, vault
+withdrawals), and in both modes whenever a signing wallet is configured, startup
+grants the one-time MAX approvals on every hedged chain with that chain's
+wallet: that chain's settlement stable to its deposit spender on every hedged
+chain, and each wrapped equity's underlying to its wrapper vault and wrapped to
+that same deposit spender -- the chain's orderbook in legacy inventory mode, its
+`RaindexInventory` in managed mode: on the primary every equity with trading or
+rebalancing enabled, on a secondary only the equities with rebalancing enabled,
+the same selection its tokenization preflight attests (a hedge-only secondary
+has no wrapper to approve, so its allowance work is the settlement-stable grant
+alone). Only when rebalancing is configured does it also revoke any stale
+orderbook allowance, per chain in managed inventory mode, the same way (also
+after those nonce restores), and a tokenization preflight runs per hedged chain,
 read-only: the chain's issuer redemption wallet must be configured, and every
 preflighted equity's configured vault must report the configured underlying as
 its `asset()` (the same attestation a redemption's unwrap step performs). The
@@ -6857,11 +6859,11 @@ therefore performs an explicit fund-moving send:
      emits `FailDeposit` (the signed tx becomes the `deposit_ref`) and pages
      (`DepositSendUnresolved`). If the `FailDeposit` write fails, the job
      retries and takes the same path.
-   - At startup, before any job can send from the Ethereum wallet, the bot
-     reserves the nonce of every signed send still on `Bridged`, so no other
-     send takes it. A failure to read those transfers pages and does not stop
-     startup; the rebroadcast reserves the nonce again when the transfer
-     resumes.
+   - At startup, before any job, startup approval or stale-allowance revoke can
+     send from the Ethereum wallet, the bot reserves the nonce of every signed
+     send still on `Bridged`, so no other send takes it. A failure to read those
+     transfers pages and does not stop startup; the rebroadcast reserves the
+     nonce again when the transfer resumes.
 3. **Resume from `Bridged`.**
    - **Signed send persisted:** broadcast the same bytes and continue as in
      step 2. Other transfers send the same amount to the same deposit address

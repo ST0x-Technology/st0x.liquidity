@@ -951,7 +951,13 @@ impl Conductor {
             seed_vault_registry_ctx,
         ) = setup_vault_registry(&pool, &apalis_pool, &ctx).await?;
 
-        run_startup_maintenance(&ctx, &pool).await?;
+        // Before its OffchainOrder reactor goes live, in both modes, and
+        // before `PositionAndRebalancing::setup`, whose resume workers write
+        // the event store concurrently. The telemetry writer is already active
+        // here, so read-model replays reserve the SQLite writer before reading
+        // their snapshots; a deferred read-to-write upgrade can fail
+        // immediately instead of waiting for the current writer.
+        catch_up_lifecycle_failures(&pool).await?;
 
         // Operational alerts are structured ERROR logs; delivery to humans
         // happens downstream in the log pipeline, so there is no per-channel
@@ -1010,6 +1016,11 @@ impl Conductor {
             &backfill_queues,
         ))
         .await?;
+
+        // After setup restored the nonces of signed sends persisted before the
+        // restart (deposit sends, vault withdrawals), so an approval cannot
+        // take one; before any worker starts.
+        grant_startup_token_approvals(&ctx).await?;
 
         let trading_schedule = setup_trading_schedule(&ctx, &pool).await?;
         let startup_policy =
@@ -1482,6 +1493,11 @@ fn startup_approval_targets(ctx: &Ctx) -> BTreeMap<Chain, Vec<ApprovalTarget>> {
 /// spender (the chain's orderbook in legacy inventory mode, its inventory in
 /// managed mode), submitted through that chain's wallet so confirmations and
 /// nonce handling match every other on-chain write there.
+///
+/// Runs before any worker, so wrap/deposit never reverts with
+/// ERC20InsufficientAllowance, and after the startup nonce restores, so an
+/// approval never takes the nonce of a signed send persisted before the
+/// restart. Fails fast -- the bot must not come up healthy with these missing.
 ///
 /// Skips entirely when no wallet is configured -- without one the bot never
 /// wraps or deposits, so it has no allowances to grant.
@@ -2001,28 +2017,6 @@ impl PositionAndRebalancing {
             deliver_mint_authorization_ctx: infra.deliver_mint_authorization_ctx,
         })
     }
-}
-
-/// One-time startup maintenance that must precede
-/// `PositionAndRebalancing::setup`.
-///
-/// Grants the one-time idempotent MAX approvals to the trusted spenders
-/// (our ERC-4626 wrapper vaults and the Raindex orderbook) before any
-/// worker or rebalancer runs, so wrap/deposit never reverts with
-/// ERC20InsufficientAllowance. Fails fast -- the bot must not come up
-/// healthy with these missing; only runs when a wallet is configured.
-///
-/// Then catches the lifecycle-failure read model up to the event log before
-/// its OffchainOrder reactor goes live, in both modes. Must run BEFORE
-/// `PositionAndRebalancing::setup`: setup spawns resume workers that write
-/// the event store concurrently. The telemetry writer is already active here,
-/// so read-model replays reserve the SQLite writer before reading their
-/// snapshots; a deferred read-to-write upgrade can fail immediately instead
-/// of waiting for the current writer.
-async fn run_startup_maintenance(ctx: &Ctx, pool: &SqlitePool) -> anyhow::Result<()> {
-    grant_startup_token_approvals(ctx).await?;
-    catch_up_lifecycle_failures(pool).await?;
-    Ok(())
 }
 
 /// Mint-authorization infrastructure for orchestrator-mode mints
@@ -3179,7 +3173,6 @@ fn spawn_rebalancing_infrastructure<Signer: Wallet + Clone>(
         )?);
 
         preflight_inventory_access(&raindex_service, &deps.ctx).await?;
-        revoke_stale_orderbook_allowances(&deps.ctx, &tokenizations).await;
         preflight_tokenization(&deps.ctx, &tokenizations, issuance_client.as_ref()).await?;
 
         let tokenizer = primary_equity.tokenizer.clone();
@@ -3298,8 +3291,9 @@ fn spawn_rebalancing_infrastructure<Signer: Wallet + Clone>(
             gas_readiness,
         );
 
-        // Before any job can send from the Ethereum wallet: a signed deposit
-        // send persisted before the restart keeps its nonce.
+        // Before any job or the startup approvals can send from the Ethereum
+        // wallet: a signed deposit send persisted before the restart keeps its
+        // nonce.
         let restored_deposit_sends = usdc_handles
             .restore_deposit_sends
             .restore_prepared_deposit_sends(&deps.pool)
@@ -3309,6 +3303,10 @@ fn spawn_rebalancing_infrastructure<Signer: Wallet + Clone>(
             restored_deposit_sends,
             "Restored the nonces of signed Alpaca deposit sends"
         );
+
+        // After the nonce restores above, so a revoke cannot take the nonce of
+        // a signed send persisted before the restart.
+        revoke_stale_orderbook_allowances(&deps.ctx, &tokenizations).await;
 
         let deliver_mint_authorization_ctx = Arc::new(DeliverMintAuthorizationCtx {
             deliverer: mint_authorization.issuance_client,
