@@ -959,9 +959,9 @@ enum UsdcTimeoutCleanup {
         corridor: UsdcCorridor,
         amount: Usdc,
     },
-    /// The same pre-burn Alpaca-to-Base state, recorded on a corridor this
-    /// build does not serve: a re-armed job could only be refused, so the
-    /// guard stays held and the operator is paged once.
+    /// A transfer on a corridor this build does not serve: a re-armed job
+    /// could only be refused, so the guard stays held and the page is
+    /// retried until delivered, instead of any generic stall alert.
     HeldForUnservedCorridor { corridor: UsdcCorridor },
 }
 
@@ -2376,6 +2376,11 @@ impl RebalancingService {
                             .await
                             .insert(id.clone(), now);
                         return Ok(Some(UsdcTimeoutCleanup::Cleared { tracking, elapsed }));
+                    }
+                    Ok(Some(state)) if state.corridor() != self.config.served_usdc_corridor => {
+                        return Ok(Some(UsdcTimeoutCleanup::HeldForUnservedCorridor {
+                            corridor: state.corridor(),
+                        }));
                     }
                     Ok(Some(_) | None) => {
                         // Guard-holding state or aggregate not yet in store:
@@ -6406,13 +6411,25 @@ impl RebalancingService {
         for id in candidate_ids {
             match usdc_store.load(&id).await {
                 // No job or re-arm can move it here, live job or not: hold
-                // the guard and page before any other classification.
+                // the guard and page before any other classification. The
+                // post-burn-shaped seed makes the sweep check it every tick:
+                // it retries the page and releases the guard once reconciled.
                 Ok(Some(entity))
                     if entity.holds_rebalance_guard()
                         && entity.corridor() != self.config.served_usdc_corridor =>
                 {
                     self.page_unserved_corridor_once(&id, entity.corridor())
                         .await;
+                    held_tracking.push((
+                        id.clone(),
+                        usdc::UsdcRebalanceTracking {
+                            direction: entity.direction(),
+                            initiated_amount: entity.amount(),
+                            bridged_amount_received: None,
+                            stage: usdc::UsdcRebalanceStage::BridgingInitiated,
+                            last_progress_at: Utc::now(),
+                        },
+                    ));
                     held_ids.push(id);
                 }
                 Ok(Some(entity)) => {
