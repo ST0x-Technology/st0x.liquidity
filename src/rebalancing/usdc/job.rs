@@ -715,9 +715,8 @@ impl Job<TransferUsdcToHedgingCtx> for TransferUsdcToHedging {
             // rather than reburning. The Alpaca deposit send is signed and
             // persisted (`DepositSendPrepared`) before its broadcast, so a
             // redrive broadcasts those same bytes and never sends twice. Count
-            // against the shared redrive budget so
-            // repeated timeouts (e.g., a permanently hung RPC) eventually surface
-            // for operator review.
+            // against the shared redrive budget so repeated timeouts (e.g., a
+            // permanently hung RPC) eventually surface for operator review.
             return self.handle_hedging_timeout_redrive(ctx).await;
         };
 

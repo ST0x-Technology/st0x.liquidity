@@ -744,6 +744,7 @@ the startup token approvals.
        WHERE aggregate_id = '<id>'
          AND event_type = 'UsdcRebalanceEvent::DepositSendPrepared';
        ```
+
     2. From the bot's Ethereum wallet (its signer), send a 0-value ETH transfer
        to the wallet itself at that nonce, with `maxFeePerGas` and
        `maxPriorityFeePerGas` at least 10% above `<tx>`'s and `maxFeePerGas`
