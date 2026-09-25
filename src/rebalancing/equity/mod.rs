@@ -445,7 +445,7 @@ impl Raindex for PanickingRaindex {
         unimplemented!("PanickingRaindex: not available in CLI context")
     }
 
-    async fn discard_prepared_withdraw(&self, _: &PreparedTransaction) {
+    async fn discard_prepared_withdraw(&self, _: TxHash) {
         unimplemented!("PanickingRaindex: not available in CLI context")
     }
 
@@ -1666,7 +1666,7 @@ impl CrossVenueEquityTransfer {
             if matches!(self.redemption_store.load(aggregate_id).await, Ok(None)) {
                 chain_services
                     .raindex
-                    .discard_prepared_withdraw(&prepared)
+                    .discard_prepared_withdraw(prepared.tx_hash())
                     .await;
             }
             return Err(error.into());
@@ -1691,12 +1691,12 @@ impl CrossVenueEquityTransfer {
     pub(crate) async fn discard_reconciled_withdrawal(
         &self,
         chain: Chain,
-        prepared: &PreparedTransaction,
+        tx_hash: TxHash,
     ) -> Result<(), RedemptionError> {
         self.services
             .for_chain(chain)?
             .raindex
-            .discard_prepared_withdraw(prepared)
+            .discard_prepared_withdraw(tx_hash)
             .await;
         Ok(())
     }

@@ -31,9 +31,10 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tracing::{info, warn};
 
+use alloy::primitives::TxHash;
 use st0x_config::ExecutionThreshold;
 use st0x_event_sorcery::{AggregateError, LifecycleError, SendError, Store};
-use st0x_evm::{Chain, PreparedTransaction};
+use st0x_evm::Chain;
 use st0x_execution::{FractionalShares, Symbol};
 use st0x_tokenization::IssuerRequestId;
 
@@ -268,6 +269,7 @@ where
 
     Ok(false)
 }
+
 impl Job<TransferEquityToMarketMakingCtx> for TransferEquityToMarketMaking {
     type Output = ();
     type Error = TransferEquityToMarketMakingJobError;
@@ -704,7 +706,7 @@ pub(crate) trait ResumeEquityToHedging: Send + Sync + 'static {
     async fn discard_reconciled_withdrawal(
         &self,
         _chain: Chain,
-        _prepared: &PreparedTransaction,
+        _tx_hash: TxHash,
     ) -> Result<(), RedemptionError> {
         Ok(())
     }
@@ -725,9 +727,9 @@ impl ResumeEquityToHedging for CrossVenueEquityTransfer {
     async fn discard_reconciled_withdrawal(
         &self,
         chain: Chain,
-        prepared: &PreparedTransaction,
+        tx_hash: TxHash,
     ) -> Result<(), RedemptionError> {
-        Self::discard_reconciled_withdrawal(self, chain, prepared).await
+        Self::discard_reconciled_withdrawal(self, chain, tx_hash).await
     }
 }
 
@@ -852,14 +854,14 @@ impl Job<TransferEquityToHedgingCtx> for TransferEquityToHedging {
             // restart. The release is idempotent, so a redriven observation is
             // harmless.
             if let EquityRedemption::Reconciled {
-                prepared: Some(prepared),
+                withdrawal_nonce_hash: Some(tx_hash),
                 chain,
                 ..
             } = &aggregate
             {
                 match ctx
                     .transfer
-                    .discard_reconciled_withdrawal(*chain, prepared)
+                    .discard_reconciled_withdrawal(*chain, *tx_hash)
                     .await
                 {
                     Ok(()) => info!(

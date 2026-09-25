@@ -1684,12 +1684,15 @@ impl RebalancingService {
                         .await;
                     if held_prepared {
                         // The reconciled redemption still held a signed vault
-                        // withdrawal, so its wallet nonce is still reserved and
-                        // no resume job remains to release it (a live one would
-                        // have observed the durable `Reconciled` itself). The
-                        // sweep holds no wallet, so enqueue a resume job whose
-                        // terminal branch discards the reservation. A restart is
-                        // the only fallback if the enqueue fails.
+                        // withdrawal, so its wallet nonce is still reserved. The
+                        // sweep holds no wallet, so it enqueues a resume job whose
+                        // terminal branch discards the reservation. Always enqueue:
+                        // the release is ownership-checked and idempotent, so a
+                        // redundant row (when a live redrive row also observes the
+                        // durable `Reconciled`) is a harmless no-op, whereas
+                        // skipping on a live row could drop the release entirely if
+                        // that row already passed its own terminal check before the
+                        // reconcile. A restart is the only fallback if enqueue fails.
                         if let Err(error) = self
                             .transfer_equity_to_hedging_queue
                             .clone()
@@ -2194,7 +2197,10 @@ impl RebalancingService {
                 return Ok(None);
             };
             match store.load(id).await {
-                Ok(Some(EquityRedemption::Reconciled { prepared, .. })) => {
+                Ok(Some(EquityRedemption::Reconciled {
+                    withdrawal_nonce_hash,
+                    ..
+                })) => {
                     // Cancel the MarketMaking inflight (the shares never left the
                     // vault, per the operator's verified-dead reconcile) and clear
                     // the active redemption, exactly like `on_redemption`'s
@@ -2239,7 +2245,7 @@ impl RebalancingService {
                     );
                     return Ok(Some(RedemptionTimeoutCleanup::Reconciled {
                         tracking,
-                        held_prepared: prepared.is_some(),
+                        held_prepared: withdrawal_nonce_hash.is_some(),
                     }));
                 }
                 Ok(Some(_) | None) => return Ok(None),

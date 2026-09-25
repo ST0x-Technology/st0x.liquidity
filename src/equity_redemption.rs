@@ -1282,13 +1282,15 @@ pub enum EquityRedemption {
         )]
         quantity: Float,
         raindex_withdraw_tx: Option<TxHash>,
-        /// The exact signed vault withdrawal this redemption held when it was
-        /// reconciled, retained so the running bot can release the wallet nonce
-        /// reservation it still holds (a reconcile is pure bookkeeping and never
-        /// touches the wallet). `None` when reconciled from `Failed` or a
-        /// pre-broadcast `VaultWithdrawPending` that never signed one.
+        /// The transaction hash of the vault withdrawal whose wallet nonce this
+        /// redemption still reserved when it was reconciled, retained so the
+        /// running bot can release that reservation by hash (a reconcile is pure
+        /// bookkeeping and never touches the wallet). Covers both a withdrawal
+        /// this bot prepared and a legacy one restored by hash. `None` when
+        /// reconciled from `Failed` or a pre-broadcast `VaultWithdrawPending`
+        /// that never signed or broadcast one.
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        prepared: Option<PreparedTransaction>,
+        withdrawal_nonce_hash: Option<TxHash>,
         redemption_tx: Option<TxHash>,
         tokenization_request_id: Option<TokenizationRequestId>,
         /// The failure reason carried over from the `Failed` state.
@@ -1641,11 +1643,13 @@ impl EventSourced for EquityRedemption {
     // without this field replay into the legacy fail-closed state.
     // v9: `VaultWithdrawSubmitted` retains the prepared transaction through
     // confirmation so startup restores its nonce ownership before workers run.
-    // v10: `Reconciled` retains the prepared withdrawal so the running bot can
-    // release its wallet nonce reservation when an operator reconciles a stuck
-    // withdrawal, instead of the reservation surviving until a restart. Additive
-    // only; bumped to clear stale snapshots so they rebuild from events.
-    const SCHEMA_VERSION: u64 = 10;
+    // v10: `Reconciled` retained the prepared withdrawal so the running bot could
+    // release its wallet nonce reservation on operator reconcile.
+    // v11: `Reconciled` retains only the withdrawal's tx hash (not the full
+    // prepared bytes) and releases the nonce reservation by hash, so a legacy
+    // hash-only submission with no persisted prepared is also freed on reconcile.
+    // Additive; bumped to clear stale snapshots so they rebuild from events.
+    const SCHEMA_VERSION: u64 = 11;
 
     fn originate(event: &Self::Event) -> Option<Self> {
         use EquityRedemptionEvent::*;
@@ -2242,7 +2246,7 @@ impl EventSourced for EquityRedemption {
                     reconcile_reason: reason.clone(),
                     started_at: *started_at,
                     reconciled_at: *reconciled_at,
-                    prepared: None,
+                    withdrawal_nonce_hash: None,
                 }),
                 // Reconciled straight from the submitting origin: nothing was
                 // withdrawn, sent, or failed, so the tx/failure fields are absent
@@ -2264,7 +2268,7 @@ impl EventSourced for EquityRedemption {
                     reconcile_reason: reason.clone(),
                     started_at: *submitting_at,
                     reconciled_at: *reconciled_at,
-                    prepared: Some(prepared.clone()),
+                    withdrawal_nonce_hash: Some(prepared.tx_hash()),
                 }),
                 // A broadcast withdrawal (`VaultWithdrawSubmitted`) or a legacy
                 // `VaultWithdrawPending`, reconciled after the operator verified
@@ -2275,7 +2279,7 @@ impl EventSourced for EquityRedemption {
                     symbol,
                     quantity,
                     submitted_at,
-                    prepared,
+                    tx_hash,
                     ..
                 } => Some(Self::Reconciled {
                     symbol: symbol.clone(),
@@ -2288,7 +2292,7 @@ impl EventSourced for EquityRedemption {
                     reconcile_reason: reason.clone(),
                     started_at: *submitted_at,
                     reconciled_at: *reconciled_at,
-                    prepared: prepared.clone(),
+                    withdrawal_nonce_hash: Some(*tx_hash),
                 }),
                 Self::VaultWithdrawPending {
                     symbol,
@@ -2306,7 +2310,7 @@ impl EventSourced for EquityRedemption {
                     reconcile_reason: reason.clone(),
                     started_at: *pending_at,
                     reconciled_at: *reconciled_at,
-                    prepared: None,
+                    withdrawal_nonce_hash: None,
                 }),
                 _ => return Ok(None),
             },
@@ -7160,7 +7164,7 @@ mod tests {
             raindex_withdraw_tx,
             redemption_tx,
             quantity,
-            prepared,
+            withdrawal_nonce_hash,
             ..
         } = state
         else {
@@ -7177,14 +7181,70 @@ mod tests {
         assert_eq!(raindex_withdraw_tx, None);
         assert_eq!(redemption_tx, None);
         assert_eq!(
-            prepared,
-            Some(prepared_withdrawal_for_test()),
+            withdrawal_nonce_hash,
+            Some(prepared_withdrawal_for_test().tx_hash()),
             "a redemption reconciled from the submitting origin must retain its \
-             prepared withdrawal so the running bot can release the wallet nonce"
+             withdrawal nonce hash so the running bot can release the wallet nonce"
         );
         assert!(
             quantity.eq(float!(50.25)).unwrap(),
             "reconciled state must preserve the requested quantity, got {quantity:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_from_legacy_submitted_without_prepared_retains_the_tx_hash() {
+        // A withdrawal broadcast before the prepared transaction was persisted
+        // (a legacy `VaultWithdrawSubmitted` with `prepared: None`) still reserves
+        // its nonce by tx hash at startup, so `Reconciled` must retain that tx
+        // hash for the running bot to release the reservation. Regression for the
+        // hash-keyed release being a no-op on legacy hash-only submissions.
+        let tx_hash = TxHash::repeat_byte(0x7c);
+        let events = TestHarness::<EquityRedemption>::with(mock_services())
+            .given(vec![EquityRedemptionEvent::VaultWithdrawSubmitted {
+                symbol: Symbol::new("AAPL").unwrap(),
+                quantity: float!(50.25),
+                token: Address::ZERO,
+                wrapped_amount: U256::from(1u64),
+                tx_hash,
+                prepared: None,
+                submitted_at: Utc::now(),
+            }])
+            .when(EquityRedemptionCommand::Reconcile {
+                reason: "legacy withdrawal verified dead onchain".to_string(),
+            })
+            .await
+            .events();
+
+        let state = replay::<EquityRedemption>(
+            [
+                vec![EquityRedemptionEvent::VaultWithdrawSubmitted {
+                    symbol: Symbol::new("AAPL").unwrap(),
+                    quantity: float!(50.25),
+                    token: Address::ZERO,
+                    wrapped_amount: U256::from(1u64),
+                    tx_hash,
+                    prepared: None,
+                    submitted_at: Utc::now(),
+                }],
+                events,
+            ]
+            .concat(),
+        )
+        .expect("event stream should replay")
+        .expect("event stream should materialize a state");
+        let EquityRedemption::Reconciled {
+            withdrawal_nonce_hash,
+            ..
+        } = state
+        else {
+            panic!("a reconciled legacy submitted redemption should be Reconciled, got {state:?}");
+        };
+        assert_eq!(
+            withdrawal_nonce_hash,
+            Some(tx_hash),
+            "a legacy submitted withdrawal with no persisted prepared must still \
+             carry its tx hash so the running bot can release the reserved nonce"
         );
     }
 
@@ -7266,7 +7326,7 @@ mod tests {
             reconcile_reason: "deposited manually".to_string(),
             started_at,
             reconciled_at,
-            prepared: None,
+            withdrawal_nonce_hash: None,
         };
 
         let TransferOperation::EquityRedemption(operation) =
@@ -7462,7 +7522,7 @@ mod tests {
                 reconcile_reason: "deposited manually".to_string(),
                 started_at: now,
                 reconciled_at: now,
-                prepared: None,
+                withdrawal_nonce_hash: None,
             }
             .is_terminal(),
         );
@@ -7503,7 +7563,7 @@ mod tests {
             reconcile_reason: "deposited manually".to_string(),
             started_at,
             reconciled_at,
-            prepared: None,
+            withdrawal_nonce_hash: None,
         };
 
         let TransferOperation::EquityRedemption(operation) =

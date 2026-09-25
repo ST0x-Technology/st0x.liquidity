@@ -263,7 +263,7 @@ impl MockRaindex {
 
     /// Every prepared withdrawal discarded via `discard_prepared_withdraw`, by
     /// tx hash, so a test can assert a reconciled withdrawal's nonce reservation
-    /// was released.
+    /// was released (the reconcile release routes through this method).
     #[cfg(test)]
     pub(crate) fn discard_prepared_withdrawal_calls(&self) -> Vec<TxHash> {
         let Ok(calls) = self.discard_prepared_withdrawal_calls.lock() else {
@@ -387,11 +387,11 @@ impl Raindex for MockRaindex {
         }
     }
 
-    async fn discard_prepared_withdraw(&self, prepared: &PreparedTransaction) {
+    async fn discard_prepared_withdraw(&self, tx_hash: TxHash) {
         let Ok(mut calls) = self.discard_prepared_withdrawal_calls.lock() else {
             panic!("mock discard-prepared-withdrawal mutex poisoned");
         };
-        calls.push(prepared.tx_hash());
+        calls.push(tx_hash);
     }
 
     async fn restore_submitted_withdrawal(

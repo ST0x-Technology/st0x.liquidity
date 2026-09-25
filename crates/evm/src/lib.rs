@@ -819,9 +819,11 @@ pub trait Wallet: Evm {
         prepared: &PreparedTransaction,
         note: &str,
     ) -> Result<TxHash, EvmError>;
-    /// Releases this prepared transaction's nonce reservation after persistence
-    /// failed and the transaction will never be broadcast.
-    async fn discard_prepared(&self, prepared: &PreparedTransaction);
+    /// Releases the wallet nonce reservation held for the withdrawal with this
+    /// transaction hash. Ownership-checked and idempotent, so it is safe for both
+    /// the persist-failure rollback (a just-prepared withdrawal that will never be
+    /// broadcast) and a repeated operator reconcile of a stuck withdrawal.
+    async fn discard_prepared(&self, tx_hash: TxHash);
 
     /// Restores allocator and ownership state for an exact transaction loaded
     /// from durable storage before any new transaction can allocate its nonce.
@@ -1070,8 +1072,8 @@ impl<Inner: Wallet + ?Sized> Wallet for Arc<Inner> {
         (**self).broadcast_prepared(prepared, note).await
     }
 
-    async fn discard_prepared(&self, prepared: &PreparedTransaction) {
-        (**self).discard_prepared(prepared).await;
+    async fn discard_prepared(&self, tx_hash: TxHash) {
+        (**self).discard_prepared(tx_hash).await;
     }
 
     async fn restore_prepared(&self, prepared: &PreparedTransaction) {

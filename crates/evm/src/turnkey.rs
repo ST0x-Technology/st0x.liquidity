@@ -1161,6 +1161,7 @@ where
         prepare_with_nonce(
             &self.signing_provider,
             &self.nonce_manager,
+            &self.in_flight,
             &self.send_lock,
             self.address,
             contract,
@@ -1186,8 +1187,8 @@ where
         .await
     }
 
-    async fn discard_prepared(&self, prepared: &PreparedTransaction) {
-        discard_prepared(&self.nonce_manager, &self.send_lock, self.address, prepared).await;
+    async fn discard_prepared(&self, tx_hash: TxHash) {
+        discard_prepared(&self.in_flight, &self.send_lock, self.address, tx_hash).await;
     }
 
     async fn restore_prepared(&self, prepared: &PreparedTransaction) {
