@@ -21,7 +21,7 @@ use st0x_bridge::cctp::{
     AttestationResponse, CctpBridge, CctpError, MinedTx, MintScanFloorCheck, UsdcTransferStatus,
 };
 use st0x_bridge::{Attestation, Bridge, BridgeDirection, BurnReceipt, BurnTxStatus, MintReceipt};
-use st0x_config::{ALPACA_MINIMUM_WITHDRAWAL, ALPACA_TO_BASE_MINIMUM_TRANSFER};
+use st0x_config::{ALPACA_MINIMUM_WITHDRAWAL, ALPACA_TO_BASE_MINIMUM_TRANSFER, ChainRegistry};
 use st0x_event_sorcery::Store;
 use st0x_evm::{Chain, IERC20, PreparedTransaction, USDC_BASE, Wallet};
 use st0x_execution::alpaca_broker_api::CryptoOrderResponse;
@@ -98,6 +98,9 @@ pub struct UsdcSettlementParams {
     /// instead of re-enqueueing forever.
     pub settlement_retry_deadline: Duration,
     pub required_confirmations: u64,
+    /// Depth a tx on Ethereum needs before it proves a signed deposit send
+    /// can never mine: Ethereum's own `required_confirmations`.
+    pub ethereum_required_confirmations: u64,
     pub reserved_cash: Option<Usd>,
     /// Circle attestation/fee API base URL (test-only override; production
     /// builds use the [`st0x_bridge::cctp::CIRCLE_API_BASE`] constant).
@@ -389,6 +392,7 @@ pub struct CrossVenueCashTransfer<Signer: Wallet, B = CctpBridge<Signer, Signer>
     attestation_retry_deadline: Duration,
     settlement_retry_deadline: Duration,
     required_confirmations: u64,
+    ethereum_required_confirmations: u64,
     reserved_cash: Option<Usd>,
     gas_readiness: ConfiguredGasReadiness,
     /// Enqueues bot-gas cost recording after CCTP burn/mint confirmations and
@@ -700,6 +704,7 @@ impl<
             attestation_retry_deadline: settlement.attestation_retry_deadline,
             settlement_retry_deadline: settlement.settlement_retry_deadline,
             required_confirmations: settlement.required_confirmations,
+            ethereum_required_confirmations: settlement.ethereum_required_confirmations,
             reserved_cash: settlement.reserved_cash,
             gas_readiness: ConfiguredGasReadiness::default(),
             bot_gas_enqueuer,
@@ -6433,6 +6438,20 @@ fn deposit_send_recipient(prepared: &PreparedTransaction) -> Option<Address> {
         .map(|call| call.to)
 }
 
+/// The configured chains have no Ethereum entry, so there is no depth for
+/// the tx that supersedes a signed deposit send.
+#[derive(Debug, thiserror::Error)]
+#[error("no [chains.ethereum] entry: its required_confirmations gates the deposit send check")]
+pub struct EthereumChainMissing;
+
+/// The depth a tx needs before it proves a signed Alpaca deposit send can
+/// never mine. Shared by the bot and the CLI so both read the same chain.
+pub fn deposit_send_required_confirmations(
+    chains: &ChainRegistry,
+) -> Result<u64, EthereumChainMissing> {
+    Ok(chains.primary().required_confirmations)
+}
+
 /// Trait-erased entry point for the operator `transfer recheck` of a failed
 /// USDC deposit, and for the chain check before a signed deposit send is
 /// reconciled. Erasing the wallet `Chain` generic lets the recovery handle
@@ -6504,7 +6523,7 @@ where
             prepared,
             superseding_tx,
             self.market_maker_wallet,
-            self.required_confirmations,
+            self.ethereum_required_confirmations,
         )
         .await
     }
@@ -7693,6 +7712,7 @@ mod tests {
             attestation_retry_deadline: TEST_ATTESTATION_RETRY_DEADLINE,
             settlement_retry_deadline: TEST_SETTLEMENT_RETRY_DEADLINE,
             required_confirmations: 3,
+            ethereum_required_confirmations: 3,
             reserved_cash: None,
             #[cfg(feature = "test-support")]
             circle_api_base: st0x_bridge::cctp::CIRCLE_API_BASE.to_string(),

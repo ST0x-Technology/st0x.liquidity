@@ -36,7 +36,7 @@ use st0x_hedge::operator::rebalancing::equity::{
 use st0x_hedge::operator::rebalancing::to_wrapped_equities;
 use st0x_hedge::operator::rebalancing::usdc::{
     CrossVenueCashTransfer, MarketMakingUsdcEndpoints, UsdcSettlementParams, UsdcTransferError,
-    verify_deposit_send_superseded,
+    deposit_send_required_confirmations, verify_deposit_send_superseded,
 };
 use st0x_hedge::operator::telemetry::TelemetrySender;
 use st0x_hedge::operator::telemetry::broker::InstrumentedAlpacaBroker;
@@ -991,6 +991,7 @@ async fn run_usdc_transfer<Writer: Write>(
             attestation_retry_deadline: rebalancing_ctx.attestation_retry_deadline,
             settlement_retry_deadline: rebalancing_ctx.settlement_retry_deadline,
             required_confirmations: ctx.chains.primary().required_confirmations,
+            ethereum_required_confirmations: deposit_send_required_confirmations(&ctx.chains)?,
             reserved_cash: ctx
                 .assets
                 .cash
@@ -1545,7 +1546,7 @@ pub(super) async fn verify_deposit_send_superseded_on_chain(
         prepared,
         superseding_tx,
         wallet_ctx.ethereum_wallet().address(),
-        ctx.chains.primary().required_confirmations,
+        deposit_send_required_confirmations(&ctx.chains)?,
     )
     .await?)
 }

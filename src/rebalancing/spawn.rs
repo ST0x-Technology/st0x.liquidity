@@ -342,6 +342,7 @@ mod tests {
             attestation_retry_deadline: rebalancing_ctx.attestation_retry_deadline,
             settlement_retry_deadline: rebalancing_ctx.settlement_retry_deadline,
             required_confirmations: 0,
+            ethereum_required_confirmations: 0,
             reserved_cash: None,
             #[cfg(feature = "test-support")]
             circle_api_base: st0x_bridge::cctp::CIRCLE_API_BASE.to_string(),

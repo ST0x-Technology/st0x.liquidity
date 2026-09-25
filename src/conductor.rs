@@ -125,6 +125,7 @@ use crate::rebalancing::trigger::{GUARD_GENERATION, GuardGeneration, GuardState}
 use crate::rebalancing::usdc::{
     RecheckUsdcDeposit, RestoredDepositSends, TransferUsdcToHedging, TransferUsdcToHedgingCtx,
     TransferUsdcToMarketMaking, TransferUsdcToMarketMakingCtx, UsdcSettlementParams,
+    deposit_send_required_confirmations,
 };
 use crate::rebalancing::{
     BaseWallet, ChainRebalancingConfig, ChainWallets, EthereumWallet, RebalancerServices,
@@ -2844,6 +2845,7 @@ async fn build_rebalancer_services<Signer: Wallet + Clone>(
     raindex_service: Arc<RaindexService<Signer>>,
     rebalancing_ctx: &RebalancingCtx,
     required_confirmations: u64,
+    ethereum_required_confirmations: u64,
     reserved_cash: Option<Usd>,
     telemetry: TelemetrySender,
 ) -> anyhow::Result<RebalancerServices<Signer>> {
@@ -2868,6 +2870,7 @@ async fn build_rebalancer_services<Signer: Wallet + Clone>(
             attestation_retry_deadline: rebalancing_ctx.attestation_retry_deadline,
             settlement_retry_deadline: rebalancing_ctx.settlement_retry_deadline,
             required_confirmations,
+            ethereum_required_confirmations,
             reserved_cash,
             #[cfg(feature = "test-support")]
             circle_api_base: rebalancing_ctx.circle_api_base.clone(),
@@ -3313,6 +3316,7 @@ fn spawn_rebalancing_infrastructure<Signer: Wallet + Clone>(
             raindex_service,
             &rebalancing_ctx,
             deps.ctx.chains.primary().required_confirmations,
+            deposit_send_required_confirmations(&deps.ctx.chains)?,
             cash.map(|cash| cash.reserved).map(Positive::inner),
             deps.telemetry.clone(),
         )

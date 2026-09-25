@@ -14,8 +14,9 @@ pub(crate) use job::{
     TransferUsdcToMarketMakingJobQueue,
 };
 pub use manager::{
-    CrossVenueCashTransfer, DepositSendNotSuperseded, MarketMakingUsdcEndpoints,
-    UsdcSettlementParams, verify_deposit_send_superseded,
+    CrossVenueCashTransfer, DepositSendNotSuperseded, EthereumChainMissing,
+    MarketMakingUsdcEndpoints, UsdcSettlementParams, deposit_send_required_confirmations,
+    verify_deposit_send_superseded,
 };
 pub(crate) use manager::{
     RecheckUsdcDeposit, RestorePreparedDepositSends, RestoredDepositSends, UsdcRecheckError,
