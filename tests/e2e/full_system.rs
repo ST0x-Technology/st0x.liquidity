@@ -607,7 +607,7 @@ attestation_retry_deadline_secs = 86400
 settlement_retry_deadline_secs = 86400
 max_burn_revert_redrives = 5
 allocation = {{ targets = {{ base = 0.5 }}, alpaca_floor = 0, deviation = 0.1, min_operation_usd = 1, cooldown_secs = 1 }}
-usdc = {{ mode = "enabled", target = 0.5, deviation = 0.1 }}
+usdc = {{ mode = "enabled", corridors = {{ base = {{ hop = "cctp", target = 0.5, deviation = 0.1 }} }} }}
 
 [chains.base.trading.assets.equities.AAPL]
 tokenized_equity = "{aapl_unwrapped}"
