@@ -29,11 +29,11 @@ use async_trait::async_trait;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use tracing::warn;
+use tracing::{info, warn};
 
 use st0x_config::ExecutionThreshold;
 use st0x_event_sorcery::{AggregateError, LifecycleError, SendError, Store};
-use st0x_evm::Chain;
+use st0x_evm::{Chain, PreparedTransaction};
 use st0x_execution::{FractionalShares, Symbol};
 use st0x_tokenization::IssuerRequestId;
 
@@ -691,6 +691,23 @@ pub(crate) trait ResumeEquityToHedging: Send + Sync + 'static {
         chain: Chain,
         quantity: FractionalShares,
     ) -> Result<(), RedemptionError>;
+
+    /// Release the wallet nonce reservation a prepared vault withdrawal still
+    /// holds after its redemption was reconciled out-of-band. A reconcile is
+    /// pure bookkeeping and never touches the wallet, so without this the
+    /// reservation survives until a restart and later sends from that wallet
+    /// queue behind the freed nonce.
+    ///
+    /// Defaults to a no-op: only the production [`CrossVenueEquityTransfer`]
+    /// holds a wallet, so a resume double without one has no reservation to
+    /// release.
+    async fn discard_reconciled_withdrawal(
+        &self,
+        _chain: Chain,
+        _prepared: &PreparedTransaction,
+    ) -> Result<(), RedemptionError> {
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -703,6 +720,14 @@ impl ResumeEquityToHedging for CrossVenueEquityTransfer {
         quantity: FractionalShares,
     ) -> Result<(), RedemptionError> {
         Self::resume_equity_to_hedging(self, aggregate_id, symbol, chain, quantity).await
+    }
+
+    async fn discard_reconciled_withdrawal(
+        &self,
+        chain: Chain,
+        prepared: &PreparedTransaction,
+    ) -> Result<(), RedemptionError> {
+        Self::discard_reconciled_withdrawal(self, chain, prepared).await
     }
 }
 
@@ -812,13 +837,46 @@ impl Job<TransferEquityToHedgingCtx> for TransferEquityToHedging {
         // blocks reservation restoration, so the job would otherwise reschedule
         // itself forever). Release the reservation defensively (idempotent; the
         // terminal-event reactor also releases it).
-        if ctx
+        let terminal_state = ctx
             .redemption_store
             .load(&self.aggregate_id)
             .await
             .map_err(|error| Box::new(RedemptionError::from(error)))?
-            .is_some_and(|aggregate| aggregate.is_terminal())
-        {
+            .filter(EquityRedemption::is_terminal);
+        if let Some(aggregate) = terminal_state {
+            // A reconcile is pure bookkeeping and never touches the wallet, so a
+            // redemption reconciled while its vault withdrawal was still signed
+            // leaves the withdrawal's nonce reserved. Release it here, the first
+            // time a resume observes the durable `Reconciled`, so later sends
+            // from this wallet stop queueing behind the freed nonce without a
+            // restart. The release is idempotent, so a redriven observation is
+            // harmless.
+            if let EquityRedemption::Reconciled {
+                prepared: Some(prepared),
+                chain,
+                ..
+            } = &aggregate
+            {
+                match ctx
+                    .transfer
+                    .discard_reconciled_withdrawal(*chain, prepared)
+                    .await
+                {
+                    Ok(()) => info!(
+                        target: "rebalance",
+                        symbol = %self.symbol,
+                        aggregate_id = %self.aggregate_id,
+                        "Released the reconciled withdrawal's nonce reservation"
+                    ),
+                    Err(error) => warn!(
+                        target: "rebalance",
+                        symbol = %self.symbol,
+                        aggregate_id = %self.aggregate_id,
+                        %error,
+                        "Failed to release a reconciled withdrawal's nonce reservation"
+                    ),
+                }
+            }
             if let Some((position_store, _)) = &ctx.position_authority {
                 position_store
                     .send(
@@ -975,8 +1033,8 @@ impl Job<TransferEquityToHedgingCtx> for TransferEquityToHedging {
                     "Equity redemption {} ({}) exhausted its transfer job budget while its \
                      Raindex vault withdrawal is unresolved, and no live job remains to drive \
                      it. Verify the withdrawal onchain; if it can never confirm, reconcile it \
-                     (`stox transfer reconcile --kind redemption --id {}`) and restart the bot \
-                     to clear the stuck wallet nonce.",
+                     (`stox transfer reconcile --kind redemption --id {}`), which releases its \
+                     reservation and frees the stuck wallet nonce.",
                     self.aggregate_id, self.symbol, self.aggregate_id,
                 );
                 if let Err(alert_error) = ctx.notifier.notify(&message).await {
@@ -3079,6 +3137,103 @@ mod tests {
             job_queue,
             notifier: Arc::new(crate::alerts::LogNotifier),
         }
+    }
+
+    /// A resume that observes a redemption reconciled while its vault withdrawal
+    /// was still signed must release the wallet nonce reservation the prepared
+    /// withdrawal still holds, so later sends stop queueing behind it without a
+    /// restart. This automated release is the reconcile's replacement for the
+    /// old "restart the bot" alert instruction.
+    #[tokio::test]
+    async fn reconciled_withdrawal_resume_releases_the_nonce_reservation() {
+        let (pool, apalis_pool) = crate::test_utils::setup_test_pools().await;
+        let raindex = Arc::new(MockRaindex::new());
+        let services = EquityTransferServices {
+            chains: BTreeMap::from([(
+                Chain::Base,
+                ChainEquityServices {
+                    wallet: Address::ZERO,
+                    raindex: raindex.clone(),
+                    vault_lookup: Arc::new(MockVaultLookup::new()),
+                    tokenizer: Arc::new(MockTokenizer::new()),
+                    wrapper: Arc::new(MockWrapper::new()),
+                    mint_authorizer: ConfiguredMintAuthorizer::Disabled,
+                    gas_readiness: ConfiguredGasReadiness::Unwired,
+                    equities: ChainEquities::default(),
+                },
+            )]),
+            bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
+        };
+        let redemption_store = Arc::new(test_store::<EquityRedemption>(
+            pool.clone(),
+            services.clone(),
+        ));
+        let mint_store = Arc::new(test_store::<TokenizedEquityMint>(
+            pool.clone(),
+            services.clone(),
+        ));
+        let transfer =
+            CrossVenueEquityTransfer::new(services.clone(), mint_store, redemption_store.clone());
+
+        // Seed a signed-but-unconfirmed withdrawal, then reconcile it out-of-band
+        // (the operator verified it will never land). `Reconciled` retains the
+        // prepared withdrawal so the resume can release its nonce.
+        let id = redemption_aggregate_id("reconciled-nonce-release");
+        let prepared = crate::equity_redemption::prepared_withdrawal_for_test();
+        redemption_store
+            .send(
+                &id,
+                EquityRedemptionCommand::Redeem {
+                    symbol: Symbol::new("AAPL").unwrap(),
+                    chain: Chain::Base,
+                    quantity: float!(10),
+                    token: Address::ZERO,
+                    vault_id: st0x_raindex::RaindexVaultId(alloy::primitives::B256::ZERO),
+                    amount: alloy::primitives::U256::from(1_u64),
+                    from_block: 0,
+                    prepared: prepared.clone(),
+                },
+            )
+            .await
+            .unwrap();
+        redemption_store
+            .send(
+                &id,
+                EquityRedemptionCommand::Reconcile {
+                    reason: "withdrawal verified dead onchain".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let ctx = TransferEquityToHedgingCtx {
+            transfer: Arc::new(transfer),
+            equity_in_progress: Arc::new(RwLock::new(HashMap::new())),
+            redemption_store,
+            position_authority: None,
+            job_queue: TransferEquityToHedgingJobQueue::new(&apalis_pool),
+            notifier: Arc::new(crate::alerts::LogNotifier),
+        };
+        let job = TransferEquityToHedging {
+            chain: Chain::Base,
+            aggregate_id: id.clone(),
+            symbol: Symbol::new("AAPL").unwrap(),
+            quantity: FractionalShares::new(float!(10)),
+            generation: GuardGeneration::default(),
+            backpressure_streak: BackpressureStreak::default(),
+            position_reservation_retry_attempts: 0,
+        };
+
+        Job::perform(&job, &ctx)
+            .await
+            .expect("a reconciled redemption must terminate cleanly");
+
+        assert_eq!(
+            raindex.discard_prepared_withdrawal_calls(),
+            vec![prepared.tx_hash()],
+            "a resume observing the durable Reconciled must release the withdrawal's \
+             nonce reservation exactly once"
+        );
     }
 
     /// Stub for `EquityRedemptionError::BotGasEnqueueFailed` propagated as

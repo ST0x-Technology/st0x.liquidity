@@ -151,9 +151,9 @@ pub(crate) async fn withdrawal_reconciliation_redrive_delay(
                  is never fee-bumped, so later sends from this wallet queue behind its nonce. \
                  Automatic redrive continues at a slower cadence (guard held). Verify the \
                  withdrawal on-chain; if it can never confirm, reconcile the redemption \
-                 (`stox transfer reconcile --kind redemption --id {aggregate_id}`) to release its \
-                 reservation, then \
-                 restart the bot to clear the stuck wallet nonce so later sends proceed."
+                 (`stox transfer reconcile --kind redemption --id {aggregate_id}`), which \
+                 releases its reservation and frees the stuck wallet nonce so later sends \
+                 proceed."
             );
             if let Err(alert_error) = notifier.notify(&message).await {
                 warn!(
@@ -1679,6 +1679,25 @@ impl CrossVenueEquityTransfer {
             .send(aggregate_id, EquityRedemptionCommand::ConfirmWithdraw)
             .await?;
 
+        Ok(())
+    }
+
+    /// Release the wallet nonce reservation a reconciled redemption's prepared
+    /// vault withdrawal still holds. The reconcile itself is pure bookkeeping
+    /// and never reaches the wallet, so the running bot frees the nonce here the
+    /// first time a resume observes the durable `Reconciled`. The underlying
+    /// release is idempotent, so a redriven or duplicate observation is a
+    /// harmless no-op.
+    pub(crate) async fn discard_reconciled_withdrawal(
+        &self,
+        chain: Chain,
+        prepared: &PreparedTransaction,
+    ) -> Result<(), RedemptionError> {
+        self.services
+            .for_chain(chain)?
+            .raindex
+            .discard_prepared_withdraw(prepared)
+            .await;
         Ok(())
     }
 

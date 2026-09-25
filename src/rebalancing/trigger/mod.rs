@@ -956,7 +956,12 @@ enum RedemptionTimeoutCleanup {
     /// wrote `OperatorReconciled` to the store, but the live reactor never
     /// observed it. The sweep applies the reactor's terminal reconcile cleanup
     /// so the guard, inflight, and reservation clear without a restart.
-    Reconciled { tracking: RedemptionTracking },
+    Reconciled {
+        tracking: RedemptionTracking,
+        /// Whether the reconciled redemption still held a signed vault
+        /// withdrawal whose wallet nonce reservation must be released.
+        held_prepared: bool,
+    },
     /// The transfer genuinely timed out at a non-submission stage and must be
     /// force-resolved.
     TimedOut {
@@ -1661,7 +1666,10 @@ impl RebalancingService {
             };
 
             match cleanup {
-                RedemptionTimeoutCleanup::Reconciled { tracking } => {
+                RedemptionTimeoutCleanup::Reconciled {
+                    tracking,
+                    held_prepared,
+                } => {
                     error!(
                         target: "rebalance",
                         aggregate_id = %id,
@@ -1674,6 +1682,38 @@ impl RebalancingService {
                     self.clear_equity_in_progress(&tracking.symbol);
                     self.queue_terminal_redemption_reservation_release(&id, &tracking.symbol)
                         .await;
+                    if held_prepared {
+                        // The reconciled redemption still held a signed vault
+                        // withdrawal, so its wallet nonce is still reserved and
+                        // no resume job remains to release it (a live one would
+                        // have observed the durable `Reconciled` itself). The
+                        // sweep holds no wallet, so enqueue a resume job whose
+                        // terminal branch discards the reservation. A restart is
+                        // the only fallback if the enqueue fails.
+                        if let Err(error) = self
+                            .transfer_equity_to_hedging_queue
+                            .clone()
+                            .push(TransferEquityToHedging {
+                                aggregate_id: id.clone(),
+                                symbol: tracking.symbol.clone(),
+                                quantity: tracking.quantity,
+                                generation: GuardGeneration::default(),
+                                chain: tracking.chain,
+                                backpressure_streak: BackpressureStreak::default(),
+                                position_reservation_retry_attempts: 0,
+                            })
+                            .await
+                        {
+                            warn!(
+                                target: "rebalance",
+                                aggregate_id = %id,
+                                symbol = %tracking.symbol,
+                                %error,
+                                "Failed to enqueue a resume job to release the \
+                                 reconciled withdrawal's nonce; a restart will clear it"
+                            );
+                        }
+                    }
                 }
                 RedemptionTimeoutCleanup::TimedOut { tracking, elapsed } => {
                     let elapsed_secs = elapsed.as_secs();
@@ -2154,7 +2194,7 @@ impl RebalancingService {
                 return Ok(None);
             };
             match store.load(id).await {
-                Ok(Some(EquityRedemption::Reconciled { .. })) => {
+                Ok(Some(EquityRedemption::Reconciled { prepared, .. })) => {
                     // Cancel the MarketMaking inflight (the shares never left the
                     // vault, per the operator's verified-dead reconcile) and clear
                     // the active redemption, exactly like `on_redemption`'s
@@ -2197,7 +2237,10 @@ impl RebalancingService {
                             timed_out_at: now,
                         },
                     );
-                    return Ok(Some(RedemptionTimeoutCleanup::Reconciled { tracking }));
+                    return Ok(Some(RedemptionTimeoutCleanup::Reconciled {
+                        tracking,
+                        held_prepared: prepared.is_some(),
+                    }));
                 }
                 Ok(Some(_) | None) => return Ok(None),
                 Err(load_error) => {
@@ -22119,6 +22162,29 @@ mod tests {
             available,
             Some(shares(100)),
             "reconcile restores the never-withdrawn shares to available"
+        );
+
+        // The reconciled redemption still held a signed withdrawal, so its wallet
+        // nonce is still reserved and no resume job remains to release it. The
+        // sweep holds no wallet, so it must enqueue a resume job whose terminal
+        // branch discards the reservation, replacing the old restart instruction.
+        let payloads: Vec<Vec<u8>> = sqlx_apalis::query_scalar(
+            "SELECT job FROM Jobs WHERE status = 'Pending' AND job_type = ?",
+        )
+        .bind(std::any::type_name::<TransferEquityToHedging>())
+        .fetch_all(service.transfer_equity_to_hedging_queue.pool())
+        .await
+        .unwrap();
+        assert_eq!(
+            payloads.len(),
+            1,
+            "the sweep must enqueue exactly one resume job to release the reconciled \
+             withdrawal's nonce"
+        );
+        let enqueued: TransferEquityToHedging = serde_json::from_slice(&payloads[0]).unwrap();
+        assert_eq!(
+            enqueued.aggregate_id, id,
+            "the enqueued resume job must target the reconciled redemption"
         );
     }
 
