@@ -1898,8 +1898,9 @@ event position).
   bot accounts raises its own critical operational alert, with the fill, its
   cover side and the uncovered net on its symbol and chain, so the exposure it
   leaves is never silent; `skipped_fills.paged_at` makes a redelivery after a
-  crash page a fill that was not paged yet. A fill excluded through CLI
-  `process-tx` is reported on the command output and stays unpaged until the bot
+  crash page a fill that was not paged yet. A fill excluded through `process-tx`
+  (CLI or REST route) is reported in its outcome with the commands to recheck
+  the uncovered list and record the cover, and stays unpaged until the bot
   delivers it. An operator lists excluded fills with
   `GET
   /liquidity-read/skipped-fills`
@@ -5834,7 +5835,11 @@ named exemptions defined after the list:**
   `not_detected_yet`, changes nothing, and the operator retries later. Other
   USDC states keep their existing paths (`resume` while non-terminal,
   `reconcile` for funds handled out-of-band rather than settled by the
-  provider).
+  provider). Because the USDC recheck sends from the rebalancing wallet and
+  advances the aggregate on the request task, it first quiesces the USDC
+  rebalancing driver and holds it paused for the whole recheck, refusing with
+  `503` when the driver cannot quiesce (see "Both bot-routed USDC recovery
+  routes quiesce the rebalancing driver first" below).
 - `fail` -- force a stuck non-terminal operation to its clean `Failed` terminal
   so the system stops waiting on it; `--reason` required.
 - `reconcile` -- declare an already-terminal-failed operation resolved
@@ -5867,18 +5872,8 @@ effect rather than a generic intent:
   the same `witness -> enrich -> acknowledge -> mark -> settle` exactly-once
   sequence as the automated pipeline (see ADR 0005 and ADR 0010). Unlike the two
   commands above it belongs to no object group -- there is no stuck aggregate to
-  recover, only a missing fill to backfill. It **fails closed on a fill already
-  recorded** in the `OnChainTrade` log, whether acknowledged or merely
-  witnessed: re-applying it would double-count the position, so only a fill with
-  no record is accounted. It runs in direct-DB mode and **must not run while the
-  bot is concurrently accounting the same symbol** -- the CLI and the bot are
-  separate processes that no in-process lock can serialize, so the persisted
-  pending-acknowledgement set (see ADR 0010), not process isolation, is what
-  makes a cross-process re-drive reject as a duplicate rather than double-count.
-  A fill the bot would exclude from hedging (see the per asset market enable and
-  disable paragraph under Risk Management) is excluded by `process-tx` too:
-  recorded in `skipped_fills`, never hedged, and reported with the commands to
-  recheck the uncovered list and record the manual cover.
+  recover, only a missing fill to backfill. Its accounting, execution paths, and
+  hedge placement rules are in the `process-tx` standing rule below.
 
 **Standing rules:**
 
@@ -5908,21 +5903,41 @@ effect rather than a generic intent:
   posts to `POST /transfers/usdc/resume/{direction}/{id}`. The endpoint
   validates server-side (unknown id refuses -- a mistyped id must never start a
   fresh burn; a direction mismatch refuses; a clean terminal refuses), then
-  applies the single-flight gates before it enqueues a transfer job keyed by the
-  EXISTING id for the apalis worker to drive: any live or retryable USDC job row
-  in either direction refuses with 409 (a terminal `Failed` row does NOT --
-  re-enqueueing it is the recovery case), and a durable guard holder other than
-  the requested id refuses with 409. The worker uses the aggregate's persisted
-  amount. Routing through the bot closes the CLI-vs-server race: the CLI process
-  never drives an aggregate the bot's worker may also drive. The manual
-  `transfer-usdc` command still starts a fresh transfer directly, but hands off
-  to this endpoint at the FIRST bot-resumable wait (attestation timeout,
-  settlement lag, inconclusive poll); when the bot is unreachable, the transfer
-  is durable -- a bot restart re-arms it automatically. Like the whole
-  `server_port` recovery surface (`/transfers/resume`, `/transfers/recheck`,
-  `/transfers/fail`), its bare path is restricted to loopback callers for the
-  in-container CLI. Network operators use the IAP-verified
-  `/liquidity-write/transfers/*` mounts.
+  quiesces the USDC rebalancing driver (see "Both bot-routed USDC recovery
+  routes quiesce the rebalancing driver first" below) and holds it paused for
+  the whole operation before it applies the single-flight gates and enqueues a
+  transfer job keyed by the EXISTING id for the apalis worker to drive: any live
+  or retryable USDC job row in either direction refuses with 409 (a terminal
+  `Failed` row does NOT -- re-enqueueing it is the recovery case), and a durable
+  guard holder other than the requested id refuses with 409. The worker uses the
+  aggregate's persisted amount. Routing through the bot closes the CLI-vs-server
+  race: the CLI process never drives an aggregate the bot's worker may also
+  drive. The manual `transfer-usdc` command still starts a fresh transfer
+  directly, but hands off to this endpoint at the FIRST bot-resumable wait
+  (attestation timeout, settlement lag, inconclusive poll); when the bot is
+  unreachable, the transfer is durable -- a bot restart re-arms it
+  automatically. Like the whole `server_port` recovery surface
+  (`/transfers/resume`, `/transfers/recheck`, `/transfers/fail`), its bare path
+  is restricted to loopback callers for the in-container CLI. Network operators
+  use the IAP-verified `/liquidity-write/transfers/*` mounts.
+- **Both bot-routed USDC recovery routes quiesce the rebalancing driver first.**
+  `transfer resume --kind usdc` and `transfer recheck --kind usdc` send
+  transactions from the rebalancing wallet or advance the `UsdcRebalance`
+  aggregate on the request task, so before either mutates, it pauses the USDC
+  rebalancing driver -- the two apalis workers (`TransferUsdcToHedging`,
+  `TransferUsdcToMarketMaking`) plus the trigger's own queued USDC check and
+  inline stuck-transfer sweep -- meaning every worker execution already in
+  flight has finished and none can start, and holds it paused for the whole
+  operation, resuming it on every exit path (success, error, or panic). The
+  pause waits up to a 5-second quiesce window; if a transfer is still executing
+  when that window elapses, the route refuses with `503` ("A USDC transfer is
+  executing; retry once it is not in flight") and leaves the driver running.
+  This `503` sits AFTER the shared resume/recheck single-in-progress lock
+  (`409`) and the conductor-not-ready gate (`503`) but BEFORE the single-flight
+  job-row and guard-holder gates (`409`): the driver is quiesced before those
+  gates read the job rows and the durable guard, so their reads and the
+  subsequent enqueue or aggregate command cannot straddle a live worker
+  execution driving the same aggregate.
 - **`--reason` MUST be required, with no default, on every event-emitting
   destructive verb** (`fail`, `reconcile`, `set`, and `position release-hedge`).
   A defaulted reason is an audit-hostile record and violates the
@@ -5942,16 +5957,97 @@ effect rather than a generic intent:
   `ReconcileStuckRebalance` command (see above) is the first realization of the
   `reconcile` verb.
 - **`process-tx` implements the ADR-0005 exactly-once fill accounting
-  protocol.** It fails closed (with a clear operator message) if the fill is
-  already acknowledged, resumes if it was witnessed but not yet acknowledged
-  (crash- recovery window), and creates the full witness/acknowledge record for
-  genuinely missed fills — so every subsequent re-delivery, whether from another
-  CLI run or the normal pipeline, hits the dedup guard and skips cleanly.
-  **Operational precondition**: run with exclusive processing for that fill:
-  stop the live bot, drain any apalis accounting job for the fill, and do not
-  run another `process-tx` for the same `(tx_hash, log_index)` concurrently. The
-  durable dedup guard and the CQRS apply are separate transactions, so any
-  concurrent actor processing the same fill can slip through the TOCTOU window.
+  protocol.** It **does not repeat fill accounting or hedging for a fill already
+  acknowledged** in the `OnChainTrade` log, since applying it again would double
+  count the position: it reports `AlreadyAccounted`, or `AlreadyExcluded` for a
+  fill kept out of hedging. It may still repair bookkeeping on that fill: it
+  records a missing source attribution on the `OnChainTrade`, and settles the
+  fill if a crash between mark and settle left it pending (ADR 0010). A fill
+  that was witnessed but not yet acknowledged is resumed from where the earlier
+  run stopped (crash recovery window), and a genuinely missed fill gets the full
+  witness/acknowledge record, so every subsequent re-delivery, whether from
+  another CLI run or the normal pipeline, hits the dedup guard and skips
+  cleanly. A decoded fill with no block number cannot be witnessed and fails as
+  an operational error (a 500 on the REST route). **Concurrent accounting of the
+  same fill is serialized on every path.** The durable dedup check and the CQRS
+  apply are separate transactions, and the Position guard rejects only a fill
+  whose trade id is still in `pending_acknowledged_trade_ids` or equals
+  `last_acknowledged_trade_id` (`DuplicateTrade`, ADR 0010). Without one guard
+  spanning both, a second actor could pass the check, then apply the fill after
+  the first actor settled it and a newer fill replaced it in
+  `last_acknowledged_trade_id`, counting it twice. `account_for_onchain_fill`
+  therefore holds the fill accounting file lock
+  (`<database>.fill-accounting.lock`) from its `skipped_fills` check through the
+  acknowledge, and `account_for_fill_excluded_from_hedging` holds it from its
+  position check through the exclusion record, so two actors that disagree on
+  the trading flag cannot both count the fill and record it as excluded. Every
+  accounting caller takes it (the apalis accounting job, the REST route, and the
+  CLI), and the kernel lock also serializes separate processes. Within one
+  process, callers first queue on a process wide mutex, so the lock file only
+  arbitrates between processes; on an in memory database, which only its own
+  process can attach to, that mutex alone is the lock. Like the bot, process-tx
+  keeps a fill the bot would exclude from hedging (trading disabled on the
+  fill's chain, or the fill landed while it was; see Risk Management) out of the
+  position and reports its cover detail with the commands to recheck the
+  uncovered list and record the manual cover, since the bot never pages a fill
+  it does not deliver; a fill excluded earlier stays excluded and is reported as
+  such. It is independent of the submission lock, which is taken after
+  accounting and serializes only the position claim and broker placement.
+
+  It has two execution paths. The **CLI** runs it in direct-DB mode, in a
+  separate process from the bot, and selects the hedged chain with `--network`,
+  defaulting to the primary chain and rejecting a chain not configured as
+  hedged. No in process lock can serialize across processes, so the fill
+  accounting file lock above is what lets a concurrent actor on the same fill
+  find it recorded instead of counting it twice. **Operational precondition (CLI
+  direct database path)**: stop the live bot. The CLI's standalone stores reach
+  none of the bot's live reactors, and its placer has no admission gate (see
+  below). The file locks are defense in depth, not a supported concurrent mode.
+  The **in bot REST route**
+  (`POST /liquidity-write/transactions/{tx_hash}/process`) removes that
+  requirement: it runs inside the live bot and serializes its position claim and
+  broker placement against the trading loop through the shared counter trade
+  submission lock (ADR 0014), so it does **not** require stopping the bot. It
+  gates on full startup readiness (503 until then), selects the hedged chain
+  from the `chain` query (defaulting to the primary), returns the decoded fill
+  alongside its outcome, and runs the accounting and placement on a detached
+  task so a client disconnect cannot strand a placed order before its Submitted
+  event persists. Graceful shutdown stops the server and waits for that task, up
+  to the drain timeout; a request that still reaches the handler after the drain
+  began is refused with 503, and a task still running at the timeout is dropped
+  when the process exits.
+
+  The claim, placement, and settlement behavior lives in the shared process-tx
+  placement path used by both the CLI and the REST route; only the admission
+  outcomes depend on the placer. **Before placement**, a Pending claim already
+  held by the live pipeline is settled against and reported as a deferral
+  (`ProcessTxOutcome::PendingHedgeDeferred`) when the schedule is enabled, and
+  rejected (after settling the fill) as
+  `RejectionReason::RetainedPendingWithoutSchedule` when the schedule is
+  disabled. A preserved failed order anchor is then reconciled with the broker:
+  when the broker still holds that order, the fill is settled and the placement
+  rejected (`RejectionReason::FailedAnchorStillAtBroker`), while an operational
+  failure of that reconciliation leaves the fill unsettled so a rerun resumes
+  it. A placement preflight that skips the hedge settles the fill and reports
+  `ProcessTxOutcome::PreflightDeferred` with the skip reason. **Broker admission
+  runs before the claim** (ADR 0022) on the REST route, whose placer applies the
+  trading schedule. The CLI placer has no admission gate: it places with session
+  validation bypassed, so it never defers and never reports
+  `HedgePlacementDeferred`. On an admission deferral process-tx writes no claim,
+  no Pending intent, and no anchor for this placement: it settles the accounted
+  fill and returns `ProcessTxOutcome::HedgePlacementDeferred` (a reconciliation
+  of an earlier claim or anchor that ran before admission stays recorded), and
+  the standing periodic position check hedges the exposure again from a fresh
+  preflight. An admission error at that check likewise claims nothing; it
+  surfaces to the caller as a 500 with the fill left unsettled, so a rerun
+  resumes it. The placement runs admission again after the claim; **if admission
+  changed in between**, a deferral or an admission error there fails the order,
+  releases its id, clears the claim, and settles the fill, reporting
+  `HedgePlacementDeferred` for a deferral and surfacing an error. **On broker
+  backpressure**, the broker call did run, so process-tx preserves the failed
+  order id as the idempotency anchor, clears the claim, settles the fill, and
+  surfaces the error; the standing position check then runs anchor recovery
+  under that client id. None of these cases retain a Pending intent.
 
 ### Event Processing Flow
 
@@ -6535,13 +6631,14 @@ multiple broker-specific contexts.
    `offchain_order_view` projections, which the event-sourcing framework
    maintains from the event log and backfills on startup. Both the HTTP endpoint
    and the WebSocket seed filter, sort, and page in SQL, so a request costs a
-   bounded index range per venue side for the page it returns, plus an
-   index-only count of the matches, rather than a replay of every aggregate.
-   Response shapes, protocol semantics, and the `limit`/`offset` contract are
-   unchanged. The views hold the serialized aggregates, and the conversion to a
-   dashboard trade still runs at read time over the returned page only, so the
-   projections stay pure read keys with no second source of truth for the wire
-   shape.
+   bounded index range per venue side for the page it returns, plus a count of
+   the matches that walks the terminal row index and reads only stored key
+   columns, never the serialized payload, rather than a replay of every
+   aggregate. Response shapes, protocol semantics, and the `limit`/`offset`
+   contract are unchanged. The views hold the serialized aggregates, and the
+   conversion to a dashboard trade still runs at read time over the returned
+   page only, so the projections stay pure read keys with no second source of
+   truth for the wire shape.
 
    Offchain counter-trade entries include successful fills, terminal failures,
    and terminal cancellations; each entry carries its terminal outcome

@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::sync::LazyLock;
 use std::time::Duration;
 
-use alloy::primitives::U256;
+use alloy::primitives::{TxHash, U256};
 use axum::Json;
 use axum::Router;
 use axum::extract::{ConnectInfo, Path, Query, Request, State};
@@ -20,9 +20,10 @@ use rain_math_float::Float;
 use serde::ser::{SerializeSeq, SerializeStruct};
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
-use tracing::{error, info, warn};
+use tokio_util::task::TaskTracker;
+use tracing::{debug, error, info, warn};
 
-use st0x_config::{BrokerCtx, OpsApiConfig};
+use st0x_config::{BrokerCtx, Ctx, HedgedChain, OpsApiConfig};
 use st0x_dto::{
     EquityTimings, HedgeLatencies, InfraReport, RebalanceTimings, ReliabilityReport, Trade,
     TradingVenue,
@@ -30,9 +31,12 @@ use st0x_dto::{
 use st0x_event_sorcery::{
     AggregateError, EventSourced, SendError, StoreBuilder, load_entity, send_command,
 };
+use st0x_evm::Chain;
 use st0x_execution::alpaca_broker_api::AccountActivitiesQuery;
 use st0x_execution::{AlpacaWalletError, Symbol};
 use st0x_finance::{FractionalShares, Positive};
+use st0x_float_serde::format_float;
+use st0x_registry::SymbolCache;
 use st0x_tokenization::IssuerRequestId;
 
 use crate::AppState;
@@ -48,7 +52,7 @@ use crate::equity_redemption::{
     EquityRedemption, EquityRedemptionCommand, EquityRedemptionEvent, RedemptionAggregateId,
 };
 use crate::iap_auth::{IapVerifier, require_iap};
-use crate::offchain::order::OffchainOrderId;
+use crate::offchain::order::{OffchainOrderId, OrderPlacer, PollOrderStatusJobQueue};
 use crate::onchain_trade::{OnChainTradeId, cover_direction};
 use crate::operator::OperatorError;
 use crate::operator::equity_transfer::{
@@ -58,6 +62,9 @@ use crate::operator::excluded_fill::record_exclusion_cover;
 use crate::operator::portfolio_snapshot::{EquityMarkCorrection, set_equity_mark};
 use crate::operator::position::{
     OffchainOrderOutcome, PointerOutcome, release_pending_offchain_order, set_position,
+};
+use crate::operator::process_tx::{
+    self, PlacedHedgeDisposition, ProcessTxFill, ProcessTxOutcome, ProcessTxReport, ProcessTxStores,
 };
 use crate::performance::equity_timing::load_equity_timings;
 use crate::performance::infra::{load_dependency_stats, load_monitor_telemetry};
@@ -69,7 +76,9 @@ use crate::performance::{ReportRange, hedge_latency_report, load_hedge_performan
 use crate::rebalancing::equity::{
     CrossVenueEquityTransfer, EquityTransferServices, RecheckError, RecheckOutcome,
 };
-use crate::rebalancing::usdc::{RecheckUsdcDeposit, UsdcRecheckError};
+use crate::rebalancing::usdc::{
+    DriverNotQuiesced, RecheckUsdcDeposit, UsdcDriverPause, UsdcDriverPauseGuard, UsdcRecheckError,
+};
 use crate::rebalancing::{RebalancingService, UsdcResumeError};
 use crate::tokenized_equity_mint::{
     TokenizedEquityMint, TokenizedEquityMintCommand, TokenizedEquityMintEvent,
@@ -1319,11 +1328,58 @@ pub(crate) struct RecoveryHandle {
     /// Runs in the bot process, so the recovery events reach the live
     /// trigger reactor and clear the in-progress guard without a restart.
     pub(crate) usdc_recheck: Arc<dyn RecheckUsdcDeposit>,
+    /// Pause control for the USDC rebalancing driver. A write route that must
+    /// read then mutate a USDC rebalance, or spend the rebalancing wallet,
+    /// quiesces the workers through it first and resumes them on every exit.
+    pub(crate) usdc_driver_pause: Arc<UsdcDriverPause>,
+}
+
+/// Shared handle backing the in-bot process-tx route: the broker order placer
+/// and the submission lock the trading loop holds, set by the conductor after
+/// startup completes.
+pub(crate) struct ProcessTxHandle {
+    pub(crate) order_placer: Arc<dyn OrderPlacer>,
+    pub(crate) counter_trade_submission_lock: Arc<Mutex<()>>,
+    /// The conductor's wired stores, so the fill's events reach the running
+    /// reactors (the rebalancing inventory and pending-order gate update at
+    /// once, not on the next inventory poll).
+    pub(crate) stores: ProcessTxStores,
+    /// The trading loop's poll-status queue and interval, so a hedge the
+    /// in-bot route submits is enrolled for status polling immediately rather
+    /// than waiting for the next startup recovery sweep.
+    pub(crate) poll_status_queue: PollOrderStatusJobQueue,
+    pub(crate) poll_interval: std::time::Duration,
+    /// The conductor's bounded, instrumented provider for every hedged chain.
+    pub(crate) providers: std::collections::BTreeMap<Chain, crate::conductor::HttpProvider>,
 }
 
 /// Serializes operator transfer-recovery requests so they cannot race through
 /// duplicate or conflicting mint/redemption flows.
 pub(crate) struct ResumeLock(pub(crate) Mutex<()>);
+
+/// Quiesces the USDC rebalancing driver for the caller's mutation window:
+/// returns once no worker execution is in flight and none can start, or 503
+/// when a transfer is executing and the driver cannot be paused within the
+/// quiesce window. The guard resumes the driver when dropped.
+async fn quiesce_usdc_driver(
+    pause: &UsdcDriverPause,
+    rebalance_id: &UsdcRebalanceId,
+    resume_direction: Option<RebalanceDirection>,
+) -> Result<UsdcDriverPauseGuard, (StatusCode, Json<ErrorResponse>)> {
+    pause.pause().await.map_err(|DriverNotQuiesced| {
+        warn!(
+            %rebalance_id,
+            ?resume_direction,
+            "USDC driver did not quiesce for an operator write; refusing"
+        );
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ErrorResponse {
+                error: "A USDC transfer is executing; retry once it is not in flight".to_string(),
+            }),
+        )
+    })
+}
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -1685,6 +1741,14 @@ async fn recheck_transfer(
                 )
             })?;
 
+            // The recheck sends transactions from the rebalancing wallet and
+            // advances the aggregate on this task, so quiesce the workers first
+            // and hold them parked for the whole recheck. Not bounded here:
+            // dropping the recheck mid step could strand the aggregate, and each
+            // call inside it is already transport bounded.
+            let _driver_paused =
+                quiesce_usdc_driver(&handle.usdc_driver_pause, &rebalance_id, None).await?;
+
             let outcome = handle
                 .usdc_recheck
                 .recheck_deposit(&rebalance_id)
@@ -1830,6 +1894,12 @@ async fn resume_usdc_transfer(
             }),
         )
     })?;
+
+    // Quiesce the workers so the resume's preflight (durable holder scan and
+    // job row dedupe) and its enqueue cannot straddle an execution already in
+    // flight for the same aggregate.
+    let _driver_paused =
+        quiesce_usdc_driver(&handle.usdc_driver_pause, &rebalance_id, Some(direction)).await?;
 
     handle
         .rebalancing_service
@@ -2083,6 +2153,12 @@ fn parse_usdc_rebalance_id(id: &str) -> Result<UsdcRebalanceId, (StatusCode, Jso
 /// same internal-failure treatment used elsewhere in this module.
 fn ops_store_error(error: impl std::fmt::Display) -> (StatusCode, Json<ErrorResponse>) {
     error!(%error, "Operator write command failed");
+    ops_write_failure()
+}
+
+/// The generic `500` for an operator write failure, without logging it. Callers
+/// that have not already recorded the failure go through `ops_store_error`.
+fn ops_write_failure() -> (StatusCode, Json<ErrorResponse>) {
     (
         StatusCode::INTERNAL_SERVER_ERROR,
         Json(ErrorResponse {
@@ -2410,9 +2486,21 @@ fn ops_precondition_error(error: impl std::fmt::Display) -> (StatusCode, Json<Er
 }
 
 /// Maps a shared operator command failure to a response: a caller-facing
-/// rejection becomes a `400`, an operational failure a logged `500` carrying
-/// the full error chain.
+/// rejection becomes a `400`, a preflight reservation mismatch a `500` whose
+/// body carries the typed invariant reason, and any other operational failure a
+/// logged `500` carrying the full error chain.
 fn ops_operator_error(error: OperatorError) -> (StatusCode, Json<ErrorResponse>) {
+    match error {
+        OperatorError::Operational(error) => ops_store_error(format!("{error:#}")),
+        other => operator_error_response(other),
+    }
+}
+
+/// Renders an operator command failure with the same statuses and bodies as
+/// `ops_operator_error`, without logging it. For callers that already recorded
+/// the failure, such as the detached process-tx task, which logs its own
+/// outcome so the record survives a client disconnect.
+fn operator_error_response(error: OperatorError) -> (StatusCode, Json<ErrorResponse>) {
     match error {
         OperatorError::Rejected(reason) => (
             StatusCode::BAD_REQUEST,
@@ -2420,7 +2508,13 @@ fn ops_operator_error(error: OperatorError) -> (StatusCode, Json<ErrorResponse>)
                 error: reason.to_string(),
             }),
         ),
-        OperatorError::Operational(error) => ops_store_error(format!("{error:#}")),
+        OperatorError::PreflightReservationMismatch(mismatch) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: mismatch.to_string(),
+            }),
+        ),
+        OperatorError::Operational(_) => ops_write_failure(),
     }
 }
 
@@ -2767,6 +2861,336 @@ async fn cover_excluded_fill(
     }))
 }
 
+/// Decoded fill and processing outcome returned by the process-tx route.
+#[derive(Debug, Serialize)]
+struct ProcessTxResponse {
+    fill: Option<ProcessTxFillResponse>,
+    #[serde(flatten)]
+    outcome: ProcessTxOutcomeResponse,
+}
+
+/// Operator-relevant identity and economics of the decoded on-chain fill.
+#[derive(Debug, Serialize)]
+struct ProcessTxFillResponse {
+    tx_hash: String,
+    log_index: u64,
+    symbol: String,
+    direction: st0x_execution::Direction,
+    quantity: String,
+    price: String,
+}
+
+impl TryFrom<ProcessTxFill> for ProcessTxFillResponse {
+    type Error = rain_math_float::FloatError;
+
+    fn try_from(fill: ProcessTxFill) -> Result<Self, Self::Error> {
+        Ok(Self {
+            tx_hash: fill.tx_hash.to_string(),
+            log_index: fill.log_index,
+            symbol: fill.symbol.to_string(),
+            direction: fill.direction,
+            quantity: fill.quantity.to_string(),
+            price: format_float(&fill.price)?,
+        })
+    }
+}
+
+/// What processing a transaction resolved to, mirrored from
+/// [`ProcessTxOutcome`] for the wire.
+#[derive(Debug, Serialize)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+enum ProcessTxOutcomeResponse {
+    NoTradeableEvents,
+    TransactionNotFound {
+        tx_hash: String,
+        chain: String,
+    },
+    AlreadyAccounted,
+    PendingHedgeInFlight,
+    BelowExecutionThreshold,
+    ExcludedFromHedging {
+        symbol: String,
+        chain: String,
+        detail: String,
+        instructions: String,
+    },
+    AlreadyExcluded {
+        detail: String,
+        instructions: String,
+    },
+    PlacementRejected {
+        symbol: String,
+    },
+    PreflightDeferred {
+        symbol: String,
+        reason: String,
+    },
+    HedgePlaced {
+        symbol: String,
+        offchain_order_id: String,
+        shares: String,
+        direction: st0x_execution::Direction,
+        disposition: PlacedHedgeDisposition,
+    },
+    HedgePlacementCleared {
+        symbol: String,
+    },
+    HedgePlacementDeferred {
+        symbol: String,
+    },
+    PendingHedgeDeferred {
+        symbol: String,
+        offchain_order_id: String,
+    },
+}
+
+impl From<ProcessTxOutcome> for ProcessTxOutcomeResponse {
+    fn from(outcome: ProcessTxOutcome) -> Self {
+        match outcome {
+            ProcessTxOutcome::NoTradeableEvents => Self::NoTradeableEvents,
+            ProcessTxOutcome::TransactionNotFound { tx_hash, chain } => Self::TransactionNotFound {
+                tx_hash: tx_hash.to_string(),
+                chain: chain.to_string(),
+            },
+            ProcessTxOutcome::AlreadyAccounted => Self::AlreadyAccounted,
+            ProcessTxOutcome::PendingHedgeInFlight => Self::PendingHedgeInFlight,
+            ProcessTxOutcome::BelowExecutionThreshold => Self::BelowExecutionThreshold,
+            ProcessTxOutcome::ExcludedFromHedging {
+                symbol,
+                chain,
+                detail,
+                instructions,
+            } => Self::ExcludedFromHedging {
+                symbol: symbol.to_string(),
+                chain: chain.to_string(),
+                detail,
+                instructions,
+            },
+            ProcessTxOutcome::AlreadyExcluded {
+                detail,
+                instructions,
+            } => Self::AlreadyExcluded {
+                detail,
+                instructions,
+            },
+            ProcessTxOutcome::PlacementRejected { symbol } => Self::PlacementRejected {
+                symbol: symbol.to_string(),
+            },
+            ProcessTxOutcome::PreflightDeferred { symbol, reason } => Self::PreflightDeferred {
+                symbol: symbol.to_string(),
+                reason,
+            },
+            ProcessTxOutcome::HedgePlaced {
+                symbol,
+                offchain_order_id,
+                shares,
+                direction,
+                disposition,
+            } => Self::HedgePlaced {
+                symbol: symbol.to_string(),
+                offchain_order_id: offchain_order_id.to_string(),
+                shares: shares.to_string(),
+                direction,
+                disposition,
+            },
+            ProcessTxOutcome::HedgePlacementCleared { symbol } => Self::HedgePlacementCleared {
+                symbol: symbol.to_string(),
+            },
+            ProcessTxOutcome::HedgePlacementDeferred { symbol } => Self::HedgePlacementDeferred {
+                symbol: symbol.to_string(),
+            },
+            ProcessTxOutcome::PendingHedgeDeferred {
+                symbol,
+                offchain_order_id,
+            } => Self::PendingHedgeDeferred {
+                symbol: symbol.to_string(),
+                offchain_order_id: offchain_order_id.to_string(),
+            },
+        }
+    }
+}
+
+impl TryFrom<ProcessTxReport> for ProcessTxResponse {
+    type Error = rain_math_float::FloatError;
+
+    fn try_from(report: ProcessTxReport) -> Result<Self, Self::Error> {
+        Ok(Self {
+            fill: report
+                .fill
+                .map(ProcessTxFillResponse::try_from)
+                .transpose()?,
+            outcome: ProcessTxOutcomeResponse::from(report.outcome),
+        })
+    }
+}
+
+#[derive(Default, Deserialize)]
+struct ProcessTransactionQuery {
+    /// Hedged chain to query; omitted means the configured primary chain.
+    chain: Option<Chain>,
+}
+
+/// Runs the process-tx workload on a detached `tokio` task and awaits its
+/// result, mapping a task-join failure and the operator error to HTTP
+/// responses.
+///
+/// The workload is spawned (not awaited inline) so that dropping the request
+/// future -- a client disconnect or cancellation -- detaches the in-flight
+/// broker placement instead of cancelling it: a hedge that has already reached
+/// the broker must run through to its `Submitted` event even when nobody is
+/// waiting on the response. Awaiting `process_tx` inline here would
+/// reintroduce that cancellation bug.
+async fn spawn_and_join_process_tx<ChainProvider: alloy::providers::Provider + Clone + 'static>(
+    tx_hash: TxHash,
+    ctx: Ctx,
+    pool: sqlx::SqlitePool,
+    trading_chain: HedgedChain,
+    provider: ChainProvider,
+    cache: SymbolCache,
+    handle: &ProcessTxHandle,
+    detached_tasks: &TaskTracker,
+) -> Result<ProcessTxReport, (StatusCode, Json<ErrorResponse>)> {
+    let stores = handle.stores.clone();
+    let order_placer = Arc::clone(&handle.order_placer);
+    let counter_trade_submission_lock = Arc::clone(&handle.counter_trade_submission_lock);
+    let poll_status_queue = handle.poll_status_queue.clone();
+    let poll_interval = handle.poll_interval;
+    // Tracked so graceful shutdown waits for a placement already under way
+    // instead of dropping it with the runtime. The token is taken before the
+    // closed check: the drain closes the tracker and then checks it is empty,
+    // so either the drain sees this request as running or the request sees the
+    // tracker closed and refuses. Spawning into a drained tracker would let the
+    // task be dropped at exit.
+    let admission = detached_tasks.token();
+    if detached_tasks.is_closed() {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ErrorResponse {
+                error: "process-tx is unavailable while the bot shuts down".to_string(),
+            }),
+        ));
+    }
+    let task = detached_tasks.spawn(async move {
+        let result = process_tx::process_tx(
+            tx_hash,
+            &ctx,
+            &pool,
+            process_tx::ProcessTxChainContext::new(&trading_chain, &provider, &cache),
+            &stores,
+            order_placer,
+            Some(&counter_trade_submission_lock),
+            Some((&poll_status_queue, poll_interval)),
+        )
+        .await;
+        // The request future may already be gone (client disconnect drops the
+        // JoinHandle), so the outcome is recorded here rather than only where
+        // it is rendered into a response.
+        match &result {
+            Ok(report) => debug!(%tx_hash, outcome = ?report.outcome, "process-tx finished"),
+            Err(OperatorError::Rejected(reason)) => {
+                warn!(%tx_hash, %reason, "process-tx rejected");
+            }
+            Err(error) => error!(%tx_hash, %error, "process-tx failed"),
+        }
+        result
+    });
+    drop(admission);
+    task.await
+        .map_err(|error| {
+            error!(%tx_hash, %error, "process-tx worker task failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: format!("process-tx worker task failed: {error}"),
+                }),
+            )
+        })?
+        // The detached task above already logged the failure, so render it
+        // without logging it a second time.
+        .map_err(operator_error_response)
+}
+
+/// Accounts a missed on-chain fill and places the opposite hedge inside the
+/// bot, serialized against the trading loop by the shared submission lock.
+/// Mirrors the CLI `process-tx` verb.
+async fn process_transaction(
+    State(state): State<AppState>,
+    Path(tx_hash): Path<String>,
+    Query(query): Query<ProcessTransactionQuery>,
+) -> Result<Json<ProcessTxResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let tx_hash = TxHash::from_str(&tx_hash)
+        .map_err(|error| ops_precondition_error(format!("invalid transaction hash: {error}")))?;
+    let trading_chain = process_tx::resolve_chain(&state.ctx, query.chain)
+        .map_err(ops_precondition_error)?
+        .clone();
+
+    // process-tx places a live broker hedge, so require FULL startup readiness,
+    // not just the published handle: the handle is set when the conductor's own
+    // setup completes, but the supervised monitors that reconcile the placed
+    // order (e.g. the poll-status monitor) acknowledge the startup barrier only
+    // afterwards. `health.is_ready()` gates on that barrier, so an operator
+    // cannot trigger a placement into a half-started pipeline.
+    if !state.health.is_ready() {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ErrorResponse {
+                error: "process-tx is unavailable until startup completes".to_owned(),
+            }),
+        ));
+    }
+
+    let handle = state.process_tx.get().ok_or_else(|| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ErrorResponse {
+                error: "process-tx is unavailable until the conductor finishes startup".to_owned(),
+            }),
+        )
+    })?;
+
+    // The conductor's bounded, instrumented provider for the chain: a hung
+    // endpoint surfaces as an error instead of parking this request, and the
+    // route's RPC calls are timed like every other bot RPC call.
+    let provider = handle
+        .providers
+        .get(&trading_chain.chain)
+        .cloned()
+        .ok_or_else(|| {
+            error!(
+                chain = %trading_chain.chain,
+                "no RPC provider is wired for the process-tx chain"
+            );
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: format!("no RPC provider is wired for chain {}", trading_chain.chain),
+                }),
+            )
+        })?;
+    let report = spawn_and_join_process_tx(
+        tx_hash,
+        state.ctx.clone(),
+        state.pool.clone(),
+        trading_chain,
+        provider,
+        SymbolCache::default(),
+        handle,
+        &state.detached_tasks,
+    )
+    .await?;
+
+    let response = ProcessTxResponse::try_from(report).map_err(|error| {
+        error!(%tx_hash, %error, "failed to format the process-tx response");
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: format!("failed to format the process-tx response: {error}"),
+            }),
+        )
+    })?;
+    Ok(Json(response))
+}
+
 /// Wire contract for the portfolio-snapshot mark route.
 #[derive(Deserialize)]
 struct SetEquityMarkRequest {
@@ -2965,6 +3389,10 @@ fn ops_api_routes(ops_api: Option<&OpsApiConfig>) -> Router<AppState> {
             "/liquidity-write/excluded-fills/{trade_id}/cover",
             post(cover_excluded_fill),
         )
+        .route(
+            "/liquidity-write/transactions/{tx_hash}/process",
+            post(process_transaction),
+        )
         .layer(axum::middleware::from_fn(move |request, next| {
             let verifier = Arc::clone(&write_verifier);
             async move { require_iap(verifier, request, next).await }
@@ -3061,7 +3489,10 @@ mod tests {
     use std::net::SocketAddr;
     use std::sync::Arc;
 
-    use alloy::primitives::{Address, TxHash};
+    use alloy::primitives::{Address, IntoLogData, TxHash, address, fixed_bytes, uint};
+    use alloy::providers::{ProviderBuilder, mock::Asserter};
+    use alloy::rpc::types::Log;
+    use async_trait::async_trait;
     use axum::body::{Body, to_bytes};
     use axum::extract::ConnectInfo;
     use axum::http::{Request, StatusCode};
@@ -3069,7 +3500,7 @@ mod tests {
     use chrono_tz::America::New_York;
     use httpmock::Method::GET;
     use sqlx::SqlitePool;
-    use tokio::sync::broadcast;
+    use tokio::sync::{Notify, broadcast};
     use tower::ServiceExt;
     use uuid::uuid;
 
@@ -3083,8 +3514,9 @@ mod tests {
     use st0x_execution::alpaca_broker_api::AlpacaBrokerMock;
     use st0x_execution::{
         AlpacaAccountId, AlpacaBrokerApiCtx, AlpacaBrokerApiMode, AlpacaWalletError,
-        DEFAULT_ALPACA_COUNTER_TRADE_SLIPPAGE_BPS, Direction, ExecutorOrderId, Positive,
-        SupportedExecutor, Symbol, TimeInForce,
+        BuyingPowerReservationCents, CancellationOutcome, CounterTradePreflight,
+        CounterTradeReservation, DEFAULT_ALPACA_COUNTER_TRADE_SLIPPAGE_BPS, Direction,
+        ExecutorOrderId, LimitOrder, MarketOrder, Positive, SupportedExecutor, Symbol, TimeInForce,
     };
     use st0x_finance::{FractionalShares, Usd, Usdc};
     use st0x_float_macro::float;
@@ -3093,12 +3525,15 @@ mod tests {
     };
 
     use super::*;
+    use crate::bindings::IRaindexV6::{SignedContextV1, TakeOrderConfigV4, TakeOrderV3};
     use crate::dashboard;
     use crate::equity_redemption::redemption_aggregate_id;
     use crate::inventory::{
         self, BroadcastingInventory, PortfolioAsset, PortfolioBalanceRow, PortfolioLocation,
     };
-    use crate::offchain::order::{OffchainOrder, OffchainOrderEvent, OffchainOrderId};
+    use crate::offchain::order::{
+        OffchainOrder, OffchainOrderEvent, OffchainOrderId, OrderPlacementResult,
+    };
     use crate::onchain_trade::{
         InventoryVenue, OnChainTrade, OnChainTradeCommand, OnChainTradeId, OnChainTradeSource,
     };
@@ -3111,7 +3546,12 @@ mod tests {
     };
     use crate::position::{Position, PositionCommand, TradeId};
     use crate::rebalancing::equity::ChainServicesMissing;
-    use crate::rebalancing::usdc::UsdcTransferError;
+    use crate::rebalancing::usdc::{UsdcDriverGate, UsdcTransferError, usdc_driver_pause};
+    use crate::rebalancing::{RebalancingSchedulers, RebalancingServiceConfig};
+    use crate::test_utils::{
+        TEST_POLL_INTERVAL, get_test_order, reserving_counter_trade_preflight,
+        seed_get_test_order_token_symbols, setup_test_pools,
+    };
     use crate::tokenized_equity_mint::TokenizedEquityMint;
     use crate::trading::onchain::skipped_fill::{
         SkipReason, excluded_fill_unpaged, record_skipped_fill, uncovered_excluded_fills,
@@ -3138,10 +3578,12 @@ mod tests {
                 ctx.chains.hedged().map(|hedged| &hedged.assets),
             ),
             recovery: Arc::new(tokio::sync::OnceCell::new()),
+            process_tx: Arc::new(tokio::sync::OnceCell::new()),
             resume_lock: Arc::new(ResumeLock(Mutex::new(()))),
             pnl_report_admission: crate::dashboard::pnl::pnl_report_admission(),
             metrics_handle: crate::metrics::setup().expect("metrics setup"),
             health: crate::startup::HealthGate::default(),
+            detached_tasks: TaskTracker::new(),
         }
     }
 
@@ -6106,6 +6548,7 @@ mod tests {
             ("POST", "/liquidity-write/portfolio-snapshot/marks"),
             ("GET", "/liquidity-read/skipped-fills"),
             ("POST", "/liquidity-write/excluded-fills/base:0xabc:1/cover"),
+            ("POST", "/liquidity-write/transactions/x/process"),
         ] {
             let response = app
                 .clone()
@@ -6156,6 +6599,7 @@ mod tests {
             ("POST", "/liquidity-write/portfolio-snapshot/marks"),
             ("GET", "/liquidity-read/skipped-fills"),
             ("POST", "/liquidity-write/excluded-fills/base:0xabc:1/cover"),
+            ("POST", "/liquidity-write/transactions/x/process"),
         ] {
             let response = app
                 .clone()
@@ -6343,6 +6787,169 @@ mod tests {
         assert_eq!(
             parsed["error"],
             "unknown direction: sideways (expected alpaca_to_base or base_to_alpaca)"
+        );
+    }
+
+    /// Recovery stub: the 503-cannot-quiesce route tests refuse at the driver
+    /// pause before the recheck runs, so a call here would mean the gate was
+    /// bypassed. It returns a benign outcome (not a panic) so that a test can
+    /// distinguish "quiesced first" (503) from "ran the recheck" (200) if the
+    /// gate call is ever removed.
+    struct LeftUnchangedUsdcRecheck;
+
+    #[async_trait]
+    impl RecheckUsdcDeposit for LeftUnchangedUsdcRecheck {
+        async fn recheck_deposit(
+            &self,
+            _id: &UsdcRebalanceId,
+        ) -> Result<RecheckOutcome, UsdcRecheckError> {
+            Ok(RecheckOutcome::LeftUnchanged)
+        }
+    }
+
+    /// Builds an `AppState` with a published recovery handle whose USDC driver
+    /// pause is returned alongside its gate, so a test can hold an execution
+    /// in flight and drive the two operator routes through their real quiesce
+    /// call. The heavy handle dependencies are never touched on the 503 path
+    /// (the route refuses at the pause), but must exist to construct the handle.
+    async fn recovery_state_with_driver_pause() -> (AppState, UsdcDriverGate) {
+        let ctx = create_test_ctx_with_order_owner(Address::ZERO);
+        let state = empty_app_state(ctx).await;
+
+        let services = EquityTransferServices::panicking();
+        let (mint_store, _) = StoreBuilder::<TokenizedEquityMint>::new(state.pool.clone())
+            .build(services.clone())
+            .await
+            .unwrap();
+        let (redemption_store, _) =
+            StoreBuilder::<crate::equity_redemption::EquityRedemption>::new(state.pool.clone())
+                .build(services.clone())
+                .await
+                .unwrap();
+        let transfer = Arc::new(CrossVenueEquityTransfer::new(
+            services,
+            mint_store.clone(),
+            redemption_store.clone(),
+        ));
+
+        let (event_sender, _) = broadcast::channel(16);
+        let rebalancing_inventory = Arc::new(BroadcastingInventory::new(
+            inventory::InventoryView::default(),
+            event_sender,
+        ));
+        let apalis_pool = crate::test_utils::setup_test_apalis_pool().await;
+        let vault_registry = Arc::new(st0x_event_sorcery::test_store::<
+            crate::vault_registry::VaultRegistry,
+        >(state.pool.clone(), ()));
+        let rebalancing_service = Arc::new(RebalancingService::new(
+            RebalancingServiceConfig {
+                poll_freshness: crate::inventory::PollFreshness::always_fresh(),
+                inventory_staleness_bound: std::time::Duration::from_secs(300),
+                allocation: st0x_config::AllocationCtx::base_test(),
+                usdc: None,
+                transfer_timeout: std::time::Duration::from_secs(60),
+                chains: std::collections::BTreeMap::from([(
+                    Chain::Base,
+                    crate::rebalancing::ChainRebalancingConfig::for_test(
+                        st0x_config::ChainAssets {
+                            equities: crate::test_utils::rebalancing_enabled_equities(&["AAPL"]),
+                            cash: None,
+                        },
+                    ),
+                )]),
+                cash_reserved: None,
+                hedge_floor: st0x_execution::HedgeFloor::default(),
+            },
+            vault_registry,
+            std::collections::BTreeMap::from([(
+                Chain::Base,
+                crate::vault_registry::VaultRegistryId {
+                    chain: Chain::Base,
+                    orderbook: Address::ZERO,
+                    owner: Address::ZERO,
+                },
+            )]),
+            rebalancing_inventory,
+            std::collections::BTreeMap::from([(
+                Chain::Base,
+                Arc::new(st0x_wrapper::MockWrapper::new()) as Arc<dyn st0x_wrapper::Wrapper>,
+            )]),
+            RebalancingSchedulers::new(&apalis_pool),
+            Arc::new(crate::alerts::LogNotifier),
+        ));
+
+        let (pause, gate) = usdc_driver_pause();
+
+        state
+            .recovery
+            .set(RecoveryHandle {
+                transfer,
+                mint_store,
+                redemption_store,
+                rebalancing_service,
+                usdc_recheck: Arc::new(LeftUnchangedUsdcRecheck),
+                usdc_driver_pause: Arc::new(pause),
+            })
+            .ok()
+            .expect("recovery cell must start empty");
+
+        (state, gate)
+    }
+
+    /// Production integration for the resume route's driver-pause call: with a
+    /// worker execution in flight the route must refuse with 503 at the pause,
+    /// before its own single-flight gates. Removing `quiesce_usdc_driver` from
+    /// the route lets it fall through to `resume_usdc_transfer`, which 404s an
+    /// unknown id, failing this 503 assertion.
+    #[tokio::test]
+    async fn resume_usdc_route_returns_503_when_driver_cannot_quiesce() {
+        let (state, gate) = recovery_state_with_driver_pause().await;
+        let _executing = gate.enter().await;
+        // Pause the clock only after the DB pools are built, so the quiesce
+        // window's 5-second timer auto-advances without a real wait while the
+        // held execution keeps the driver from quiescing.
+        tokio::time::pause();
+        let id = uuid::Uuid::new_v4();
+
+        let Err((status, Json(body))) = resume_usdc_transfer(
+            State(state),
+            Path(("base_to_alpaca".to_string(), id.to_string())),
+        )
+        .await
+        else {
+            panic!("the resume route must refuse while a transfer is executing");
+        };
+
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            body.error,
+            "A USDC transfer is executing; retry once it is not in flight"
+        );
+    }
+
+    /// Sibling of the resume test for the recheck route. Removing the route's
+    /// `quiesce_usdc_driver` call lets it run the recheck (a 200
+    /// `left_unchanged`), failing this 503 assertion.
+    #[tokio::test]
+    async fn recheck_usdc_route_returns_503_when_driver_cannot_quiesce() {
+        let (state, gate) = recovery_state_with_driver_pause().await;
+        let _executing = gate.enter().await;
+        tokio::time::pause();
+        let id = uuid::Uuid::new_v4();
+
+        let Err((status, Json(body))) = recheck_transfer(
+            State(state),
+            Path(("usdc_bridge".to_string(), id.to_string())),
+        )
+        .await
+        else {
+            panic!("the recheck route must refuse while a transfer is executing");
+        };
+
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            body.error,
+            "A USDC transfer is executing; retry once it is not in flight"
         );
     }
 
@@ -7183,15 +7790,45 @@ mod tests {
     }
 
     #[test]
-    fn operator_error_maps_rejection_to_400_and_operational_to_500() {
-        assert_eq!(
-            ops_operator_error(OperatorError::Rejected(RejectionReason::BlankReason)).0,
-            StatusCode::BAD_REQUEST
-        );
-        assert_eq!(
-            ops_operator_error(OperatorError::Operational(anyhow::anyhow!("db down"))).0,
-            StatusCode::INTERNAL_SERVER_ERROR
-        );
+    fn operator_error_maps_each_variant_to_its_status() {
+        fn mismatch() -> process_tx::PreflightReservationMismatch {
+            process_tx::PreflightReservationMismatch::SellReservedOtherSymbol {
+                symbol: Symbol::new("AAPL").unwrap(),
+                reserved: Symbol::new("MSTR").unwrap(),
+            }
+        }
+
+        type MakeError = fn() -> OperatorError;
+        let cases: [(MakeError, StatusCode, String); 3] = [
+            (
+                || OperatorError::Rejected(RejectionReason::BlankReason),
+                StatusCode::BAD_REQUEST,
+                RejectionReason::BlankReason.to_string(),
+            ),
+            (
+                || OperatorError::Operational(anyhow::anyhow!("db down")),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Operator write command failed".to_string(),
+            ),
+            (
+                || OperatorError::PreflightReservationMismatch(mismatch()),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                // The body carries the typed mismatch reason, not a generic message.
+                mismatch().to_string(),
+            ),
+        ];
+
+        for (error, expected_status, expected_body) in cases {
+            // The logging mapping and the unlogged one the process-tx route uses
+            // must render every variant identically.
+            for (status, Json(body)) in [
+                ops_operator_error(error()),
+                operator_error_response(error()),
+            ] {
+                assert_eq!(status, expected_status);
+                assert_eq!(body.error, expected_body);
+            }
+        }
     }
 
     #[test]
@@ -7827,5 +8464,824 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(error.0, StatusCode::BAD_REQUEST);
+    }
+
+    /// A fill kept out of hedging must reach the operator with its cover
+    /// detail, whether this run excluded it or an earlier one did.
+    #[test]
+    fn process_tx_response_serializes_the_exclusion_outcomes() {
+        let cases = [
+            (
+                ProcessTxOutcome::ExcludedFromHedging {
+                    symbol: Symbol::new("AAPL").unwrap(),
+                    chain: Chain::Base,
+                    detail: "cover by SELL".to_string(),
+                    instructions: "record the cover".to_string(),
+                },
+                serde_json::json!({
+                    "fill": null,
+                    "outcome": "excluded_from_hedging",
+                    "symbol": "AAPL",
+                    "chain": "base",
+                    "detail": "cover by SELL",
+                    "instructions": "record the cover",
+                }),
+            ),
+            (
+                ProcessTxOutcome::AlreadyExcluded {
+                    detail: "cover by SELL".to_string(),
+                    instructions: "record the cover".to_string(),
+                },
+                serde_json::json!({
+                    "fill": null,
+                    "outcome": "already_excluded",
+                    "detail": "cover by SELL",
+                    "instructions": "record the cover",
+                }),
+            ),
+        ];
+
+        for (outcome, expected) in cases {
+            let report = ProcessTxReport {
+                fill: None,
+                outcome,
+            };
+            assert_eq!(
+                serde_json::to_value(ProcessTxResponse::try_from(report).unwrap()).unwrap(),
+                expected,
+            );
+        }
+    }
+
+    /// Every domain report must retain its fill identity and outcome across the API boundary.
+    #[test]
+    fn process_tx_response_serializes_each_mapped_outcome() {
+        let tx_hash = TxHash::repeat_byte(0x11);
+        let fill = || crate::test_utils::process_tx_fill_fixture(tx_hash, "AAPL");
+        let fill_json = serde_json::json!({
+            "tx_hash": tx_hash.to_string(),
+            "log_index": 7,
+            "symbol": "AAPL",
+            "direction": "sell",
+            "quantity": "1.5",
+            "price": "123.45",
+        });
+        let mut cases: Vec<(ProcessTxReport, serde_json::Value)> = vec![
+            (
+                ProcessTxReport {
+                    fill: None,
+                    outcome: ProcessTxOutcome::NoTradeableEvents,
+                },
+                serde_json::json!({
+                    "fill": null,
+                    "outcome": "no_tradeable_events",
+                }),
+            ),
+            (
+                ProcessTxReport {
+                    fill: None,
+                    outcome: ProcessTxOutcome::TransactionNotFound {
+                        tx_hash: TxHash::repeat_byte(0x22),
+                        chain: Chain::Ethereum,
+                    },
+                },
+                serde_json::json!({
+                    "fill": null,
+                    "outcome": "transaction_not_found",
+                    "tx_hash": TxHash::repeat_byte(0x22).to_string(),
+                    "chain": "ethereum",
+                }),
+            ),
+            (
+                ProcessTxReport {
+                    fill: Some(fill()),
+                    outcome: ProcessTxOutcome::AlreadyAccounted,
+                },
+                serde_json::json!({
+                    "fill": fill_json,
+                    "outcome": "already_accounted",
+                }),
+            ),
+            (
+                ProcessTxReport {
+                    fill: Some(fill()),
+                    outcome: ProcessTxOutcome::PendingHedgeInFlight,
+                },
+                serde_json::json!({
+                    "fill": fill_json,
+                    "outcome": "pending_hedge_in_flight",
+                }),
+            ),
+            (
+                ProcessTxReport {
+                    fill: Some(fill()),
+                    outcome: ProcessTxOutcome::BelowExecutionThreshold,
+                },
+                serde_json::json!({
+                    "fill": fill_json,
+                    "outcome": "below_execution_threshold",
+                }),
+            ),
+            (
+                ProcessTxReport {
+                    fill: Some(fill()),
+                    outcome: ProcessTxOutcome::PlacementRejected {
+                        symbol: Symbol::new("AAPL").unwrap(),
+                    },
+                },
+                serde_json::json!({
+                    "fill": fill_json,
+                    "outcome": "placement_rejected",
+                    "symbol": "AAPL",
+                }),
+            ),
+        ];
+
+        for (disposition, wire) in [
+            (PlacedHedgeDisposition::InFlight, "in_flight"),
+            (PlacedHedgeDisposition::Finalized, "finalized"),
+        ] {
+            cases.push((
+                ProcessTxReport {
+                    fill: Some(fill()),
+                    outcome: ProcessTxOutcome::HedgePlaced {
+                        symbol: Symbol::new("AAPL").unwrap(),
+                        offchain_order_id: OffchainOrderId::from_uuid(uuid!(
+                            "11111111-1111-4111-8111-111111111111"
+                        )),
+                        shares: Positive::new(FractionalShares::new(float!(1.5))).unwrap(),
+                        direction: st0x_execution::Direction::Buy,
+                        disposition,
+                    },
+                },
+                serde_json::json!({
+                    "fill": fill_json,
+                    "outcome": "hedge_placed",
+                    "symbol": "AAPL",
+                    "offchain_order_id": "11111111-1111-4111-8111-111111111111",
+                    "shares": "1.5",
+                    "direction": "buy",
+                    "disposition": wire,
+                }),
+            ));
+        }
+
+        cases.push((
+            ProcessTxReport {
+                fill: Some(fill()),
+                outcome: ProcessTxOutcome::PreflightDeferred {
+                    symbol: Symbol::new("AAPL").unwrap(),
+                    reason: "market closed".to_string(),
+                },
+            },
+            serde_json::json!({
+                "fill": fill_json,
+                "outcome": "preflight_deferred",
+                "symbol": "AAPL",
+                "reason": "market closed",
+            }),
+        ));
+
+        cases.push((
+            ProcessTxReport {
+                fill: Some(fill()),
+                outcome: ProcessTxOutcome::HedgePlacementCleared {
+                    symbol: Symbol::new("AAPL").unwrap(),
+                },
+            },
+            serde_json::json!({
+                "fill": fill_json,
+                "outcome": "hedge_placement_cleared",
+                "symbol": "AAPL",
+            }),
+        ));
+
+        cases.push((
+            ProcessTxReport {
+                fill: Some(fill()),
+                outcome: ProcessTxOutcome::HedgePlacementDeferred {
+                    symbol: Symbol::new("AAPL").unwrap(),
+                },
+            },
+            serde_json::json!({
+                "fill": fill_json,
+                "outcome": "hedge_placement_deferred",
+                "symbol": "AAPL",
+            }),
+        ));
+
+        cases.push((
+            ProcessTxReport {
+                fill: Some(fill()),
+                outcome: ProcessTxOutcome::PendingHedgeDeferred {
+                    symbol: Symbol::new("AAPL").unwrap(),
+                    offchain_order_id: OffchainOrderId::from_uuid(uuid!(
+                        "22222222-2222-4222-8222-222222222222"
+                    )),
+                },
+            },
+            serde_json::json!({
+                "fill": fill_json,
+                "outcome": "pending_hedge_deferred",
+                "symbol": "AAPL",
+                "offchain_order_id": "22222222-2222-4222-8222-222222222222",
+            }),
+        ));
+
+        for (report, expected) in cases {
+            assert_eq!(
+                serde_json::to_value(ProcessTxResponse::try_from(report).unwrap()).unwrap(),
+                expected,
+            );
+        }
+    }
+
+    /// `OrderPlacer` whose market placement parks on a `Notify`: it signals that
+    /// the broker call has begun, waits to be released, then signals that it
+    /// completed. Driving `process_transaction`'s placement through this lets a
+    /// test abort the request future mid-placement and prove the broker call
+    /// still runs to completion.
+    struct ParkedOrderPlacer {
+        started: Arc<Notify>,
+        release: Arc<Notify>,
+        finished: Arc<Notify>,
+    }
+
+    #[async_trait]
+    impl OrderPlacer for ParkedOrderPlacer {
+        async fn place_market_order(
+            &self,
+            order: MarketOrder,
+        ) -> Result<OrderPlacementResult, Box<dyn std::error::Error + Send + Sync>> {
+            self.started.notify_one();
+            self.release.notified().await;
+            self.finished.notify_one();
+            Ok(OrderPlacementResult {
+                executor_order_id: ExecutorOrderId::new("parked-broker-order-id"),
+                placed_shares: order.shares,
+                placed_at: Utc::now(),
+                is_extended_hours: false,
+                limit_price: None,
+            })
+        }
+
+        async fn place_limit_order(
+            &self,
+            _order: LimitOrder,
+        ) -> Result<OrderPlacementResult, Box<dyn std::error::Error + Send + Sync>> {
+            panic!("process-tx market hedge must not place a limit order")
+        }
+
+        async fn cancel_order(
+            &self,
+            _executor_order_id: &ExecutorOrderId,
+        ) -> Result<CancellationOutcome, Box<dyn std::error::Error + Send + Sync>> {
+            panic!("process-tx placement must not cancel")
+        }
+
+        async fn preflight_counter_trade_with_reserved_buying_power(
+            &self,
+            order: MarketOrder,
+            _reserved: BuyingPowerReservationCents,
+        ) -> Result<CounterTradePreflight, Box<dyn std::error::Error + Send + Sync>> {
+            Ok(reserving_counter_trade_preflight(&order))
+        }
+    }
+
+    /// A `TakeOrderV3` fill in `tx_hash` against the bot's own order
+    /// (`get_test_order`), with the equity token on the input leg and USDC on
+    /// the output leg, so the decoder classifies a 1 share onchain BUY of AAPL at
+    /// 150 USDC; the opposite hedge is a market SELL. Returns a provider mocked
+    /// to answer the transaction receipt, a symbol cache seeded for the order's
+    /// tokens, and a context whose primary chain points at the fill's orderbook
+    /// and enables AAPL for trading.
+    fn aapl_buy_fill_fixture(
+        tx_hash: TxHash,
+    ) -> (
+        impl alloy::providers::Provider + Clone + 'static,
+        SymbolCache,
+        Ctx,
+    ) {
+        let orderbook = address!("0x1111111111111111111111111111111111111111");
+        let take_order = TakeOrderV3 {
+            sender: address!("0x2222222222222222222222222222222222222222"),
+            config: TakeOrderConfigV4 {
+                order: get_test_order(),
+                inputIOIndex: U256::from(1),
+                outputIOIndex: U256::from(0),
+                signedContext: vec![SignedContextV1 {
+                    signer: Address::ZERO,
+                    signature: Vec::new().into(),
+                    context: Vec::new(),
+                }],
+            },
+            input: Float::from_fixed_decimal_lossy(uint!(150_U256), 0)
+                .unwrap()
+                .0
+                .get_inner(),
+            output: Float::from_fixed_decimal_lossy(uint!(1_U256), 0)
+                .unwrap()
+                .0
+                .get_inner(),
+        };
+        let orderbook_log = Log {
+            inner: alloy::primitives::Log {
+                address: orderbook,
+                data: take_order.to_log_data(),
+            },
+            block_hash: None,
+            block_number: None,
+            block_timestamp: Some(1_700_000_000),
+            transaction_hash: Some(tx_hash),
+            transaction_index: None,
+            log_index: Some(7),
+            removed: false,
+        };
+        let receipt = serde_json::json!({
+            "transactionHash": tx_hash,
+            "transactionIndex": "0x1",
+            "blockHash": "0x1234567890123456789012345678901234567890123456789012345678901234",
+            "blockNumber": "0x2a",
+            "from": "0x1234567890123456789012345678901234567890",
+            "to": orderbook,
+            "gasUsed": "0x5208",
+            "effectiveGasPrice": "0x77359400",
+            "cumulativeGasUsed": "0x5208",
+            "status": "0x1",
+            "type": "0x2",
+            "logsBloom": format!("0x{}", "0".repeat(512)),
+            "logs": [orderbook_log]
+        });
+        let asserter = Asserter::new();
+        asserter.push_success(&receipt);
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+
+        let cache = SymbolCache::default();
+        seed_get_test_order_token_symbols(&cache);
+
+        let mut ctx = create_test_ctx_with_order_owner(get_test_order().owner);
+        ctx.chains.primary_mut().orderbook = orderbook;
+        ctx.chains.primary_mut().assets.equities.symbols.insert(
+            Symbol::new("AAPL").unwrap(),
+            crate::test_utils::trading_enabled_equity(),
+        );
+
+        (provider, cache, ctx)
+    }
+
+    /// A `ProcessTxHandle` over standalone stores for `ctx`, with a fresh
+    /// submission lock, the test poll queue and interval, and no wired
+    /// providers (the seam tests pass their provider directly).
+    async fn process_tx_handle(
+        pool: &SqlitePool,
+        apalis_pool: &apalis_sqlite::SqlitePool,
+        ctx: &Ctx,
+        order_placer: Arc<dyn OrderPlacer>,
+    ) -> ProcessTxHandle {
+        let stores = ProcessTxStores::standalone(pool, ctx, Arc::clone(&order_placer))
+            .await
+            .expect("standalone stores must build");
+        ProcessTxHandle {
+            order_placer,
+            counter_trade_submission_lock: Arc::new(Mutex::new(())),
+            stores,
+            poll_status_queue: PollOrderStatusJobQueue::new(apalis_pool),
+            poll_interval: TEST_POLL_INTERVAL,
+            providers: std::collections::BTreeMap::new(),
+        }
+    }
+
+    /// Aborting the HTTP request future after the broker placement has begun
+    /// must NOT cancel that placement: `process_transaction` runs the process-tx
+    /// workload on a detached task, so a live broker order completes even when
+    /// nobody awaits the response. This drives the `spawn_and_join_process_tx`
+    /// seam (a mocked provider decodes a tradeable fill, and the
+    /// `ProcessTxHandle` carries an `OrderPlacer` parked on a `Notify`), aborts
+    /// the request once placement has begun, and asserts the placement still
+    /// finishes and that the detached task records its own outcome. Awaiting
+    /// the workload inline instead of the tracked `detached_tasks.spawn(...).await`
+    /// would cancel the parked placement and hang `finished`, which is the
+    /// regression this test guards.
+    #[tracing_test::traced_test]
+    #[tokio::test]
+    async fn process_tx_task_survives_request_cancellation() {
+        let (pool, apalis_pool) = setup_test_pools().await;
+
+        let started = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        let finished = Arc::new(Notify::new());
+        let order_placer: Arc<dyn OrderPlacer> = Arc::new(ParkedOrderPlacer {
+            started: Arc::clone(&started),
+            release: Arc::clone(&release),
+            finished: Arc::clone(&finished),
+        });
+
+        // The fixture's opposite hedge is a market SELL, which reaches the
+        // parked placer without a buy preflight.
+        let tx_hash =
+            fixed_bytes!("0x4545454545454545454545454545454545454545454545454545454545454545");
+        let (provider, cache, ctx) = aapl_buy_fill_fixture(tx_hash);
+        let trading_chain = ctx.chains.primary().clone();
+
+        let handle = process_tx_handle(&pool, &apalis_pool, &ctx, order_placer).await;
+
+        let request = tokio::spawn(async move {
+            spawn_and_join_process_tx(
+                tx_hash,
+                ctx,
+                pool,
+                trading_chain,
+                provider,
+                cache,
+                &handle,
+                &TaskTracker::new(),
+            )
+            .await
+        });
+
+        tokio::time::timeout(Duration::from_secs(5), started.notified())
+            .await
+            .expect("the broker placement must begin");
+        request.abort();
+        assert!(request.await.unwrap_err().is_cancelled());
+
+        release.notify_one();
+        tokio::time::timeout(Duration::from_secs(5), finished.notified())
+            .await
+            .expect("the detached broker placement must finish after request cancellation");
+
+        // The request future was aborted before the workload finished, so the
+        // detached task's own log is the only record of what it did.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !logs_contain("process-tx finished") {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the detached run must record its outcome without a request awaiting it");
+    }
+
+    /// An operational failure from the process-tx workload maps to a 500 through
+    /// the handler seam: a failing RPC endpoint surfaces as an operational error
+    /// that `spawn_and_join_process_tx` renders as a 500.
+    #[tokio::test]
+    async fn spawn_and_join_process_tx_maps_an_operational_failure_to_500() {
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let ctx = create_test_ctx_with_order_owner(Address::ZERO);
+        let trading_chain = ctx.chains.primary().clone();
+
+        let asserter = Asserter::new();
+        asserter.push_failure_msg("connection reset by peer");
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+
+        let order_placer: Arc<dyn OrderPlacer> = crate::offchain::order::noop_order_placer();
+        let handle = process_tx_handle(&pool, &apalis_pool, &ctx, order_placer).await;
+
+        let Err((status, Json(_body))) = spawn_and_join_process_tx(
+            TxHash::repeat_byte(0x33),
+            ctx,
+            pool,
+            trading_chain,
+            provider,
+            SymbolCache::default(),
+            &handle,
+            &TaskTracker::new(),
+        )
+        .await
+        else {
+            panic!("a failing RPC endpoint must surface as an error");
+        };
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    /// Once shutdown closed the detached task tracker, a process-tx request must
+    /// refuse with 503 instead of spawning work the drain already stopped
+    /// waiting for. The mocked RPC would fail the run with a 500, so a 503 also
+    /// proves the workload never started.
+    #[tokio::test]
+    async fn spawn_and_join_process_tx_refuses_after_the_shutdown_drain_closed() {
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let ctx = create_test_ctx_with_order_owner(Address::ZERO);
+        let trading_chain = ctx.chains.primary().clone();
+        let asserter = Asserter::new();
+        asserter.push_failure_msg("connection reset by peer");
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+
+        let order_placer: Arc<dyn OrderPlacer> = crate::offchain::order::noop_order_placer();
+        let handle = process_tx_handle(&pool, &apalis_pool, &ctx, order_placer).await;
+        let detached_tasks = TaskTracker::new();
+        detached_tasks.close();
+
+        let Err((status, Json(body))) = spawn_and_join_process_tx(
+            TxHash::repeat_byte(0x34),
+            ctx,
+            pool,
+            trading_chain,
+            provider,
+            SymbolCache::default(),
+            &handle,
+            &detached_tasks,
+        )
+        .await
+        else {
+            panic!("a closed tracker must refuse the request");
+        };
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{}", body.error);
+        assert!(
+            detached_tasks.is_empty(),
+            "nothing may be spawned after the close"
+        );
+    }
+
+    /// A domain rejection from the process-tx workload maps to a 400 through the
+    /// handler seam: with the trading schedule disabled (a standalone process), a
+    /// retained pre-placement `Pending` hedge is a typed rejection that
+    /// `spawn_and_join_process_tx` renders as a 400.
+    #[tokio::test]
+    async fn spawn_and_join_process_tx_maps_a_domain_rejection_to_400() {
+        let (pool, apalis_pool) = setup_test_pools().await;
+
+        let symbol = Symbol::new("AAPL").unwrap();
+        let pending_order_id = OffchainOrderId::new();
+        // The live pipeline's retained deferred state: a position claim over a
+        // pending offchain order that rests in `Pending`, never sent.
+        seed_pending_position(&pool, &symbol, pending_order_id).await;
+        st0x_event_sorcery::send_command::<OffchainOrder>(
+            &pool,
+            &pending_order_id,
+            crate::offchain::order::OffchainOrderCommand::Place {
+                symbol: symbol.clone(),
+                shares: Positive::new(FractionalShares::new(float!(0.5))).unwrap(),
+                direction: Direction::Sell,
+                executor: SupportedExecutor::AlpacaBrokerApi,
+                client_order_id: st0x_execution::ClientOrderId::from_uuid(uuid::Uuid::new_v4()),
+                kind: crate::offchain::order::CounterTradeOrderKind::Market,
+            },
+            crate::offchain::order::noop_order_placer(),
+        )
+        .await
+        .unwrap();
+
+        let tx_hash =
+            fixed_bytes!("0x4646464646464646464646464646464646464646464646464646464646464646");
+        let (provider, cache, ctx) = aapl_buy_fill_fixture(tx_hash);
+        let trading_chain = ctx.chains.primary().clone();
+
+        let order_placer: Arc<dyn OrderPlacer> = crate::offchain::order::noop_order_placer();
+        let handle = process_tx_handle(&pool, &apalis_pool, &ctx, order_placer).await;
+        assert!(
+            !handle.stores.schedule_enabled,
+            "this context configures no trading schedule, so the stores must have it disabled"
+        );
+
+        let Err((status, Json(body))) = spawn_and_join_process_tx(
+            tx_hash,
+            ctx,
+            pool,
+            trading_chain,
+            provider,
+            cache,
+            &handle,
+            &TaskTracker::new(),
+        )
+        .await
+        else {
+            panic!("a schedule-disabled retained Pending must surface as a rejection");
+        };
+        assert_eq!(status, StatusCode::BAD_REQUEST, "body: {}", body.error);
+        assert!(
+            body.error.contains("schedule is disabled"),
+            "the 400 body must explain the schedule-disabled rejection, got: {}",
+            body.error
+        );
+    }
+
+    /// `OrderPlacer` whose placement preflight answers a sell with a buying
+    /// power reservation, the wrong reservation for a sell. Driving a sell hedge
+    /// through it forces a `PreflightReservationMismatch` so the handler seam can
+    /// be observed mapping that typed invariant to a 500.
+    struct MismatchOrderPlacer;
+
+    #[async_trait]
+    impl OrderPlacer for MismatchOrderPlacer {
+        async fn preflight_counter_trade_with_reserved_buying_power(
+            &self,
+            _order: MarketOrder,
+            _reserved: BuyingPowerReservationCents,
+        ) -> Result<CounterTradePreflight, Box<dyn std::error::Error + Send + Sync>> {
+            Ok(CounterTradePreflight::Allowed {
+                reservation: Some(CounterTradeReservation::BuyingPower {
+                    required: Positive::new(FractionalShares::new(float!(1))).unwrap(),
+                    estimated_cost_cents: 15_000,
+                    available_buying_power_cents: 100_000,
+                }),
+            })
+        }
+
+        async fn place_market_order(
+            &self,
+            _order: MarketOrder,
+        ) -> Result<OrderPlacementResult, Box<dyn std::error::Error + Send + Sync>> {
+            panic!("a mismatched preflight must fail closed before placement")
+        }
+
+        async fn place_limit_order(
+            &self,
+            _order: LimitOrder,
+        ) -> Result<OrderPlacementResult, Box<dyn std::error::Error + Send + Sync>> {
+            panic!("process-tx market hedge must not place a limit order")
+        }
+
+        async fn cancel_order(
+            &self,
+            _executor_order_id: &ExecutorOrderId,
+        ) -> Result<CancellationOutcome, Box<dyn std::error::Error + Send + Sync>> {
+            panic!("a mismatched preflight must not cancel")
+        }
+    }
+
+    /// A placement preflight reservation mismatch is an internal invariant
+    /// violation, not a bad operator request, so it must map to a 500 through
+    /// the handler seam. The 500 body must carry the typed mismatch reason
+    /// rather than the generic operational chain.
+    #[tokio::test]
+    async fn spawn_and_join_process_tx_maps_a_preflight_reservation_mismatch_to_500() {
+        let (pool, apalis_pool) = setup_test_pools().await;
+
+        let order_placer: Arc<dyn OrderPlacer> = Arc::new(MismatchOrderPlacer);
+
+        // The fixture's opposite hedge is a market SELL. The placer answers
+        // that sell's preflight with a buying power reservation, the
+        // reservation a buy would earn, so the sell fails closed.
+        let tx_hash =
+            fixed_bytes!("0x4747474747474747474747474747474747474747474747474747474747474747");
+        let (provider, cache, ctx) = aapl_buy_fill_fixture(tx_hash);
+        let trading_chain = ctx.chains.primary().clone();
+
+        let handle = process_tx_handle(&pool, &apalis_pool, &ctx, order_placer).await;
+
+        let Err((status, Json(body))) = spawn_and_join_process_tx(
+            tx_hash,
+            ctx,
+            pool,
+            trading_chain,
+            provider,
+            cache,
+            &handle,
+            &TaskTracker::new(),
+        )
+        .await
+        else {
+            panic!("a sell that received a buying power reservation must fail closed");
+        };
+        assert_eq!(
+            status,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "body: {}",
+            body.error
+        );
+        assert_eq!(
+            body.error,
+            "placement preflight for a sell of AAPL returned a buying power reservation; a sell \
+             must reserve equity inventory, so the hedge is refused",
+            "the 500 body must carry the typed mismatch reason, not the generic message"
+        );
+    }
+
+    /// A chain that is not configured as a hedged chain is an operator input
+    /// error, rejected with a 400 before any recovery work starts.
+    #[tokio::test]
+    async fn process_transaction_rejects_an_unconfigured_chain() {
+        let state = empty_app_state(create_test_ctx_with_order_owner(Address::ZERO)).await;
+
+        let (status, Json(body)) = process_transaction(
+            State(state),
+            Path(TxHash::repeat_byte(0x11).to_string()),
+            Query(ProcessTransactionQuery {
+                chain: Some(Chain::Robinhood),
+            }),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(body.error.contains("robinhood"), "got: {}", body.error);
+    }
+
+    /// Invalid transaction hashes must be rejected before any recovery work starts.
+    #[tokio::test]
+    async fn process_transaction_rejects_an_invalid_tx_hash() {
+        let state = empty_app_state(create_test_ctx_with_order_owner(Address::ZERO)).await;
+
+        let (status, Json(body)) = process_transaction(
+            State(state),
+            Path("not-a-hash".to_string()),
+            Query(ProcessTransactionQuery::default()),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(
+            body.error.contains("invalid transaction hash"),
+            "got: {}",
+            body.error
+        );
+    }
+
+    /// A live-hedge placement must wait for full startup readiness, not just the
+    /// published handle: `health.is_ready()` gates the whole supervised pipeline.
+    #[tokio::test]
+    async fn process_transaction_reports_unavailable_until_health_ready() {
+        let state = empty_app_state(create_test_ctx_with_order_owner(Address::ZERO)).await;
+        // A valid hash clears the parse guard and reaches the health gate, which
+        // empty_app_state leaves un-ready.
+        let tx_hash = TxHash::repeat_byte(0x11).to_string();
+
+        let (status, Json(body)) = process_transaction(
+            State(state),
+            Path(tx_hash),
+            Query(ProcessTransactionQuery::default()),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            body.error.contains("until startup completes"),
+            "got: {}",
+            body.error
+        );
+    }
+
+    /// Once healthy, the handle must still be published before process-tx runs;
+    /// `empty_app_state` leaves the cell unset, so the handler reports 503 at the
+    /// handle gate before it ever builds an RPC provider.
+    #[tokio::test]
+    async fn process_transaction_reports_unavailable_before_the_handle_is_published() {
+        let state = empty_app_state(create_test_ctx_with_order_owner(Address::ZERO)).await;
+        state.health.set_ready();
+        let tx_hash = TxHash::repeat_byte(0x11).to_string();
+
+        let (status, Json(body)) = process_transaction(
+            State(state),
+            Path(tx_hash),
+            Query(ProcessTransactionQuery::default()),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            body.error.contains("until the conductor finishes startup"),
+            "got: {}",
+            body.error
+        );
+    }
+
+    /// A write route must refuse with 503 while a transfer is executing, and
+    /// the refusal must leave the driver running rather than flagged paused.
+    #[tokio::test(start_paused = true)]
+    #[tracing_test::traced_test]
+    async fn quiesce_usdc_driver_returns_503_while_a_transfer_executes() {
+        let (control, gate) = usdc_driver_pause();
+        let rebalance_id = UsdcRebalanceId(uuid!("11111111-2222-3333-4444-555555555555"));
+        let direction = RebalanceDirection::BaseToAlpaca;
+        let _executing = gate.enter().await;
+
+        let Err((status, Json(body))) =
+            quiesce_usdc_driver(&control, &rebalance_id, Some(direction)).await
+        else {
+            panic!("a quiesce with an execution in flight must be refused");
+        };
+
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            body.error,
+            "A USDC transfer is executing; retry once it is not in flight"
+        );
+        assert!(
+            !gate.is_paused(),
+            "a refused quiesce must not leave the driver paused"
+        );
+        assert!(logs_contain(&format!("rebalance_id={rebalance_id}")));
+        assert!(logs_contain("resume_direction=Some(BaseToAlpaca)"));
+    }
+
+    /// With no execution in flight the route gets its guard at once, the
+    /// driver stays parked for the guard's lifetime, and dropping the guard
+    /// resumes it, so every handler exit path resumes the driver.
+    #[tokio::test]
+    async fn quiesce_usdc_driver_parks_the_driver_until_the_guard_drops() {
+        let (control, gate) = usdc_driver_pause();
+
+        let rebalance_id = UsdcRebalanceId(uuid!("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"));
+        let guard = quiesce_usdc_driver(&control, &rebalance_id, None)
+            .await
+            .unwrap();
+        assert!(gate.is_paused());
+
+        drop(guard);
+        assert!(!gate.is_paused());
     }
 }

@@ -309,6 +309,7 @@ where
 #[bon::builder]
 pub(crate) fn spawn<Prov, Exec>(
     context: ConductorCtx<Prov, Exec>,
+    counter_trade_submission_lock: Arc<tokio::sync::Mutex<()>>,
     job_queue: DexTradeAccountingJobQueue,
     backfill_queues: BackfillQueues,
     dashboard_trade_delivery_queue: DashboardTradeDeliveryJobQueue,
@@ -488,8 +489,6 @@ where
         position: context.frameworks.position.clone(),
     });
 
-    let counter_trade_submission_lock = Arc::new(tokio::sync::Mutex::new(()));
-
     // The broker placement capability, lifted out of the (now pure)
     // `OffchainOrder::Place` handler: both the rebalancing hedge job and the
     // trade-processing path place through it instead of the aggregate.
@@ -601,6 +600,8 @@ where
         poll_status_queue: poll_status_queue.clone(),
         hedge_queue: hedge_queue.clone(),
         poll_interval,
+        #[cfg(any(test, feature = "test-support"))]
+        placement_barrier: None,
     };
 
     let maintenance_interval = context.executor.maintenance_interval();
@@ -1681,7 +1682,9 @@ mod tests {
         ResumeEquityToHedging, ResumeEquityToMarketMaking,
     };
     use crate::rebalancing::trigger::{GuardGeneration, GuardState, InProgressGuard};
-    use crate::rebalancing::usdc::{ResumeAlpacaToBase, ResumeBaseToAlpaca, UsdcTransferError};
+    use crate::rebalancing::usdc::{
+        ResumeAlpacaToBase, ResumeBaseToAlpaca, UsdcDriverGate, UsdcTransferError,
+    };
     use crate::startup::StartupBarrier;
     use crate::test_utils::{setup_test_apalis_pool, setup_test_pools};
     use crate::usdc_rebalance::UsdcRebalanceId;
@@ -2580,6 +2583,7 @@ mod tests {
         let healthy_completed = Arc::new(tokio::sync::Notify::new());
         let notifier = Arc::new(CapturingNotifier::default());
         let transfer_ctx = Arc::new(TransferUsdcToHedgingCtx {
+            driver_gate: UsdcDriverGate::unpaused(),
             transfer: Arc::new(PoisonThenHealthyUsdcResume {
                 poison_id,
                 healthy_completed: healthy_completed.clone(),
@@ -2665,6 +2669,7 @@ mod tests {
         let healthy_completed = Arc::new(tokio::sync::Notify::new());
         let notifier = Arc::new(CapturingNotifier::default());
         let transfer_ctx = Arc::new(TransferUsdcToMarketMakingCtx {
+            driver_gate: UsdcDriverGate::unpaused(),
             transfer: Arc::new(PoisonThenHealthyUsdcResume {
                 poison_id,
                 healthy_completed: healthy_completed.clone(),

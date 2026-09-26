@@ -287,7 +287,7 @@ where
             // The hedged path also finishes an exclusion it finds recorded (a
             // fill excluded earlier, landing outside every disabled period on
             // this delivery). Its page may still be owed, for example after a
-            // crash before paging or an exclusion by CLI `process-tx`.
+            // crash before paging or an exclusion by `process-tx`.
             Ok(None) => {
                 self.page_if_excluded(&ctx.pool, &ctx.notifier, &paging_trade)
                     .await
@@ -812,9 +812,9 @@ pub enum TradeAccountingError {
     #[error("Buying-power reservation lookup failed: {0}")]
     BuyingPowerReservation(#[from] crate::trading::offchain::hedge::BuyingPowerReservationError),
     #[error("Broker submission lock failed: {0}")]
-    CounterTradeSubmissionLock(
-        #[from] crate::trading::offchain::hedge::CounterTradeSubmissionLockError,
-    ),
+    CounterTradeSubmissionLock(#[from] crate::database_file_lock::DatabaseFileLockError),
+    #[error("Fill accounting lock failed: {0}")]
+    FillAccountingLock(#[source] crate::database_file_lock::DatabaseFileLockError),
     #[error("Failed to reconcile broker idempotency anchor for {symbol}")]
     BrokerAnchorLookup {
         symbol: st0x_execution::Symbol,
@@ -1032,6 +1032,7 @@ impl TradeAccountingError {
             | Self::HedgeJobGuard(_)
             | Self::BuyingPowerReservation(_)
             | Self::CounterTradeSubmissionLock(_)
+            | Self::FillAccountingLock(_)
             | Self::BrokerAnchorOrderMissing { .. }
             | Self::BrokerAnchorMismatch { .. }
             | Self::BrokerAnchorMissingLimitPrice { .. } => ProcessScoped,
@@ -1140,6 +1141,8 @@ mod tests {
             poll_status_queue: crate::offchain::order::PollOrderStatusJobQueue::new(apalis_pool),
             hedge_queue: crate::trading::offchain::hedge::HedgeJobQueue::new(apalis_pool),
             poll_interval: TEST_POLL_INTERVAL,
+            #[cfg(any(test, feature = "test-support"))]
+            placement_barrier: None,
         };
 
         let job_queue = DexTradeAccountingJobQueue::new(apalis_pool);

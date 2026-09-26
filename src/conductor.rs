@@ -15,7 +15,7 @@ use alloy::providers::fillers::{
     BlobGasFiller, ChainIdFiller, FillProvider, GasFiller, JoinFill, NonceFiller,
 };
 use alloy::providers::{Identity, Provider, ProviderBuilder, RootProvider};
-use alloy::rpc::client::ClientBuilder;
+use alloy::rpc::client::{ClientBuilder, RpcClient};
 use anyhow::Context;
 use apalis::prelude::Status;
 use apalis_core::error::BoxDynError;
@@ -72,6 +72,7 @@ use crate::conductor::job::{BACKPRESSURE_RESCHEDULE_LIMIT, BackpressureStreak};
 use crate::conductor::monitor::order_fills::{CutoffProbe, probe_cutoff_block_support};
 use crate::dashboard::pnl::{LedgerHead, PnlLedger, PnlLedgerReactor};
 use crate::dashboard::{Broadcaster, DashboardTradeDelivery};
+use crate::database_file_lock::{DatabaseFileLock, acquire_database_file_lock};
 use crate::equity_redemption::{
     EquityRedemption, interrupted_redemption_ids, symbols_with_stuck_redemptions,
 };
@@ -100,6 +101,7 @@ use crate::onchain_trade::{
     OnChainTrade, OnChainTradeCommand, OnChainTradeError, OnChainTradeEvent, OnChainTradeId,
     OnChainTradeSource, SourceAttributionDecision, cover_direction,
 };
+use crate::operator::process_tx::ProcessTxStores;
 use crate::performance::HedgeLatencyProjection;
 use crate::performance::equity_timing::EquityTimingProjection;
 use crate::performance::rebalance::RebalanceTimingProjection;
@@ -123,7 +125,8 @@ use crate::rebalancing::equity::{
 use crate::rebalancing::trigger::{GUARD_GENERATION, GuardGeneration, GuardState};
 use crate::rebalancing::usdc::{
     RecheckUsdcDeposit, TransferUsdcToHedging, TransferUsdcToHedgingCtx,
-    TransferUsdcToMarketMaking, TransferUsdcToMarketMakingCtx, UsdcSettlementParams,
+    TransferUsdcToMarketMaking, TransferUsdcToMarketMakingCtx, UsdcDriverPause,
+    UsdcSettlementParams,
 };
 use crate::rebalancing::{
     BaseWallet, ChainRebalancingConfig, ChainWallets, EthereumWallet, RebalancerServices,
@@ -346,19 +349,25 @@ where
 
     rebuild_stale_offchain_order_projection(pool, &offchain_order_projection).await?;
 
-    // Startup recovery runs before any job worker starts, so no concurrent
-    // placement can race its broker re-drive -- it intentionally runs without
-    // `counter_trade_submission_lock` (which the builder constructs later). The
-    // periodic `CheckPositions` sweep, which CAN race live placements, holds the
-    // lock across the same call.
-    recover_orphaned_pending_offchain_orders(
-        position,
-        position_projection,
-        &offchain_order,
-        order_placer.as_ref(),
-        executor.to_supported_executor(),
-    )
-    .await?;
+    // Startup recovery runs before any job worker starts or the process-tx
+    // route is published, so no in-process placement can race its broker
+    // re-drive and it does not need `counter_trade_submission_lock`. A
+    // standalone process-tx CLI can still be mid placement, holding only the
+    // file lock between recording its `Pending` intent and calling the broker,
+    // so take the file lock: without it the replay would race that broker
+    // call. The periodic `CheckPositions` sweep holds both locks across the
+    // same call.
+    {
+        let _file_submission_guard = acquire_counter_trade_submission_file_lock(pool).await?;
+        recover_orphaned_pending_offchain_orders(
+            position,
+            position_projection,
+            &offchain_order,
+            order_placer.as_ref(),
+            executor.to_supported_executor(),
+        )
+        .await?;
+    }
 
     Ok((offchain_order, offchain_order_projection))
 }
@@ -465,6 +474,103 @@ pub struct TradeProcessingCqrs {
     /// still-open order) is skipped instead of forking a new
     /// self-perpetuating chain.
     pub poll_interval: Duration,
+    /// Test-only coordination hook: pauses the first placement between its
+    /// Position claim and the `OffchainOrder` creation, announces each tick
+    /// arriving at the submission lock, and signals when a racer's
+    /// reconciliation observes the pending pointer. Lets a test pin the exact
+    /// double-hedge window deterministically instead of relying on scheduler
+    /// timing. `None` in production and in tests that do not use it.
+    #[cfg(any(test, feature = "test-support"))]
+    pub placement_barrier: Option<Arc<PlacementBarrier>>,
+}
+
+/// Deterministic race harness for the placement path (see the
+/// `placement_barrier` field). The first placement to claim the Position parks
+/// at [`Self::on_first_claim`] until [`Self::release`] is signalled, holding
+/// the window open so a concurrent reconciliation is guaranteed to observe the
+/// orphan pointer it would otherwise only see under an unlucky schedule.
+///
+/// A racer announces itself at [`Self::on_submission_lock`] before contending
+/// for the lock, so a test can wait for one named tick to arrive rather than
+/// guess how long its fill accounting takes.
+#[cfg(any(test, feature = "test-support"))]
+#[derive(Default)]
+pub struct PlacementBarrier {
+    claim_fired: std::sync::atomic::AtomicBool,
+    claimed: tokio::sync::Notify,
+    release: tokio::sync::Notify,
+    saw_pending: tokio::sync::Notify,
+    submission_lock_arrivals: std::sync::Mutex<std::collections::HashSet<OnChainTradeId>>,
+    submission_lock_arrival: tokio::sync::Notify,
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl PlacementBarrier {
+    /// Called between the Position claim and the `OffchainOrder` creation. Only
+    /// the first claimer parks (a second claimer in the same test would be the
+    /// buggy double-placement and must not deadlock); it announces `claimed`
+    /// and waits for `release`.
+    async fn on_first_claim(&self) {
+        if self
+            .claim_fired
+            .swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
+            return;
+        }
+        self.claimed.notify_one();
+        self.release.notified().await;
+    }
+
+    /// Called when a reconciliation finds a pending pointer -- the orphan-misread
+    /// window a concurrent placement opens.
+    fn on_saw_pending(&self) {
+        self.saw_pending.notify_one();
+    }
+
+    /// Called by a tick that has finished accounting its fill and is about to
+    /// contend for `counter_trade_submission_lock`. Keyed by the fill so a
+    /// test waits for one specific racer rather than for whichever tick
+    /// reached the lock first.
+    fn on_submission_lock(&self, trade_id: &OnChainTradeId) {
+        self.submission_lock_arrivals
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(trade_id.clone());
+        self.submission_lock_arrival.notify_waiters();
+    }
+
+    /// Awaits the first claimer parking.
+    pub async fn wait_claimed(&self) {
+        self.claimed.notified().await;
+    }
+
+    /// Awaits a racer observing the pending pointer.
+    pub async fn wait_saw_pending(&self) {
+        self.saw_pending.notified().await;
+    }
+
+    /// Awaits the tick hedging `trade_id` reaching the submission lock. The
+    /// arrival is recorded before the wait registers, so an arrival that has
+    /// already happened returns immediately instead of hanging.
+    pub async fn wait_submission_lock(&self, trade_id: &OnChainTradeId) {
+        loop {
+            let arrival = self.submission_lock_arrival.notified();
+            if self
+                .submission_lock_arrivals
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains(trade_id)
+            {
+                return;
+            }
+            arrival.await;
+        }
+    }
+
+    /// Releases the parked claimer.
+    pub fn release(&self) {
+        self.release.notify_one();
+    }
 }
 
 /// Orchestrates the bot's runtime by composing long-running supervised tasks
@@ -741,7 +847,7 @@ where
 /// Provider type returned by `ProviderBuilder::new().connect_client(...)` over
 /// an HTTP transport. Named here to make `setup_instrumentation`'s return type
 /// concrete without coupling callers to `alloy` internals.
-type HttpProvider = FillProvider<
+pub(crate) type HttpProvider = FillProvider<
     JoinFill<
         Identity,
         JoinFill<GasFiller, JoinFill<BlobGasFiller, JoinFill<NonceFiller, ChainIdFiller>>>,
@@ -749,8 +855,11 @@ type HttpProvider = FillProvider<
     RootProvider,
 >;
 
-/// Bounds for the primary chain RPC transport. A hung endpoint that accepts
-/// the connection and never responds otherwise parks every await that runs
+/// Bounds for every chain RPC transport: the primary, each hedged secondary,
+/// and the `process-tx` CLI's provider.
+///
+/// A hung endpoint that accepts the connection and never responds otherwise
+/// parks every await that runs
 /// through this provider (the fill poll loop, backfill, and all read-only
 /// contract calls) with no error surfaced (RAI-2218). 30s accommodates the
 /// heavy eth_getLogs range scans backfill issues; the wallet transport uses
@@ -768,13 +877,11 @@ fn hedged_secondaries(ctx: &Ctx) -> Vec<HedgedChain> {
         .collect()
 }
 
-/// An HTTP provider whose transport is wrapped by the telemetry layer (every
-/// JSON-RPC call from any handle is timed) and bounded by the RPC timeouts,
-/// so a hung endpoint surfaces as an error instead of a silent park.
-fn bounded_http_provider(
-    rpc_url: &Url,
-    telemetry: &TelemetrySender,
-) -> anyhow::Result<HttpProvider> {
+/// The HTTP transport every chain RPC client shares, bounded by the RPC
+/// timeouts, paired with whether the endpoint looks local.
+fn bounded_http_transport(
+    rpc_url: Url,
+) -> anyhow::Result<(alloy::transports::http::Http<reqwest::Client>, bool)> {
     let http_client = reqwest::Client::builder()
         .connect_timeout(RPC_CONNECT_TIMEOUT)
         .timeout(RPC_REQUEST_TIMEOUT)
@@ -783,7 +890,27 @@ fn bounded_http_provider(
     // Same heuristic ClientBuilder::http applies, so local nodes keep
     // alloy's faster polling defaults.
     let is_local = alloy::transports::utils::guess_local_url(rpc_url.as_str());
-    let transport = alloy::transports::http::Http::with_client(http_client, rpc_url.clone());
+    let transport = alloy::transports::http::Http::with_client(http_client, rpc_url);
+
+    Ok((transport, is_local))
+}
+
+/// An RPC client over the bounded HTTP transport without the telemetry layer,
+/// for the `process-tx` CLI, which has no telemetry writer.
+pub fn bounded_rpc_client(rpc_url: Url) -> anyhow::Result<RpcClient> {
+    let (transport, is_local) = bounded_http_transport(rpc_url)?;
+
+    Ok(ClientBuilder::default().transport(transport, is_local))
+}
+
+/// An HTTP provider whose transport is wrapped by the telemetry layer (every
+/// JSON-RPC call from any handle is timed) and bounded by the RPC timeouts,
+/// so a hung endpoint surfaces as an error instead of a silent park.
+fn bounded_http_provider(
+    rpc_url: &Url,
+    telemetry: &TelemetrySender,
+) -> anyhow::Result<HttpProvider> {
+    let (transport, is_local) = bounded_http_transport(rpc_url.clone())?;
     let rpc_client = ClientBuilder::default()
         .layer(RpcTelemetryLayer::new(telemetry.clone()))
         .transport(transport, is_local);
@@ -866,6 +993,7 @@ fn publish_recovery_handle(
     redemption_store: Arc<Store<EquityRedemption>>,
     rebalancing_service: Arc<RebalancingService>,
     usdc_recheck: Arc<dyn RecheckUsdcDeposit>,
+    usdc_driver_pause: Arc<UsdcDriverPause>,
 ) {
     let _ = recovery_cell.set(crate::api::RecoveryHandle {
         transfer,
@@ -873,17 +1001,43 @@ fn publish_recovery_handle(
         redemption_store,
         rebalancing_service,
         usdc_recheck,
+        usdc_driver_pause,
+    });
+}
+
+/// Publishes the process-tx handle backing the in-bot process-tx route, set
+/// after startup so the endpoint returns 503 until the conductor is ready. A
+/// losing `set` race is ignored: the cell is written once per boot, so an
+/// already populated cell holds an equivalent handle.
+fn publish_process_tx_handle(
+    process_tx_cell: &tokio::sync::OnceCell<crate::api::ProcessTxHandle>,
+    order_placer: Arc<dyn OrderPlacer>,
+    counter_trade_submission_lock: Arc<Mutex<()>>,
+    stores: ProcessTxStores,
+    poll_status_queue: PollOrderStatusJobQueue,
+    poll_interval: Duration,
+    providers: BTreeMap<Chain, HttpProvider>,
+) {
+    let _ = process_tx_cell.set(crate::api::ProcessTxHandle {
+        order_placer,
+        counter_trade_submission_lock,
+        stores,
+        poll_status_queue,
+        poll_interval,
+        providers,
     });
 }
 
 /// Handles the conductor shares with the axum server's `AppState`: the
 /// dashboard event stream, the broadcasting inventory, the recovery cell the
-/// conductor populates for `/transfers/resume`, and the PnL ledger whose
-/// ingestion both sides drive.
+/// conductor populates for `/transfers/resume`, the process-tx cell the
+/// conductor populates for the in bot process-tx route, and the PnL ledger
+/// whose ingestion both sides drive.
 pub(crate) struct ServerHandles {
     pub(crate) event_sender: broadcast::Sender<Statement>,
     pub(crate) inventory: Arc<BroadcastingInventory>,
     pub(crate) recovery_cell: Arc<tokio::sync::OnceCell<crate::api::RecoveryHandle>>,
+    pub(crate) process_tx_cell: Arc<tokio::sync::OnceCell<crate::api::ProcessTxHandle>>,
     pub(crate) pnl_ledger: Arc<PnlLedger>,
 }
 
@@ -908,6 +1062,10 @@ async fn setup_trading_schedule(
 }
 
 impl Conductor {
+    // `run` is the bot's startup wiring: it threads the store, queue, and
+    // rebalancing setup values into the conductor builder in one place.
+    // Extracting a phase moves those values through a helper struct without
+    // reducing complexity, so it stays one function.
     #[allow(clippy::too_many_lines)]
     pub(crate) async fn run<E>(
         executor_ctx: impl TryIntoExecutor<Executor = E>,
@@ -920,6 +1078,7 @@ impl Conductor {
             event_sender,
             inventory,
             recovery_cell,
+            process_tx_cell,
             pnl_ledger,
         }: ServerHandles,
         shutdown_token: CancellationToken,
@@ -934,8 +1093,18 @@ impl Conductor {
     {
         let (executor, provider, watch_providers, telemetry_writer, telemetry) =
             setup_instrumentation(executor_ctx, &ctx, pool.clone()).await?;
+        // The in-bot process-tx route reads fills through these bounded,
+        // instrumented providers instead of building a transport per request.
+        let process_tx_providers: BTreeMap<Chain, HttpProvider> =
+            std::iter::once((ctx.chains.primary().chain, provider.clone()))
+                .chain(watch_providers.clone())
+                .collect();
 
         let cache = SymbolCache::default();
+
+        // Shared with every placement path so the in-bot process-tx route
+        // serializes its broker submission against live hedging (ADR 0014).
+        let counter_trade_submission_lock = Arc::new(Mutex::new(()));
 
         let (job_queue, backfill_queues, dashboard_delivery, schedulers) =
             setup_apalis_queues(&pool, &apalis_pool, event_sender, &ctx.chains).await?;
@@ -988,6 +1157,7 @@ impl Conductor {
             service: rebalancing_service,
             recovery_transfer,
             usdc_recheck,
+            usdc_driver_pause,
             wrapped_equity_recovery_store,
             unwrapped_equity_recovery_store,
             mint_store,
@@ -1024,6 +1194,20 @@ impl Conductor {
         let startup_policy =
             CloseFlattenPolicy::from_secs(ctx.extended_hours_close_flatten_window_secs)?
                 .with_schedule(trading_schedule.clone());
+        // The same flag, derived from config, that the offline CLI computes for its
+        // standalone stores, so both processes classify a retained Pending
+        // hedge identically. Read here because `startup_policy` is moved into
+        // the placer and offchain store below.
+        let process_tx_schedule_enabled = crate::trading_schedule::schedule_enabled(&ctx);
+
+        // Built from the same `startup_policy` as the conductor's own placer so
+        // the in-bot process-tx route runs `recover_order_by_client_id` and the
+        // session-eligibility gate before placing, rather than shortcutting to
+        // `New`.
+        let process_tx_order_placer: Arc<dyn OrderPlacer> = Arc::new(ExecutorOrderPlacer {
+            executor: executor.clone(),
+            close_flatten_policy: Some(startup_policy.clone()),
+        });
         let (offchain_order, offchain_order_projection) = setup_offchain_order_store(
             &pool,
             &executor,
@@ -1045,6 +1229,16 @@ impl Conductor {
             vault_registry,
             snapshot,
             portfolio_snapshot,
+        };
+
+        // The in-bot process-tx route writes through these wired stores so the
+        // fill's events reach the running reactors, not a detached copy.
+        let process_tx_stores = ProcessTxStores {
+            onchain_trade: frameworks.onchain_trade.clone(),
+            position: frameworks.position.clone(),
+            position_projection: frameworks.position_projection.clone(),
+            offchain_order: frameworks.offchain_order.clone(),
+            schedule_enabled: process_tx_schedule_enabled,
         };
 
         let TradingJobQueues {
@@ -1076,6 +1270,12 @@ impl Conductor {
             ctx.order_polling_interval(),
         )
         .await?;
+
+        // Clone before the builder consumes `poll_status_queue`: the in-bot
+        // process-tx route enrolls a submitted hedge for status polling on the
+        // same queue and interval the trading loop uses.
+        let process_tx_poll_status_queue = poll_status_queue.clone();
+        let process_tx_poll_interval = ctx.order_polling_interval();
 
         let job_cleanup = spawn_finished_job_cleanup(
             pool.clone(),
@@ -1123,6 +1323,7 @@ impl Conductor {
 
         let conductor = builder::spawn()
             .context(conductor_ctx)
+            .counter_trade_submission_lock(counter_trade_submission_lock.clone())
             .job_queue(job_queue)
             .backfill_queues(backfill_queues)
             .dashboard_trade_delivery_queue(dashboard_delivery.queue)
@@ -1172,6 +1373,17 @@ impl Conductor {
             recovery_redemption_store,
             recovery_service,
             usdc_recheck,
+            usdc_driver_pause,
+        );
+
+        publish_process_tx_handle(
+            &process_tx_cell,
+            process_tx_order_placer,
+            counter_trade_submission_lock,
+            process_tx_stores,
+            process_tx_poll_status_queue,
+            process_tx_poll_interval,
+            process_tx_providers,
         );
 
         conductor
@@ -1741,6 +1953,9 @@ struct RebalancingInfrastructure {
     /// Operator `transfer recheck` entry point for a failed USDC deposit,
     /// published on the recovery handle.
     usdc_recheck: Arc<dyn RecheckUsdcDeposit>,
+    /// Operator pause control for the USDC driver, published on the recovery
+    /// handle so a write route can quiesce the workers before it mutates.
+    usdc_driver_pause: Arc<UsdcDriverPause>,
     wrapped_equity_recovery_store: Arc<Store<WrappedEquityRecovery>>,
     unwrapped_equity_recovery_store: Arc<Store<UnwrappedEquityRecovery>>,
     mint_store: Arc<Store<TokenizedEquityMint>>,
@@ -1785,6 +2000,7 @@ struct PositionAndRebalancing {
     service: Arc<RebalancingService>,
     recovery_transfer: Arc<CrossVenueEquityTransfer>,
     usdc_recheck: Arc<dyn RecheckUsdcDeposit>,
+    usdc_driver_pause: Arc<UsdcDriverPause>,
     wrapped_equity_recovery_store: Arc<Store<WrappedEquityRecovery>>,
     unwrapped_equity_recovery_store: Arc<Store<UnwrappedEquityRecovery>>,
     mint_store: Arc<Store<TokenizedEquityMint>>,
@@ -1997,6 +2213,7 @@ impl PositionAndRebalancing {
             service: infra.service,
             recovery_transfer: infra.recovery_transfer,
             usdc_recheck: infra.usdc_recheck,
+            usdc_driver_pause: infra.usdc_driver_pause,
             wrapped_equity_recovery_store: infra.wrapped_equity_recovery_store,
             unwrapped_equity_recovery_store: infra.unwrapped_equity_recovery_store,
             mint_store: infra.mint_store,
@@ -2987,7 +3204,9 @@ fn build_transfer_gas_readiness<Signer: Wallet + Clone>(
 
 /// Builds the trigger service from the validated rebalancing config plus the
 /// conductor-owned dependencies (the trigger config is the runtime projection
-/// of `RebalancingCtx` onto every hedged chain's asset table).
+/// of `RebalancingCtx` onto every hedged chain's asset table). The service owns
+/// the USDC driver pause: its gate is shared with the USDC workers and its
+/// controller is published for operator write routes.
 fn build_rebalancing_service(
     rebalancing_ctx: &RebalancingCtx,
     deps: &RebalancingDeps,
@@ -3176,6 +3395,89 @@ fn build_hedged_equity_services<Signer: Wallet + Clone + 'static>(
     })
 }
 
+/// The primary chain's rebalancing services, and the shared handles the rest
+/// of the rebalancing wiring hangs off, once the startup preflights have
+/// passed.
+struct PrimaryRebalancingServices<Signer: Wallet> {
+    primary_chain: Chain,
+    market_maker_wallet: Address,
+    gas_readiness: Arc<GasReadiness>,
+    bot_gas_enqueuer: BotGasReceiptCostEnqueuer,
+    raindex_service: Arc<RaindexService<Signer>>,
+    tokenizer: Arc<dyn Tokenizer>,
+    mint_authorization: MintAuthorizationInfra,
+}
+
+/// Resolves the primary chain's equity leg -- the rebalancer, the recovery
+/// jobs and the resume paths all run on it -- builds the handles the rest of
+/// the rebalancing wiring shares, and runs the startup preflights that gate
+/// them: inventory access, the stale-allowance revoke and tokenization.
+/// Nothing downstream is built until those pass.
+async fn build_primary_rebalancing_services<Signer: Wallet + Clone>(
+    deps: &RebalancingDeps,
+    tokenizations: &BTreeMap<Chain, ChainTokenization<Signer>>,
+    wallets: &ChainWallets<Signer>,
+) -> anyhow::Result<PrimaryRebalancingServices<Signer>> {
+    let primary_chain = deps.ctx.chains.primary().chain;
+    let primary = tokenizations.get(&primary_chain).with_context(|| {
+        format!("no tokenization services were built for the primary chain {primary_chain}")
+    })?;
+    let primary_equity = match &primary.equity {
+        EquityTokenization::Rebalancing(equity) => equity,
+        EquityTokenization::HedgeOnly => anyhow::bail!(
+            "the primary chain {primary_chain} was built hedge-only, but the rebalancer \
+             runs on its equity leg"
+        ),
+    };
+    info!(
+        chain = %primary.chain,
+        "Initializing rebalancing infrastructure on the primary chain's tokenization services"
+    );
+    let market_maker_wallet = primary.wallet.address();
+    let gas_readiness = build_transfer_gas_readiness(wallets, &deps.ctx)?;
+
+    // The worker consuming this queue is always registered
+    // (`build_record_bot_gas_receipt_cost_ctx` fails startup when its
+    // config is missing), so the enqueuer and the worker can never
+    // disagree: every enqueued row has a consumer.
+    let bot_gas_enqueuer =
+        BotGasReceiptCostEnqueuer::Enabled(deps.record_bot_gas_receipt_cost_queue.clone());
+
+    let raindex_service = build_rebalancing_raindex_service(
+        &primary.wallet,
+        deps.ctx.chains.primary(),
+        market_maker_wallet,
+    );
+
+    // One issuance client serves the tokenization preflight's vault-mode
+    // reads and both mint-authorization consumers (the saga's vault-mode
+    // read and the delivery job), from the same `[issuance]` credentials
+    // as the freeze guard's own instance.
+    let issuance_client = Arc::new(IssuanceClient::new(
+        deps.ctx.issuance.base_url.clone(),
+        deps.ctx.issuance.api_key.header_value(),
+    )?);
+
+    preflight_inventory_access(&raindex_service, &deps.ctx).await?;
+    revoke_stale_orderbook_allowances(&deps.ctx, tokenizations).await;
+    preflight_tokenization(&deps.ctx, tokenizations, issuance_client.as_ref()).await?;
+
+    let tokenizer = primary_equity.tokenizer.clone();
+
+    let mint_authorization =
+        build_mint_authorization_infra(issuance_client, &deps.apalis_pool).await?;
+
+    Ok(PrimaryRebalancingServices {
+        primary_chain,
+        market_maker_wallet,
+        gas_readiness,
+        bot_gas_enqueuer,
+        raindex_service,
+        tokenizer,
+        mint_authorization,
+    })
+}
+
 /// The rebalancer, the recovery jobs and the resume paths run on the primary
 /// chain's [`ChainTokenization`] until chain selection moves into the global
 /// rebalancer; the other hedged chains' services are built and preflighted
@@ -3196,54 +3498,15 @@ fn spawn_rebalancing_infrastructure<Signer: Wallet + Clone>(
 
         let BrokerCtx::AlpacaBrokerApi(alpaca_auth) = &deps.ctx.broker;
 
-        let primary_chain = deps.ctx.chains.primary().chain;
-        let primary = tokenizations.get(&primary_chain).with_context(|| {
-            format!("no tokenization services were built for the primary chain {primary_chain}")
-        })?;
-        let primary_equity = match &primary.equity {
-            EquityTokenization::Rebalancing(equity) => equity,
-            EquityTokenization::HedgeOnly => anyhow::bail!(
-                "the primary chain {primary_chain} was built hedge-only, but the rebalancer \
-                 runs on its equity leg"
-            ),
-        };
-        info!(
-            chain = %primary.chain,
-            "Initializing rebalancing infrastructure on the primary chain's tokenization services"
-        );
-        let market_maker_wallet = primary.wallet.address();
-        let gas_readiness = build_transfer_gas_readiness(&wallets, &deps.ctx)?;
-
-        // The worker consuming this queue is always registered
-        // (`build_record_bot_gas_receipt_cost_ctx` fails startup when its
-        // config is missing), so the enqueuer and the worker can never
-        // disagree: every enqueued row has a consumer.
-        let bot_gas_enqueuer =
-            BotGasReceiptCostEnqueuer::Enabled(deps.record_bot_gas_receipt_cost_queue.clone());
-
-        let raindex_service = build_rebalancing_raindex_service(
-            &primary.wallet,
-            deps.ctx.chains.primary(),
+        let PrimaryRebalancingServices {
+            primary_chain,
             market_maker_wallet,
-        );
-
-        // One issuance client serves the tokenization preflight's vault-mode
-        // reads and both mint-authorization consumers (the saga's vault-mode
-        // read and the delivery job), from the same `[issuance]` credentials
-        // as the freeze guard's own instance.
-        let issuance_client = Arc::new(IssuanceClient::new(
-            deps.ctx.issuance.base_url.clone(),
-            deps.ctx.issuance.api_key.header_value(),
-        )?);
-
-        preflight_inventory_access(&raindex_service, &deps.ctx).await?;
-        revoke_stale_orderbook_allowances(&deps.ctx, &tokenizations).await;
-        preflight_tokenization(&deps.ctx, &tokenizations, issuance_client.as_ref()).await?;
-
-        let tokenizer = primary_equity.tokenizer.clone();
-
-        let mint_authorization =
-            build_mint_authorization_infra(issuance_client, &deps.apalis_pool).await?;
+            gas_readiness,
+            bot_gas_enqueuer,
+            raindex_service,
+            tokenizer,
+            mint_authorization,
+        } = build_primary_rebalancing_services(&deps, &tokenizations, &wallets).await?;
 
         let HedgedEquityServices {
             chains: chain_services,
@@ -3266,6 +3529,8 @@ fn spawn_rebalancing_infrastructure<Signer: Wallet + Clone>(
 
         let rebalancing_service =
             build_rebalancing_service(&rebalancing_ctx, &deps, registry_ids, wrappers.clone());
+        let usdc_driver_gate = rebalancing_service.usdc_driver_gate();
+        let usdc_driver_pause = rebalancing_service.usdc_driver_pause();
 
         wire_transfer_admission_guards(
             &rebalancing_service,
@@ -3368,6 +3633,7 @@ fn spawn_rebalancing_infrastructure<Signer: Wallet + Clone>(
             job_queue: deps.schedulers.transfer_usdc_to_market_making.clone(),
             max_burn_revert_redrives: rebalancing_ctx.max_burn_revert_redrives,
             notifier: deps.notifier.clone(),
+            driver_gate: usdc_driver_gate.clone(),
         });
 
         let transfer_usdc_to_hedging_ctx = Arc::new(TransferUsdcToHedgingCtx {
@@ -3376,6 +3642,7 @@ fn spawn_rebalancing_infrastructure<Signer: Wallet + Clone>(
             job_queue: deps.schedulers.transfer_usdc_to_hedging.clone(),
             max_burn_revert_redrives: rebalancing_ctx.max_burn_revert_redrives,
             notifier: deps.notifier.clone(),
+            driver_gate: usdc_driver_gate,
         });
 
         let transfer_equity_to_market_making_ctx = Arc::new(TransferEquityToMarketMakingCtx {
@@ -3406,6 +3673,7 @@ fn spawn_rebalancing_infrastructure<Signer: Wallet + Clone>(
             service: rebalancing_service,
             recovery_transfer,
             usdc_recheck: usdc_handles.recheck_deposit,
+            usdc_driver_pause,
             wrapped_equity_recovery_store,
             unwrapped_equity_recovery_store,
             mint_store: built.mint,
@@ -5040,6 +5308,18 @@ pub async fn account_for_onchain_fill(
             }
         };
 
+    // Held from the exclusion check through the acknowledge, and taken by
+    // `account_for_fill_excluded_from_hedging` across its own check and record.
+    // The durable checks and the writes are separate transactions, and the
+    // `Position` guard only rejects a fill still pending or last acknowledged.
+    // Without one guard across them, a second actor on this fill could pass
+    // the check, then apply the fill after it settled and a newer fill
+    // displaced it (counting it twice), or record it as excluded while this
+    // path counts it. The file lock spans the REST route, the accounting job,
+    // and a standalone CLI process attached to the same database.
+    let _accounting_guard = acquire_database_file_lock(pool, DatabaseFileLock::FillAccounting)
+        .await
+        .map_err(TradeAccountingError::FillAccountingLock)?;
     let in_position = position_fill_already_recorded(pool, trade.symbol.base(), &trade_id).await?;
 
     // Excluded while trading was disabled, then interrupted before its
@@ -5125,6 +5405,13 @@ pub async fn account_for_fill_excluded_from_hedging(
         }
     };
 
+    // Serialized with `account_for_onchain_fill` from this check through the
+    // exclusion record, so a concurrent hedged accounting of the same fill
+    // cannot count it in the position while this path records it as excluded.
+    let _accounting_guard = acquire_database_file_lock(pool, DatabaseFileLock::FillAccounting)
+        .await
+        .map_err(TradeAccountingError::FillAccountingLock)?;
+
     // Applied to the position before trading was disabled and interrupted
     // before its marker: finish that accounting (ADR 0010) instead of
     // recording a delta the position already holds.
@@ -5178,9 +5465,8 @@ pub async fn account_for_fill_excluded_from_hedging(
 /// What the operator does about an excluded fill: recheck the uncovered list,
 /// cover at the broker, and record the cover.
 ///
-/// Shared by the bot's page and the
-/// CLI `process-tx` output, which is the only prompt for a fill the bot never
-/// delivers.
+/// Shared by the bot's page and the `process-tx` outcome (CLI and REST
+/// route), which is the only prompt for a fill the bot never delivers.
 pub fn excluded_fill_cover_instructions(trade: &OnchainTrade) -> String {
     format!(
         "Before covering anything, recheck what is still uncovered on {symbol} ({chain}) \
@@ -5243,7 +5529,39 @@ where
 
     let configured_executor = executor.to_supported_executor();
 
-    match reconcile_existing_pending_order(base_symbol, cqrs, configured_executor).await? {
+    // Test hook: announce that this fill has been accounted and is about to
+    // contend for the submission lock, so a race test can line its racers up
+    // at the lock instead of guessing how long accounting takes. No-op unless
+    // a test installs the barrier.
+    #[cfg(any(test, feature = "test-support"))]
+    if let Some(barrier) = &cqrs.placement_barrier {
+        barrier.on_submission_lock(&trade_id);
+    }
+
+    // Serialize the whole reconcile -> claim -> placement sequence against
+    // process-tx (ADR 0014). The in-process mutex covers the in-bot route; the
+    // file lock covers a standalone CLI, which holds only the file lock across
+    // its claim, `Pending` intent, admission and broker call. Both sides hold
+    // the pair across `Position::PlaceOffChainOrder` (the claim) and
+    // `OffchainOrder::Place` (the aggregate), so a pending pointer observed here
+    // is a genuine orphan -- never a claim whose aggregate is about to exist,
+    // and never a placement another process still has in flight, which
+    // reconcile would otherwise re-drive underneath it. Readiness stays inside the
+    // hold: `is_ready_for_execution` depends on what reconcile just cleared, and
+    // the inline claim must follow readiness under the same hold. The extended
+    // hours branch never claims inline, so it releases both guards across its
+    // network bound crossed price preflight.
+    let counter_trade_submission_guard = cqrs.counter_trade_submission_lock.lock().await;
+    let file_submission_guard = acquire_counter_trade_submission_file_lock(&cqrs.pool).await?;
+
+    match reconcile_existing_pending_order(
+        &counter_trade_submission_guard,
+        base_symbol,
+        cqrs,
+        configured_executor,
+    )
+    .await?
+    {
         ExistingPendingOrderOutcome::NoPending | ExistingPendingOrderOutcome::Cleared => {}
         ExistingPendingOrderOutcome::InFlight | ExistingPendingOrderOutcome::Deferred => {
             return Ok(None);
@@ -5273,6 +5591,12 @@ where
     // crossed reference the job will price from; the ordinary latest-trade
     // preflight can understate a ramped limit's buying-power requirement.
     if execution.market_session == MarketSession::Extended {
+        // The enqueued PlaceHedge job claims under its own locks, so release
+        // both guards across the crossed price preflight (Alpaca calendar and
+        // quote calls) and reacquire them for the reservation gated submission
+        // preflight.
+        drop(file_submission_guard);
+        drop(counter_trade_submission_guard);
         let Some(preflight) = resolve_extended_hours_preflight(&execution, cqrs).await else {
             return Ok(None);
         };
@@ -5342,13 +5666,6 @@ where
         // the position (via PlaceOffChainOrder) when it runs. Returning the job's
         // not-yet-recorded id would be a synthetic handle the aggregates know
         // nothing about, so signal "no inline placement" with None.
-        return Ok(None);
-    }
-
-    let _counter_trade_submission_guard = cqrs.counter_trade_submission_lock.lock().await;
-    let _file_submission_guard = acquire_counter_trade_submission_file_lock(&cqrs.pool).await?;
-
-    if handle_failed_anchor_recovery(base_symbol, configured_executor, cqrs).await? {
         return Ok(None);
     }
 
@@ -5814,6 +6131,14 @@ async fn place_offchain_order(
         return recover_claimed_offchain_order(execution, cqrs).await;
     }
 
+    // Test hook: hold the window between the Position claim above and the
+    // `OffchainOrder` creation below, so a concurrent reconciliation reliably
+    // observes the orphan pointer. No-op unless a test installs the barrier.
+    #[cfg(any(test, feature = "test-support"))]
+    if let Some(barrier) = &cqrs.placement_barrier {
+        barrier.on_first_claim().await;
+    }
+
     if !execute_create_offchain_order(execution, cqrs, offchain_order_id, buying_power_reservation)
         .await?
     {
@@ -5915,7 +6240,14 @@ async fn handle_failed_anchor_recovery(
     Ok(true)
 }
 
+/// Reconciles a position's existing pending offchain-order pointer.
+///
+/// Precondition: the caller MUST hold `counter_trade_submission_lock`. The
+/// `_submission_guard` parameter makes the compiler enforce this -- the
+/// schedule-enabled close-flatten branch re-drives the claim recovery without
+/// re-acquiring the non-reentrant mutex and would self-deadlock if it did.
 async fn reconcile_existing_pending_order(
+    _submission_guard: &tokio::sync::MutexGuard<'_, ()>,
     symbol: &Symbol,
     cqrs: &TradeProcessingCqrs,
     configured_executor: SupportedExecutor,
@@ -5927,6 +6259,13 @@ async fn reconcile_existing_pending_order(
     let Some(offchain_order_id) = position.pending_offchain_order_id else {
         return Ok(ExistingPendingOrderOutcome::NoPending);
     };
+
+    // Test hook: announce that this reconciliation observed a pending pointer
+    // (the orphan-misread window). No-op unless a test installs the barrier.
+    #[cfg(any(test, feature = "test-support"))]
+    if let Some(barrier) = &cqrs.placement_barrier {
+        barrier.on_saw_pending();
+    }
 
     let loaded = cqrs
         .offchain_order
@@ -5944,7 +6283,7 @@ async fn reconcile_existing_pending_order(
     if cqrs.close_flatten_policy.schedule_enabled()
         && matches!(loaded, Some(OffchainOrder::Pending { .. }))
     {
-        let _submission_guard = cqrs.counter_trade_submission_lock.lock().await;
+        // Recover under the caller's `_submission_guard` -- no re-acquire (ADR 0014).
         let recovered =
             recover_claimed_offchain_order_for_symbol(symbol, cqrs, configured_executor).await?;
         let retained = cqrs
@@ -10719,49 +11058,66 @@ mod tests {
         );
     }
 
-    fn succeeding_order_placer() -> Arc<dyn OrderPlacer> {
-        struct TestOrderPlacer;
+    /// An `OrderPlacer` whose every call succeeds, optionally counting broker
+    /// `place_market_order` calls.
+    struct SucceedingOrderPlacer {
+        market_orders: Option<Arc<AtomicUsize>>,
+    }
 
-        #[async_trait::async_trait]
-        impl OrderPlacer for TestOrderPlacer {
-            async fn place_market_order(
-                &self,
-                order: MarketOrder,
-            ) -> Result<OrderPlacementResult, Box<dyn std::error::Error + Send + Sync>>
-            {
-                Ok(OrderPlacementResult {
-                    executor_order_id: ExecutorOrderId::new("TEST_BROKER_ORD"),
-                    placed_shares: order.shares,
-                    placed_at: Utc::now(),
-                    is_extended_hours: false,
-                    limit_price: None,
-                })
+    #[async_trait::async_trait]
+    impl OrderPlacer for SucceedingOrderPlacer {
+        async fn place_market_order(
+            &self,
+            order: MarketOrder,
+        ) -> Result<OrderPlacementResult, Box<dyn std::error::Error + Send + Sync>> {
+            if let Some(market_orders) = &self.market_orders {
+                market_orders.fetch_add(1, Ordering::SeqCst);
             }
-
-            async fn place_limit_order(
-                &self,
-                order: st0x_execution::LimitOrder,
-            ) -> Result<OrderPlacementResult, Box<dyn std::error::Error + Send + Sync>>
-            {
-                Ok(OrderPlacementResult {
-                    executor_order_id: ExecutorOrderId::new("TEST_BROKER_LIMIT_ORD"),
-                    placed_shares: order.shares,
-                    placed_at: Utc::now(),
-                    is_extended_hours: order.extended_hours,
-                    limit_price: Some(order.limit_price),
-                })
-            }
-
-            async fn cancel_order(
-                &self,
-                _executor_order_id: &st0x_execution::ExecutorOrderId,
-            ) -> Result<st0x_execution::CancellationOutcome, Box<dyn std::error::Error + Send + Sync>>
-            {
-                Ok(st0x_execution::CancellationOutcome::Requested)
-            }
+            Ok(OrderPlacementResult {
+                executor_order_id: ExecutorOrderId::new("TEST_BROKER_ORD"),
+                placed_shares: order.shares,
+                placed_at: Utc::now(),
+                is_extended_hours: false,
+                limit_price: None,
+            })
         }
 
-        Arc::new(TestOrderPlacer)
+        async fn place_limit_order(
+            &self,
+            order: st0x_execution::LimitOrder,
+        ) -> Result<OrderPlacementResult, Box<dyn std::error::Error + Send + Sync>> {
+            Ok(OrderPlacementResult {
+                executor_order_id: ExecutorOrderId::new("TEST_BROKER_LIMIT_ORD"),
+                placed_shares: order.shares,
+                placed_at: Utc::now(),
+                is_extended_hours: order.extended_hours,
+                limit_price: Some(order.limit_price),
+            })
+        }
+
+        async fn cancel_order(
+            &self,
+            _executor_order_id: &st0x_execution::ExecutorOrderId,
+        ) -> Result<st0x_execution::CancellationOutcome, Box<dyn std::error::Error + Send + Sync>>
+        {
+            Ok(st0x_execution::CancellationOutcome::Requested)
+        }
+    }
+
+    fn succeeding_order_placer() -> Arc<dyn OrderPlacer> {
+        Arc::new(SucceedingOrderPlacer {
+            market_orders: None,
+        })
+    }
+
+    /// A `succeeding_order_placer` that also counts broker `place_market_order`
+    /// calls, so a test can assert exactly one broker submission.
+    fn counting_order_placer() -> (Arc<dyn OrderPlacer>, Arc<AtomicUsize>) {
+        let market_orders = Arc::new(AtomicUsize::new(0));
+        let placer = Arc::new(SucceedingOrderPlacer {
+            market_orders: Some(market_orders.clone()),
+        });
+        (placer, market_orders)
     }
 
     async fn create_cqrs_frameworks(
@@ -10863,6 +11219,8 @@ mod tests {
             poll_status_queue: PollOrderStatusJobQueue::new(apalis_pool),
             hedge_queue: crate::trading::offchain::hedge::HedgeJobQueue::new(apalis_pool),
             poll_interval: TEST_POLL_INTERVAL,
+            #[cfg(any(test, feature = "test-support"))]
+            placement_barrier: None,
         };
 
         (cqrs, assets)
@@ -11155,6 +11513,314 @@ mod tests {
             matches!(offchain_order, OffchainOrder::Submitted { .. }),
             "Offchain order should be Submitted after successful placement, got: {offchain_order:?}"
         );
+    }
+
+    /// Two live ticks race to hedge the same symbol. The `placement_barrier`
+    /// pins the first claimer in the exact window between its `Position` claim
+    /// and its `OffchainOrder` creation, holding it open until the test
+    /// releases it -- so the race no longer depends on scheduler timing. With
+    /// the fix, the second tick blocks on `counter_trade_submission_lock` the
+    /// claimer holds and cannot reconcile within that window, so it never sees
+    /// the claim as an orphan; the barrier's `saw_pending` signal therefore
+    /// stays silent (the bounded wait elapses) and the second tick only runs
+    /// after the first fully placed, observing the order as in-flight. Exactly
+    /// one broker call and one persisted order. Reverting the lock hoist makes
+    /// the second tick reconcile inside the pinned window, clear the claim as
+    /// an orphan, and place a second order -- which this test then catches.
+    #[tokio::test]
+    async fn concurrent_live_ticks_place_one_hedge() {
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let (frameworks, _offchain_order_projection) = create_cqrs_frameworks(&pool).await;
+        let (mut cqrs, assets) = trade_processing_cqrs_with_threshold(
+            &frameworks,
+            &pool,
+            ExecutionThreshold::whole_share(),
+            &apalis_pool,
+        );
+        let barrier = Arc::new(PlacementBarrier::default());
+        let (placer, broker_calls) = counting_order_placer();
+        cqrs.order_placer = placer;
+        cqrs.placement_barrier = Some(barrier.clone());
+        let cqrs = Arc::new(cqrs);
+        let assets = Arc::new(assets);
+
+        // Two distinct fills for the same symbol: distinct log_index (and so
+        // tx_hash and trade_id) so both are accounted and both reach placement.
+        let event_a = make_trade_event(10);
+        let event_b = make_trade_event(20);
+        let fill_a = test_trade_with_amount(float!(1.5), 10);
+        let fill_b = test_trade_with_amount(float!(1.5), 20);
+        let trade_id_b = OnChainTradeId::new(fill_b.chain, fill_b.tx_hash, fill_b.log_index);
+
+        let tick = |event: EmittedOnChain<RaindexTradeEvent>, fill: OnchainTrade| {
+            let cqrs = cqrs.clone();
+            let assets = assets.clone();
+            tokio::spawn(async move {
+                let executor = MockExecutor::new();
+                process_queued_trade(&executor, &event, fill, &cqrs, &assets).await
+            })
+        };
+
+        let a = tick(event_a, fill_a);
+        // The first claimer has claimed the Position and parked before creating
+        // its OffchainOrder, holding the submission lock.
+        barrier.wait_claimed().await;
+
+        let b = tick(event_b, fill_b);
+        // Line B up at the lock first: it accounts, acknowledges, and settles
+        // its own fill before contending, so without this checkpoint the
+        // bounded window below can elapse while B is still accounting and the
+        // assertion would hold without the race ever running. The checkpoint
+        // names B's fill, so A's earlier arrival cannot satisfy it.
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            barrier.wait_submission_lock(&trade_id_b),
+        )
+        .await
+        .expect("the second tick must reach the submission lock");
+
+        // Give the second tick a bounded chance to reconcile inside the pinned
+        // window. Under the fix it is blocked on the lock and this elapses;
+        // without the fix it reconciles and signals immediately.
+        let saw_pending =
+            tokio::time::timeout(Duration::from_millis(500), barrier.wait_saw_pending())
+                .await
+                .is_ok();
+        assert!(
+            !saw_pending,
+            "the second tick must not reconcile while the first holds the claim window under the lock"
+        );
+
+        barrier.release();
+        let (result_a, result_b) = tokio::join!(a, b);
+        let placed_count = usize::from(result_a.unwrap().unwrap().is_some())
+            + usize::from(result_b.unwrap().unwrap().is_some());
+        assert_eq!(placed_count, 1, "exactly one tick may place a hedge");
+
+        assert_eq!(
+            broker_calls.load(Ordering::SeqCst),
+            1,
+            "exactly one broker order must be placed"
+        );
+        let (order_count,): (i64,) = sqlx::query_as(
+            "SELECT COUNT(DISTINCT aggregate_id) FROM events \
+             WHERE event_type LIKE 'OffchainOrderEvent%'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            order_count, 1,
+            "concurrent live ticks must persist exactly one hedge order, got {order_count}"
+        );
+    }
+
+    /// The durable dedup check and the `Position` acknowledge must run under the
+    /// fill accounting file lock, so a second actor on the same fill (another
+    /// task, the REST route, or a CLI process) cannot interleave between them
+    /// and count the fill twice. Accounting must not acknowledge while another
+    /// holder has the lock, and must complete once it is released.
+    #[tokio::test]
+    async fn fill_accounting_waits_for_the_fill_accounting_lock() {
+        let (pool, _apalis_pool, _db_path, _dir) =
+            crate::test_utils::setup_file_backed_test_db(Duration::from_secs(1)).await;
+        let (frameworks, _offchain_order_projection) = create_cqrs_frameworks(&pool).await;
+
+        let trade = test_trade_with_amount(float!(1.5), 30);
+        let trade_id = OnChainTradeId {
+            chain: trade.chain,
+            tx_hash: trade.tx_hash,
+            log_index: trade.log_index,
+        };
+        let symbol = trade.symbol.base().clone();
+
+        let held = acquire_database_file_lock(&pool, DatabaseFileLock::FillAccounting)
+            .await
+            .unwrap();
+        let mut accounting = tokio::spawn({
+            let pool = pool.clone();
+            let onchain_trade = frameworks.onchain_trade.clone();
+            let position = frameworks.position.clone();
+            async move {
+                account_for_onchain_fill(
+                    &pool,
+                    &onchain_trade,
+                    &position,
+                    &trade,
+                    1,
+                    ExecutionThreshold::whole_share(),
+                )
+                .await
+            }
+        });
+
+        // Accounting witnesses the fill before it takes the lock. Wait until
+        // the witness lands, so the timeout below measures the wait on the
+        // lock rather than a witness write that has not finished yet.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while frameworks
+                .onchain_trade
+                .load(&trade_id)
+                .await
+                .unwrap()
+                .is_none()
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("accounting must witness the fill before contending for the lock");
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), &mut accounting)
+                .await
+                .is_err(),
+            "accounting must wait while another holder has the fill accounting lock"
+        );
+        assert!(
+            !position_fill_already_recorded(&pool, &symbol, &trade_id)
+                .await
+                .unwrap(),
+            "the fill must not be acknowledged while the lock is held elsewhere"
+        );
+
+        drop(held);
+        let outcome = tokio::time::timeout(Duration::from_secs(5), accounting)
+            .await
+            .expect("accounting must finish once the lock is released")
+            .unwrap()
+            .unwrap();
+        assert!(matches!(outcome, FillAccountingOutcome::Accounted { .. }));
+        assert!(
+            position_fill_already_recorded(&pool, &symbol, &trade_id)
+                .await
+                .unwrap()
+        );
+    }
+
+    /// The in-bot process-tx route and the live trading tick race to hedge the
+    /// same symbol through the one `counter_trade_submission_lock` the conductor
+    /// shares with both. The `placement_barrier` pins the tick between its
+    /// `Position` claim and its `OffchainOrder` creation. Process-tx must wait
+    /// on the lock for that whole window: were it to reconcile inside it, it
+    /// would find a claim with no order behind it, clear it as an orphan, and
+    /// place a second hedge. Once the tick places, process-tx sees the hedge in
+    /// flight and settles its fill without a second broker call.
+    #[tokio::test]
+    async fn process_tx_waits_for_a_live_tick_holding_its_claim_window() {
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let (frameworks, _offchain_order_projection) = create_cqrs_frameworks(&pool).await;
+        let (mut cqrs, assets) = trade_processing_cqrs_with_threshold(
+            &frameworks,
+            &pool,
+            ExecutionThreshold::whole_share(),
+            &apalis_pool,
+        );
+        let barrier = Arc::new(PlacementBarrier::default());
+        let (placer, broker_calls) = counting_order_placer();
+        cqrs.order_placer = placer;
+        cqrs.placement_barrier = Some(barrier.clone());
+        let cqrs = Arc::new(cqrs);
+
+        let mut ctx = create_test_ctx_with_order_owner(Address::ZERO);
+        ctx.chains.primary_mut().assets.equities.symbols.insert(
+            Symbol::new("AAPL").unwrap(),
+            equity_asset(Address::ZERO, Address::ZERO),
+        );
+        // The stores the conductor publishes to the route: the same frameworks
+        // the tick writes through.
+        let stores = crate::operator::process_tx::ProcessTxStores {
+            onchain_trade: frameworks.onchain_trade.clone(),
+            position: frameworks.position.clone(),
+            position_projection: frameworks.position_projection.clone(),
+            offchain_order: frameworks.offchain_order.clone(),
+            schedule_enabled: false,
+        };
+
+        let tick_event = make_trade_event(10);
+        let tick_fill = test_trade_with_amount(float!(1.5), 10);
+        let process_tx_fill = test_trade_with_amount(float!(1.5), 20);
+        let process_tx_trade_id = OnChainTradeId {
+            chain: process_tx_fill.chain,
+            tx_hash: process_tx_fill.tx_hash,
+            log_index: process_tx_fill.log_index,
+        };
+        let process_tx_symbol = process_tx_fill.symbol.base().clone();
+
+        let tick = tokio::spawn({
+            let cqrs = cqrs.clone();
+            async move {
+                let executor = MockExecutor::new();
+                process_queued_trade(&executor, &tick_event, tick_fill, &cqrs, &assets).await
+            }
+        });
+        barrier.wait_claimed().await;
+
+        let mut process_tx = tokio::spawn({
+            let cqrs = cqrs.clone();
+            async move {
+                crate::operator::process_tx::process_found_trade(
+                    process_tx_fill,
+                    &ctx,
+                    &cqrs.pool,
+                    &stores,
+                    cqrs.order_placer.clone(),
+                    Some(&cqrs.counter_trade_submission_lock),
+                    None,
+                )
+                .await
+            }
+        });
+
+        // Accounting runs before the submission lock. Wait until the fill is
+        // recorded, so the timeout below measures the wait on the lock rather
+        // than accounting that has not finished yet.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !position_fill_already_recorded(&pool, &process_tx_symbol, &process_tx_trade_id)
+                .await
+                .unwrap()
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("process-tx must finish accounting before contending for the lock");
+
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), &mut process_tx)
+                .await
+                .is_err(),
+            "process-tx must wait on the submission lock while the tick holds its claim window"
+        );
+        assert_eq!(broker_calls.load(Ordering::SeqCst), 0);
+
+        barrier.release();
+        assert!(
+            tick.await.unwrap().unwrap().is_some(),
+            "the tick holding the claim places the hedge"
+        );
+        let outcome = process_tx.await.unwrap().unwrap();
+        assert!(
+            matches!(
+                outcome,
+                crate::operator::process_tx::ProcessTxOutcome::PendingHedgeInFlight
+            ),
+            "process-tx must see the tick's hedge in flight, got {outcome:?}"
+        );
+
+        assert_eq!(
+            broker_calls.load(Ordering::SeqCst),
+            1,
+            "exactly one broker order must be placed"
+        );
+        let (order_count,): (i64,) = sqlx::query_as(
+            "SELECT COUNT(DISTINCT aggregate_id) FROM events \
+             WHERE event_type LIKE 'OffchainOrderEvent%'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(order_count, 1, "exactly one hedge order must be persisted");
     }
 
     /// A database write lock during the Witness write must surface as a
@@ -13196,6 +13862,8 @@ mod tests {
             poll_status_queue: PollOrderStatusJobQueue::new(&apalis_pool),
             hedge_queue: crate::trading::offchain::hedge::HedgeJobQueue::new(&apalis_pool),
             poll_interval: TEST_POLL_INTERVAL,
+            #[cfg(any(test, feature = "test-support"))]
+            placement_barrier: None,
         };
 
         let trade_event = make_trade_event(77);
@@ -17336,18 +18004,22 @@ mod tests {
                 .await
                 .unwrap();
             for index in [90, 91] {
-                assert_eq!(
+                let outcome = tokio::time::timeout(
+                    Duration::from_secs(5),
                     process_queued_trade(
                         &MockExecutor::with_failure("readiness must not run for retained claim"),
                         &make_trade_event(index),
                         test_trade_with_amount(float!(1.5), index),
                         &cqrs,
                         &assets,
-                    )
-                    .await
-                    .unwrap(),
-                    None
+                    ),
+                )
+                .await
+                .expect(
+                    "process_queued_trade must not deadlock reconciling a scheduled pending order \
+                     under the submission lock",
                 );
+                assert_eq!(outcome.unwrap(), None);
             }
             assert_eq!(
                 cqrs.position
@@ -17417,8 +18089,14 @@ mod tests {
             )
             .await
             .unwrap();
-        let Err(error) =
-            reconcile_existing_pending_order(&symbol, &cqrs, SupportedExecutor::DryRun).await
+        let submission_guard = cqrs.counter_trade_submission_lock.lock().await;
+        let Err(error) = reconcile_existing_pending_order(
+            &submission_guard,
+            &symbol,
+            &cqrs,
+            SupportedExecutor::DryRun,
+        )
+        .await
         else {
             panic!("pending order without schedule must retain strict reconciliation error");
         };
@@ -18814,6 +19492,7 @@ mod tests {
             redemption_store.clone(),
             rebalancing_service.clone(),
             usdc_recheck,
+            Arc::new(crate::rebalancing::usdc::usdc_driver_pause().0),
         );
 
         let handle = recovery_cell
