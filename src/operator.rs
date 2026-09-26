@@ -46,6 +46,39 @@ pub enum RejectionReason {
     },
     #[error("position {symbol} not found")]
     PositionNotFound { symbol: Symbol },
+    #[error("fill {trade_id} was not excluded from hedging, so it has no manual cover to record")]
+    FillNotExcluded {
+        trade_id: crate::onchain_trade::OnChainTradeId,
+    },
+    #[error("excluded fill {trade_id} already has a recorded manual cover")]
+    ExcludedFillAlreadyCovered {
+        trade_id: crate::onchain_trade::OnChainTradeId,
+    },
+    #[error("the cover price must be strictly positive")]
+    NonPositiveCoverPrice,
+    #[error(
+        "fill {trade_id} is also in the hedged position, so the bot hedges it; do not cover it \
+         by hand, reconcile its conflicting records instead"
+    )]
+    ExcludedFillInPosition {
+        trade_id: crate::onchain_trade::OnChainTradeId,
+    },
+    #[error(
+        "the cover must be the full amount of excluded fill {trade_id} ({expected} shares); \
+         record it once the whole amount is covered"
+    )]
+    CoverSharesMismatch {
+        trade_id: crate::onchain_trade::OnChainTradeId,
+        expected: String,
+    },
+    #[error("the cover cannot have executed before the fill it covers")]
+    CoverBeforeFill,
+    #[error("the cover cannot have executed more than five minutes ahead of the bot's clock")]
+    CoverInFuture,
+    #[error("another request changed excluded fill {trade_id} concurrently; retry")]
+    ConcurrentCover {
+        trade_id: crate::onchain_trade::OnChainTradeId,
+    },
     #[error(
         "OffchainOrder {offchain_order_id} belongs to {owner}, not {symbol} -- refusing to \
          repair"
@@ -849,6 +882,144 @@ pub mod portfolio_snapshot {
     }
 }
 
+pub mod excluded_fill {
+    use anyhow::Context;
+    use chrono::{DateTime, Utc};
+    use rain_math_float::Float;
+    use sqlx::SqlitePool;
+    use st0x_event_sorcery::{AggregateError, LifecycleError, StoreBuilder};
+
+    use crate::conductor::position_fill_already_recorded;
+    use crate::onchain_trade::{
+        OnChainTrade, OnChainTradeCommand, OnChainTradeError, OnChainTradeId,
+    };
+    use crate::operator::{OperatorError, RejectionReason};
+
+    /// Records the operator's manual broker cover of a fill excluded from
+    /// hedging, booked in the PnL ledger against that fill.
+    ///
+    /// The cover is the fill's full amount (`shares` must equal it) on the
+    /// opposite side of the fill, at `price_usdc`. Record it once the whole
+    /// amount is covered, at the volume weighted price when it took several
+    /// broker orders.
+    ///
+    /// Shared by the ops API. Refuses a fill that was not excluded or already
+    /// has a cover, so a cover is recorded exactly once, including when two
+    /// requests race. Success means the `ExclusionCovered` event is durable;
+    /// the uncovered listing and the pager read it from the event log, so no
+    /// view has to catch up first.
+    pub async fn record_exclusion_cover(
+        pool: &SqlitePool,
+        trade_id: &OnChainTradeId,
+        shares: Float,
+        price_usdc: Float,
+        broker_order_id: Option<String>,
+        covered_at: DateTime<Utc>,
+    ) -> Result<(), OperatorError> {
+        let (onchain_trade, _) = StoreBuilder::<OnChainTrade>::new(pool.clone())
+            .build(())
+            .await
+            .context("failed to build onchain trade store")?;
+
+        let Some(state) = onchain_trade
+            .load(trade_id)
+            .await
+            .context("failed to load the excluded fill")?
+        else {
+            return Err(RejectionReason::FillNotExcluded {
+                trade_id: trade_id.clone(),
+            }
+            .into());
+        };
+        // Checked before the position: a plain hedged fill is simply not
+        // excluded, not a record conflict.
+        if !state.is_excluded() {
+            return Err(RejectionReason::FillNotExcluded {
+                trade_id: trade_id.clone(),
+            }
+            .into());
+        }
+        // A fill also in `Position` is hedged by the bot; a manual cover would
+        // double it.
+        if position_fill_already_recorded(pool, &state.symbol, trade_id)
+            .await
+            .context("failed to check the fill against the position")?
+        {
+            return Err(RejectionReason::ExcludedFillInPosition {
+                trade_id: trade_id.clone(),
+            }
+            .into());
+        }
+
+        let result = onchain_trade
+            .send(
+                trade_id,
+                OnChainTradeCommand::RecordExclusionCover {
+                    shares,
+                    price_usdc,
+                    broker_order_id,
+                    covered_at,
+                },
+            )
+            .await;
+
+        match result {
+            Ok(()) => Ok(()),
+            Err(AggregateError::UserError(LifecycleError::Apply(
+                OnChainTradeError::NotExcluded | OnChainTradeError::NotFilled,
+            ))) => Err(RejectionReason::FillNotExcluded {
+                trade_id: trade_id.clone(),
+            }
+            .into()),
+            Err(AggregateError::UserError(LifecycleError::Apply(
+                OnChainTradeError::AlreadyCovered,
+            ))) => Err(RejectionReason::ExcludedFillAlreadyCovered {
+                trade_id: trade_id.clone(),
+            }
+            .into()),
+            Err(AggregateError::UserError(LifecycleError::Apply(
+                OnChainTradeError::NonPositiveCoverPrice,
+            ))) => Err(RejectionReason::NonPositiveCoverPrice.into()),
+            Err(AggregateError::UserError(LifecycleError::Apply(
+                OnChainTradeError::CoverSharesMismatch,
+            ))) => Err(RejectionReason::CoverSharesMismatch {
+                trade_id: trade_id.clone(),
+                expected: st0x_float_serde::format_float_with_fallback(&state.amount),
+            }
+            .into()),
+            Err(AggregateError::UserError(LifecycleError::Apply(
+                OnChainTradeError::CoverBeforeFill,
+            ))) => Err(RejectionReason::CoverBeforeFill.into()),
+            Err(AggregateError::UserError(LifecycleError::Apply(
+                OnChainTradeError::CoverInFuture,
+            ))) => Err(RejectionReason::CoverInFuture.into()),
+            // Two requests raced on the same fill. Report what the winner did
+            // instead of a bare server error.
+            Err(AggregateError::AggregateConflict) => {
+                let covered = onchain_trade
+                    .load(trade_id)
+                    .await
+                    .context("failed to reload the excluded fill after a conflict")?
+                    .and_then(|state| state.exclusion)
+                    .is_some_and(|exclusion| exclusion.cover.is_some());
+                if covered {
+                    return Err(RejectionReason::ExcludedFillAlreadyCovered {
+                        trade_id: trade_id.clone(),
+                    }
+                    .into());
+                }
+                Err(RejectionReason::ConcurrentCover {
+                    trade_id: trade_id.clone(),
+                }
+                .into())
+            }
+            Err(error) => Err(anyhow::Error::new(error)
+                .context("failed to record the excluded fill cover")
+                .into()),
+        }
+    }
+}
+
 pub mod position {
     use anyhow::Context;
     use rain_math_float::Float;
@@ -1514,8 +1685,8 @@ pub mod process_tx {
 
     use crate::conductor::{
         ExcludedFillOutcome, FillAccountingOutcome, account_for_fill_excluded_from_hedging,
-        account_for_onchain_fill, execute_mark_acknowledged, execute_settle_fill,
-        is_expected_place_offchain_order_rejection,
+        account_for_onchain_fill, excluded_fill_cover_instructions, execute_mark_acknowledged,
+        execute_settle_fill, is_expected_place_offchain_order_rejection,
     };
     use crate::offchain::order::{
         CounterTradeOrderKind, OffchainOrder, OffchainOrderCommand, OffchainOrderId,
@@ -1533,6 +1704,7 @@ pub mod process_tx {
         BuyingPowerReservationError, acquire_counter_trade_submission_file_lock,
         live_buying_power_reservations,
     };
+    use crate::trading::onchain::exclusion::exclusion_cause;
 
     use super::{OperatorError, RejectionReason};
 
@@ -1618,20 +1790,27 @@ pub mod process_tx {
         /// threshold has no price yet, or an equity transfer holds the symbol.
         /// No hedge was placed yet.
         BelowExecutionThreshold,
-        /// Trading is disabled for the symbol on the fill's chain, so this run
-        /// kept the fill out of the hedged position and recorded it in
-        /// `skipped_fills`. The pipeline will not hedge it; `detail` states the
-        /// delta and the side an operator covers it with.
+        /// The bot would not hedge this fill (trading is disabled for the
+        /// symbol on the fill's chain, or the fill landed while it was), so
+        /// this run kept it out of the hedged position and recorded it in
+        /// `skipped_fills`. `detail` states the delta, the side an operator
+        /// covers it with and why; `instructions` how to recheck the uncovered
+        /// list and record the cover, since the bot never pages a fill it does
+        /// not deliver.
         ExcludedFromHedging {
             symbol: Symbol,
             chain: Chain,
             detail: String,
+            instructions: String,
         },
-        /// An earlier run already excluded the fill from hedging while trading
-        /// was disabled, and it stays excluded even if trading is enabled
-        /// since. The pipeline will not hedge it; `detail` is the recorded
-        /// delta and cover side.
-        AlreadyExcluded { detail: String },
+        /// An earlier run already excluded the fill from hedging, and it stays
+        /// excluded even if trading is enabled since. The pipeline will not
+        /// hedge it; `detail` is the recorded delta and cover side, and
+        /// `instructions` as for `ExcludedFromHedging`.
+        AlreadyExcluded {
+            detail: String,
+            instructions: String,
+        },
         /// The position refused the claim in its current state (a pending
         /// order, an equity transfer, or a changed net), so the fill was settled
         /// without placing a hedge.
@@ -1941,28 +2120,38 @@ pub mod process_tx {
         let base_symbol = onchain_trade.symbol();
 
         // Same rule as the bot: `Position` is one net per symbol across every
-        // hedged chain, so a fill on an asset disabled on its own chain stays
-        // out of it, or the periodic scan hedges it for whichever chain
-        // enables the symbol.
-        if !trading_chain.assets.is_trading_enabled(base_symbol) {
+        // hedged chain, so a fill on an asset disabled on its own chain, or
+        // that landed while it was, stays out of it, or the periodic scan
+        // hedges it for whichever chain enables the symbol.
+        if let Some(cause) =
+            exclusion_cause(pool, &trading_chain.assets, &onchain_trade, block_number)
+                .await
+                .context("failed to read the trading enablement history")?
+        {
             let outcome = account_for_fill_excluded_from_hedging(
                 pool,
                 onchain_trade_store,
                 position_store,
                 &onchain_trade,
                 block_number,
+                cause,
                 "process-tx",
             )
             .await
             .context("failed to exclude the onchain fill from hedging")?;
+            let instructions = excluded_fill_cover_instructions(&onchain_trade);
             return Ok(match outcome {
                 ExcludedFillOutcome::Excluded { detail } => ProcessTxOutcome::ExcludedFromHedging {
                     symbol: base_symbol.clone(),
                     chain: onchain_trade.chain,
                     detail,
+                    instructions,
                 },
                 ExcludedFillOutcome::AlreadyExcluded { detail } => {
-                    ProcessTxOutcome::AlreadyExcluded { detail }
+                    ProcessTxOutcome::AlreadyExcluded {
+                        detail,
+                        instructions,
+                    }
                 }
                 ExcludedFillOutcome::AlreadyAcknowledged => ProcessTxOutcome::AlreadyAccounted,
             });
@@ -1986,7 +2175,10 @@ pub mod process_tx {
             // Excluded while trading was disabled: the fill is not in the
             // position, so it must not be reported as one the pipeline hedges.
             FillAccountingOutcome::ExcludedFromHedging { detail } => {
-                return Ok(ProcessTxOutcome::AlreadyExcluded { detail });
+                return Ok(ProcessTxOutcome::AlreadyExcluded {
+                    detail,
+                    instructions: excluded_fill_cover_instructions(&onchain_trade),
+                });
             }
         };
 
@@ -3134,7 +3326,7 @@ pub mod process_tx {
         use crate::conductor::job::find_backpressure;
         use crate::conductor::{
             TradeProcessingCqrs, execute_acknowledge_fill, execute_mark_acknowledged,
-            process_queued_trade,
+            execute_settle_fill, process_queued_trade,
         };
         use crate::offchain::order::{
             BrokerOrderPlacement, CancellationReason, CounterTradeOrderKind, ExecutorOrderPlacer,
@@ -3142,6 +3334,7 @@ pub mod process_tx {
             OrderPlacer, PlacementAdmission, PollOrderStatusJobQueue, RetainedFill,
             noop_order_placer,
         };
+        use crate::onchain::OnchainTrade;
         use crate::onchain::trade::RaindexTradeEvent;
         use crate::onchain_trade::{
             InventoryVenue, OnChainTrade as OnChainTradeCqrs, OnChainTradeCommand, OnChainTradeId,
@@ -4807,12 +5000,29 @@ pub mod process_tx {
             )
             .await
             .unwrap();
-            let ProcessTxOutcome::ExcludedFromHedging { symbol, detail, .. } = first else {
+            let ProcessTxOutcome::ExcludedFromHedging {
+                symbol,
+                detail,
+                instructions,
+                ..
+            } = first
+            else {
                 panic!("a fill on a trading disabled asset must be excluded, got: {first:?}");
             };
             assert_eq!(symbol, Symbol::new("AAPL").unwrap());
             // The fixture is an onchain buy, so the operator covers with a sell.
-            assert!(detail.contains("cover by SELL"), "{detail}");
+            assert!(
+                detail.contains("cover by SELL") && detail.contains("trading is disabled for AAPL"),
+                "{detail}"
+            );
+            // A fill the bot never delivers is never paged, so the outcome is
+            // the operator's only prompt to record the cover.
+            assert!(
+                instructions
+                    .contains("--param covered=false --param chain=base --param symbol=AAPL")
+                    && instructions.contains(&cover_command(&onchain_trade)),
+                "{instructions}"
+            );
 
             let rerun = process_found_trade(
                 onchain_trade,
@@ -4826,7 +5036,7 @@ pub mod process_tx {
             .await
             .unwrap();
             assert!(
-                matches!(&rerun, ProcessTxOutcome::AlreadyExcluded { detail } if detail.contains("cover by SELL")),
+                matches!(&rerun, ProcessTxOutcome::AlreadyExcluded { detail, .. } if detail.contains("cover by SELL")),
                 "a rerun on an excluded fill must repeat the cover side, got: {rerun:?}"
             );
 
@@ -4885,7 +5095,7 @@ pub mod process_tx {
             .unwrap();
 
             let outcome = process_found_trade(
-                onchain_trade,
+                onchain_trade.clone(),
                 &aapl_accounting_ctx(),
                 &pool,
                 &stores_for(&pool, &order_placer).await,
@@ -4895,9 +5105,21 @@ pub mod process_tx {
             )
             .await
             .unwrap();
+            let ProcessTxOutcome::AlreadyExcluded {
+                detail,
+                instructions,
+            } = &outcome
+            else {
+                panic!(
+                    "an excluded fill must stay excluded after trading is enabled, got: {outcome:?}"
+                );
+            };
+            assert!(detail.contains("cover by SELL"), "{detail}");
+            // The rerun may be the only prompt, so it must say how to record
+            // the cover.
             assert!(
-                matches!(&outcome, ProcessTxOutcome::AlreadyExcluded { detail } if detail.contains("cover by SELL")),
-                "an excluded fill must stay excluded after trading is enabled, got: {outcome:?}"
+                instructions.contains(&cover_command(&onchain_trade)),
+                "{instructions}"
             );
 
             let (fill_count,): (i64,) =
@@ -4910,6 +5132,72 @@ pub mod process_tx {
                 fill_count, 0,
                 "the excluded fill must stay out of the position"
             );
+        }
+
+        /// The client command that records this fill's manual cover.
+        fn cover_command(onchain_trade: &OnchainTrade) -> String {
+            format!(
+                "debug cover-excluded-fill base {} {}",
+                onchain_trade.tx_hash, onchain_trade.log_index
+            )
+        }
+
+        /// A fresh fill that landed inside a closed disabled period stays out
+        /// of the position even though the config already enables the asset:
+        /// only the fill's own block, checked against the recorded period,
+        /// keeps it from being hedged.
+        #[tokio::test]
+        async fn process_tx_excludes_a_fill_from_a_closed_disabled_period() {
+            let pool = setup_test_db().await;
+            sqlx::query(
+                "INSERT INTO trading_disabled_period \
+                 (chain, symbol, disabled_from_block, enabled_from_block, enabled_at) \
+                 VALUES ('base', 'AAPL', 40, 50, '2026-09-25T00:00:00+00:00')",
+            )
+            .execute(&pool)
+            .await
+            .unwrap();
+            let order_placer: Arc<dyn OrderPlacer> = Arc::new(ExecutorOrderPlacer {
+                executor: MockExecutor::new(),
+                close_flatten_policy: None,
+            });
+            let onchain_trade = onchain_trade_builder().with_block_number(42).build();
+
+            let outcome = process_found_trade(
+                onchain_trade.clone(),
+                &aapl_accounting_ctx(),
+                &pool,
+                &stores_for(&pool, &order_placer).await,
+                order_placer,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+            let ProcessTxOutcome::ExcludedFromHedging {
+                detail,
+                instructions,
+                ..
+            } = &outcome
+            else {
+                panic!("a fill from a closed disabled period must be excluded, got: {outcome:?}");
+            };
+            assert!(
+                detail.contains("landed in block 42") && detail.contains("enabled from block 50"),
+                "{detail}"
+            );
+            assert!(
+                instructions.contains(&cover_command(&onchain_trade)),
+                "{instructions}"
+            );
+
+            let (fill_count,): (i64,) =
+                sqlx::query_as("SELECT COUNT(*) FROM events WHERE event_type = ?")
+                    .bind("PositionEvent::OnChainOrderFilled")
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+            assert_eq!(fill_count, 0, "the fill must stay out of the position");
         }
 
         /// After process-tx applies a fill via `process_found_trade`, the normal
@@ -5957,16 +6245,17 @@ pub mod process_tx {
 
         /// Regression test for the crash-window double-count bug:
         ///
-        /// 1. Fill A is witnessed and acknowledged in Position (slot = A), but the
-        ///    process crashes BEFORE `mark_acknowledged` runs -- OnChainTrade A stays
-        ///    Witnessed.
-        /// 2. Fill B arrives and is fully processed (slot advances to B).
+        /// 1. Fill A is witnessed and applied to Position, but the process crashes
+        ///    BEFORE `mark_acknowledged` runs, so OnChainTrade A stays Witnessed.
+        ///    A is a legacy fill applied before the pending set existed, so
+        ///    Position no longer holds it as pending.
+        /// 2. Fill B arrives and is fully processed.
         /// 3. `process-tx` is retried for A.
         ///
-        /// Without the durable `position_fill_already_recorded` guard, the resume
-        /// path would call `execute_acknowledge_fill(A)` again. Because the slot now
-        /// holds B (not A), `PositionError::DuplicateTrade` does NOT fire and A is
-        /// counted a second time -- corrupting the net position.
+        /// Only the durable `position_fill_already_recorded` guard stops the resume
+        /// path from calling `execute_acknowledge_fill(A)` again: Position's own
+        /// duplicate check only covers fills still in its pending set, so without
+        /// the guard A is counted a second time, corrupting the net position.
         ///
         /// After the fix, the retry must:
         /// - Apply fill A exactly once (total fill events = 2: one A + one B).
@@ -6030,6 +6319,10 @@ pub mod process_tx {
             .await
             .unwrap();
 
+            // A legacy fill: applied before the pending set existed, so Position
+            // does not hold it as pending and its own duplicate check cannot see it.
+            execute_settle_fill(&position_store, &fill_a).await.unwrap();
+
             // Simulate crash: do NOT call execute_mark_acknowledged for fill A.
             // OnChainTrade A stays Witnessed; Position already has A applied.
 
@@ -6064,11 +6357,11 @@ pub mod process_tx {
                 .unwrap();
 
             // At this point:
-            // - Position has fill_a and fill_b applied (last_slot = fill_b's trade_id).
+            // - Position has fill_a and fill_b applied, and fill_a is not pending.
             // - OnChainTrade fill_a is Witnessed (not Acknowledged).
             // - OnChainTrade fill_b is Acknowledged.
             // Without the durable guard, retrying process-tx for fill_a would
-            // re-apply it: last_slot (B) != A, so DuplicateTrade does NOT fire.
+            // re-apply it.
 
             // Step 4: Retry process-tx for fill A (crash-recovery scenario).
             let outcome = process_found_trade(
@@ -6118,12 +6411,12 @@ pub mod process_tx {
         /// Regression test for the None-path (fresh-witness) double-count hole:
         ///
         /// A legacy fill whose Position record was written (e.g. via a prior direct
-        /// `execute_acknowledge_fill` call) but whose OnChainTrade record was NEVER
-        /// created causes `process_found_trade` to take the `None` branch. Without
-        /// the unified durable guard the fresh-witness arm would call
-        /// `execute_acknowledge_fill` again; because the Position slot already
-        /// advanced to a newer fill (B), `DuplicateTrade` does NOT fire and fill A
-        /// is counted a second time.
+        /// `execute_acknowledge_fill` call, before the pending set existed) but
+        /// whose OnChainTrade record was NEVER created causes `process_found_trade`
+        /// to take the `None` branch. Without the unified durable guard the
+        /// fresh-witness arm would call `execute_acknowledge_fill` again; Position
+        /// no longer holds A as pending, so its own duplicate check cannot see it
+        /// and fill A is counted a second time.
         ///
         /// After the fix the unified `position_fill_already_recorded` guard runs on
         /// every path -- including the `None` path -- and blocks the re-apply.
@@ -6158,9 +6451,11 @@ pub mod process_tx {
                 .await
                 .unwrap();
 
-            // Step 1: Apply fill A to Position ONLY -- no OnChainTrade witness record.
-            // This simulates a legacy fill whose OnChainTrade record was never created.
-            // process_found_trade will load None for trade_id_a and take the None path.
+            // Step 1: Apply fill A to Position ONLY, with no OnChainTrade witness
+            // record, then settle it out of the pending set. This simulates a legacy
+            // fill applied before the pending set existed whose OnChainTrade record
+            // was never created. process_found_trade will load None for trade_id_a
+            // and take the None path.
             execute_acknowledge_fill(
                 &position_store,
                 &fill_a,
@@ -6169,10 +6464,10 @@ pub mod process_tx {
             )
             .await
             .unwrap();
+            execute_settle_fill(&position_store, &fill_a).await.unwrap();
 
-            // Step 2: Fully process fill B so the Position slot advances beyond A.
-            // Now last_acknowledged_trade_id = B, so a re-apply of A bypasses the
-            // single-slot DuplicateTrade guard without the durable check.
+            // Step 2: Fully process fill B. A re-apply of A is now visible only to
+            // the durable check.
             onchain_store
                 .send(
                     &trade_id_b,

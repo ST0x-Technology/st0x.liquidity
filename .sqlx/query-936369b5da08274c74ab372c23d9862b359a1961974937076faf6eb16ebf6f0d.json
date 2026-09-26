@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "UPDATE skipped_fills SET paged_at = ? WHERE chain = ? AND tx_hash = ? AND log_index = ? AND paged_at IS NULL",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 4
+    },
+    "nullable": []
+  },
+  "hash": "936369b5da08274c74ab372c23d9862b359a1961974937076faf6eb16ebf6f0d"
+}

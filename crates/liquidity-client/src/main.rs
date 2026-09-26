@@ -167,6 +167,23 @@ async fn dispatch<A: TokenSource + Sync>(
                 .post(&format!("/transfers/recheck/{kind}/{id}"))
                 .await?
         }
+        Command::Debug(Debug::CoverExcludedFill(args)) => {
+            let trade_id = encode_segment(&format!(
+                "{}:{}:{}",
+                args.chain, args.tx_hash, args.log_index
+            ));
+            client
+                .post_json(
+                    &format!("/excluded-fills/{trade_id}/cover"),
+                    &serde_json::json!({
+                        "shares": args.shares,
+                        "price_usdc": args.price_usdc,
+                        "covered_at": args.covered_at,
+                        "broker_order_id": args.broker_order_id,
+                    }),
+                )
+                .await?
+        }
     };
     output::print(&value).map_err(ApiError::from)
 }
@@ -182,7 +199,8 @@ mod tests {
     use super::{ApiError, dispatch};
     use crate::auth::{AuthError, StaticToken};
     use crate::cli::{
-        Command, Debug, Read, ReadResource, ResourceArgs, TradeEventsArgs, TransferEventsArgs,
+        Command, CoverExcludedFillArgs, Debug, Read, ReadResource, ResourceArgs, TradeEventsArgs,
+        TransferEventsArgs,
     };
     use crate::output::OutputError;
     use crate::transport::{Client, TransportError};
@@ -300,6 +318,36 @@ mod tests {
         assert_eq!(
             request_line(&request),
             "POST /liquidity-write/transfers/recheck/mint/abc HTTP/1.1"
+        );
+        Ok(())
+    }
+
+    /// The fill's `chain:tx_hash:log_index` identity is one path segment, so
+    /// its colons must be percent encoded for the server to route it.
+    #[tokio::test]
+    async fn cover_excluded_fill_posts_json_to_the_fill_path()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let request = request_for(Command::Debug(Debug::CoverExcludedFill(
+            CoverExcludedFillArgs {
+                chain: "base".to_owned(),
+                tx_hash: "0xabc".to_owned(),
+                log_index: 7,
+                shares: "3".to_owned(),
+                price_usdc: "151".to_owned(),
+                covered_at: "2026-09-24T15:00:00Z".to_owned(),
+                broker_order_id: None,
+            },
+        )))
+        .await?;
+        assert_eq!(
+            request_line(&request),
+            "POST /liquidity-write/excluded-fills/base%3A0xabc%3A7/cover HTTP/1.1"
+        );
+        assert!(
+            request
+                .to_ascii_lowercase()
+                .contains("content-type: application/json"),
+            "{request}"
         );
         Ok(())
     }

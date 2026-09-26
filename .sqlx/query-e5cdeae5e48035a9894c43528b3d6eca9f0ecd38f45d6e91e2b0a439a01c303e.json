@@ -1,0 +1,26 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT disabled_from_block FROM trading_enablement WHERE chain = ? AND symbol = ? AND trading_enabled = 0 AND disabled_from_block <= ?",
+  "describe": {
+    "columns": [
+      {
+        "name": "disabled_from_block",
+        "ordinal": 0,
+        "type_info": "Integer",
+        "origin": {
+          "Table": {
+            "table": "trading_enablement",
+            "name": "disabled_from_block"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Right": 3
+    },
+    "nullable": [
+      true
+    ]
+  },
+  "hash": "e5cdeae5e48035a9894c43528b3d6eca9f0ecd38f45d6e91e2b0a439a01c303e"
+}

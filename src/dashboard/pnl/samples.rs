@@ -7,7 +7,10 @@ use super::parsing::is_safe_symbol;
 use super::query::{PnlError, PnlFinancialFieldError, PnlQuery};
 use super::response::{PnlAvailableRange, PnlSampleStats, PnlSampleSymbolStats};
 use super::sessions::{date_key, matches_date_bounds_for_iso, matches_trade_filters};
-use super::state::{PositionLedgerRow, PositionViewRow, SampleStatsAcc, Venue};
+use super::state::{
+    ExcludedFillCoverRow, ExcludedFillRow, PositionLedgerRow, PositionViewRow, SampleStatsAcc,
+    Venue,
+};
 
 pub(crate) fn parse_position_view(
     rows: &[PositionViewRow],
@@ -57,8 +60,14 @@ pub(crate) fn parse_position_view(
 /// available range ignore.
 fn fill_timestamp(row: &PositionLedgerRow) -> Option<(Venue, &str)> {
     match row {
-        PositionLedgerRow::OnchainFill(fill) => Some((Venue::Onchain, fill.executed_at.as_str())),
-        PositionLedgerRow::OffchainFill(fill) => Some((Venue::Offchain, fill.executed_at.as_str())),
+        PositionLedgerRow::OnchainFill(fill)
+        | PositionLedgerRow::ExcludedFill(ExcludedFillRow { fill, .. }) => {
+            Some((Venue::Onchain, fill.executed_at.as_str()))
+        }
+        PositionLedgerRow::OffchainFill(fill)
+        | PositionLedgerRow::ExcludedFillCover(ExcludedFillCoverRow { cover: fill, .. }) => {
+            Some((Venue::Offchain, fill.executed_at.as_str()))
+        }
         PositionLedgerRow::OffchainPlacement(_) | PositionLedgerRow::ManualAdjustment(_) => None,
     }
 }

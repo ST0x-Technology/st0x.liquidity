@@ -26,7 +26,8 @@ use super::sessions::{
     date_key, et_day_key, matches_cost_date_filter, matches_cost_symbol_filter, matches_date_filter,
 };
 use super::state::{
-    BotGasCostRow, CostLedgerRow, PositionLedgerRow, PositionViewRow, SummaryAcc, SymbolBook,
+    BotGasCostRow, CostLedgerRow, ExcludedFillCoverRow, ExcludedFillRow, PositionLedgerRow,
+    PositionReplayDelta, PositionViewRow, SummaryAcc, SymbolBook,
 };
 use super::windows::build_windows;
 
@@ -123,6 +124,7 @@ pub(crate) fn build_pnl_response_from_rows(
     let available_range = build_available_range(&event_rows, &mut warnings);
     let sample_stats = build_sample_stats(&event_rows, query, &mut warnings);
     let mut books: HashMap<Symbol, SymbolBook> = HashMap::new();
+    let mut excluded_books: BTreeMap<(Symbol, String), SymbolBook> = BTreeMap::new();
     let mut entries = Vec::new();
     let mut unmatched_offchain_allocations = Vec::new();
     let mut position_replay_deltas = Vec::new();
@@ -144,16 +146,20 @@ pub(crate) fn build_pnl_response_from_rows(
             continue;
         };
 
-        let book = books.entry(symbol).or_default();
+        let book = book_for(&row, symbol, &mut books, &mut excluded_books);
         match &row {
-            PositionLedgerRow::OnchainFill(fill_row) => {
+            PositionLedgerRow::OnchainFill(fill_row)
+            | PositionLedgerRow::ExcludedFill(ExcludedFillRow { fill: fill_row, .. }) => {
                 let fill = parse_onchain_fill(fill_row)?;
                 apply_onchain_fill(book, &fill, &mut entries, &mut warnings)?;
             }
             PositionLedgerRow::OffchainPlacement(placement) => {
                 apply_offchain_placement(book, placement, &mut warnings);
             }
-            PositionLedgerRow::OffchainFill(fill_row) => {
+            PositionLedgerRow::OffchainFill(fill_row)
+            | PositionLedgerRow::ExcludedFillCover(ExcludedFillCoverRow {
+                cover: fill_row, ..
+            }) => {
                 let fill = parse_offchain_fill(fill_row)?;
                 apply_offchain_fill(
                     book,
@@ -186,6 +192,13 @@ pub(crate) fn build_pnl_response_from_rows(
             replay_symbols.push((symbol, book.summary.clone()));
         }
     }
+    finalize_excluded_books(
+        &mut excluded_books,
+        &mut full_total,
+        &mut replay_symbols,
+        &mut warnings,
+        &mut position_replay_deltas,
+    )?;
     append_replay_diagnostics(
         &mut warnings,
         &unmatched_offchain_allocations,
@@ -281,6 +294,7 @@ pub(crate) fn build_pnl_response_from_rows(
 
     let mut symbol_universe: BTreeSet<Symbol> = position_symbols.into_iter().collect();
     symbol_universe.extend(books.keys().cloned());
+    symbol_universe.extend(excluded_books.keys().map(|(symbol, _)| symbol.clone()));
     symbol_universe.extend(symbols_with_costs.iter().map(|row| row.symbol.clone()));
     let symbol_universe: Vec<_> = symbol_universe.into_iter().collect();
 
@@ -310,6 +324,76 @@ pub(crate) fn build_pnl_response_from_rows(
         },
         daily_net_realized_pnl_usd,
     ))
+}
+
+/// The book `row` replays on. Excluded fills never reached `Position`, so
+/// each replays on its own book, keyed by its chain qualified identity, with
+/// the manual cover recorded against it; they never net against the hedged
+/// fills or against each other.
+fn book_for<'books>(
+    row: &PositionLedgerRow,
+    symbol: Symbol,
+    books: &'books mut HashMap<Symbol, SymbolBook>,
+    excluded_books: &'books mut BTreeMap<(Symbol, String), SymbolBook>,
+) -> &'books mut SymbolBook {
+    match row {
+        PositionLedgerRow::ExcludedFill(ExcludedFillRow { trade_id, .. })
+        | PositionLedgerRow::ExcludedFillCover(ExcludedFillCoverRow { trade_id, .. }) => {
+            excluded_books
+                .entry((symbol, trade_id.clone()))
+                .or_default()
+        }
+        PositionLedgerRow::OnchainFill(_)
+        | PositionLedgerRow::OffchainPlacement(_)
+        | PositionLedgerRow::OffchainFill(_)
+        | PositionLedgerRow::ManualAdjustment(_) => books.entry(symbol).or_default(),
+    }
+}
+
+/// Finalizes each excluded fill's book and folds it into its symbol's totals.
+/// Open lots left on those books are exposure the operator has not covered
+/// yet, reported as a warning per symbol, but never reconciled with the
+/// position view's net, which excluded fills never reached.
+fn finalize_excluded_books(
+    excluded_books: &mut BTreeMap<(Symbol, String), SymbolBook>,
+    full_total: &mut SummaryAcc,
+    replay_symbols: &mut Vec<(Symbol, SummaryAcc)>,
+    warnings: &mut Vec<String>,
+    position_replay_deltas: &mut Vec<PositionReplayDelta>,
+) -> Result<(), PnlError> {
+    let no_position_nets = HashMap::new();
+    let mut per_symbol: BTreeMap<Symbol, SummaryAcc> = BTreeMap::new();
+    for ((symbol, _), book) in excluded_books.iter_mut() {
+        finalize_book(
+            symbol,
+            book,
+            &no_position_nets,
+            warnings,
+            position_replay_deltas,
+        )?;
+        add_summary(per_symbol.entry(symbol.clone()).or_default(), &book.summary)?;
+    }
+
+    for (symbol, summary) in per_symbol {
+        let open_shares = (summary.open_long_shares + summary.open_short_shares)?;
+        if !open_shares.is_zero()? {
+            warnings.push(format!(
+                "Fills on {symbol} excluded from hedging leave {} shares not yet covered \
+                 by a recorded manual cover; their PnL is open until the cover is recorded.",
+                fmt_decimal(open_shares)?
+            ));
+        }
+        add_summary(full_total, &summary)?;
+        match replay_symbols
+            .iter_mut()
+            .find(|(hedged, _)| *hedged == symbol)
+        {
+            Some((_, hedged)) => add_summary(hedged, &summary)?,
+            None => replay_symbols.push((symbol, summary)),
+        }
+    }
+
+    Ok(())
 }
 
 fn build_bot_gas_cost_entries(

@@ -1,0 +1,26 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT enabled_from_block FROM trading_disabled_period WHERE chain = ? AND symbol = ? AND disabled_from_block <= ? AND ? < enabled_from_block ORDER BY enabled_from_block LIMIT 1",
+  "describe": {
+    "columns": [
+      {
+        "name": "enabled_from_block",
+        "ordinal": 0,
+        "type_info": "Integer",
+        "origin": {
+          "Table": {
+            "table": "trading_disabled_period",
+            "name": "enabled_from_block"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Right": 4
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "00530a28e01d2e89a963b56e5c7437fcf3d81a69c2a67e38e9f3248ea0d661f0"
+}

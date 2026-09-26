@@ -769,16 +769,20 @@ fn render_process_tx_outcome<W: Write>(
             symbol,
             chain,
             detail,
+            instructions,
         } => {
             writeln!(
                 stdout,
-                "Trading is disabled for {symbol} on {chain}: the fill is not counter traded and was recorded in skipped_fills: {detail}"
+                "The fill on {symbol} ({chain}) is excluded from hedging: it is not counter traded and was recorded in skipped_fills: {detail}. {instructions}"
             )?;
         }
-        ProcessTxOutcome::AlreadyExcluded { detail } => {
+        ProcessTxOutcome::AlreadyExcluded {
+            detail,
+            instructions,
+        } => {
             writeln!(
                 stdout,
-                "The fill was excluded from hedging while trading was disabled and is recorded in skipped_fills. The pipeline will not hedge it: {detail}"
+                "The fill was already excluded from hedging and is recorded in skipped_fills. The pipeline will not hedge it: {detail}. {instructions}"
             )?;
         }
         ProcessTxOutcome::PlacementRejected { symbol } => {
@@ -2940,10 +2944,11 @@ mod tests {
                         symbol: symbol(),
                         chain: st0x_evm::Chain::Base,
                         detail: "cover by SELL".to_string(),
+                        instructions: "Record the cover.".to_string(),
                     },
                 },
                 format!(
-                    "{fill_summary}Trading is disabled for {} on base: the fill is not counter traded and was recorded in skipped_fills: cover by SELL\n",
+                    "{fill_summary}The fill on {} (base) is excluded from hedging: it is not counter traded and was recorded in skipped_fills: cover by SELL. Record the cover.\n",
                     symbol()
                 ),
             ),
@@ -2952,10 +2957,11 @@ mod tests {
                     fill: Some(fill()),
                     outcome: ProcessTxOutcome::AlreadyExcluded {
                         detail: "cover by SELL".to_string(),
+                        instructions: "Record the cover.".to_string(),
                     },
                 },
                 format!(
-                    "{fill_summary}The fill was excluded from hedging while trading was disabled and is recorded in skipped_fills. The pipeline will not hedge it: cover by SELL\n"
+                    "{fill_summary}The fill was already excluded from hedging and is recorded in skipped_fills. The pipeline will not hedge it: cover by SELL. Record the cover.\n"
                 ),
             ),
             (

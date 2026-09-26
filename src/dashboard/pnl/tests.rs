@@ -46,6 +46,7 @@ use crate::bot_gas::{
     BotGasOperationCategory, BotGasReceiptCost, BotGasReceiptCostError, BotGasReceiptCostEvent,
 };
 use crate::offchain::order::OffchainOrderId;
+use crate::onchain_trade::{OnChainTrade, OnChainTradeEvent};
 use crate::portfolio_snapshot::EtDayRange;
 use crate::position::{Position, PositionEvent, TradeId};
 use crate::test_utils::{persist_event, setup_test_db};
@@ -643,6 +644,7 @@ enum SeedEvent {
     Mint(String, TokenizedEquityMintEvent),
     Rebalance(String, UsdcRebalanceEvent),
     BotGas(String, BotGasReceiptCostEvent),
+    OnChainTrade(String, OnChainTradeEvent),
 }
 
 fn seed_bot_gas(cost: BotGasReceiptCost) -> SeedEvent {
@@ -763,6 +765,9 @@ async fn pnl_test_pool(seed: Vec<SeedEvent>, positions: Vec<PositionViewRow>) ->
             }
             SeedEvent::BotGas(id, event) => {
                 persist_event::<BotGasReceiptCost>(&pool, &id, next_sequence(&id), &event).await;
+            }
+            SeedEvent::OnChainTrade(id, event) => {
+                persist_event::<OnChainTrade>(&pool, &id, next_sequence(&id), &event).await;
             }
         }
     }
@@ -1073,13 +1078,248 @@ async fn source_loader_includes_manual_position_adjustments() {
     assert_eq!(report.entries.len(), 0);
 }
 
+const EXCLUDED_TRADE_ID: &str =
+    "base:0x5555555555555555555555555555555555555555555555555555555555555555:5";
+
+/// An onchain sell of 3 AAPL at 150 excluded from hedging.
+fn excluded_sell_event() -> SeedEvent {
+    SeedEvent::OnChainTrade(
+        EXCLUDED_TRADE_ID.to_owned(),
+        OnChainTradeEvent::ExcludedFromHedging {
+            symbol: Symbol::new("AAPL").unwrap(),
+            amount: float!(3),
+            direction: exec_direction(Direction::Sell),
+            price_usdc: float!(150),
+            block_timestamp: parse_timestamp("2026-05-15T13:00:00Z").unwrap(),
+            excluded_at: parse_timestamp("2026-05-15T13:00:05Z").unwrap(),
+        },
+    )
+}
+
+/// An excluded fill replays on its own book against the operator's manual
+/// cover: the hedged fills on the same symbol neither absorb it nor are
+/// disturbed by it, and the cover realizes its PnL.
+#[tokio::test]
+async fn excluded_fill_and_its_manual_cover_realize_pnl_on_their_own_book() {
+    let pool = pnl_test_pool(
+        vec![
+            SeedEvent::Position(
+                "AAPL",
+                onchain_fill_event(Direction::Sell, "100", "10", "2026-05-15T12:00:00Z"),
+            ),
+            SeedEvent::Position(
+                "AAPL",
+                offchain_fill_event(Direction::Buy, "100", "10", "2026-05-15T12:00:01Z"),
+            ),
+            excluded_sell_event(),
+            SeedEvent::OnChainTrade(
+                EXCLUDED_TRADE_ID.to_owned(),
+                OnChainTradeEvent::ExclusionCovered {
+                    symbol: Symbol::new("AAPL").unwrap(),
+                    shares: float!(3),
+                    direction: exec_direction(Direction::Buy),
+                    price_usdc: float!(140),
+                    broker_order_id: Some("order-1".to_owned()),
+                    covered_at: parse_timestamp("2026-05-15T14:00:00Z").unwrap(),
+                    recorded_at: parse_timestamp("2026-05-15T14:05:00Z").unwrap(),
+                },
+            ),
+        ],
+        vec![position_row("AAPL", "0")],
+    )
+    .await;
+
+    let report = build_pnl_report(&pool, &query(), Vec::new(), Utc::now())
+        .await
+        .unwrap();
+
+    assert_eq!(report.summary.gross_realized_pnl_usd, "30");
+    assert_eq!(report.summary.open_short_shares, "0");
+    assert_eq!(report.summary.open_long_shares, "0");
+    assert!(
+        report
+            .warnings
+            .iter()
+            .all(|warning| !warning.contains("not yet covered")),
+        "a covered exclusion leaves nothing open: {:?}",
+        report.warnings
+    );
+}
+
+/// Two excluded sells on one symbol, the second covered first: each cover
+/// closes its own fill, not the oldest open one. Sell A at 100 and B at 200,
+/// cover B at 190: 10 realized on B, and A stays open.
+#[tokio::test]
+async fn cover_closes_its_own_excluded_fill_not_the_oldest() {
+    let trade_a = "base:0x6666666666666666666666666666666666666666666666666666666666666666:1";
+    let trade_b = "base:0x7777777777777777777777777777777777777777777777777777777777777777:2";
+    let excluded = |trade: &str, price: Float, at: &str| {
+        SeedEvent::OnChainTrade(
+            trade.to_owned(),
+            OnChainTradeEvent::ExcludedFromHedging {
+                symbol: Symbol::new("AAPL").unwrap(),
+                amount: float!(1),
+                direction: exec_direction(Direction::Sell),
+                price_usdc: price,
+                block_timestamp: parse_timestamp(at).unwrap(),
+                excluded_at: parse_timestamp(at).unwrap(),
+            },
+        )
+    };
+    let pool = pnl_test_pool(
+        vec![
+            excluded(trade_a, float!(100), "2026-05-15T13:00:00Z"),
+            excluded(trade_b, float!(200), "2026-05-15T13:10:00Z"),
+            SeedEvent::OnChainTrade(
+                trade_b.to_owned(),
+                OnChainTradeEvent::ExclusionCovered {
+                    symbol: Symbol::new("AAPL").unwrap(),
+                    shares: float!(1),
+                    direction: exec_direction(Direction::Buy),
+                    price_usdc: float!(190),
+                    broker_order_id: None,
+                    covered_at: parse_timestamp("2026-05-15T14:00:00Z").unwrap(),
+                    recorded_at: parse_timestamp("2026-05-15T14:05:00Z").unwrap(),
+                },
+            ),
+        ],
+        vec![position_row("AAPL", "0")],
+    )
+    .await;
+
+    let report = build_pnl_report(&pool, &query(), Vec::new(), Utc::now())
+        .await
+        .unwrap();
+
+    assert_eq!(report.summary.gross_realized_pnl_usd, "10");
+    assert_eq!(report.summary.open_short_shares, "1");
+}
+
+/// A fill classified both ways is booked once, through `Position`, at every
+/// watermark from the hedged event on; before that event it is the exclusion
+/// it was, open and then covered.
+#[tokio::test]
+async fn fill_also_in_position_is_booked_once_from_the_hedged_event_on() {
+    let tx_hash = TxHash::repeat_byte(0x55);
+    let hedged = PositionEvent::OnChainOrderFilled {
+        trade_id: TradeId {
+            chain: Chain::Base,
+            tx_hash,
+            log_index: 5,
+        },
+        amount: FractionalShares::new(float!(3)),
+        direction: exec_direction(Direction::Sell),
+        price_usdc: float!(150),
+        block_timestamp: parse_timestamp("2026-05-15T13:00:00Z").unwrap(),
+        block_number: None,
+        seen_at: parse_timestamp("2026-05-15T13:00:00Z").unwrap(),
+    };
+    let cover = SeedEvent::OnChainTrade(
+        EXCLUDED_TRADE_ID.to_owned(),
+        OnChainTradeEvent::ExclusionCovered {
+            symbol: Symbol::new("AAPL").unwrap(),
+            shares: float!(3),
+            direction: exec_direction(Direction::Buy),
+            price_usdc: float!(140),
+            broker_order_id: None,
+            covered_at: parse_timestamp("2026-05-15T14:00:00Z").unwrap(),
+            recorded_at: parse_timestamp("2026-05-15T14:05:00Z").unwrap(),
+        },
+    );
+    let pool = pnl_test_pool(
+        vec![
+            excluded_sell_event(),
+            cover,
+            SeedEvent::Position("AAPL", hedged),
+        ],
+        vec![position_row("AAPL", "-3")],
+    )
+    .await;
+
+    let current = build_pnl_report(&pool, &query(), Vec::new(), Utc::now())
+        .await
+        .unwrap();
+    assert_eq!(
+        current.summary.open_short_shares, "3",
+        "booked once, not twice"
+    );
+    assert!(
+        current
+            .warnings
+            .iter()
+            .all(|warning| !warning.contains("not yet covered")),
+        "{:?}",
+        current.warnings
+    );
+
+    assert_eq!(
+        current.summary.gross_realized_pnl_usd, "0",
+        "the cover of a fill the bot hedges is not booked either"
+    );
+
+    let before_cover = PnlQuery {
+        as_of_rowid: Some(1),
+        ..query()
+    };
+    let excluded = build_pnl_report(&pool, &before_cover, Vec::new(), Utc::now())
+        .await
+        .unwrap();
+    assert_eq!(excluded.summary.open_short_shares, "3");
+    assert!(
+        excluded
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("not yet covered")),
+        "before the hedged event the fill was an open exclusion: {:?}",
+        excluded.warnings
+    );
+
+    let before_hedge = PnlQuery {
+        as_of_rowid: Some(2),
+        ..query()
+    };
+    let covered = build_pnl_report(&pool, &before_hedge, Vec::new(), Utc::now())
+        .await
+        .unwrap();
+    assert_eq!(
+        covered.summary.gross_realized_pnl_usd, "30",
+        "at the cover's watermark the exclusion and its cover are booked"
+    );
+    assert_eq!(covered.summary.open_short_shares, "0");
+}
+
+/// Until the cover is recorded the excluded fill is open exposure, and the
+/// report says so.
+#[tokio::test]
+async fn uncovered_excluded_fill_is_open_exposure_with_a_warning() {
+    let pool = pnl_test_pool(vec![excluded_sell_event()], vec![position_row("AAPL", "0")]).await;
+
+    let report = build_pnl_report(&pool, &query(), Vec::new(), Utc::now())
+        .await
+        .unwrap();
+
+    assert_eq!(report.summary.gross_realized_pnl_usd, "0");
+    assert_eq!(report.summary.open_short_shares, "3");
+    assert!(
+        report
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("AAPL") && warning.contains("not yet covered")),
+        "the open excluded exposure must be called out: {:?}",
+        report.warnings
+    );
+}
+
+// An onchain fill's payload feeds `idx_events_position_fill_tx_hash`, so SQLite
+// refuses malformed text for it at write time; an offchain fill has no such
+// index, which leaves the ingestion check as the guard under test.
 #[tokio::test]
 async fn ledger_ingestion_rejects_malformed_persisted_payload_text() {
     let pool = pnl_test_pool(Vec::new(), position_rows()).await;
     sqlx::query(
         "INSERT INTO events (aggregate_type, aggregate_id, sequence, \
          event_type, event_version, payload, metadata) \
-         VALUES ('Position', 'RKLB', 1, 'PositionEvent::OnChainOrderFilled', '1.0', \
+         VALUES ('Position', 'RKLB', 1, 'PositionEvent::OffChainOrderFilled', '1.0', \
          '{not-json', '{}')",
     )
     .execute(&pool)

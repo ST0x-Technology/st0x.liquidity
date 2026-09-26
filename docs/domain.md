@@ -70,10 +70,13 @@ verbs -- one verb per intent:
   `--reason` required.
 - `rebuild` -- recompute a projection from the event log.
 
-Two commands sit deliberately outside the verb set, named for their exact
-effect: `cctp complete-mint` (a raw on-chain primitive touching no aggregate)
-and `position release-hedge` (releases a Position's stuck pending-offchain-order
-pointer so hedging can retry; `--reason` required).
+Three commands sit deliberately outside the verb set, named for their exact
+effect: `cctp complete-mint` (a raw on-chain primitive touching no aggregate),
+`position release-hedge` (releases a Position's stuck pending-offchain-order
+pointer so hedging can retry; `--reason` required) and the liquidity client's
+`debug cover-excluded-fill` (records the facts of the operator's broker cover of
+a fill excluded from hedging, its shares, price, time and optional order id, and
+overrides no derived state).
 
 `recover` is forbidden as a CLI verb -- it spans three unrelated intents and
 carries no information. All state-mutating verbs emit events through aggregate

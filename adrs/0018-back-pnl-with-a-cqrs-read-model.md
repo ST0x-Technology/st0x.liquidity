@@ -5,6 +5,13 @@
 - **Linear:** RAI-1506
 - **Related:** ADR 0016 (event row ID as the shared immutable ingestion cursor)
 
+Status note (2026-09-25, RAI-2641): `OnChainTrade` joined the source aggregates
+for its `ExcludedFromHedging` and `ExclusionCovered` events, which the ledger
+books into `pnl_excluded_fill` and `pnl_excluded_fill_cover` under the same
+conventions as the other `pnl_*` tables; the reactor runs a catch up only for
+those two event types. `LEDGER_VERSION` went to 2, so the ledger rebuilds on
+first start. The source list and table set below predate this change.
+
 ## Context
 
 `/pnl` is the last consumer that queries the `events` table directly.

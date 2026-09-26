@@ -1858,27 +1858,77 @@ event position).
 - Per-asset market enable/disable: individual equity markets can be disabled via
   `trading = "disabled"` on the asset's entry in its chain's assets table. The
   flag is the hedge kill switch for that asset on that chain, and it holds for
-  every fill accounted while it is disabled: such a fill is never counter
-  traded, inline or by the periodic position scan. `Position` holds one net per
-  symbol across all hedged chains, so the fill is kept out of it entirely;
-  otherwise the scan would hedge it for any other chain that enables the symbol.
-  Disabling does not unwind a net the symbol already accumulated on that chain
-  while it was enabled: that net stays in `Position`, and the scan keeps hedging
-  it for as long as any hedged chain enables the symbol, so flipping the switch
-  mid incident does not stop the bot hedging exposure it already accounted. An
-  excluded fill is still witnessed on its `OnChainTrade` and recorded in
-  `skipped_fills` with reason `trading_disabled`, and it raises a deduplicated
-  critical operational alert (once per process per chain and symbol), so the
-  exposure it leaves is never silent. The flag is read when the bot accounts the
-  fill, not when the fill lands on chain. Enabling the asset again therefore
-  hedges every fill the bot accounts from the restart on, including fills that
-  landed earlier but were not accounted yet: still queued, not yet backfilled
-  past the ingestion cutoff, or landing during the restart itself. Only fills
-  already recorded in `skipped_fills` with reason `trading_disabled` stay
-  excluded and are never hedged later; an operator covers that delta by hand
-  from those records. Excluded fills also never reach the PnL ledger, which
-  replays `Position` events, so PnL is incomplete for them and a manual cover
-  must be reconciled outside the ledger. Rebalancing is governed separately by
+  every fill that lands while it is disabled and every fill the bot accounts
+  while it is disabled: such a fill is never counter traded, inline or by the
+  periodic position scan. `Position` holds one net per symbol across all hedged
+  chains, so the fill is kept out of it entirely; otherwise the scan would hedge
+  it for any other chain that enables the symbol. Disabling does not unwind a
+  net the symbol already accumulated on that chain while it was enabled: that
+  net stays in `Position`, and the scan keeps hedging it for as long as any
+  hedged chain enables the symbol, so flipping the switch mid incident does not
+  stop the bot hedging exposure it already accounted. Each restart reads every
+  hedged chain's head block and records the flags it observes per chain and
+  symbol in `trading_enablement`, before it accounts any fill. A restart that
+  sees an asset disabled opens a disabled period from the block after that head;
+  a restart that sees it enabled again closes the period at the block after its
+  head and keeps it in `trading_disabled_period`. A fill whose block falls
+  inside a closed disabled period landed while trading was disabled and stays
+  excluded even when the bot accounts it after the enable (still queued, not yet
+  backfilled past the ingestion cutoff, or landing during the restart itself);
+  fills from the enabled periods on either side are hedged. An asset first seen
+  disabled is known disabled only from that restart, so fills before it keep the
+  hedged path once it is enabled; an asset first seen enabled has no disabled
+  period. A process whose config already enables an asset while the last restart
+  still recorded it disabled (CLI `process-tx` run after the config edit and
+  before the bot restarts) treats that period as still open and excludes fills
+  from its start block on, with a detail naming the open period. The boundary is
+  the head each restart reads, so a reorg at that exact head can place a fill on
+  the wrong side of it. A restart that sees the asset enabled at the very head
+  that disabled it keeps no period, since no block landed while it was disabled.
+  A restart whose head is behind the head the disabling restart read (a stale
+  node) records nothing and refuses to start, which clears on a later start once
+  the node reports a current head; if the chain endpoint was pointed at a
+  different network, correct the endpoint, or delete the chain and symbol row
+  from `trading_enablement` after deciding by hand which fills of that period
+  stay excluded. Fills excluded before exclusions were recorded on
+  `OnChainTrade` are adopted at startup, unless the fill already reached
+  `Position`. An excluded fill is still witnessed on its `OnChainTrade`, which
+  records the exclusion, and it is recorded in `skipped_fills` with reason
+  `trading_disabled` and a detail naming its cover side. Each excluded fill the
+  bot accounts raises its own critical operational alert, with the fill, its
+  cover side and the uncovered net on its symbol and chain, so the exposure it
+  leaves is never silent; `skipped_fills.paged_at` makes a redelivery after a
+  crash page a fill that was not paged yet. A fill excluded through `process-tx`
+  (CLI or REST route) is reported in its outcome with the commands to recheck
+  the uncovered list and record the cover, and stays unpaged until the bot
+  delivers it. An operator lists excluded fills with
+  `GET
+  /liquidity-read/skipped-fills`
+  (`st0x-liquidity-client read resource
+  skipped-fills`, filters `reason`,
+  `chain`, `symbol`, `since` and `covered`, paged newest first with the `before`
+  cursor the previous page returns as `nextBefore`), covers each delta by hand
+  at the broker, and records the cover once the fill's whole amount is covered,
+  at the volume weighted price, with
+  `POST /liquidity-write/excluded-fills/{trade_id}/cover`
+  (`st0x-liquidity-client debug cover-excluded-fill`), which rejects a partial
+  amount, a time before the fill or more than five minutes ahead of the bot's
+  clock, and a second cover. A recorded cover is final: no command amends or
+  voids it, so its price and time are checked before submission. Each fill is
+  covered by its own broker trade, so the PnL ledger books real executions; the
+  page's uncovered net is exposure context, not a trade to place. A fill whose
+  cover is recorded is not paged, and the page tells the operator to check the
+  uncovered list first. A fill found both in `Position` and recorded as excluded
+  (concurrent runs classified it both ways) is handled by where it stands: when
+  one run writes its acknowledged marker after the other run's marker, that
+  marker write fails with `ExclusionConflict`; a fill already in `Position`
+  whose marker is not written yet, and every later delivery, is finished as
+  hedged and the conflict is logged for manual reconciliation, and it is never
+  paged, listed as uncovered, coverable or booked on the excluded PnL book (the
+  listing flags it `inPosition`). The PnL ledger books excluded fills and their
+  recorded covers on their own book per excluded fill, apart from the hedged
+  fills and from each other: an excluded fill without a recorded cover is open
+  exposure and the report warns about it. Rebalancing is governed separately by
   the asset's `rebalancing` flag.
 
 ### Infrastructure and Deployment
@@ -2602,6 +2652,24 @@ struct OnChainTrade {
     block_timestamp: DateTime<Utc>,
     filled_at: DateTime<Utc>,
     enrichment: Option<Enrichment>,
+    // Set once the fill is fully accounted: applied to `Position`, or
+    // excluded from hedging.
+    acknowledged_at: Option<DateTime<Utc>>,
+    // Set when the fill was excluded from hedging instead of applied to
+    // `Position`, with the operator's manual cover once recorded.
+    exclusion: Option<Exclusion>,
+}
+
+struct Exclusion {
+    excluded_at: DateTime<Utc>,
+    cover: Option<ExclusionCover>,
+}
+
+struct ExclusionCover {
+    price_usdc: Decimal,
+    broker_order_id: Option<String>,
+    covered_at: DateTime<Utc>,
+    recorded_at: DateTime<Utc>,
 }
 
 // Legacy persisted state only. The runtime no longer emits this data.
@@ -2627,6 +2695,17 @@ enum OnChainTradeCommand {
     },
     AttributeSource { source: OnChainTradeSource },
     Acknowledge,
+    // Excludes the fill from hedging; also acknowledges it.
+    Exclude,
+    // Records the exclusion of an acknowledged fill excluded before
+    // exclusions were recorded on the trade.
+    AdoptLegacyExclusion,
+    RecordExclusionCover {
+        shares: Decimal,
+        price_usdc: Decimal,
+        broker_order_id: Option<String>,
+        covered_at: DateTime<Utc>,
+    },
 }
 ```
 
@@ -2650,13 +2729,44 @@ enum OnChainTradeEvent {
         pyth_price: PythPrice,
         enriched_at: DateTime<Utc>,
     },
+    Acknowledged {
+        acknowledged_at: DateTime<Utc>,
+    },
+    // The fill's own terms, so the PnL ledger books it from this event.
+    ExcludedFromHedging {
+        symbol: Symbol,
+        amount: Decimal,
+        direction: Direction,
+        price_usdc: Decimal,
+        block_timestamp: DateTime<Utc>,
+        excluded_at: DateTime<Utc>,
+    },
+    // `direction` is the cover's side, opposite the fill; `shares` is the
+    // fill's amount.
+    ExclusionCovered {
+        symbol: Symbol,
+        shares: Decimal,
+        direction: Direction,
+        price_usdc: Decimal,
+        broker_order_id: Option<String>,
+        covered_at: DateTime<Utc>,
+        recorded_at: DateTime<Utc>,
+    },
 }
 ```
 
 **Business Rules** (enforced in `handle()`):
 
 - Current commands never append `Enriched`; historical events remain replayable
-- A fill can be acknowledged only after it is witnessed
+- A fill can be acknowledged only after it is witnessed, and only once
+- `Exclude` emits `ExcludedFromHedging` then `Acknowledged`, so an excluded fill
+  is also acknowledged; it is refused on an acknowledged fill
+- `AdoptLegacyExclusion` applies only to an acknowledged fill without an
+  exclusion, and emits only `ExcludedFromHedging`
+- A cover applies only to an excluded fill, once: a second cover is rejected
+- A cover must be for the fill's full amount, at a positive price, executed no
+  earlier than the fill's block timestamp and no more than five minutes ahead of
+  the bot's clock (broker and host clocks differ by seconds)
 
 #### Position Aggregate
 
@@ -5876,11 +5986,13 @@ effect rather than a generic intent:
   process, callers first queue on a process wide mutex, so the lock file only
   arbitrates between processes; on an in memory database, which only its own
   process can attach to, that mutex alone is the lock. Like the bot, process-tx
-  keeps a fill on an asset whose trading is disabled on the fill's chain out of
-  the position (see Risk Management) and reports its cover detail; a fill
-  excluded earlier stays excluded and is reported as such. It is independent of
-  the submission lock, which is taken after accounting and serializes only the
-  position claim and broker placement.
+  keeps a fill the bot would exclude from hedging (trading disabled on the
+  fill's chain, or the fill landed while it was; see Risk Management) out of the
+  position and reports its cover detail with the commands to recheck the
+  uncovered list and record the manual cover, since the bot never pages a fill
+  it does not deliver; a fill excluded earlier stays excluded and is reported as
+  such. It is independent of the submission lock, which is taken after
+  accounting and serializes only the position claim and broker placement.
 
   It has two execution paths. The **CLI** runs it in direct-DB mode, in a
   separate process from the bot, and selects the hedged chain with `--network`,

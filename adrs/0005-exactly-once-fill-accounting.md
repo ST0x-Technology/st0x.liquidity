@@ -67,8 +67,10 @@ dedupe identity):
 
    Status note (2026-09-24): one exception. A fill on an asset whose trading is
    disabled on its own chain never reaches `Position`; its marker follows a
-   `skipped_fills` record instead. See the per asset market enable and disable
-   paragraph under Risk Management in `SPEC.md`.
+   `skipped_fills` record instead, and is written by the `Exclude` command,
+   which records the exclusion on the `OnChainTrade` alongside the marker. See
+   the per asset market enable and disable paragraph under Risk Management in
+   `SPEC.md`.
 3. `execute_acknowledge_fill` propagates errors so apalis retries the job
    instead of silently dropping the fill (`execute_enrich_trade` stays
    best-effort: enrichment is observability data, not financial state).
