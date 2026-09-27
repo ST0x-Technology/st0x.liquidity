@@ -1390,6 +1390,7 @@ impl std::fmt::Debug for Ctx {
             .field("telemetry", &self.telemetry)
             .field("alerts", &self.alerts)
             .field("startup_notices", &self.startup_notices)
+            .field("registry", &self.registry)
             .field("pricing", &self.pricing)
             .field("rebalancing", &self.rebalancing)
             .field("order_owner", &self.order_owner)
@@ -1760,7 +1761,7 @@ fn validate_config(
             registry.url,
             registry
                 .generation
-                .map_or("latest copy".to_string(), |g| format!("generation {g}"))
+                .map_or_else(|| "latest copy".to_string(), |g| format!("generation {g}"))
         )));
     }
     if let Some(schedule) = config
@@ -1990,9 +1991,10 @@ pub async fn fetch_token_file(
         .map_err(registry_error)
 }
 
-/// Judge a fresh copy of the token file the way boot would, against the
-/// config this instance runs: parse, merge, validate. Returns what differs
-/// from the running tables ("no difference" when nothing does).
+/// Judge a fresh copy of the token file the way boot would.
+///
+/// Parse, merge into the config this instance runs, validate. Returns what
+/// differs from the running tables ("no difference" when nothing does).
 pub fn registry_check(live: &RegistryLive, fresh: &[u8]) -> Result<String, CtxError> {
     let path = Path::new(&live.source.url);
     let registry_error = |source| CtxError::Registry {
