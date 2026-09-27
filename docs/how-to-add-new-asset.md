@@ -254,14 +254,14 @@ cargo run --bin validate-config -- --config config/prod/st0x-hedge.toml \
 
 ### Retiring an asset
 
-One config change. List the symbol under `[assets.equities] retired_symbols`
-in the bot's config and release that. From then on the bot ignores the token
-file's rows for that symbol, so the merged config never has it both configured
-and retired, and `verify-migrations` still finds every symbol the database
-references either configured or retired. Remove its rows from `t0/<env>.toml`
-in `st0x.registry` whenever convenient afterwards; for production that lands
-with the next `generation` bump. Never remove the rows first: the database
-would then reference a symbol that is neither configured nor retired.
+One config change. List the symbol under `[assets.equities] retired_symbols` in
+the bot's config and release that. From then on the bot ignores the token file's
+rows for that symbol, so the merged config never has it both configured and
+retired, and `verify-migrations` still finds every symbol the database
+references either configured or retired. Remove its rows from `t0/<env>.toml` in
+`st0x.registry` whenever convenient afterwards; for production that lands with
+the next `generation` bump. Never remove the rows first: the database would then
+reference a symbol that is neither configured nor retired.
 
 **Tip:** Start with `trading = "disabled"` first. Publish, verify the bot sees
 the asset, then enable trading in a follow-up change.
