@@ -3534,7 +3534,7 @@ mod tests {
             "",
         ));
 
-        Ctx::validate_files(config.path(), secrets.path()).unwrap();
+        Ctx::validate_files(config.path(), secrets.path(), TokenFile::Skipped).unwrap();
     }
 
     /// The enablement predicate has to run on the real load path, not just as
@@ -3550,7 +3550,8 @@ mod tests {
         );
         let secrets = alpaca_secrets_toml();
 
-        let error = Ctx::validate_files(config.path(), secrets.path()).unwrap_err();
+        let error =
+            Ctx::validate_files(config.path(), secrets.path(), TokenFile::Skipped).unwrap_err();
         let message = error.to_string();
 
         assert!(
@@ -3571,7 +3572,7 @@ mod tests {
         );
         let secrets = alpaca_secrets_toml();
 
-        Ctx::validate_files(config.path(), secrets.path()).unwrap();
+        Ctx::validate_files(config.path(), secrets.path(), TokenFile::Skipped).unwrap();
     }
 
     /// A disabled chain is dropped from the registry, so a wallet that signs
@@ -3610,7 +3611,8 @@ mod tests {
             "#,
         );
 
-        let error = Ctx::validate_files(config.path(), secrets.path()).unwrap_err();
+        let error =
+            Ctx::validate_files(config.path(), secrets.path(), TokenFile::Skipped).unwrap_err();
 
         assert!(
             matches!(
@@ -3634,7 +3636,8 @@ mod tests {
         );
         let secrets = alpaca_secrets_toml();
 
-        let error = Ctx::validate_files(config.path(), secrets.path()).unwrap_err();
+        let error =
+            Ctx::validate_files(config.path(), secrets.path(), TokenFile::Skipped).unwrap_err();
 
         assert!(
             error.to_string().contains("no chain at all"),
@@ -3699,7 +3702,8 @@ mod tests {
         );
         let secrets = alpaca_secrets_toml();
 
-        let error = Ctx::validate_files(config.path(), secrets.path()).unwrap_err();
+        let error =
+            Ctx::validate_files(config.path(), secrets.path(), TokenFile::Skipped).unwrap_err();
         let source = std::error::Error::source(&error)
             .map(ToString::to_string)
             .unwrap_or_default();
@@ -4215,7 +4219,7 @@ mod tests {
         "#,
         );
         let secrets = alpaca_secrets_toml();
-        let error = Ctx::load_files(config.path(), secrets.path())
+        let error = Ctx::load_files(config.path(), secrets.path(), None)
             .await
             .unwrap_err();
 
@@ -4354,7 +4358,8 @@ mod tests {
         ));
         let secrets = alpaca_secrets_toml();
 
-        let error = Ctx::validate_files(config.path(), secrets.path()).unwrap_err();
+        let error =
+            Ctx::validate_files(config.path(), secrets.path(), TokenFile::Skipped).unwrap_err();
 
         assert!(
             matches!(error, CtxError::MissingCounterTradeSlippageBps),
@@ -4422,7 +4427,7 @@ mod tests {
         "#
         ));
         let secrets = alpaca_secrets_toml();
-        let error = Ctx::load_files(config.path(), secrets.path())
+        let error = Ctx::load_files(config.path(), secrets.path(), None)
             .await
             .unwrap_err();
 
@@ -4497,7 +4502,7 @@ mod tests {
         "#
         ));
         let secrets = alpaca_secrets_toml();
-        let error = Ctx::load_files(config.path(), secrets.path())
+        let error = Ctx::load_files(config.path(), secrets.path(), None)
             .await
             .unwrap_err();
 
@@ -4638,7 +4643,7 @@ mod tests {
             ("0.05", "not-a-number", Chain::Ethereum),
         ] {
             let config = alerts_config_toml(base_threshold, ethereum_threshold);
-            let error = Ctx::load_files(config.path(), secrets.path())
+            let error = Ctx::load_files(config.path(), secrets.path(), None)
                 .await
                 .unwrap_err();
 
@@ -4666,7 +4671,7 @@ mod tests {
         ));
         let secrets = alpaca_secrets_toml();
 
-        let error = Ctx::load_files(config.path(), secrets.path())
+        let error = Ctx::load_files(config.path(), secrets.path(), None)
             .await
             .unwrap_err();
 
@@ -4692,7 +4697,7 @@ mod tests {
         );
         let secrets = alpaca_secrets_toml();
 
-        let error = Ctx::load_files(config.path(), secrets.path())
+        let error = Ctx::load_files(config.path(), secrets.path(), None)
             .await
             .unwrap_err();
 
@@ -4713,7 +4718,7 @@ mod tests {
         );
         let secrets = alpaca_secrets_toml();
 
-        let error = Ctx::load_files(config.path(), secrets.path())
+        let error = Ctx::load_files(config.path(), secrets.path(), None)
             .await
             .unwrap_err();
 
@@ -4731,7 +4736,7 @@ mod tests {
         let config = minimal_config_toml();
         let secrets = dry_run_secrets_toml();
 
-        let error = Ctx::load_files(config.path(), secrets.path())
+        let error = Ctx::load_files(config.path(), secrets.path(), None)
             .await
             .unwrap_err();
 
@@ -4772,7 +4777,7 @@ mod tests {
         );
         let secrets = alpaca_secrets_toml();
 
-        let error = Ctx::load_files(config.path(), secrets.path())
+        let error = Ctx::load_files(config.path(), secrets.path(), None)
             .await
             .unwrap_err();
 
@@ -4789,7 +4794,7 @@ mod tests {
         );
         let secrets = alpaca_secrets_toml();
 
-        let error = Ctx::load_files(config.path(), secrets.path())
+        let error = Ctx::load_files(config.path(), secrets.path(), None)
             .await
             .unwrap_err();
 
@@ -4806,7 +4811,7 @@ mod tests {
         );
         let secrets = alpaca_secrets_toml();
 
-        let error = Ctx::load_files(config.path(), secrets.path())
+        let error = Ctx::load_files(config.path(), secrets.path(), None)
             .await
             .unwrap_err();
 
@@ -4873,7 +4878,7 @@ mod tests {
         "#,
         );
         let secrets = alpaca_secrets_toml();
-        let error = Ctx::load_files(config.path(), secrets.path())
+        let error = Ctx::load_files(config.path(), secrets.path(), None)
             .await
             .unwrap_err();
 
@@ -4932,7 +4937,7 @@ mod tests {
         "#,
         );
         let secrets = alpaca_secrets_toml();
-        let error = Ctx::load_files(config.path(), secrets.path())
+        let error = Ctx::load_files(config.path(), secrets.path(), None)
             .await
             .unwrap_err();
 
@@ -5000,7 +5005,7 @@ mod tests {
         "#,
         );
         let secrets = alpaca_secrets_toml();
-        let error = Ctx::load_files(config.path(), secrets.path())
+        let error = Ctx::load_files(config.path(), secrets.path(), None)
             .await
             .unwrap_err();
 
@@ -5061,7 +5066,7 @@ mod tests {
         "#,
         );
         let secrets = alpaca_secrets_toml();
-        let error = Ctx::load_files(config.path(), secrets.path())
+        let error = Ctx::load_files(config.path(), secrets.path(), None)
             .await
             .unwrap_err();
 
@@ -5121,7 +5126,7 @@ mod tests {
         "#,
         );
         let secrets = alpaca_secrets_toml();
-        let error = Ctx::load_files(config.path(), secrets.path())
+        let error = Ctx::load_files(config.path(), secrets.path(), None)
             .await
             .unwrap_err();
 
@@ -5181,7 +5186,7 @@ mod tests {
         "#,
         );
         let secrets = alpaca_secrets_toml();
-        let error = Ctx::load_files(config.path(), secrets.path())
+        let error = Ctx::load_files(config.path(), secrets.path(), None)
             .await
             .unwrap_err();
 
@@ -5251,7 +5256,7 @@ mod tests {
         "#,
         );
         let secrets = alpaca_secrets_toml();
-        let error = Ctx::load_files(config.path(), secrets.path())
+        let error = Ctx::load_files(config.path(), secrets.path(), None)
             .await
             .unwrap_err();
 
@@ -5314,7 +5319,7 @@ mod tests {
         "#,
         );
         let secrets = alpaca_secrets_toml();
-        let error = Ctx::load_files(config.path(), secrets.path())
+        let error = Ctx::load_files(config.path(), secrets.path(), None)
             .await
             .unwrap_err();
 
@@ -5338,7 +5343,7 @@ mod tests {
             ),
         );
         let secrets = alpaca_secrets_toml();
-        let error = Ctx::load_files(config.path(), secrets.path())
+        let error = Ctx::load_files(config.path(), secrets.path(), None)
             .await
             .unwrap_err();
 
@@ -5396,7 +5401,7 @@ mod tests {
         "#,
         );
         let secrets = alpaca_secrets_toml();
-        let error = Ctx::load_files(config.path(), secrets.path())
+        let error = Ctx::load_files(config.path(), secrets.path(), None)
             .await
             .unwrap_err();
 
@@ -5474,7 +5479,7 @@ mod tests {
             "#
             ));
             let secrets = alpaca_secrets_toml();
-            let error = Ctx::load_files(config.path(), secrets.path())
+            let error = Ctx::load_files(config.path(), secrets.path(), None)
                 .await
                 .unwrap_err();
 
@@ -5603,7 +5608,7 @@ mod tests {
         "#,
         );
 
-        let error = Ctx::load_files(config.path(), secrets.path())
+        let error = Ctx::load_files(config.path(), secrets.path(), None)
             .await
             .unwrap_err();
         let CtxError::CashOperationalLimitBelowMinimumTransfer {
@@ -5768,7 +5773,7 @@ mod tests {
         ));
         let secrets = alpaca_secrets_toml();
 
-        let error = Ctx::load_files(config.path(), secrets.path())
+        let error = Ctx::load_files(config.path(), secrets.path(), None)
             .await
             .unwrap_err();
         assert!(
@@ -5787,7 +5792,7 @@ mod tests {
         ));
         let secrets = alpaca_secrets_toml();
 
-        let error = Ctx::load_files(config.path(), secrets.path())
+        let error = Ctx::load_files(config.path(), secrets.path(), None)
             .await
             .unwrap_err();
         assert!(
@@ -5895,7 +5900,7 @@ mod tests {
         "#,
         );
 
-        let error = Ctx::load_files(config.path(), secrets.path())
+        let error = Ctx::load_files(config.path(), secrets.path(), None)
             .await
             .unwrap_err();
         assert!(
@@ -5908,7 +5913,7 @@ mod tests {
     async fn unsupported_schwab_broker_fails_during_secret_parsing() {
         let config = minimal_config_toml();
         let secrets = unsupported_schwab_secrets_toml();
-        let result = Ctx::load_files(config.path(), secrets.path()).await;
+        let result = Ctx::load_files(config.path(), secrets.path(), None).await;
         assert!(
             matches!(result, Err(CtxError::SecretsToml { .. })),
             "Expected unsupported Schwab broker secrets to fail during parsing, got {result:?}"
@@ -5919,7 +5924,7 @@ mod tests {
     async fn unsupported_schwab_broker_with_order_owner_fails_during_secret_parsing() {
         let config = minimal_config_toml();
         let secrets = unsupported_schwab_secrets_toml();
-        let error = Ctx::load_files(config.path(), secrets.path())
+        let error = Ctx::load_files(config.path(), secrets.path(), None)
             .await
             .unwrap_err();
         assert_eq!(
@@ -5937,7 +5942,7 @@ mod tests {
     #[cfg(feature = "wallet-private-key")]
     #[tokio::test]
     async fn example_config_and_secrets_parse_successfully() {
-        let ctx = Ctx::load_files(example_config_toml(), example_secrets_toml())
+        let ctx = Ctx::load_files(example_config_toml(), example_secrets_toml(), None)
             .await
             .unwrap();
 
@@ -6063,7 +6068,7 @@ mod tests {
         );
         let secrets = secrets_only_secrets_toml(CREDENTIALS_ONLY_BROKER, API_KEY_ONLY_ISSUANCE);
 
-        let ctx = Ctx::load_files(config.path(), secrets.path())
+        let ctx = Ctx::load_files(config.path(), secrets.path(), None)
             .await
             .unwrap();
 
@@ -6100,7 +6105,7 @@ mod tests {
         );
         let secrets = secrets_only_secrets_toml("", API_KEY_ONLY_ISSUANCE);
 
-        let ctx = Ctx::load_files(config.path(), secrets.path())
+        let ctx = Ctx::load_files(config.path(), secrets.path(), None)
             .await
             .unwrap();
 
@@ -6128,7 +6133,7 @@ mod tests {
         );
         let secrets = alpaca_secrets_toml();
 
-        let ctx = Ctx::load_files(config.path(), secrets.path())
+        let ctx = Ctx::load_files(config.path(), secrets.path(), None)
             .await
             .unwrap();
 
@@ -6163,7 +6168,7 @@ mod tests {
         );
         let secrets = alpaca_secrets_toml();
 
-        let error = Ctx::load_files(config.path(), secrets.path())
+        let error = Ctx::load_files(config.path(), secrets.path(), None)
             .await
             .unwrap_err();
 
@@ -6183,7 +6188,7 @@ mod tests {
         let config = broker_identity_config_toml(r#"type = "alpaca-broker-api-kms""#);
         let secrets = alpaca_secrets_toml();
 
-        let error = Ctx::load_files(config.path(), secrets.path())
+        let error = Ctx::load_files(config.path(), secrets.path(), None)
             .await
             .unwrap_err();
 
@@ -6198,7 +6203,7 @@ mod tests {
         let config = alpaca_trading_config_toml();
         let secrets = secrets_only_secrets_toml("", API_KEY_ONLY_ISSUANCE);
 
-        let error = Ctx::load_files(config.path(), secrets.path())
+        let error = Ctx::load_files(config.path(), secrets.path(), None)
             .await
             .unwrap_err();
 
@@ -6217,7 +6222,7 @@ mod tests {
         let config = broker_identity_config_toml(r#"type = "dry-run""#);
         let secrets = secrets_only_secrets_toml("", API_KEY_ONLY_ISSUANCE);
 
-        let error = Ctx::load_files(config.path(), secrets.path())
+        let error = Ctx::load_files(config.path(), secrets.path(), None)
             .await
             .unwrap_err();
 
@@ -6244,7 +6249,7 @@ mod tests {
         );
         let secrets = secrets_only_secrets_toml(CREDENTIALS_ONLY_BROKER, API_KEY_ONLY_ISSUANCE);
 
-        let error = Ctx::load_files(config.path(), secrets.path())
+        let error = Ctx::load_files(config.path(), secrets.path(), None)
             .await
             .unwrap_err();
 
@@ -6268,7 +6273,7 @@ mod tests {
         );
         let secrets = secrets_only_secrets_toml("", API_KEY_ONLY_ISSUANCE);
 
-        let error = Ctx::load_files(config.path(), secrets.path())
+        let error = Ctx::load_files(config.path(), secrets.path(), None)
             .await
             .unwrap_err();
 
@@ -6291,7 +6296,7 @@ mod tests {
             api_key = "0xaabbccddeeff00112233445566778899aabbccddeeff00112233445566778899""#,
         );
 
-        let error = Ctx::load_files(config.path(), secrets.path())
+        let error = Ctx::load_files(config.path(), secrets.path(), None)
             .await
             .unwrap_err();
 
@@ -6316,7 +6321,7 @@ mod tests {
             api_key = "0xaabbccddeeff00112233445566778899aabbccddeeff00112233445566778899""#,
         );
 
-        let ctx = Ctx::load_files(config.path(), secrets.path())
+        let ctx = Ctx::load_files(config.path(), secrets.path(), None)
             .await
             .unwrap();
 
@@ -6335,7 +6340,7 @@ mod tests {
             API_KEY_ONLY_ISSUANCE,
         );
 
-        let error = Ctx::load_files(config.path(), secrets.path())
+        let error = Ctx::load_files(config.path(), secrets.path(), None)
             .await
             .unwrap_err();
 
@@ -6494,7 +6499,7 @@ mod tests {
         "#,
         );
 
-        let result = Ctx::load_files(config.path(), secrets.path()).await;
+        let result = Ctx::load_files(config.path(), secrets.path(), None).await;
         assert!(
             matches!(result, Err(CtxError::WalletNotConfigured)),
             "Expected WalletNotConfigured error, got {result:?}"
@@ -6615,7 +6620,7 @@ mod tests {
         "#,
         );
 
-        let result = Ctx::load_files(config.path(), secrets.path()).await;
+        let result = Ctx::load_files(config.path(), secrets.path(), None).await;
         assert!(
             matches!(result, Err(CtxError::WalletNotConfigured)),
             "Expected WalletNotConfigured error, got {result:?}"
@@ -6740,7 +6745,7 @@ mod tests {
         "#,
         );
 
-        let result = Ctx::load_files(config.path(), secrets.path()).await;
+        let result = Ctx::load_files(config.path(), secrets.path(), None).await;
         assert!(
             matches!(result, Err(CtxError::MissingTokenization)),
             "Expected MissingTokenization error, got {result:?}"
@@ -7129,7 +7134,7 @@ mod tests {
         "#,
         );
 
-        let result = Ctx::load_files(config.path(), secrets.path()).await;
+        let result = Ctx::load_files(config.path(), secrets.path(), None).await;
         assert!(
             matches!(result, Err(CtxError::WalletSecretsMissing)),
             "Expected WalletSecretsMissing error, got {result:?}"
@@ -7223,7 +7228,7 @@ mod tests {
         "#,
         );
 
-        let result = Ctx::load_files(config.path(), secrets.path()).await;
+        let result = Ctx::load_files(config.path(), secrets.path(), None).await;
         assert!(
             !matches!(result, Err(CtxError::WalletSecretsMissing)),
             "KMS-stamped wallet must not require [wallet] secrets, got {result:?}"
@@ -7301,7 +7306,7 @@ mod tests {
         "#,
         );
 
-        let result = Ctx::load_files(config.path(), secrets.path()).await;
+        let result = Ctx::load_files(config.path(), secrets.path(), None).await;
         let error = result.unwrap_err();
         let detail = std::error::Error::source(&error)
             .map(std::string::ToString::to_string)
@@ -7393,7 +7398,7 @@ mod tests {
         "#,
         );
 
-        let result = Ctx::load_files(config.path(), secrets.path()).await;
+        let result = Ctx::load_files(config.path(), secrets.path(), None).await;
         assert!(
             matches!(
                 result,
@@ -7484,7 +7489,8 @@ mod tests {
         "#,
         );
 
-        let err = Ctx::validate_files(config.path(), secrets.path()).unwrap_err();
+        let err =
+            Ctx::validate_files(config.path(), secrets.path(), TokenFile::Skipped).unwrap_err();
 
         assert!(
             matches!(err, CtxError::MissingCounterTradeSlippageBps),
@@ -7497,7 +7503,8 @@ mod tests {
         let config = alpaca_config_toml(None);
         let secrets = alpaca_secrets_toml();
 
-        let err = Ctx::validate_files(config.path(), secrets.path()).unwrap_err();
+        let err =
+            Ctx::validate_files(config.path(), secrets.path(), TokenFile::Skipped).unwrap_err();
 
         assert!(
             matches!(err, CtxError::MissingCloseFlattenCrossMaxBps),
@@ -7583,7 +7590,8 @@ mod tests {
         "#,
         );
 
-        let err = Ctx::validate_files(config.path(), secrets.path()).unwrap_err();
+        let err =
+            Ctx::validate_files(config.path(), secrets.path(), TokenFile::Skipped).unwrap_err();
 
         assert!(
             matches!(err, CtxError::MissingExtendedHoursRepriceTimeout),
@@ -7848,7 +7856,8 @@ mod tests {
         "#,
         );
 
-        let err = Ctx::validate_files(config.path(), secrets.path()).unwrap_err();
+        let err =
+            Ctx::validate_files(config.path(), secrets.path(), TokenFile::Skipped).unwrap_err();
 
         assert!(
             matches!(err, CtxError::MissingExtendedHoursCloseFlattenWindow),
@@ -7937,7 +7946,8 @@ mod tests {
         "#,
         );
 
-        let err = Ctx::validate_files(config.path(), secrets.path()).unwrap_err();
+        let err =
+            Ctx::validate_files(config.path(), secrets.path(), TokenFile::Skipped).unwrap_err();
 
         assert!(
             matches!(
@@ -8018,7 +8028,7 @@ mod tests {
         "#,
         );
 
-        let err = Ctx::load_files(config.path(), secrets.path())
+        let err = Ctx::load_files(config.path(), secrets.path(), None)
             .await
             .unwrap_err();
 
@@ -8111,7 +8121,7 @@ mod tests {
         "#,
         );
 
-        let err = Ctx::load_files(config.path(), secrets.path())
+        let err = Ctx::load_files(config.path(), secrets.path(), None)
             .await
             .unwrap_err();
 
@@ -8337,7 +8347,8 @@ mod tests {
         let config = hedge_floor_config_toml("1", "-1");
         let secrets = alpaca_pricing_secrets_toml();
 
-        let err = Ctx::validate_files(config.path(), secrets.path()).unwrap_err();
+        let err =
+            Ctx::validate_files(config.path(), secrets.path(), TokenFile::Skipped).unwrap_err();
 
         let CtxError::NegativeHedgeFloor { symbol, configured } = err else {
             panic!("expected NegativeHedgeFloor, got: {err:?}");
@@ -8354,7 +8365,8 @@ mod tests {
         let config = alpaca_config_toml(Some(50));
         let secrets = alpaca_secrets_toml();
 
-        let err = Ctx::validate_files(config.path(), secrets.path()).unwrap_err();
+        let err =
+            Ctx::validate_files(config.path(), secrets.path(), TokenFile::Skipped).unwrap_err();
 
         let CtxError::CloseFlattenCrossMaxBpsOutOfRange {
             configured,
@@ -8374,7 +8386,8 @@ mod tests {
         let config = alpaca_config_toml(Some(10_000));
         let secrets = alpaca_secrets_toml();
 
-        let err = Ctx::validate_files(config.path(), secrets.path()).unwrap_err();
+        let err =
+            Ctx::validate_files(config.path(), secrets.path(), TokenFile::Skipped).unwrap_err();
 
         let CtxError::CloseFlattenCrossMaxBpsOutOfRange {
             configured,
@@ -8430,7 +8443,7 @@ mod tests {
             private_key = "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
         "#,
         );
-        let error = Ctx::load_files(config.path(), secrets.path())
+        let error = Ctx::load_files(config.path(), secrets.path(), None)
             .await
             .unwrap_err();
 
@@ -8471,7 +8484,7 @@ mod tests {
             base_url = "http://issuance.test:8000"
         "#,
         );
-        let error = Ctx::load_files(config.path(), secrets.path())
+        let error = Ctx::load_files(config.path(), secrets.path(), None)
             .await
             .unwrap_err();
 
@@ -8513,7 +8526,7 @@ mod tests {
             api_key = "0xaabbccddeeff00112233445566778899aabbccddeeff00112233445566778899"
         "#,
         );
-        let error = Ctx::load_files(config.path(), secrets.path())
+        let error = Ctx::load_files(config.path(), secrets.path(), None)
             .await
             .unwrap_err();
 
@@ -8555,7 +8568,7 @@ mod tests {
             api_key = "0xdeadbeef"
         "#,
         );
-        let error = Ctx::load_files(config.path(), secrets.path())
+        let error = Ctx::load_files(config.path(), secrets.path(), None)
             .await
             .unwrap_err();
 
@@ -8600,7 +8613,7 @@ mod tests {
             api_key = "{raw_key}"
         "#
         ));
-        let error = Ctx::load_files(config.path(), secrets.path())
+        let error = Ctx::load_files(config.path(), secrets.path(), None)
             .await
             .unwrap_err();
 
@@ -8777,7 +8790,7 @@ mod tests {
         "#,
         );
 
-        let err = Ctx::load_files(config.path(), secrets.path())
+        let err = Ctx::load_files(config.path(), secrets.path(), None)
             .await
             .unwrap_err();
 
@@ -8898,7 +8911,7 @@ mod tests {
         "#,
         );
 
-        let error = Ctx::load_files(config.path(), secrets.path())
+        let error = Ctx::load_files(config.path(), secrets.path(), None)
             .await
             .unwrap_err();
 
@@ -9431,7 +9444,7 @@ mod tests {
     #[test]
     fn every_repo_config_passes_config_only_validation() {
         for path in repo_config_paths() {
-            Ctx::validate_config_file(&path).unwrap_or_else(|error| {
+            Ctx::validate_config_file(&path, TokenFile::Skipped).unwrap_or_else(|error| {
                 panic!("{path:?} fails config validation: {error}");
             });
         }
@@ -9445,7 +9458,7 @@ mod tests {
         );
         let config = toml_file(&config_str);
 
-        let error = Ctx::validate_config_file(config.path()).unwrap_err();
+        let error = Ctx::validate_config_file(config.path(), TokenFile::Skipped).unwrap_err();
 
         assert!(
             matches!(error, CtxError::ConfigToml { .. }),
@@ -9462,7 +9475,7 @@ mod tests {
             .replace("# target_share = 0.5", "target_share = 0.4");
         let config = toml_file(&config_str);
 
-        Ctx::validate_config_file(config.path()).unwrap();
+        Ctx::validate_config_file(config.path(), TokenFile::Skipped).unwrap();
     }
 
     /// The allocation targets are checked against the chain tables by the
@@ -9474,7 +9487,7 @@ mod tests {
             .replace("targets = { base = 0.5 }", "targets = { hyperevm = 0.5 }");
         let config = toml_file(&config_str);
 
-        let error = Ctx::validate_config_file(config.path()).unwrap_err();
+        let error = Ctx::validate_config_file(config.path(), TokenFile::Skipped).unwrap_err();
 
         assert!(
             matches!(
@@ -9494,7 +9507,7 @@ mod tests {
             .replace("board_port = 8081", "board_port = 8080");
         let config = toml_file(&config_str);
 
-        let error = Ctx::validate_config_file(config.path()).unwrap_err();
+        let error = Ctx::validate_config_file(config.path(), TokenFile::Skipped).unwrap_err();
 
         assert!(
             matches!(error, CtxError::ServerAndBoardPortsMatch { port: 8080 }),
@@ -9509,7 +9522,7 @@ mod tests {
     fn validate_config_file_refuses_a_negative_hedge_floor() {
         let config = hedge_floor_config_toml("-1", "3");
 
-        let error = Ctx::validate_config_file(config.path()).unwrap_err();
+        let error = Ctx::validate_config_file(config.path(), TokenFile::Skipped).unwrap_err();
 
         let CtxError::NegativeHedgeFloor { symbol, configured } = error else {
             panic!("expected NegativeHedgeFloor, got: {error:?}");
@@ -9531,7 +9544,7 @@ mod tests {
                 fragment["pricing"]["trading_schedule"].clone(),
             );
             let valid = toml_file(&toml::to_string(&config).unwrap());
-            Ctx::validate_config_file(valid.path()).unwrap();
+            Ctx::validate_config_file(valid.path(), TokenFile::Skipped).unwrap();
 
             let schedule = &mut config["pricing"]["trading_schedule"];
             if invalid_timing {
@@ -9540,7 +9553,7 @@ mod tests {
                 schedule["scopes"] = toml::Value::Array(Vec::new());
             }
             let invalid = toml_file(&toml::to_string(&config).unwrap());
-            let error = Ctx::validate_config_file(invalid.path()).unwrap_err();
+            let error = Ctx::validate_config_file(invalid.path(), TokenFile::Skipped).unwrap_err();
             if invalid_timing {
                 assert!(matches!(
                     error,
@@ -9565,7 +9578,7 @@ mod tests {
     /// validator must not invent a verdict about credentials it never read.
     #[test]
     fn validate_config_file_ignores_the_secrets_half() {
-        let notices = Ctx::validate_config_file(example_config_toml()).unwrap();
+        let notices = Ctx::validate_config_file(example_config_toml(), TokenFile::Skipped).unwrap();
 
         assert!(
             !notices
@@ -9885,7 +9898,7 @@ mod tests {
         );
         let secrets = alpaca_secrets_toml();
 
-        let err = Ctx::load_files(config.path(), secrets.path())
+        let err = Ctx::load_files(config.path(), secrets.path(), None)
             .await
             .unwrap_err();
         assert!(
@@ -9942,7 +9955,7 @@ mod tests {
         );
         let secrets = alpaca_secrets_toml();
 
-        let err = Ctx::load_files(config.path(), secrets.path())
+        let err = Ctx::load_files(config.path(), secrets.path(), None)
             .await
             .unwrap_err();
         assert!(
@@ -10008,7 +10021,7 @@ mod tests {
         );
         let secrets = alpaca_secrets_toml();
 
-        let err = Ctx::load_files(config.path(), secrets.path())
+        let err = Ctx::load_files(config.path(), secrets.path(), None)
             .await
             .unwrap_err();
         assert!(
@@ -10064,7 +10077,7 @@ mod tests {
         );
         let secrets = alpaca_secrets_toml();
 
-        let err = Ctx::load_files(config.path(), secrets.path())
+        let err = Ctx::load_files(config.path(), secrets.path(), None)
             .await
             .unwrap_err();
         assert!(
@@ -10100,7 +10113,7 @@ mod tests {
         "#,
         );
 
-        let err = Ctx::load_files(config.path(), secrets.path())
+        let err = Ctx::load_files(config.path(), secrets.path(), None)
             .await
             .unwrap_err();
         assert!(
@@ -10137,7 +10150,7 @@ mod tests {
         );
 
         let secrets_path = secrets.path().to_path_buf();
-        let err = Ctx::load_files(config.path(), &secrets_path)
+        let err = Ctx::load_files(config.path(), &secrets_path, None)
             .await
             .unwrap_err();
         let display = err.to_string();
@@ -10200,7 +10213,7 @@ mod tests {
         let secrets = alpaca_secrets_toml();
 
         let config_path = config.path().to_path_buf();
-        let err = Ctx::load_files(&config_path, secrets.path())
+        let err = Ctx::load_files(&config_path, secrets.path(), None)
             .await
             .unwrap_err();
         let display = err.to_string();
@@ -10238,7 +10251,7 @@ mod tests {
         "#,
         );
 
-        let err = Ctx::load_files(config.path(), secrets.path())
+        let err = Ctx::load_files(config.path(), secrets.path(), None)
             .await
             .unwrap_err();
         assert!(
@@ -10555,13 +10568,13 @@ mod tests {
     fn validate_files_accepts_valid_config_and_secrets() {
         let config = minimal_config_toml();
         let secrets = alpaca_secrets_toml();
-        Ctx::validate_files(config.path(), secrets.path()).unwrap();
+        Ctx::validate_files(config.path(), secrets.path(), TokenFile::Skipped).unwrap();
     }
 
     #[test]
     fn validate_config_file_accepts_a_valid_config_without_secrets() {
         let config = minimal_config_toml();
-        Ctx::validate_config_file(config.path()).unwrap();
+        Ctx::validate_config_file(config.path(), TokenFile::Skipped).unwrap();
     }
 
     #[test]
@@ -10577,7 +10590,7 @@ mod tests {
         let mut file = NamedTempFile::new().unwrap();
         file.write_all(stripped.as_bytes()).unwrap();
 
-        let error = Ctx::validate_config_file(file.path()).unwrap_err();
+        let error = Ctx::validate_config_file(file.path(), TokenFile::Skipped).unwrap_err();
         assert!(
             error.to_string().contains("failed to parse config"),
             "must surface as a config parse error: {error}"
@@ -10604,7 +10617,7 @@ mod tests {
         let config = equity_pricing_config_toml(true);
         let secrets = alpaca_pricing_secrets_toml();
 
-        let ctx = Ctx::load_files(config.path(), secrets.path())
+        let ctx = Ctx::load_files(config.path(), secrets.path(), None)
             .await
             .unwrap();
 
@@ -10618,7 +10631,7 @@ mod tests {
         let config = equity_pricing_config_toml(false);
         let secrets = alpaca_pricing_secrets_toml();
 
-        let error = Ctx::load_files(config.path(), secrets.path())
+        let error = Ctx::load_files(config.path(), secrets.path(), None)
             .await
             .unwrap_err();
 
@@ -10633,7 +10646,7 @@ mod tests {
         let config = equity_pricing_config_toml(true);
         let secrets = alpaca_secrets_toml();
 
-        let error = Ctx::load_files(config.path(), secrets.path())
+        let error = Ctx::load_files(config.path(), secrets.path(), None)
             .await
             .unwrap_err();
 
@@ -10784,9 +10797,13 @@ mod tests {
             "#,
         );
 
-        let inputs = Ctx::load_turnkey_approval_policy_inputs(config.path(), secrets.path())
-            .unwrap()
-            .unwrap();
+        let inputs = Ctx::load_turnkey_approval_policy_inputs(
+            config.path(),
+            secrets.path(),
+            TokenFile::Skipped,
+        )
+        .unwrap()
+        .unwrap();
 
         assert_eq!(inputs.organization_id.as_str(), "org-test");
         assert_eq!(
@@ -10969,9 +10986,13 @@ mod tests {
             "#,
         );
 
-        let inputs = Ctx::load_turnkey_approval_policy_inputs(config.path(), secrets.path())
-            .unwrap()
-            .unwrap();
+        let inputs = Ctx::load_turnkey_approval_policy_inputs(
+            config.path(),
+            secrets.path(),
+            TokenFile::Skipped,
+        )
+        .unwrap()
+        .unwrap();
 
         assert_eq!(
             inputs
@@ -11015,15 +11036,24 @@ mod tests {
         let config = minimal_config_toml();
         let secrets = alpaca_secrets_toml();
 
-        let inputs =
-            Ctx::load_turnkey_approval_policy_inputs(config.path(), secrets.path()).unwrap();
+        let inputs = Ctx::load_turnkey_approval_policy_inputs(
+            config.path(),
+            secrets.path(),
+            TokenFile::Skipped,
+        )
+        .unwrap();
 
         assert!(inputs.is_none());
     }
 
     #[test]
     fn validate_files_accepts_example_config_and_secrets() {
-        Ctx::validate_files(example_config_toml(), example_secrets_toml()).unwrap();
+        Ctx::validate_files(
+            example_config_toml(),
+            example_secrets_toml(),
+            TokenFile::Skipped,
+        )
+        .unwrap();
     }
 
     #[test]
@@ -11088,7 +11118,8 @@ mod tests {
         );
         let secrets = alpaca_secrets_toml();
 
-        let error = Ctx::validate_files(config.path(), secrets.path()).unwrap_err();
+        let error =
+            Ctx::validate_files(config.path(), secrets.path(), TokenFile::Skipped).unwrap_err();
         assert!(
             matches!(
                 error,
@@ -11172,7 +11203,7 @@ mod tests {
         ));
         let secrets = alpaca_pricing_secrets_toml();
 
-        Ctx::validate_files(config.path(), secrets.path()).unwrap();
+        Ctx::validate_files(config.path(), secrets.path(), TokenFile::Skipped).unwrap();
     }
 
     #[test]
@@ -11216,7 +11247,8 @@ mod tests {
         );
         let secrets = alpaca_secrets_toml();
 
-        let error = Ctx::validate_files(config.path(), secrets.path()).unwrap_err();
+        let error =
+            Ctx::validate_files(config.path(), secrets.path(), TokenFile::Skipped).unwrap_err();
         assert!(
             matches!(error, CtxError::ConfigToml { .. }),
             "Expected config parse error for unknown field, got {error:?}"
@@ -11250,7 +11282,8 @@ mod tests {
         "#,
         );
 
-        let error = Ctx::validate_files(config.path(), secrets.path()).unwrap_err();
+        let error =
+            Ctx::validate_files(config.path(), secrets.path(), TokenFile::Skipped).unwrap_err();
         assert!(
             matches!(error, CtxError::SecretsToml { .. }),
             "Expected secrets parse error for unknown field, got {error:?}"
@@ -11334,7 +11367,8 @@ mod tests {
         "#,
         );
 
-        let error = Ctx::validate_files(config.path(), secrets.path()).unwrap_err();
+        let error =
+            Ctx::validate_files(config.path(), secrets.path(), TokenFile::Skipped).unwrap_err();
         assert!(
             matches!(error, CtxError::WalletNotConfigured),
             "Expected WalletNotConfigured, got {error:?}"
@@ -11423,7 +11457,8 @@ mod tests {
         "#,
         );
 
-        let error = Ctx::validate_files(config.path(), secrets.path()).unwrap_err();
+        let error =
+            Ctx::validate_files(config.path(), secrets.path(), TokenFile::Skipped).unwrap_err();
         assert!(
             matches!(error, CtxError::WalletSecretsMissing),
             "Expected WalletSecretsMissing, got {error:?}"
@@ -11500,7 +11535,8 @@ mod tests {
         "#,
         );
 
-        let error = Ctx::validate_files(config.path(), secrets.path()).unwrap_err();
+        let error =
+            Ctx::validate_files(config.path(), secrets.path(), TokenFile::Skipped).unwrap_err();
         assert!(
             matches!(error, CtxError::SecretsToml { .. }),
             "a secrets file supplying no chain endpoints must fail to parse, \
@@ -11537,7 +11573,8 @@ mod tests {
         "#,
         );
 
-        let error = Ctx::validate_files(config.path(), secrets.path()).unwrap_err();
+        let error =
+            Ctx::validate_files(config.path(), secrets.path(), TokenFile::Skipped).unwrap_err();
         assert!(
             matches!(error, CtxError::MissingTravelRule),
             "Expected MissingTravelRule, got {error:?}"
@@ -11604,7 +11641,8 @@ mod tests {
         ));
         let secrets = alpaca_secrets_toml();
 
-        let error = Ctx::validate_files(config.path(), secrets.path()).unwrap_err();
+        let error =
+            Ctx::validate_files(config.path(), secrets.path(), TokenFile::Skipped).unwrap_err();
         assert!(
             matches!(
                 error,
@@ -11666,7 +11704,8 @@ mod tests {
         );
         let secrets = alpaca_secrets_toml();
 
-        let error = Ctx::validate_files(config.path(), secrets.path()).unwrap_err();
+        let error =
+            Ctx::validate_files(config.path(), secrets.path(), TokenFile::Skipped).unwrap_err();
         assert!(
             matches!(error, CtxError::ZeroPollingInterval { .. }),
             "Expected ZeroPollingInterval, got {error:?}"

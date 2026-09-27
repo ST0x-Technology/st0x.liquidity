@@ -33,7 +33,7 @@ quote_token = "0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168"
 contract = "0x242FdEc55623187E80A690ff15302e63dddd7130"
 inventory = "0x1eFd85E6C384fAD9B80C6D508E9098Eb91C4eD30"
 
-[[trading_state.scopes]]  # pricing, unchanged
+[[trading_state.scopes]] # pricing, unchanged
 id = "alpaca-regular"
 profile_revision = "production-existing-v1"
 sessions = "regular"
@@ -43,7 +43,54 @@ assets = ["RKLB"]
 id = "alpaca-extended"
 profile_revision = "production-existing-v1"
 sessions = "extended"
-assets = ["COIN", "TSLA", "SPYM", "SGOV", "AMZN", "ARKK", "ASML", "BMNR", "CEG", "CRCL", "DRAM", "IAU", "MSTR", "NVDA", "PPLT", "QQQM", "SIVR", "SKHY", "SPCX", "TSM", "VWO", "MU", "AMD", "AVGO", "AMAT", "LRCX", "TTWO", "AAPL", "BABA", "GOOGL", "HOOD", "INTC", "LLY", "MSFT", "ORCL", "PTY", "SMCI", "TQQQ", "MCD", "NKE", "GRND", "DNUT", "FGI", "PLBY", "TR", "WEN"]
+assets = [
+  "COIN",
+  "TSLA",
+  "SPYM",
+  "SGOV",
+  "AMZN",
+  "ARKK",
+  "ASML",
+  "BMNR",
+  "CEG",
+  "CRCL",
+  "DRAM",
+  "IAU",
+  "MSTR",
+  "NVDA",
+  "PPLT",
+  "QQQM",
+  "SIVR",
+  "SKHY",
+  "SPCX",
+  "TSM",
+  "VWO",
+  "MU",
+  "AMD",
+  "AVGO",
+  "AMAT",
+  "LRCX",
+  "TTWO",
+  "AAPL",
+  "BABA",
+  "GOOGL",
+  "HOOD",
+  "INTC",
+  "LLY",
+  "MSFT",
+  "ORCL",
+  "PTY",
+  "SMCI",
+  "TQQQ",
+  "MCD",
+  "NKE",
+  "GRND",
+  "DNUT",
+  "FGI",
+  "PLBY",
+  "TR",
+  "WEN",
+]
 
 [[trading_state.scopes]]
 id = "alpaca-ethereum-regular"

@@ -27,11 +27,57 @@ quote_token = "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"
 chain_id = 4663
 quote_token = "0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168"
 
-[[trading_state.scopes]]  # pricing, unchanged
+[[trading_state.scopes]] # pricing, unchanged
 id = "alpaca-regular"
 profile_revision = "staging-existing-v1"
 sessions = "regular"
-assets = ["COIN", "TSLA", "SPYM", "AMZN", "ARKK", "ASML", "BMNR", "CEG", "CRCL", "DRAM", "IAU", "MSTR", "NVDA", "PPLT", "QQQM", "SIVR", "SKHY", "SPCX", "TSM", "VWO", "MU", "AMD", "AVGO", "AMAT", "LRCX", "TTWO", "AAPL", "BABA", "GOOGL", "HOOD", "INTC", "LLY", "MSFT", "ORCL", "PTY", "SMCI", "TQQQ", "MCD", "NKE", "GRND", "DNUT", "FGI", "PLBY", "TR", "WEN"]
+assets = [
+  "COIN",
+  "TSLA",
+  "SPYM",
+  "AMZN",
+  "ARKK",
+  "ASML",
+  "BMNR",
+  "CEG",
+  "CRCL",
+  "DRAM",
+  "IAU",
+  "MSTR",
+  "NVDA",
+  "PPLT",
+  "QQQM",
+  "SIVR",
+  "SKHY",
+  "SPCX",
+  "TSM",
+  "VWO",
+  "MU",
+  "AMD",
+  "AVGO",
+  "AMAT",
+  "LRCX",
+  "TTWO",
+  "AAPL",
+  "BABA",
+  "GOOGL",
+  "HOOD",
+  "INTC",
+  "LLY",
+  "MSFT",
+  "ORCL",
+  "PTY",
+  "SMCI",
+  "TQQQ",
+  "MCD",
+  "NKE",
+  "GRND",
+  "DNUT",
+  "FGI",
+  "PLBY",
+  "TR",
+  "WEN",
+]
 
 [[trading_state.scopes]]
 id = "alpaca-extended"
