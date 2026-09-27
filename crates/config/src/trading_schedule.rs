@@ -173,7 +173,8 @@ mod tests {
         for (runtime, tokens, fragment) in [
             (
                 include_str!("../../../config/prod/st0x-hedge.toml"),
-                include_bytes!("../../../tests/fixtures/tokens-production-1790341753647581.toml").as_slice(),
+                include_bytes!("../../../tests/fixtures/tokens-production-1790341753647581.toml")
+                    .as_slice(),
                 include_str!("../../../docs/trading-schedule/prod.toml"),
             ),
             (
