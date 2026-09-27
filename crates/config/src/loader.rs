@@ -31,7 +31,7 @@ use crate::InventoryAdapters;
 #[cfg(any(test, feature = "test-support"))]
 use crate::chain::HedgedChain;
 use crate::pricing::PricingSecrets;
-use crate::registry::{self, Projection, RegistryLive, RegistrySource, TokenFile};
+use crate::registry::{self, RegistryLive, RegistrySource, TokenFile};
 use crate::wallet::{SigningChain, SigningChains};
 use crate::{
     AlertsConfig, AlertsCtx, AllocationConfigError, BotGasValuationConfig, ChainConfig,
@@ -1754,6 +1754,15 @@ fn validate_config(
     config_path: &Path,
     startup_notices: &mut Vec<StartupNotice>,
 ) -> Result<ValidatedConfigParts, CtxError> {
+    if let Some(registry) = &config.registry {
+        startup_notices.push(StartupNotice::info(format!(
+            "per-symbol tables read from {} ({})",
+            registry.url,
+            registry
+                .generation
+                .map_or("latest copy".to_string(), |g| format!("generation {g}"))
+        )));
+    }
     if let Some(schedule) = config
         .pricing
         .as_ref()
@@ -1884,6 +1893,7 @@ fn validate_config(
 
 /// [`parse_and_validate_with`] for a config that carries its per-symbol
 /// tables inline (every test fixture does).
+#[cfg(test)]
 fn parse_and_validate(
     config_str: &str,
     config_path: &Path,
