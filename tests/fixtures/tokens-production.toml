@@ -1,0 +1,1473 @@
+# T0's per-token config. Field names are the ones the owning service uses.
+#
+# Who owns what:
+#   [chains.<c>]                chain_id, quote_token: pricing. contract, inventory: bebop.
+#   [chains.<c>.assets...<SYM>] pricing, venues: pricing (venues = bebop / raindex / hook,
+#                               only on a priced slot). vault_ids: liquidity and bebop.
+#                               tokenized_equity, trading, rebalancing,
+#                               wrapped_equity_recovery: liquidity.
+#                               tokenized_equity_derivative: everyone (the wt token).
+#   [assets.equities.<SYM>]     fixed_half_spread_bps, spread_model: pricing.
+#                               extended_hours_counter_trading: liquidity.
+#   [[trading_state.scopes]]    pricing.
+#
+# Bump schema_version on any rename or type change; consumers refuse a version
+# they do not know and keep their last good copy.
+schema_version = 1
+
+[chains.base]
+chain_id = 8453
+quote_token = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913"
+contract = "0x7BDEa3bA0101E06Cbb7f12500ed12eF046148A03"
+inventory = "0x10e4db39275C3b128C01bA1194D45D19aE1520d9"
+
+[chains.ethereum]
+chain_id = 1
+quote_token = "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"
+contract = "0x2D539fe4C1e72B239735AB79A7858040016Bf134"
+inventory = "0x59401C9302E79Eb8AC6aea659B8B3ae475715e86"
+
+[chains.robinhood]
+chain_id = 4663
+quote_token = "0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168"
+contract = "0x242FdEc55623187E80A690ff15302e63dddd7130"
+inventory = "0x1eFd85E6C384fAD9B80C6D508E9098Eb91C4eD30"
+
+[[trading_state.scopes]]  # pricing, unchanged
+id = "alpaca-regular"
+profile_revision = "production-existing-v1"
+sessions = "regular"
+assets = ["RKLB"]
+
+[[trading_state.scopes]]
+id = "alpaca-extended"
+profile_revision = "production-existing-v1"
+sessions = "extended"
+assets = ["COIN", "TSLA", "SPYM", "SGOV", "AMZN", "ARKK", "ASML", "BMNR", "CEG", "CRCL", "DRAM", "IAU", "MSTR", "NVDA", "PPLT", "QQQM", "SIVR", "SKHY", "SPCX", "TSM", "VWO", "MU", "AMD", "AVGO", "AMAT", "LRCX", "TTWO", "AAPL", "BABA", "GOOGL", "HOOD", "INTC", "LLY", "MSFT", "ORCL", "PTY", "SMCI", "TQQQ", "MCD", "NKE", "GRND", "DNUT", "FGI", "PLBY", "TR", "WEN"]
+
+[[trading_state.scopes]]
+id = "alpaca-ethereum-regular"
+profile_revision = "ethereum-regular-v1"
+sessions = "regular"
+assets = ["FTF"]
+
+[assets.equities.AAPL]
+extended_hours_counter_trading = "enabled"
+fixed_half_spread_bps = 31.25
+[chains.base.assets.equities.AAPL]
+tokenized_equity = "0xD36056a4a03707D3743fCE4e9C08852820ADcfdC"
+tokenized_equity_derivative = "0x1020EC8Aa3f709a1f3D8705cdBa89b950451bd88"
+vault_ids = ["0xfab"]
+pricing = "enabled"
+venues = ["raindex", "bebop"]
+trading = "enabled"
+rebalancing = "enabled"
+wrapped_equity_recovery = "enabled"
+
+[assets.equities.AMAT]
+extended_hours_counter_trading = "enabled"
+[[assets.equities.AMAT.spread_model.profiles]]
+session = "rth"
+half_spread_bps = 53.0507896711503
+quote_staleness_seconds = 20
+[[assets.equities.AMAT.spread_model.profiles]]
+session = "pre"
+half_spread_bps = 190.25624990082503
+quote_staleness_seconds = 20
+[[assets.equities.AMAT.spread_model.profiles]]
+session = "post"
+half_spread_bps = 160.94720194127996
+quote_staleness_seconds = 20
+[[assets.equities.AMAT.spread_model.profiles]]
+session = "rth"
+venue = "bebop"
+half_spread_bps = 81.71880258105023
+quote_staleness_seconds = 70
+[[assets.equities.AMAT.spread_model.profiles]]
+session = "pre"
+venue = "bebop"
+half_spread_bps = 205.80150417633675
+quote_staleness_seconds = 70
+[[assets.equities.AMAT.spread_model.profiles]]
+session = "post"
+venue = "bebop"
+half_spread_bps = 179.1856514492903
+quote_staleness_seconds = 70
+[chains.base.assets.equities.AMAT]
+tokenized_equity = "0x98C02B58b7E65EF5a4262d9536162949e3B2E141"
+tokenized_equity_derivative = "0x522DC65c89C9Af4f410BAe01bbf53aF75854a9f9"
+vault_ids = ["0xfab"]
+pricing = "enabled"
+venues = ["raindex", "bebop"]
+trading = "enabled"
+rebalancing = "enabled"
+wrapped_equity_recovery = "enabled"
+
+[assets.equities.AMD]
+extended_hours_counter_trading = "enabled"
+[[assets.equities.AMD.spread_model.profiles]]
+session = "rth"
+half_spread_bps = 46.61419626081642
+quote_staleness_seconds = 20
+[[assets.equities.AMD.spread_model.profiles]]
+session = "pre"
+half_spread_bps = 54.64926742810272
+quote_staleness_seconds = 20
+[[assets.equities.AMD.spread_model.profiles]]
+session = "post"
+half_spread_bps = 46.61419626081642
+quote_staleness_seconds = 20
+[[assets.equities.AMD.spread_model.profiles]]
+session = "rth"
+venue = "bebop"
+half_spread_bps = 79.53458457944731
+quote_staleness_seconds = 70
+[[assets.equities.AMD.spread_model.profiles]]
+session = "pre"
+venue = "bebop"
+half_spread_bps = 79.53458457944731
+quote_staleness_seconds = 70
+[[assets.equities.AMD.spread_model.profiles]]
+session = "post"
+venue = "bebop"
+half_spread_bps = 79.53458457944731
+quote_staleness_seconds = 70
+[chains.base.assets.equities.AMD]
+tokenized_equity = "0x50b5225409A55B873fD6C2Fd5880AF5a11acE9b1"
+tokenized_equity_derivative = "0x648042Acd8638E12fEfd51C2b25A9f993f21a612"
+vault_ids = ["0xfab"]
+pricing = "enabled"
+venues = ["raindex", "bebop"]
+trading = "enabled"
+rebalancing = "enabled"
+wrapped_equity_recovery = "enabled"
+
+[assets.equities.AMZN]
+extended_hours_counter_trading = "enabled"
+[[assets.equities.AMZN.spread_model.profiles]]
+session = "rth"
+half_spread_bps = 23.996357276641813
+quote_staleness_seconds = 20
+[[assets.equities.AMZN.spread_model.profiles]]
+session = "pre"
+half_spread_bps = 37.52677196455684
+quote_staleness_seconds = 20
+[[assets.equities.AMZN.spread_model.profiles]]
+session = "post"
+half_spread_bps = 38.45082893562718
+quote_staleness_seconds = 20
+[[assets.equities.AMZN.spread_model.profiles]]
+session = "rth"
+venue = "bebop"
+half_spread_bps = 41.70897435700546
+quote_staleness_seconds = 70
+[[assets.equities.AMZN.spread_model.profiles]]
+session = "pre"
+venue = "bebop"
+half_spread_bps = 49.213618527993894
+quote_staleness_seconds = 70
+[[assets.equities.AMZN.spread_model.profiles]]
+session = "post"
+venue = "bebop"
+half_spread_bps = 51.2176255487621
+quote_staleness_seconds = 70
+[chains.base.assets.equities.AMZN]
+tokenized_equity = "0x466cb2e46fa1afc0ab5e22274b34d0391db18efd"
+tokenized_equity_derivative = "0x997bae3ec193a249596d3708c3fab7c501bb8a53"
+vault_ids = ["0xfab"]
+pricing = "enabled"
+venues = ["raindex", "bebop"]
+trading = "enabled"
+rebalancing = "enabled"
+wrapped_equity_recovery = "enabled"
+
+[assets.equities.ARKK]
+extended_hours_counter_trading = "enabled"
+[[assets.equities.ARKK.spread_model.profiles]]
+session = "rth"
+half_spread_bps = 30.247828025902006
+quote_staleness_seconds = 20
+[[assets.equities.ARKK.spread_model.profiles]]
+session = "pre"
+half_spread_bps = 199.319868593343
+quote_staleness_seconds = 20
+[[assets.equities.ARKK.spread_model.profiles]]
+session = "post"
+half_spread_bps = 128.79630046851634
+quote_staleness_seconds = 20
+[[assets.equities.ARKK.spread_model.profiles]]
+session = "rth"
+venue = "bebop"
+half_spread_bps = 52.34229077720131
+quote_staleness_seconds = 70
+[[assets.equities.ARKK.spread_model.profiles]]
+session = "pre"
+venue = "bebop"
+half_spread_bps = 217.74148676819152
+quote_staleness_seconds = 70
+[[assets.equities.ARKK.spread_model.profiles]]
+session = "post"
+venue = "bebop"
+half_spread_bps = 142.19555011713186
+quote_staleness_seconds = 70
+[chains.base.assets.equities.ARKK]
+tokenized_equity = "0x323804af6f3bb463d688b854667c6870a0fc06ad"
+tokenized_equity_derivative = "0x9FfF48B4535AF3765Ac9E1b164720EDc01DF8EE7"
+vault_ids = ["0xfab"]
+pricing = "enabled"
+venues = ["raindex", "bebop"]
+trading = "enabled"
+rebalancing = "enabled"
+wrapped_equity_recovery = "enabled"
+
+[assets.equities.ASML]
+extended_hours_counter_trading = "enabled"
+[[assets.equities.ASML.spread_model.profiles]]
+session = "rth"
+half_spread_bps = 43.11125368153883
+quote_staleness_seconds = 20
+[[assets.equities.ASML.spread_model.profiles]]
+session = "pre"
+half_spread_bps = 43.11125368153883
+quote_staleness_seconds = 20
+[[assets.equities.ASML.spread_model.profiles]]
+session = "post"
+half_spread_bps = 152.55207882991198
+quote_staleness_seconds = 20
+[[assets.equities.ASML.spread_model.profiles]]
+session = "rth"
+venue = "bebop"
+half_spread_bps = 64.50462782132492
+quote_staleness_seconds = 70
+[[assets.equities.ASML.spread_model.profiles]]
+session = "pre"
+venue = "bebop"
+half_spread_bps = 64.50462782132492
+quote_staleness_seconds = 70
+[[assets.equities.ASML.spread_model.profiles]]
+session = "post"
+venue = "bebop"
+half_spread_bps = 163.616936570414
+quote_staleness_seconds = 70
+[chains.base.assets.equities.ASML]
+tokenized_equity = "0x722Cb373f1871A176fb5DC3953046f2EAE22F619"
+tokenized_equity_derivative = "0x8200c6d9AB9E02A25D7F2099244C476d99a085ef"
+vault_ids = ["0xfab"]
+pricing = "enabled"
+venues = ["raindex", "bebop"]
+trading = "enabled"
+rebalancing = "enabled"
+wrapped_equity_recovery = "enabled"
+
+[assets.equities.AVGO]
+extended_hours_counter_trading = "enabled"
+[[assets.equities.AVGO.spread_model.profiles]]
+session = "rth"
+half_spread_bps = 41.802057696130824
+quote_staleness_seconds = 20
+[[assets.equities.AVGO.spread_model.profiles]]
+session = "pre"
+half_spread_bps = 70.16179759108675
+quote_staleness_seconds = 20
+[[assets.equities.AVGO.spread_model.profiles]]
+session = "post"
+half_spread_bps = 62.361732162976615
+quote_staleness_seconds = 20
+[[assets.equities.AVGO.spread_model.profiles]]
+session = "rth"
+venue = "bebop"
+half_spread_bps = 68.52892025146696
+quote_staleness_seconds = 70
+[[assets.equities.AVGO.spread_model.profiles]]
+session = "pre"
+venue = "bebop"
+half_spread_bps = 85.9799661521238
+quote_staleness_seconds = 70
+[[assets.equities.AVGO.spread_model.profiles]]
+session = "post"
+venue = "bebop"
+half_spread_bps = 75.7714613543859
+quote_staleness_seconds = 70
+[chains.base.assets.equities.AVGO]
+tokenized_equity = "0x6088F8ef741AE1f5A61882866f130631b41617E2"
+tokenized_equity_derivative = "0x70A182f481AEF05836666B6CfDbe84dCBCE8AC19"
+vault_ids = ["0xfab"]
+pricing = "enabled"
+venues = ["raindex", "bebop"]
+trading = "enabled"
+rebalancing = "enabled"
+wrapped_equity_recovery = "enabled"
+
+[assets.equities.BABA]
+extended_hours_counter_trading = "enabled"
+fixed_half_spread_bps = 31.25
+[chains.base.assets.equities.BABA]
+tokenized_equity = "0x6B8fa7288dBEc7C1c62BfE59Cbd7Bec7EBF846C5"
+tokenized_equity_derivative = "0x7e5cc7eAe0455A07Ab4abf354E0f5657BA2888BD"
+vault_ids = ["0xfab"]
+pricing = "enabled"
+venues = ["raindex", "bebop"]
+trading = "enabled"
+rebalancing = "enabled"
+wrapped_equity_recovery = "enabled"
+
+[assets.equities.BMNR]
+extended_hours_counter_trading = "enabled"
+[[assets.equities.BMNR.spread_model.profiles]]
+session = "rth"
+half_spread_bps = 193.9218028094828
+quote_staleness_seconds = 20
+[[assets.equities.BMNR.spread_model.profiles]]
+session = "pre"
+half_spread_bps = 193.9218028094828
+quote_staleness_seconds = 20
+[[assets.equities.BMNR.spread_model.profiles]]
+session = "post"
+half_spread_bps = 193.9218028094828
+quote_staleness_seconds = 20
+[[assets.equities.BMNR.spread_model.profiles]]
+session = "rth"
+venue = "bebop"
+half_spread_bps = 265.9039793458109
+quote_staleness_seconds = 70
+[[assets.equities.BMNR.spread_model.profiles]]
+session = "pre"
+venue = "bebop"
+half_spread_bps = 265.9039793458109
+quote_staleness_seconds = 70
+[[assets.equities.BMNR.spread_model.profiles]]
+session = "post"
+venue = "bebop"
+half_spread_bps = 265.9039793458109
+quote_staleness_seconds = 70
+[chains.base.assets.equities.BMNR]
+tokenized_equity = "0xfbde45df60249203b12148452fc77c3b5f811eb2"
+tokenized_equity_derivative = "0x2512EC661f0bA089c275EA105E31bAD6FcFcf319"
+vault_ids = ["0xfab"]
+pricing = "enabled"
+venues = ["raindex", "bebop"]
+trading = "enabled"
+rebalancing = "enabled"
+wrapped_equity_recovery = "enabled"
+
+[assets.equities.CBRS]
+extended_hours_counter_trading = "enabled"
+[chains.base.assets.equities.CBRS]
+tokenized_equity = "0xBeB0c2011bd5520A0998b69132E9245E39Ac5D1D"
+tokenized_equity_derivative = "0xB457cfBF31995d3aAAa704dA9999cC0b011820ca"
+vault_ids = ["0xfab"]
+pricing = "disabled"
+venues = []
+trading = "enabled"
+rebalancing = "enabled"
+wrapped_equity_recovery = "enabled"
+
+[assets.equities.CEG]
+extended_hours_counter_trading = "enabled"
+[[assets.equities.CEG.spread_model.profiles]]
+session = "rth"
+half_spread_bps = 77.85346469947015
+quote_staleness_seconds = 20
+[[assets.equities.CEG.spread_model.profiles]]
+session = "pre"
+half_spread_bps = 394.03566728817424
+quote_staleness_seconds = 20
+[[assets.equities.CEG.spread_model.profiles]]
+session = "post"
+half_spread_bps = 252.653409564673
+quote_staleness_seconds = 20
+[[assets.equities.CEG.spread_model.profiles]]
+session = "rth"
+venue = "bebop"
+half_spread_bps = 107.68009371957362
+quote_staleness_seconds = 70
+[[assets.equities.CEG.spread_model.profiles]]
+session = "pre"
+venue = "bebop"
+half_spread_bps = 414.2169508290326
+quote_staleness_seconds = 70
+[[assets.equities.CEG.spread_model.profiles]]
+session = "post"
+venue = "bebop"
+half_spread_bps = 269.82757998445936
+quote_staleness_seconds = 70
+[chains.base.assets.equities.CEG]
+tokenized_equity = "0x9a5D3cAeC90b0332b18C0B93fEF42F3F8C918289"
+tokenized_equity_derivative = "0x3aF952888Cd89DAD3e8AF67cf4b7E740B36829C3"
+vault_ids = ["0xfab"]
+pricing = "enabled"
+venues = ["raindex", "bebop"]
+trading = "enabled"
+rebalancing = "enabled"
+wrapped_equity_recovery = "enabled"
+
+[assets.equities.COIN]
+extended_hours_counter_trading = "enabled"
+[[assets.equities.COIN.spread_model.profiles]]
+session = "rth"
+half_spread_bps = 64.91282064281495
+quote_staleness_seconds = 20
+[[assets.equities.COIN.spread_model.profiles]]
+session = "pre"
+half_spread_bps = 70.39232513976039
+quote_staleness_seconds = 20
+[[assets.equities.COIN.spread_model.profiles]]
+session = "post"
+half_spread_bps = 81.25339184113923
+quote_staleness_seconds = 20
+[[assets.equities.COIN.spread_model.profiles]]
+session = "rth"
+venue = "bebop"
+half_spread_bps = 103.30566444799352
+quote_staleness_seconds = 70
+[[assets.equities.COIN.spread_model.profiles]]
+session = "pre"
+venue = "bebop"
+half_spread_bps = 103.30566444799352
+quote_staleness_seconds = 70
+[[assets.equities.COIN.spread_model.profiles]]
+session = "post"
+venue = "bebop"
+half_spread_bps = 103.30566444799352
+quote_staleness_seconds = 70
+[chains.base.assets.equities.COIN]
+tokenized_equity = "0x626757e6f50675d17fcad312e82f989ae7a23d38"
+tokenized_equity_derivative = "0x5cda0e1ca4ce2af96315f7f8963c85399c172204"
+vault_ids = ["0xfab"]
+pricing = "enabled"
+venues = ["raindex", "bebop", "hook"]
+trading = "enabled"
+rebalancing = "enabled"
+wrapped_equity_recovery = "enabled"
+
+[assets.equities.CRCL]
+extended_hours_counter_trading = "enabled"
+[[assets.equities.CRCL.spread_model.profiles]]
+session = "rth"
+half_spread_bps = 98.90766260454514
+quote_staleness_seconds = 20
+[[assets.equities.CRCL.spread_model.profiles]]
+session = "pre"
+half_spread_bps = 98.90766260454514
+quote_staleness_seconds = 20
+[[assets.equities.CRCL.spread_model.profiles]]
+session = "post"
+half_spread_bps = 98.90766260454514
+quote_staleness_seconds = 20
+[[assets.equities.CRCL.spread_model.profiles]]
+session = "rth"
+venue = "bebop"
+half_spread_bps = 155.22956014910744
+quote_staleness_seconds = 70
+[[assets.equities.CRCL.spread_model.profiles]]
+session = "pre"
+venue = "bebop"
+half_spread_bps = 155.22956014910744
+quote_staleness_seconds = 70
+[[assets.equities.CRCL.spread_model.profiles]]
+session = "post"
+venue = "bebop"
+half_spread_bps = 155.22956014910744
+quote_staleness_seconds = 70
+[chains.base.assets.equities.CRCL]
+tokenized_equity = "0x38eb797892ed71da69bdc27a456a7c83ff813b52"
+tokenized_equity_derivative = "0x8afba81dec38de0a18e2df5e1967a7493651eebf"
+vault_ids = ["0xfab"]
+pricing = "enabled"
+venues = ["raindex", "bebop"]
+trading = "enabled"
+rebalancing = "enabled"
+wrapped_equity_recovery = "enabled"
+
+[assets.equities.DNUT]
+extended_hours_counter_trading = "enabled"
+fixed_half_spread_bps = 75.0
+[chains.base.assets.equities.DNUT]
+tokenized_equity = "0x6C2b6Ed57d4d9e93F3E4975FAc70eE4B180F4Eb9"
+tokenized_equity_derivative = "0x1db49Ff8BEe88ec73F82F395B0BEAd372BdcAdb7"
+vault_ids = ["0xfab"]
+pricing = "enabled"
+venues = ["raindex", "bebop"]
+trading = "enabled"
+rebalancing = "enabled"
+wrapped_equity_recovery = "enabled"
+[chains.robinhood.assets.equities.DNUT]
+tokenized_equity = "0x4a88c84AA04a5151997e8E503BEe7fD92E0918A9"
+tokenized_equity_derivative = "0xb7fC2b7881cceeB73D8DEccf69B6AcB8aC2E0826"
+vault_ids = ["0xfab"]
+pricing = "enabled"
+venues = ["raindex", "bebop"]
+trading = "enabled"
+rebalancing = "disabled"
+wrapped_equity_recovery = "disabled"
+
+[assets.equities.DRAM]
+extended_hours_counter_trading = "enabled"
+[[assets.equities.DRAM.spread_model.profiles]]
+session = "rth"
+half_spread_bps = 53.15000881608282
+quote_staleness_seconds = 20
+[[assets.equities.DRAM.spread_model.profiles]]
+session = "pre"
+half_spread_bps = 64.0052352509013
+quote_staleness_seconds = 20
+[[assets.equities.DRAM.spread_model.profiles]]
+session = "post"
+half_spread_bps = 73.64090287926373
+quote_staleness_seconds = 20
+[[assets.equities.DRAM.spread_model.profiles]]
+session = "rth"
+venue = "bebop"
+half_spread_bps = 91.82374844731241
+quote_staleness_seconds = 70
+[[assets.equities.DRAM.spread_model.profiles]]
+session = "pre"
+venue = "bebop"
+half_spread_bps = 91.82374844731241
+quote_staleness_seconds = 70
+[[assets.equities.DRAM.spread_model.profiles]]
+session = "post"
+venue = "bebop"
+half_spread_bps = 99.97892530061564
+quote_staleness_seconds = 70
+[chains.base.assets.equities.DRAM]
+tokenized_equity = "0x96DE077262609298CD891E4Ab21bd34837dE33aB"
+tokenized_equity_derivative = "0x1A91Df4a970EBaB1bB4AF32Eb6d10509028eE4b8"
+vault_ids = ["0xfab"]
+pricing = "enabled"
+venues = ["raindex", "bebop"]
+trading = "enabled"
+rebalancing = "enabled"
+wrapped_equity_recovery = "enabled"
+
+[assets.equities.FGI]
+extended_hours_counter_trading = "enabled"
+fixed_half_spread_bps = 400.0
+[chains.base.assets.equities.FGI]
+tokenized_equity = "0x785BD77B8e92866f87E01416D1022d729975D529"
+tokenized_equity_derivative = "0x6aed8b1aCfb04F4e0e6db580F12fF41438a394e5"
+vault_ids = ["0xfab"]
+pricing = "enabled"
+venues = ["raindex", "bebop"]
+trading = "enabled"
+rebalancing = "enabled"
+wrapped_equity_recovery = "enabled"
+[chains.robinhood.assets.equities.FGI]
+tokenized_equity = "0xfEa217600e2b00bBB2172a99345016a0cEb7d29f"
+tokenized_equity_derivative = "0x685DFd386968B58D895F934485820C479C79a8bB"
+vault_ids = ["0xfab"]
+pricing = "enabled"
+venues = ["raindex", "bebop"]
+trading = "enabled"
+rebalancing = "disabled"
+wrapped_equity_recovery = "disabled"
+
+[assets.equities.FTF]
+extended_hours_counter_trading = "enabled"
+fixed_half_spread_bps = 43.75
+[chains.base.assets.equities.FTF]
+tokenized_equity = "0x51D5C8C8040358686952A30fAC116aAC32390d6A"
+tokenized_equity_derivative = "0x9bDe199Ac6E7E050334306D9267c93e3D6d38333"
+vault_ids = ["0xfab"]
+pricing = "disabled"
+venues = []
+trading = "enabled"
+rebalancing = "enabled"
+wrapped_equity_recovery = "enabled"
+[chains.ethereum.assets.equities.FTF]
+tokenized_equity_derivative = "0x710a14a41a8ea2e25376124c48bf9cadc1e69be5"
+vault_ids = ["0xfab"]
+pricing = "enabled"
+venues = ["bebop"]
+
+[assets.equities.GOOGL]
+extended_hours_counter_trading = "enabled"
+fixed_half_spread_bps = 31.25
+[chains.base.assets.equities.GOOGL]
+tokenized_equity = "0x15De944Cd020A18C8E5626fB0F81b36e73956199"
+tokenized_equity_derivative = "0x6a2357Df4975C667B171bE53dA6FFe6deBf7030c"
+vault_ids = ["0xfab"]
+pricing = "enabled"
+venues = ["raindex", "bebop"]
+trading = "enabled"
+rebalancing = "enabled"
+wrapped_equity_recovery = "enabled"
+
+[assets.equities.GRND]
+extended_hours_counter_trading = "enabled"
+fixed_half_spread_bps = 31.25
+[chains.base.assets.equities.GRND]
+tokenized_equity = "0xA4178410216F5f00C718BE88C2fF8AC24de192bc"
+tokenized_equity_derivative = "0x1197E6FA778c4D13E47875bD1761c68C22c928e0"
+vault_ids = ["0xfab"]
+pricing = "enabled"
+venues = ["raindex", "bebop"]
+trading = "enabled"
+rebalancing = "enabled"
+wrapped_equity_recovery = "enabled"
+[chains.robinhood.assets.equities.GRND]
+tokenized_equity = "0xdca06fddf5320870C8E9D0534aa102677C36bCc4"
+tokenized_equity_derivative = "0xB80Bd4D599EeBBF2851d4E7F5594918B82FF1823"
+vault_ids = ["0xfab"]
+pricing = "enabled"
+venues = ["raindex"]
+trading = "enabled"
+rebalancing = "disabled"
+wrapped_equity_recovery = "disabled"
+
+[assets.equities.HOOD]
+extended_hours_counter_trading = "enabled"
+fixed_half_spread_bps = 31.25
+[chains.base.assets.equities.HOOD]
+tokenized_equity = "0x5cEfd886dD05001c2Fc32c313E05360D07f37d8f"
+tokenized_equity_derivative = "0xd50f561322fe3235DBc9Ec8b3aB7693383d8A425"
+vault_ids = ["0xfab"]
+pricing = "enabled"
+venues = ["raindex", "bebop"]
+trading = "enabled"
+rebalancing = "enabled"
+wrapped_equity_recovery = "enabled"
+
+[assets.equities.IAU]
+extended_hours_counter_trading = "enabled"
+[[assets.equities.IAU.spread_model.profiles]]
+session = "rth"
+half_spread_bps = 14.092101241002995
+quote_staleness_seconds = 20
+[[assets.equities.IAU.spread_model.profiles]]
+session = "pre"
+half_spread_bps = 33.46824104936023
+quote_staleness_seconds = 20
+[[assets.equities.IAU.spread_model.profiles]]
+session = "post"
+half_spread_bps = 59.515188081430594
+quote_staleness_seconds = 20
+[[assets.equities.IAU.spread_model.profiles]]
+session = "rth"
+venue = "bebop"
+half_spread_bps = 23.930174865668832
+quote_staleness_seconds = 70
+[[assets.equities.IAU.spread_model.profiles]]
+session = "pre"
+venue = "bebop"
+half_spread_bps = 41.74455095074711
+quote_staleness_seconds = 70
+[[assets.equities.IAU.spread_model.profiles]]
+session = "post"
+venue = "bebop"
+half_spread_bps = 67.76981989499657
+quote_staleness_seconds = 70
+[chains.base.assets.equities.IAU]
+tokenized_equity = "0x9a507314ea2a6c5686c0d07bfecb764dcf324dff"
+tokenized_equity_derivative = "0x1e46d7efef64a833afb1cd49299a7ad5b439f4d8"
+vault_ids = ["0xfab"]
+pricing = "enabled"
+venues = ["raindex", "bebop"]
+trading = "enabled"
+rebalancing = "enabled"
+wrapped_equity_recovery = "enabled"
+
+[assets.equities.INTC]
+extended_hours_counter_trading = "enabled"
+fixed_half_spread_bps = 31.25
+[chains.base.assets.equities.INTC]
+tokenized_equity = "0xBDC237Aa3B67cC3088adAf117913F30Bf08157a3"
+tokenized_equity_derivative = "0xf567652fC2d7Db8D5469fD06AEbe8C9c4372d722"
+vault_ids = ["0xfab"]
+pricing = "enabled"
+venues = ["raindex", "bebop"]
+trading = "enabled"
+rebalancing = "enabled"
+wrapped_equity_recovery = "enabled"
+
+[assets.equities.LLY]
+extended_hours_counter_trading = "enabled"
+fixed_half_spread_bps = 31.25
+[chains.base.assets.equities.LLY]
+tokenized_equity = "0xA41Ce7B8255A01062ED1AF23ea5E8137B9300554"
+tokenized_equity_derivative = "0x892CcF5E75f4a7Ee6402971a1587F65BEE4d52bd"
+vault_ids = ["0xfab"]
+pricing = "enabled"
+venues = ["raindex", "bebop"]
+trading = "enabled"
+rebalancing = "enabled"
+wrapped_equity_recovery = "enabled"
+
+[assets.equities.LRCX]
+extended_hours_counter_trading = "enabled"
+[[assets.equities.LRCX.spread_model.profiles]]
+session = "rth"
+half_spread_bps = 52.220760689502725
+quote_staleness_seconds = 20
+[[assets.equities.LRCX.spread_model.profiles]]
+session = "pre"
+half_spread_bps = 292.78973175299905
+quote_staleness_seconds = 20
+[[assets.equities.LRCX.spread_model.profiles]]
+session = "post"
+half_spread_bps = 218.82493636577686
+quote_staleness_seconds = 20
+[[assets.equities.LRCX.spread_model.profiles]]
+session = "rth"
+venue = "bebop"
+half_spread_bps = 82.66361207062936
+quote_staleness_seconds = 70
+[[assets.equities.LRCX.spread_model.profiles]]
+session = "pre"
+venue = "bebop"
+half_spread_bps = 317.4281441484765
+quote_staleness_seconds = 70
+[[assets.equities.LRCX.spread_model.profiles]]
+session = "post"
+venue = "bebop"
+half_spread_bps = 243.35901357818466
+quote_staleness_seconds = 70
+[chains.base.assets.equities.LRCX]
+tokenized_equity = "0xDdE9346107609A05439A0B59Ab6eD4f7F81a1FBF"
+tokenized_equity_derivative = "0x328B9aFFa511fE26673edBb4fEa37eDaF908A3bc"
+vault_ids = ["0xfab"]
+pricing = "enabled"
+venues = ["raindex", "bebop"]
+trading = "enabled"
+rebalancing = "enabled"
+wrapped_equity_recovery = "enabled"
+
+[assets.equities.MCD]
+extended_hours_counter_trading = "enabled"
+fixed_half_spread_bps = 31.25
+[chains.base.assets.equities.MCD]
+tokenized_equity = "0x6363657E19A82ABE0E210e9b8c88Ea61d96eceaB"
+tokenized_equity_derivative = "0x7ecAE30Ed8ee4F72653ada7b0941bDE7a0a8eE8d"
+vault_ids = ["0xfab"]
+pricing = "enabled"
+venues = ["raindex", "bebop"]
+trading = "enabled"
+rebalancing = "enabled"
+wrapped_equity_recovery = "enabled"
+
+[assets.equities.MSFT]
+extended_hours_counter_trading = "enabled"
+fixed_half_spread_bps = 31.25
+[chains.base.assets.equities.MSFT]
+tokenized_equity = "0x6a071E25fa25653cF15d1ee320eA3df771926Aa0"
+tokenized_equity_derivative = "0x515A3Ac2a6aB590bDFa970caFFFd7fAdC680886E"
+vault_ids = ["0xfab"]
+pricing = "enabled"
+venues = ["raindex", "bebop"]
+trading = "enabled"
+rebalancing = "enabled"
+wrapped_equity_recovery = "enabled"
+
+[assets.equities.MSTR]
+extended_hours_counter_trading = "enabled"
+[[assets.equities.MSTR.spread_model.profiles]]
+session = "rth"
+half_spread_bps = 65.31249967249501
+quote_staleness_seconds = 20
+[[assets.equities.MSTR.spread_model.profiles]]
+session = "pre"
+half_spread_bps = 65.31249967249501
+quote_staleness_seconds = 20
+[[assets.equities.MSTR.spread_model.profiles]]
+session = "post"
+half_spread_bps = 65.31249967249501
+quote_staleness_seconds = 20
+[[assets.equities.MSTR.spread_model.profiles]]
+session = "rth"
+venue = "bebop"
+half_spread_bps = 105.12180226112758
+quote_staleness_seconds = 70
+[[assets.equities.MSTR.spread_model.profiles]]
+session = "pre"
+venue = "bebop"
+half_spread_bps = 105.12180226112758
+quote_staleness_seconds = 70
+[[assets.equities.MSTR.spread_model.profiles]]
+session = "post"
+venue = "bebop"
+half_spread_bps = 105.12180226112758
+quote_staleness_seconds = 70
+[chains.base.assets.equities.MSTR]
+tokenized_equity = "0x013b782f402d61aa1004cca95b9f5bb402c9d5fe"
+tokenized_equity_derivative = "0xff05e1bd696900dc6a52ca35ca61bb1024eda8e2"
+vault_ids = ["0xfab"]
+pricing = "enabled"
+venues = ["raindex", "bebop"]
+trading = "enabled"
+rebalancing = "enabled"
+wrapped_equity_recovery = "enabled"
+
+[assets.equities.MU]
+extended_hours_counter_trading = "enabled"
+[[assets.equities.MU.spread_model.profiles]]
+session = "rth"
+half_spread_bps = 53.238594175986115
+quote_staleness_seconds = 20
+[[assets.equities.MU.spread_model.profiles]]
+session = "pre"
+half_spread_bps = 71.03973818399844
+quote_staleness_seconds = 20
+[[assets.equities.MU.spread_model.profiles]]
+session = "post"
+half_spread_bps = 53.412273168182836
+quote_staleness_seconds = 20
+[[assets.equities.MU.spread_model.profiles]]
+session = "rth"
+venue = "bebop"
+half_spread_bps = 91.84398759797162
+quote_staleness_seconds = 70
+[[assets.equities.MU.spread_model.profiles]]
+session = "pre"
+venue = "bebop"
+half_spread_bps = 92.59766419682663
+quote_staleness_seconds = 70
+[[assets.equities.MU.spread_model.profiles]]
+session = "post"
+venue = "bebop"
+half_spread_bps = 91.84398759797162
+quote_staleness_seconds = 70
+[chains.base.assets.equities.MU]
+tokenized_equity = "0x7d89a2DFfDaF9f48A64337C725D925381b431aE2"
+tokenized_equity_derivative = "0x89EcfE9E0728D6b3c5eb0EE7236f8C6F806C7B56"
+vault_ids = ["0xfab"]
+pricing = "enabled"
+venues = ["raindex", "bebop"]
+trading = "enabled"
+rebalancing = "enabled"
+wrapped_equity_recovery = "enabled"
+
+[assets.equities.NKE]
+extended_hours_counter_trading = "enabled"
+fixed_half_spread_bps = 31.25
+[chains.base.assets.equities.NKE]
+tokenized_equity = "0x88C3F4E2E0a977Fed97ed246c70BFD7A01070246"
+tokenized_equity_derivative = "0x0883f32d23Ed5535057a4B5E3eB1970FE08606AF"
+vault_ids = ["0xfab"]
+pricing = "enabled"
+venues = ["raindex", "bebop"]
+trading = "enabled"
+rebalancing = "enabled"
+wrapped_equity_recovery = "enabled"
+
+[assets.equities.NVDA]
+extended_hours_counter_trading = "enabled"
+[[assets.equities.NVDA.spread_model.profiles]]
+session = "rth"
+half_spread_bps = 31.338572057608694
+quote_staleness_seconds = 20
+[[assets.equities.NVDA.spread_model.profiles]]
+session = "pre"
+half_spread_bps = 31.338572057608694
+quote_staleness_seconds = 20
+[[assets.equities.NVDA.spread_model.profiles]]
+session = "post"
+half_spread_bps = 31.338572057608694
+quote_staleness_seconds = 20
+[[assets.equities.NVDA.spread_model.profiles]]
+session = "rth"
+venue = "bebop"
+half_spread_bps = 55.08329792272353
+quote_staleness_seconds = 70
+[[assets.equities.NVDA.spread_model.profiles]]
+session = "pre"
+venue = "bebop"
+half_spread_bps = 55.08329792272353
+quote_staleness_seconds = 70
+[[assets.equities.NVDA.spread_model.profiles]]
+session = "post"
+venue = "bebop"
+half_spread_bps = 55.08329792272353
+quote_staleness_seconds = 70
+[chains.base.assets.equities.NVDA]
+tokenized_equity = "0x7271a3c91bb6070ed09333b84a815949d4f16d14"
+tokenized_equity_derivative = "0xfb5b41acdba20a3230f84be995173cfb98b8d6e7"
+vault_ids = ["0xfab"]
+pricing = "enabled"
+venues = ["raindex", "bebop"]
+trading = "enabled"
+rebalancing = "enabled"
+wrapped_equity_recovery = "enabled"
+
+[assets.equities.ORCL]
+extended_hours_counter_trading = "enabled"
+fixed_half_spread_bps = 31.25
+[chains.base.assets.equities.ORCL]
+tokenized_equity = "0x57573351f3fdD20a57dEE4a7f836de1cE9900d4B"
+tokenized_equity_derivative = "0xCB9571aB96aA47374eF30D8E9ACCC1cD51064726"
+vault_ids = ["0xfab"]
+pricing = "enabled"
+venues = ["raindex", "bebop"]
+trading = "enabled"
+rebalancing = "enabled"
+wrapped_equity_recovery = "enabled"
+
+[assets.equities.PLBY]
+extended_hours_counter_trading = "enabled"
+fixed_half_spread_bps = 43.75
+[chains.base.assets.equities.PLBY]
+tokenized_equity = "0xe9bc7eF69f123cA2bcA1021D1BE30224271a9217"
+tokenized_equity_derivative = "0x35fDe767dBFAa610D12cf99914bCd6CFEda73B7B"
+vault_ids = ["0xfab"]
+pricing = "enabled"
+venues = ["raindex", "bebop"]
+trading = "enabled"
+rebalancing = "enabled"
+wrapped_equity_recovery = "enabled"
+[chains.robinhood.assets.equities.PLBY]
+tokenized_equity = "0x4a18036Dce22168D8891919a1c75aC2CAf9a08AB"
+tokenized_equity_derivative = "0xBe127eeD812DC1F622227FAdc8639d4138B47b2e"
+vault_ids = ["0xfab"]
+pricing = "enabled"
+venues = ["raindex"]
+trading = "enabled"
+rebalancing = "disabled"
+wrapped_equity_recovery = "disabled"
+
+[assets.equities.PPLT]
+extended_hours_counter_trading = "enabled"
+[[assets.equities.PPLT.spread_model.profiles]]
+session = "rth"
+half_spread_bps = 51.19914208140678
+quote_staleness_seconds = 20
+[[assets.equities.PPLT.spread_model.profiles]]
+session = "pre"
+half_spread_bps = 179.65123542435194
+quote_staleness_seconds = 20
+[[assets.equities.PPLT.spread_model.profiles]]
+session = "post"
+half_spread_bps = 211.98427113417046
+quote_staleness_seconds = 20
+[[assets.equities.PPLT.spread_model.profiles]]
+session = "rth"
+venue = "bebop"
+half_spread_bps = 72.5
+quote_staleness_seconds = 70
+[[assets.equities.PPLT.spread_model.profiles]]
+session = "pre"
+venue = "bebop"
+half_spread_bps = 206.25
+quote_staleness_seconds = 70
+[[assets.equities.PPLT.spread_model.profiles]]
+session = "post"
+venue = "bebop"
+half_spread_bps = 233.75
+quote_staleness_seconds = 70
+[chains.base.assets.equities.PPLT]
+tokenized_equity = "0x1f17523b147ccc2a2328c0f014f6d49c479ea063"
+tokenized_equity_derivative = "0x82f5baee1076334357a34a19e04f7c282d51ce47"
+vault_ids = ["0xfab"]
+pricing = "enabled"
+venues = ["raindex", "bebop"]
+trading = "enabled"
+rebalancing = "enabled"
+wrapped_equity_recovery = "enabled"
+
+[assets.equities.PTY]
+extended_hours_counter_trading = "enabled"
+fixed_half_spread_bps = 31.25
+[chains.base.assets.equities.PTY]
+tokenized_equity = "0xb6021810971714cD48572af527307Acc324ecF61"
+tokenized_equity_derivative = "0xb6D779A79E7493ed821a65D52bA419F0F6D5dD0a"
+vault_ids = ["0xfab"]
+pricing = "enabled"
+venues = ["raindex", "bebop"]
+trading = "enabled"
+rebalancing = "enabled"
+wrapped_equity_recovery = "enabled"
+
+[assets.equities.QQQM]
+extended_hours_counter_trading = "enabled"
+[[assets.equities.QQQM.spread_model.profiles]]
+session = "rth"
+half_spread_bps = 15.851512862399247
+quote_staleness_seconds = 20
+[[assets.equities.QQQM.spread_model.profiles]]
+session = "pre"
+half_spread_bps = 18.132383705744463
+quote_staleness_seconds = 20
+[[assets.equities.QQQM.spread_model.profiles]]
+session = "post"
+half_spread_bps = 22.45298714657369
+quote_staleness_seconds = 20
+[[assets.equities.QQQM.spread_model.profiles]]
+session = "rth"
+venue = "bebop"
+half_spread_bps = 27.555769879319442
+quote_staleness_seconds = 70
+[[assets.equities.QQQM.spread_model.profiles]]
+session = "pre"
+venue = "bebop"
+half_spread_bps = 27.555769879319442
+quote_staleness_seconds = 70
+[[assets.equities.QQQM.spread_model.profiles]]
+session = "post"
+venue = "bebop"
+half_spread_bps = 28.337261781781713
+quote_staleness_seconds = 70
+[chains.base.assets.equities.QQQM]
+tokenized_equity = "0x09ee803ba675052e10a54bfc8e18c0f67793056b"
+tokenized_equity_derivative = "0x823FF7Bbde2869aAe73A6CD53e7f614442836757"
+vault_ids = ["0xfab"]
+pricing = "enabled"
+venues = ["raindex", "bebop"]
+trading = "enabled"
+rebalancing = "enabled"
+wrapped_equity_recovery = "enabled"
+
+[assets.equities.QSEP]
+extended_hours_counter_trading = "disabled"
+[chains.base.assets.equities.QSEP]
+tokenized_equity = "0x4a9a9fc94a507559481270d0bff3315ab92fcefa"
+tokenized_equity_derivative = "0x849e389982209f901b7b9ffca57ae4c9eeb11c0d"
+vault_ids = ["0xfab"]
+pricing = "disabled"
+venues = []
+trading = "disabled"
+rebalancing = "disabled"
+wrapped_equity_recovery = "disabled"
+
+[assets.equities.RKLB]
+extended_hours_counter_trading = "disabled"
+[[assets.equities.RKLB.spread_model.profiles]]
+session = "rth"
+half_spread_bps = 83.86300646476676
+quote_staleness_seconds = 20
+[[assets.equities.RKLB.spread_model.profiles]]
+session = "pre"
+half_spread_bps = 108.8450293827043
+quote_staleness_seconds = 20
+[[assets.equities.RKLB.spread_model.profiles]]
+session = "post"
+half_spread_bps = 97.53531363902079
+quote_staleness_seconds = 20
+[[assets.equities.RKLB.spread_model.profiles]]
+session = "rth"
+venue = "bebop"
+half_spread_bps = 139.0483089255124
+quote_staleness_seconds = 70
+[[assets.equities.RKLB.spread_model.profiles]]
+session = "pre"
+venue = "bebop"
+half_spread_bps = 139.0483089255124
+quote_staleness_seconds = 70
+[[assets.equities.RKLB.spread_model.profiles]]
+session = "post"
+venue = "bebop"
+half_spread_bps = 139.0483089255124
+quote_staleness_seconds = 70
+[chains.base.assets.equities.RKLB]
+tokenized_equity = "0xf6744fd94e27c2f58f6110aa9fdc77a87e41766b"
+tokenized_equity_derivative = "0xf4f8c66085910d583c01f3b4e44bf731d4e2c565"
+vault_ids = ["0xfab"]
+pricing = "enabled"
+venues = ["raindex", "hook"]
+trading = "disabled"
+rebalancing = "enabled"
+wrapped_equity_recovery = "disabled"
+
+[assets.equities.SGOV]
+extended_hours_counter_trading = "enabled"
+[[assets.equities.SGOV.spread_model.profiles]]
+session = "rth"
+half_spread_bps = 0.8106616730638931
+quote_staleness_seconds = 20
+[[assets.equities.SGOV.spread_model.profiles]]
+session = "pre"
+half_spread_bps = 0.8106616730638931
+quote_staleness_seconds = 20
+[[assets.equities.SGOV.spread_model.profiles]]
+session = "post"
+half_spread_bps = 0.8107859636004187
+quote_staleness_seconds = 20
+[[assets.equities.SGOV.spread_model.profiles]]
+session = "rth"
+venue = "bebop"
+half_spread_bps = 0.8106616730638931
+quote_staleness_seconds = 70
+[[assets.equities.SGOV.spread_model.profiles]]
+session = "pre"
+venue = "bebop"
+half_spread_bps = 0.8106616730638931
+quote_staleness_seconds = 70
+[[assets.equities.SGOV.spread_model.profiles]]
+session = "post"
+venue = "bebop"
+half_spread_bps = 0.810723812135733
+quote_staleness_seconds = 70
+[chains.base.assets.equities.SGOV]
+tokenized_equity = "0xc941C1506B7555Ba8C506Fb6c9b9CC259902d612"
+tokenized_equity_derivative = "0x78c31580c97101694c70022c83d570150c11e935"
+vault_ids = ["0xfab"]
+pricing = "enabled"
+venues = ["raindex", "bebop"]
+trading = "enabled"
+rebalancing = "enabled"
+wrapped_equity_recovery = "enabled"
+[chains.robinhood.assets.equities.SGOV]
+tokenized_equity_derivative = "0x06b17e431a957dd8522bf106653bac6b39f437e6"
+pricing = "enabled"
+venues = ["raindex"]
+
+[assets.equities.SIVR]
+extended_hours_counter_trading = "enabled"
+[[assets.equities.SIVR.spread_model.profiles]]
+session = "rth"
+half_spread_bps = 36.82120442242331
+quote_staleness_seconds = 20
+[[assets.equities.SIVR.spread_model.profiles]]
+session = "pre"
+half_spread_bps = 269.49022723585125
+quote_staleness_seconds = 20
+[[assets.equities.SIVR.spread_model.profiles]]
+session = "post"
+half_spread_bps = 151.37395622539316
+quote_staleness_seconds = 20
+[[assets.equities.SIVR.spread_model.profiles]]
+session = "rth"
+venue = "bebop"
+half_spread_bps = 58.36089886320275
+quote_staleness_seconds = 70
+[[assets.equities.SIVR.spread_model.profiles]]
+session = "pre"
+venue = "bebop"
+half_spread_bps = 295.96614297581857
+quote_staleness_seconds = 70
+[[assets.equities.SIVR.spread_model.profiles]]
+session = "post"
+venue = "bebop"
+half_spread_bps = 170.7011283101393
+quote_staleness_seconds = 70
+[chains.base.assets.equities.SIVR]
+tokenized_equity = "0x58ce5024b89b4f73c27814c0f0abbea331c99be8"
+tokenized_equity_derivative = "0xeb7f3e4093c9d68253b6104fbbff561f3ec0442f"
+vault_ids = ["0xfab"]
+pricing = "enabled"
+venues = ["raindex", "bebop"]
+trading = "enabled"
+rebalancing = "enabled"
+wrapped_equity_recovery = "enabled"
+
+[assets.equities.SKHY]
+extended_hours_counter_trading = "enabled"
+[[assets.equities.SKHY.spread_model.profiles]]
+session = "rth"
+half_spread_bps = 107.06251643128616
+quote_staleness_seconds = 20
+[[assets.equities.SKHY.spread_model.profiles]]
+session = "pre"
+half_spread_bps = 107.06251643128616
+quote_staleness_seconds = 20
+[[assets.equities.SKHY.spread_model.profiles]]
+session = "post"
+half_spread_bps = 107.06251643128616
+quote_staleness_seconds = 20
+[[assets.equities.SKHY.spread_model.profiles]]
+session = "rth"
+venue = "bebop"
+half_spread_bps = 135.50646948940027
+quote_staleness_seconds = 70
+[[assets.equities.SKHY.spread_model.profiles]]
+session = "pre"
+venue = "bebop"
+half_spread_bps = 135.50646948940027
+quote_staleness_seconds = 70
+[[assets.equities.SKHY.spread_model.profiles]]
+session = "post"
+venue = "bebop"
+half_spread_bps = 135.50646948940027
+quote_staleness_seconds = 70
+[chains.base.assets.equities.SKHY]
+tokenized_equity = "0x4DBA41f0feb390F208a85e96168fF5d8aC2b6F5c"
+tokenized_equity_derivative = "0xFcD17aC4c4BF6a72c93018096F3fC09e66573Ff9"
+vault_ids = ["0xfab"]
+pricing = "enabled"
+venues = ["raindex", "bebop"]
+trading = "enabled"
+rebalancing = "enabled"
+wrapped_equity_recovery = "enabled"
+
+[assets.equities.SMCI]
+extended_hours_counter_trading = "enabled"
+fixed_half_spread_bps = 31.25
+[chains.base.assets.equities.SMCI]
+tokenized_equity = "0x8518931497d2A8f07Bc607D1D3295b398D065A65"
+tokenized_equity_derivative = "0xA759FAbbD866e6DB8bF76613C35825dC2e380bf0"
+vault_ids = ["0xfab"]
+pricing = "enabled"
+venues = ["raindex", "bebop"]
+trading = "enabled"
+rebalancing = "enabled"
+wrapped_equity_recovery = "enabled"
+
+[assets.equities.SPCX]
+extended_hours_counter_trading = "enabled"
+[[assets.equities.SPCX.spread_model.profiles]]
+session = "rth"
+half_spread_bps = 79.4408713730611
+quote_staleness_seconds = 20
+[[assets.equities.SPCX.spread_model.profiles]]
+session = "pre"
+half_spread_bps = 79.4408713730611
+quote_staleness_seconds = 20
+[[assets.equities.SPCX.spread_model.profiles]]
+session = "post"
+half_spread_bps = 79.4408713730611
+quote_staleness_seconds = 20
+[[assets.equities.SPCX.spread_model.profiles]]
+session = "rth"
+venue = "bebop"
+half_spread_bps = 129.7170991932019
+quote_staleness_seconds = 70
+[[assets.equities.SPCX.spread_model.profiles]]
+session = "pre"
+venue = "bebop"
+half_spread_bps = 129.7170991932019
+quote_staleness_seconds = 70
+[[assets.equities.SPCX.spread_model.profiles]]
+session = "post"
+venue = "bebop"
+half_spread_bps = 129.7170991932019
+quote_staleness_seconds = 70
+[chains.base.assets.equities.SPCX]
+tokenized_equity = "0xc585AeB8B76c5F5e4215470A7625258e86ED7746"
+tokenized_equity_derivative = "0x19F89aaEf8a93f38A974beca9776f09aB844887F"
+vault_ids = ["0xfab"]
+pricing = "enabled"
+venues = ["raindex", "bebop"]
+trading = "enabled"
+rebalancing = "enabled"
+wrapped_equity_recovery = "enabled"
+
+[assets.equities.SPYM]
+extended_hours_counter_trading = "enabled"
+[[assets.equities.SPYM.spread_model.profiles]]
+session = "rth"
+half_spread_bps = 50.0
+quote_staleness_seconds = 20
+[[assets.equities.SPYM.spread_model.profiles]]
+session = "pre"
+half_spread_bps = 50.0
+quote_staleness_seconds = 20
+[[assets.equities.SPYM.spread_model.profiles]]
+session = "post"
+half_spread_bps = 50.0
+quote_staleness_seconds = 20
+[[assets.equities.SPYM.spread_model.profiles]]
+session = "rth"
+venue = "bebop"
+half_spread_bps = 50.0
+quote_staleness_seconds = 70
+[[assets.equities.SPYM.spread_model.profiles]]
+session = "pre"
+venue = "bebop"
+half_spread_bps = 50.0
+quote_staleness_seconds = 70
+[[assets.equities.SPYM.spread_model.profiles]]
+session = "post"
+venue = "bebop"
+half_spread_bps = 50.0
+quote_staleness_seconds = 70
+[chains.base.assets.equities.SPYM]
+tokenized_equity = "0x8fdf41116f755771bfe0747d5f8c3711d5debfbb"
+tokenized_equity_derivative = "0x31c2c14134e6e3b7ef9478297f199331133fc2d8"
+vault_ids = ["0xfab"]
+pricing = "enabled"
+venues = ["raindex", "bebop"]
+trading = "enabled"
+rebalancing = "enabled"
+wrapped_equity_recovery = "enabled"
+
+[assets.equities.TQQQ]
+extended_hours_counter_trading = "enabled"
+fixed_half_spread_bps = 31.25
+[chains.base.assets.equities.TQQQ]
+tokenized_equity = "0xcA1A378F9a250131A2fE51c10f120FeF7EDCa56E"
+tokenized_equity_derivative = "0x295e9eCAb319006900a53b3f8D6Fcb0C131F4ada"
+vault_ids = ["0xfab"]
+pricing = "enabled"
+venues = ["raindex", "bebop"]
+trading = "enabled"
+rebalancing = "enabled"
+wrapped_equity_recovery = "enabled"
+
+[assets.equities.TR]
+extended_hours_counter_trading = "enabled"
+fixed_half_spread_bps = 43.75
+[chains.base.assets.equities.TR]
+tokenized_equity = "0xeF935b17d5BE5b7ecA803158a845A08A7A9383f2"
+tokenized_equity_derivative = "0x433fd2Fc0964B07E9820e4cd01774eDE59D1F002"
+vault_ids = ["0xfab"]
+pricing = "enabled"
+venues = ["raindex", "bebop"]
+trading = "enabled"
+rebalancing = "enabled"
+wrapped_equity_recovery = "enabled"
+
+[assets.equities.TSLA]
+extended_hours_counter_trading = "enabled"
+[[assets.equities.TSLA.spread_model.profiles]]
+session = "rth"
+half_spread_bps = 41.691018699943925
+quote_staleness_seconds = 20
+[[assets.equities.TSLA.spread_model.profiles]]
+session = "pre"
+half_spread_bps = 41.691018699943925
+quote_staleness_seconds = 20
+[[assets.equities.TSLA.spread_model.profiles]]
+session = "post"
+half_spread_bps = 41.691018699943925
+quote_staleness_seconds = 20
+[[assets.equities.TSLA.spread_model.profiles]]
+session = "rth"
+venue = "bebop"
+half_spread_bps = 71.6924743607141
+quote_staleness_seconds = 70
+[[assets.equities.TSLA.spread_model.profiles]]
+session = "pre"
+venue = "bebop"
+half_spread_bps = 71.6924743607141
+quote_staleness_seconds = 70
+[[assets.equities.TSLA.spread_model.profiles]]
+session = "post"
+venue = "bebop"
+half_spread_bps = 71.6924743607141
+quote_staleness_seconds = 70
+[chains.base.assets.equities.TSLA]
+tokenized_equity = "0x4e169cd2ab4f82640a8c65c68fed55863866fdb0"
+tokenized_equity_derivative = "0x219a8d384a10bf19b9f24cb5cc53f79dd0e5a03d"
+vault_ids = ["0xfab"]
+pricing = "enabled"
+venues = ["raindex", "bebop"]
+trading = "enabled"
+rebalancing = "enabled"
+wrapped_equity_recovery = "enabled"
+
+[assets.equities.TSM]
+extended_hours_counter_trading = "enabled"
+[[assets.equities.TSM.spread_model.profiles]]
+session = "rth"
+half_spread_bps = 33.28488181740574
+quote_staleness_seconds = 20
+[[assets.equities.TSM.spread_model.profiles]]
+session = "pre"
+half_spread_bps = 53.70727936530217
+quote_staleness_seconds = 20
+[[assets.equities.TSM.spread_model.profiles]]
+session = "post"
+half_spread_bps = 53.756023906447716
+quote_staleness_seconds = 20
+[[assets.equities.TSM.spread_model.profiles]]
+session = "rth"
+venue = "bebop"
+half_spread_bps = 55.11710423528153
+quote_staleness_seconds = 70
+[[assets.equities.TSM.spread_model.profiles]]
+session = "pre"
+venue = "bebop"
+half_spread_bps = 64.05172120798846
+quote_staleness_seconds = 70
+[[assets.equities.TSM.spread_model.profiles]]
+session = "post"
+venue = "bebop"
+half_spread_bps = 61.90664824391536
+quote_staleness_seconds = 70
+[chains.base.assets.equities.TSM]
+tokenized_equity = "0x7001e2974F775f0Fd73a3D2e5914e591f3EC3fBB"
+tokenized_equity_derivative = "0x71C66449d2528E23514A9c197BFD55Ae9DB3B714"
+vault_ids = ["0xfab"]
+pricing = "enabled"
+venues = ["raindex", "bebop"]
+trading = "enabled"
+rebalancing = "enabled"
+wrapped_equity_recovery = "enabled"
+
+[assets.equities.TTWO]
+extended_hours_counter_trading = "enabled"
+[[assets.equities.TTWO.spread_model.profiles]]
+session = "rth"
+half_spread_bps = 68.77594791494067
+quote_staleness_seconds = 20
+[[assets.equities.TTWO.spread_model.profiles]]
+session = "pre"
+half_spread_bps = 426.5362794856799
+quote_staleness_seconds = 20
+[[assets.equities.TTWO.spread_model.profiles]]
+session = "post"
+half_spread_bps = 425.1947057900935
+quote_staleness_seconds = 20
+[[assets.equities.TTWO.spread_model.profiles]]
+session = "rth"
+venue = "bebop"
+half_spread_bps = 89.02670914174145
+quote_staleness_seconds = 70
+[[assets.equities.TTWO.spread_model.profiles]]
+session = "pre"
+venue = "bebop"
+half_spread_bps = 441.33448119614275
+quote_staleness_seconds = 70
+[[assets.equities.TTWO.spread_model.profiles]]
+session = "post"
+venue = "bebop"
+half_spread_bps = 448.6573954275325
+quote_staleness_seconds = 70
+[chains.base.assets.equities.TTWO]
+tokenized_equity = "0x1a29eD11DF8295D5F3B5F59849FD94caD615E024"
+tokenized_equity_derivative = "0x045Fb493D970f94a54FeaF931033622fC82192e6"
+vault_ids = ["0xfab"]
+pricing = "enabled"
+venues = ["raindex", "bebop"]
+trading = "enabled"
+rebalancing = "enabled"
+wrapped_equity_recovery = "enabled"
+
+[assets.equities.VWO]
+extended_hours_counter_trading = "enabled"
+[[assets.equities.VWO.spread_model.profiles]]
+session = "rth"
+half_spread_bps = 10.47870802092763
+quote_staleness_seconds = 20
+[[assets.equities.VWO.spread_model.profiles]]
+session = "pre"
+half_spread_bps = 307.6597752459792
+quote_staleness_seconds = 20
+[[assets.equities.VWO.spread_model.profiles]]
+session = "post"
+half_spread_bps = 161.83594870861924
+quote_staleness_seconds = 20
+[[assets.equities.VWO.spread_model.profiles]]
+session = "rth"
+venue = "bebop"
+half_spread_bps = 17.28389263910732
+quote_staleness_seconds = 70
+[[assets.equities.VWO.spread_model.profiles]]
+session = "pre"
+venue = "bebop"
+half_spread_bps = 326.8520856510472
+quote_staleness_seconds = 70
+[[assets.equities.VWO.spread_model.profiles]]
+session = "post"
+venue = "bebop"
+half_spread_bps = 191.3773253276472
+quote_staleness_seconds = 70
+[chains.base.assets.equities.VWO]
+tokenized_equity = "0x0acfea6833c4a3f41bf2fbd736aa9eea547d90ee"
+tokenized_equity_derivative = "0x23ec6886b49D7ab123E9ee8e474D2fa7AB6Cbc2d"
+vault_ids = ["0xfab"]
+pricing = "enabled"
+venues = ["raindex", "bebop"]
+trading = "enabled"
+rebalancing = "enabled"
+wrapped_equity_recovery = "enabled"
+
+[assets.equities.WEN]
+extended_hours_counter_trading = "enabled"
+fixed_half_spread_bps = 43.75
+[chains.base.assets.equities.WEN]
+tokenized_equity = "0xedA4df511dEA07b6529db2196998B30E03791d87"
+tokenized_equity_derivative = "0x31Fa821F8B1BDea7Db357ec9622d1A2f6aFE903d"
+vault_ids = ["0xfab"]
+pricing = "enabled"
+venues = ["raindex", "bebop"]
+trading = "enabled"
+rebalancing = "enabled"
+wrapped_equity_recovery = "enabled"

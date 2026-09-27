@@ -5,8 +5,12 @@ use st0x_hedge::{apalis_board_tracing_layer, run_server_bot_session, setup_traci
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let Env { config, secrets } = Env::parse();
-    let ctx = Ctx::load_files(&config, &secrets).await?;
+    let Env {
+        config,
+        secrets,
+        registry_file,
+    } = Env::parse();
+    let ctx = Ctx::load_files(&config, &secrets, registry_file.as_deref()).await?;
 
     let log_level: tracing::Level = (&ctx.log_level).into();
 

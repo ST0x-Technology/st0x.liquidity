@@ -70,6 +70,7 @@ mod position;
 mod position_check;
 mod pricing_identity;
 mod rebalancing;
+mod registry_watch;
 mod startup;
 mod telemetry;
 mod trading;
@@ -299,6 +300,9 @@ async fn run_bot_session_inner(
 
     let health = startup::HealthGate::default();
     let detached_tasks = TaskTracker::new();
+    if let Some(live) = ctx.registry.clone() {
+        detached_tasks.spawn(registry_watch::watch(live, shutdown_token.clone()));
+    }
     let state = AppState {
         ctx: ctx.clone(),
         pool: pools.cqrs.clone(),

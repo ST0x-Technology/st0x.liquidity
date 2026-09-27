@@ -7,13 +7,18 @@
 //! validated alone, which is what lets CI check every config the repository
 //! ships without a secret, a network, or a clock.
 //!
+//! A config that names `[registry]` keeps its per-symbol tables in the
+//! bucket. `--registry-file` supplies a local copy so they are checked too;
+//! without it the config is judged on its own and the report says so. This
+//! binary never reads the bucket, so it stays usable on any CI runner.
+//!
 //! Exits 0 on success, 1 on validation failure.
 
 use std::path::{Path, PathBuf};
 
 use clap::Parser;
 
-use st0x_config::{Ctx, CtxError, StartupNotice};
+use st0x_config::{Ctx, CtxError, StartupNotice, TokenFile};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -31,14 +36,38 @@ struct Args {
     /// file on its own.
     #[clap(long)]
     secrets: Option<PathBuf>,
+    /// A local copy of the token file the config's `[registry]` names, so
+    /// the per-symbol tables are checked too. Omit to judge the config alone.
+    #[clap(long)]
+    registry_file: Option<PathBuf>,
 }
 
 fn main() -> std::process::ExitCode {
-    let Args { config, secrets } = Args::parse();
+    let Args {
+        config,
+        secrets,
+        registry_file,
+    } = Args::parse();
+
+    let token_bytes = match registry_file.as_ref().map(std::fs::read).transpose() {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            eprintln!("Config validation failed: reading --registry-file: {error}");
+            return std::process::ExitCode::FAILURE;
+        }
+    };
+    let tokens = token_bytes
+        .as_deref()
+        .map_or(TokenFile::Skipped, TokenFile::Bytes);
 
     let (scope, validated) = secrets.as_ref().map_or_else(
-        || ("config", Ctx::validate_config_file(&config)),
-        |secrets| ("config and secrets", Ctx::validate_files(&config, secrets)),
+        || ("config", Ctx::validate_config_file(&config, tokens)),
+        |secrets| {
+            (
+                "config and secrets",
+                Ctx::validate_files(&config, secrets, tokens),
+            )
+        },
     );
 
     match validated {

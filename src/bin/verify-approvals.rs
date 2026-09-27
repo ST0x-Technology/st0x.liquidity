@@ -7,9 +7,13 @@ use st0x_hedge::approval_policy::{ApprovalPolicyVerification, verify_turnkey_app
 
 #[tokio::main]
 async fn main() -> std::process::ExitCode {
-    let Env { config, secrets } = Env::parse();
+    let Env {
+        config,
+        secrets,
+        registry_file,
+    } = Env::parse();
 
-    match verify_turnkey_approval_policies(&config, &secrets).await {
+    match verify_turnkey_approval_policies(&config, &secrets, registry_file.as_deref()).await {
         Ok(ApprovalPolicyVerification::SkippedNonTurnkey) => {
             eprintln!("Turnkey approval policy verification skipped for non-Turnkey wallet");
             std::process::ExitCode::SUCCESS

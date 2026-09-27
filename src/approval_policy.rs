@@ -4,7 +4,7 @@ use std::fmt::{Display, Formatter};
 use std::path::Path;
 
 use alloy::primitives::Address;
-use st0x_config::{ChainApprovalInputs, Ctx};
+use st0x_config::{ChainApprovalInputs, Ctx, TokenFile, fetch_token_file};
 use st0x_evm::Chain;
 use st0x_evm::turnkey::{
     TurnkeyPolicy, TurnkeyPolicyClient, TurnkeyPolicyEffect, TurnkeyPolicyError,
@@ -92,8 +92,14 @@ pub enum ChainCoverageError {
 pub async fn verify_turnkey_approval_policies(
     config_path: &Path,
     secrets_path: &Path,
+    registry_file: Option<&Path>,
 ) -> Result<ApprovalPolicyVerification, ApprovalPolicyVerificationError> {
-    let Some(inputs) = Ctx::load_turnkey_approval_policy_inputs(config_path, secrets_path)? else {
+    let tokens = fetch_token_file(config_path, registry_file).await?;
+    let tokens = tokens
+        .as_deref()
+        .map_or(TokenFile::Skipped, TokenFile::Bytes);
+    let Some(inputs) = Ctx::load_turnkey_approval_policy_inputs(config_path, secrets_path, tokens)?
+    else {
         return Ok(ApprovalPolicyVerification::SkippedNonTurnkey);
     };
     let client = TurnkeyPolicyClient::new(

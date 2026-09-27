@@ -31,6 +31,7 @@ use crate::InventoryAdapters;
 #[cfg(any(test, feature = "test-support"))]
 use crate::chain::HedgedChain;
 use crate::pricing::PricingSecrets;
+use crate::registry::{self, Projection, RegistryLive, RegistrySource, TokenFile};
 use crate::wallet::{SigningChain, SigningChains};
 use crate::{
     AlertsConfig, AlertsCtx, AllocationConfigError, BotGasValuationConfig, ChainConfig,
@@ -70,6 +71,10 @@ pub struct Env {
     /// Path to encrypted TOML secrets file
     #[clap(long)]
     pub secrets: PathBuf,
+    /// A local copy of the token file `[registry]` names, read instead of
+    /// the bucket. For offline checks and development; boot reads the bucket.
+    #[clap(long)]
+    pub registry_file: Option<PathBuf>,
 }
 
 /// A migration/deprecation notice produced while parsing config + secrets.
@@ -168,16 +173,17 @@ struct DeploymentConfig {
 /// `validate-config`; this loader performs no network or secret access.
 pub fn load_deployment_symbol_policy(
     config_path: &Path,
+    tokens: TokenFile<'_>,
 ) -> Result<DeploymentSymbolPolicy, CtxError> {
     let config_str = std::fs::read_to_string(config_path).map_err(|source| CtxError::ConfigIo {
         path: config_path.to_path_buf(),
         source,
     })?;
-    let config: DeploymentConfig =
-        toml::from_str(&config_str).map_err(|source| CtxError::ConfigToml {
-            path: config_path.to_path_buf(),
-            source,
-        })?;
+    let (table, _) = config_table(&config_str, config_path, tokens, &mut Vec::new())?;
+    let config: DeploymentConfig = table.try_into().map_err(|source| CtxError::ConfigToml {
+        path: config_path.to_path_buf(),
+        source,
+    })?;
 
     DeploymentSymbolPolicy::new(
         config.assets.equities.symbols.into_keys(),
@@ -260,6 +266,12 @@ struct Config {
     /// Per-network ST0xOrchestrator contract addresses. See
     /// [`Ctx::orchestrator`].
     orchestrator: Option<OrchestratorConfig>,
+    /// Where the per-symbol tables come from when the config carries none
+    /// of its own: `[chains.<c>.trading.assets.equities.<SYM>]` and
+    /// `[assets.equities.<SYM>]` are then read from the token file in the
+    /// bucket. See [`crate::registry`].
+    #[serde(default)]
+    registry: Option<RegistrySource>,
 }
 
 fn default_hedge_order_gate_reconciliation_timeout_secs() -> NonZeroU64 {
@@ -767,6 +779,9 @@ pub struct Ctx {
     /// Notices collected during parsing, before any tracing subscriber
     /// existed. Emit via [`Ctx::emit_startup_notices`] once logging is up.
     pub startup_notices: Vec<StartupNotice>,
+    /// What the token file contributed at boot, when `[registry]` names
+    /// one: the refresh loop compares the bucket copy against it.
+    pub registry: Option<RegistryLive>,
     /// Live reference prices used exclusively by dashboard USD valuations.
     pub pricing: Option<PricingCtx>,
     /// Rebalancing operating parameters from the required `[rebalancing]`
@@ -1499,6 +1514,7 @@ struct ValidatedParts {
     telemetry: Option<TelemetryCtx>,
     alerts: Option<AlertsCtx>,
     startup_notices: Vec<StartupNotice>,
+    registry: Option<RegistryLive>,
     pricing: Option<PricingCtx>,
     execution_threshold: ExecutionThreshold,
     rebalancing: Box<RebalancingCtx>,
@@ -1866,16 +1882,142 @@ fn validate_config(
     })
 }
 
-/// Single validation path shared by [`Ctx::load_files`] and
-/// [`Ctx::validate_files`]. All config/secrets business-rule checks live
-/// here — neither caller duplicates validation logic.
+/// [`parse_and_validate_with`] for a config that carries its per-symbol
+/// tables inline (every test fixture does).
 fn parse_and_validate(
     config_str: &str,
     config_path: &Path,
     secrets_str: &str,
     secrets_path: &Path,
 ) -> Result<ValidatedParts, CtxError> {
-    let config: Config = toml::from_str(config_str).map_err(|source| CtxError::ConfigToml {
+    parse_and_validate_with(
+        config_str,
+        config_path,
+        TokenFile::Skipped,
+        secrets_str,
+        secrets_path,
+    )
+}
+
+/// The config as a TOML table with its per-symbol tables in place, and what
+/// the token file contributed when `[registry]` names one.
+///
+/// The merge happens at the table level, before deserialization, so the
+/// rows are exactly what the inline tables held and every check below runs
+/// unchanged on the result. With [`TokenFile::Skipped`] a config that names
+/// `[registry]` is judged without those tables, and a notice says so.
+fn config_table(
+    config_str: &str,
+    config_path: &Path,
+    tokens: TokenFile<'_>,
+    startup_notices: &mut Vec<StartupNotice>,
+) -> Result<(toml::Table, Option<RegistryLive>), CtxError> {
+    let mut table: toml::Table =
+        toml::from_str(config_str).map_err(|source| CtxError::ConfigToml {
+            path: config_path.to_path_buf(),
+            source,
+        })?;
+    let registry_error = |source| CtxError::Registry {
+        path: config_path.to_path_buf(),
+        source,
+    };
+    let Some(source) = registry::source_of(&table).map_err(registry_error)? else {
+        return Ok((table, None));
+    };
+    match tokens {
+        TokenFile::Bytes(bytes) => {
+            let file = registry::parse(bytes).map_err(registry_error)?;
+            let live = registry::project(&file).map_err(registry_error)?;
+            let static_config = table.clone();
+            registry::merge(&mut table, &live).map_err(registry_error)?;
+            Ok((
+                table,
+                Some(RegistryLive {
+                    source,
+                    static_config,
+                    live,
+                }),
+            ))
+        }
+        TokenFile::Skipped => {
+            startup_notices.push(StartupNotice::warning(format!(
+                "per-symbol tables come from {} and were not checked here; pass --registry-file \
+                 to cover them",
+                source.url
+            )));
+            Ok((table, None))
+        }
+    }
+}
+
+/// The token file bytes a config needs, or `None` when it carries its
+/// per-symbol tables inline. A local copy wins over the bucket.
+pub async fn fetch_token_file(
+    config_path: &Path,
+    registry_file: Option<&Path>,
+) -> Result<Option<Vec<u8>>, CtxError> {
+    let config_str = tokio::fs::read_to_string(config_path)
+        .await
+        .map_err(|source| CtxError::ConfigIo {
+            path: config_path.to_path_buf(),
+            source,
+        })?;
+    let registry_error = |source| CtxError::Registry {
+        path: config_path.to_path_buf(),
+        source,
+    };
+    let table: toml::Table =
+        toml::from_str(&config_str).map_err(|source| CtxError::ConfigToml {
+            path: config_path.to_path_buf(),
+            source,
+        })?;
+    let Some(source) = registry::source_of(&table).map_err(registry_error)? else {
+        return Ok(None);
+    };
+    registry::load_bytes(&source, registry_file)
+        .await
+        .map(Some)
+        .map_err(registry_error)
+}
+
+/// Judge a fresh copy of the token file the way boot would, against the
+/// config this instance runs: parse, merge, validate. Returns what differs
+/// from the running tables ("no difference" when nothing does).
+pub fn registry_check(live: &RegistryLive, fresh: &[u8]) -> Result<String, CtxError> {
+    let path = Path::new(&live.source.url);
+    let registry_error = |source| CtxError::Registry {
+        path: path.to_path_buf(),
+        source,
+    };
+    let file = registry::parse(fresh).map_err(registry_error)?;
+    let projection = registry::project(&file).map_err(registry_error)?;
+    let mut table = live.static_config.clone();
+    registry::merge(&mut table, &projection).map_err(registry_error)?;
+    let config: Config = table.try_into().map_err(|source| CtxError::ConfigToml {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    validate_config(&config, path, &mut Vec::new())?;
+    Ok(registry::describe_change(&live.live, &projection))
+}
+
+/// Single validation path shared by [`Ctx::load_files`] and
+/// [`Ctx::validate_files`]. All config/secrets business-rule checks live
+/// here; neither caller duplicates validation logic.
+fn parse_and_validate_with(
+    config_str: &str,
+    config_path: &Path,
+    tokens: TokenFile<'_>,
+    secrets_str: &str,
+    secrets_path: &Path,
+) -> Result<ValidatedParts, CtxError> {
+    // Collected instead of warn!ed: no tracing subscriber exists yet (the
+    // binaries build theirs from the parsed Ctx), so a warn! here would
+    // dispatch to NoSubscriber and vanish. See `StartupNotice`.
+    let mut startup_notices = Vec::new();
+
+    let (table, registry) = config_table(config_str, config_path, tokens, &mut startup_notices)?;
+    let config: Config = table.try_into().map_err(|source| CtxError::ConfigToml {
         path: config_path.to_path_buf(),
         source,
     })?;
@@ -1883,11 +2025,6 @@ fn parse_and_validate(
         path: secrets_path.to_path_buf(),
         source,
     })?;
-
-    // Collected instead of warn!ed: no tracing subscriber exists yet (the
-    // binaries build theirs from the parsed Ctx), so a warn! here would
-    // dispatch to NoSubscriber and vanish. See `StartupNotice`.
-    let mut startup_notices = Vec::new();
 
     let ValidatedConfigParts {
         polling_intervals,
@@ -2004,6 +2141,7 @@ fn parse_and_validate(
         issuance: issuance_ctx(config.issuance, secrets.issuance, &mut startup_notices)?,
         ops_api: config.ops_api,
         startup_notices,
+        registry,
         bot_gas_valuation: config.bot_gas_valuation,
         orchestrator: config.orchestrator,
         wallet_inputs,
@@ -2098,7 +2236,13 @@ fn issuance_ctx(
 }
 
 impl Ctx {
-    pub async fn load_files(config_path: &Path, secrets_path: &Path) -> Result<Self, CtxError> {
+    /// `registry_file` replaces the bucket read when the config names
+    /// `[registry]`; boot passes `None` and reads the bucket.
+    pub async fn load_files(
+        config_path: &Path,
+        secrets_path: &Path,
+        registry_file: Option<&Path>,
+    ) -> Result<Self, CtxError> {
         let config_str = tokio::fs::read_to_string(config_path)
             .await
             .map_err(|source| CtxError::ConfigIo {
@@ -2111,8 +2255,13 @@ impl Ctx {
                 path: secrets_path.to_path_buf(),
                 source,
             })?;
+        let tokens = fetch_token_file(config_path, registry_file).await?;
+        let tokens = tokens
+            .as_deref()
+            .map_or(TokenFile::Skipped, TokenFile::Bytes);
 
-        let parts = parse_and_validate(&config_str, config_path, &secrets_str, secrets_path)?;
+        let parts =
+            parse_and_validate_with(&config_str, config_path, tokens, &secrets_str, secrets_path)?;
 
         // Async wallet construction — the only step that requires network
         // access and cannot run in the deploy-time validator.
@@ -2152,6 +2301,7 @@ impl Ctx {
             telemetry: parts.telemetry,
             alerts: parts.alerts,
             startup_notices: parts.startup_notices,
+            registry: parts.registry,
             pricing: parts.pricing,
             rebalancing: parts.rebalancing,
             order_owner,
@@ -2179,6 +2329,7 @@ impl Ctx {
     pub fn validate_files(
         config_path: &Path,
         secrets_path: &Path,
+        tokens: TokenFile<'_>,
     ) -> Result<Vec<StartupNotice>, CtxError> {
         let config_str =
             std::fs::read_to_string(config_path).map_err(|source| CtxError::ConfigIo {
@@ -2190,7 +2341,8 @@ impl Ctx {
                 path: secrets_path.to_path_buf(),
                 source,
             })?;
-        let parts = parse_and_validate(&config_str, config_path, &secrets_str, secrets_path)?;
+        let parts =
+            parse_and_validate_with(&config_str, config_path, tokens, &secrets_str, secrets_path)?;
         Ok(parts.startup_notices)
     }
 
@@ -2206,19 +2358,22 @@ impl Ctx {
     ///
     /// This is what lets CI check every config the repository ships on each
     /// pull request: it needs no secret, no network, no clock.
-    pub fn validate_config_file(config_path: &Path) -> Result<Vec<StartupNotice>, CtxError> {
+    pub fn validate_config_file(
+        config_path: &Path,
+        tokens: TokenFile<'_>,
+    ) -> Result<Vec<StartupNotice>, CtxError> {
         let config_str =
             std::fs::read_to_string(config_path).map_err(|source| CtxError::ConfigIo {
                 path: config_path.to_path_buf(),
                 source,
             })?;
-        let config: Config =
-            toml::from_str(&config_str).map_err(|source| CtxError::ConfigToml {
-                path: config_path.to_path_buf(),
-                source,
-            })?;
-
         let mut startup_notices = Vec::new();
+        let (table, _) = config_table(&config_str, config_path, tokens, &mut startup_notices)?;
+        let config: Config = table.try_into().map_err(|source| CtxError::ConfigToml {
+            path: config_path.to_path_buf(),
+            source,
+        })?;
+
         validate_config(&config, config_path, &mut startup_notices)?;
 
         Ok(startup_notices)
@@ -2243,6 +2398,7 @@ impl Ctx {
     pub fn load_turnkey_approval_policy_inputs(
         config_path: &Path,
         secrets_path: &Path,
+        tokens: TokenFile<'_>,
     ) -> Result<Option<TurnkeyApprovalPolicyInputs>, CtxError> {
         let config_str =
             std::fs::read_to_string(config_path).map_err(|source| CtxError::ConfigIo {
@@ -2254,7 +2410,8 @@ impl Ctx {
                 path: secrets_path.to_path_buf(),
                 source,
             })?;
-        let parts = parse_and_validate(&config_str, config_path, &secrets_str, secrets_path)?;
+        let parts =
+            parse_and_validate_with(&config_str, config_path, tokens, &secrets_str, secrets_path)?;
 
         if parts.wallet_meta.kind != "turnkey" {
             return Ok(None);
@@ -2488,6 +2645,7 @@ impl Ctx {
             telemetry: None,
             alerts,
             startup_notices: Vec::new(),
+            registry: None,
             pricing: None,
             rebalancing,
             order_owner,
@@ -2608,6 +2766,11 @@ pub enum CtxError {
     ConfigToml {
         path: PathBuf,
         source: toml::de::Error,
+    },
+    #[error("token file for config {path}")]
+    Registry {
+        path: PathBuf,
+        source: registry::RegistryError,
     },
     #[error("duplicate symbol {symbol} in [assets.equities].retired_symbols")]
     DuplicateRetiredSymbol { symbol: Symbol },
@@ -2802,6 +2965,7 @@ impl CtxError {
             Self::SecretsIo { .. } => "failed to read secrets file",
             Self::BrokerPrivateKeyIo { .. } => "failed to read broker private key file",
             Self::ConfigToml { .. } => "failed to parse config",
+            Self::Registry { .. } => "token file",
             Self::DuplicateRetiredSymbol { .. } => "duplicate retired symbol",
             Self::ConfiguredSymbolMarkedRetired { .. } => "configured symbol marked retired",
             Self::SecretsToml { .. } => "failed to parse secrets",
@@ -3056,6 +3220,7 @@ pub fn create_test_ctx_with_order_owner(order_owner: Address) -> Ctx {
         telemetry: None,
         alerts: None,
         startup_notices: Vec::new(),
+        registry: None,
         pricing: None,
         rebalancing: default_test_rebalancing_ctx(),
         order_owner,
@@ -9044,6 +9209,97 @@ mod tests {
         ));
     }
 
+    /// The deployed configs, with the token file in place, carry exactly the
+    /// per-symbol tables the inline configs held the day they were replaced,
+    /// and pass every check; judged without the token file they still pass
+    /// and say what was not covered.
+    #[test]
+    fn deployed_configs_with_the_token_file_match_the_inline_ones() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        for env in ["staging", "production"] {
+            let config_path = root.join(format!(
+                "config/{}/st0x-hedge.toml",
+                if env == "staging" { "staging" } else { "prod" }
+            ));
+            let deployed = std::fs::read_to_string(&config_path).unwrap();
+            let tokens =
+                std::fs::read(root.join(format!("tests/fixtures/tokens-{env}.toml"))).unwrap();
+            let inline: Config = toml::from_str(
+                &std::fs::read_to_string(root.join(format!("tests/fixtures/{env}-inline.toml")))
+                    .unwrap(),
+            )
+            .unwrap();
+
+            let mut notices = Vec::new();
+            let (table, live) = config_table(
+                &deployed,
+                &config_path,
+                TokenFile::Bytes(&tokens),
+                &mut notices,
+            )
+            .unwrap();
+            assert!(
+                live.is_some(),
+                "{env}: [registry] is what the deployed config names"
+            );
+            let merged: Config = table.try_into().unwrap();
+
+            let rows = |config: &Config| -> BTreeMap<String, String> {
+                let mut rows = BTreeMap::new();
+                for (chain, chain_config) in &config.chains {
+                    let Some(trading) = &chain_config.trading else {
+                        continue;
+                    };
+                    for (symbol, asset) in &trading.assets.equities.symbols {
+                        rows.insert(format!("{chain:?}/{symbol}"), format!("{asset:?}"));
+                    }
+                }
+                for (symbol, policy) in &config.assets.equities.symbols {
+                    rows.insert(format!("policy/{symbol}"), format!("{policy:?}"));
+                }
+                rows
+            };
+            assert_eq!(rows(&merged), rows(&inline), "{env}: per-symbol tables");
+            validate_config(&merged, &config_path, &mut notices).unwrap();
+
+            let mut notices = Vec::new();
+            let (table, live) =
+                config_table(&deployed, &config_path, TokenFile::Skipped, &mut notices).unwrap();
+            assert!(live.is_none());
+            assert!(
+                notices
+                    .iter()
+                    .any(|notice| notice.message.contains("not checked here")),
+                "{env}: the offline check must say the tables were skipped"
+            );
+            let alone: Config = table.try_into().unwrap();
+            validate_config(&alone, &config_path, &mut notices).unwrap();
+        }
+    }
+
+    /// A config that names `[registry]` and still carries a per-symbol
+    /// table of its own is refused: one source of truth.
+    #[test]
+    fn registry_and_an_inline_symbol_table_are_refused_together() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let tokens = std::fs::read(root.join("tests/fixtures/tokens-staging.toml")).unwrap();
+        let mut deployed =
+            std::fs::read_to_string(root.join("config/staging/st0x-hedge.toml")).unwrap();
+        deployed
+            .push_str("\n[assets.equities.FGI]\nextended_hours_counter_trading = \"enabled\"\n");
+        let error = config_table(
+            &deployed,
+            Path::new("config.toml"),
+            TokenFile::Bytes(&tokens),
+            &mut Vec::new(),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(&error, CtxError::Registry { source, .. } if source.to_string().contains("keep one source")),
+            "{error:?}"
+        );
+    }
+
     #[test]
     fn deployment_symbol_policy_reads_only_plaintext_asset_config() {
         let config = toml_file(
@@ -9058,7 +9314,7 @@ mod tests {
             "#,
         );
 
-        let policy = load_deployment_symbol_policy(config.path()).unwrap();
+        let policy = load_deployment_symbol_policy(config.path(), TokenFile::Skipped).unwrap();
 
         assert_eq!(
             policy.configured(),
@@ -9079,7 +9335,7 @@ mod tests {
             "#,
         );
 
-        let error = load_deployment_symbol_policy(config.path()).unwrap_err();
+        let error = load_deployment_symbol_policy(config.path(), TokenFile::Skipped).unwrap_err();
 
         assert!(matches!(error, CtxError::DuplicateRetiredSymbol { .. }));
     }
@@ -9096,7 +9352,7 @@ mod tests {
             "#,
         );
 
-        let error = load_deployment_symbol_policy(config.path()).unwrap_err();
+        let error = load_deployment_symbol_policy(config.path(), TokenFile::Skipped).unwrap_err();
 
         assert!(matches!(
             error,
