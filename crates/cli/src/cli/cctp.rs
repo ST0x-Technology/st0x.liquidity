@@ -293,6 +293,7 @@ mod tests {
             telemetry: None,
             alerts: None,
             startup_notices: Vec::new(),
+            registry: None,
             pricing: None,
             rebalancing: st0x_config::default_test_rebalancing_ctx(),
             order_owner: Address::ZERO,
