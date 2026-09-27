@@ -203,11 +203,12 @@ fn is_switch(v: Option<&Value>) -> bool {
 
 /// Turn the token file into the bot's per-symbol tables.
 ///
-/// A chain row is taken from every slot that carries the bot's own keys
-/// (`trading` present); a slot that is only priced is not the bot's.
-/// A policy is taken from every `[assets.equities.<SYM>]` that carries
-/// `extended_hours_counter_trading`. Pricing's keys on either level are
-/// ignored. Anything malformed is refused, never dropped.
+/// A chain row is taken from every slot that carries any of the bot's own
+/// keys; a slot that is only priced is not the bot's. A policy is taken from
+/// every `[assets.equities.<SYM>]` that sets any of the bot's policy keys. On
+/// a table the bot takes, the keys other services own (`OTHER_SLOT_KEYS`,
+/// `OTHER_POLICY_KEYS`) are skipped and any other key is refused. Anything
+/// malformed is refused, never dropped.
 pub fn project(file: &Table) -> Result<Projection, RegistryError> {
     match file.get("schema_version") {
         Some(Value::Integer(v)) if *v == SCHEMA_VERSION => {}
