@@ -1898,10 +1898,13 @@ edit that only the deployed service can judge is a config edit whose first check
 is a bot that will not boot, which is what the `validate-config` binary exists
 to prevent.
 
-`validate-config --config <path> [--secrets <path>]` runs the boot path's
-validation and exits 0 or 1, writing a plain-text report to stdout and the
-failure with its cause chain to stderr. It starts no server, opens no database,
-and reaches no external service in either mode.
+`validate-config --config <path> [--secrets <path>] [--registry-file <path>]`
+runs the boot path's validation and exits 0 or 1, writing a plain-text report to
+stdout and the failure with its cause chain to stderr. It starts no server,
+opens no database, and reaches no external service in either mode. A config that
+names `[registry]` keeps its per-symbol tables in the token file in the bucket;
+`--registry-file` supplies a local copy so they are checked too. Without it the
+config is judged without them and the report says so.
 
 The two modes differ only in how much of the input they have:
 

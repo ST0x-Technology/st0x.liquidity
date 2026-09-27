@@ -34,11 +34,13 @@ pub const BOOT_READ_BUDGET: Duration = Duration::from_secs(20);
 
 const MAX_BODY: usize = 4 << 20;
 
-/// The keys a chain row may carry, as `ChainEquityAsset` reads them.
-const CHAIN_ROW_KEYS: [&str; 8] = [
+/// The keys a chain row may carry, as `ChainEquityAsset` reads them
+/// (`vault_id` is its alias for `vault_ids`).
+const CHAIN_ROW_KEYS: [&str; 9] = [
     "tokenized_equity",
     "tokenized_equity_derivative",
     "vault_ids",
+    "vault_id",
     "trading",
     "rebalancing",
     "wrapped_equity_recovery",
@@ -48,6 +50,12 @@ const CHAIN_ROW_KEYS: [&str; 8] = [
 
 /// The keys a hedge policy may carry, as `EquityHedgePolicy` reads them.
 const POLICY_KEYS: [&str; 2] = ["extended_hours_counter_trading", "hedge_floor_shares"];
+
+/// Keys other services own on a slot and on `[assets.equities.<SYM>]`, as
+/// the token file's header lists them. Any other key on a table the bot
+/// takes is refused, as `deny_unknown_fields` refused it inline.
+const OTHER_SLOT_KEYS: [&str; 2] = ["pricing", "venues"];
+const OTHER_POLICY_KEYS: [&str; 2] = ["fixed_half_spread_bps", "spread_model"];
 
 /// `[registry]` in the bot config.
 #[derive(Debug, Clone, Deserialize)]
@@ -80,6 +88,8 @@ pub enum RegistryError {
     BadSwitch { what: String, key: &'static str },
     #[error("token file: {what}.{key} missing")]
     MissingAddress { what: String, key: &'static str },
+    #[error("token file: {what}.{key} is not a key the bot or another service reads")]
+    UnknownKey { what: String, key: String },
     #[error("token file: no slot carries the bot's keys; refusing an empty universe")]
     EmptyUniverse,
     #[error(
@@ -244,6 +254,14 @@ pub fn project(file: &Table) -> Result<Projection, RegistryError> {
                     return Err(RegistryError::MissingAddress { what, key });
                 }
             }
+            if let Some(key) = slot.keys().find(|key| {
+                !CHAIN_ROW_KEYS.contains(&key.as_str()) && !OTHER_SLOT_KEYS.contains(&key.as_str())
+            }) {
+                return Err(RegistryError::UnknownKey {
+                    what,
+                    key: key.clone(),
+                });
+            }
             let mut row = Table::new();
             for k in CHAIN_ROW_KEYS {
                 if let Some(v) = slot.get(k) {
@@ -259,14 +277,23 @@ pub fn project(file: &Table) -> Result<Projection, RegistryError> {
 
     let mut policies = BTreeMap::new();
     for (sym, a) in equities {
-        let a = table(Some(a), &format!("assets.equities.{sym}"))?;
-        if !a.contains_key("extended_hours_counter_trading") {
+        let what = format!("assets.equities.{sym}");
+        let a = table(Some(a), &what)?;
+        if !POLICY_KEYS.iter().any(|key| a.contains_key(*key)) {
             continue;
         }
         if !is_switch(a.get("extended_hours_counter_trading")) {
             return Err(RegistryError::BadSwitch {
-                what: format!("assets.equities.{sym}"),
+                what,
                 key: "extended_hours_counter_trading",
+            });
+        }
+        if let Some(key) = a.keys().find(|key| {
+            !POLICY_KEYS.contains(&key.as_str()) && !OTHER_POLICY_KEYS.contains(&key.as_str())
+        }) {
+            return Err(RegistryError::UnknownKey {
+                what,
+                key: key.clone(),
             });
         }
         let mut row = Table::new();
@@ -298,15 +325,9 @@ fn subtable<'a>(t: &'a mut Table, key: &str) -> &'a mut Table {
     }
 }
 
-/// Put the projected tables into a config table that reads `[registry]`.
-///
-/// The config must not carry any per-symbol table itself (one source of
-/// truth). Chain-wide keys such as `operational_limit`, `cash`, and
-/// `retired_symbols` are the config's own and are left as they are. A
-/// chain the file lists but the config does not declare with a `trading`
-/// table is refused: a chain needs an rpc_url and signing, which are
-/// release-time facts.
-pub fn merge(config: &mut Table, p: &Projection) -> Result<(), RegistryError> {
+/// Refuse a config that names `[registry]` and still carries a per-symbol
+/// table of its own: one source of truth.
+pub fn refuse_inline_tables(config: &Table) -> Result<(), RegistryError> {
     let is_symbol = |k: &str| k.chars().next().is_some_and(|c| c.is_ascii_uppercase());
     let inline_symbol = |equities: Option<&Value>| {
         equities
@@ -336,6 +357,19 @@ pub fn merge(config: &mut Table, p: &Projection) -> Result<(), RegistryError> {
             table: format!("assets.equities.{sym}"),
         });
     }
+    Ok(())
+}
+
+/// Put the projected tables into a config table that reads `[registry]`.
+///
+/// The config must not carry any per-symbol table itself (one source of
+/// truth). Chain-wide keys such as `operational_limit`, `cash`, and
+/// `retired_symbols` are the config's own and are left as they are. A
+/// chain the file lists but the config does not declare with a `trading`
+/// table is refused: a chain needs an rpc_url and signing, which are
+/// release-time facts.
+pub fn merge(config: &mut Table, p: &Projection) -> Result<(), RegistryError> {
+    refuse_inline_tables(config)?;
 
     let chains = subtable(config, "chains");
     for (chain, rows) in &p.chain_rows {
@@ -498,7 +532,7 @@ pub async fn load_bytes(
 }
 
 /// What changed between the running projection and a fresh one.
-pub fn describe_change(live: &Projection, fresh: &Projection) -> String {
+pub fn describe_change(live: &Projection, fresh: &Projection) -> Option<String> {
     let (a, b) = (live.slots(), fresh.slots());
     let mut parts = Vec::new();
     let added: Vec<_> = b.difference(&a).cloned().collect();
@@ -538,11 +572,7 @@ pub fn describe_change(live: &Projection, fresh: &Projection) -> String {
     if live.policies != fresh.policies {
         parts.push("hedge policies changed".to_string());
     }
-    if parts.is_empty() {
-        "no difference".to_string()
-    } else {
-        parts.join("; ")
-    }
+    (!parts.is_empty()).then(|| parts.join("; "))
 }
 
 /// What the bot keeps after boot, so the refresh loop can compare.
@@ -722,6 +752,41 @@ mod tests {
     }
 
     #[test]
+    fn an_unknown_key_on_a_bots_row_or_policy_is_refused() {
+        let mut t = parse(fixture("tokens-staging.toml").as_bytes()).unwrap();
+        t["chains"]["base"]["assets"]["equities"]["FGI"]
+            .as_table_mut()
+            .unwrap()
+            .insert("operational_limt".into(), Value::Integer(50));
+        assert!(matches!(
+            project(&t).unwrap_err(),
+            RegistryError::UnknownKey { key, .. } if key == "operational_limt"
+        ));
+
+        let mut t = parse(fixture("tokens-staging.toml").as_bytes()).unwrap();
+        t["assets"]["equities"]["FGI"]
+            .as_table_mut()
+            .unwrap()
+            .insert("hedge_floor_share".into(), Value::Integer(1));
+        assert!(matches!(
+            project(&t).unwrap_err(),
+            RegistryError::UnknownKey { key, .. } if key == "hedge_floor_share"
+        ));
+
+        let mut t = parse(fixture("tokens-staging.toml").as_bytes()).unwrap();
+        let policy = t["assets"]["equities"]["FGI"].as_table_mut().unwrap();
+        policy.remove("extended_hours_counter_trading");
+        policy.insert("hedge_floor_shares".into(), Value::Integer(1));
+        assert!(matches!(
+            project(&t).unwrap_err(),
+            RegistryError::BadSwitch {
+                key: "extended_hours_counter_trading",
+                ..
+            }
+        ));
+    }
+
+    #[test]
     fn a_bad_registry_url_or_key_is_refused_offline() {
         for text in [
             "[registry]\nurl = \"gcs://b/o\"\n",
@@ -747,8 +812,12 @@ mod tests {
                 }
             }
         }
-        assert_eq!(describe_change(&p, &q), "no difference");
+        assert_eq!(describe_change(&p, &q), None);
         q.chain_rows.get_mut("base").unwrap().remove("FGI");
-        assert!(describe_change(&p, &q).contains("removed [base/FGI]"));
+        assert!(
+            describe_change(&p, &q)
+                .unwrap()
+                .contains("removed [base/FGI]")
+        );
     }
 }

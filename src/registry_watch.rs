@@ -45,8 +45,8 @@ pub(crate) async fn watch(live: RegistryLive, shutdown: CancellationToken) {
             continue;
         }
         match registry_check(&live, &bytes) {
-            Ok(change) if change == "no difference" => report(0, 0),
-            Ok(change) => {
+            Ok(None) => report(0, 0),
+            Ok(Some(change)) => {
                 report(1, 0);
                 info!(
                     url = %live.source.url,

@@ -179,11 +179,18 @@ pub fn load_deployment_symbol_policy(
         path: config_path.to_path_buf(),
         source,
     })?;
-    let (table, _) = config_table(&config_str, config_path, tokens, &mut Vec::new())?;
-    let config: DeploymentConfig = table.try_into().map_err(|source| CtxError::ConfigToml {
+    let config_error = |source| CtxError::ConfigToml {
         path: config_path.to_path_buf(),
         source,
-    })?;
+    };
+    // The text first, so an error in the config's own keys names its line.
+    let config: DeploymentConfig = toml::from_str(&config_str).map_err(config_error)?;
+    let (table, registry) = config_table(&config_str, config_path, tokens, &mut Vec::new())?;
+    let config: DeploymentConfig = if registry.is_some() {
+        table.try_into().map_err(config_error)?
+    } else {
+        config
+    };
 
     DeploymentSymbolPolicy::new(
         config.assets.equities.symbols.into_keys(),
@@ -1935,6 +1942,7 @@ fn config_table(
     let Some(source) = registry::source_of(&table).map_err(registry_error)? else {
         return Ok((table, None));
     };
+    registry::refuse_inline_tables(&table).map_err(registry_error)?;
     match tokens {
         TokenFile::Bytes(bytes) => {
             let file = registry::parse(bytes).map_err(registry_error)?;
@@ -2015,10 +2023,11 @@ pub async fn fetch_token_file(
 
 /// Judge a fresh copy of the token file against the config this instance runs.
 ///
-/// Parses, merges and runs the checks boot runs that need no secrets.
-/// Returns what differs from the running tables ("no difference" when
-/// nothing does).
-pub fn registry_check(live: &RegistryLive, fresh: &[u8]) -> Result<String, CtxError> {
+/// Parses, merges, and runs the config-only checks and the allocation check.
+/// Boot runs more (those that need secrets or chain state), so a pass here
+/// does not promise a clean boot. Returns what differs from the running
+/// tables, or `None` when nothing does.
+pub fn registry_check(live: &RegistryLive, fresh: &[u8]) -> Result<Option<String>, CtxError> {
     let path = Path::new(&live.source.url);
     let registry_error = |source| CtxError::Registry {
         path: path.to_path_buf(),
@@ -9347,6 +9356,26 @@ mod tests {
         .unwrap_err();
         assert!(
             matches!(&error, CtxError::Registry { source, .. } if source.to_string().contains("keep one source")),
+            "{error:?}"
+        );
+    }
+
+    /// The offline check refuses the same pair without the token file.
+    #[test]
+    fn registry_and_an_inline_symbol_table_are_refused_offline() {
+        let mut deployed = include_str!("../../../config/staging/st0x-hedge.toml").to_string();
+        deployed
+            .push_str("\n[assets.equities.FGI]\nextended_hours_counter_trading = \"enabled\"\n");
+        let config = toml_file(&deployed);
+        let error = Ctx::validate_config_file(config.path(), TokenFile::Skipped).unwrap_err();
+        assert!(
+            matches!(
+                &error,
+                CtxError::Registry {
+                    source: registry::RegistryError::InlineTable { .. },
+                    ..
+                }
+            ),
             "{error:?}"
         );
     }
