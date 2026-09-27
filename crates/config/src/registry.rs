@@ -358,16 +358,33 @@ pub fn refuse_inline_tables(config: &Table) -> Result<(), RegistryError> {
     Ok(())
 }
 
+/// The symbols the config lists under `[assets.equities] retired_symbols`.
+fn retired_symbols(config: &Table) -> BTreeSet<String> {
+    config
+        .get("assets")
+        .and_then(|assets| assets.get("equities"))
+        .and_then(|equities| equities.get("retired_symbols"))
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .map(str::to_string)
+        .collect()
+}
+
 /// Put the projected tables into a config table that reads `[registry]`.
 ///
 /// The config must not carry any per-symbol table itself (one source of
 /// truth). Chain-wide keys such as `operational_limit`, `cash`, and
 /// `retired_symbols` are the config's own and are left as they are. A
+/// symbol the config retires is not taken from the file at all, so a
+/// retirement is one config change and the file's rows can go later. A
 /// chain the file lists but the config does not declare with a `trading`
 /// table is refused: a chain needs an rpc_url and signing, which are
 /// release-time facts.
 pub fn merge(config: &mut Table, projection: &Projection) -> Result<(), RegistryError> {
     refuse_inline_tables(config)?;
+    let retired = retired_symbols(config);
 
     let chains = subtable(config, "chains", "chains")?;
     for (chain, rows) in &projection.chain_rows {
@@ -390,6 +407,9 @@ pub fn merge(config: &mut Table, projection: &Projection) -> Result<(), Registry
             &format!("chains.{chain}.trading.assets.equities"),
         )?;
         for (symbol, row) in rows {
+            if retired.contains(symbol) {
+                continue;
+            }
             equities.insert(symbol.clone(), Value::Table(row.clone()));
         }
     }
@@ -397,6 +417,9 @@ pub fn merge(config: &mut Table, projection: &Projection) -> Result<(), Registry
     let assets = subtable(config, "assets", "assets")?;
     let equities = subtable(assets, "equities", "assets.equities")?;
     for (symbol, row) in &projection.policies {
+        if retired.contains(symbol) {
+            continue;
+        }
         equities.insert(symbol.clone(), Value::Table(row.clone()));
     }
     Ok(())
@@ -702,32 +725,26 @@ mod tests {
             .as_table_mut()
             .unwrap()
             .insert("trading".into(), Value::String("enable".into()));
-        assert!(
-            project(&file)
-                .unwrap_err()
-                .to_string()
-                .contains("trading must be")
-        );
+        assert!(matches!(
+            project(&file).unwrap_err(),
+            RegistryError::BadSwitch { key: "trading", .. }
+        ));
 
         let mut file = parse(fixture("tokens-staging.toml").as_bytes()).unwrap();
         file.insert("schema_version".into(), Value::Integer(2));
-        assert!(
-            project(&file)
-                .unwrap_err()
-                .to_string()
-                .contains("schema_version")
-        );
+        assert!(matches!(
+            project(&file).unwrap_err(),
+            RegistryError::SchemaVersion { .. }
+        ));
 
         let projection =
             project(&parse(fixture("tokens-staging.toml").as_bytes()).unwrap()).unwrap();
         let mut config: Table =
             toml::from_str("[registry]\nurl = \"gs://b/o\"\n[chains.base]\n").unwrap();
-        assert!(
-            merge(&mut config, &projection)
-                .unwrap_err()
-                .to_string()
-                .contains("does not declare")
-        );
+        assert!(matches!(
+            merge(&mut config, &projection).unwrap_err(),
+            RegistryError::UndeclaredChain { chain } if chain == "base"
+        ));
     }
 
     #[test]
@@ -738,12 +755,10 @@ mod tests {
             "[registry]\nurl = \"gs://b/o\"\n[chains.base]\n[chains.robinhood]\n[assets.equities.FGI]\nextended_hours_counter_trading = \"enabled\"\n",
         )
         .unwrap();
-        assert!(
-            merge(&mut config, &projection)
-                .unwrap_err()
-                .to_string()
-                .contains("keep one source")
-        );
+        assert!(matches!(
+            merge(&mut config, &projection).unwrap_err(),
+            RegistryError::InlineTable { table } if table == "assets.equities.FGI"
+        ));
     }
 
     #[test]
@@ -775,9 +790,9 @@ mod tests {
         ));
     }
 
-    /// Another service'symbol key on assets slot or policy the bot takes is left to
-    /// that service: the token file'symbol allowlist lives in st0x.registry'symbol CI,
-    /// so assets new key there must not fail assets boot here.
+    /// Another service's key on a slot or policy the bot takes is left to
+    /// that service: the token file's allowlist lives in st0x.registry's CI,
+    /// so a new key there must not fail a boot here.
     #[test]
     fn a_key_the_bot_does_not_own_is_left_alone() {
         let mut file = parse(fixture("tokens-staging.toml").as_bytes()).unwrap();
@@ -806,6 +821,29 @@ mod tests {
         ));
     }
 
+    /// A retired symbol is not taken from the file: a retirement is one
+    /// config change, and the file's rows for it can go at any time after.
+    #[test]
+    fn a_retired_symbol_is_not_taken_from_the_file() {
+        let projection =
+            project(&parse(fixture("tokens-staging.toml").as_bytes()).unwrap()).unwrap();
+        assert!(projection.slots().contains("base/FGI"));
+        let mut config: Table = toml::from_str(
+            "[registry]\nurl = \"gs://b/o\"\n[chains.base.trading]\n[chains.robinhood.trading]\n\
+             [assets.equities]\nretired_symbols = [\"FGI\"]\n",
+        )
+        .unwrap();
+        merge(&mut config, &projection).unwrap();
+        let base = config["chains"]["base"]["trading"]["assets"]["equities"]
+            .as_table()
+            .unwrap();
+        assert!(!base.contains_key("FGI"));
+        assert!(base.contains_key("RKLB"));
+        let policies = config["assets"]["equities"].as_table().unwrap();
+        assert!(!policies.contains_key("FGI"));
+        assert!(policies.contains_key("RKLB"));
+    }
+
     /// A lowercase or oddly spelled inline table is still an inline table.
     #[test]
     fn a_lowercase_inline_symbol_table_is_refused_too() {
@@ -820,7 +858,7 @@ mod tests {
     }
 
     /// The object name is one path segment: its `/` must reach the API as
-    /// `%2F`, or the request names assets different object.
+    /// `%2F`, or the request names a different object.
     #[test]
     fn the_object_name_is_one_path_segment() {
         let url = object_url("t0-artifacts-tokens", "production/tokens.toml", Some(7)).unwrap();
@@ -835,11 +873,22 @@ mod tests {
         for text in [
             "[registry]\nurl = \"gcs://b/o\"\n",
             "[registry]\nurl = \"gs://bucket\"\n",
+        ] {
+            let config: Table = toml::from_str(text).unwrap();
+            assert!(
+                matches!(source_of(&config).unwrap_err(), RegistryError::Url { .. }),
+                "{text:?}"
+            );
+        }
+        for text in [
             "[registry]\nurl = \"gs://b/o\"\ngeneraton = 1\n",
             "[registry]\nurl = \"gs://b/o\"\nrefresh_secs = 60\n",
         ] {
-            let file: Table = toml::from_str(text).unwrap();
-            assert!(source_of(&file).is_err(), "{text:?}");
+            let config: Table = toml::from_str(text).unwrap();
+            assert!(
+                matches!(source_of(&config).unwrap_err(), RegistryError::Source(_)),
+                "{text:?}"
+            );
         }
     }
 

@@ -8954,7 +8954,15 @@ mod tests {
     #[test]
     fn server_config_toml_is_valid() {
         let config_str = include_str!("../../../config/prod/st0x-hedge.toml");
-        let config: Config = toml::from_str(config_str).unwrap();
+        let (config, _) = config_from(
+            config_str,
+            Path::new("config/prod/st0x-hedge.toml"),
+            TokenFile::Bytes(include_bytes!(
+                "../../../tests/fixtures/tokens-production-1790341753647581.toml"
+            )),
+            &mut Vec::new(),
+        )
+        .unwrap();
 
         let base = config
             .chains
@@ -8989,6 +8997,10 @@ mod tests {
             .validated()
             .unwrap();
 
+        assert!(
+            !base.assets.equities.symbols.is_empty(),
+            "the pinned token file must give Base its equities, or the loop below checks nothing"
+        );
         for (symbol, equity) in &base.assets.equities.symbols {
             if equity.rebalancing == OperationMode::Enabled
                 && let Some(limit) = &equity.operational_limit

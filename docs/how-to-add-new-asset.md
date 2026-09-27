@@ -143,8 +143,9 @@ takes two tables per asset. The first says where the asset is listed on-chain,
 so it goes under the chain that lists it. The second says how the bot hedges it,
 which is independent of any chain -- there is one broker account and one
 position per symbol. Other services own other keys on the same tables (the
-file's header lists them); the bot refuses any key on its tables that neither it
-nor another service reads.
+file's header lists them). The bot takes its own keys and ignores the others;
+which keys may appear, and their spelling, is checked by `st0x.registry`'s CI
+(`t0/check.jq`) before the file is published, not by the bot.
 
 ```toml
 [chains.base.assets.equities.SGOV]
@@ -253,13 +254,14 @@ cargo run --bin validate-config -- --config config/prod/st0x-hedge.toml \
 
 ### Retiring an asset
 
-Two repos, in this order. First list the symbol under
-`[assets.equities] retired_symbols` in the bot's config and release that:
-`verify-migrations` needs every symbol the database still references to be
-either configured or retired, and the token file may lose the rows at any
-restart after that. Then remove its rows from `t0/<env>.toml` in
-`st0x.registry`; for production, bump `generation` in the same release that
-carries the retirement.
+One config change. List the symbol under `[assets.equities] retired_symbols`
+in the bot's config and release that. From then on the bot ignores the token
+file's rows for that symbol, so the merged config never has it both configured
+and retired, and `verify-migrations` still finds every symbol the database
+references either configured or retired. Remove its rows from `t0/<env>.toml`
+in `st0x.registry` whenever convenient afterwards; for production that lands
+with the next `generation` bump. Never remove the rows first: the database
+would then reference a symbol that is neither configured nor retired.
 
 **Tip:** Start with `trading = "disabled"` first. Publish, verify the bot sees
 the asset, then enable trading in a follow-up change.
