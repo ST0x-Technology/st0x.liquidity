@@ -1,6 +1,9 @@
 //! Reports when the token file in the bucket differs from what this
 //! instance runs. It never applies the change: a token change still takes
 //! a roll, this only says one is due, or that the new copy would be refused.
+//! With a pinned generation it reads that generation, so it reports whether
+//! the copy the next roll needs is still readable, not what was published
+//! since.
 
 use std::time::Duration;
 
@@ -8,22 +11,33 @@ use st0x_config::{RegistryLive, registry, registry_check};
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
+const REFRESH: Duration = Duration::from_secs(60);
+
 pub(crate) async fn watch(live: RegistryLive, shutdown: CancellationToken) {
-    let http = reqwest::Client::new();
-    let every = Duration::from_secs(live.source.refresh_secs.max(5));
+    let http = match registry::http_client() {
+        Ok(http) => http,
+        Err(error) => {
+            warn!(?error, "token file: refresh loop not started");
+            return;
+        }
+    };
     let mut last: Option<Vec<u8>> = None;
     loop {
         tokio::select! {
             () = shutdown.cancelled() => return,
-            () = tokio::time::sleep(every) => {}
+            () = tokio::time::sleep(REFRESH) => {}
         }
-        // The latest copy, not the pinned generation: the question is what
-        // the next roll would pick up.
-        let bytes = match registry::fetch(&http, &live.source.url, None).await {
+        // The copy the next roll would read: the pinned generation when
+        // there is one, else the latest.
+        let read = tokio::select! {
+            () = shutdown.cancelled() => return,
+            read = registry::fetch(&http, &live.source.url, live.source.generation) => read,
+        };
+        let bytes = match read {
             Ok(bytes) => bytes,
             Err(error) => {
                 metrics::counter!("registry_fetch_errors_total").increment(1);
-                warn!(%error, "token file: refresh read failed");
+                warn!(?error, "token file: refresh read failed");
                 continue;
             }
         };
@@ -44,7 +58,7 @@ pub(crate) async fn watch(live: RegistryLive, shutdown: CancellationToken) {
                 report(0, 1);
                 warn!(
                     url = %live.source.url,
-                    %error,
+                    ?error,
                     "token file in the bucket would be refused at boot"
                 );
             }

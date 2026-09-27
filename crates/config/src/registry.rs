@@ -20,7 +20,7 @@
 //! one file.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use serde::Deserialize;
@@ -60,22 +60,65 @@ pub struct RegistrySource {
     /// latest copy.
     #[serde(default)]
     pub generation: Option<u64>,
-    #[serde(default = "default_refresh_secs")]
-    pub refresh_secs: u64,
-}
-
-fn default_refresh_secs() -> u64 {
-    60
 }
 
 #[derive(Debug, Error)]
 pub enum RegistryError {
-    #[error("[registry] {0}")]
-    Source(String),
-    #[error("token file: {0}")]
-    File(String),
-    #[error("token file: reading {0}: {1}")]
-    Read(String, String),
+    #[error("[registry] takes `url` and, optionally, `generation`; nothing else")]
+    Source(#[source] toml::de::Error),
+    #[error("[registry] url {url:?} must be gs://<bucket>/<object>")]
+    Url { url: String },
+    #[error("token file is not UTF-8")]
+    Utf8(#[source] std::str::Utf8Error),
+    #[error("token file is not valid TOML")]
+    Toml(#[source] toml::de::Error),
+    #[error("token file schema_version must be {SCHEMA_VERSION}, got {got}")]
+    SchemaVersion { got: String },
+    #[error("token file: {what} is missing or not a table")]
+    NotATable { what: String },
+    #[error("token file: {what}.{key} must be \"enabled\" or \"disabled\"")]
+    BadSwitch { what: String, key: &'static str },
+    #[error("token file: {what}.{key} missing")]
+    MissingAddress { what: String, key: &'static str },
+    #[error("token file: no slot carries the bot's keys; refusing an empty universe")]
+    EmptyUniverse,
+    #[error(
+        "token file lists hedged slots on chain {chain}, which this config does not declare \
+         with a [chains.{chain}.trading] table; a chain needs an rpc_url and signing, which \
+         are release-time facts"
+    )]
+    UndeclaredChain { chain: String },
+    #[error(
+        "the config reads the per-symbol tables from the bucket but also carries [{table}]; \
+         keep one source"
+    )]
+    InlineTable { table: String },
+    #[error("reading {}", path.display())]
+    LocalRead {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("building the HTTP client")]
+    Client(#[source] reqwest::Error),
+    #[error("requesting a token from the metadata server")]
+    MetadataToken(#[source] reqwest::Error),
+    #[error("reading {url}")]
+    Http {
+        url: String,
+        #[source]
+        source: reqwest::Error,
+    },
+    #[error("reading {url}: {status}: {body}")]
+    Status {
+        url: String,
+        status: reqwest::StatusCode,
+        body: String,
+    },
+    #[error("reading {url}: larger than {MAX_BODY} bytes")]
+    TooLarge { url: String },
+    #[error("reading {url}: boot read exceeded {}s", BOOT_READ_BUDGET.as_secs())]
+    BootTimeout { url: String },
 }
 
 /// How the token file reaches a parse of the config.
@@ -113,11 +156,7 @@ pub fn source_of(config: &Table) -> Result<Option<RegistrySource>, RegistryError
     match config.get("registry") {
         None => Ok(None),
         Some(v) => {
-            let source: RegistrySource = v.clone().try_into().map_err(|e| {
-                RegistryError::Source(format!(
-                    "takes `url` and, optionally, `generation` and `refresh_secs`; nothing else: {e}"
-                ))
-            })?;
+            let source: RegistrySource = v.clone().try_into().map_err(RegistryError::Source)?;
             parse_gs_url(&source.url)?;
             Ok(Some(source))
         }
@@ -125,25 +164,27 @@ pub fn source_of(config: &Table) -> Result<Option<RegistrySource>, RegistryError
 }
 
 pub fn parse_gs_url(gs_url: &str) -> Result<(&str, &str), RegistryError> {
-    let rest = gs_url
+    match gs_url
         .strip_prefix("gs://")
-        .ok_or_else(|| RegistryError::Source(format!("url {gs_url:?} is not a gs:// url")))?;
-    match rest.split_once('/') {
+        .and_then(|rest| rest.split_once('/'))
+    {
         Some((b, o)) if !b.is_empty() && !o.is_empty() => Ok((b, o)),
-        _ => Err(RegistryError::Source(format!(
-            "url {gs_url:?} must be gs://<bucket>/<object>"
-        ))),
+        _ => Err(RegistryError::Url {
+            url: gs_url.to_string(),
+        }),
     }
 }
 
 pub fn parse(bytes: &[u8]) -> Result<Table, RegistryError> {
-    let text = std::str::from_utf8(bytes).map_err(|_| RegistryError::File("not UTF-8".into()))?;
-    toml::from_str(text).map_err(|e| RegistryError::File(format!("not valid TOML: {e}")))
+    let text = std::str::from_utf8(bytes).map_err(RegistryError::Utf8)?;
+    toml::from_str(text).map_err(RegistryError::Toml)
 }
 
 fn table<'a>(v: Option<&'a Value>, what: &str) -> Result<&'a Table, RegistryError> {
     v.and_then(Value::as_table)
-        .ok_or_else(|| RegistryError::File(format!("{what} is missing or not a table")))
+        .ok_or_else(|| RegistryError::NotATable {
+            what: what.to_string(),
+        })
 }
 
 fn is_switch(v: Option<&Value>) -> bool {
@@ -161,10 +202,9 @@ pub fn project(file: &Table) -> Result<Projection, RegistryError> {
     match file.get("schema_version") {
         Some(Value::Integer(v)) if *v == SCHEMA_VERSION => {}
         other => {
-            return Err(RegistryError::File(format!(
-                "schema_version must be {SCHEMA_VERSION}, got {}",
-                other.map_or_else(|| "nothing".to_string(), Value::to_string)
-            )));
+            return Err(RegistryError::SchemaVersion {
+                got: other.map_or_else(|| "nothing".to_string(), Value::to_string),
+            });
         }
     }
     let chains = table(file.get("chains"), "chains")?;
@@ -194,16 +234,14 @@ pub fn project(file: &Table) -> Result<Projection, RegistryError> {
             if !ours {
                 continue;
             }
-            for k in ["trading", "rebalancing", "wrapped_equity_recovery"] {
-                if !is_switch(slot.get(k)) {
-                    return Err(RegistryError::File(format!(
-                        "{what}.{k} must be \"enabled\" or \"disabled\""
-                    )));
+            for key in ["trading", "rebalancing", "wrapped_equity_recovery"] {
+                if !is_switch(slot.get(key)) {
+                    return Err(RegistryError::BadSwitch { what, key });
                 }
             }
-            for k in ["tokenized_equity", "tokenized_equity_derivative"] {
-                if slot.get(k).and_then(Value::as_str).is_none() {
-                    return Err(RegistryError::File(format!("{what}.{k} missing")));
+            for key in ["tokenized_equity", "tokenized_equity_derivative"] {
+                if slot.get(key).and_then(Value::as_str).is_none() {
+                    return Err(RegistryError::MissingAddress { what, key });
                 }
             }
             let mut row = Table::new();
@@ -226,9 +264,10 @@ pub fn project(file: &Table) -> Result<Projection, RegistryError> {
             continue;
         }
         if !is_switch(a.get("extended_hours_counter_trading")) {
-            return Err(RegistryError::File(format!(
-                "assets.equities.{sym}.extended_hours_counter_trading must be \"enabled\" or \"disabled\""
-            )));
+            return Err(RegistryError::BadSwitch {
+                what: format!("assets.equities.{sym}"),
+                key: "extended_hours_counter_trading",
+            });
         }
         let mut row = Table::new();
         for k in POLICY_KEYS {
@@ -240,9 +279,7 @@ pub fn project(file: &Table) -> Result<Projection, RegistryError> {
     }
 
     if chain_rows.values().all(BTreeMap::is_empty) {
-        return Err(RegistryError::File(
-            "no slot carries the bot's keys; refusing an empty universe".into(),
-        ));
+        return Err(RegistryError::EmptyUniverse);
     }
     Ok(Projection {
         chain_rows,
@@ -266,52 +303,61 @@ fn subtable<'a>(t: &'a mut Table, key: &str) -> &'a mut Table {
 /// The config must not carry any per-symbol table itself (one source of
 /// truth). Chain-wide keys such as `operational_limit`, `cash`, and
 /// `retired_symbols` are the config's own and are left as they are. A
-/// chain the file lists but the config does not declare is refused: a
-/// chain needs an rpc_url and signing, which are release-time facts.
+/// chain the file lists but the config does not declare with a `trading`
+/// table is refused: a chain needs an rpc_url and signing, which are
+/// release-time facts.
 pub fn merge(config: &mut Table, p: &Projection) -> Result<(), RegistryError> {
     let is_symbol = |k: &str| k.chars().next().is_some_and(|c| c.is_ascii_uppercase());
+    let inline_symbol = |equities: Option<&Value>| {
+        equities
+            .and_then(Value::as_table)
+            .and_then(|equities| equities.keys().find(|k| is_symbol(k)).cloned())
+    };
 
-    let declared: BTreeSet<String> = config
+    for (chain, chain_config) in config
         .get("chains")
         .and_then(Value::as_table)
-        .map(|c| c.keys().cloned().collect())
-        .unwrap_or_default();
-    for (chain, rows) in &p.chain_rows {
-        if rows.is_empty() {
-            continue;
+        .into_iter()
+        .flatten()
+    {
+        let equities = chain_config
+            .get("trading")
+            .and_then(|t| t.get("assets"))
+            .and_then(|a| a.get("equities"));
+        if let Some(sym) = inline_symbol(equities) {
+            return Err(RegistryError::InlineTable {
+                table: format!("chains.{chain}.trading.assets.equities.{sym}"),
+            });
         }
-        if !declared.contains(chain) {
-            return Err(RegistryError::File(format!(
-                "lists hedged slots on chain {chain}, which this config does not declare under [chains]; \
-                 a chain needs an rpc_url and signing, which are release-time facts"
-            )));
-        }
+    }
+    let equities = config.get("assets").and_then(|a| a.get("equities"));
+    if let Some(sym) = inline_symbol(equities) {
+        return Err(RegistryError::InlineTable {
+            table: format!("assets.equities.{sym}"),
+        });
     }
 
     let chains = subtable(config, "chains");
     for (chain, rows) in &p.chain_rows {
-        let Some(ct) = chains.get_mut(chain).and_then(Value::as_table_mut) else {
+        if rows.is_empty() {
             continue;
-        };
-        let equities = subtable(subtable(subtable(ct, "trading"), "assets"), "equities");
-        if let Some(k) = equities.keys().find(|k| is_symbol(k)) {
-            return Err(RegistryError::Source(format!(
-                "reads the per-symbol tables from the bucket but the config also carries \
-                 [chains.{chain}.trading.assets.equities.{k}]; keep one source"
-            )));
         }
+        let Some(trading) = chains
+            .get_mut(chain)
+            .and_then(|c| c.get_mut("trading"))
+            .and_then(Value::as_table_mut)
+        else {
+            return Err(RegistryError::UndeclaredChain {
+                chain: chain.clone(),
+            });
+        };
+        let equities = subtable(subtable(trading, "assets"), "equities");
         for (sym, row) in rows {
             equities.insert(sym.clone(), Value::Table(row.clone()));
         }
     }
 
     let equities = subtable(subtable(config, "assets"), "equities");
-    if let Some(k) = equities.keys().find(|k| is_symbol(k)) {
-        return Err(RegistryError::Source(format!(
-            "reads the per-symbol tables from the bucket but the config also carries \
-             [assets.equities.{k}]; keep one source"
-        )));
-    }
     for (sym, row) in &p.policies {
         equities.insert(sym.clone(), Value::Table(row.clone()));
     }
@@ -334,26 +380,40 @@ fn percent(segment: &str) -> String {
     out
 }
 
+/// A client for the metadata server and Cloud Storage: no proxy (the bearer
+/// token must travel only the direct link) and no redirects.
+pub fn http_client() -> Result<reqwest::Client, RegistryError> {
+    reqwest::Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(Duration::from_secs(4))
+        .build()
+        .map_err(RegistryError::Client)
+}
+
+/// The VM service account's access token.
+/// See <https://cloud.google.com/compute/docs/access/authenticate-workloads#applications>.
 async fn access_token(http: &reqwest::Client) -> Result<String, RegistryError> {
     #[derive(Deserialize)]
     struct Token {
         access_token: String,
     }
-    let t: Token = http
+    let token: Token = http
         .get("http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token")
         .header("Metadata-Flavor", "Google")
-        .timeout(Duration::from_secs(4))
         .send()
         .await
         .and_then(reqwest::Response::error_for_status)
-        .map_err(|e| RegistryError::Read("metadata server".into(), e.to_string()))?
+        .map_err(RegistryError::MetadataToken)?
         .json()
         .await
-        .map_err(|e| RegistryError::Read("metadata token".into(), e.to_string()))?;
-    Ok(t.access_token)
+        .map_err(RegistryError::MetadataToken)?;
+    Ok(token.access_token)
 }
 
-/// One `objects.get` as the VM's service account.
+/// One `objects.get` with `alt=media` as the VM's service account; with a
+/// generation, exactly that immutable version of the object.
+/// See <https://cloud.google.com/storage/docs/json_api/v1/objects/get>.
 pub async fn fetch(
     http: &reqwest::Client,
     gs_url: &str,
@@ -367,49 +427,39 @@ pub async fn fetch(
         percent(bucket),
         percent(object)
     );
-    let response = http
+    let named = || generation.map_or_else(|| gs_url.to_string(), |g| format!("{gs_url}#{g}"));
+    let http_error = |source| RegistryError::Http {
+        url: named(),
+        source,
+    };
+    let mut response = http
         .get(&url)
         .bearer_auth(token)
-        .timeout(Duration::from_secs(4))
         .send()
         .await
-        .map_err(|e| RegistryError::Read(gs_url.into(), e.to_string()))?;
-    let status = response.status();
+        .map_err(http_error)?;
     if response
         .content_length()
         .is_some_and(|length| length > MAX_BODY as u64)
     {
-        return Err(RegistryError::Read(
-            gs_url.into(),
-            format!("larger than {MAX_BODY} bytes"),
-        ));
+        return Err(RegistryError::TooLarge { url: named() });
     }
-    let body = response
-        .bytes()
-        .await
-        .map_err(|e| RegistryError::Read(gs_url.into(), e.to_string()))?;
+    let status = response.status();
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(http_error)? {
+        if body.len() + chunk.len() > MAX_BODY {
+            return Err(RegistryError::TooLarge { url: named() });
+        }
+        body.extend_from_slice(&chunk);
+    }
     if !status.is_success() {
-        return Err(RegistryError::Read(
-            format!(
-                "{gs_url}{}",
-                generation.map_or(String::new(), |g| format!(" generation {g}"))
-            ),
-            format!(
-                "{status}: {}",
-                String::from_utf8_lossy(&body)
-                    .chars()
-                    .take(300)
-                    .collect::<String>()
-            ),
-        ));
+        return Err(RegistryError::Status {
+            url: named(),
+            status,
+            body: String::from_utf8_lossy(&body).chars().take(300).collect(),
+        });
     }
-    if body.len() > MAX_BODY {
-        return Err(RegistryError::Read(
-            gs_url.into(),
-            format!("larger than {MAX_BODY} bytes"),
-        ));
-    }
-    Ok(body.to_vec())
+    Ok(body)
 }
 
 /// The token file bytes for boot: a local file (`--registry-file`) or the
@@ -420,17 +470,19 @@ pub async fn load_bytes(
     local: Option<&Path>,
 ) -> Result<Vec<u8>, RegistryError> {
     if let Some(path) = local {
-        return std::fs::read(path)
-            .map_err(|e| RegistryError::Read(path.display().to_string(), e.to_string()));
+        return std::fs::read(path).map_err(|source| RegistryError::LocalRead {
+            path: path.to_path_buf(),
+            source,
+        });
     }
-    let http = reqwest::Client::new();
+    let http = http_client()?;
     let read = async {
         let mut attempt = 1;
         loop {
             match fetch(&http, &source.url, source.generation).await {
                 Ok(b) => break Ok(b),
-                Err(e) if attempt < 3 => {
-                    tracing::warn!(attempt, error = %e, "token file: boot read failed; retrying");
+                Err(error) if attempt < 3 => {
+                    tracing::warn!(attempt, ?error, "token file: boot read failed; retrying");
                     tokio::time::sleep(Duration::from_secs(1 << attempt)).await;
                     attempt += 1;
                 }
@@ -440,11 +492,8 @@ pub async fn load_bytes(
     };
     tokio::time::timeout(BOOT_READ_BUDGET, read)
         .await
-        .map_err(|_| {
-            RegistryError::Read(
-                source.url.clone(),
-                format!("boot read exceeded {}s", BOOT_READ_BUDGET.as_secs()),
-            )
+        .map_err(|_| RegistryError::BootTimeout {
+            url: source.url.clone(),
         })?
 }
 
@@ -646,11 +695,39 @@ mod tests {
     }
 
     #[test]
+    fn an_inline_row_on_a_chain_the_file_leaves_empty_is_refused() {
+        let p = project(&parse(fixture("tokens-staging.toml").as_bytes()).unwrap()).unwrap();
+        let mut config: Table = toml::from_str(
+            "[registry]\nurl = \"gs://b/o\"\n[chains.base.trading]\n[chains.robinhood.trading]\n\
+             [chains.hyperevm.trading.assets.equities.FGI]\ntrading = \"enabled\"\n",
+        )
+        .unwrap();
+        assert!(matches!(
+            merge(&mut config, &p).unwrap_err(),
+            RegistryError::InlineTable { table } if table == "chains.hyperevm.trading.assets.equities.FGI"
+        ));
+    }
+
+    #[test]
+    fn rows_on_a_chain_without_a_trading_table_are_refused() {
+        let p = project(&parse(fixture("tokens-staging.toml").as_bytes()).unwrap()).unwrap();
+        let mut config: Table = toml::from_str(
+            "[registry]\nurl = \"gs://b/o\"\n[chains.base]\n[chains.robinhood.trading]\n",
+        )
+        .unwrap();
+        assert!(matches!(
+            merge(&mut config, &p).unwrap_err(),
+            RegistryError::UndeclaredChain { chain } if chain == "base"
+        ));
+    }
+
+    #[test]
     fn a_bad_registry_url_or_key_is_refused_offline() {
         for text in [
             "[registry]\nurl = \"gcs://b/o\"\n",
             "[registry]\nurl = \"gs://bucket\"\n",
             "[registry]\nurl = \"gs://b/o\"\ngeneraton = 1\n",
+            "[registry]\nurl = \"gs://b/o\"\nrefresh_secs = 60\n",
         ] {
             let t: Table = toml::from_str(text).unwrap();
             assert!(source_of(&t).is_err(), "{text:?}");

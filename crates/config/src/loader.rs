@@ -1961,6 +1961,28 @@ fn config_table(
     }
 }
 
+/// The config as [`Config`], with the token file's rows when `[registry]`
+/// names one. The text is always deserialized itself first, so an error in
+/// the config's own keys names its line.
+fn config_from(
+    config_str: &str,
+    config_path: &Path,
+    tokens: TokenFile<'_>,
+    startup_notices: &mut Vec<StartupNotice>,
+) -> Result<(Config, Option<RegistryLive>), CtxError> {
+    let config_error = |source| CtxError::ConfigToml {
+        path: config_path.to_path_buf(),
+        source,
+    };
+    let config: Config = toml::from_str(config_str).map_err(config_error)?;
+    let (table, registry) = config_table(config_str, config_path, tokens, startup_notices)?;
+    if registry.is_none() {
+        return Ok((config, None));
+    }
+    let merged = table.try_into().map_err(config_error)?;
+    Ok((merged, registry))
+}
+
 /// The token file bytes a config needs, or `None` when it carries its
 /// per-symbol tables inline. A local copy wins over the bucket.
 pub async fn fetch_token_file(
@@ -1991,10 +2013,11 @@ pub async fn fetch_token_file(
         .map_err(registry_error)
 }
 
-/// Judge a fresh copy of the token file the way boot would.
+/// Judge a fresh copy of the token file against the config this instance runs.
 ///
-/// Parse, merge into the config this instance runs, validate. Returns what
-/// differs from the running tables ("no difference" when nothing does).
+/// Parses, merges and runs the checks boot runs that need no secrets.
+/// Returns what differs from the running tables ("no difference" when
+/// nothing does).
 pub fn registry_check(live: &RegistryLive, fresh: &[u8]) -> Result<String, CtxError> {
     let path = Path::new(&live.source.url);
     let registry_error = |source| CtxError::Registry {
@@ -2010,6 +2033,9 @@ pub fn registry_check(live: &RegistryLive, fresh: &[u8]) -> Result<String, CtxEr
         source,
     })?;
     validate_config(&config, path, &mut Vec::new())?;
+    if let Some(rebalancing) = &config.rebalancing {
+        rebalancing.allocation()?.validate(&config.chains)?;
+    }
     Ok(registry::describe_change(&live.live, &projection))
 }
 
@@ -2028,11 +2054,7 @@ fn parse_and_validate_with(
     // dispatch to NoSubscriber and vanish. See `StartupNotice`.
     let mut startup_notices = Vec::new();
 
-    let (table, registry) = config_table(config_str, config_path, tokens, &mut startup_notices)?;
-    let config: Config = table.try_into().map_err(|source| CtxError::ConfigToml {
-        path: config_path.to_path_buf(),
-        source,
-    })?;
+    let (config, registry) = config_from(config_str, config_path, tokens, &mut startup_notices)?;
     let secrets: Secrets = toml::from_str(secrets_str).map_err(|source| CtxError::SecretsToml {
         path: secrets_path.to_path_buf(),
         source,
@@ -2380,11 +2402,7 @@ impl Ctx {
                 source,
             })?;
         let mut startup_notices = Vec::new();
-        let (table, _) = config_table(&config_str, config_path, tokens, &mut startup_notices)?;
-        let config: Config = table.try_into().map_err(|source| CtxError::ConfigToml {
-            path: config_path.to_path_buf(),
-            source,
-        })?;
+        let (config, _) = config_from(&config_str, config_path, tokens, &mut startup_notices)?;
 
         validate_config(&config, config_path, &mut startup_notices)?;
 
@@ -9057,19 +9075,27 @@ mod tests {
         let staging_equities: BTreeMap<Symbol, (Address, Address)> =
             launch_equities.iter().cloned().collect();
 
-        for (name, config_str, expected_equities) in [
+        for (name, config_str, tokens, expected_equities) in [
             (
                 "prod",
                 include_str!("../../../config/prod/st0x-hedge.toml"),
+                include_bytes!("../../../tests/fixtures/tokens-production.toml").as_slice(),
                 &prod_equities,
             ),
             (
                 "staging",
                 include_str!("../../../config/staging/st0x-hedge.toml"),
+                include_bytes!("../../../tests/fixtures/tokens-staging.toml").as_slice(),
                 &staging_equities,
             ),
         ] {
-            let config: Config = toml::from_str(config_str).unwrap();
+            let (config, _) = config_from(
+                config_str,
+                Path::new(name),
+                TokenFile::Bytes(tokens),
+                &mut Vec::new(),
+            )
+            .unwrap();
             let robinhood = config
                 .chains
                 .get(&Chain::Robinhood)
@@ -9535,8 +9561,15 @@ mod tests {
 
     #[test]
     fn config_only_validation_rejects_invalid_schedule_timing_and_membership() {
-        let runtime: toml::Value =
+        let mut runtime: toml::Table =
             toml::from_str(include_str!("../../../config/staging/st0x-hedge.toml")).unwrap();
+        runtime.remove("registry");
+        let tokens = registry::parse(include_bytes!(
+            "../../../tests/fixtures/tokens-staging.toml"
+        ))
+        .unwrap();
+        registry::merge(&mut runtime, &registry::project(&tokens).unwrap()).unwrap();
+        let runtime = toml::Value::Table(runtime);
         let fragment: toml::Value =
             toml::from_str(include_str!("../../../docs/trading-schedule/staging.toml")).unwrap();
         for invalid_timing in [true, false] {

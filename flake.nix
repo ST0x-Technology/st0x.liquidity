@@ -568,19 +568,41 @@
             # this build's `verify-migrations` binary against it. Lives here
             # rather than in infra/default.nix because it needs `rust.st0x-liquidity`
             # (the compiled binary), which that module doesn't have access to.
+            # The config's `[registry]` token file is read here with the
+            # operator's gcloud credentials (the pinned generation when there
+            # is one), since the binary can reach the bucket only on the VM.
+            # REGISTRY_FILE points at a local copy instead.
             verifyMigrationsPkgs = builtins.listToAttrs (
-              map (env: {
-                name = "${env}VerifyMigrations";
-                value = pkgs.writeShellApplication {
-                  name = "${env}-verify-migrations";
-                  runtimeInputs = [ rust.st0x-liquidity ];
-                  text = ''
-                    local_snapshot="$(${infraPkgs.packages.${env + "DbSnapshot"}}/bin/${env}-db-snapshot "$@")"
-                    echo "Verifying migrations against $local_snapshot..." >&2
-                    exec verify-migrations --db "$local_snapshot" --config ${./config/${env}/st0x-hedge.toml}
-                  '';
-                };
-              }) envNames
+              map (
+                env:
+                let
+                  inherit (builtins.fromTOML (builtins.readFile ./config/${env}/st0x-hedge.toml)) registry;
+                  tokenObject =
+                    registry.url + pkgs.lib.optionalString (registry ? generation) "#${toString registry.generation}";
+                in
+                {
+                  name = "${env}VerifyMigrations";
+                  value = pkgs.writeShellApplication {
+                    name = "${env}-verify-migrations";
+                    runtimeInputs = [
+                      rust.st0x-liquidity
+                      pkgs.google-cloud-sdk
+                    ];
+                    text = ''
+                      registry_file="''${REGISTRY_FILE:-}"
+                      if [ -z "$registry_file" ]; then
+                        registry_file="$(mktemp)"
+                        trap 'rm -f "$registry_file"' EXIT
+                        gcloud storage cp ${pkgs.lib.escapeShellArg tokenObject} "$registry_file"
+                      fi
+                      local_snapshot="$(${infraPkgs.packages.${env + "DbSnapshot"}}/bin/${env}-db-snapshot "$@")"
+                      echo "Verifying migrations against $local_snapshot..." >&2
+                      verify-migrations --db "$local_snapshot" --config ${./config/${env}/st0x-hedge.toml} \
+                        --registry-file "$registry_file"
+                    '';
+                  };
+                }
+              ) envNames
             );
           in
           rainixPkgs // infraPkgs.packages // deployScripts // abis // others // verifyMigrationsPkgs;

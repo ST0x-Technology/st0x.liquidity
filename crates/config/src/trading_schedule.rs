@@ -170,17 +170,22 @@ mod tests {
 
     #[test]
     fn rollout_fragments_match_runtime_asset_eligibility() {
-        for (runtime, fragment) in [
+        for (runtime, tokens, fragment) in [
             (
                 include_str!("../../../config/prod/st0x-hedge.toml"),
+                include_bytes!("../../../tests/fixtures/tokens-production.toml").as_slice(),
                 include_str!("../../../docs/trading-schedule/prod.toml"),
             ),
             (
                 include_str!("../../../config/staging/st0x-hedge.toml"),
+                include_bytes!("../../../tests/fixtures/tokens-staging.toml").as_slice(),
                 include_str!("../../../docs/trading-schedule/staging.toml"),
             ),
         ] {
-            let runtime: toml::Value = toml::from_str(runtime).unwrap();
+            let mut runtime: toml::Table = toml::from_str(runtime).unwrap();
+            let tokens =
+                crate::registry::project(&crate::registry::parse(tokens).unwrap()).unwrap();
+            crate::registry::merge(&mut runtime, &tokens).unwrap();
             let assets: HedgingAssets = runtime["assets"].clone().try_into().unwrap();
             let fragment: toml::Value = toml::from_str(fragment).unwrap();
             let config: TradingScheduleConfig = fragment["pricing"]["trading_schedule"]

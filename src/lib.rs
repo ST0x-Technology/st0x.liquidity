@@ -300,8 +300,10 @@ async fn run_bot_session_inner(
 
     let health = startup::HealthGate::default();
     let detached_tasks = TaskTracker::new();
+    // Not on `detached_tasks`: shutdown drains that tracker, and this loop
+    // only ends on cancellation, which the bot-exit path never sends.
     if let Some(live) = ctx.registry.clone() {
-        detached_tasks.spawn(registry_watch::watch(live, shutdown_token.clone()));
+        tokio::spawn(registry_watch::watch(live, shutdown_token.clone()));
     }
     let state = AppState {
         ctx: ctx.clone(),
