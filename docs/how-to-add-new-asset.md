@@ -251,6 +251,16 @@ cargo run --bin validate-config -- --config config/prod/st0x-hedge.toml \
   --registry-file tokens.toml
 ```
 
+### Retiring an asset
+
+Two repos, in this order. First list the symbol under
+`[assets.equities] retired_symbols` in the bot's config and release that:
+`verify-migrations` needs every symbol the database still references to be
+either configured or retired, and the token file may lose the rows at any
+restart after that. Then remove its rows from `t0/<env>.toml` in
+`st0x.registry`; for production, bump `generation` in the same release that
+carries the retirement.
+
 **Tip:** Start with `trading = "disabled"` first. Publish, verify the bot sees
 the asset, then enable trading in a follow-up change.
 

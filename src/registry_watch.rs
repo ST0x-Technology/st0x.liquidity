@@ -35,6 +35,19 @@ pub(crate) async fn watch(live: RegistryLive, shutdown: CancellationToken) {
         };
         let bytes = match read {
             Ok(bytes) => bytes,
+            // The pinned copy is gone: the next roll cannot boot. That is
+            // an invalid source, not a passing read failure.
+            Err(registry::RegistryError::Status { status, .. })
+                if status == reqwest::StatusCode::NOT_FOUND && live.source.generation.is_some() =>
+            {
+                report(0, 1);
+                warn!(
+                    url = %live.source.url,
+                    generation = ?live.source.generation,
+                    "token file: the pinned generation is no longer readable"
+                );
+                continue;
+            }
             Err(error) => {
                 metrics::counter!("registry_fetch_errors_total").increment(1);
                 warn!(?error, "token file: refresh read failed");

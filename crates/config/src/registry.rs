@@ -26,6 +26,7 @@ use std::time::Duration;
 use serde::Deserialize;
 use thiserror::Error;
 use toml::{Table, Value};
+use url::Url;
 
 pub const SCHEMA_VERSION: i64 = 1;
 
@@ -50,12 +51,6 @@ const CHAIN_ROW_KEYS: [&str; 9] = [
 
 /// The keys a hedge policy may carry, as `EquityHedgePolicy` reads them.
 const POLICY_KEYS: [&str; 2] = ["extended_hours_counter_trading", "hedge_floor_shares"];
-
-/// Keys other services own on a slot and on `[assets.equities.<SYM>]`, as
-/// the token file's header lists them. Any other key on a table the bot
-/// takes is refused, as `deny_unknown_fields` refused it inline.
-const OTHER_SLOT_KEYS: [&str; 2] = ["pricing", "venues"];
-const OTHER_POLICY_KEYS: [&str; 2] = ["fixed_half_spread_bps", "spread_model"];
 
 /// `[registry]` in the bot config.
 #[derive(Debug, Clone, Deserialize)]
@@ -88,8 +83,6 @@ pub enum RegistryError {
     BadSwitch { what: String, key: &'static str },
     #[error("token file: {what}.{key} missing")]
     MissingAddress { what: String, key: &'static str },
-    #[error("token file: {what}.{key} is not a key the bot or another service reads")]
-    UnknownKey { what: String, key: String },
     #[error("token file: no slot carries the bot's keys; refusing an empty universe")]
     EmptyUniverse,
     #[error(
@@ -157,7 +150,7 @@ impl Projection {
     pub fn slots(&self) -> BTreeSet<String> {
         self.chain_rows
             .iter()
-            .flat_map(|(c, rows)| rows.keys().map(move |s| format!("{c}/{s}")))
+            .flat_map(|(chain, rows)| rows.keys().map(move |symbol| format!("{chain}/{symbol}")))
             .collect()
     }
 }
@@ -165,8 +158,8 @@ impl Projection {
 pub fn source_of(config: &Table) -> Result<Option<RegistrySource>, RegistryError> {
     match config.get("registry") {
         None => Ok(None),
-        Some(v) => {
-            let source: RegistrySource = v.clone().try_into().map_err(RegistryError::Source)?;
+        Some(value) => {
+            let source: RegistrySource = value.clone().try_into().map_err(RegistryError::Source)?;
             parse_gs_url(&source.url)?;
             Ok(Some(source))
         }
@@ -178,7 +171,7 @@ pub fn parse_gs_url(gs_url: &str) -> Result<(&str, &str), RegistryError> {
         .strip_prefix("gs://")
         .and_then(|rest| rest.split_once('/'))
     {
-        Some((b, o)) if !b.is_empty() && !o.is_empty() => Ok((b, o)),
+        Some((bucket, object)) if !bucket.is_empty() && !object.is_empty() => Ok((bucket, object)),
         _ => Err(RegistryError::Url {
             url: gs_url.to_string(),
         }),
@@ -190,28 +183,31 @@ pub fn parse(bytes: &[u8]) -> Result<Table, RegistryError> {
     toml::from_str(text).map_err(RegistryError::Toml)
 }
 
-fn table<'a>(v: Option<&'a Value>, what: &str) -> Result<&'a Table, RegistryError> {
-    v.and_then(Value::as_table)
+fn table<'a>(value: Option<&'a Value>, what: &str) -> Result<&'a Table, RegistryError> {
+    value
+        .and_then(Value::as_table)
         .ok_or_else(|| RegistryError::NotATable {
             what: what.to_string(),
         })
 }
 
-fn is_switch(v: Option<&Value>) -> bool {
-    matches!(v.and_then(Value::as_str), Some("enabled" | "disabled"))
+fn is_switch(value: Option<&Value>) -> bool {
+    matches!(value.and_then(Value::as_str), Some("enabled" | "disabled"))
 }
 
 /// Turn the token file into the bot's per-symbol tables.
 ///
 /// A chain row is taken from every slot that carries any of the bot's own
 /// keys; a slot that is only priced is not the bot's. A policy is taken from
-/// every `[assets.equities.<SYM>]` that sets any of the bot's policy keys. On
-/// a table the bot takes, the keys other services own (`OTHER_SLOT_KEYS`,
-/// `OTHER_POLICY_KEYS`) are skipped and any other key is refused. Anything
-/// malformed is refused, never dropped.
+/// every `[assets.equities.<SYM>]` that sets any of the bot's policy keys.
+/// The bot reads its own keys and leaves the rest to the services that own
+/// them: which keys may appear at all, and their spelling, is checked by
+/// st0x.registry's CI (`t0/check.jq`) before the file is published, so a
+/// new key of another service cannot fail a boot here. Anything malformed in
+/// the bot's own keys is refused, never dropped.
 pub fn project(file: &Table) -> Result<Projection, RegistryError> {
     match file.get("schema_version") {
-        Some(Value::Integer(v)) if *v == SCHEMA_VERSION => {}
+        Some(Value::Integer(version)) if *version == SCHEMA_VERSION => {}
         other => {
             return Err(RegistryError::SchemaVersion {
                 got: other.map_or_else(|| "nothing".to_string(), Value::to_string),
@@ -220,19 +216,22 @@ pub fn project(file: &Table) -> Result<Projection, RegistryError> {
     }
     let chains = table(file.get("chains"), "chains")?;
     let equities = table(
-        file.get("assets").and_then(|a| a.get("equities")),
+        file.get("assets").and_then(|assets| assets.get("equities")),
         "assets.equities",
     )?;
 
     let mut chain_rows: BTreeMap<String, BTreeMap<String, Table>> = BTreeMap::new();
     for (name, chain) in chains {
         let chain = table(Some(chain), &format!("chains.{name}"))?;
-        let Some(slots) = chain.get("assets").and_then(|a| a.get("equities")) else {
+        let Some(slots) = chain
+            .get("assets")
+            .and_then(|assets| assets.get("equities"))
+        else {
             continue;
         };
         let slots = table(Some(slots), &format!("chains.{name}.assets.equities"))?;
-        for (sym, slot) in slots {
-            let what = format!("chains.{name}.assets.equities.{sym}");
+        for (symbol, slot) in slots {
+            let what = format!("chains.{name}.assets.equities.{symbol}");
             let slot = table(Some(slot), &what)?;
             let ours = [
                 "trading",
@@ -241,7 +240,7 @@ pub fn project(file: &Table) -> Result<Projection, RegistryError> {
                 "tokenized_equity",
             ]
             .iter()
-            .any(|k| slot.contains_key(*k));
+            .any(|key| slot.contains_key(*key));
             if !ours {
                 continue;
             }
@@ -255,55 +254,39 @@ pub fn project(file: &Table) -> Result<Projection, RegistryError> {
                     return Err(RegistryError::MissingAddress { what, key });
                 }
             }
-            if let Some(key) = slot.keys().find(|key| {
-                !CHAIN_ROW_KEYS.contains(&key.as_str()) && !OTHER_SLOT_KEYS.contains(&key.as_str())
-            }) {
-                return Err(RegistryError::UnknownKey {
-                    what,
-                    key: key.clone(),
-                });
-            }
             let mut row = Table::new();
-            for k in CHAIN_ROW_KEYS {
-                if let Some(v) = slot.get(k) {
-                    row.insert(k.to_string(), v.clone());
+            for key in CHAIN_ROW_KEYS {
+                if let Some(value) = slot.get(key) {
+                    row.insert(key.to_string(), value.clone());
                 }
             }
             chain_rows
                 .entry(name.clone())
                 .or_default()
-                .insert(sym.clone(), row);
+                .insert(symbol.clone(), row);
         }
     }
 
     let mut policies = BTreeMap::new();
-    for (sym, a) in equities {
-        let what = format!("assets.equities.{sym}");
-        let a = table(Some(a), &what)?;
-        if !POLICY_KEYS.iter().any(|key| a.contains_key(*key)) {
+    for (symbol, policy) in equities {
+        let what = format!("assets.equities.{symbol}");
+        let policy = table(Some(policy), &what)?;
+        if !POLICY_KEYS.iter().any(|key| policy.contains_key(*key)) {
             continue;
         }
-        if !is_switch(a.get("extended_hours_counter_trading")) {
+        if !is_switch(policy.get("extended_hours_counter_trading")) {
             return Err(RegistryError::BadSwitch {
                 what,
                 key: "extended_hours_counter_trading",
             });
         }
-        if let Some(key) = a.keys().find(|key| {
-            !POLICY_KEYS.contains(&key.as_str()) && !OTHER_POLICY_KEYS.contains(&key.as_str())
-        }) {
-            return Err(RegistryError::UnknownKey {
-                what,
-                key: key.clone(),
-            });
-        }
         let mut row = Table::new();
-        for k in POLICY_KEYS {
-            if let Some(v) = a.get(k) {
-                row.insert(k.to_string(), v.clone());
+        for key in POLICY_KEYS {
+            if let Some(value) = policy.get(key) {
+                row.insert(key.to_string(), value.clone());
             }
         }
-        policies.insert(sym.clone(), row);
+        policies.insert(symbol.clone(), row);
     }
 
     if chain_rows.values().all(BTreeMap::is_empty) {
@@ -315,25 +298,37 @@ pub fn project(file: &Table) -> Result<Projection, RegistryError> {
     })
 }
 
-fn subtable<'a>(t: &'a mut Table, key: &str) -> &'a mut Table {
-    if !t.get(key).is_some_and(Value::is_table) {
-        t.insert(key.to_string(), Value::Table(Table::new()));
-    }
-    match t.get_mut(key) {
-        Some(Value::Table(table)) => table,
-        // Unreachable: the key was just made a table above.
-        _ => unreachable!("{key} was just made a table"),
+/// `parent.key` as a table, created when absent. A non-table value in the
+/// way is a config error and is refused rather than overwritten.
+fn subtable<'a>(
+    parent: &'a mut Table,
+    key: &str,
+    what: &str,
+) -> Result<&'a mut Table, RegistryError> {
+    match parent
+        .entry(key.to_string())
+        .or_insert_with(|| Value::Table(Table::new()))
+    {
+        Value::Table(table) => Ok(table),
+        _ => Err(RegistryError::NotATable {
+            what: what.to_string(),
+        }),
     }
 }
 
 /// Refuse a config that names `[registry]` and still carries a per-symbol
 /// table of its own: one source of truth.
 pub fn refuse_inline_tables(config: &Table) -> Result<(), RegistryError> {
-    let is_symbol = |k: &str| k.chars().next().is_some_and(|c| c.is_ascii_uppercase());
+    // Every key of an `equities` table that is itself a table is a symbol's
+    // (the chain-wide keys, `operational_limit` and `retired_symbols`, are
+    // not tables), whatever its spelling or case.
     let inline_symbol = |equities: Option<&Value>| {
-        equities
-            .and_then(Value::as_table)
-            .and_then(|equities| equities.keys().find(|k| is_symbol(k)).cloned())
+        equities.and_then(Value::as_table).and_then(|equities| {
+            equities
+                .iter()
+                .find(|(_, value)| value.is_table())
+                .map(|(symbol, _)| symbol.clone())
+        })
     };
 
     for (chain, chain_config) in config
@@ -344,18 +339,20 @@ pub fn refuse_inline_tables(config: &Table) -> Result<(), RegistryError> {
     {
         let equities = chain_config
             .get("trading")
-            .and_then(|t| t.get("assets"))
-            .and_then(|a| a.get("equities"));
-        if let Some(sym) = inline_symbol(equities) {
+            .and_then(|trading| trading.get("assets"))
+            .and_then(|assets| assets.get("equities"));
+        if let Some(symbol) = inline_symbol(equities) {
             return Err(RegistryError::InlineTable {
-                table: format!("chains.{chain}.trading.assets.equities.{sym}"),
+                table: format!("chains.{chain}.trading.assets.equities.{symbol}"),
             });
         }
     }
-    let equities = config.get("assets").and_then(|a| a.get("equities"));
-    if let Some(sym) = inline_symbol(equities) {
+    let equities = config
+        .get("assets")
+        .and_then(|assets| assets.get("equities"));
+    if let Some(symbol) = inline_symbol(equities) {
         return Err(RegistryError::InlineTable {
-            table: format!("assets.equities.{sym}"),
+            table: format!("assets.equities.{symbol}"),
         });
     }
     Ok(())
@@ -369,50 +366,65 @@ pub fn refuse_inline_tables(config: &Table) -> Result<(), RegistryError> {
 /// chain the file lists but the config does not declare with a `trading`
 /// table is refused: a chain needs an rpc_url and signing, which are
 /// release-time facts.
-pub fn merge(config: &mut Table, p: &Projection) -> Result<(), RegistryError> {
+pub fn merge(config: &mut Table, projection: &Projection) -> Result<(), RegistryError> {
     refuse_inline_tables(config)?;
 
-    let chains = subtable(config, "chains");
-    for (chain, rows) in &p.chain_rows {
+    let chains = subtable(config, "chains", "chains")?;
+    for (chain, rows) in &projection.chain_rows {
         if rows.is_empty() {
             continue;
         }
         let Some(trading) = chains
             .get_mut(chain)
-            .and_then(|c| c.get_mut("trading"))
+            .and_then(|chain_config| chain_config.get_mut("trading"))
             .and_then(Value::as_table_mut)
         else {
             return Err(RegistryError::UndeclaredChain {
                 chain: chain.clone(),
             });
         };
-        let equities = subtable(subtable(trading, "assets"), "equities");
-        for (sym, row) in rows {
-            equities.insert(sym.clone(), Value::Table(row.clone()));
+        let assets = subtable(trading, "assets", &format!("chains.{chain}.trading.assets"))?;
+        let equities = subtable(
+            assets,
+            "equities",
+            &format!("chains.{chain}.trading.assets.equities"),
+        )?;
+        for (symbol, row) in rows {
+            equities.insert(symbol.clone(), Value::Table(row.clone()));
         }
     }
 
-    let equities = subtable(subtable(config, "assets"), "equities");
-    for (sym, row) in &p.policies {
-        equities.insert(sym.clone(), Value::Table(row.clone()));
+    let assets = subtable(config, "assets", "assets")?;
+    let equities = subtable(assets, "equities", "assets.equities")?;
+    for (symbol, row) in &projection.policies {
+        equities.insert(symbol.clone(), Value::Table(row.clone()));
     }
     Ok(())
 }
 
-fn percent(segment: &str) -> String {
-    use std::fmt::Write as _;
-    let mut out = String::with_capacity(segment.len());
-    for b in segment.bytes() {
-        match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                out.push(b as char);
-            }
-            _ => {
-                let _ = write!(out, "%{b:02X}");
-            }
+/// The JSON API URL of one object: `/b/<bucket>/o/<object>?alt=media`, the
+/// object name as one path segment (`/` in it becomes `%2F`), plus
+/// `generation` when pinned.
+fn object_url(bucket: &str, object: &str, generation: Option<u64>) -> Result<Url, RegistryError> {
+    let mut url = Url::parse("https://storage.googleapis.com/storage/v1/").map_err(|_| {
+        RegistryError::Url {
+            url: format!("gs://{bucket}/{object}"),
+        }
+    })?;
+    url.path_segments_mut()
+        .map_err(|()| RegistryError::Url {
+            url: format!("gs://{bucket}/{object}"),
+        })?
+        .pop_if_empty()
+        .extend(["b", bucket, "o", object]);
+    {
+        let mut query = url.query_pairs_mut();
+        query.append_pair("alt", "media");
+        if let Some(generation) = generation {
+            query.append_pair("generation", &generation.to_string());
         }
     }
-    out
+    Ok(url)
 }
 
 /// A client for the metadata server and Cloud Storage: no proxy (the bearer
@@ -455,20 +467,20 @@ pub async fn fetch(
     generation: Option<u64>,
 ) -> Result<Vec<u8>, RegistryError> {
     let (bucket, object) = parse_gs_url(gs_url)?;
+    let url = object_url(bucket, object, generation)?;
     let token = access_token(http).await?;
-    let generation_query = generation.map_or(String::new(), |g| format!("&generation={g}"));
-    let url = format!(
-        "https://storage.googleapis.com/storage/v1/b/{}/o/{}?alt=media{generation_query}",
-        percent(bucket),
-        percent(object)
-    );
-    let named = || generation.map_or_else(|| gs_url.to_string(), |g| format!("{gs_url}#{g}"));
+    let named = || {
+        generation.map_or_else(
+            || gs_url.to_string(),
+            |generation| format!("{gs_url}#{generation}"),
+        )
+    };
     let http_error = |source| RegistryError::Http {
         url: named(),
         source,
     };
     let mut response = http
-        .get(&url)
+        .get(url)
         .bearer_auth(token)
         .send()
         .await
@@ -515,13 +527,13 @@ pub async fn load_bytes(
         let mut attempt = 1;
         loop {
             match fetch(&http, &source.url, source.generation).await {
-                Ok(b) => break Ok(b),
+                Ok(bytes) => break Ok(bytes),
                 Err(error) if attempt < 3 => {
                     tracing::warn!(attempt, ?error, "token file: boot read failed; retrying");
                     tokio::time::sleep(Duration::from_secs(1 << attempt)).await;
                     attempt += 1;
                 }
-                Err(e) => break Err(e),
+                Err(error) => break Err(error),
             }
         }
     };
@@ -534,36 +546,37 @@ pub async fn load_bytes(
 
 /// What changed between the running projection and a fresh one.
 pub fn describe_change(live: &Projection, fresh: &Projection) -> Option<String> {
-    let (a, b) = (live.slots(), fresh.slots());
+    let (live_slots, fresh_slots) = (live.slots(), fresh.slots());
     let mut parts = Vec::new();
-    let added: Vec<_> = b.difference(&a).cloned().collect();
-    let removed: Vec<_> = a.difference(&b).cloned().collect();
+    let added: Vec<_> = fresh_slots.difference(&live_slots).cloned().collect();
+    let removed: Vec<_> = live_slots.difference(&fresh_slots).cloned().collect();
     if !added.is_empty() {
         parts.push(format!("added [{}]", added.join(",")));
     }
     if !removed.is_empty() {
         parts.push(format!("removed [{}]", removed.join(",")));
     }
-    let canon = |t: &Table| -> Table {
-        let mut t = t.clone();
-        for k in ["tokenized_equity", "tokenized_equity_derivative"] {
-            if let Some(Value::String(v)) = t.get(k) {
-                t.insert(k.into(), Value::String(v.to_lowercase()));
+    // Addresses compare case-blind: a checksum re-spelling is not a change.
+    let canon = |row: &Table| -> Table {
+        let mut row = row.clone();
+        for key in ["tokenized_equity", "tokenized_equity_derivative"] {
+            if let Some(Value::String(address)) = row.get(key) {
+                row.insert(key.into(), Value::String(address.to_lowercase()));
             }
         }
-        t
+        row
     };
     let changed: Vec<String> = live
         .chain_rows
         .iter()
-        .flat_map(|(c, rows)| {
-            rows.iter().filter_map(move |(s, row)| {
+        .flat_map(|(chain, rows)| {
+            rows.iter().filter_map(move |(symbol, row)| {
                 fresh
                     .chain_rows
-                    .get(c)
-                    .and_then(|r| r.get(s))
-                    .filter(|f| canon(f) != canon(row))
-                    .map(|_| format!("{c}/{s}"))
+                    .get(chain)
+                    .and_then(|fresh_rows| fresh_rows.get(symbol))
+                    .filter(|fresh_row| canon(fresh_row) != canon(row))
+                    .map(|_| format!("{chain}/{symbol}"))
             })
         })
         .collect();
@@ -594,14 +607,14 @@ mod tests {
             "{}/../../tests/fixtures/{name}",
             env!("CARGO_MANIFEST_DIR")
         ))
-        .unwrap_or_else(|e| panic!("{name}: {e}"))
+        .unwrap_or_else(|error| panic!("{name}: {error}"))
     }
 
-    fn canon(t: &Table) -> String {
-        let mut keys: Vec<_> = t.iter().collect();
-        keys.sort_by_key(|(k, _)| k.as_str());
+    fn canon(file: &Table) -> String {
+        let mut keys: Vec<_> = file.iter().collect();
+        keys.sort_by_key(|(key, _)| key.as_str());
         keys.iter()
-            .map(|(k, v)| format!("{k}={}", v.to_string().to_lowercase()))
+            .map(|(key, value)| format!("{key}={}", value.to_string().to_lowercase()))
             .collect::<Vec<_>>()
             .join(" ")
     }
@@ -612,39 +625,42 @@ mod tests {
     fn registry_projects_to_the_inline_tables_it_replaced() {
         for env in ["staging", "production"] {
             let inline: Table = toml::from_str(&fixture(&format!("{env}-inline.toml"))).unwrap();
-            let p = project(&parse(fixture(&format!("tokens-{env}.toml")).as_bytes()).unwrap())
-                .unwrap();
+            let tokens = match env {
+                "staging" => "tokens-staging.toml",
+                _ => "tokens-production-1790341753647581.toml",
+            };
+            let projection = project(&parse(fixture(tokens).as_bytes()).unwrap()).unwrap();
 
             let mut want_rows: BTreeMap<String, String> = BTreeMap::new();
-            for (c, ct) in inline["chains"].as_table().unwrap() {
-                let Some(eq) = ct
+            for (chain, chain_config) in inline["chains"].as_table().unwrap() {
+                let Some(equities) = chain_config
                     .get("trading")
-                    .and_then(|t| t.get("assets"))
-                    .and_then(|a| a.get("equities"))
+                    .and_then(|file| file.get("assets"))
+                    .and_then(|assets| assets.get("equities"))
                     .and_then(Value::as_table)
                 else {
                     continue;
                 };
-                for (s, row) in eq {
+                for (symbol, row) in equities {
                     let Some(row) = row
                         .as_table()
-                        .filter(|r| r.contains_key("tokenized_equity"))
+                        .filter(|row| row.contains_key("tokenized_equity"))
                     else {
                         continue;
                     };
                     let mut row = row.clone();
-                    if let Some(v) = row.remove("vault_id") {
-                        row.insert("vault_ids".into(), Value::Array(vec![v]));
+                    if let Some(value) = row.remove("vault_id") {
+                        row.insert("vault_ids".into(), Value::Array(vec![value]));
                     }
-                    want_rows.insert(format!("{c}/{s}"), canon(&row));
+                    want_rows.insert(format!("{chain}/{symbol}"), canon(&row));
                 }
             }
-            let got_rows: BTreeMap<String, String> = p
+            let got_rows: BTreeMap<String, String> = projection
                 .chain_rows
                 .iter()
-                .flat_map(|(c, rows)| {
+                .flat_map(|(chain, rows)| {
                     rows.iter()
-                        .map(move |(s, r)| (format!("{c}/{s}"), canon(r)))
+                        .map(move |(symbol, row)| (format!("{chain}/{symbol}"), canon(row)))
                 })
                 .collect();
             assert_eq!(got_rows, want_rows, "{env} chain rows");
@@ -653,16 +669,17 @@ mod tests {
                 .as_table()
                 .unwrap()
                 .iter()
-                .filter_map(|(s, v)| {
-                    v.as_table()
-                        .filter(|t| t.contains_key("extended_hours_counter_trading"))
-                        .map(|t| (s.clone(), canon(t)))
+                .filter_map(|(symbol, value)| {
+                    value
+                        .as_table()
+                        .filter(|file| file.contains_key("extended_hours_counter_trading"))
+                        .map(|file| (symbol.clone(), canon(file)))
                 })
                 .collect();
-            let got_pol: BTreeMap<String, String> = p
+            let got_pol: BTreeMap<String, String> = projection
                 .policies
                 .iter()
-                .map(|(s, t)| (s.clone(), canon(t)))
+                .map(|(symbol, file)| (symbol.clone(), canon(file)))
                 .collect();
             assert_eq!(got_pol, want_pol, "{env} policies");
         }
@@ -670,40 +687,43 @@ mod tests {
 
     #[test]
     fn a_priced_only_slot_is_not_the_bots() {
-        let p = project(&parse(fixture("tokens-production.toml").as_bytes()).unwrap()).unwrap();
+        let projection =
+            project(&parse(fixture("tokens-production-1790341753647581.toml").as_bytes()).unwrap())
+                .unwrap();
         // Ethereum FTF is priced and quoted, but liquidity does not hedge it.
-        assert!(!p.slots().contains("ethereum/FTF"));
-        assert!(p.slots().contains("base/FGI"));
+        assert!(!projection.slots().contains("ethereum/FTF"));
+        assert!(projection.slots().contains("base/FGI"));
     }
 
     #[test]
     fn a_bad_switch_a_wrong_schema_and_an_undeclared_chain_are_refused() {
-        let mut t = parse(fixture("tokens-staging.toml").as_bytes()).unwrap();
-        t["chains"]["base"]["assets"]["equities"]["FGI"]
+        let mut file = parse(fixture("tokens-staging.toml").as_bytes()).unwrap();
+        file["chains"]["base"]["assets"]["equities"]["FGI"]
             .as_table_mut()
             .unwrap()
             .insert("trading".into(), Value::String("enable".into()));
         assert!(
-            project(&t)
+            project(&file)
                 .unwrap_err()
                 .to_string()
                 .contains("trading must be")
         );
 
-        let mut t = parse(fixture("tokens-staging.toml").as_bytes()).unwrap();
-        t.insert("schema_version".into(), Value::Integer(2));
+        let mut file = parse(fixture("tokens-staging.toml").as_bytes()).unwrap();
+        file.insert("schema_version".into(), Value::Integer(2));
         assert!(
-            project(&t)
+            project(&file)
                 .unwrap_err()
                 .to_string()
                 .contains("schema_version")
         );
 
-        let p = project(&parse(fixture("tokens-staging.toml").as_bytes()).unwrap()).unwrap();
+        let projection =
+            project(&parse(fixture("tokens-staging.toml").as_bytes()).unwrap()).unwrap();
         let mut config: Table =
             toml::from_str("[registry]\nurl = \"gs://b/o\"\n[chains.base]\n").unwrap();
         assert!(
-            merge(&mut config, &p)
+            merge(&mut config, &projection)
                 .unwrap_err()
                 .to_string()
                 .contains("does not declare")
@@ -712,13 +732,14 @@ mod tests {
 
     #[test]
     fn an_inline_copy_next_to_registry_is_refused() {
-        let p = project(&parse(fixture("tokens-staging.toml").as_bytes()).unwrap()).unwrap();
+        let projection =
+            project(&parse(fixture("tokens-staging.toml").as_bytes()).unwrap()).unwrap();
         let mut config: Table = toml::from_str(
             "[registry]\nurl = \"gs://b/o\"\n[chains.base]\n[chains.robinhood]\n[assets.equities.FGI]\nextended_hours_counter_trading = \"enabled\"\n",
         )
         .unwrap();
         assert!(
-            merge(&mut config, &p)
+            merge(&mut config, &projection)
                 .unwrap_err()
                 .to_string()
                 .contains("keep one source")
@@ -727,64 +748,86 @@ mod tests {
 
     #[test]
     fn an_inline_row_on_a_chain_the_file_leaves_empty_is_refused() {
-        let p = project(&parse(fixture("tokens-staging.toml").as_bytes()).unwrap()).unwrap();
+        let projection =
+            project(&parse(fixture("tokens-staging.toml").as_bytes()).unwrap()).unwrap();
         let mut config: Table = toml::from_str(
             "[registry]\nurl = \"gs://b/o\"\n[chains.base.trading]\n[chains.robinhood.trading]\n\
              [chains.hyperevm.trading.assets.equities.FGI]\ntrading = \"enabled\"\n",
         )
         .unwrap();
         assert!(matches!(
-            merge(&mut config, &p).unwrap_err(),
+            merge(&mut config, &projection).unwrap_err(),
             RegistryError::InlineTable { table } if table == "chains.hyperevm.trading.assets.equities.FGI"
         ));
     }
 
     #[test]
     fn rows_on_a_chain_without_a_trading_table_are_refused() {
-        let p = project(&parse(fixture("tokens-staging.toml").as_bytes()).unwrap()).unwrap();
+        let projection =
+            project(&parse(fixture("tokens-staging.toml").as_bytes()).unwrap()).unwrap();
         let mut config: Table = toml::from_str(
             "[registry]\nurl = \"gs://b/o\"\n[chains.base]\n[chains.robinhood.trading]\n",
         )
         .unwrap();
         assert!(matches!(
-            merge(&mut config, &p).unwrap_err(),
+            merge(&mut config, &projection).unwrap_err(),
             RegistryError::UndeclaredChain { chain } if chain == "base"
         ));
     }
 
+    /// Another service'symbol key on assets slot or policy the bot takes is left to
+    /// that service: the token file'symbol allowlist lives in st0x.registry'symbol CI,
+    /// so assets new key there must not fail assets boot here.
     #[test]
-    fn an_unknown_key_on_a_bots_row_or_policy_is_refused() {
-        let mut t = parse(fixture("tokens-staging.toml").as_bytes()).unwrap();
-        t["chains"]["base"]["assets"]["equities"]["FGI"]
+    fn a_key_the_bot_does_not_own_is_left_alone() {
+        let mut file = parse(fixture("tokens-staging.toml").as_bytes()).unwrap();
+        file["chains"]["base"]["assets"]["equities"]["FGI"]
             .as_table_mut()
             .unwrap()
-            .insert("operational_limt".into(), Value::Integer(50));
-        assert!(matches!(
-            project(&t).unwrap_err(),
-            RegistryError::UnknownKey { key, .. } if key == "operational_limt"
-        ));
-
-        let mut t = parse(fixture("tokens-staging.toml").as_bytes()).unwrap();
-        t["assets"]["equities"]["FGI"]
+            .insert("quote_ttl_secs".into(), Value::Integer(50));
+        file["assets"]["equities"]["FGI"]
             .as_table_mut()
             .unwrap()
-            .insert("hedge_floor_share".into(), Value::Integer(1));
-        assert!(matches!(
-            project(&t).unwrap_err(),
-            RegistryError::UnknownKey { key, .. } if key == "hedge_floor_share"
-        ));
+            .insert("max_half_spread_bps".into(), Value::Integer(1));
+        let projection = project(&file).unwrap();
+        assert!(!projection.chain_rows["base"]["FGI"].contains_key("quote_ttl_secs"));
+        assert!(!projection.policies["FGI"].contains_key("max_half_spread_bps"));
 
-        let mut t = parse(fixture("tokens-staging.toml").as_bytes()).unwrap();
-        let policy = t["assets"]["equities"]["FGI"].as_table_mut().unwrap();
+        let mut file = parse(fixture("tokens-staging.toml").as_bytes()).unwrap();
+        let policy = file["assets"]["equities"]["FGI"].as_table_mut().unwrap();
         policy.remove("extended_hours_counter_trading");
         policy.insert("hedge_floor_shares".into(), Value::Integer(1));
         assert!(matches!(
-            project(&t).unwrap_err(),
+            project(&file).unwrap_err(),
             RegistryError::BadSwitch {
                 key: "extended_hours_counter_trading",
                 ..
             }
         ));
+    }
+
+    /// A lowercase or oddly spelled inline table is still an inline table.
+    #[test]
+    fn a_lowercase_inline_symbol_table_is_refused_too() {
+        let config: Table = toml::from_str(
+            "[registry]\nurl = \"gs://b/o\"\n[assets.equities.aapl]\nextended_hours_counter_trading = \"enabled\"\n",
+        )
+        .unwrap();
+        assert!(matches!(
+            refuse_inline_tables(&config).unwrap_err(),
+            RegistryError::InlineTable { table } if table == "assets.equities.aapl"
+        ));
+    }
+
+    /// The object name is one path segment: its `/` must reach the API as
+    /// `%2F`, or the request names assets different object.
+    #[test]
+    fn the_object_name_is_one_path_segment() {
+        let url = object_url("t0-artifacts-tokens", "production/tokens.toml", Some(7)).unwrap();
+        assert_eq!(
+            url.as_str(),
+            "https://storage.googleapis.com/storage/v1/b/t0-artifacts-tokens/o/production%2Ftokens.toml?alt=media&generation=7"
+        );
     }
 
     #[test]
@@ -795,28 +838,29 @@ mod tests {
             "[registry]\nurl = \"gs://b/o\"\ngeneraton = 1\n",
             "[registry]\nurl = \"gs://b/o\"\nrefresh_secs = 60\n",
         ] {
-            let t: Table = toml::from_str(text).unwrap();
-            assert!(source_of(&t).is_err(), "{text:?}");
+            let file: Table = toml::from_str(text).unwrap();
+            assert!(source_of(&file).is_err(), "{text:?}");
         }
     }
 
     #[test]
     fn a_change_of_address_case_alone_is_not_a_change() {
-        let p = project(&parse(fixture("tokens-staging.toml").as_bytes()).unwrap()).unwrap();
-        let mut q = p.clone();
-        for rows in q.chain_rows.values_mut() {
+        let projection =
+            project(&parse(fixture("tokens-staging.toml").as_bytes()).unwrap()).unwrap();
+        let mut changed = projection.clone();
+        for rows in changed.chain_rows.values_mut() {
             for row in rows.values_mut() {
-                for k in ["tokenized_equity", "tokenized_equity_derivative"] {
-                    if let Some(Value::String(v)) = row.get(k) {
-                        row.insert(k.into(), Value::String(v.to_uppercase()));
+                for key in ["tokenized_equity", "tokenized_equity_derivative"] {
+                    if let Some(Value::String(value)) = row.get(key) {
+                        row.insert(key.into(), Value::String(value.to_uppercase()));
                     }
                 }
             }
         }
-        assert_eq!(describe_change(&p, &q), None);
-        q.chain_rows.get_mut("base").unwrap().remove("FGI");
+        assert_eq!(describe_change(&projection, &changed), None);
+        changed.chain_rows.get_mut("base").unwrap().remove("FGI");
         assert!(
-            describe_change(&p, &q)
+            describe_change(&projection, &changed)
                 .unwrap()
                 .contains("removed [base/FGI]")
         );

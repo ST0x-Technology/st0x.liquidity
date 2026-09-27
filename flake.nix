@@ -570,7 +570,9 @@
             # (the compiled binary), which that module doesn't have access to.
             # The config's `[registry]` token file is read here with the
             # operator's gcloud credentials (the pinned generation when there
-            # is one), since the binary can reach the bucket only on the VM.
+            # is one, as `gs://bucket/object#generation`, see
+            # https://cloud.google.com/storage/docs/using-versioned-objects#gcloud-cli),
+            # since the binary can reach the bucket only on the VM.
             # REGISTRY_FILE points at a local copy instead.
             verifyMigrationsPkgs = builtins.listToAttrs (
               map (

@@ -9088,7 +9088,8 @@ mod tests {
             (
                 "prod",
                 include_str!("../../../config/prod/st0x-hedge.toml"),
-                include_bytes!("../../../tests/fixtures/tokens-production.toml").as_slice(),
+                include_bytes!("../../../tests/fixtures/tokens-production-1790341753647581.toml")
+                    .as_slice(),
                 &prod_equities,
             ),
             (
@@ -9282,8 +9283,11 @@ mod tests {
                 if env == "staging" { "staging" } else { "prod" }
             ));
             let deployed = std::fs::read_to_string(&config_path).unwrap();
-            let tokens =
-                std::fs::read(root.join(format!("tests/fixtures/tokens-{env}.toml"))).unwrap();
+            let tokens = std::fs::read(root.join(match env {
+                "staging" => "tests/fixtures/tokens-staging.toml",
+                _ => "tests/fixtures/tokens-production-1790341753647581.toml",
+            }))
+            .unwrap();
             let inline: Config = toml::from_str(
                 &std::fs::read_to_string(root.join(format!("tests/fixtures/{env}-inline.toml")))
                     .unwrap(),
@@ -9335,6 +9339,32 @@ mod tests {
             let alone: Config = table.try_into().unwrap();
             validate_config(&alone, &config_path, &mut notices).unwrap();
         }
+    }
+
+    /// The production fixture is the pinned generation, by name: bumping the
+    /// pin without refreshing the fixture (and the tests that read it) fails
+    /// here, before a VM boot finds out.
+    #[test]
+    fn the_production_fixture_is_the_pinned_generation() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let deployed: toml::Table =
+            toml::from_str(include_str!("../../../config/prod/st0x-hedge.toml")).unwrap();
+        let pinned = registry::source_of(&deployed)
+            .unwrap()
+            .unwrap()
+            .generation
+            .unwrap();
+        let fixture = root.join(format!("tests/fixtures/tokens-production-{pinned}.toml"));
+        assert!(
+            fixture.is_file(),
+            "config/prod pins generation {pinned}; put that copy at {}",
+            fixture.display()
+        );
+        assert_eq!(
+            std::fs::read(&fixture).unwrap(),
+            include_bytes!("../../../tests/fixtures/tokens-production-1790341753647581.toml"),
+            "the tests read a different fixture than the pin names"
+        );
     }
 
     /// A config that names `[registry]` and still carries a per-symbol

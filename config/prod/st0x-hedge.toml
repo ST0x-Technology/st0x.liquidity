@@ -323,7 +323,8 @@ operational_limit = 25000
 # config-check stays red on this file until that tag exists. Empty on
 # purpose: QSEP is still CONFIGURED below (as production runs it), and the
 # schema refuses a symbol that is both configured and retired; retire it
-# by deleting its tables and listing it here in one change.
+# by listing it here first, then removing its rows from the token file in
+# st0x.registry (see docs/how-to-add-new-asset.md, "Retiring an asset").
 [assets.equities]
 retired_symbols = []
 
