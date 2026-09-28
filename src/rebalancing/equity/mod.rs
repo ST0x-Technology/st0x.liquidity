@@ -480,6 +480,10 @@ impl Raindex for PanickingRaindex {
         unimplemented!("PanickingRaindex: not available in CLI context")
     }
 
+    async fn tx_mined(&self, _: TxHash) -> Result<bool, RaindexError> {
+        unimplemented!("PanickingRaindex: not available in CLI context")
+    }
+
     async fn confirm_tx_receipt(&self, _: TxHash) -> Result<TransactionReceipt, RaindexError> {
         unimplemented!("PanickingRaindex: not available in CLI context")
     }
@@ -2651,6 +2655,7 @@ mod tests {
     use std::time::Duration;
     use tokio::sync::{Notify, broadcast};
 
+    use st0x_bridge::corridor::UsdcCorridor;
     use st0x_config::{AllocationCtx, ChainAssets, ChainEquities, ChainEquityAsset, OperationMode};
     use st0x_dto::Statement;
     use st0x_event_sorcery::{
@@ -3313,6 +3318,7 @@ mod tests {
 
         let service = Arc::new(RebalancingService::new(
             RebalancingServiceConfig {
+                served_usdc_corridor: UsdcCorridor::BASE_CCTP,
                 poll_freshness: PollFreshness::always_fresh(),
                 inventory_staleness_bound: Duration::from_secs(300),
                 cash_reserved: None,
@@ -3470,6 +3476,7 @@ mod tests {
 
         let service = Arc::new(RebalancingService::new(
             RebalancingServiceConfig {
+                served_usdc_corridor: UsdcCorridor::BASE_CCTP,
                 poll_freshness: PollFreshness::always_fresh(),
                 inventory_staleness_bound: Duration::from_secs(300),
                 cash_reserved: None,
@@ -3878,6 +3885,7 @@ mod tests {
         ));
         let service = Arc::new(RebalancingService::new(
             RebalancingServiceConfig {
+                served_usdc_corridor: UsdcCorridor::BASE_CCTP,
                 poll_freshness: PollFreshness::always_fresh(),
                 inventory_staleness_bound: Duration::from_secs(300),
                 cash_reserved: None,
@@ -4029,6 +4037,7 @@ mod tests {
 
         let service = Arc::new(RebalancingService::new(
             RebalancingServiceConfig {
+                served_usdc_corridor: UsdcCorridor::BASE_CCTP,
                 poll_freshness: PollFreshness::always_fresh(),
                 inventory_staleness_bound: Duration::from_secs(300),
                 cash_reserved: None,

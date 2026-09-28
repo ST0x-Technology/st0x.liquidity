@@ -55,8 +55,8 @@ st0x-finance.workspace = true
 st0x-float-macro.workspace = true
 st0x-float-serde.workspace = true
 st0x-hedge.workspace = true
-st0x-issuance-client = { git = "https://github.com/ST0x-Technology/st0x.issuance.git", branch = "2026-08-06-mint-authorization-client-dto", version = "0.1.0" }
-st0x-issuance-dto = { git = "https://github.com/ST0x-Technology/st0x.issuance.git", branch = "2026-08-06-mint-authorization-client-dto", version = "0.1.0" }
+st0x-issuance-client = { git = "https://github.com/ST0x-Technology/st0x.issuance.git", tag = "v0.13.3" }
+st0x-issuance-dto = { git = "https://github.com/ST0x-Technology/st0x.issuance.git", tag = "v0.13.3" }
 st0x-raindex = { workspace = true, features = ["rain"] }
 st0x-registry.workspace = true
 st0x-tokenization.workspace = true
