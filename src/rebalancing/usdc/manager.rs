@@ -4967,7 +4967,8 @@ impl<
     }
 
     /// Checks the credit ledger, signs the send and persists it, then
-    /// broadcasts it, records its hash and waits for it to confirm.
+    /// broadcasts it and waits for it to confirm; `InitiateDeposit` then
+    /// records its hash.
     async fn send_alpaca_deposit_to(
         &self,
         id: &UsdcRebalanceId,
@@ -5051,8 +5052,8 @@ impl<
         })?
     }
 
-    /// Broadcasts the persisted deposit send, records its hash and waits for
-    /// it to confirm. Every call sends the same signed bytes, so a crash,
+    /// Broadcasts the persisted deposit send and waits for it to confirm;
+    /// `InitiateDeposit` then records its hash. Every call sends the same signed bytes, so a crash,
     /// timeout or failed write anywhere here is recovered by calling it again.
     /// An outcome not known yet is `DepositSendReconciliationPending`, which
     /// the job redrives; a revert fails the deposit for reconciliation.
@@ -5101,7 +5102,7 @@ impl<
                 Err(self
                     .fail_unresolved_deposit_send(
                         id,
-                        UnresolvedDepositSend::RecordedSendReverted { tx: expected },
+                        UnresolvedDepositSend::SignedSendReverted { tx: expected },
                     )
                     .await)
             }
@@ -16837,7 +16838,7 @@ mod tests {
             .unwrap_err();
 
         let UsdcTransferError::DepositSendUnresolved {
-            cause: UnresolvedDepositSend::RecordedSendReverted { tx },
+            cause: UnresolvedDepositSend::SignedSendReverted { tx },
             ..
         } = error
         else {

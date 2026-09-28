@@ -840,7 +840,7 @@ before the startup token approvals.
 - **"deposit marked failed for operator reconciliation"**
   (`DepositSendUnresolved`): the transfer is `DepositFailed`, holds the guard,
   and the job does not retry. The page names the cause and the step:
-  - "the recorded deposit send <tx> was mined reverted": the send moved nothing.
+  - "the signed deposit send <tx> was mined reverted": the send moved nothing.
     The minted USDC is still in the Ethereum wallet. Move it by hand, then
     `transfer reconcile --kind usdc`.
   - "no deposit send was recorded, but send <tx> of the same amount ...": only a

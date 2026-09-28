@@ -576,8 +576,8 @@ pub enum UnresolvedDepositSend {
          Alpaca deposit address landed after the mint and may belong to another transfer"
     )]
     UnrecordedSend { tx: TxHash },
-    #[error("the recorded deposit send {tx} was mined reverted")]
-    RecordedSendReverted { tx: TxHash },
+    #[error("the signed deposit send {tx} was mined reverted")]
+    SignedSendReverted { tx: TxHash },
 }
 
 impl UnresolvedDepositSend {
@@ -590,7 +590,7 @@ impl UnresolvedDepositSend {
                 "`transfer recheck --kind usdc --deposit-tx <hash>` with this transfer's own \
                  send if Alpaca credited it, else `transfer reconcile --kind usdc`"
             }
-            Self::RecordedSendReverted { .. } => {
+            Self::SignedSendReverted { .. } => {
                 "the send moved no USDC; settle the minted USDC with `transfer reconcile --kind usdc`"
             }
         }
