@@ -36042,33 +36042,69 @@ mod tests {
         );
     }
 
-    async fn resume_base_transfer_with_a_holder_on(
+    async fn resume_base_alpaca_outbound_with_a_holder_on(
         corridor: UsdcCorridor,
+        direction: RebalanceDirection,
     ) -> Result<(), UsdcResumeError> {
         let (trigger, pool, store) = make_resume_trigger().await;
         let id = seed_converting_alpaca_to_base(&store).await;
         let holder = UsdcRebalanceId(Uuid::new_v4());
-        seed_withdrawing_alpaca_to_base_on(&store, &holder, usdc(300), corridor).await;
+        match direction {
+            RebalanceDirection::AlpacaToBase => {
+                seed_withdrawing_alpaca_to_base_on(&store, &holder, usdc(300), corridor).await;
+            }
+            RebalanceDirection::BaseToAlpaca => store
+                .send(
+                    &holder,
+                    UsdcRebalanceCommand::BeginWithdrawal {
+                        direction,
+                        corridor,
+                        amount: usdc(300),
+                        from_block: 1,
+                    },
+                )
+                .await
+                .unwrap(),
+        }
 
         trigger
             .resume_usdc_transfer(&pool, &id, RebalanceDirection::AlpacaToBase)
             .await
     }
 
-    /// The durable guard-holder gate of a manual resume counts only holders
-    /// on the resumed transfer's corridor.
+    /// A manual resume is refused by a holder on its own corridor, and, for
+    /// an Alpaca-outbound transfer, by an Alpaca-outbound holder on any
+    /// corridor; an inbound holder on another corridor does not refuse it.
     #[tokio::test]
     async fn manual_resume_is_refused_only_by_a_holder_on_its_corridor() {
-        resume_base_transfer_with_a_holder_on(ROBINHOOD_RELAY)
-            .await
-            .expect("a holder on another corridor must not refuse a Base resume");
+        resume_base_alpaca_outbound_with_a_holder_on(
+            ROBINHOOD_RELAY,
+            RebalanceDirection::BaseToAlpaca,
+        )
+        .await
+        .expect("an inbound holder on another corridor must not refuse a Base resume");
 
-        let error = resume_base_transfer_with_a_holder_on(UsdcCorridor::BASE_CCTP)
-            .await
-            .unwrap_err();
+        let error = resume_base_alpaca_outbound_with_a_holder_on(
+            UsdcCorridor::BASE_CCTP,
+            RebalanceDirection::BaseToAlpaca,
+        )
+        .await
+        .unwrap_err();
         assert!(
             matches!(error, UsdcResumeError::GuardHeldElsewhere),
             "a Base holder must refuse a Base resume, got {error:?}"
+        );
+
+        let error = resume_base_alpaca_outbound_with_a_holder_on(
+            ROBINHOOD_RELAY,
+            RebalanceDirection::AlpacaToBase,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(error, UsdcResumeError::GuardHeldElsewhere),
+            "an Alpaca-outbound holder on another corridor must refuse an \
+             Alpaca-outbound resume, got {error:?}"
         );
     }
 }
