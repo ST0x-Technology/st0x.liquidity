@@ -1971,8 +1971,8 @@ rule fails startup with a named error:
 5. `hop = "cctp"` on a chain whose settlement stable is not Circle's USDC
    (Robinhood), or on a chain this build has no CCTP domain for (HyperEVM).
 6. `hop = "relay"` on any chain: this build has no Relay hop.
-7. USDC mode enabled and a chain whose cash table enables rebalancing has no
-   corridor table: there is no implicit corridor.
+7. USDC mode enabled and a chain that is not disabled, whose cash table enables
+   rebalancing, has no corridor table: there is no implicit corridor.
 8. A corridor chain other than the primary chain, until each corridor has its
    own cash guard.
 9. Transitional: `target` or `deviation` still set directly under

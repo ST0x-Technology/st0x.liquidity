@@ -1913,12 +1913,14 @@ fn validate_usdc_corridor_chains(
         return Ok(());
     }
 
+    // A disabled chain's asset flags are inert, as in `check_enablement`.
     let uncovered = chains.iter().find(|(chain, config)| {
-        config
-            .trading
-            .as_ref()
-            .and_then(|trading| trading.assets.cash.as_ref())
-            .is_some_and(|cash| cash.rebalancing == OperationMode::Enabled)
+        config.lifecycle != ChainLifecycle::Disabled
+            && config
+                .trading
+                .as_ref()
+                .and_then(|trading| trading.assets.cash.as_ref())
+                .is_some_and(|cash| cash.rebalancing == OperationMode::Enabled)
             && !usdc.corridors.contains_key(chain)
     });
 
@@ -11674,6 +11676,16 @@ mod tests {
             ),
             "got {error:?}"
         );
+    }
+
+    #[test]
+    fn disabled_chain_with_stale_cash_rebalancing_needs_no_corridor() {
+        let mut config = prod_config();
+        cash_mut(&mut config, Chain::Robinhood).rebalancing = OperationMode::Enabled;
+        config.chains.get_mut(&Chain::Robinhood).unwrap().lifecycle = ChainLifecycle::Disabled;
+
+        validate_usdc_corridor_chains(&config.rebalancing.as_ref().unwrap().usdc, &config.chains)
+            .unwrap();
     }
 
     #[test]
