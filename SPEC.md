@@ -5872,11 +5872,11 @@ named exemptions defined after the list:**
   settled. The recheck reports `not_detected_yet`, changes nothing, and the
   operator retries later. Other USDC states keep their existing paths (`resume`
   while non-terminal, `reconcile` for funds handled out-of-band rather than
-  settled by the provider). Because the USDC recheck sends from the
-  rebalancing wallet and advances the aggregate on the request task, it first
-  quiesces the USDC rebalancing driver and holds it paused for the whole
-  recheck, refusing with `503` when the driver cannot quiesce (see "Both
-  bot-routed USDC recovery routes quiesce the rebalancing driver first" below).
+  settled by the provider). Because the USDC recheck sends from the rebalancing
+  wallet and advances the aggregate on the request task, it first quiesces the
+  USDC rebalancing driver and holds it paused for the whole recheck, refusing
+  with `503` when the driver cannot quiesce (see "Both bot-routed USDC recovery
+  routes quiesce the rebalancing driver first" below).
 - `fail` -- force a stuck non-terminal operation to its clean `Failed` terminal
   so the system stops waiting on it; `--reason` required.
 - `reconcile` -- declare an already-terminal-failed operation resolved
