@@ -7264,6 +7264,7 @@ dependencies = [
  "bon",
  "chrono",
  "clap",
+ "httpmock",
  "itertools 0.14.0",
  "opentelemetry",
  "opentelemetry-appender-tracing",

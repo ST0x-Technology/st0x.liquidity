@@ -510,15 +510,31 @@ pub fn merge(config: &mut Table, projection: &Projection) -> Result<(), Registry
     Ok(())
 }
 
+/// Where the metadata server and Cloud Storage answer.
+#[derive(Debug, Clone, Copy)]
+struct Endpoints<'a> {
+    metadata: &'a str,
+    storage: &'a str,
+}
+
+const GOOGLE: Endpoints<'static> = Endpoints {
+    metadata: "http://metadata.google.internal",
+    storage: "https://storage.googleapis.com",
+};
+
 /// The JSON API URL of one object: `/b/<bucket>/o/<object>?alt=media`, the
 /// object name as one path segment (`/` in it becomes `%2F`), plus
 /// `generation` when pinned.
-fn object_url(bucket: &str, object: &str, generation: Option<u64>) -> Result<Url, RegistryError> {
-    let mut url = Url::parse("https://storage.googleapis.com/storage/v1/").map_err(|_| {
-        RegistryError::Url {
+fn object_url(
+    storage: &str,
+    bucket: &str,
+    object: &str,
+    generation: Option<u64>,
+) -> Result<Url, RegistryError> {
+    let mut url =
+        Url::parse(&format!("{storage}/storage/v1/")).map_err(|_| RegistryError::Url {
             url: format!("gs://{bucket}/{object}"),
-        }
-    })?;
+        })?;
     url.path_segments_mut()
         .map_err(|()| RegistryError::Url {
             url: format!("gs://{bucket}/{object}"),
@@ -548,13 +564,15 @@ pub fn http_client() -> Result<reqwest::Client, RegistryError> {
 
 /// The VM service account's access token.
 /// See <https://cloud.google.com/compute/docs/access/authenticate-workloads#applications>.
-async fn access_token(http: &reqwest::Client) -> Result<String, RegistryError> {
+async fn access_token(http: &reqwest::Client, metadata: &str) -> Result<String, RegistryError> {
     #[derive(Deserialize)]
     struct Token {
         access_token: String,
     }
     let token: Token = http
-        .get("http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token")
+        .get(format!(
+            "{metadata}/computeMetadata/v1/instance/service-accounts/default/token"
+        ))
         .header("Metadata-Flavor", "Google")
         .send()
         .await
@@ -574,9 +592,18 @@ pub async fn fetch(
     gs_url: &str,
     generation: Option<u64>,
 ) -> Result<Vec<u8>, RegistryError> {
+    fetch_from(http, GOOGLE, gs_url, generation).await
+}
+
+async fn fetch_from(
+    http: &reqwest::Client,
+    endpoints: Endpoints<'_>,
+    gs_url: &str,
+    generation: Option<u64>,
+) -> Result<Vec<u8>, RegistryError> {
     let (bucket, object) = parse_gs_url(gs_url)?;
-    let url = object_url(bucket, object, generation)?;
-    let token = access_token(http).await?;
+    let url = object_url(endpoints.storage, bucket, object, generation)?;
+    let token = access_token(http, endpoints.metadata).await?;
     let named = || {
         generation.map_or_else(
             || gs_url.to_string(),
@@ -630,7 +657,15 @@ pub async fn load_bytes(
             source,
         });
     }
-    let http = http_client()?;
+    load_from(&http_client()?, GOOGLE, source, BOOT_READ_BUDGET).await
+}
+
+async fn load_from(
+    http: &reqwest::Client,
+    endpoints: Endpoints<'_>,
+    source: &RegistrySource,
+    budget: Duration,
+) -> Result<Vec<u8>, RegistryError> {
     // No tracing subscriber exists yet at boot, so a failed attempt is kept
     // for the error rather than logged: the budget running out still names
     // why the attempts before it failed.
@@ -638,7 +673,7 @@ pub async fn load_bytes(
     let read = async {
         let mut attempt = 1;
         loop {
-            match fetch(&http, &source.url, source.generation).await {
+            match fetch_from(http, endpoints, &source.url, source.generation).await {
                 Ok(bytes) => break Ok(bytes),
                 Err(error) if attempt < 3 => {
                     last = Some(Box::new(error));
@@ -649,7 +684,7 @@ pub async fn load_bytes(
             }
         }
     };
-    let outcome = tokio::time::timeout(BOOT_READ_BUDGET, read).await;
+    let outcome = tokio::time::timeout(budget, read).await;
     outcome.map_err(|_| RegistryError::BootTimeout {
         url: source.url.clone(),
         last,
@@ -1006,7 +1041,13 @@ mod tests {
     /// `%2F`, or the request names a different object.
     #[test]
     fn the_object_name_is_one_path_segment() {
-        let url = object_url("t0-artifacts-tokens", "production/tokens.toml", Some(7)).unwrap();
+        let url = object_url(
+            GOOGLE.storage,
+            "t0-artifacts-tokens",
+            "production/tokens.toml",
+            Some(7),
+        )
+        .unwrap();
         assert_eq!(
             url.as_str(),
             "https://storage.googleapis.com/storage/v1/b/t0-artifacts-tokens/o/production%2Ftokens.toml?alt=media&generation=7"
@@ -1167,5 +1208,155 @@ mod tests {
             };
             assert_eq!(error.copy_is_unusable(), unusable, "{status}");
         }
+    }
+
+    const OBJECT: &str = "gs://t0-artifacts-tokens/staging/tokens.toml";
+
+    fn source() -> RegistrySource {
+        RegistrySource {
+            url: OBJECT.into(),
+            generation: None,
+        }
+    }
+
+    fn endpoints(server: &httpmock::MockServer) -> (String, String) {
+        (server.base_url(), server.base_url())
+    }
+
+    fn serve_token(server: &httpmock::MockServer) {
+        server.mock(|when, then| {
+            when.method(httpmock::Method::GET)
+                .path("/computeMetadata/v1/instance/service-accounts/default/token")
+                .header("Metadata-Flavor", "Google");
+            then.status(200)
+                .header("content-type", "application/json")
+                .body(r#"{"access_token":"vm-token","expires_in":3599,"token_type":"Bearer"}"#);
+        });
+    }
+
+    fn serve_object(
+        server: &httpmock::MockServer,
+        status: u16,
+        body: Vec<u8>,
+    ) -> httpmock::Mock<'_> {
+        server.mock(|when, then| {
+            when.method(httpmock::Method::GET)
+                .path_includes("/storage/v1/b/t0-artifacts-tokens/o/")
+                .query_param("alt", "media")
+                .header("authorization", "Bearer vm-token");
+            then.status(status).body(body);
+        })
+    }
+
+    async fn read(server: &httpmock::MockServer) -> Result<Vec<u8>, RegistryError> {
+        let (metadata, storage) = endpoints(server);
+        fetch_from(
+            &http_client().unwrap(),
+            Endpoints {
+                metadata: &metadata,
+                storage: &storage,
+            },
+            OBJECT,
+            None,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn a_read_carries_the_vm_token_and_returns_the_body() {
+        let server = httpmock::MockServer::start_async().await;
+        serve_token(&server);
+        let object = serve_object(&server, 200, b"schema_version = 1".to_vec());
+
+        assert_eq!(read(&server).await.unwrap(), b"schema_version = 1");
+        object.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn a_gone_or_forbidden_copy_is_unusable() {
+        for status in [404, 403] {
+            let server = httpmock::MockServer::start_async().await;
+            serve_token(&server);
+            serve_object(&server, status, b"no".to_vec());
+
+            let error = read(&server).await.unwrap_err();
+            assert!(
+                matches!(&error, RegistryError::Status { status: got, .. } if got.as_u16() == status),
+                "{error:?}"
+            );
+            assert!(error.copy_is_unusable(), "{status}");
+        }
+    }
+
+    #[tokio::test]
+    async fn an_oversized_copy_is_refused() {
+        let server = httpmock::MockServer::start_async().await;
+        serve_token(&server);
+        serve_object(&server, 200, vec![b'#'; MAX_BODY + 1]);
+
+        let error = read(&server).await.unwrap_err();
+        assert!(matches!(error, RegistryError::TooLarge { .. }), "{error:?}");
+        assert!(error.copy_is_unusable());
+    }
+
+    #[tokio::test]
+    async fn boot_succeeds_on_a_later_attempt() {
+        let server = httpmock::MockServer::start_async().await;
+        serve_token(&server);
+        let failing = serve_object(&server, 503, b"busy".to_vec());
+        let (metadata, storage) = endpoints(&server);
+        let http = http_client().unwrap();
+        let source = source();
+        let boot = load_from(
+            &http,
+            Endpoints {
+                metadata: &metadata,
+                storage: &storage,
+            },
+            &source,
+            BOOT_READ_BUDGET,
+        );
+        let swap = async {
+            while failing.calls_async().await == 0 {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            failing.delete_async().await;
+            serve_object(&server, 200, b"schema_version = 1".to_vec())
+        };
+
+        let (bytes, _) = tokio::join!(boot, swap);
+        assert_eq!(bytes.unwrap(), b"schema_version = 1");
+    }
+
+    #[tokio::test]
+    async fn a_stalled_bucket_ends_in_a_boot_timeout() {
+        let server = httpmock::MockServer::start_async().await;
+        serve_token(&server);
+        server
+            .mock_async(|when, then| {
+                when.method(httpmock::Method::GET)
+                    .path_includes("/storage/v1/b/");
+                then.status(200)
+                    .body("schema_version = 1")
+                    .delay(Duration::from_secs(2));
+            })
+            .await;
+        let (metadata, storage) = endpoints(&server);
+
+        let error = load_from(
+            &http_client().unwrap(),
+            Endpoints {
+                metadata: &metadata,
+                storage: &storage,
+            },
+            &source(),
+            Duration::from_millis(500),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(error, RegistryError::BootTimeout { last: None, .. }),
+            "{error:?}"
+        );
     }
 }
