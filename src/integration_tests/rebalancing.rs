@@ -2472,7 +2472,7 @@ async fn usdc_operational_limits_cap_across_trigger_cycles() {
         }],
         "First transfer capped to $100",
     );
-    trigger.clear_usdc_in_progress();
+    trigger.usdc_guards.release_every_holder();
 
     // Simulate first transfer: 150 onchain, 850 offchain = 15% ratio
     // Still below 30% lower bound, excess = 500 - 150 = 350
@@ -2494,7 +2494,7 @@ async fn usdc_operational_limits_cap_across_trigger_cycles() {
         }],
         "Second transfer capped to $100",
     );
-    trigger.clear_usdc_in_progress();
+    trigger.usdc_guards.release_every_holder();
 
     // Simulate second transfer: 250 onchain, 750 offchain = 25% ratio
     // Still below 30% lower bound, excess = 500 - 250 = 250
@@ -2516,7 +2516,7 @@ async fn usdc_operational_limits_cap_across_trigger_cycles() {
         }],
         "Third transfer capped to $100",
     );
-    trigger.clear_usdc_in_progress();
+    trigger.usdc_guards.release_every_holder();
 
     // Simulate third transfer: 350 onchain, 650 offchain = 35% ratio
     // Now within [30%, 70%] band -> balanced, no more trigger
@@ -2622,7 +2622,7 @@ async fn usdc_in_progress_blocks_concurrent_triggers() {
     );
 
     // Clear in-progress (simulates operation completion/failure)
-    trigger.clear_usdc_in_progress();
+    trigger.usdc_guards.release_every_holder();
 
     // Trigger fires again: same inventory, same excess = 400, capped to 100
     trigger.check_and_trigger_usdc().await;
