@@ -300,10 +300,22 @@ fn parse_positive_shares(input: &str) -> Result<Positive<FractionalShares>, Stri
     Positive::new(shares).map_err(|err| format!("{err}"))
 }
 
+/// What `--version` reports: the commit this binary was built from, as
+/// `rust.nix` passes it and the server already reports from `/health`.
+///
+/// The crate version cannot serve here. It is the workspace `0.1.0` and has
+/// never tracked a release tag -- liquidity is on v1.13.x -- so it names
+/// every build identically and identifies none of them. "dev" is what a
+/// cargo build outside nix gets, where there is no commit to name.
+const VERSION: &str = match option_env!("ST0X_GIT_COMMIT") {
+    Some(commit) => commit,
+    None => "dev",
+};
+
 #[derive(Debug, Parser)]
 #[command(name = "st0x-cli")]
 #[command(about = "A CLI tool for st0x liquidity operations")]
-#[command(version)]
+#[command(version = VERSION)]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Commands,
@@ -1039,7 +1051,7 @@ pub enum CctpCommand {
 #[derive(Debug, Parser)]
 #[command(name = "st0x-cli")]
 #[command(about = "A CLI tool for st0x liquidity operations")]
-#[command(version)]
+#[command(version = VERSION)]
 pub struct CliEnv {
     #[clap(flatten)]
     env: Env,

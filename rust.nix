@@ -228,6 +228,11 @@ in
         homepage = "https://github.com/ST0x-Technology/st0x.liquidity";
       };
     }
+    # Same compile-time commit the server reports from /health, so
+    # `st0x-cli --version` names the build an operator is actually running.
+    # The crate version cannot: it is the workspace `0.1.0` and has never
+    # tracked a release tag.
+    // pkgs.lib.optionalAttrs (gitCommit != null) { ST0X_GIT_COMMIT = gitCommit; }
   );
 
 }
