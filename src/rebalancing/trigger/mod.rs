@@ -36284,4 +36284,55 @@ mod tests {
         );
         assert!(market_making_job_rows(&trigger).await.is_empty());
     }
+
+    /// A failed startup page for an every-corridor latch is retried by the
+    /// sweep until it is delivered, then never sent again.
+    #[tokio::test]
+    async fn failed_startup_every_corridor_page_is_retried_by_the_sweep() {
+        let pool = crate::test_utils::setup_test_db().await;
+        let store = test_store::<UsdcRebalance>(pool.clone(), ());
+        // Direct INSERT into `events`: no command can produce an unoriginated
+        // first event, which replays to no aggregate.
+        let event = UsdcRebalanceEvent::BridgingInitiated {
+            burn_tx_hash: B256::repeat_byte(0xaa),
+            burned_at: Utc::now(),
+        };
+        sqlx::query(
+            "INSERT INTO events \
+             (aggregate_type, aggregate_id, sequence, event_type, event_version, payload, metadata) \
+             VALUES ('UsdcRebalance', ?, 0, 'UsdcRebalanceEvent::BridgingInitiated', '1.0', ?, '{}')",
+        )
+        .bind(UsdcRebalanceId(Uuid::new_v4()).to_string())
+        .bind(serde_json::to_string(&event).unwrap())
+        .execute(&pool)
+        .await
+        .unwrap();
+        let notifier = Arc::new(FlakyNotifier {
+            remaining_failures: std::sync::atomic::AtomicUsize::new(1),
+            delivered: std::sync::Mutex::new(Vec::new()),
+        });
+        let trigger = make_trigger_with_inventory_config_and_notifier(
+            InventoryView::default(),
+            test_config(),
+            notifier.clone(),
+        )
+        .await;
+
+        trigger.recover_usdc_guard(&pool, &store).await.unwrap();
+        assert_eq!(notifier.delivered.lock().unwrap().len(), 0);
+        for _ in 0..2 {
+            trigger
+                .expire_stuck_usdc_rebalances(Utc::now())
+                .await
+                .unwrap();
+        }
+
+        let delivered = notifier.delivered.lock().unwrap().clone();
+        assert_eq!(delivered.len(), 1, "got {delivered:?}");
+        assert!(
+            delivered[0]
+                .starts_with("USDC rebalancing is LATCHED on startup with no automated recovery"),
+            "got {delivered:?}"
+        );
+    }
 }
