@@ -156,8 +156,11 @@ own transaction, so it needs no guard.
 Startup rebuilds each corridor's entry from the persisted aggregates, as before:
 a transfer whose state holds the guard holds its corridor's entry. A candidate
 that cannot be loaded or parsed has no known corridor and latches every corridor
-until a restart can classify it. The guard stays in memory and derived from the
-event log; there is still no stored flag.
+until a restart can classify it. The running bot does the same when a post-burn
+failure's corridor cannot be read (no tracking, and the aggregate does not
+load): every corridor stays latched until a restart, and a page is retried until
+delivered. The guard stays in memory and derived from the event log; there is
+still no stored flag.
 
 The Jobs-table dedupe and the manual resume gates are scoped to the corridor in
 the same way. The operator pause stays global: it quiesces the shared transfer

@@ -4703,7 +4703,13 @@ terminal states only.
 - **Unresolved/unparseable aggregate IDs**: Aggregates that are missing from the
   store or have unparseable IDs have no known corridor, so they latch every
   corridor's guard until a restart can classify them, with an operator alert.
-  These indicate store inconsistency and require manual investigation.
+  These indicate store inconsistency and require manual investigation. The
+  running bot latches every corridor the same way when a post-burn failure's
+  corridor cannot be read (no in-memory tracking and the aggregate does not
+  load); the latch lasts until a restart and pages once, retried by the timeout
+  sweep until delivered: "USDC rebalancing is LATCHED on every corridor with no
+  automated recovery". While any every-corridor latch is set, manual resumes are
+  refused.
 
 Note: USDC (FiatToken v2.2) decrements even `U256::MAX` allowances in
 `transferFrom`. At realistic rebalancing sizes the allowance never drops below
@@ -5884,7 +5890,9 @@ second burn. Reconcilable failures (`DepositFailed`, a `BridgingFailed` with
 burn evidence or in the AlpacaToBase direction, and a BaseToAlpaca
 `ConversionFailed`) keep the guard held until the operator settles them with
 `transfer reconcile --kind usdc`. All other guarded states keep the guard held
-and page the operator for manual recovery.
+and page the operator for manual recovery. A candidate that cannot be loaded or
+parsed at boot, or a post-burn failure whose corridor the running bot cannot
+read, latches every corridor until a restart.
 
 **Operator recovery of a pre-burn stranded guard latch**: A USDC rebalance can
 become stranded in `WithdrawalComplete` (pre-bridging, no burn intent recorded)

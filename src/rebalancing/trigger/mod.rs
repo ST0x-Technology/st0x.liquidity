@@ -6875,9 +6875,9 @@ impl RebalancingService {
         let (latched, remedy) = if unclassified {
             (
                 "every corridor".to_string(),
-                "A transfer the bot cannot load or parse blocks every corridor until it is \
-                 repaired and the bot restarts; resolve any stranded transfer with \
-                 `transfer resume` or `transfer reconcile`.",
+                "A transfer the bot cannot load or parse blocks every corridor, and every \
+                 manual resume, until it is repaired and the bot restarts; use \
+                 `transfer reconcile`, or repair the unreadable transfer and restart.",
             )
         } else {
             (
