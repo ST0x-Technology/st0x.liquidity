@@ -62,7 +62,7 @@ let
         "sha256-dDsvRkrGXhfoFunvk6fwP+12fSsjiWYoxz/CzVVGpHA=";
       "git+https://github.com/ST0x-Technology/event-sorcery.git?tag=v0.3.0#5f88f1498aa565510fe20d9d0092f48a2f5b0615" =
         "sha256-Ycs/ycz9V0+dDHdADUiLs4xh1aSJvZjuks5/M1nbv9o=";
-      "git+https://github.com/ST0x-Technology/st0x.pricing-types?rev=152d7486ccc8a4b6c2750716415320c074e9f321#152d7486ccc8a4b6c2750716415320c074e9f321" =
+      "git+https://github.com/ST0x-Technology/st0x.pricing-types?tag=v0.8.0#152d7486ccc8a4b6c2750716415320c074e9f321" =
         "sha256-1YaWG9nrjIZq2zbA6vsTlriABrvKAavJLKaekGE1fQs=";
       "git+https://github.com/ST0x-Technology/st0x.finance?tag=v0.3.0#563f82511309dc30910ea40da1975edd0ef37736" =
         "sha256-DN/5I45GOMobUSAvBwJPGCWD1LuEQdIWJnNZQ/D6GKk=";

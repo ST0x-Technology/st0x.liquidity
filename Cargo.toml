@@ -258,9 +258,11 @@ sqlx-apalis = { version = "0.8.6", package = "sqlx", features = [
   "chrono",
   "runtime-tokio-rustls",
 ] }
-# Branch pin: the mint-authorization delivery method is on the issuance
-# stack, not yet in a tag. Swap to the next tag once that stack merges to
-# issuance main.
+# v0.13.3 is the newest issuance version tag and an ancestor of main. This
+# was a branch pin until the branch it named went stale: it diverged from
+# main and its only unique content was a Fireblocks decommission that never
+# merged, while the mint-authorization types it was named for reached main
+# by another route.
 st0x-issuance-client = { git = "https://github.com/ST0x-Technology/st0x.issuance.git", tag = "v0.13.3" }
 st0x-issuance-dto = { git = "https://github.com/ST0x-Technology/st0x.issuance.git", tag = "v0.13.3" }
 tower = { version = "0.5.3", features = ["util"] }
