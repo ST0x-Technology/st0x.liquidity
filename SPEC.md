@@ -122,6 +122,10 @@ and the system proves market fit.
   - The corridor is recorded on each transfer when it starts. A transfer
     recorded before corridors existed reads as Base via CCTP, the only route
     there was.
+  - Each corridor chain has its own cash guard: one transfer per corridor,
+    either direction, and at most one Alpaca-outbound transfer across all
+    corridors, because Alpaca's withdrawable cash and its USDC inflight are
+    shared. Releasing a transfer frees only the guard that transfer held.
 - **Complete Audit Trail**: All rebalancing operations tracked as events
   (CrossVenueEquityTransfer, CrossVenueCashTransfer)
 - **Integration**: Uses Alpaca for share/USDC management, Circle CCTP for
@@ -165,7 +169,7 @@ runs a fill watcher against its order book, accounts its fills and hedges them
 with offsetting broker orders. Exactly one hedged chain must set
 `primary = true` on that table -- the **primary** chain anchors USDC rebalancing
 and the operator defaults (Base). The corridor table names the cash chain; until
-each corridor has its own cash guard, the trigger, inventory and services of the
+cash inventory is per corridor chain, the trigger, inventory and services of the
 cash path still run on the primary chain, so a corridor keyed by another chain
 is refused at load; equity rebalancing, hedging and vault balance polling happen
 on every hedged chain. Vault balance polling runs once per hedged chain, each on
@@ -1978,8 +1982,8 @@ rule fails startup with a named error:
 6. `hop = "relay"` on any chain: this build has no Relay hop.
 7. USDC mode enabled and a chain that is not disabled, whose cash table enables
    rebalancing, has no corridor table: there is no implicit corridor.
-8. A corridor chain other than the primary chain, until each corridor has its
-   own cash guard.
+8. A corridor chain other than the primary chain, until the inventory addresses
+   each corridor's chain.
 9. Transitional: `target` or `deviation` still set directly under
    `[rebalancing.usdc]` and different from the corridor's value. The released
    image reads those two keys and ignores the corridor tables, so both stay in
@@ -2170,6 +2174,13 @@ profile generation that can be rolled back to. deploy-rs uses legacy
 (`nix-env`-style) profiles internally, not the new Nix CLI profiles. Old
 generations are cleaned up by the NixOS garbage collector on a configured
 schedule.
+
+Rollback floor for the per-corridor cash guard: a build before it keeps one
+guard for all corridors. Rolling back onto such a build is safe while only one
+corridor has run; once two corridors have run transfers at the same time, do not
+roll back below the first per-corridor release. It must therefore ship in a
+release before the first config that can run two corridors
+([RAI-2488](https://linear.app/makeitrain/issue/RAI-2488)).
 
 #### CI/CD Credential Management
 
@@ -3222,8 +3233,9 @@ arbitrary owner while another aggregate remains recoverable.
 The trigger enqueues at most one transfer per scope at a time, guarded both by
 an in-memory in-progress set and by a Jobs-table dedupe (the in-memory guard
 resets on restart; a non-terminal job row suppresses a duplicate enqueue). The
-equity dedupe is per-symbol and direction-independent; the USDC dedupe is global
-and direction-independent.
+equity dedupe is per-symbol and direction-independent; the USDC dedupe is per
+corridor and direction-independent, and a row queued before corridors counts as
+Base.
 
 **Bottom layer -- Lifecycle aggregates**: Event-sourced entities that track
 multi-step transfer progress. These are implementation details of their
@@ -4034,17 +4046,17 @@ treats a recorded transfer on another corridor as permanent for the build: its
 job re-queues itself every 10 minutes without a retry cost, so a build that
 serves the corridor finds a job to resume it, until the transfer holds no guard
 (reconciled, say), when the job ends; startup recovery (even while a job is
-live) and the timeout sweep never re-arm it, and its guard stays held. A fresh
-job asking for another corridor has no transfer to hold: it retries,
-dead-letters, and its dead-letter alert pages once. Startup recovery pages once
-per transfer per run (the record is kept in memory) with "USDC transfer corridor
-mismatch: transfer {id} runs on the {corridor} corridor, which this build does
-not serve"; the timeout sweep retries that page until it is delivered and raises
-no other stall alert for the transfer. The next sweep releases its guard once it
-is reconciled, or once an operator moves it to a state that holds no guard (such
-as a pre-burn `BridgingFailed`). A manual `transfer resume` or
-`transfer recheck` is refused (422). The way out is a build that serves that
-corridor.
+live) and the timeout sweep never re-arm it, and its corridor's guard stays
+held; other corridors are not blocked. A fresh job asking for another corridor
+has no transfer to hold: it retries, dead-letters, and its dead-letter alert
+pages once. Startup recovery pages once per transfer per run (the record is kept
+in memory) with "USDC transfer corridor mismatch: transfer {id} runs on the
+{corridor} corridor, which this build does not serve"; the timeout sweep retries
+that page until it is delivered and raises no other stall alert for the
+transfer. The next sweep releases its guard once it is reconciled, or once an
+operator moves it to a state that holds no guard (such as a pre-burn
+`BridgingFailed`). A manual `transfer resume` or `transfer recheck` is refused
+(422). The way out is a build that serves that corridor.
 
 - `WithdrawalSubmitting`: scan the source chain for an already-mined withdrawal
   (`find_recent_withdrawal`) from the captured head and adopt it. An empty mined
@@ -4663,9 +4675,9 @@ transfer ID has not yet been persisted in that state (it is persisted only when
 `Withdrawing` is entered), so `resume_alpaca_to_base` returns
 `ResumeDirectionMismatch` and cannot reconstruct which Alpaca withdrawal to
 poll. When a crash leaves an aggregate in this state, `recover_usdc_guard`
-latches `usdc_in_progress` (no USDC rebalancing proceeds) and fires an operator
-alert via `self.notifier` so the operator is paged to run `transfer resume` or
-`transfer reconcile` manually.
+latches that transfer's corridor guard (no USDC rebalancing proceeds on it) and
+fires an operator alert via `self.notifier` so the operator is paged to run
+`transfer resume` or `transfer reconcile` manually.
 
 These states do NOT receive a tracking seed (unlike `DepositFailed` /
 `ConversionFailed` / `BridgingFailed{burn_tx=Some}`): seeding tracking for a
@@ -4689,7 +4701,8 @@ terminal states only.
   before submitting one. Startup recovery enqueues a fresh
   `TransferUsdcToMarketMaking` job for either state when no live job row exists.
 - **Unresolved/unparseable aggregate IDs**: Aggregates that are missing from the
-  store or have unparseable IDs also latch the guard with an operator alert.
+  store or have unparseable IDs have no known corridor, so they latch every
+  corridor's guard until a restart can classify them, with an operator alert.
   These indicate store inconsistency and require manual investigation.
 
 Note: USDC (FiatToken v2.2) decrements even `U256::MAX` allowances in
@@ -5854,24 +5867,24 @@ balances back to the source venue's available balance. Failures after an
 irreversible handoff (for example, a CCTP burn) stay inflight until settlement
 or manual operator recovery.
 
-**Durable rebalancing guard**: The single-rebalance guard that blocks a new USDC
-rebalance while one is unsettled is reconstructed from persisted `UsdcRebalance`
-event state on startup, so a restart between a post-burn failure and settlement
-cannot re-open the re-burn window. Any aggregate not in a clearable-terminal
-state (success, or a failure whose funds never left the source venue) re-asserts
-the guard at boot and blocks new USDC rebalancing until it settles or an
-operator recovers it. The `holds_rebalance_guard` classifier decides this at
-boot; it is a separate, more defensive rule than the `is_reconcilable_failure`
-predicate that gates operator reconciliation. Startup re-arms idempotent
-transfer jobs only for states with a recorded burn: `Bridging`,
-`AwaitingAttestation`, `Attested`, and a post-burn BaseToAlpaca
-`BridgingFailed`. Startup never re-arms `WithdrawalComplete` or
-`BridgingSubmitting`: a re-drive there can submit a second burn. Reconcilable
-failures (`DepositFailed`, a `BridgingFailed` with burn evidence or in the
-AlpacaToBase direction, and a BaseToAlpaca `ConversionFailed`) keep the guard
-held until the operator settles them with `transfer reconcile --kind usdc`. All
-other guarded states keep the guard held and page the operator for manual
-recovery.
+**Durable rebalancing guard**: The per-corridor guard that blocks a new USDC
+rebalance on a corridor while one is unsettled there is reconstructed from
+persisted `UsdcRebalance` event state on startup, so a restart between a
+post-burn failure and settlement cannot re-open the re-burn window. Any
+aggregate not in a clearable-terminal state (success, or a failure whose funds
+never left the source venue) re-asserts its corridor's guard at boot and blocks
+new USDC rebalancing on that corridor until it settles or an operator recovers
+it. The `holds_rebalance_guard` classifier decides this at boot; it is a
+separate, more defensive rule than the `is_reconcilable_failure` predicate that
+gates operator reconciliation. Startup re-arms idempotent transfer jobs only for
+states with a recorded burn: `Bridging`, `AwaitingAttestation`, `Attested`, and
+a post-burn BaseToAlpaca `BridgingFailed`. Startup never re-arms
+`WithdrawalComplete` or `BridgingSubmitting`: a re-drive there can submit a
+second burn. Reconcilable failures (`DepositFailed`, a `BridgingFailed` with
+burn evidence or in the AlpacaToBase direction, and a BaseToAlpaca
+`ConversionFailed`) keep the guard held until the operator settles them with
+`transfer reconcile --kind usdc`. All other guarded states keep the guard held
+and page the operator for manual recovery.
 
 **Operator recovery of a pre-burn stranded guard latch**: A USDC rebalance can
 become stranded in `WithdrawalComplete` (pre-bridging, no burn intent recorded)

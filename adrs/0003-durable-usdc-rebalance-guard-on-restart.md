@@ -137,3 +137,32 @@ follow-up) remains optional polish on top of the automatic path.
   exists; tracked separately).
 - An explicit "CCTP stuck" aggregate state with retry/resume (floated in
   RAI-715, left as follow-up).
+
+## Amendment: one guard per corridor (RAI-2083)
+
+Cash transfers now run on named corridors (SPEC "USDC Rebalancing"). A single
+`usdc_in_progress` flag would serialize every corridor behind the slowest one,
+and releasing one transfer cleared it for all.
+
+Decision: the guard is one entry per corridor chain, holding the set of transfer
+ids that keep it. A corridor admits a new transfer only when its set is empty;
+releasing a transfer removes only its id. Both directions of a corridor share
+its guard. Across corridors, at most one Alpaca-outbound transfer holds a guard
+at a time, because Alpaca's withdrawable cash and its USDC inflight slot are
+shared. Everything else the corridors share (the Ethereum wallet's nonces, the
+Alpaca deposit address, the CCTP burn scan) is identified per transfer by its
+own transaction, so it needs no guard.
+
+Startup rebuilds each corridor's entry from the persisted aggregates, as before:
+a transfer whose state holds the guard holds its corridor's entry. A candidate
+that cannot be loaded or parsed has no known corridor and latches every corridor
+until a restart can classify it. The guard stays in memory and derived from the
+event log; there is still no stored flag.
+
+The Jobs-table dedupe and the manual resume gates are scoped to the corridor in
+the same way. The operator pause stays global: it quiesces the shared transfer
+workers and never touches the guard.
+
+Rollback: a single-guard build treats all corridors as one. It is safe on data
+written while only one corridor ran; after two corridors have run at the same
+time, do not roll back below the first per-corridor release.
