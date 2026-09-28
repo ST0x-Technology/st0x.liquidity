@@ -6842,22 +6842,30 @@ impl RebalancingService {
         unresolved_ids: &[UsdcRebalanceId],
         unparseable: &[String],
     ) {
-        let latched = if unresolved_ids.is_empty() && unparseable.is_empty() {
-            held.iter()
-                .filter(|(id, _, _)| stranded_held_ids.contains(id))
-                .map(|(_, corridor, _)| corridor.to_string())
-                .collect::<BTreeSet<_>>()
-                .into_iter()
-                .collect::<Vec<_>>()
-                .join(", ")
+        let unclassified = !unresolved_ids.is_empty() || !unparseable.is_empty();
+        let (latched, remedy) = if unclassified {
+            (
+                "every corridor".to_string(),
+                "A transfer the bot cannot load or parse blocks every corridor until it is \
+                 repaired and the bot restarts; resolve any stranded transfer with \
+                 `transfer resume` or `transfer reconcile`.",
+            )
         } else {
-            "every corridor".to_string()
+            (
+                held.iter()
+                    .filter(|(id, _, _)| stranded_held_ids.contains(id))
+                    .map(|(_, corridor, _)| corridor.to_string())
+                    .collect::<BTreeSet<_>>()
+                    .into_iter()
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                "Run `transfer resume` or `transfer reconcile` to unblock.",
+            )
         };
         let message = format!(
             "USDC rebalancing is LATCHED on startup with no automated recovery on \
              {latched}. stranded={stranded_held_ids:?} unresolved={unresolved_ids:?} \
-             unparseable={unparseable:?}. \
-             Run `transfer resume` or `transfer reconcile` to unblock. \
+             unparseable={unparseable:?}. {remedy} \
              Rebalancing is blocked until manually resolved."
         );
         if let Err(error) = self.notifier.notify(&message).await {

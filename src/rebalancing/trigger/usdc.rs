@@ -676,7 +676,17 @@ impl RebalancingService {
                 "No corridor known for a post-burn terminal failure; latching every \
                  corridor's guard until a restart classifies it"
             );
-            self.usdc_guards.latch_unclassified();
+            if self.usdc_guards.latch_unclassified() {
+                let message = format!(
+                    "USDC rebalancing is LATCHED on every corridor with no automated \
+                     recovery: transfer {id} failed after its burn and its corridor cannot \
+                     be read. Repair the transfer's stored events, then restart the bot; \
+                     only a restart lifts this latch."
+                );
+                if let Err(error) = self.notifier.notify(&message).await {
+                    warn!(target: "rebalance", ?error, "Failed to deliver the every-corridor latch page");
+                }
+            }
             return;
         };
 

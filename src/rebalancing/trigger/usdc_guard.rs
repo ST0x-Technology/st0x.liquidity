@@ -55,9 +55,10 @@ impl UsdcCashGuards {
     }
 
     /// Blocks every corridor until a restart: a startup candidate whose
-    /// corridor is unknown may hold any of them.
-    pub(super) fn latch_unclassified(&self) {
-        self.state().unclassified = true;
+    /// corridor is unknown may hold any of them. Returns whether the latch
+    /// is new.
+    pub(super) fn latch_unclassified(&self) -> bool {
+        !std::mem::replace(&mut self.state().unclassified, true)
     }
 
     #[cfg(test)]
