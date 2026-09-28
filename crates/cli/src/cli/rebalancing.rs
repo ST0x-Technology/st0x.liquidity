@@ -693,7 +693,6 @@ fn is_bot_resumable_wait(error: &UsdcTransferError) -> bool {
         | UsdcTransferError::MissingFilledAveragePrice { .. }
         | UsdcTransferError::ResumeIndeterminateConversion { .. }
         | UsdcTransferError::ConversionPlacementFailed { .. }
-        | UsdcTransferError::ResumeWithoutMintScanBound { .. }
         | UsdcTransferError::AttestationRetryDeadlineElapsed { .. }
         | UsdcTransferError::AttestationRetryDeadlineOverflow { .. }
         | UsdcTransferError::AttestationNonceMismatch { .. }
