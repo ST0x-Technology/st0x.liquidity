@@ -36222,4 +36222,41 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(pages.len(), 1, "got {pages:?}");
     }
+
+    /// A failed every-corridor latch page is retried by the sweep until it
+    /// is delivered, then never sent again.
+    #[tokio::test]
+    async fn failed_every_corridor_latch_page_is_retried_by_the_sweep() {
+        let notifier = Arc::new(FlakyNotifier {
+            remaining_failures: std::sync::atomic::AtomicUsize::new(1),
+            delivered: std::sync::Mutex::new(Vec::new()),
+        });
+        let trigger = make_trigger_with_inventory_config_and_notifier(
+            InventoryView::default(),
+            test_config(),
+            notifier.clone(),
+        )
+        .await;
+        let harness = ReactorHarness::new(Arc::clone(&trigger));
+
+        harness
+            .receive::<UsdcRebalance>(UsdcRebalanceId(Uuid::new_v4()), make_usdc_deposit_failed())
+            .await
+            .unwrap();
+        assert_eq!(notifier.delivered.lock().unwrap().len(), 0);
+
+        for _ in 0..2 {
+            trigger
+                .expire_stuck_usdc_rebalances(Utc::now())
+                .await
+                .unwrap();
+        }
+
+        let delivered = notifier.delivered.lock().unwrap().clone();
+        assert_eq!(delivered.len(), 1, "got {delivered:?}");
+        assert!(
+            delivered[0].starts_with("USDC rebalancing is LATCHED on every corridor"),
+            "got {delivered:?}"
+        );
+    }
 }
