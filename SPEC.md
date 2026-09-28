@@ -4371,9 +4371,11 @@ enum BridgeStage { Burn, Attestation, Mint }
   the send's nonce, is not the send itself, has Ethereum's required
   confirmations (`[chains.ethereum]`, not the primary chain's), and paid the
   send's deposit address no USDC (a fee-bumped copy of the send did) unless
-  another transfer signed, attached or recorded it as its own deposit send. A
-  missing receipt for the send is never proof, since a lagging node shows none
-  for a send that mined.
+  another transfer signed, attached or recorded it as its own deposit send.
+  Nonces are per sender, so they also refuse a send whose recovered signer is
+  not the configured Ethereum wallet (a key rotated out since). A missing
+  receipt for the send is never proof, since a lagging node shows none for a
+  send that mined.
 
 ##### Integration Points
 
@@ -6984,8 +6986,9 @@ therefore performs an explicit fund-moving send:
      confirmations, and paying the send's deposit address no USDC, so a
      fee-bumped copy of the send is refused. The deposit address is shared, so a
      tx that paid it is accepted when another transfer signed, attached or
-     recorded it as its own deposit send. A superseding tx on a transfer with no
-     signed send is refused.
+     recorded it as its own deposit send. Nonces are per sender, so a send whose
+     recovered signer is not the configured bot wallet (a key rotated out since)
+     is refused. A superseding tx on a transfer with no signed send is refused.
    - Mined reverted: it moved no USDC. The bot does not sign another send; it
      emits `FailDeposit` (the signed tx becomes the `deposit_ref`) and pages
      (`DepositSendUnresolved`). If the `FailDeposit` write fails, the job

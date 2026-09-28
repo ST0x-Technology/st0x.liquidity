@@ -2361,6 +2361,7 @@ fn deposit_send_not_superseded_response(
         | DepositSendNotSuperseded::SupersedingTxUnconfirmed { .. }
         | DepositSendNotSuperseded::SupersedingTxPaidTheDepositAddress { .. }
         | DepositSendNotSuperseded::UnreadableDepositSend { .. }
+        | DepositSendNotSuperseded::SendSignedByAnotherWallet { .. }
         | DepositSendNotSuperseded::EthereumChainMissing(_) => (
             StatusCode::CONFLICT,
             format!("Transfer {id}: refusing to reconcile: {error}"),

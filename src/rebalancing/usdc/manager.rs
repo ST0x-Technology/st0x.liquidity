@@ -4,6 +4,7 @@
 //! `CctpBridge`, `RaindexService`, and the `UsdcRebalance` aggregate to
 //! execute USDC transfers between Alpaca and Base.
 
+use alloy::consensus::transaction::SignerRecoverable as _;
 use alloy::consensus::{Transaction as _, TxEnvelope};
 use alloy::eips::eip2718::Decodable2718 as _;
 use alloy::primitives::{Address, B256, TxHash, U256};
@@ -6449,10 +6450,24 @@ pub enum DepositSendNotSuperseded {
         deposit_address: Address,
         paid: U256,
     },
-    /// The persisted send's bytes are not a USDC transfer, so the deposit
-    /// address it pays cannot be read.
-    #[error("deposit send {tx} is not a readable USDC transfer; its deposit address is unknown")]
+    /// The persisted send's bytes are not a signed USDC transfer, so its
+    /// signer or the deposit address it pays cannot be read.
+    #[error(
+        "deposit send {tx} is not a readable signed USDC transfer; its signer or deposit \
+         address is unknown"
+    )]
     UnreadableDepositSend { tx: TxHash },
+    /// Nonces are per sender, so only a tx from the send's signer can take
+    /// its nonce, and the check reads the configured wallet's txs only.
+    #[error(
+        "deposit send {tx} was signed by {signer}, not the bot's Ethereum wallet {bot_wallet} \
+         (was the key rotated?): only a tx from {signer} at its nonce supersedes it"
+    )]
+    SendSignedByAnotherWallet {
+        tx: TxHash,
+        signer: Address,
+        bot_wallet: Address,
+    },
     #[error(transparent)]
     EthereumChainMissing(#[from] EthereumChainMissing),
     /// Reading the event store for another transfer's claim on the
@@ -6475,6 +6490,7 @@ pub enum DepositSendNotSuperseded {
 /// Proves that `prepared`, the signed deposit send of transfer `id`, can
 /// never mine.
 ///
+/// `prepared` must be signed by `bot_wallet`, since nonces are per sender.
 /// The operator-named `superseding_tx` must be a different tx from
 /// `bot_wallet` at the send's nonce with `required_confirmations`. It must
 /// pay the send's deposit address nothing, so a fee-bumped copy of the send
@@ -6499,6 +6515,16 @@ pub async fn verify_deposit_send_superseded<Helper: UsdcBridgeHelper + ?Sized>(
 
     if superseding == tx {
         return Err(DepositSendNotSuperseded::SupersedingTxIsTheSend { tx });
+    }
+
+    let signer = deposit_send_signer(prepared)
+        .ok_or(DepositSendNotSuperseded::UnreadableDepositSend { tx })?;
+    if signer != bot_wallet {
+        return Err(DepositSendNotSuperseded::SendSignedByAnotherWallet {
+            tx,
+            signer,
+            bot_wallet,
+        });
     }
 
     let read = |source| DepositSendNotSuperseded::Read {
@@ -6571,6 +6597,14 @@ pub async fn verify_deposit_send_superseded<Helper: UsdcBridgeHelper + ?Sized>(
             },
         ),
     }
+}
+
+/// The account that signed the deposit send.
+fn deposit_send_signer(prepared: &PreparedTransaction) -> Option<Address> {
+    TxEnvelope::decode_2718_exact(prepared.raw().as_ref())
+        .ok()?
+        .recover_signer()
+        .ok()
 }
 
 /// The address a signed deposit send pays: the `to` of its USDC `transfer`.
@@ -16559,7 +16593,7 @@ mod tests {
         let cancel = send_self_transfer(&bot_provider, chain.bot_address, Some(nonce)).await;
         bot_provider.anvil_mine(Some(2), None).await.unwrap();
 
-        manager
+        let error = manager
             .verify_deposit_send_superseded(
                 &UsdcRebalanceId(Uuid::new_v4()),
                 &prepared,
@@ -16567,6 +16601,17 @@ mod tests {
             )
             .await
             .expect_err("the configured wallet's nonce does not supersede another key's send");
+
+        assert!(
+            matches!(
+                error,
+                DepositSendNotSuperseded::SendSignedByAnotherWallet { tx, signer, bot_wallet }
+                    if tx == prepared.tx_hash()
+                        && signer == rotated_key.address()
+                        && bot_wallet == chain.bot_address
+            ),
+            "got: {error:?}"
+        );
     }
 
     /// Signs a send of `amount` USDC to the Alpaca deposit address with
