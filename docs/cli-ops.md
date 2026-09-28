@@ -536,29 +536,35 @@ CLI command clears a `Withdrawing` aggregate whose Alpaca UUID is genuinely
 absent; escalate to the on-call engineer for direct recovery after confirming no
 funds moved.
 
-### The USDC single-rebalance guard lifecycle
+### The USDC corridor guard lifecycle
 
-One in-memory atomic (`usdc_in_progress`) serializes USDC rebalancing: at most
-one transfer moves funds through the shared vault and market-maker wallet at a
-time. Who touches it, and when:
+One in-memory guard per corridor chain (`usdc_guards`) serializes USDC
+rebalancing on that corridor: at most one transfer, either direction, moves
+funds through the corridor's vault at a time, and at most one Alpaca-outbound
+transfer runs across all corridors (Alpaca's withdrawable cash is shared). Each
+guard records the transfers that hold it. Who touches it, and when:
 
-- **Claim**: the automatic trigger claims it before it enqueues a transfer job
-  (RAII: a failed enqueue releases the claim). A manual resume via
-  `POST /transfers/usdc/resume/{direction}/{id}` claims it the same way; when
-  the guard is already latched for the SAME aggregate (boot recovery re-latched
-  it), the resume keeps the latch and enqueues.
-- **Clear (event-driven)**: the trigger reactor clears it when a rebalance
-  reaches a clearable terminal. Guard-holding terminals (post-burn failures, any
-  AlpacaToBase `BridgingFailed`, `DepositFailed`) keep it latched until
-  `transfer reconcile` settles them.
-- **Restart**: the atomic resets to false; `recover_usdc_guard` re-derives it
-  from durable state (`holds_rebalance_guard`) and re-arms resumable jobs.
+- **Claim**: the automatic trigger claims its corridor's guard for the new
+  transfer's id before it enqueues the job (RAII: a failed enqueue releases the
+  claim). A manual resume via `POST /transfers/usdc/resume/{direction}/{id}`
+  claims the transfer's corridor the same way; when the SAME aggregate already
+  holds it (boot recovery re-latched it), the resume keeps that hold and
+  enqueues.
+- **Release (event-driven)**: the trigger reactor releases the transfer's own
+  hold when it reaches a clearable terminal; other holders keep their guards.
+  Guard-holding terminals (post-burn failures, any AlpacaToBase
+  `BridgingFailed`, `DepositFailed`) keep it held until `transfer reconcile`
+  settles them.
+- **Restart**: the guards reset; `recover_usdc_guard` re-derives each corridor's
+  holders from durable state (`holds_rebalance_guard`) and re-arms resumable
+  jobs. A candidate that cannot be loaded or parsed latches every corridor until
+  a restart classifies it.
 - **Single-flight for manual commands**: the resume endpoint refuses while any
-  live or retryable USDC job row exists (either direction) or while another
-  aggregate durably holds the guard, so an operator command can never run
-  concurrently with the bot's own driving. A terminal `Failed` job row (retries
-  exhausted) does not refuse: re-enqueueing that transfer is the recovery case
-  this command exists for.
+  live or retryable USDC job row exists on the transfer's corridor (either
+  direction) or while another aggregate durably holds that corridor's guard, so
+  an operator command can never run concurrently with the bot's own driving. A
+  terminal `Failed` job row (retries exhausted) does not refuse: re-enqueueing
+  that transfer is the recovery case this command exists for.
 
 ### Clearing a pre-burn guard latch
 
@@ -878,18 +884,19 @@ before the startup token approvals.
   transfer per run: a restart pages again): the transfer was recorded on a USDC
   corridor this build does not carry, for example after a rollback from a build
   that served it, or after the corridor config changed. This build cannot move
-  its funds. The bot holds the transfer and its guard: its job re-queues itself
-  every 10 minutes (a warning log each time, no page) until the transfer holds
-  no guard (reconciled, say), when the job ends; startup and the timeout sweep
-  do not re-arm it. A job for a fresh transfer asking for that corridor (nothing
-  recorded yet) dead-letters instead, and its dead-letter alert contains the
-  same text. `transfer resume` and `transfer recheck` are refused with messages
-  that start with the same words. `transfer reconcile` does not accept the
-  pre-burn states such a transfer is usually in; do not try it there. A held
-  transfer in a reconcilable failed state can be reconciled as usual, and the
-  next sweep releases its guard. Deploy a build (and config) that serves the
-  named corridor; that build's worker picks up the queued job within 10 minutes
-  and resumes the transfer where it stopped.
+  its funds. The bot holds the transfer and its corridor's guard (other
+  corridors keep running): its job re-queues itself every 10 minutes (a warning
+  log each time, no page) until the transfer holds no guard (reconciled, say),
+  when the job ends; startup and the timeout sweep do not re-arm it. A job for a
+  fresh transfer asking for that corridor (nothing recorded yet) dead-letters
+  instead, and its dead-letter alert contains the same text. `transfer resume`
+  and `transfer recheck` are refused with messages that start with the same
+  words. `transfer reconcile` does not accept the pre-burn states such a
+  transfer is usually in; do not try it there. A held transfer in a reconcilable
+  failed state can be reconciled as usual, and the next sweep releases its
+  guard. Deploy a build (and config) that serves the named corridor; that
+  build's worker picks up the queued job within 10 minutes and resumes the
+  transfer where it stopped.
 
 ### Clearing a dropped pending burn (`BridgingSubmitting` latch)
 

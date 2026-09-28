@@ -11371,7 +11371,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_usdc_in_progress_does_not_send() {
+    async fn test_held_usdc_guard_does_not_send() {
         let trigger = make_trigger().await;
 
         trigger.usdc_guards.hold(
@@ -17323,7 +17323,7 @@ mod tests {
 
         assert!(
             trigger.usdc_guards.is_held(Chain::Base),
-            "the resume must latch the single-rebalance guard"
+            "the resume must latch the Base guard"
         );
         let rows = market_making_job_rows(&trigger).await;
         assert_eq!(rows.len(), 1, "exactly one job row must be enqueued");
@@ -20021,7 +20021,7 @@ mod tests {
         ));
         assert!(
             trigger.usdc_guards.is_held(Chain::Base),
-            "usdc_in_progress should stay set when terminal settlement context is missing"
+            "the Base guard should stay set when terminal settlement context is missing"
         );
         assert!(
             trigger.usdc_tracking.read().await.contains_key(&id),
@@ -20063,7 +20063,7 @@ mod tests {
 
         assert!(
             !trigger.usdc_guards.is_held(Chain::Base),
-            "usdc_in_progress should clear after a terminal failure cancels inflight inventory"
+            "the Base guard should clear after a terminal failure cancels inflight inventory"
         );
         assert!(
             !trigger.usdc_tracking.read().await.contains_key(&id),
@@ -23459,7 +23459,7 @@ mod tests {
     /// The main RAI-1017 regression test: the operator runs
     /// `transfer reconcile` in a separate CLI process, which writes
     /// `OperatorReconciled` to durable storage. The live server's
-    /// `usdc_in_progress` guard must clear on the next sweep tick without
+    /// Base guard must clear on the next sweep tick without
     /// requiring a restart.
     #[tokio::test]
     async fn sweep_clears_guard_after_cli_reconcile_without_restart() {
@@ -25683,7 +25683,7 @@ mod tests {
         );
         assert!(
             service.usdc_guards.is_held(Chain::Base),
-            "usdc_in_progress must be latched after re-arming a Withdrawing{{AlpacaToBase}} job",
+            "the Base guard must be latched after re-arming a Withdrawing{{AlpacaToBase}} job",
         );
     }
 
@@ -25724,7 +25724,7 @@ mod tests {
         );
         assert!(
             service.usdc_guards.is_held(Chain::Base),
-            "usdc_in_progress must be latched after re-arming a WithdrawalComplete{{AlpacaToBase}} job",
+            "the Base guard must be latched after re-arming a WithdrawalComplete{{AlpacaToBase}} job",
         );
     }
 
@@ -25766,7 +25766,7 @@ mod tests {
         );
         assert!(
             service.usdc_guards.is_held(Chain::Base),
-            "usdc_in_progress must be latched even when no re-arm is enqueued \
+            "the Base guard must be latched even when no re-arm is enqueued \
              (Withdrawing{{AlpacaToBase}} holds the guard regardless)",
         );
     }
@@ -25814,7 +25814,7 @@ mod tests {
         );
         assert!(
             service.usdc_guards.is_held(Chain::Base),
-            "usdc_in_progress must be latched even when no re-arm is enqueued \
+            "the Base guard must be latched even when no re-arm is enqueued \
              (Withdrawing{{AlpacaToBase}} holds the guard regardless)",
         );
     }
@@ -25869,7 +25869,7 @@ mod tests {
         );
         assert!(
             service.usdc_guards.is_held(Chain::Base),
-            "usdc_in_progress must be latched after re-arming a Withdrawing{{AlpacaToBase}} \
+            "the Base guard must be latched after re-arming a Withdrawing{{AlpacaToBase}} \
              with a terminal job row"
         );
     }
@@ -25918,7 +25918,7 @@ mod tests {
         );
         assert!(
             service.usdc_guards.is_held(Chain::Base),
-            "usdc_in_progress must be latched even when no re-arm is enqueued \
+            "the Base guard must be latched even when no re-arm is enqueued \
              (Withdrawing{{AlpacaToBase}} holds the guard regardless)",
         );
     }
@@ -25954,7 +25954,7 @@ mod tests {
         );
         assert!(
             service.usdc_guards.is_held(Chain::Base),
-            "usdc_in_progress must remain latched (WithdrawalSubmitting holds the guard \
+            "the Base guard must remain latched (WithdrawalSubmitting holds the guard \
              even without re-arming)",
         );
     }
@@ -26041,7 +26041,7 @@ mod tests {
         );
         assert!(
             service.usdc_guards.is_held(Chain::Base),
-            "usdc_in_progress must be latched after re-arming a stranded BridgingSubmitting job",
+            "the Base guard must be latched after re-arming a stranded BridgingSubmitting job",
         );
     }
 
@@ -26165,7 +26165,7 @@ mod tests {
         );
         assert!(
             service.usdc_guards.is_held(Chain::Base),
-            "usdc_in_progress must be latched after re-arming a stranded BridgingSubmitting job",
+            "the Base guard must be latched after re-arming a stranded BridgingSubmitting job",
         );
     }
 
@@ -26197,7 +26197,7 @@ mod tests {
         );
         assert!(
             service.usdc_guards.is_held(Chain::Base),
-            "usdc_in_progress must be latched after re-arming a stranded WithdrawalSubmitting job",
+            "the Base guard must be latched after re-arming a stranded WithdrawalSubmitting job",
         );
     }
 
@@ -27728,7 +27728,7 @@ mod tests {
         ));
         assert!(
             trigger.usdc_guards.is_held(Chain::Base),
-            "usdc_in_progress should stay set when settled amount validation fails"
+            "the Base guard should stay set when settled amount validation fails"
         );
         assert!(
             trigger.usdc_tracking.read().await.contains_key(&id),
@@ -28355,7 +28355,7 @@ mod tests {
         // Verify in_progress flag was cleared (AlpacaToBase deposit is terminal)
         assert!(
             !trigger.usdc_guards.is_held(Chain::Base),
-            "usdc_in_progress should be cleared after terminal event dispatch"
+            "the Base guard should be cleared after terminal event dispatch"
         );
     }
 

@@ -1185,9 +1185,9 @@ new balance check.
 Several operator write routes read aggregate or on-chain state and then send a
 command or a transaction, and must not have a USDC rebalancing job advance the
 same aggregate or spend the same wallet in between. The CLI avoids the race by
-requiring the bot stopped; an HTTP handler cannot. The `usdc_in_progress` latch
-does not help: it only admits the creation of a new transfer by the trigger and
-is neither read nor held by the workers that execute one.
+requiring the bot stopped; an HTTP handler cannot. The corridor guards do not
+help: they only admit the creation of a new transfer by the trigger and are
+neither read nor held by the workers that execute one.
 
 `src/rebalancing/usdc/driver_pause.rs` provides the control. The driver is the
 two apalis workers, `TransferUsdcToHedging` and `TransferUsdcToMarketMaking`,

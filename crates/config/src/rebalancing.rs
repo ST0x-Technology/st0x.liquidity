@@ -272,7 +272,7 @@ pub struct RebalancingConfig {
     /// between redrive attempts (~30 s apart), not a hard cutoff. Settlement
     /// normally completes in minutes; the deadline only exists so a
     /// withdrawal that never settles (deep reorg, wrong tx hash from Alpaca,
-    /// funds that never arrive) cannot keep the single-rebalance guard
+    /// funds that never arrive) cannot keep the corridor guard
     /// latched forever with no operator signal.
     #[serde(default = "default_settlement_retry_deadline_secs")]
     pub settlement_retry_deadline_secs: u64,

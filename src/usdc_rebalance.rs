@@ -1522,8 +1522,8 @@ impl UsdcRebalance {
         }
     }
 
-    /// Whether an aggregate in this state should hold the single-rebalance
-    /// guard (`usdc_in_progress`) when the guard is reconstructed on startup.
+    /// Whether an aggregate in this state should hold its corridor's guard
+    /// (`usdc_guards`) when the guards are reconstructed on startup.
     ///
     /// True for any state where a rebalance is still in progress or stranded
     /// after a CCTP burn; false only for clearable-terminal states -- success,
@@ -1896,7 +1896,7 @@ impl UsdcRebalance {
 }
 
 /// Candidate `UsdcRebalance` aggregates whose latest event leaves them
-/// potentially holding the single-rebalance guard, for startup recovery, split
+/// potentially holding their corridor's guard, for startup recovery, split
 /// by whether their persisted `aggregate_id` parsed.
 ///
 /// `unparseable` rows cannot be loaded or classified, so the recovery path must
@@ -1909,7 +1909,7 @@ pub(crate) struct InterruptedUsdcRebalances {
 }
 
 /// Returns the candidate `UsdcRebalance` aggregates whose latest event leaves
-/// them potentially holding the single-rebalance guard, for startup recovery.
+/// them potentially holding their corridor's guard, for startup recovery.
 ///
 /// The `event_type` filter is a coarse pre-filter: it excludes only
 /// `WithdrawalFailed` (always pre-burn, reconciles to source) and keeps every
@@ -4340,7 +4340,7 @@ impl UsdcRebalance {
     /// Reconciles a stuck post-burn rebalance to the guard-clearing terminal
     /// `Reconciled` state. The CCTP burn/mint already moved the funds off the
     /// source venue, so the operator settles them out-of-band and this clears
-    /// the `usdc_in_progress` guard rather than re-driving the failed leg.
+    /// the transfer's corridor guard rather than re-driving the failed leg.
     ///
     /// Valid only from a post-burn terminal failure that strands the guard with
     /// no other exit:
@@ -11925,7 +11925,7 @@ mod tests {
 
         // Recovered post-burn bridge (latest event BridgingCompletionRecovered,
         // state Bridged) -- mid-flight after un-fail, holds the guard, must be
-        // included so a crash before the deposit leg reasserts usdc_in_progress.
+        // included so a crash before the deposit leg reasserts its corridor guard.
         let recovered = seed_through(
             &store,
             vec![

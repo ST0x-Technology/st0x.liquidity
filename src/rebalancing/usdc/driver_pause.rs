@@ -10,7 +10,7 @@
 //!
 //! The control is a reusable primitive for any operator operation that must
 //! mutate while the rebalancer is live, not a one-off for its first users.
-//! It deliberately does not touch the `usdc_in_progress` latch: that latch
+//! It deliberately does not touch the corridor guards: a guard
 //! only admits the creation of a new transfer by the trigger and is neither
 //! read nor held by the workers that execute one.
 

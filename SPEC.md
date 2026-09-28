@@ -4791,16 +4791,16 @@ Alpaca to Base:
      Alpaca), not only clean not-settled answers. At or after the deadline, the
      redrive emits `FailBridging` instead of re-enqueueing, and the worker pages
      the operator with `SettlementRetryDeadlineElapsed`. The aggregate becomes a
-     pre-burn `BridgingFailed` that KEEPS the single-rebalance guard held: the
-     withdrawn funds are off Alpaca and may still land on-chain late, so a fresh
-     transfer must not start and mis-attribute them. The operator verifies where
-     the funds sit (Alpaca balance vs the market-maker wallet) and settles them
-     with `transfer reconcile --kind usdc`, which releases the guard. An
-     AlpacaToBase `BridgingFailed` is reconcile-eligible even without burn
-     evidence: `FailBridging` is only reachable after the withdrawal completed,
-     so the funds are provably off Alpaca. Without this deadline, a withdrawal
-     that never settles on-chain redrives every 30 seconds forever, with the
-     guard latched and no operator signal.
+     pre-burn `BridgingFailed` that KEEPS the corridor guard held: the withdrawn
+     funds are off Alpaca and may still land on-chain late, so a fresh transfer
+     must not start and mis-attribute them. The operator verifies where the
+     funds sit (Alpaca balance vs the market-maker wallet) and settles them with
+     `transfer reconcile --kind usdc`, which releases the guard. An AlpacaToBase
+     `BridgingFailed` is reconcile-eligible even without burn evidence:
+     `FailBridging` is only reachable after the withdrawal completed, so the
+     funds are provably off Alpaca. Without this deadline, a withdrawal that
+     never settles on-chain redrives every 30 seconds forever, with the guard
+     latched and no operator signal.
    - **Per-transfer credit:** after confirmation, read the withdrawal tx
      receipt. The credit is the sum of that transaction's USDC `Transfer` logs
      to the market-maker wallet, exact in USDC base units. The wallet balance is

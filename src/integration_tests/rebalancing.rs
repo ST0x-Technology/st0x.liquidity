@@ -2542,7 +2542,7 @@ async fn usdc_operational_limits_cap_across_trigger_cycles() {
 /// skipped. After the guard is released (operation completes or fails), the
 /// trigger fires again.
 #[tokio::test]
-async fn usdc_in_progress_blocks_concurrent_triggers() {
+async fn usdc_guard_blocks_concurrent_triggers() {
     let (pool, apalis_pool) = setup_test_pools().await;
 
     // Large imbalance: 100 onchain, 900 offchain
