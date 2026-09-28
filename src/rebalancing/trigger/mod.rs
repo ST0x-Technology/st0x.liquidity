@@ -5504,6 +5504,12 @@ impl RebalancingService {
             });
         }
 
+        // An unreadable transfer latches every corridor; the durable gates
+        // below would count it as a holder and misreport it as a conflict.
+        if self.usdc_guards.is_latched() {
+            return Err(UsdcResumeError::EveryCorridorLatched);
+        }
+
         // Single-flight gate 1: any live or retryable USDC transfer job row on
         // this corridor, in either direction, blocks a manual resume (both
         // directions move funds through the same vault and wallet). Terminal

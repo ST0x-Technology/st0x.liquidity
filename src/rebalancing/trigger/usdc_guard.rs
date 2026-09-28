@@ -61,6 +61,12 @@ impl UsdcCashGuards {
         !std::mem::replace(&mut self.state().unclassified, true)
     }
 
+    /// Whether a transfer whose corridor could not be read latches every
+    /// corridor.
+    pub(super) fn is_latched(&self) -> bool {
+        self.state().unclassified
+    }
+
     #[cfg(test)]
     pub(crate) fn is_held(&self, chain: Chain) -> bool {
         let state = self.state();
