@@ -1979,9 +1979,16 @@ impl RebalancingService {
     }
 
     /// Pages once per transfer (retried until delivered) that it runs on a
-    /// corridor this build does not serve and is held with its guard.
+    /// corridor this build does not serve and is held with its guard. The id
+    /// is recorded before the send, so a concurrent caller does not page too,
+    /// and removed again if delivery fails, so a later sweep retries.
     async fn page_unserved_corridor_once(&self, id: &UsdcRebalanceId, corridor: UsdcCorridor) {
-        if self.corridor_not_served_alerted.read().await.contains(id) {
+        if !self
+            .corridor_not_served_alerted
+            .write()
+            .await
+            .insert(id.clone())
+        {
             return;
         }
 
@@ -1992,21 +1999,14 @@ impl RebalancingService {
              not re-armed; deploy a build that serves {corridor} (docs/cli-ops.md)."
         );
 
-        match self.notifier.notify(&message).await {
-            Ok(()) => {
-                self.corridor_not_served_alerted
-                    .write()
-                    .await
-                    .insert(id.clone());
-            }
-            Err(error) => {
-                warn!(
-                    target: "rebalance",
-                    %id,
-                    ?error,
-                    "Failed to deliver the unserved-corridor page; will retry next sweep"
-                );
-            }
+        if let Err(error) = self.notifier.notify(&message).await {
+            self.corridor_not_served_alerted.write().await.remove(id);
+            warn!(
+                target: "rebalance",
+                %id,
+                ?error,
+                "Failed to deliver the unserved-corridor page; will retry next sweep"
+            );
         }
     }
 
