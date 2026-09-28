@@ -35405,6 +35405,40 @@ mod tests {
         assert_eq!(notifier.messages(), Vec::<String>::new());
     }
 
+    /// Yields once before capturing, so a concurrent caller runs while a page
+    /// is in flight.
+    #[derive(Default)]
+    struct YieldingNotifier(CapturingNotifier);
+
+    #[async_trait]
+    impl crate::alerts::Notifier for YieldingNotifier {
+        async fn notify(&self, message: &str) -> Result<(), crate::alerts::NotifierError> {
+            tokio::task::yield_now().await;
+            self.0.notify(message).await
+        }
+    }
+
+    /// Startup and a sweep can page the same transfer at once; only one of
+    /// them may send.
+    #[tokio::test]
+    async fn concurrent_unserved_corridor_pages_send_once() {
+        let notifier = Arc::new(YieldingNotifier::default());
+        let trigger = make_trigger_with_inventory_config_and_notifier(
+            InventoryView::default(),
+            test_config(),
+            notifier.clone(),
+        )
+        .await;
+        let id = UsdcRebalanceId(Uuid::new_v4());
+
+        tokio::join!(
+            trigger.page_unserved_corridor_once(&id, ROBINHOOD_RELAY),
+            trigger.page_unserved_corridor_once(&id, ROBINHOOD_RELAY),
+        );
+
+        assert_eq!(corridor_pages(&notifier.0).len(), 1);
+    }
+
     async fn make_unserved_corridor_trigger(
         pool: &SqlitePool,
         store: Arc<Store<UsdcRebalance>>,
