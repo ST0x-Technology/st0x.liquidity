@@ -1780,7 +1780,7 @@ fn validate_config(
     tokens: TokenFile<'_>,
     startup_notices: &mut Vec<StartupNotice>,
 ) -> Result<ValidatedConfigParts, CtxError> {
-    if let Some(registry) = &config.registry {
+    if let (Some(registry), TokenFile::Bytes(_)) = (&config.registry, tokens) {
         startup_notices.push(StartupNotice::info(format!(
             "per-symbol tables read from {} ({})",
             registry.url,
