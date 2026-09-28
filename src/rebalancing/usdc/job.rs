@@ -161,6 +161,10 @@ const DEPOSIT_SEND_RECONCILIATION_REDRIVE_DELAY: Duration = Duration::from_secs(
 const DEPOSIT_SEND_RECONCILIATION_POST_DEADLINE_REDRIVE_DELAY: Duration =
     Duration::from_secs(30 * 60);
 
+/// Delay between re-checks of a transfer on a corridor this build does not
+/// serve. The job stays queued so a build that serves the corridor resumes it.
+const UNSERVED_CORRIDOR_REDRIVE_DELAY: Duration = Duration::from_secs(10 * 60);
+
 /// Returns the warn-threshold attempt count at which an early operator alert
 /// fires, or `None` when there is no room for a distinct early warning.
 ///
@@ -350,17 +354,37 @@ where
     }
 }
 
-/// Ends the attempt quietly for a transfer on a corridor this build does not
-/// serve: no retry can change that, and a dead letter would page on every
-/// sweep. Startup recovery holds the transfer and pages once; the timeout
-/// sweep retries that page until it is delivered.
-fn intercept_unserved_corridor<JobError>(
+/// Re-queues, with no retry cost and no page, a transfer on a corridor this
+/// build does not serve: this build cannot move it, and a job that ended here
+/// would leave nothing to resume it after a roll-forward to a build that
+/// serves the corridor. Startup recovery holds the transfer and pages once;
+/// the timeout sweep retries that page until it is delivered.
+async fn intercept_unserved_corridor<Ctx, TaskJob>(
+    job: &TaskJob,
+    job_queue: &JobQueue<TaskJob>,
     result: Result<(), UsdcTransferError>,
-) -> ControlFlow<Result<(), JobError>, Result<(), UsdcTransferError>> {
+) -> ControlFlow<Result<(), TaskJob::Error>, Result<(), UsdcTransferError>>
+where
+    Ctx: Send + Sync + 'static,
+    TaskJob: Job<Ctx> + Clone + Sync + Unpin,
+    TaskJob::Error: From<QueuePushError>,
+{
     match result {
         Err(error @ UsdcTransferError::CorridorMismatch { .. }) => {
-            warn!(target: "rebalance", %error, "USDC transfer not redriven; left for the operator");
-            ControlFlow::Break(Ok(()))
+            warn!(
+                target: "rebalance",
+                %error,
+                delay = ?UNSERVED_CORRIDOR_REDRIVE_DELAY,
+                "USDC transfer re-queued for a build that serves its corridor"
+            );
+            let mut job_queue = job_queue.clone();
+            match job_queue
+                .push_with_delay(job.clone(), UNSERVED_CORRIDOR_REDRIVE_DELAY)
+                .await
+            {
+                Ok(()) => ControlFlow::Break(Ok(())),
+                Err(error) => ControlFlow::Break(Err(TaskJob::Error::from(error))),
+            }
         }
         other => ControlFlow::Continue(other),
     }
@@ -765,7 +789,7 @@ impl Job<TransferUsdcToHedgingCtx> for TransferUsdcToHedging {
             ControlFlow::Break(outcome) => return outcome,
             ControlFlow::Continue(result) => result,
         };
-        let result = match intercept_unserved_corridor(result) {
+        let result = match intercept_unserved_corridor(self, &ctx.job_queue, result).await {
             ControlFlow::Break(outcome) => return outcome,
             ControlFlow::Continue(result) => result,
         };
@@ -1533,7 +1557,7 @@ impl Job<TransferUsdcToMarketMakingCtx> for TransferUsdcToMarketMaking {
             ControlFlow::Break(outcome) => return outcome,
             ControlFlow::Continue(result) => result,
         };
-        let result = match intercept_unserved_corridor(result) {
+        let result = match intercept_unserved_corridor(self, &ctx.job_queue, result).await {
             ControlFlow::Break(outcome) => return outcome,
             ControlFlow::Continue(result) => result,
         };
@@ -6959,11 +6983,11 @@ mod tests {
         assert_eq!(market_making.corridor, UsdcCorridor::BASE_CCTP);
     }
 
-    /// A transfer on a corridor this build does not serve cannot progress;
-    /// retrying and dead-lettering would page on every sweep. The job ends
-    /// quietly; startup recovery pages once, retried by the sweep.
+    /// A transfer on a corridor this build does not serve cannot progress here,
+    /// and dead-lettering would page on every sweep. The job re-queues itself,
+    /// without a page, for a build that serves the corridor.
     #[tokio::test]
-    async fn jobs_end_quietly_on_a_corridor_this_build_does_not_serve() {
+    async fn jobs_requeue_quietly_on_a_corridor_this_build_does_not_serve() {
         let pool = setup_queue_pool().await;
         let notifier = Arc::new(CapturingNotifier::default());
         let hedging = TransferUsdcToHedgingCtx {
@@ -7003,11 +7027,15 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(pending_job_count::<TransferUsdcToHedging>(&pool).await, 0);
-        assert_eq!(
-            pending_job_count::<TransferUsdcToMarketMaking>(&pool).await,
-            0
-        );
+        let now = Utc::now().timestamp();
+        let (_, hedging_run_at) = pending_job_row::<TransferUsdcToHedging>(&pool).await;
+        let (_, market_making_run_at) = pending_job_row::<TransferUsdcToMarketMaking>(&pool).await;
+        for run_at in [hedging_run_at, market_making_run_at] {
+            assert!(
+                run_at >= now + 9 * 60,
+                "the re-queued job waits UNSERVED_CORRIDOR_REDRIVE_DELAY, run_at={run_at} now={now}"
+            );
+        }
         assert_eq!(notifier.messages(), Vec::<String>::new());
     }
 }

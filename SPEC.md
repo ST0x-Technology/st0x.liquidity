@@ -3985,17 +3985,18 @@ recorded on another corridor, or a fresh transfer asking for another corridor,
 fails closed before any send and leaves the transfer untouched; the error starts
 with "USDC transfer corridor mismatch" and names both corridors. Automation
 treats a recorded transfer on another corridor as permanent for the build: its
-job ends without a retry, startup recovery (even while a job is live) and the
-timeout sweep never re-arm it, and its guard stays held. A fresh job asking for
-another corridor has no transfer to hold: it retries, dead-letters, and its
-dead-letter alert pages once. Startup recovery pages once per transfer per run
-(the record is kept in memory) with "USDC transfer corridor mismatch: transfer
-{id} runs on the {corridor} corridor, which this build does not serve"; the
-timeout sweep retries that page until it is delivered and raises no other stall
-alert for the transfer. The next sweep releases its guard once it is reconciled,
-or once an operator moves it to a state that holds no guard (such as a pre-burn
-`BridgingFailed`). A manual `transfer resume` is refused (422). The way out is a
-build that serves that corridor.
+job re-queues itself every 10 minutes without a retry cost, so a build that
+serves the corridor finds a job to resume it; startup recovery (even while a job
+is live) and the timeout sweep never re-arm it, and its guard stays held. A
+fresh job asking for another corridor has no transfer to hold: it retries,
+dead-letters, and its dead-letter alert pages once. Startup recovery pages once
+per transfer per run (the record is kept in memory) with "USDC transfer corridor
+mismatch: transfer {id} runs on the {corridor} corridor, which this build does
+not serve"; the timeout sweep retries that page until it is delivered and raises
+no other stall alert for the transfer. The next sweep releases its guard once it
+is reconciled, or once an operator moves it to a state that holds no guard (such
+as a pre-burn `BridgingFailed`). A manual `transfer resume` is refused (422).
+The way out is a build that serves that corridor.
 
 - `WithdrawalSubmitting`: scan the source chain for an already-mined withdrawal
   (`find_recent_withdrawal`) from the captured head and adopt it. An empty mined

@@ -35258,7 +35258,7 @@ mod tests {
     }
 
     /// A live job cannot move a transfer on a corridor this build does not
-    /// serve (it ends without a retry), so startup pages for it even though
+    /// serve (it only re-queues itself), so startup pages for it even though
     /// a job still owns it.
     #[tokio::test]
     async fn startup_pages_for_a_live_job_on_a_corridor_this_build_does_not_serve() {
