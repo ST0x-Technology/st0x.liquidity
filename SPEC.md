@@ -4062,10 +4062,10 @@ build that serves that corridor.
   the operator did. A message that can never mint pages only for AlpacaToBase,
   with "the recorded CCTP message cannot mint on Base" (the nonce is not read,
   so the operator gets the attestation for the burn tx and mints it); an
-  AlpacaToBase retry finds the
-  transfer failed and does not alert. That BaseToAlpaca latch does not page: its
-  recovery re-polls Circle and may still mint and send the deposit, and the
-  job's dead-letter alert covers a give-up. Other lookup failures redrive.
+  AlpacaToBase retry finds the transfer failed and does not alert. That
+  BaseToAlpaca latch does not page: its recovery re-polls Circle and may still
+  mint and send the deposit, and the job's dead-letter alert covers a give-up.
+  Other lookup failures redrive.
 
 ##### Commands
 
