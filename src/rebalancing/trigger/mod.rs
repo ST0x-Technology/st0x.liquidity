@@ -47,7 +47,7 @@ use self::allocation::{
 };
 use self::freeze::FreezeStatusReader;
 use self::usdc::UsdcRebalanceOperation;
-use self::usdc_guard::UsdcCashGuards;
+use self::usdc_guard::{ClaimRefusal, UsdcCashGuards};
 #[cfg(test)]
 use crate::bot_gas::BotGasReceiptCostEnqueuer;
 use crate::conductor::job::{BackpressureStreak, QueuePushError};
@@ -5482,21 +5482,33 @@ impl RebalancingService {
         }
 
         // Single-flight gate 2: another persisted rebalance still holding this
-        // corridor's durable guard refuses; this id's OWN latch (boot recovery
-        // re-latched it) is precisely what the operator is here to resolve.
-        if any_rebalance_holds_guard(pool, &store, Some(id), state.corridor().chain()).await? {
+        // corridor's durable guard refuses, and so does, for an Alpaca-outbound
+        // resume, an Alpaca-outbound holder on any corridor; this id's OWN
+        // latch (boot recovery re-latched it) is precisely what the operator
+        // is here to resolve.
+        if any_rebalance_holds_guard(pool, &store, Some(id), state.corridor().chain(), direction)
+            .await?
+        {
             return Err(UsdcResumeError::GuardHeldElsewhere);
         }
 
         // Claim the corridor's guard for this id; a claim this id already
-        // holds (boot recovery re-latched it) stays held on drop. A refused
-        // claim does not refuse: gate 2 proved no other durable holder, so
-        // the holder is a racing trigger claim, which the job-row dedupe
-        // resolves.
-        let claim = self
+        // holds (boot recovery re-latched it) stays held on drop. The
+        // Alpaca-outbound rule and the every-corridor latch refuse like gate
+        // 2. Another holder on this corridor does not: gate 2 proved it holds
+        // nothing durably, so it is a racing trigger claim, which the job-row
+        // dedupe resolves.
+        let claim = match self
             .usdc_guards
             .try_claim(state.corridor().chain(), id, direction)
-            .ok();
+        {
+            Ok(claim) => Some(claim),
+            Err(ClaimRefusal::CorridorHeld) => None,
+            Err(refusal @ (ClaimRefusal::AlpacaOutboundElsewhere | ClaimRefusal::Unclassified)) => {
+                warn!(target: "rebalance", %id, %refusal, "Manual USDC resume refused");
+                return Err(UsdcResumeError::GuardHeldElsewhere);
+            }
+        };
 
         // Single-flight for concurrent duplicate resumes: two racing calls
         // for the same id can pass the read gates together (and a failed

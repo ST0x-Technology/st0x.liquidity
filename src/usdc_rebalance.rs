@@ -2017,8 +2017,10 @@ pub(crate) async fn prepared_deposit_send_ids(
 }
 
 /// Whether any persisted USDC rebalance currently holds `chain`'s corridor
-/// guard, optionally ignoring one id (`except` -- so a manual resume of that
-/// very id does not count its own latch as a conflict). Mirrors startup
+/// guard, or, for an Alpaca-outbound `direction`, an Alpaca-outbound
+/// transfer's guard on any corridor (Alpaca's cash is shared), optionally
+/// ignoring one id (`except` -- so a manual resume of that very id does not
+/// count its own latch as a conflict). Mirrors startup
 /// guard recovery's defensive posture: unparseable candidate ids and
 /// aggregates that fail to load count as holders on every corridor, because
 /// treating them as clear could release a latch that still protects a
@@ -2028,6 +2030,7 @@ pub(crate) async fn any_rebalance_holds_guard(
     store: &Store<UsdcRebalance>,
     except: Option<&UsdcRebalanceId>,
     chain: Chain,
+    direction: RebalanceDirection,
 ) -> Result<bool, sqlx::Error> {
     let InterruptedUsdcRebalances { ids, unparseable } =
         interrupted_usdc_rebalance_ids(pool).await?;
@@ -2048,7 +2051,10 @@ pub(crate) async fn any_rebalance_holds_guard(
 
         match store.load(&id).await {
             Ok(Some(entity)) => {
-                if entity.holds_rebalance_guard() && entity.corridor().chain() == chain {
+                let conflicts = entity.corridor().chain() == chain
+                    || (direction == RebalanceDirection::AlpacaToBase
+                        && entity.direction() == RebalanceDirection::AlpacaToBase);
+                if entity.holds_rebalance_guard() && conflicts {
                     return Ok(true);
                 }
             }
@@ -11691,9 +11697,15 @@ mod tests {
         let store = test_store::<UsdcRebalance>(pool.clone(), ());
 
         assert!(
-            !any_rebalance_holds_guard(&pool, &store, None, Chain::Base)
-                .await
-                .unwrap()
+            !any_rebalance_holds_guard(
+                &pool,
+                &store,
+                None,
+                Chain::Base,
+                RebalanceDirection::BaseToAlpaca,
+            )
+            .await
+            .unwrap()
         );
     }
 
@@ -11725,9 +11737,15 @@ mod tests {
         .await;
 
         assert!(
-            any_rebalance_holds_guard(&pool, &store, None, Chain::Base)
-                .await
-                .unwrap()
+            any_rebalance_holds_guard(
+                &pool,
+                &store,
+                None,
+                Chain::Base,
+                RebalanceDirection::BaseToAlpaca,
+            )
+            .await
+            .unwrap()
         );
     }
 
@@ -11755,9 +11773,15 @@ mod tests {
         .await;
 
         assert!(
-            !any_rebalance_holds_guard(&pool, &store, None, Chain::Base)
-                .await
-                .unwrap()
+            !any_rebalance_holds_guard(
+                &pool,
+                &store,
+                None,
+                Chain::Base,
+                RebalanceDirection::BaseToAlpaca,
+            )
+            .await
+            .unwrap()
         );
     }
 
@@ -11800,9 +11824,15 @@ mod tests {
         );
 
         assert!(
-            any_rebalance_holds_guard(&pool, &store, None, Chain::Base)
-                .await
-                .unwrap(),
+            any_rebalance_holds_guard(
+                &pool,
+                &store,
+                None,
+                Chain::Base,
+                RebalanceDirection::BaseToAlpaca,
+            )
+            .await
+            .unwrap(),
             "a candidate with events but no materialized state must count as \
              a guard holder"
         );
@@ -11836,23 +11866,41 @@ mod tests {
 
         let requested = seed_through(&store, holder_commands()).await;
         assert!(
-            any_rebalance_holds_guard(&pool, &store, None, Chain::Base)
-                .await
-                .unwrap(),
+            any_rebalance_holds_guard(
+                &pool,
+                &store,
+                None,
+                Chain::Base,
+                RebalanceDirection::BaseToAlpaca,
+            )
+            .await
+            .unwrap(),
             "without an exclusion the holder must block"
         );
         assert!(
-            !any_rebalance_holds_guard(&pool, &store, Some(&requested), Chain::Base)
-                .await
-                .unwrap(),
+            !any_rebalance_holds_guard(
+                &pool,
+                &store,
+                Some(&requested),
+                Chain::Base,
+                RebalanceDirection::BaseToAlpaca,
+            )
+            .await
+            .unwrap(),
             "the requested id's own hold must be excluded"
         );
 
         let _other_holder = seed_through(&store, holder_commands()).await;
         assert!(
-            any_rebalance_holds_guard(&pool, &store, Some(&requested), Chain::Base)
-                .await
-                .unwrap(),
+            any_rebalance_holds_guard(
+                &pool,
+                &store,
+                Some(&requested),
+                Chain::Base,
+                RebalanceDirection::BaseToAlpaca,
+            )
+            .await
+            .unwrap(),
             "a DIFFERENT guard holder must still block despite the exclusion"
         );
     }
