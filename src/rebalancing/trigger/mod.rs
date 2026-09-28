@@ -36158,4 +36158,36 @@ mod tests {
             "an inbound transfer does not draw on Alpaca's cash"
         );
     }
+
+    /// A post-burn failure whose corridor cannot be read latches every
+    /// corridor until a restart, and pages once so the operator knows.
+    #[tokio::test]
+    async fn unknown_corridor_post_burn_failure_latches_every_corridor_and_pages_once() {
+        let notifier = Arc::new(CapturingNotifier::default());
+        let trigger = make_trigger_with_inventory_config_and_notifier(
+            InventoryView::default(),
+            test_config(),
+            notifier.clone(),
+        )
+        .await;
+        let harness = ReactorHarness::new(Arc::clone(&trigger));
+
+        for _ in 0..2 {
+            harness
+                .receive::<UsdcRebalance>(
+                    UsdcRebalanceId(Uuid::new_v4()),
+                    make_usdc_deposit_failed(),
+                )
+                .await
+                .unwrap();
+        }
+
+        assert!(trigger.usdc_guards.is_held(Chain::Robinhood));
+        let pages = notifier
+            .messages()
+            .into_iter()
+            .filter(|message| message.starts_with("USDC rebalancing is LATCHED"))
+            .collect::<Vec<_>>();
+        assert_eq!(pages.len(), 1, "got {pages:?}");
+    }
 }
