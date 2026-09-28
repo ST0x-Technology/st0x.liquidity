@@ -1777,6 +1777,7 @@ struct ValidatedConfigParts {
 fn validate_config(
     config: &Config,
     config_path: &Path,
+    tokens: TokenFile<'_>,
     startup_notices: &mut Vec<StartupNotice>,
 ) -> Result<ValidatedConfigParts, CtxError> {
     if let Some(registry) = &config.registry {
@@ -1796,7 +1797,7 @@ fn validate_config(
     {
         // With `[registry]` and no token file supplied the per-symbol
         // tables are absent, so only the schedule's own shape can be judged.
-        if config.registry.is_some() && config.assets.equities.symbols.is_empty() {
+        if config.registry.is_some() && matches!(tokens, TokenFile::Skipped) {
             schedule.validate_shape()?;
             startup_notices.push(StartupNotice::warning(
                 "trading schedule membership not checked: the per-symbol tables are in the \
@@ -2075,7 +2076,7 @@ pub fn registry_check(live: &RegistryLive, fresh: &[u8]) -> Result<Option<String
         path: path.to_path_buf(),
         source,
     })?;
-    validate_config(&config, path, &mut Vec::new())?;
+    validate_config(&config, path, TokenFile::Bytes(fresh), &mut Vec::new())?;
     Ok(registry::describe_change(&live.live, &projection))
 }
 
@@ -2107,7 +2108,7 @@ fn parse_and_validate_with(
         log_query_url_template,
         travel_rule,
         hedge_floor,
-    } = validate_config(&config, config_path, &mut startup_notices)?;
+    } = validate_config(&config, config_path, tokens, &mut startup_notices)?;
 
     let broker = resolve_broker(
         config.broker.as_ref(),
@@ -2444,7 +2445,7 @@ impl Ctx {
         let mut startup_notices = Vec::new();
         let (config, _) = config_from(&config_str, config_path, tokens, &mut startup_notices)?;
 
-        validate_config(&config, config_path, &mut startup_notices)?;
+        validate_config(&config, config_path, tokens, &mut startup_notices)?;
 
         Ok(startup_notices)
     }
@@ -3569,7 +3570,13 @@ mod tests {
         let config: Config =
             toml::from_str(&String::from_utf8_lossy(minimal_config_toml_bytes())).unwrap();
 
-        validate_config(&config, Path::new("config.toml"), &mut Vec::new()).unwrap();
+        validate_config(
+            &config,
+            Path::new("config.toml"),
+            TokenFile::Skipped,
+            &mut Vec::new(),
+        )
+        .unwrap();
 
         let robinhood = config
             .chains
@@ -4886,8 +4893,13 @@ mod tests {
         );
         let config: Config = toml::from_str(&config_toml).unwrap();
         let mut startup_notices = Vec::new();
-        let validated =
-            validate_config(&config, Path::new("test-config.toml"), &mut startup_notices).unwrap();
+        let validated = validate_config(
+            &config,
+            Path::new("test-config.toml"),
+            TokenFile::Skipped,
+            &mut startup_notices,
+        )
+        .unwrap();
         let file_logging = validated.file_logging.expect("file logging is configured");
 
         assert!(matches!(config.log_level, LogLevel::Trace));
@@ -9368,7 +9380,13 @@ mod tests {
                 rows
             };
             assert_eq!(rows(&merged), rows(&inline), "{env}: per-symbol tables");
-            validate_config(&merged, &config_path, &mut notices).unwrap();
+            validate_config(
+                &merged,
+                &config_path,
+                TokenFile::Bytes(&tokens),
+                &mut notices,
+            )
+            .unwrap();
 
             let mut notices = Vec::new();
             let (table, live) =
@@ -9381,7 +9399,7 @@ mod tests {
                 "{env}: the offline check must say the tables were skipped"
             );
             let alone: Config = table.try_into().unwrap();
-            validate_config(&alone, &config_path, &mut notices).unwrap();
+            validate_config(&alone, &config_path, TokenFile::Skipped, &mut notices).unwrap();
         }
     }
 
@@ -9446,7 +9464,13 @@ mod tests {
         )
         .unwrap();
         assert!(live.is_some());
-        validate_config(&config, config_path, &mut notices).unwrap();
+        validate_config(
+            &config,
+            config_path,
+            TokenFile::Bytes(&tokens),
+            &mut notices,
+        )
+        .unwrap();
     }
 
     /// Without the token file a schedule is judged on its shape only, and
@@ -9468,12 +9492,83 @@ mod tests {
             );
         let config: Config = toml::Value::Table(runtime).try_into().unwrap();
         let mut notices = Vec::new();
-        validate_config(&config, Path::new("config.toml"), &mut notices).unwrap();
+        validate_config(
+            &config,
+            Path::new("config.toml"),
+            TokenFile::Skipped,
+            &mut notices,
+        )
+        .unwrap();
         assert!(
             notices
                 .iter()
                 .any(|notice| notice.message.contains("membership not checked")),
             "{notices:?}"
+        );
+    }
+
+    /// A token file whose every symbol is retired leaves the symbol map
+    /// empty, but it was supplied: a schedule that still names a retired
+    /// symbol is refused, not judged on its shape.
+    #[test]
+    fn a_schedule_naming_a_retired_symbol_is_refused_with_the_token_file() {
+        let tokens = registry::fixtures::read("tokens-staging.toml");
+        let projection = registry::project(&registry::parse(&tokens).unwrap()).unwrap();
+        let retired: BTreeSet<String> = projection
+            .chain_rows
+            .values()
+            .flat_map(|rows| rows.keys().cloned())
+            .chain(projection.policies.keys().cloned())
+            .collect();
+
+        let mut runtime: toml::Table =
+            toml::from_str(include_str!("../../../config/staging/st0x-hedge.toml")).unwrap();
+        runtime["assets"]["equities"]
+            .as_table_mut()
+            .unwrap()
+            .insert(
+                "retired_symbols".into(),
+                toml::Value::Array(retired.into_iter().map(toml::Value::String).collect()),
+            );
+        let fragment: toml::Table =
+            toml::from_str(include_str!("../../../docs/trading-schedule/staging.toml")).unwrap();
+        runtime
+            .entry("pricing")
+            .or_insert_with(|| toml::Value::Table(toml::Table::new()))
+            .as_table_mut()
+            .unwrap()
+            .insert(
+                "trading_schedule".into(),
+                fragment["pricing"]["trading_schedule"].clone(),
+            );
+
+        let config_path = Path::new("config.toml");
+        let mut notices = Vec::new();
+        let (config, live) = config_from(
+            &toml::to_string(&runtime).unwrap(),
+            config_path,
+            TokenFile::Bytes(&tokens),
+            &mut notices,
+        )
+        .unwrap();
+        assert!(live.is_some());
+        assert!(config.assets.equities.symbols.is_empty());
+
+        let error = validate_config(
+            &config,
+            config_path,
+            TokenFile::Bytes(&tokens),
+            &mut notices,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                CtxError::TradingSchedule(crate::TradingScheduleConfigError::Membership(
+                    crate::TradingScheduleMembershipError::Unknown(_)
+                ))
+            ),
+            "{error:?}"
         );
     }
 
@@ -9900,9 +9995,14 @@ mod tests {
             .as_mut()
             .unwrap()
             .primary = true;
-        let error = validate_config(&config, Path::new("example.config.toml"), &mut Vec::new())
-            .err()
-            .expect("HyperEVM primary must fail configuration validation");
+        let error = validate_config(
+            &config,
+            Path::new("example.config.toml"),
+            TokenFile::Skipped,
+            &mut Vec::new(),
+        )
+        .err()
+        .expect("HyperEVM primary must fail configuration validation");
         assert!(
             matches!(
                 error,
@@ -9919,8 +10019,13 @@ mod tests {
     #[test]
     fn prefunded_hedged_hyperevm_loads_with_hype_monitoring() {
         let mut config = prefunded_hyperevm_config();
-        let validated =
-            validate_config(&config, Path::new("example.config.toml"), &mut Vec::new()).unwrap();
+        let validated = validate_config(
+            &config,
+            Path::new("example.config.toml"),
+            TokenFile::Skipped,
+            &mut Vec::new(),
+        )
+        .unwrap();
         assert_eq!(
             validated
                 .alerts
@@ -9930,7 +10035,12 @@ mod tests {
         );
         config.alerts = None;
         assert!(matches!(
-            validate_config(&config, Path::new("example.config.toml"), &mut Vec::new()),
+            validate_config(
+                &config,
+                Path::new("example.config.toml"),
+                TokenFile::Skipped,
+                &mut Vec::new()
+            ),
             Err(CtxError::Alerts(
                 crate::AlertsAssemblyError::HedgedChainRequiresAlerts {
                     chain: Chain::HyperEvm

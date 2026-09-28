@@ -1907,7 +1907,31 @@ names `[registry]` keeps its per-symbol tables in the token file in the bucket;
 `--registry-file` supplies a local copy so they are checked too. Without it the
 config is judged without them and the report says so.
 
-### The token file
+The two modes differ only in how much of the input they have:
+
+- **With `--secrets`** it applies every rule, the config/secrets cross-checks
+  included: broker credentials and the type they resolve to, each chain's
+  `rpc_url`, wallet keys, and the pricing and issuance API keys. This is the
+  deploy gate described below, run against the staged candidate files while the
+  old process is still serving.
+- **Without `--secrets`** it applies every rule the config file can be judged
+  against alone: its schema (an unknown key is a failure, never a silently
+  ignored line), the port, chain, asset-table and `[rebalancing]` cross-field
+  rules, and each value the config carries on its own. It requires no secret, no
+  network, and no clock.
+
+Both modes run one shared implementation, so the secrets-free mode is a strict
+subset of the deploy gate rather than a parallel set of rules: a config it
+accepts cannot fail startup on any rule it checked, and a config it rejects
+would have failed the deploy gate too.
+
+That subset is what makes the check affordable in continuous integration, which
+validates every config the repository ships -- `config/**/*.toml`,
+`example.config.toml`, and `e2e/config.toml` -- on every pull request. Configs
+are discovered by walking `config/`, so a new environment directory is covered
+the day it is added rather than the day someone remembers to list it.
+
+#### The token file
 
 The per-symbol tables, `[chains.<c>.trading.assets.equities.<SYM>]` (addresses,
 vault ids, `trading` / `rebalancing` / `wrapped_equity_recovery`) and
@@ -1932,37 +1956,21 @@ the file's rows can go afterwards.
 
 Production pins `generation`: every roll of a release runs the same object, and
 a token change ships only with a release that bumps the pin. Staging reads the
-latest copy at every start. A refresh loop reads the bucket every 60 s and never
-applies a change; it reports `registry_pending_restart` (the latest published
-copy differs from the running tables), `registry_invalid` (the copy the next
-start would read, the pin in production and the latest in staging, is gone, too
-large, or would be refused) and `registry_fetch_errors_total` (transient read
-failures). `verify-migrations` and `verify-approvals` read the same file, from
-the bucket on the VM or from `--registry-file` elsewhere.
-
-The two modes differ only in how much of the input they have:
-
-- **With `--secrets`** it applies every rule, the config/secrets cross-checks
-  included: broker credentials and the type they resolve to, each chain's
-  `rpc_url`, wallet keys, and the pricing and issuance API keys. This is the
-  deploy gate described below, run against the staged candidate files while the
-  old process is still serving.
-- **Without `--secrets`** it applies every rule the config file can be judged
-  against alone: its schema (an unknown key is a failure, never a silently
-  ignored line), the port, chain, asset-table and `[rebalancing]` cross-field
-  rules, and each value the config carries on its own. It requires no secret, no
-  network, and no clock.
-
-Both modes run one shared implementation, so the secrets-free mode is a strict
-subset of the deploy gate rather than a parallel set of rules: a config it
-accepts cannot fail startup on any rule it checked, and a config it rejects
-would have failed the deploy gate too.
-
-That subset is what makes the check affordable in continuous integration, which
-validates every config the repository ships -- `config/**/*.toml`,
-`example.config.toml`, and `e2e/config.toml` -- on every pull request. Configs
-are discovered by walking `config/`, so a new environment directory is covered
-the day it is added rather than the day someone remembers to list it.
+latest copy at every start, a crash restart included, so a staging token change
+takes effect without the deploy gates: `verify-migrations` does not run, and
+nothing refuses a file that drops a symbol the database still references. The
+order in "Retiring an asset" in `docs/how-to-add-new-asset.md` (retire in the
+config first, remove the rows after) is the only guard. A refresh loop reads the
+bucket every 60 s and never applies a change; it reports
+`registry_pending_restart` (the latest published copy differs from the running
+tables), `registry_invalid` (the copy the next start would read, the pin in
+production and the latest in staging, is gone, refused to the service account
+with a 401 or 403, too large, or would be refused), `registry_latest_refused`
+(the latest copy would be refused at boot; with a pin it is the copy a pin bump
+would move to) and `registry_fetch_errors_total` (transient read failures: the
+metadata token, 429, 5xx, the network). `verify-migrations` and
+`verify-approvals` read the same file, from the bucket on the VM or from
+`--registry-file` elsewhere.
 
 #### Tools
 

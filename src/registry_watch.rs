@@ -7,9 +7,11 @@
 //! published that this instance does not run" (`registry_pending_restart`).
 //! The copy the next roll reads, the pinned generation when there is one
 //! and the latest otherwise, answers "would that roll boot"
-//! (`registry_invalid`): a copy that is gone or oversized, or a latest copy
-//! the validation refuses. The pinned read happens whatever the latest read
-//! did, so a lost pin is reported even while the latest copy cannot be read.
+//! (`registry_invalid`): a copy that is gone, refused to the service account
+//! or oversized, or a latest copy the validation refuses. The pinned read
+//! happens whatever the latest read did, so a lost pin is reported even while
+//! the latest copy cannot be read. `registry_latest_refused` says the latest
+//! copy alone would be refused, so a bad target shows before a pin moves to it.
 
 use std::time::Duration;
 
@@ -25,7 +27,8 @@ const REFRESH: Duration = Duration::from_secs(60);
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Copy {
     Bytes(Vec<u8>),
-    /// Gone (404) or over the size cap: boot refuses it too.
+    /// Gone (404), refused to the service account (401, 403) or over the
+    /// size cap: boot refuses it too.
     Unusable,
 }
 
@@ -125,6 +128,7 @@ pub(crate) async fn watch(live: RegistryLive, shutdown: CancellationToken) {
         let Gauges {
             pending_restart,
             invalid,
+            latest_refused,
         } = gauges(
             check.as_ref(),
             live.source.generation.is_some(),
@@ -132,6 +136,7 @@ pub(crate) async fn watch(live: RegistryLive, shutdown: CancellationToken) {
         );
         metrics::gauge!("registry_pending_restart").set(f64::from(u8::from(pending_restart)));
         metrics::gauge!("registry_invalid").set(f64::from(u8::from(invalid)));
+        metrics::gauge!("registry_latest_refused").set(f64::from(u8::from(latest_refused)));
     }
 }
 
@@ -167,11 +172,12 @@ impl Seen {
 struct Gauges {
     pending_restart: bool,
     invalid: bool,
+    latest_refused: bool,
 }
 
 /// What one judged tick reports. `check` is `None` when the latest copy is
-/// unusable (gone or oversized): nothing is waiting to be picked up, and the
-/// next roll cannot read it. A latest copy that differs, or is refused, is a
+/// unusable (gone, refused to the service account or oversized): nothing is
+/// waiting to be picked up, and the next roll cannot read it. A latest copy that differs, or is refused, is a
 /// change waiting; it makes the next roll fail only without a pin. With a
 /// pin, only that copy being unusable makes the next roll fail.
 fn gauges<Error>(
@@ -188,6 +194,7 @@ fn gauges<Error>(
     Gauges {
         pending_restart,
         invalid: (latest_refused && !pinned) || !pinned_readable,
+        latest_refused,
     }
 }
 
@@ -223,6 +230,7 @@ mod tests {
             Gauges {
                 pending_restart: false,
                 invalid: false,
+                latest_refused: false,
             }
         );
     }
@@ -247,11 +255,14 @@ mod tests {
                 Gauges {
                     pending_restart: true,
                     invalid: false,
+                    latest_refused: false,
                 }
             );
         }
     }
 
+    /// With a pin a refused latest copy does not stop the next roll, but
+    /// `registry_latest_refused` still says the next pin target is bad.
     #[test]
     fn a_refused_latest_copy_is_invalid_only_without_a_pin() {
         assert_eq!(
@@ -259,6 +270,7 @@ mod tests {
             Gauges {
                 pending_restart: true,
                 invalid: true,
+                latest_refused: true,
             }
         );
         assert_eq!(
@@ -266,12 +278,13 @@ mod tests {
             Gauges {
                 pending_restart: true,
                 invalid: false,
+                latest_refused: true,
             }
         );
     }
 
-    /// A latest copy that is gone or oversized: boot refuses it, so the
-    /// gauge says so without a pin, and nothing is pending.
+    /// A latest copy that is gone, refused or oversized: boot refuses it, so
+    /// the gauge says so without a pin, and nothing is pending.
     #[test]
     fn an_unusable_latest_copy_is_invalid_without_a_pin() {
         assert_eq!(
@@ -279,6 +292,7 @@ mod tests {
             Gauges {
                 pending_restart: false,
                 invalid: true,
+                latest_refused: true,
             }
         );
         assert_eq!(
@@ -286,6 +300,7 @@ mod tests {
             Gauges {
                 pending_restart: false,
                 invalid: false,
+                latest_refused: true,
             }
         );
     }
@@ -297,6 +312,7 @@ mod tests {
             Gauges {
                 pending_restart: false,
                 invalid: true,
+                latest_refused: false,
             }
         );
         assert_eq!(
@@ -304,6 +320,7 @@ mod tests {
             Gauges {
                 pending_restart: true,
                 invalid: true,
+                latest_refused: true,
             }
         );
         assert_eq!(
@@ -311,6 +328,7 @@ mod tests {
             Gauges {
                 pending_restart: false,
                 invalid: true,
+                latest_refused: true,
             }
         );
     }

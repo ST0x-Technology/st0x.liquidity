@@ -130,11 +130,16 @@ pub enum RegistryError {
 }
 
 impl RegistryError {
-    /// A copy boot refuses as well, gone or over the size cap, as opposed
-    /// to a read that may succeed next time.
+    /// A copy boot refuses as well, gone, refused to the service account or
+    /// over the size cap, as opposed to a read that may succeed next time.
     pub fn copy_is_unusable(&self) -> bool {
         match self {
-            Self::Status { status, .. } => *status == reqwest::StatusCode::NOT_FOUND,
+            Self::Status { status, .. } => matches!(
+                *status,
+                reqwest::StatusCode::NOT_FOUND
+                    | reqwest::StatusCode::UNAUTHORIZED
+                    | reqwest::StatusCode::FORBIDDEN
+            ),
             Self::TooLarge { .. } => true,
             Self::Source(_)
             | Self::Url { .. }
@@ -1141,5 +1146,26 @@ mod tests {
             describe_change(&live, &fresh).as_deref(),
             Some("hedge policies changed")
         );
+    }
+
+    /// A copy that is gone or refused to the service account fails every
+    /// boot until someone acts; a rate limit or a server error may not.
+    #[test]
+    fn a_lost_grant_is_unusable_and_a_server_error_is_transient() {
+        for (status, unusable) in [
+            (reqwest::StatusCode::UNAUTHORIZED, true),
+            (reqwest::StatusCode::FORBIDDEN, true),
+            (reqwest::StatusCode::NOT_FOUND, true),
+            (reqwest::StatusCode::TOO_MANY_REQUESTS, false),
+            (reqwest::StatusCode::INTERNAL_SERVER_ERROR, false),
+            (reqwest::StatusCode::SERVICE_UNAVAILABLE, false),
+        ] {
+            let error = RegistryError::Status {
+                url: "gs://bucket/tokens.toml".into(),
+                status,
+                body: String::new(),
+            };
+            assert_eq!(error.copy_is_unusable(), unusable, "{status}");
+        }
     }
 }

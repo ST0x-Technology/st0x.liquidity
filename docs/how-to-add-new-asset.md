@@ -152,7 +152,7 @@ which keys may appear, and their spelling, is checked by `st0x.registry`'s CI
 trading = "disabled"                          # "enabled" or "disabled"
 rebalancing = "disabled"                      # "enabled" or "disabled"
 wrapped_equity_recovery = "disabled"          # "enabled" or "disabled"
-vault_ids = ["0xfab"]                         # Raindex vault IDs (can omit for auto-discovery)
+vault_ids = ["0xfab"]                         # Raindex vault IDs (required when rebalancing = "enabled")
 tokenized_equity = "0xc941C1506B7555Ba8C506Fb6c9b9CC259902d612"
 tokenized_equity_derivative = "0x78c31580c97101694c70022c83d570150c11e935"
 
@@ -227,8 +227,10 @@ chain's signing wallet, orderbook, `redemption_wallet` and
   bot to place offsetting broker trades outside regular market hours;
   `"disabled"` restricts counter-trading to regular session only. Must be
   specified for every equity entry.
-- `vault_ids`: The Raindex vault IDs. Can be omitted to let the bot discover
-  them automatically.
+- `vault_ids`: The Raindex vault IDs. Required when `rebalancing = "enabled"`:
+  the bot refuses a token file with a rebalancing row that has none. With
+  rebalancing disabled they can be omitted, and the bot discovers the vaults
+  from its trade events.
 - `tokenized_equity`: The base token contract address.
 - `tokenized_equity_derivative`: The wrapped token contract address.
 
@@ -238,11 +240,15 @@ Merge the `st0x.registry` change; its CI publishes the file. The bot never
 applies a new copy while it runs: its `registry_pending_restart` gauge goes to 1
 when the latest published copy differs from the one it runs, and
 `registry_invalid` goes to 1 when the copy its next start would read (the pinned
-generation in production, the latest copy in staging) would be refused. In
-production a restart alone changes nothing: it loads the pinned generation
-again, so the gauge stays at 1 until the pin is bumped and released.
+generation in production, the latest copy in staging) would be refused.
+`registry_latest_refused` goes to 1 when the latest copy would be refused, so in
+production a bad copy shows before the pin is bumped to it. In production a
+restart alone changes nothing: it loads the pinned generation again, so the
+gauge stays at 1 until the pin is bumped and released.
 
-- **Staging** reads the latest copy, so the next restart picks the asset up.
+- **Staging** reads the latest copy on every start, so the next restart picks
+  the asset up. That includes a crash restart, and no deploy gate runs on it:
+  whatever is published is what the next staging start runs.
 - **Production** pins `generation` under `[registry]` in
   `config/prod/st0x-hedge.toml`. Set it to the new generation
   (`gcloud storage objects describe gs://t0-artifacts-tokens/production/tokens.toml`)
@@ -269,7 +275,9 @@ retired, and `verify-migrations` still finds every symbol the database
 references either configured or retired. Remove its rows from `t0/<env>.toml` in
 `st0x.registry` whenever convenient afterwards; for production that lands with
 the next `generation` bump. Never remove the rows first: the database would then
-reference a symbol that is neither configured nor retired.
+reference a symbol that is neither configured nor retired. Nothing enforces this
+order. Staging loads the latest copy on any restart without a deploy gate, so
+rows removed too early take effect at the next staging start.
 
 **Tip:** Start with `trading = "disabled"` first. Publish, verify the bot sees
 the asset, then enable trading in a follow-up change.

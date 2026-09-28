@@ -53,6 +53,12 @@ pub(crate) fn setup() -> Result<PrometheusHandle, BuildError> {
         "1 while the copy the next roll reads (the pinned generation, else the latest) would \
          be refused at boot or is gone"
     );
+    metrics::describe_gauge!(
+        "registry_latest_refused",
+        "1 while the latest token file in the bucket would be refused at boot or cannot be \
+         read (gone, refused to the service account, too large); with a pinned generation, \
+         the copy a pin bump would move to"
+    );
     metrics::describe_counter!(
         "registry_fetch_errors_total",
         "Refresh reads of the token file that failed"
