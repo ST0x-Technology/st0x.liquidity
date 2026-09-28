@@ -6823,9 +6823,17 @@ mod tests {
     use st0x_raindex::{RaindexContracts, RaindexService};
 
     use super::*;
+    use crate::alerts::CapturingNotifier;
     use crate::bot_gas::pending_bot_gas_jobs;
+    use crate::conductor::job::{BackpressureStreak, Job};
+    use crate::rebalancing::usdc::{
+        TransferUsdcToMarketMaking, TransferUsdcToMarketMakingCtx,
+        TransferUsdcToMarketMakingJobQueue,
+    };
     use crate::telemetry::TelemetrySender;
-    use crate::test_utils::{TestAnvilInstance, persist_event, spawn_anvil, spawn_anvil_pair};
+    use crate::test_utils::{
+        TestAnvilInstance, persist_event, setup_test_apalis_pool, spawn_anvil, spawn_anvil_pair,
+    };
     use crate::usdc_rebalance::{
         RebalanceDirection, ReconcileReason, TransferRef, UsdcRebalanceError, UsdcRebalanceEvent,
     };
@@ -26761,5 +26769,65 @@ mod tests {
             ),
             "got {error:?}"
         );
+    }
+
+    /// A reconciled transfer on another corridor holds no guard and needs no
+    /// build to resume it, so its job ends instead of re-queuing forever.
+    #[tokio::test]
+    async fn job_for_a_reconciled_transfer_on_another_corridor_ends() {
+        let server = MockServer::start();
+        let (manager, cqrs, _anvil) = make_resume_test_manager(&server).await;
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let amount = usdc("100");
+        for command in [
+            UsdcRebalanceCommand::InitiateConversion {
+                direction: RebalanceDirection::AlpacaToBase,
+                corridor: ROBINHOOD_RELAY,
+                amount,
+                order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
+            },
+            UsdcRebalanceCommand::ConfirmConversion {
+                conversion: par_conversion(amount),
+            },
+            UsdcRebalanceCommand::Initiate {
+                corridor: ROBINHOOD_RELAY,
+                direction: RebalanceDirection::AlpacaToBase,
+                amount,
+                withdrawal: TransferRef::AlpacaId(AlpacaTransferId::from(Uuid::new_v4())),
+            },
+            UsdcRebalanceCommand::ConfirmWithdrawal {
+                withdrawal_tx: None,
+            },
+            UsdcRebalanceCommand::FailBridging {
+                reason: "withdrawn funds need the operator".to_string(),
+            },
+            UsdcRebalanceCommand::ReconcileStuckRebalance {
+                reason: ReconcileReason::FundsMovedManually,
+            },
+        ] {
+            cqrs.send(&id, command).await.unwrap();
+        }
+        let pool = setup_test_apalis_pool().await;
+        let ctx = TransferUsdcToMarketMakingCtx {
+            transfer: Arc::new(manager),
+            job_queue: TransferUsdcToMarketMakingJobQueue::new(&pool),
+            max_burn_revert_redrives: 5,
+            notifier: Arc::new(CapturingNotifier::default()),
+        };
+        let job = TransferUsdcToMarketMaking {
+            id,
+            amount,
+            corridor: ROBINHOOD_RELAY,
+            revert_redrive_attempts: 0,
+            backpressure_streak: BackpressureStreak::default(),
+        };
+
+        Job::perform(&job, &ctx).await.unwrap();
+
+        let queued: i64 = sqlx_apalis::query_scalar("SELECT COUNT(*) FROM Jobs")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(queued, 0, "a reconciled transfer's job must not re-queue");
     }
 }
