@@ -173,19 +173,18 @@ mod tests {
         for (runtime, tokens, fragment) in [
             (
                 include_str!("../../../config/prod/st0x-hedge.toml"),
-                include_bytes!("../../../tests/fixtures/tokens-production-1790341753647581.toml")
-                    .as_slice(),
+                crate::registry::fixtures::pinned_production_tokens(),
                 include_str!("../../../docs/trading-schedule/prod.toml"),
             ),
             (
                 include_str!("../../../config/staging/st0x-hedge.toml"),
-                include_bytes!("../../../tests/fixtures/tokens-staging.toml").as_slice(),
+                crate::registry::fixtures::read("tokens-staging.toml"),
                 include_str!("../../../docs/trading-schedule/staging.toml"),
             ),
         ] {
             let mut runtime: toml::Table = toml::from_str(runtime).unwrap();
             let tokens =
-                crate::registry::project(&crate::registry::parse(tokens).unwrap()).unwrap();
+                crate::registry::project(&crate::registry::parse(&tokens).unwrap()).unwrap();
             crate::registry::merge(&mut runtime, &tokens).unwrap();
             let assets: HedgingAssets = runtime["assets"].clone().try_into().unwrap();
             let fragment: toml::Value = toml::from_str(fragment).unwrap();

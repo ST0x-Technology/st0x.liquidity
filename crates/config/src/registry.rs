@@ -129,6 +129,74 @@ pub enum RegistryError {
     },
 }
 
+impl RegistryError {
+    /// A copy boot refuses as well, gone or over the size cap, as opposed
+    /// to a read that may succeed next time.
+    pub fn copy_is_unusable(&self) -> bool {
+        match self {
+            Self::Status { status, .. } => *status == reqwest::StatusCode::NOT_FOUND,
+            Self::TooLarge { .. } => true,
+            Self::Source(_)
+            | Self::Url { .. }
+            | Self::Utf8(_)
+            | Self::Toml(_)
+            | Self::SchemaVersion { .. }
+            | Self::NotATable { .. }
+            | Self::BadSwitch { .. }
+            | Self::MissingAddress { .. }
+            | Self::EmptyUniverse
+            | Self::UndeclaredChain { .. }
+            | Self::InlineTable { .. }
+            | Self::LocalRead { .. }
+            | Self::Client(_)
+            | Self::MetadataToken(_)
+            | Self::Http { .. }
+            | Self::BootTimeout { .. } => false,
+        }
+    }
+}
+
+/// The token files the tests read, from `tests/fixtures`.
+///
+/// Two production copies exist on purpose. `tokens-production-migration.toml`
+/// is frozen beside `production-inline.toml`, the pair that proves the
+/// projection reproduces the inline tables the day they were replaced. The
+/// copy production runs is the one `config/prod`'s pin names,
+/// `tokens-production-<generation>.toml`; a pin bump adds that file.
+#[cfg(test)]
+pub(crate) mod fixtures {
+    use std::path::{Path, PathBuf};
+
+    fn root() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
+    }
+
+    pub(crate) fn read(name: &str) -> Vec<u8> {
+        std::fs::read(root().join("tests/fixtures").join(name))
+            .unwrap_or_else(|error| panic!("tests/fixtures/{name}: {error}"))
+    }
+
+    /// The copy `config/prod` pins, by generation.
+    pub(crate) fn pinned_production_tokens() -> Vec<u8> {
+        let deployed: toml::Table = toml::from_str(
+            &std::fs::read_to_string(root().join("config/prod/st0x-hedge.toml")).unwrap(),
+        )
+        .unwrap();
+        let pinned = super::source_of(&deployed)
+            .unwrap()
+            .unwrap()
+            .generation
+            .expect("config/prod pins a generation");
+        let name = format!("tokens-production-{pinned}.toml");
+        assert!(
+            root().join("tests/fixtures").join(&name).is_file(),
+            "config/prod pins generation {pinned}; copy that object to tests/fixtures/{name} \
+             (gcloud storage cp 'gs://t0-artifacts-tokens/production/tokens.toml#{pinned}' ...)"
+        );
+        read(&name)
+    }
+}
+
 /// How the token file reaches a parse of the config.
 #[derive(Debug, Clone, Copy)]
 pub enum TokenFile<'a> {
@@ -643,11 +711,7 @@ mod tests {
     use crate::assets::{ChainEquityAsset, EquityHedgePolicy};
 
     fn fixture(name: &str) -> String {
-        std::fs::read_to_string(format!(
-            "{}/../../tests/fixtures/{name}",
-            env!("CARGO_MANIFEST_DIR")
-        ))
-        .unwrap_or_else(|error| panic!("{name}: {error}"))
+        String::from_utf8(fixtures::read(name)).unwrap()
     }
 
     fn canon(file: &Table) -> String {
@@ -667,7 +731,7 @@ mod tests {
             let inline: Table = toml::from_str(&fixture(&format!("{env}-inline.toml"))).unwrap();
             let tokens = match env {
                 "staging" => "tokens-staging.toml",
-                _ => "tokens-production-1790341753647581.toml",
+                _ => "tokens-production-migration.toml",
             };
             let projection = project(&parse(fixture(tokens).as_bytes()).unwrap()).unwrap();
 
@@ -727,9 +791,7 @@ mod tests {
 
     #[test]
     fn a_priced_only_slot_is_not_the_bots() {
-        let projection =
-            project(&parse(fixture("tokens-production-1790341753647581.toml").as_bytes()).unwrap())
-                .unwrap();
+        let projection = project(&parse(&fixtures::pinned_production_tokens()).unwrap()).unwrap();
         // Ethereum FTF is priced and quoted, but liquidity does not hedge it.
         assert!(!projection.slots().contains("ethereum/FTF"));
         assert!(projection.slots().contains("base/FGI"));
@@ -761,6 +823,42 @@ mod tests {
         assert!(matches!(
             merge(&mut config, &projection).unwrap_err(),
             RegistryError::UndeclaredChain { chain } if chain == "base"
+        ));
+
+        let mut file = parse(fixture("tokens-staging.toml").as_bytes()).unwrap();
+        file["chains"]["base"]["assets"]["equities"]["FGI"]
+            .as_table_mut()
+            .unwrap()
+            .remove("tokenized_equity_derivative");
+        assert!(matches!(
+            project(&file).unwrap_err(),
+            RegistryError::MissingAddress {
+                key: "tokenized_equity_derivative",
+                ..
+            }
+        ));
+
+        let mut file = parse(fixture("tokens-staging.toml").as_bytes()).unwrap();
+        for chain in ["base", "robinhood"] {
+            for (_, slot) in file["chains"][chain]["assets"]["equities"]
+                .as_table_mut()
+                .unwrap()
+                .iter_mut()
+            {
+                let slot = slot.as_table_mut().unwrap();
+                for key in [
+                    "trading",
+                    "rebalancing",
+                    "wrapped_equity_recovery",
+                    "tokenized_equity",
+                ] {
+                    slot.remove(key);
+                }
+            }
+        }
+        assert!(matches!(
+            project(&file).unwrap_err(),
+            RegistryError::EmptyUniverse
         ));
     }
 

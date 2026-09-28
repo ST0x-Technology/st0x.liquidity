@@ -1673,6 +1673,23 @@ fn validate_asset_tables(
         }
     }
 
+    // Startup seeds one vault per rebalancing-enabled equity, so a row that
+    // rebalances with no vault id crash-loops the conductor. Judged here,
+    // where every config-only path (boot, validate-config, verify-approvals,
+    // the token-file refresh check) runs it.
+    for config in chains.values() {
+        let Some(trading) = &config.trading else {
+            continue;
+        };
+        for (symbol, asset) in &trading.assets.equities.symbols {
+            if asset.rebalancing == OperationMode::Enabled && asset.vault_ids.is_empty() {
+                return Err(CtxError::MissingEquityVaultId {
+                    symbol: symbol.clone(),
+                });
+            }
+        }
+    }
+
     for (symbol, policy) in &hedging.equities.symbols {
         let listed = listings(symbol);
 
@@ -2026,10 +2043,12 @@ pub async fn fetch_token_file(
 
 /// Judge a fresh copy of the token file against the config this instance runs.
 ///
-/// Parses, merges, and runs the config-only checks and the allocation check.
-/// Boot runs more (those that need secrets or chain state), so a pass here
-/// does not promise a clean boot. Returns what differs from the running
-/// tables, or `None` when nothing does.
+/// Parses, merges, and runs every rule boot runs on the config alone
+/// (`validate_config`, the allocation check included); the per-symbol rules
+/// live in `validate_asset_tables` so they are on this path. What boot adds
+/// beyond that needs secrets or chain state, so a pass here does not
+/// promise a clean boot. Returns what differs from the running tables, or
+/// `None` when nothing does.
 pub fn registry_check(live: &RegistryLive, fresh: &[u8]) -> Result<Option<String>, CtxError> {
     let path = Path::new(&live.source.url);
     let registry_error = |source| CtxError::Registry {
@@ -8959,12 +8978,11 @@ mod tests {
     #[test]
     fn server_config_toml_is_valid() {
         let config_str = include_str!("../../../config/prod/st0x-hedge.toml");
+        let tokens = registry::fixtures::pinned_production_tokens();
         let (config, _) = config_from(
             config_str,
             Path::new("config/prod/st0x-hedge.toml"),
-            TokenFile::Bytes(include_bytes!(
-                "../../../tests/fixtures/tokens-production-1790341753647581.toml"
-            )),
+            TokenFile::Bytes(&tokens),
             &mut Vec::new(),
         )
         .unwrap();
@@ -9105,21 +9123,20 @@ mod tests {
             (
                 "prod",
                 include_str!("../../../config/prod/st0x-hedge.toml"),
-                include_bytes!("../../../tests/fixtures/tokens-production-1790341753647581.toml")
-                    .as_slice(),
+                registry::fixtures::pinned_production_tokens(),
                 &prod_equities,
             ),
             (
                 "staging",
                 include_str!("../../../config/staging/st0x-hedge.toml"),
-                include_bytes!("../../../tests/fixtures/tokens-staging.toml").as_slice(),
+                registry::fixtures::read("tokens-staging.toml"),
                 &staging_equities,
             ),
         ] {
             let (config, _) = config_from(
                 config_str,
                 Path::new(name),
-                TokenFile::Bytes(tokens),
+                TokenFile::Bytes(&tokens),
                 &mut Vec::new(),
             )
             .unwrap();
@@ -9300,9 +9317,12 @@ mod tests {
                 if env == "staging" { "staging" } else { "prod" }
             ));
             let deployed = std::fs::read_to_string(&config_path).unwrap();
+            // The migration pair is frozen: the inline config the day it was
+            // replaced and the token file it was replaced with. A later pin
+            // bump does not touch it.
             let tokens = std::fs::read(root.join(match env {
                 "staging" => "tests/fixtures/tokens-staging.toml",
-                _ => "tests/fixtures/tokens-production-1790341753647581.toml",
+                _ => "tests/fixtures/tokens-production-migration.toml",
             }))
             .unwrap();
             let inline: Config = toml::from_str(
@@ -9403,30 +9423,46 @@ mod tests {
         );
     }
 
-    /// The production fixture is the pinned generation, by name: bumping the
-    /// pin without refreshing the fixture (and the tests that read it) fails
-    /// here, before a VM boot finds out.
+    /// The copy production runs is the fixture the pin names: a pin bump
+    /// without that fixture fails here, before a VM boot finds out, and the
+    /// copy must pass every check the deployed config runs.
     #[test]
-    fn the_production_fixture_is_the_pinned_generation() {
+    fn the_pinned_production_copy_passes_the_deployed_config() {
+        let tokens = registry::fixtures::pinned_production_tokens();
+        let config_path = Path::new("config/prod/st0x-hedge.toml");
+        let mut notices = Vec::new();
+        let (config, live) = config_from(
+            include_str!("../../../config/prod/st0x-hedge.toml"),
+            config_path,
+            TokenFile::Bytes(&tokens),
+            &mut notices,
+        )
+        .unwrap();
+        assert!(live.is_some());
+        validate_config(&config, config_path, &mut notices).unwrap();
+    }
+
+    /// The verify-migrations path, end to end: the symbols it sees are the
+    /// token file's bot slots minus the config's retired ones.
+    #[test]
+    fn deployment_symbol_policy_reads_the_token_file() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-        let deployed: toml::Table =
-            toml::from_str(include_str!("../../../config/prod/st0x-hedge.toml")).unwrap();
-        let pinned = registry::source_of(&deployed)
-            .unwrap()
-            .unwrap()
-            .generation
-            .unwrap();
-        let fixture = root.join(format!("tests/fixtures/tokens-production-{pinned}.toml"));
-        assert!(
-            fixture.is_file(),
-            "config/prod pins generation {pinned}; put that copy at {}",
-            fixture.display()
-        );
-        assert_eq!(
-            std::fs::read(&fixture).unwrap(),
-            include_bytes!("../../../tests/fixtures/tokens-production-1790341753647581.toml"),
-            "the tests read a different fixture than the pin names"
-        );
+        let tokens = registry::fixtures::read("tokens-staging.toml");
+        let policy = load_deployment_symbol_policy(
+            &root.join("config/staging/st0x-hedge.toml"),
+            TokenFile::Bytes(&tokens),
+        )
+        .unwrap();
+        let projection = registry::project(&registry::parse(&tokens).unwrap()).unwrap();
+        let want: BTreeSet<Symbol> = projection
+            .chain_rows
+            .values()
+            .flat_map(|rows| rows.keys())
+            .map(|symbol| Symbol::new(symbol).unwrap())
+            .filter(|symbol| !policy.retired().contains(symbol))
+            .collect();
+        assert!(!want.is_empty());
+        assert_eq!(policy.configured(), &want);
     }
 
     /// A config that names `[registry]` and still carries a per-symbol
@@ -9685,10 +9721,7 @@ mod tests {
         let mut runtime: toml::Table =
             toml::from_str(include_str!("../../../config/staging/st0x-hedge.toml")).unwrap();
         runtime.remove("registry");
-        let tokens = registry::parse(include_bytes!(
-            "../../../tests/fixtures/tokens-staging.toml"
-        ))
-        .unwrap();
+        let tokens = registry::parse(&registry::fixtures::read("tokens-staging.toml")).unwrap();
         registry::merge(&mut runtime, &registry::project(&tokens).unwrap()).unwrap();
         let runtime = toml::Value::Table(runtime);
         let fragment: toml::Value =
