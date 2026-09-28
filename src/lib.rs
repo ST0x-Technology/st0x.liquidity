@@ -22,7 +22,7 @@ use tokio::net::TcpListener;
 use tokio::sync::broadcast;
 use tokio::task::{AbortHandle, JoinError, JoinHandle};
 use tokio_util::sync::CancellationToken;
-use tokio_util::task::TaskTracker;
+use tokio_util::task::{AbortOnDropHandle, TaskTracker};
 use tracing::{debug, error, info, warn};
 use tracing_subscriber::Layer;
 
@@ -300,11 +300,14 @@ async fn run_bot_session_inner(
 
     let health = startup::HealthGate::default();
     let detached_tasks = TaskTracker::new();
-    // Not on `detached_tasks`: shutdown drains that tracker, and this loop
-    // only ends on cancellation, which the bot-exit path never sends.
-    if let Some(live) = ctx.registry.clone() {
-        tokio::spawn(registry_watch::watch(live, shutdown_token.clone()));
-    }
+    // Owned by this session: the handle aborts the loop when this function
+    // returns on any path, so no second session ever shares its gauges.
+    let _registry_watch = ctx.registry.clone().map(|live| {
+        AbortOnDropHandle::new(tokio::spawn(registry_watch::watch(
+            live,
+            shutdown_token.clone(),
+        )))
+    });
     let state = AppState {
         ctx: ctx.clone(),
         pool: pools.cqrs.clone(),

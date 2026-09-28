@@ -1946,8 +1946,10 @@ fn config_table(
     match tokens {
         TokenFile::Bytes(bytes) => {
             let file = registry::parse(bytes).map_err(registry_error)?;
-            let live = registry::project(&file).map_err(registry_error)?;
             let static_config = table.clone();
+            let live = registry::project(&file)
+                .map_err(registry_error)?
+                .without_retired(&static_config);
             registry::merge(&mut table, &live).map_err(registry_error)?;
             Ok((
                 table,
@@ -2034,7 +2036,9 @@ pub fn registry_check(live: &RegistryLive, fresh: &[u8]) -> Result<Option<String
         source,
     };
     let file = registry::parse(fresh).map_err(registry_error)?;
-    let projection = registry::project(&file).map_err(registry_error)?;
+    let projection = registry::project(&file)
+        .map_err(registry_error)?
+        .without_retired(&live.static_config);
     let mut table = live.static_config.clone();
     registry::merge(&mut table, &projection).map_err(registry_error)?;
     let config: Config = table.try_into().map_err(|source| CtxError::ConfigToml {

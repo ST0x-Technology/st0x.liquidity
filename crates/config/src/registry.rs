@@ -146,6 +146,19 @@ pub struct Projection {
 }
 
 impl Projection {
+    /// The projection as the merge takes it: without the symbols the config
+    /// retires. What runs and what the refresh loop compares are both this,
+    /// so deleting a retired symbol's rows from the file is not a change.
+    #[must_use]
+    pub fn without_retired(mut self, config: &Table) -> Self {
+        let retired = retired_symbols(config);
+        for rows in self.chain_rows.values_mut() {
+            rows.retain(|symbol, _| !retired.contains(symbol));
+        }
+        self.policies.retain(|symbol, _| !retired.contains(symbol));
+        self
+    }
+
     /// `chain/SYMBOL` of every hedged slot.
     pub fn slots(&self) -> BTreeSet<String> {
         self.chain_rows
@@ -384,7 +397,7 @@ fn retired_symbols(config: &Table) -> BTreeSet<String> {
 /// release-time facts.
 pub fn merge(config: &mut Table, projection: &Projection) -> Result<(), RegistryError> {
     refuse_inline_tables(config)?;
-    let retired = retired_symbols(config);
+    let projection = projection.clone().without_retired(config);
 
     let chains = subtable(config, "chains", "chains")?;
     for (chain, rows) in &projection.chain_rows {
@@ -407,9 +420,6 @@ pub fn merge(config: &mut Table, projection: &Projection) -> Result<(), Registry
             &format!("chains.{chain}.trading.assets.equities"),
         )?;
         for (symbol, row) in rows {
-            if retired.contains(symbol) {
-                continue;
-            }
             equities.insert(symbol.clone(), Value::Table(row.clone()));
         }
     }
@@ -417,9 +427,6 @@ pub fn merge(config: &mut Table, projection: &Projection) -> Result<(), Registry
     let assets = subtable(config, "assets", "assets")?;
     let equities = subtable(assets, "equities", "assets.equities")?;
     for (symbol, row) in &projection.policies {
-        if retired.contains(symbol) {
-            continue;
-        }
         equities.insert(symbol.clone(), Value::Table(row.clone()));
     }
     Ok(())
@@ -842,6 +849,31 @@ mod tests {
         let policies = config["assets"]["equities"].as_table().unwrap();
         assert!(!policies.contains_key("FGI"));
         assert!(policies.contains_key("RKLB"));
+    }
+
+    /// Deleting a retired symbol's rows from the file is not a change: the
+    /// running projection never had them.
+    #[test]
+    fn a_retired_symbols_rows_leaving_the_file_is_not_a_change() {
+        let config: Table = toml::from_str(
+            "[registry]\nurl = \"gs://b/o\"\n[chains.base.trading]\n[chains.robinhood.trading]\n\
+             [assets.equities]\nretired_symbols = [\"FGI\"]\n",
+        )
+        .unwrap();
+        let live = project(&parse(fixture("tokens-staging.toml").as_bytes()).unwrap())
+            .unwrap()
+            .without_retired(&config);
+        let mut file = parse(fixture("tokens-staging.toml").as_bytes()).unwrap();
+        file["chains"]["base"]["assets"]["equities"]
+            .as_table_mut()
+            .unwrap()
+            .remove("FGI");
+        file["assets"]["equities"]
+            .as_table_mut()
+            .unwrap()
+            .remove("FGI");
+        let fresh = project(&file).unwrap().without_retired(&config);
+        assert_eq!(describe_change(&live, &fresh), None);
     }
 
     /// A lowercase or oddly spelled inline table is still an inline table.

@@ -236,8 +236,11 @@ chain's signing wallet, orderbook, `redemption_wallet` and
 
 Merge the `st0x.registry` change; its CI publishes the file. The bot never
 applies a new copy while it runs: its `registry_pending_restart` gauge goes to 1
-when the copy it would read on its next start differs from the one it runs, and
-`registry_invalid` goes to 1 when that copy would be refused.
+when the latest published copy differs from the one it runs, and
+`registry_invalid` goes to 1 when the copy its next start would read (the pinned
+generation in production, the latest copy in staging) would be refused. In
+production a restart alone changes nothing: it loads the pinned generation
+again, so the gauge stays at 1 until the pin is bumped and released.
 
 - **Staging** reads the latest copy, so the next restart picks the asset up.
 - **Production** pins `generation` under `[registry]` in
