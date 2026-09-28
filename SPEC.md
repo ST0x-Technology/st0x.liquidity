@@ -829,8 +829,9 @@ orders, and converges any unfilled extended-hours orders back to market orders
 at the regular open.
 
 This behavior is **opt-in per asset** via the required
-`extended_hours_counter_trading` field on each `[assets.equities.SYMBOL]` config
-block (committed as `"disabled"`). That block is global rather than per chain:
+`extended_hours_counter_trading` field on each `[assets.equities.SYMBOL]` block
+(committed as `"disabled"`), which lives in the token file (see "The token file"
+below), not in the bot's own config. That block is global rather than per chain:
 one broker account hedges one position per symbol, so the same exposure cannot
 carry two session policies. With it disabled for an asset, behavior for that
 asset is unchanged: market orders during regular hours only. Assets absent from
@@ -1905,6 +1906,39 @@ opens no database, and reaches no external service in either mode. A config that
 names `[registry]` keeps its per-symbol tables in the token file in the bucket;
 `--registry-file` supplies a local copy so they are checked too. Without it the
 config is judged without them and the report says so.
+
+### The token file
+
+The per-symbol tables, `[chains.<c>.trading.assets.equities.<SYM>]` (addresses,
+vault ids, `trading` / `rebalancing` / `wrapped_equity_recovery`) and
+`[assets.equities.<SYM>]` (the hedge policy), are not in the bot's config. They
+come from the token file that `st0x.registry` publishes to
+`gs://t0-artifacts-tokens/<env>/tokens.toml`, one file per environment shared
+with pricing, the oracle, bebop and the price publisher. The config names it
+under `[registry]` (`url`, and in production `generation`) and must carry no
+per-symbol table of its own; one that does is refused.
+
+At boot the file is read as the VM's service account (`storage.objects.get` on
+its own env prefix only, no proxy, no redirects), three attempts within a 20
+second budget, 4 MiB cap. A read that fails, a file that does not parse, a slot
+with a malformed switch or a missing address, a chain the config does not
+declare, or an empty universe all fail boot. The bot takes its own keys from
+each slot and ignores the others; which keys may appear is checked by
+`st0x.registry`'s CI before the file is published. The rows are merged into the
+config's TOML table before it is deserialized, so every rule in
+`validate_config` runs on the result unchanged. A symbol listed under
+`retired_symbols` is dropped at the merge, so retiring is one config change and
+the file's rows can go afterwards.
+
+Production pins `generation`: every roll of a release runs the same object, and
+a token change ships only with a release that bumps the pin. Staging reads the
+latest copy at every start. A refresh loop reads the bucket every 60 s and never
+applies a change; it reports `registry_pending_restart` (the latest published
+copy differs from the running tables), `registry_invalid` (the copy the next
+start would read, the pin in production and the latest in staging, is gone, too
+large, or would be refused) and `registry_fetch_errors_total` (transient read
+failures). `verify-migrations` and `verify-approvals` read the same file, from
+the bucket on the VM or from `--registry-file` elsewhere.
 
 The two modes differ only in how much of the input they have:
 

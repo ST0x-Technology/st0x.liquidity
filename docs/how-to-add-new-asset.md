@@ -246,7 +246,12 @@ again, so the gauge stays at 1 until the pin is bumped and released.
 - **Production** pins `generation` under `[registry]` in
   `config/prod/st0x-hedge.toml`. Set it to the new generation
   (`gcloud storage objects describe gs://t0-artifacts-tokens/production/tokens.toml`)
-  in a liquidity PR and release it.
+  in a liquidity PR and release it. In the same PR copy that object to
+  `tests/fixtures/tokens-production-<generation>.toml`
+  (`gcloud storage cp 'gs://t0-artifacts-tokens/production/tokens.toml#<generation>' tests/fixtures/tokens-production-<generation>.toml`):
+  the tests that describe what production runs read the fixture the pin names,
+  and CI fails without it. `tokens-production-migration.toml` stays as it is; it
+  is the frozen proof of the move from inline tables.
 
 Before a release, check the file against the config offline:
 
