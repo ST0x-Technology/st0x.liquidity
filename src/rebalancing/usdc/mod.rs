@@ -35,6 +35,7 @@ use rain_math_float::FloatError;
 use thiserror::Error;
 
 use st0x_bridge::cctp::CctpError;
+use st0x_bridge::corridor::UsdcCorridor;
 use st0x_event_sorcery::SendError;
 use st0x_execution::{
     AlpacaBrokerApiError, AlpacaWalletError, ClientOrderId, InvalidSharesError, NotPositive,
@@ -246,6 +247,27 @@ pub enum UsdcTransferError {
     },
     #[error("USDC rebalance {id} cannot resume: aggregate is in terminal failure state")]
     PreviouslyFailedAggregate { id: UsdcRebalanceId },
+    #[error(
+        "USDC transfer corridor mismatch: transfer {id} runs on the {recorded} corridor, \
+         this service serves {served}; left untouched for the operator"
+    )]
+    CorridorMismatch {
+        id: UsdcRebalanceId,
+        recorded: UsdcCorridor,
+        served: UsdcCorridor,
+        /// Whether the transfer still holds the rebalance guard, so a build
+        /// that serves `recorded` must still resume it.
+        holds_guard: bool,
+    },
+    #[error(
+        "USDC transfer corridor mismatch: transfer {id} asks for the {requested} corridor, \
+         this service serves {served}; nothing was recorded"
+    )]
+    CorridorNotServed {
+        id: UsdcRebalanceId,
+        requested: UsdcCorridor,
+        served: UsdcCorridor,
+    },
     #[error(
         "USDC rebalance {id} DepositInitiated has non-onchain deposit ref; \
          BaseToAlpaca always records the mint tx as OnchainTx"
@@ -633,6 +655,8 @@ impl UsdcTransferError {
             | Self::AttestationRetryDeadlineOverflow { .. }
             | Self::AttestationNonceMismatch { .. }
             | Self::PreviouslyFailedAggregate { .. }
+            | Self::CorridorMismatch { .. }
+            | Self::CorridorNotServed { .. }
             | Self::DepositRefMustBeOnchain { .. }
             | Self::ResumeDirectionMismatch { .. }
             | Self::AdoptedWithdrawalAmountMismatch { .. }
@@ -693,6 +717,8 @@ impl BotGasFailureClassifier for UsdcTransferError {
             | Self::AttestationRetryDeadlineOverflow { .. }
             | Self::AttestationNonceMismatch { .. }
             | Self::PreviouslyFailedAggregate { .. }
+            | Self::CorridorMismatch { .. }
+            | Self::CorridorNotServed { .. }
             | Self::DepositRefMustBeOnchain { .. }
             | Self::ResumeDirectionMismatch { .. }
             | Self::AdoptedWithdrawalAmountMismatch { .. }

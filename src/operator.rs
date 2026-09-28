@@ -8021,6 +8021,7 @@ pub mod process_tx {
                             cash: None,
                         }),
                     )]),
+                    served_usdc_corridor: st0x_bridge::corridor::UsdcCorridor::BASE_CCTP,
                 },
                 vault_registry,
                 std::collections::BTreeMap::from([(

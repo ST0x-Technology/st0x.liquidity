@@ -29,6 +29,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
+use st0x_bridge::corridor::UsdcCorridor;
 use st0x_config::ChainEquities;
 use st0x_event_sorcery::{RetryOnBusy, Store, StoreBuilder};
 use st0x_evm::{Chain, IERC20, PreparedTransaction};
@@ -424,6 +425,7 @@ async fn seed_alpaca_to_base(
         .send(
             &id,
             UsdcRebalanceCommand::InitiateConversionAt {
+                corridor: UsdcCorridor::BASE_CCTP,
                 direction: RebalanceDirection::AlpacaToBase,
                 amount: requested,
                 order_id,
@@ -446,6 +448,7 @@ async fn seed_alpaca_to_base(
         .send(
             &id,
             UsdcRebalanceCommand::BeginWithdrawalAt {
+                corridor: UsdcCorridor::BASE_CCTP,
                 direction: RebalanceDirection::AlpacaToBase,
                 amount: received,
                 from_block,
@@ -460,6 +463,7 @@ async fn seed_alpaca_to_base(
         .send(
             &id,
             UsdcRebalanceCommand::InitiateAt {
+                corridor: UsdcCorridor::BASE_CCTP,
                 direction: RebalanceDirection::AlpacaToBase,
                 amount: received,
                 withdrawal: TransferRef::AlpacaId(withdrawal_ref),
@@ -594,6 +598,7 @@ async fn seed_base_to_alpaca(
         .send(
             &id,
             UsdcRebalanceCommand::BeginWithdrawalAt {
+                corridor: UsdcCorridor::BASE_CCTP,
                 direction: RebalanceDirection::BaseToAlpaca,
                 amount: withdraw_amount,
                 from_block,
@@ -608,6 +613,7 @@ async fn seed_base_to_alpaca(
         .send(
             &id,
             UsdcRebalanceCommand::InitiateAt {
+                corridor: UsdcCorridor::BASE_CCTP,
                 direction: RebalanceDirection::BaseToAlpaca,
                 amount: withdraw_amount,
                 withdrawal: TransferRef::OnchainTx(withdrawal_tx),

@@ -86,6 +86,7 @@ use st0x_evm::{
 use st0x_float_serde::{deserialize_float_from_number_or_string, format_float_with_fallback};
 
 use crate::BridgeDirection;
+use crate::corridor::UsdcCorridor;
 use evm::CctpEndpoint;
 
 // Committed ABI: CCTP contracts use solc 0.7.6 which solc.nix doesn't have for aarch64-darwin
@@ -111,6 +112,15 @@ const ETHEREUM_DOMAIN: u32 = 0;
 
 /// CCTP domain identifier for Base
 const BASE_DOMAIN: u32 = 6;
+
+/// The CCTP domain this build knows for `chain`, `None` where it has none.
+pub const fn cctp_domain(chain: Chain) -> Option<u32> {
+    match chain {
+        Chain::Ethereum => Some(ETHEREUM_DOMAIN),
+        Chain::Base => Some(BASE_DOMAIN),
+        Chain::HyperEvm | Chain::Robinhood => None,
+    }
+}
 
 impl BridgeDirection {
     /// Returns the source CCTP domain for this bridge direction.
@@ -375,6 +385,11 @@ impl CctpCorridor {
 
     pub const fn usdc_base(self) -> Address {
         self.usdc_base
+    }
+
+    /// The cash corridor this CCTP pair carries: Base via CCTP.
+    pub const fn usdc_corridor(self) -> UsdcCorridor {
+        UsdcCorridor::BASE_CCTP
     }
 }
 
@@ -740,6 +755,7 @@ impl<EthWallet: Wallet, BaseWallet: Wallet> CctpBridge<EthWallet, BaseWallet> {
         let message_transmitter = MESSAGE_TRANSMITTER_V2;
 
         let ethereum = CctpEndpoint::new(
+            Chain::Ethereum,
             ctx.corridor.usdc_ethereum,
             token_messenger,
             message_transmitter,
@@ -747,6 +763,7 @@ impl<EthWallet: Wallet, BaseWallet: Wallet> CctpBridge<EthWallet, BaseWallet> {
         );
 
         let base = CctpEndpoint::new(
+            Chain::Base,
             ctx.corridor.usdc_base,
             token_messenger,
             message_transmitter,
@@ -1580,6 +1597,7 @@ mod tests {
 
     use super::evm::MintRecoveryConfig;
     use super::*;
+    use crate::corridor::HopKind;
     use crate::{Attestation, Bridge};
 
     #[test]
@@ -1588,6 +1606,23 @@ mod tests {
 
         assert_eq!(corridor.usdc_ethereum(), USDC_ETHEREUM);
         assert_eq!(corridor.usdc_base(), USDC_BASE);
+        assert_eq!(
+            corridor.usdc_corridor(),
+            UsdcCorridor::HubRouted {
+                chain: Chain::Base,
+                hop: HopKind::Cctp,
+            }
+        );
+    }
+
+    /// Circle's domain numbers, pinned as literals: a burn names its
+    /// destination by domain, so a wrong number mints on another chain.
+    #[test]
+    fn cctp_domains_exist_for_ethereum_and_base_only() {
+        assert_eq!(cctp_domain(Chain::Ethereum), Some(0));
+        assert_eq!(cctp_domain(Chain::Base), Some(6));
+        assert_eq!(cctp_domain(Chain::HyperEvm), None);
+        assert_eq!(cctp_domain(Chain::Robinhood), None);
     }
 
     /// Robinhood settles in USDG, which CCTP neither burns nor mints: that end
@@ -2254,6 +2289,7 @@ mod tests {
         let base_wallet = RawPrivateKeyWallet::new(private_key, base_provider, 1)?;
 
         let ethereum = CctpEndpoint::new(
+            Chain::Ethereum,
             usdc_address,
             TOKEN_MESSENGER_V2,
             MESSAGE_TRANSMITTER_V2,
@@ -2262,6 +2298,7 @@ mod tests {
         .with_node_sync_poll_interval(Duration::ZERO);
 
         let base = CctpEndpoint::new(
+            Chain::Base,
             USDC_BASE,
             TOKEN_MESSENGER_V2,
             MESSAGE_TRANSMITTER_V2,
@@ -2950,6 +2987,7 @@ mod tests {
         let base_wallet = RawPrivateKeyWallet::new(private_key, base_provider, 1)?;
 
         let ethereum = CctpEndpoint::new(
+            Chain::Ethereum,
             USDC_ETHEREUM,
             TOKEN_MESSENGER_V2,
             MESSAGE_TRANSMITTER_V2,
@@ -2958,6 +2996,7 @@ mod tests {
         .with_node_sync_poll_interval(Duration::ZERO);
 
         let base = CctpEndpoint::new(
+            Chain::Base,
             base_usdc_address,
             TOKEN_MESSENGER_V2,
             MESSAGE_TRANSMITTER_V2,
@@ -3640,6 +3679,7 @@ mod tests {
             let base_wallet = RawPrivateKeyWallet::new(private_key, base_provider, 1)?;
 
             let ethereum = CctpEndpoint::new(
+                Chain::Ethereum,
                 self.ethereum.usdc,
                 self.ethereum.token_messenger,
                 self.ethereum.message_transmitter,
@@ -3648,6 +3688,7 @@ mod tests {
             .with_node_sync_poll_interval(Duration::ZERO);
 
             let base = CctpEndpoint::new(
+                Chain::Base,
                 self.base.usdc,
                 self.base.token_messenger,
                 self.base.message_transmitter,
@@ -4177,6 +4218,7 @@ mod tests {
             Arc::clone(&call_count),
         );
         let recovering_endpoint = CctpEndpoint::new(
+            Chain::Base,
             cctp.base.usdc,
             cctp.base.token_messenger,
             cctp.base.message_transmitter,
@@ -4281,6 +4323,7 @@ mod tests {
             Arc::clone(&call_count),
         );
         let counting_endpoint = CctpEndpoint::new(
+            Chain::Base,
             cctp.base.usdc,
             cctp.base.token_messenger,
             cctp.base.message_transmitter,
@@ -4374,6 +4417,7 @@ mod tests {
         )
         .with_revert_failures(1);
         let reverting_endpoint = CctpEndpoint::new(
+            Chain::Base,
             cctp.base.usdc,
             cctp.base.token_messenger,
             cctp.base.message_transmitter,
@@ -4458,6 +4502,7 @@ mod tests {
             Arc::clone(&call_count),
         );
         let flaky_endpoint = CctpEndpoint::new(
+            Chain::Base,
             cctp.base.usdc,
             cctp.base.token_messenger,
             cctp.base.message_transmitter,
@@ -4535,6 +4580,7 @@ mod tests {
             Arc::clone(&call_count),
         );
         let flaky_endpoint = CctpEndpoint::new(
+            Chain::Base,
             cctp.base.usdc,
             cctp.base.token_messenger,
             cctp.base.message_transmitter,
@@ -4633,6 +4679,7 @@ mod tests {
         );
         let remaining_empty_log_scans = flaky_wallet.remaining_empty_log_scans();
         let flaky_endpoint = CctpEndpoint::new(
+            Chain::Base,
             cctp.base.usdc,
             cctp.base.token_messenger,
             cctp.base.message_transmitter,
@@ -4727,6 +4774,7 @@ mod tests {
             Arc::clone(&call_count),
         );
         let flaky_endpoint = CctpEndpoint::new(
+            Chain::Base,
             cctp.base.usdc,
             cctp.base.token_messenger,
             cctp.base.message_transmitter,
@@ -4824,6 +4872,7 @@ mod tests {
         .with_failing_historical_reads();
         let lowest_scanned_block = flaky_wallet.lowest_scanned_block();
         let flaky_endpoint = CctpEndpoint::new(
+            Chain::Base,
             cctp.base.usdc,
             cctp.base.token_messenger,
             cctp.base.message_transmitter,
@@ -4953,6 +5002,7 @@ mod tests {
         .with_historical_reads_at(before_burn);
         let requested_historical_block = flaky_wallet.requested_historical_block();
         let flaky_endpoint = CctpEndpoint::new(
+            Chain::Base,
             cctp.base.usdc,
             cctp.base.token_messenger,
             cctp.base.message_transmitter,
@@ -5034,6 +5084,7 @@ mod tests {
         .with_reported_head_offset(1_000_000)
         .with_historical_reads_at(after_mint);
         let flaky_endpoint = CctpEndpoint::new(
+            Chain::Base,
             cctp.base.usdc,
             cctp.base.token_messenger,
             cctp.base.message_transmitter,
@@ -5162,6 +5213,7 @@ mod tests {
         .with_historical_reads_shifted_by(captured - 1 - after_mint);
         let requested_historical_block = flaky_wallet.requested_historical_block();
         let flaky_endpoint = CctpEndpoint::new(
+            Chain::Base,
             cctp.base.usdc,
             cctp.base.token_messenger,
             cctp.base.message_transmitter,
@@ -5229,6 +5281,7 @@ mod tests {
             .await
             .unwrap();
         let ethereum = CctpEndpoint::new(
+            Chain::Ethereum,
             cctp.ethereum.usdc,
             cctp.ethereum.token_messenger,
             cctp.ethereum.message_transmitter,
@@ -5240,6 +5293,7 @@ mod tests {
             .await
             .unwrap();
         let lagging_base = CctpEndpoint::new(
+            Chain::Base,
             cctp.base.usdc,
             cctp.base.token_messenger,
             cctp.base.message_transmitter,
@@ -5313,6 +5367,7 @@ mod tests {
         .with_failing_head_reads(1);
         let lowest_scanned_block = flaky_wallet.lowest_scanned_block();
         let flaky_endpoint = CctpEndpoint::new(
+            Chain::Base,
             cctp.base.usdc,
             cctp.base.token_messenger,
             cctp.base.message_transmitter,
@@ -5394,6 +5449,7 @@ mod tests {
             Arc::clone(&call_count),
         );
         let flaky_endpoint = CctpEndpoint::new(
+            Chain::Base,
             cctp.base.usdc,
             cctp.base.token_messenger,
             cctp.base.message_transmitter,
@@ -7332,5 +7388,94 @@ mod tests {
              got {} additional txs",
             tx_count_after.saturating_sub(tx_count_before)
         );
+    }
+
+    /// The mint scan floor follows the endpoint's chain: an Ethereum endpoint
+    /// looks back 10,000 blocks (33 h 20 min of 12 s blocks), not Base's
+    /// 60,000, and keeps a 50-block margin below a captured floor.
+    #[tokio::test]
+    async fn find_existing_mint_floors_at_the_ethereum_lookback_on_an_ethereum_endpoint() {
+        let cctp = LocalCctp::new().await.unwrap();
+        let bridge = cctp.create_bridge().await.unwrap();
+
+        let recipient = bridge.base.owner();
+        let amount = U256::from(1_400_000u64);
+
+        let burn_receipt = bridge
+            .burn_internal::<NoOpErrorRegistry>(BridgeDirection::EthereumToBase, amount, recipient)
+            .await
+            .unwrap();
+        let message = cctp
+            .extract_message_from_burn_tx(burn_receipt.tx, true)
+            .await
+            .unwrap();
+        let (attestation, message_with_nonce) = cctp.sign_message(&message).await.unwrap();
+
+        bridge
+            .mint_internal::<NoOpErrorRegistry>(
+                BridgeDirection::EthereumToBase,
+                message_with_nonce.clone(),
+                attestation,
+            )
+            .await
+            .unwrap();
+
+        let head_offset = 1_000_000;
+        let base_provider = ProviderBuilder::new()
+            .connect(&cctp.base_endpoint)
+            .await
+            .unwrap();
+        let head = base_provider.get_block_number().await.unwrap() + head_offset;
+        let flaky_wallet = FlakyProbeWallet::new(
+            RawPrivateKeyWallet::new(&cctp.deployer_key, base_provider, 1).unwrap(),
+            FlakyProbeFailures {
+                call_failures: 0,
+                empty_log_scans: u32::MAX,
+            },
+            Arc::new(AtomicU32::new(0)),
+        )
+        .with_reported_head_offset(head_offset)
+        .with_failing_historical_reads();
+        let lowest_scanned_block = flaky_wallet.lowest_scanned_block();
+        // The contracts are the local Base ones; the chain only sets the
+        // window, which is what this checks.
+        let ethereum_endpoint = CctpEndpoint::new(
+            Chain::Ethereum,
+            cctp.base.usdc,
+            cctp.base.token_messenger,
+            cctp.base.message_transmitter,
+            flaky_wallet,
+        )
+        .with_node_sync_poll_interval(Duration::ZERO);
+
+        let error = ethereum_endpoint
+            .find_existing_mint::<NoOpErrorRegistry>(
+                BridgeDirection::EthereumToBase,
+                &message_with_nonce,
+                None,
+            )
+            .await
+            .unwrap_err();
+
+        let CctpError::MintNotFoundInScanWindow { from_block, .. } = error else {
+            panic!("a consumed nonce outside the window must fail: {error:?}");
+        };
+        assert_eq!(from_block, head - 10_000);
+        assert!(lowest_scanned_block.load(Ordering::SeqCst) >= head - 10_000);
+
+        let old_floor = head - 20_000;
+        let old_floor_error = ethereum_endpoint
+            .find_existing_mint::<NoOpErrorRegistry>(
+                BridgeDirection::EthereumToBase,
+                &message_with_nonce,
+                Some(old_floor),
+            )
+            .await
+            .unwrap_err();
+
+        let CctpError::MintNotFoundInScanWindow { from_block, .. } = old_floor_error else {
+            panic!("a consumed nonce outside the window must fail: {old_floor_error:?}");
+        };
+        assert_eq!(from_block, old_floor - 50);
     }
 }

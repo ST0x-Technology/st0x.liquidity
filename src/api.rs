@@ -76,7 +76,7 @@ use crate::rebalancing::equity::{
 };
 use crate::rebalancing::usdc::{
     DepositSendNotSuperseded, DriverNotQuiesced, RecheckUsdcDeposit, UsdcDriverPause,
-    UsdcDriverPauseGuard, UsdcRecheckError,
+    UsdcDriverPauseGuard, UsdcRecheckError, UsdcTransferError,
 };
 use crate::rebalancing::{RebalancingService, UsdcResumeError};
 use crate::tokenized_equity_mint::{
@@ -1847,6 +1847,18 @@ fn usdc_recheck_error_response(error: &UsdcRecheckError) -> (StatusCode, String)
         | DepositTxNotMined { .. }
         | DepositTxAmountMismatch { .. }
         | DepositTxBeforeMint { .. } => (StatusCode::UNPROCESSABLE_ENTITY, error.to_string()),
+        // A corridor refusal is deterministic for this build, like the resume
+        // refusal: the operator needs its message, not a generic 500.
+        Transfer(transfer_error) => match transfer_error.as_ref() {
+            UsdcTransferError::CorridorMismatch { .. }
+            | UsdcTransferError::CorridorNotServed { .. } => {
+                (StatusCode::UNPROCESSABLE_ENTITY, error.to_string())
+            }
+            _ => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Failed to recheck transfer".to_string(),
+            ),
+        },
         DepositTxRead { .. } => (
             StatusCode::BAD_GATEWAY,
             "Ethereum RPC unavailable; retry later".to_string(),
@@ -1855,7 +1867,6 @@ fn usdc_recheck_error_response(error: &UsdcRecheckError) -> (StatusCode, String)
         // identically on every retry -- so "retry later" would misguide;
         // only the transport/API failures are transient and keep the 502.
         Alpaca(AlpacaWalletError::ParseError(_))
-        | Transfer(_)
         | DepositTxUnchecked(_)
         | DepositTxLookup { .. } => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -1955,13 +1966,13 @@ async fn resume_usdc_transfer(
 /// stay generic (the full error is logged at the call site).
 fn usdc_resume_error_response(error: &UsdcResumeError) -> (StatusCode, String) {
     use UsdcResumeError::{
-        Aggregate, AlreadyInFlight, AlreadyTerminal, ApalisDatabase, Database, DirectionMismatch,
-        GuardHeldElsewhere, NotFound, NotReady, Queue,
+        Aggregate, AlreadyInFlight, AlreadyTerminal, ApalisDatabase, CorridorNotServed, Database,
+        DirectionMismatch, GuardHeldElsewhere, NotFound, NotReady, Queue,
     };
 
     match error {
         NotFound(_) => (StatusCode::NOT_FOUND, error.to_string()),
-        DirectionMismatch { .. } | AlreadyTerminal { .. } => {
+        DirectionMismatch { .. } | AlreadyTerminal { .. } | CorridorNotServed { .. } => {
             (StatusCode::UNPROCESSABLE_ENTITY, error.to_string())
         }
         AlreadyInFlight { .. } | GuardHeldElsewhere => (StatusCode::CONFLICT, error.to_string()),
@@ -3391,6 +3402,7 @@ mod tests {
     use uuid::uuid;
 
     use st0x_bridge::cctp::CctpError;
+    use st0x_bridge::corridor::{HopKind, UsdcCorridor};
     use st0x_config::{
         BrokerCtx, Ctx, ExecutionThreshold, FileLogging, HedgedChain, LogLevel, RestApiCtx,
         create_test_ctx_with_order_owner,
@@ -3433,7 +3445,7 @@ mod tests {
     };
     use crate::position::{Position, PositionCommand, TradeId};
     use crate::rebalancing::equity::ChainServicesMissing;
-    use crate::rebalancing::usdc::{UsdcDriverGate, UsdcTransferError, usdc_driver_pause};
+    use crate::rebalancing::usdc::{UsdcDriverGate, usdc_driver_pause};
     use crate::rebalancing::{RebalancingSchedulers, RebalancingServiceConfig};
     use crate::test_utils::{
         TEST_POLL_INTERVAL, get_test_order, reserving_counter_trade_preflight,
@@ -5544,6 +5556,7 @@ mod tests {
             .receive::<UsdcRebalance>(
                 operation_id,
                 UsdcRebalanceEvent::WithdrawalSubmitting {
+                    corridor: UsdcCorridor::BASE_CCTP,
                     direction: RebalanceDirection::BaseToAlpaca,
                     amount: st0x_finance::Usdc::new(float!(500)),
                     from_block: 1,
@@ -6749,6 +6762,7 @@ mod tests {
                 )]),
                 cash_reserved: None,
                 hedge_floor: st0x_execution::HedgeFloor::default(),
+                served_usdc_corridor: UsdcCorridor::BASE_CCTP,
             },
             vault_registry,
             std::collections::BTreeMap::from([(
@@ -6877,10 +6891,24 @@ mod tests {
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
 
         let (status, _) = usdc_resume_error_response(&UsdcResumeError::AlreadyTerminal {
-            id,
+            id: id.clone(),
             state: "Reconciled",
         });
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+
+        let (status, message) = usdc_resume_error_response(&UsdcResumeError::CorridorNotServed {
+            id,
+            recorded: UsdcCorridor::HubRouted {
+                chain: Chain::Robinhood,
+                hop: HopKind::Relay,
+            },
+            served: UsdcCorridor::BASE_CCTP,
+        });
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(
+            message.starts_with("USDC transfer corridor mismatch"),
+            "{message}"
+        );
 
         let (status, _) = usdc_resume_error_response(&UsdcResumeError::AlreadyInFlight {
             row_id: "row-1".to_string(),
@@ -6971,10 +6999,41 @@ mod tests {
         assert_eq!(message, "Failed to recheck transfer");
 
         let (status, message) = usdc_recheck_error_response(&UsdcRecheckError::Transfer(Box::new(
-            UsdcTransferError::PreviouslyFailedAggregate { id },
+            UsdcTransferError::PreviouslyFailedAggregate { id: id.clone() },
         )));
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(message, "Failed to recheck transfer");
+
+        let relay = UsdcCorridor::HubRouted {
+            chain: Chain::Robinhood,
+            hop: HopKind::Relay,
+        };
+        let (status, message) = usdc_recheck_error_response(&UsdcRecheckError::Transfer(Box::new(
+            UsdcTransferError::CorridorMismatch {
+                id: id.clone(),
+                recorded: relay,
+                served: UsdcCorridor::BASE_CCTP,
+                holds_guard: true,
+            },
+        )));
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(
+            message.starts_with("USDC transfer corridor mismatch"),
+            "got {message}"
+        );
+
+        let (status, message) = usdc_recheck_error_response(&UsdcRecheckError::Transfer(Box::new(
+            UsdcTransferError::CorridorNotServed {
+                id,
+                requested: relay,
+                served: UsdcCorridor::BASE_CCTP,
+            },
+        )));
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(
+            message.starts_with("USDC transfer corridor mismatch"),
+            "got {message}"
+        );
     }
 
     /// Seeds a `UsdcRebalance` (BaseToAlpaca) into a post-burn `BridgingFailed`
@@ -6990,6 +7049,7 @@ mod tests {
             .send(
                 id,
                 UsdcRebalanceCommand::BeginWithdrawal {
+                    corridor: UsdcCorridor::BASE_CCTP,
                     direction: RebalanceDirection::BaseToAlpaca,
                     amount,
                     from_block: 1,
@@ -7001,6 +7061,7 @@ mod tests {
             .send(
                 id,
                 UsdcRebalanceCommand::Initiate {
+                    corridor: UsdcCorridor::BASE_CCTP,
                     direction: RebalanceDirection::BaseToAlpaca,
                     amount,
                     withdrawal: TransferRef::OnchainTx(TxHash::repeat_byte(0x22)),
@@ -7095,6 +7156,7 @@ mod tests {
             .send(
                 id,
                 UsdcRebalanceCommand::BeginWithdrawal {
+                    corridor: UsdcCorridor::BASE_CCTP,
                     direction: RebalanceDirection::BaseToAlpaca,
                     amount,
                     from_block: 1,
@@ -7106,6 +7168,7 @@ mod tests {
             .send(
                 id,
                 UsdcRebalanceCommand::Initiate {
+                    corridor: UsdcCorridor::BASE_CCTP,
                     direction: RebalanceDirection::BaseToAlpaca,
                     amount,
                     withdrawal: TransferRef::OnchainTx(TxHash::repeat_byte(0x22)),
