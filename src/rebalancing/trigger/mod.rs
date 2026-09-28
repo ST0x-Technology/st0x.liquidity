@@ -26,7 +26,7 @@ use tracing::{debug, error, info, trace, warn};
 use uuid::Uuid;
 
 use rain_math_float::Float;
-use st0x_bridge::corridor::UsdcCorridor;
+use st0x_bridge::corridor::{UsdcCorridor, legacy_base_cctp};
 use st0x_config::{
     AllocationCtx, ChainAssets, ChainEquityAsset, ExecutionThreshold, OperationMode, TargetShare,
     UsdcCorridorCtx,
@@ -4989,16 +4989,19 @@ impl RebalancingService {
         guard.defuse();
     }
 
-    /// Returns the oldest non-terminal USDC transfer job in *either* direction
-    /// (the row id and its age in seconds), if any.
+    /// Returns the oldest non-terminal USDC transfer job on `chain`'s corridor
+    /// in *either* direction (the row id and its age in seconds), if any.
     ///
     /// The dedupe gate is deliberately direction-independent. Both directions
-    /// move funds through the same vault and market-maker wallet, and the
-    /// in-memory corridor guards reset on restart, so an in-flight
-    /// transfer in one direction must also suppress enqueuing a transfer in the
-    /// *other* direction. Querying only one job type would, after a restart, let
-    /// an opposite-direction transfer run concurrently against the same funds --
-    /// churning capital and paying CCTP/withdrawal fees twice.
+    /// of a corridor move funds through the same vault and market-maker
+    /// wallet, and the in-memory corridor guards reset on restart, so an
+    /// in-flight transfer in one direction must also suppress enqueuing a
+    /// transfer in the *other* direction. Querying only one job type would,
+    /// after a restart, let an opposite-direction transfer run concurrently
+    /// against the same funds -- churning capital and paying CCTP/withdrawal
+    /// fees twice. A row on another corridor does not count; a row queued
+    /// before corridors reads as Base via CCTP, and a row whose payload cannot
+    /// be parsed counts for every corridor.
     ///
     /// `Pending`/`Queued`/`Running` rows are always treated as in-flight.
     /// `Failed AND attempts < max_attempts` rows are checked: apalis WILL
@@ -5022,67 +5025,37 @@ impl RebalancingService {
     async fn in_flight_usdc_transfer(
         pool: &apalis_sqlite::SqlitePool,
         usdc_store: Option<&Store<UsdcRebalance>>,
+        chain: Chain,
     ) -> Result<Option<(String, i64)>, sqlx_apalis::Error> {
-        // Both job types carry `id: UsdcRebalanceId` at the top level of their
+        // Both job types carry `id` and `corridor` at the top level of their
         // JSON payload (apalis JsonCodec serializes the struct directly).
         #[derive(serde::Deserialize)]
-        struct UsdcJobId {
+        struct UsdcJobKey {
             id: UsdcRebalanceId,
+            #[serde(default = "legacy_base_cctp")]
+            corridor: UsdcCorridor,
         }
 
-        loop {
-            let row: Option<(String, i64, String)> = sqlx_apalis::query_as(
-                "SELECT id, \
-                        CAST(strftime('%s', 'now') AS INTEGER) - run_at AS age_secs, \
-                        status \
-                 FROM Jobs \
-                 WHERE job_type IN (?, ?) \
-                 AND (status IN ('Pending', 'Queued', 'Running') \
-                      OR (status = 'Failed' AND attempts < max_attempts)) \
-                 ORDER BY run_at ASC \
-                 LIMIT 1",
-            )
-            .bind(std::any::type_name::<TransferUsdcToHedging>())
-            .bind(std::any::type_name::<TransferUsdcToMarketMaking>())
-            .fetch_optional(pool)
-            .await?;
+        let rows: Vec<(String, i64, String, Vec<u8>)> = sqlx_apalis::query_as(
+            "SELECT id, \
+                    CAST(strftime('%s', 'now') AS INTEGER) - run_at AS age_secs, \
+                    status, \
+                    job \
+             FROM Jobs \
+             WHERE job_type IN (?, ?) \
+             AND (status IN ('Pending', 'Queued', 'Running') \
+                  OR (status = 'Failed' AND attempts < max_attempts)) \
+             ORDER BY run_at ASC",
+        )
+        .bind(std::any::type_name::<TransferUsdcToHedging>())
+        .bind(std::any::type_name::<TransferUsdcToMarketMaking>())
+        .fetch_all(pool)
+        .await?;
 
-            let Some((row_id, age_secs, status)) = row else {
-                return Ok(None);
-            };
-
-            // Pending/Queued/Running rows are always in-flight.
-            if status != "Failed" {
-                return Ok(Some((row_id, age_secs)));
-            }
-
-            // Failed+attempts<max path: check whether this is a zombie.
-            let Some(store) = usdc_store else {
-                // Store not yet wired; conservative: treat as in-flight.
-                debug!(
-                    target: "rebalance",
-                    %row_id,
-                    "USDC store not yet wired; treating Failed row as in-flight conservatively"
-                );
-                return Ok(Some((row_id, age_secs)));
-            };
-
-            // Fetch the job payload (a JSON BLOB, apalis `JsonCodec`) only on the
-            // Failed path, so the common non-terminal case skips the extra read.
-            let job_payload: Option<Vec<u8>> =
-                sqlx_apalis::query_scalar("SELECT job FROM Jobs WHERE id = ?")
-                    .bind(&row_id)
-                    .fetch_optional(pool)
-                    .await?;
-
-            let Some(job_payload) = job_payload else {
-                // Row disappeared between the two queries (apalis killed it);
-                // re-query for the next candidate.
-                continue;
-            };
-
-            let aggregate_id = match serde_json::from_slice::<UsdcJobId>(&job_payload) {
-                Ok(parsed) => parsed.id,
+        for (row_id, age_secs, status, job_payload) in rows {
+            let aggregate_id = match serde_json::from_slice::<UsdcJobKey>(&job_payload) {
+                Ok(UsdcJobKey { id, corridor }) if corridor.chain() == chain => id,
+                Ok(_) => continue,
                 Err(error) => {
                     warn!(
                         target: "rebalance",
@@ -5094,62 +5067,94 @@ impl RebalancingService {
                 }
             };
 
-            let aggregate = match store.load(&aggregate_id).await {
-                Ok(Some(agg)) => agg,
-                Ok(None) => {
-                    // A Jobs row referencing an aggregate with no events is a
-                    // data inconsistency; conservative: treat as in-flight.
-                    warn!(
-                        target: "rebalance",
-                        %row_id,
-                        %aggregate_id,
-                        "USDC transfer Jobs row references an aggregate with no events; \
-                         treating as in-flight"
-                    );
-                    return Ok(Some((row_id, age_secs)));
-                }
-                Err(error) => {
-                    warn!(
-                        target: "rebalance",
-                        %row_id,
-                        ?error,
-                        "Failed to load USDC aggregate; treating row as in-flight"
-                    );
-                    return Ok(Some((row_id, age_secs)));
-                }
-            };
-
-            if aggregate.holds_rebalance_guard() {
-                // Genuine retry: aggregate is still live.
+            // Pending/Queued/Running rows are always in-flight.
+            if status != "Failed" {
                 return Ok(Some((row_id, age_secs)));
             }
 
-            // Zombie: aggregate is terminal but the Jobs row is still retryable.
-            // Kill it so apalis cannot re-drive it and this guard clears.
-            match Self::kill_zombie_job(pool, &row_id).await? {
-                ZombieJobKillOutcome::Killed => {
-                    info!(
-                        target: "rebalance",
-                        %row_id,
-                        %aggregate_id,
-                        "Killed zombie USDC Jobs row (aggregate already terminal)"
-                    );
-                }
-                ZombieJobKillOutcome::NoLongerInFlight => {
-                    debug!(
-                        target: "rebalance",
-                        %row_id,
-                        %aggregate_id,
-                        "Zombie USDC Jobs row was terminalized concurrently"
-                    );
-                }
-                ZombieJobKillOutcome::StillInFlight => {
-                    return Ok(Some((row_id, age_secs)));
-                }
+            if Self::usdc_failed_row_is_live(pool, usdc_store, &row_id, &aggregate_id).await? {
+                return Ok(Some((row_id, age_secs)));
             }
 
-            // The zombie was killed here or terminalized concurrently. Re-query
-            // so another genuinely live row still blocks the enqueue.
+            // The zombie was killed here or terminalized concurrently; a
+            // later row on this corridor may still block the enqueue.
+        }
+
+        Ok(None)
+    }
+
+    /// Whether a retryable `Failed` USDC job row still drives a live
+    /// transfer. A row whose aggregate is already terminal is a zombie: it
+    /// is killed so apalis cannot re-drive it. Fails closed (live) when the
+    /// store is not wired or the aggregate cannot be loaded.
+    async fn usdc_failed_row_is_live(
+        pool: &apalis_sqlite::SqlitePool,
+        usdc_store: Option<&Store<UsdcRebalance>>,
+        row_id: &str,
+        aggregate_id: &UsdcRebalanceId,
+    ) -> Result<bool, sqlx_apalis::Error> {
+        let Some(store) = usdc_store else {
+            // Store not yet wired; conservative: treat as in-flight.
+            debug!(
+                target: "rebalance",
+                %row_id,
+                "USDC store not yet wired; treating Failed row as in-flight conservatively"
+            );
+            return Ok(true);
+        };
+
+        let aggregate = match store.load(aggregate_id).await {
+            Ok(Some(agg)) => agg,
+            Ok(None) => {
+                // A Jobs row referencing an aggregate with no events is a
+                // data inconsistency; conservative: treat as in-flight.
+                warn!(
+                    target: "rebalance",
+                    %row_id,
+                    %aggregate_id,
+                    "USDC transfer Jobs row references an aggregate with no events; \
+                     treating as in-flight"
+                );
+                return Ok(true);
+            }
+            Err(error) => {
+                warn!(
+                    target: "rebalance",
+                    %row_id,
+                    ?error,
+                    "Failed to load USDC aggregate; treating row as in-flight"
+                );
+                return Ok(true);
+            }
+        };
+
+        if aggregate.holds_rebalance_guard() {
+            // Genuine retry: aggregate is still live.
+            return Ok(true);
+        }
+
+        // Zombie: aggregate is terminal but the Jobs row is still retryable.
+        // Kill it so apalis cannot re-drive it and this guard clears.
+        match Self::kill_zombie_job(pool, row_id).await? {
+            ZombieJobKillOutcome::Killed => {
+                info!(
+                    target: "rebalance",
+                    %row_id,
+                    %aggregate_id,
+                    "Killed zombie USDC Jobs row (aggregate already terminal)"
+                );
+                Ok(false)
+            }
+            ZombieJobKillOutcome::NoLongerInFlight => {
+                debug!(
+                    target: "rebalance",
+                    %row_id,
+                    %aggregate_id,
+                    "Zombie USDC Jobs row was terminalized concurrently"
+                );
+                Ok(false)
+            }
+            ZombieJobKillOutcome::StillInFlight => Ok(true),
         }
     }
 
@@ -5219,7 +5224,9 @@ impl RebalancingService {
         let queue = self.transfer_usdc_to_hedging_queue.clone();
         let usdc_store = self.usdc_store.read().await.as_ref().map(Arc::clone);
 
-        match Self::in_flight_usdc_transfer(queue.pool(), usdc_store.as_deref()).await {
+        match Self::in_flight_usdc_transfer(queue.pool(), usdc_store.as_deref(), corridor.chain())
+            .await
+        {
             Ok(Some((row_id, age_secs))) if age_secs >= STUCK_TRANSFER_WARN_AFTER_SECS => {
                 warn!(
                     target: "rebalance",
@@ -5308,7 +5315,9 @@ impl RebalancingService {
         let queue = self.transfer_usdc_to_market_making_queue.clone();
         let usdc_store = self.usdc_store.read().await.as_ref().map(Arc::clone);
 
-        match Self::in_flight_usdc_transfer(queue.pool(), usdc_store.as_deref()).await {
+        match Self::in_flight_usdc_transfer(queue.pool(), usdc_store.as_deref(), corridor.chain())
+            .await
+        {
             Ok(Some((row_id, age_secs))) => {
                 debug!(
                     target: "rebalance",
@@ -5456,12 +5465,14 @@ impl RebalancingService {
             });
         }
 
-        // Single-flight gate 1: any live or retryable USDC transfer job row,
-        // in either direction, blocks a manual resume (both directions move
-        // funds through the same vault and wallet). Terminal rows do not.
+        // Single-flight gate 1: any live or retryable USDC transfer job row on
+        // this corridor, in either direction, blocks a manual resume (both
+        // directions move funds through the same vault and wallet). Terminal
+        // rows do not.
         let queue_pool = self.transfer_usdc_to_market_making_queue.pool();
         if let Some((row_id, age_secs)) =
-            Self::in_flight_usdc_transfer(queue_pool, Some(&store)).await?
+            Self::in_flight_usdc_transfer(queue_pool, Some(&store), state.corridor().chain())
+                .await?
         {
             return Err(UsdcResumeError::AlreadyInFlight { row_id, age_secs });
         }
