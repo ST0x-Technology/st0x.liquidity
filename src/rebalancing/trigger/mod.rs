@@ -36210,7 +36210,8 @@ mod tests {
     /// A post-burn failure whose corridor cannot be read latches every
     /// corridor until a restart, and pages once per transfer.
     #[tokio::test]
-    async fn unknown_corridor_post_burn_failure_latches_every_corridor_and_pages_once() {
+    async fn unknown_corridor_post_burn_failure_latches_every_corridor_and_pages_once_per_transfer()
+    {
         let notifier = Arc::new(CapturingNotifier::default());
         let trigger = make_trigger_with_inventory_config_and_notifier(
             InventoryView::default(),
@@ -36220,8 +36221,9 @@ mod tests {
         .await;
         let harness = ReactorHarness::new(Arc::clone(&trigger));
 
-        let id = UsdcRebalanceId(Uuid::new_v4());
-        for _ in 0..2 {
+        let first = UsdcRebalanceId(Uuid::new_v4());
+        let second = UsdcRebalanceId(Uuid::new_v4());
+        for id in [&first, &first, &second] {
             harness
                 .receive::<UsdcRebalance>(id.clone(), make_usdc_deposit_failed())
                 .await
@@ -36234,7 +36236,17 @@ mod tests {
             .into_iter()
             .filter(|message| message.starts_with("USDC rebalancing is LATCHED"))
             .collect::<Vec<_>>();
-        assert_eq!(pages.len(), 1, "got {pages:?}");
+        assert_eq!(pages.len(), 2, "got {pages:?}");
+        for id in [&first, &second] {
+            assert_eq!(
+                pages
+                    .iter()
+                    .filter(|page| page.contains(&id.to_string()))
+                    .count(),
+                1,
+                "{id} must appear in exactly one page: {pages:?}"
+            );
+        }
     }
 
     /// A failed every-corridor latch page is retried by the sweep until it
@@ -36374,6 +36386,7 @@ mod tests {
             .unwrap();
 
         let pages = notifier.messages();
+        assert_eq!(pages.len(), 2, "got {pages:?}");
         assert!(
             pages
                 .iter()
