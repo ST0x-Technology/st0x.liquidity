@@ -36034,4 +36034,34 @@ mod tests {
             "a live row queued before corridors must count as Base"
         );
     }
+
+    async fn resume_base_transfer_with_a_holder_on(
+        corridor: UsdcCorridor,
+    ) -> Result<(), UsdcResumeError> {
+        let (trigger, pool, store) = make_resume_trigger().await;
+        let id = seed_converting_alpaca_to_base(&store).await;
+        let holder = UsdcRebalanceId(Uuid::new_v4());
+        seed_withdrawing_alpaca_to_base_on(&store, &holder, usdc(300), corridor).await;
+
+        trigger
+            .resume_usdc_transfer(&pool, &id, RebalanceDirection::AlpacaToBase)
+            .await
+    }
+
+    /// The durable guard-holder gate of a manual resume counts only holders
+    /// on the resumed transfer's corridor.
+    #[tokio::test]
+    async fn manual_resume_is_refused_only_by_a_holder_on_its_corridor() {
+        resume_base_transfer_with_a_holder_on(ROBINHOOD_RELAY)
+            .await
+            .expect("a holder on another corridor must not refuse a Base resume");
+
+        let error = resume_base_transfer_with_a_holder_on(UsdcCorridor::BASE_CCTP)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, UsdcResumeError::GuardHeldElsewhere),
+            "a Base holder must refuse a Base resume, got {error:?}"
+        );
+    }
 }
