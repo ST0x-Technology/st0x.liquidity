@@ -4832,7 +4832,7 @@ mod tests {
     /// Alpaca->Base job's `perform` can be tested without onchain/broker setup.
     struct RecordingResume {
         fail: bool,
-        captured: std::sync::Mutex<Option<(UsdcRebalanceId, Usdc)>>,
+        captured: std::sync::Mutex<Option<(UsdcRebalanceId, Usdc, UsdcCorridor)>>,
     }
 
     #[async_trait]
@@ -4841,9 +4841,9 @@ mod tests {
             &self,
             id: &UsdcRebalanceId,
             amount: Usdc,
-            _corridor: UsdcCorridor,
+            corridor: UsdcCorridor,
         ) -> Result<(), UsdcTransferError> {
-            *self.captured.lock().unwrap() = Some((id.clone(), amount));
+            *self.captured.lock().unwrap() = Some((id.clone(), amount, corridor));
             if self.fail {
                 Err(UsdcTransferError::WithdrawalFailed {
                     status: "test-induced".to_string(),
@@ -4855,7 +4855,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn market_making_perform_forwards_id_and_amount_to_resume() {
+    async fn market_making_perform_forwards_id_amount_and_corridor_to_resume() {
         let pool = setup_queue_pool().await;
         let stub = Arc::new(RecordingResume {
             fail: false,
@@ -4864,8 +4864,12 @@ mod tests {
         let ctx = market_making_ctx(stub.clone(), &pool);
         let id = UsdcRebalanceId(Uuid::new_v4());
         let amount = Usdc::new(float!(250));
+        let corridor = UsdcCorridor::HubRouted {
+            chain: Chain::Robinhood,
+            hop: HopKind::Relay,
+        };
         let job = TransferUsdcToMarketMaking {
-            corridor: UsdcCorridor::BASE_CCTP,
+            corridor,
             id: id.clone(),
             amount,
             revert_redrive_attempts: 0,
@@ -4877,8 +4881,8 @@ mod tests {
         let captured = stub.captured.lock().unwrap().clone();
         assert_eq!(
             captured,
-            Some((id, amount)),
-            "perform must forward its id and amount to resume_alpaca_to_base",
+            Some((id, amount, corridor)),
+            "perform must forward its id, amount and corridor to resume_alpaca_to_base",
         );
     }
 
