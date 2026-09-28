@@ -6897,7 +6897,14 @@ impl RebalancingService {
              unparseable={unparseable:?}. {remedy} \
              Rebalancing is blocked until manually resolved."
         );
-        if let Err(error) = self.notifier.notify(&message).await {
+
+        // The every-corridor latch lasts until a restart, so its page is
+        // retried by the sweep until delivered; a later runtime latch finds
+        // it pending and leaves it in place.
+        if unclassified {
+            *self.pending_latch_page.write().await = Some(message);
+            self.deliver_pending_latch_page().await;
+        } else if let Err(error) = self.notifier.notify(&message).await {
             warn!(target: "rebalance", ?error, "Failed to deliver USDC startup-stranded alert");
         }
     }
