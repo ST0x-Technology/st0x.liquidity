@@ -36119,4 +36119,43 @@ mod tests {
              Alpaca-outbound resume, got {error:?}"
         );
     }
+
+    /// The trigger keeps one Alpaca-outbound transfer across corridors: with
+    /// one held on another chain, an Alpaca-outbound imbalance is skipped
+    /// while an inbound one proceeds.
+    #[tokio::test]
+    async fn trigger_waits_for_another_corridors_alpaca_outbound_transfer() {
+        let outbound = make_trigger_with_inventory(
+            InventoryView::default()
+                .with_usdc(usdc(100), usdc(900))
+                .with_withdrawable_cash_cents(90_000),
+        )
+        .await;
+        outbound.usdc_guards.hold(
+            Chain::Robinhood,
+            &UsdcRebalanceId(Uuid::new_v4()),
+            RebalanceDirection::AlpacaToBase,
+        );
+        outbound.check_and_trigger_usdc().await;
+        assert_eq!(
+            count_pending_transfer_usdc_to_market_making_jobs(&outbound).await,
+            0,
+            "a second Alpaca-outbound transfer must wait"
+        );
+
+        let inbound =
+            make_trigger_with_inventory(InventoryView::default().with_usdc(usdc(900), usdc(100)))
+                .await;
+        inbound.usdc_guards.hold(
+            Chain::Robinhood,
+            &UsdcRebalanceId(Uuid::new_v4()),
+            RebalanceDirection::AlpacaToBase,
+        );
+        inbound.check_and_trigger_usdc().await;
+        assert_eq!(
+            count_pending_transfer_usdc_to_hedging_jobs(&inbound).await,
+            1,
+            "an inbound transfer does not draw on Alpaca's cash"
+        );
+    }
 }
