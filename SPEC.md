@@ -3995,8 +3995,9 @@ mismatch: transfer {id} runs on the {corridor} corridor, which this build does
 not serve"; the timeout sweep retries that page until it is delivered and raises
 no other stall alert for the transfer. The next sweep releases its guard once it
 is reconciled, or once an operator moves it to a state that holds no guard (such
-as a pre-burn `BridgingFailed`). A manual `transfer resume` is refused (422).
-The way out is a build that serves that corridor.
+as a pre-burn `BridgingFailed`). A manual `transfer resume` or
+`transfer recheck` is refused (422). The way out is a build that serves that
+corridor.
 
 - `WithdrawalSubmitting`: scan the source chain for an already-mined withdrawal
   (`find_recent_withdrawal`) from the captured head and adopt it. An empty mined

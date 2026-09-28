@@ -76,7 +76,7 @@ use crate::rebalancing::equity::{
 };
 use crate::rebalancing::usdc::{
     DepositSendNotSuperseded, DriverNotQuiesced, RecheckUsdcDeposit, UsdcDriverPause,
-    UsdcDriverPauseGuard, UsdcRecheckError,
+    UsdcDriverPauseGuard, UsdcRecheckError, UsdcTransferError,
 };
 use crate::rebalancing::{RebalancingService, UsdcResumeError};
 use crate::tokenized_equity_mint::{
@@ -1847,6 +1847,18 @@ fn usdc_recheck_error_response(error: &UsdcRecheckError) -> (StatusCode, String)
         | DepositTxNotMined { .. }
         | DepositTxAmountMismatch { .. }
         | DepositTxBeforeMint { .. } => (StatusCode::UNPROCESSABLE_ENTITY, error.to_string()),
+        // A corridor refusal is deterministic for this build, like the resume
+        // refusal: the operator needs its message, not a generic 500.
+        Transfer(transfer_error) => match transfer_error.as_ref() {
+            UsdcTransferError::CorridorMismatch { .. }
+            | UsdcTransferError::CorridorNotServed { .. } => {
+                (StatusCode::UNPROCESSABLE_ENTITY, error.to_string())
+            }
+            _ => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Failed to recheck transfer".to_string(),
+            ),
+        },
         DepositTxRead { .. } => (
             StatusCode::BAD_GATEWAY,
             "Ethereum RPC unavailable; retry later".to_string(),
@@ -1855,7 +1867,6 @@ fn usdc_recheck_error_response(error: &UsdcRecheckError) -> (StatusCode, String)
         // identically on every retry -- so "retry later" would misguide;
         // only the transport/API failures are transient and keep the 502.
         Alpaca(AlpacaWalletError::ParseError(_))
-        | Transfer(_)
         | DepositTxUnchecked(_)
         | DepositTxLookup { .. } => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -3434,7 +3445,7 @@ mod tests {
     };
     use crate::position::{Position, PositionCommand, TradeId};
     use crate::rebalancing::equity::ChainServicesMissing;
-    use crate::rebalancing::usdc::{UsdcDriverGate, UsdcTransferError, usdc_driver_pause};
+    use crate::rebalancing::usdc::{UsdcDriverGate, usdc_driver_pause};
     use crate::rebalancing::{RebalancingSchedulers, RebalancingServiceConfig};
     use crate::test_utils::{
         TEST_POLL_INTERVAL, get_test_order, reserving_counter_trade_preflight,
