@@ -44,12 +44,14 @@ pub(crate) fn setup() -> Result<PrometheusHandle, BuildError> {
     );
     metrics::describe_gauge!(
         "registry_pending_restart",
-        "1 while the token file in the bucket differs from the per-symbol tables this instance \
-         runs; a roll picks it up"
+        "1 while the latest token file in the bucket differs from the per-symbol tables this \
+         instance runs; without a pinned generation a roll picks it up, with one the pin must \
+         move in a release"
     );
     metrics::describe_gauge!(
         "registry_invalid",
-        "1 while the token file in the bucket would be refused at boot"
+        "1 while the copy the next roll reads (the pinned generation, else the latest) would \
+         be refused at boot or is gone"
     );
     metrics::describe_counter!(
         "registry_fetch_errors_total",

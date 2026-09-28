@@ -1766,9 +1766,10 @@ fn validate_config(
         startup_notices.push(StartupNotice::info(format!(
             "per-symbol tables read from {} ({})",
             registry.url,
-            registry
-                .generation
-                .map_or_else(|| "latest copy".to_string(), |g| format!("generation {g}"))
+            registry.generation.map_or_else(
+                || "latest copy".to_string(),
+                |generation| format!("generation {generation}")
+            )
         )));
     }
     if let Some(schedule) = config
@@ -9355,6 +9356,51 @@ mod tests {
             let alone: Config = table.try_into().unwrap();
             validate_config(&alone, &config_path, &mut notices).unwrap();
         }
+    }
+
+    /// The refresh loop's judge: the running copy is no change, an edited
+    /// row is a change it names, and a copy boot would refuse is an error.
+    #[test]
+    fn registry_check_judges_a_fresh_copy_against_the_running_one() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let config_path = root.join("config/staging/st0x-hedge.toml");
+        let deployed = std::fs::read_to_string(&config_path).unwrap();
+        let tokens =
+            std::fs::read_to_string(root.join("tests/fixtures/tokens-staging.toml")).unwrap();
+        let (_, live) = config_table(
+            &deployed,
+            &config_path,
+            TokenFile::Bytes(tokens.as_bytes()),
+            &mut Vec::new(),
+        )
+        .unwrap();
+        let live = live.unwrap();
+
+        assert_eq!(registry_check(&live, tokens.as_bytes()).unwrap(), None);
+
+        let mut file = registry::parse(tokens.as_bytes()).unwrap();
+        file["chains"]["base"]["assets"]["equities"]["FGI"]
+            .as_table_mut()
+            .unwrap()
+            .insert("trading".into(), toml::Value::String("enabled".into()));
+        assert_eq!(
+            registry_check(&live, file.to_string().as_bytes()).unwrap(),
+            Some("rows changed [base/FGI]".to_string())
+        );
+
+        let mut file = registry::parse(tokens.as_bytes()).unwrap();
+        file.insert("schema_version".into(), toml::Value::Integer(2));
+        let error = registry_check(&live, file.to_string().as_bytes()).unwrap_err();
+        assert!(
+            matches!(
+                &error,
+                CtxError::Registry {
+                    source: registry::RegistryError::SchemaVersion { .. },
+                    ..
+                }
+            ),
+            "{error:?}"
+        );
     }
 
     /// The production fixture is the pinned generation, by name: bumping the

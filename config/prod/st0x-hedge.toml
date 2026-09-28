@@ -81,7 +81,7 @@ beneficiary_entity_name = "T0 TRADE (BVI) LTD"
 
 [chains.base]
 # Trades, hedges and rebalances: everything is on, subject to the
-# per-asset flags below.
+# per-asset flags in the token file ([registry] below).
 lifecycle = "active"
 # Block confirmations required before a submitted transaction is treated as
 # settled. Does not govern fill ingestion (controlled by ingestion_cutoff).
@@ -300,20 +300,6 @@ rebalancing = "enabled"
 # Maximum USDC moved per rebalance operation.
 operational_limit = 25000
 
-# Per-equity config, grouped by symbol. Two tables are required:
-# [assets.equities.SYM] is the broker hedge policy (extended hours, and an
-# optional hedge_floor_shares override of the [broker] default).
-# [chains.base.trading.assets.equities.SYM] is the Base listing
-# (trading, rebalancing, recovery, addresses, vault).
-# - trading: whether the bot hedges fills for this asset.
-# - rebalancing: whether automatic equity rebalancing is active.
-# - wrapped_equity_recovery: whether wrapped equity tokens detected in bot
-#   wallets are auto-recovered (resume stalled transfer or deposit orphans).
-# - tokenized_equity: unwrapped tTOKEN contract address on Base.
-# - tokenized_equity_derivative: wrapped wtTOKEN contract address on Base.
-# - vault_ids: Raindex vault ID(s) - single string or array of strings.
-#   (alias: vault_id for backward compat. Required when rebalancing is enabled.)
-
 # Schema-at-HEAD note (2026-09-07): `retired_symbols` is REQUIRED by the
 # config schema on master but unknown to v1.10.0, the build production
 # runs. This file therefore parses at HEAD (loader tests, config-drift)
@@ -321,8 +307,7 @@ operational_limit = 25000
 # the field is tagged: the first liquidity production release after the
 # hand-over must be a version tag, not a config-only release, and
 # config-check stays red on this file until that tag exists. Empty on
-# purpose: QSEP is still CONFIGURED below (as production runs it), and the
-# schema refuses a symbol that is both configured and retired. Listing a
+# purpose: QSEP is still in the token file (as production runs it). Listing a
 # symbol here drops its rows from the token file at the merge, so retire it
 # here first; its rows in st0x.registry can go afterwards (see
 # docs/how-to-add-new-asset.md, "Retiring an asset").

@@ -121,7 +121,12 @@ pub enum RegistryError {
     #[error("reading {url}: larger than {MAX_BODY} bytes")]
     TooLarge { url: String },
     #[error("reading {url}: boot read exceeded {}s", BOOT_READ_BUDGET.as_secs())]
-    BootTimeout { url: String },
+    BootTimeout {
+        url: String,
+        /// The last failed attempt before the budget ran out, if one ended.
+        #[source]
+        last: Option<Box<Self>>,
+    },
 }
 
 /// How the token file reaches a parse of the config.
@@ -553,13 +558,17 @@ pub async fn load_bytes(
         });
     }
     let http = http_client()?;
+    // No tracing subscriber exists yet at boot, so a failed attempt is kept
+    // for the error rather than logged: the budget running out still names
+    // why the attempts before it failed.
+    let mut last = None;
     let read = async {
         let mut attempt = 1;
         loop {
             match fetch(&http, &source.url, source.generation).await {
                 Ok(bytes) => break Ok(bytes),
                 Err(error) if attempt < 3 => {
-                    tracing::warn!(attempt, ?error, "token file: boot read failed; retrying");
+                    last = Some(Box::new(error));
                     tokio::time::sleep(Duration::from_secs(1 << attempt)).await;
                     attempt += 1;
                 }
@@ -567,11 +576,11 @@ pub async fn load_bytes(
             }
         }
     };
-    tokio::time::timeout(BOOT_READ_BUDGET, read)
-        .await
-        .map_err(|_| RegistryError::BootTimeout {
-            url: source.url.clone(),
-        })?
+    let outcome = tokio::time::timeout(BOOT_READ_BUDGET, read).await;
+    outcome.map_err(|_| RegistryError::BootTimeout {
+        url: source.url.clone(),
+        last,
+    })?
 }
 
 /// What changed between the running projection and a fresh one.
@@ -631,6 +640,7 @@ pub struct RegistryLive {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::assets::{ChainEquityAsset, EquityHedgePolicy};
 
     fn fixture(name: &str) -> String {
         std::fs::read_to_string(format!(
@@ -944,6 +954,94 @@ mod tests {
             describe_change(&projection, &changed)
                 .unwrap()
                 .contains("removed [base/FGI]")
+        );
+    }
+
+    /// The key lists `project` copies are the fields the bot deserializes.
+    /// A row holding every listed key must deserialize (so no listed key is
+    /// stale), and the destructures below list every field without `..`, so
+    /// a new field fails to compile here until it is added to the lists.
+    #[test]
+    fn the_projected_keys_are_the_structs_fields() {
+        let row: Table = toml::from_str(
+            "tokenized_equity = \"0x0000000000000000000000000000000000000001\"\n\
+             tokenized_equity_derivative = \"0x0000000000000000000000000000000000000002\"\n\
+             vault_ids = [\"0x01\"]\n\
+             trading = \"enabled\"\n\
+             rebalancing = \"disabled\"\n\
+             wrapped_equity_recovery = \"disabled\"\n\
+             operational_limit = 5\n\
+             target_share = 0.5\n",
+        )
+        .unwrap();
+        let mut keys: Vec<_> = row.keys().map(String::as_str).chain(["vault_id"]).collect();
+        let mut listed = CHAIN_ROW_KEYS.to_vec();
+        keys.sort_unstable();
+        listed.sort_unstable();
+        assert_eq!(keys, listed);
+        let ChainEquityAsset {
+            tokenized_equity: _,
+            tokenized_equity_derivative: _,
+            vault_ids: _,
+            trading: _,
+            rebalancing: _,
+            wrapped_equity_recovery: _,
+            operational_limit: _,
+            target_share: _,
+        } = row.try_into().unwrap();
+
+        let policy: Table = toml::from_str(
+            "extended_hours_counter_trading = \"enabled\"\nhedge_floor_shares = 1\n",
+        )
+        .unwrap();
+        let mut keys: Vec<_> = policy.keys().map(String::as_str).collect();
+        let mut listed = POLICY_KEYS.to_vec();
+        keys.sort_unstable();
+        listed.sort_unstable();
+        assert_eq!(keys, listed);
+        let EquityHedgePolicy {
+            extended_hours_counter_trading: _,
+            hedge_floor_shares: _,
+        } = policy.try_into().unwrap();
+    }
+
+    #[test]
+    fn an_added_symbol_a_changed_row_and_a_changed_policy_are_changes() {
+        let live = project(&parse(fixture("tokens-staging.toml").as_bytes()).unwrap()).unwrap();
+
+        let mut fresh = live.clone();
+        let row = fresh.chain_rows["base"]["FGI"].clone();
+        fresh
+            .chain_rows
+            .get_mut("base")
+            .unwrap()
+            .insert("NEWSYM".into(), row);
+        assert_eq!(
+            describe_change(&live, &fresh).as_deref(),
+            Some("added [base/NEWSYM]")
+        );
+
+        let mut fresh = live.clone();
+        fresh
+            .chain_rows
+            .get_mut("base")
+            .unwrap()
+            .get_mut("FGI")
+            .unwrap()
+            .insert("trading".into(), Value::String("enabled".into()));
+        assert_eq!(
+            describe_change(&live, &fresh).as_deref(),
+            Some("rows changed [base/FGI]")
+        );
+
+        let mut fresh = live.clone();
+        fresh.policies.get_mut("FGI").unwrap().insert(
+            "extended_hours_counter_trading".into(),
+            Value::String("enabled".into()),
+        );
+        assert_eq!(
+            describe_change(&live, &fresh).as_deref(),
+            Some("hedge policies changed")
         );
     }
 }

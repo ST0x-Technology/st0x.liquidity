@@ -72,7 +72,7 @@ beneficiary_entity_name = "T0 TRADE (BVI) LTD"
 # Per-equity hedging policy (broker-side). Chain asset facts live under
 # [chains.base.trading.assets].
 [assets.equities]
-# Symbols deliberately removed from the tables below while the DB still
+# Symbols deliberately removed from the per-symbol tables while the DB still
 # references them (st0x.liquidity#1321). Required since that merge: its
 # absence crash-looped the staging bot from 15:38 UTC on 2026-09-02, the
 # same drift as hedge_order_gate_reconciliation_timeout_secs the day before.
@@ -80,7 +80,7 @@ retired_symbols = []
 
 [chains.base]
 # Trades, hedges and rebalances: everything is on, subject to the
-# per-asset flags below.
+# per-asset flags in the token file ([registry] below).
 lifecycle = "active"
 # Block confirmations required before a submitted transaction is treated as
 # settled. Does not govern fill ingestion (controlled by ingestion_cutoff).
