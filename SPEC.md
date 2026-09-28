@@ -859,8 +859,9 @@ orders, and converges any unfilled extended-hours orders back to market orders
 at the regular open.
 
 This behavior is **opt-in per asset** via the required
-`extended_hours_counter_trading` field on each `[assets.equities.SYMBOL]` config
-block (committed as `"disabled"`). That block is global rather than per chain:
+`extended_hours_counter_trading` field on each `[assets.equities.SYMBOL]` block
+(committed as `"disabled"`), which lives in the token file (see "The token file"
+below), not in the bot's own config. That block is global rather than per chain:
 one broker account hedges one position per symbol, so the same exposure cannot
 carry two session policies. With it disabled for an asset, behavior for that
 asset is unchanged: market orders during regular hours only. Assets absent from
@@ -1024,23 +1025,24 @@ not the stale enqueue-time one.
 ##### Overnight hedging (24/5)
 
 Overnight counter-trading is **opt-in per asset** via a required
-`overnight_counter_trading` field on each `[assets.equities.SYMBOL]` config
-block, independent from `extended_hours_counter_trading` (committed as
-`"disabled"`; absent assets are disabled, fail-closed). Overnight has a separate
-broker entitlement, a separate feed, and a separate risk profile, so it never
-piggybacks on the extended-hours flag. Disabling one asset — or all of them — is
-a config change only and does not disturb regular or extended-hours hedging. The
-protection bound for overnight limits is a separate `overnight_slippage_bps`,
-because the indicative feed's spreads are not comparable to tape-based
-extended-hours pricing. It follows the same configuration contract as
-`counter_trade_slippage_bps`: required whenever any asset enables overnight
-counter-trading, and startup validation rejects zero and out-of-range values
-(the accepted range matches `counter_trade_slippage_bps` — a 1–9,999 bps sanity
-bound, not a calibration to tape-session spreads, so it does not constrain
-legitimate overnight values; the type admits no negatives). The crossed
-reference is rounded to the broker tick by the same path as every other limit
-price — buys round up, sells round down — so the bound stays protective without
-going sub-tick aggressive.
+`overnight_counter_trading` field on each `[assets.equities.SYMBOL]` block in
+the token file (see "The token file"), independent from
+`extended_hours_counter_trading` (committed as `"disabled"`; absent assets are
+disabled, fail-closed). Overnight has a separate broker entitlement, a separate
+feed, and a separate risk profile, so it never piggybacks on the extended-hours
+flag. Disabling one asset, or all of them, is a token-file change only (in
+production, shipped with a `generation` bump) and does not disturb regular or
+extended-hours hedging. The protection bound for overnight limits is a separate
+`overnight_slippage_bps`, because the indicative feed's spreads are not
+comparable to tape-based extended-hours pricing. It follows the same
+configuration contract as `counter_trade_slippage_bps`: required whenever any
+asset enables overnight counter-trading, and startup validation rejects zero and
+out-of-range values (the accepted range matches `counter_trade_slippage_bps` — a
+1–9,999 bps sanity bound, not a calibration to tape-session spreads, so it does
+not constrain legitimate overnight values; the type admits no negatives). The
+crossed reference is rounded to the broker tick by the same path as every other
+limit price — buys round up, sells round down — so the bound stays protective
+without going sub-tick aggressive.
 
 **Eligibility.** Before an overnight placement, the bot checks its synced asset
 attributes: the asset must be `overnight_tradable`, not `overnight_halted`, and
@@ -1928,10 +1930,13 @@ edit that only the deployed service can judge is a config edit whose first check
 is a bot that will not boot, which is what the `validate-config` binary exists
 to prevent.
 
-`validate-config --config <path> [--secrets <path>]` runs the boot path's
-validation and exits 0 or 1, writing a plain-text report to stdout and the
-failure with its cause chain to stderr. It starts no server, opens no database,
-and reaches no external service in either mode.
+`validate-config --config <path> [--secrets <path>] [--registry-file <path>]`
+runs the boot path's validation and exits 0 or 1, writing a plain-text report to
+stdout and the failure with its cause chain to stderr. It starts no server,
+opens no database, and reaches no external service in either mode. A config that
+names `[registry]` keeps its per-symbol tables in the token file in the bucket;
+`--registry-file` supplies a local copy so they are checked too. Without it the
+config is judged without them and the report says so.
 
 The two modes differ only in how much of the input they have:
 
@@ -1985,6 +1990,47 @@ rule fails startup with a named error:
 
 The hub (the Ethereum wallet), the CCTP domains and the USDC addresses are
 pinned in code per chain, never configured.
+
+#### The token file
+
+The per-symbol tables, `[chains.<c>.trading.assets.equities.<SYM>]` (addresses,
+vault ids, `trading` / `rebalancing` / `wrapped_equity_recovery`) and
+`[assets.equities.<SYM>]` (the hedge policy), are not in the bot's config. They
+come from the token file that `st0x.registry` publishes to
+`gs://t0-artifacts-tokens/<env>/tokens.toml`, one file per environment shared
+with pricing, the oracle, bebop and the price publisher. The config names it
+under `[registry]` (`url`, and in production `generation`) and must carry no
+per-symbol table of its own; one that does is refused.
+
+At boot the file is read as the VM's service account (`storage.objects.get` on
+its own env prefix only, no proxy, no redirects), three attempts within a 20
+second budget, 4 MiB cap. A read that fails, a file that does not parse, a slot
+with a malformed switch or a missing address, a chain the config does not
+declare, or an empty universe all fail boot. The bot takes its own keys from
+each slot and ignores the others; which keys may appear is checked by
+`st0x.registry`'s CI before the file is published. The rows are merged into the
+config's TOML table before it is deserialized, so every rule in
+`validate_config` runs on the result unchanged. A symbol listed under
+`retired_symbols` is dropped at the merge, so retiring is one config change and
+the file's rows can go afterwards.
+
+Production pins `generation`: every roll of a release runs the same object, and
+a token change ships only with a release that bumps the pin. Staging reads the
+latest copy at every start, a crash restart included, so a staging token change
+takes effect without the deploy gates: `verify-migrations` does not run, and
+nothing refuses a file that drops a symbol the database still references. The
+order in "Retiring an asset" in `docs/how-to-add-new-asset.md` (retire in the
+config first, remove the rows after) is the only guard. A refresh loop reads the
+bucket every 60 s and never applies a change; it reports
+`registry_pending_restart` (the latest published copy differs from the running
+tables), `registry_invalid` (the copy the next start would read, the pin in
+production and the latest in staging, is gone, refused to the service account
+with a 401 or 403, too large, or would be refused), `registry_latest_refused`
+(the latest copy would be refused at boot; with a pin it is the copy a pin bump
+would move to) and `registry_fetch_errors_total` (transient read failures: the
+metadata token, 429, 5xx, the network). `verify-migrations` and
+`verify-approvals` read the same file, from the bucket on the VM or from
+`--registry-file` elsewhere.
 
 #### Tools
 

@@ -1085,7 +1085,12 @@ impl CliEnv {
 
     /// Load config and secrets from the file paths parsed from CLI arguments.
     pub(crate) async fn load(self) -> anyhow::Result<(Ctx, Commands)> {
-        let ctx = Ctx::load_files(&self.env.config, &self.env.secrets).await?;
+        let ctx = Ctx::load_files(
+            &self.env.config,
+            &self.env.secrets,
+            self.env.registry_file.as_deref(),
+        )
+        .await?;
         Ok((ctx, self.command))
     }
 }
@@ -2358,6 +2363,7 @@ mod tests {
             telemetry: None,
             alerts: None,
             startup_notices: Vec::new(),
+            registry: None,
             pricing: None,
             rebalancing: st0x_config::default_test_rebalancing_ctx(),
             order_owner: Address::ZERO,
