@@ -205,10 +205,16 @@ pub(crate) enum UsdcResumeError {
     )]
     AlreadyInFlight { row_id: String, age_secs: i64 },
     #[error(
-        "another persisted USDC rebalance still holds the single-rebalance \
-         guard; reconcile or resume that one first"
+        "another USDC transfer still holds the corridor guard (for an Alpaca-outbound \
+         resume, an Alpaca-outbound transfer on any corridor counts); reconcile or \
+         resume that one first"
     )]
     GuardHeldElsewhere,
+    #[error(
+        "every corridor is latched until the unreadable transfer is repaired and the \
+         bot restarts"
+    )]
+    EveryCorridorLatched,
     #[error("USDC rebalancing stores are not wired yet (conductor still starting)")]
     NotReady,
     #[error(
@@ -5533,9 +5539,13 @@ impl RebalancingService {
         {
             Ok(claim) => Some(claim),
             Err(ClaimRefusal::CorridorHeld) => None,
-            Err(refusal @ (ClaimRefusal::AlpacaOutboundElsewhere | ClaimRefusal::Unclassified)) => {
+            Err(refusal @ ClaimRefusal::AlpacaOutboundElsewhere) => {
                 warn!(target: "rebalance", %id, %refusal, "Manual USDC resume refused");
                 return Err(UsdcResumeError::GuardHeldElsewhere);
+            }
+            Err(refusal @ ClaimRefusal::Unclassified) => {
+                warn!(target: "rebalance", %id, %refusal, "Manual USDC resume refused");
+                return Err(UsdcResumeError::EveryCorridorLatched);
             }
         };
 
@@ -6876,8 +6886,8 @@ impl RebalancingService {
             (
                 "every corridor".to_string(),
                 "A transfer the bot cannot load or parse blocks every corridor, and every \
-                 manual resume, until it is repaired and the bot restarts; use \
-                 `transfer reconcile`, or repair the unreadable transfer and restart.",
+                 manual resume, until it is repaired and the bot restarts. Reconcile the \
+                 stranded transfers; repair the unreadable one and restart.",
             )
         } else {
             (
@@ -36286,7 +36296,7 @@ mod tests {
             .unwrap_err();
 
         assert!(
-            matches!(error, UsdcResumeError::GuardHeldElsewhere),
+            matches!(error, UsdcResumeError::EveryCorridorLatched),
             "got {error:?}"
         );
         assert!(market_making_job_rows(&trigger).await.is_empty());

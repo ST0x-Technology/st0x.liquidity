@@ -18,8 +18,8 @@ pub(crate) struct UsdcCashGuards(Mutex<CashGuardState>);
 
 impl UsdcCashGuards {
     /// Claims `chain`'s guard for `id`. Refused while another transfer holds
-    /// the chain, while an unclassified startup candidate latches every
-    /// chain, or, for an Alpaca-outbound transfer, while another chain holds
+    /// the chain, while a transfer whose corridor could not be read latches
+    /// every chain, or, for an Alpaca-outbound transfer, while another chain holds
     /// one. A claim by the transfer already holding the chain succeeds and
     /// leaves that hold in place on drop.
     pub(super) fn try_claim(
@@ -54,8 +54,8 @@ impl UsdcCashGuards {
         });
     }
 
-    /// Blocks every corridor until a restart: a startup candidate whose
-    /// corridor is unknown may hold any of them. Returns whether the latch
+    /// Blocks every corridor until a restart: a transfer whose corridor
+    /// could not be read may hold any of them. Returns whether the latch
     /// is new.
     pub(super) fn latch_unclassified(&self) -> bool {
         !std::mem::replace(&mut self.state().unclassified, true)
@@ -86,8 +86,8 @@ pub(super) enum ClaimRefusal {
     /// Another corridor holds an Alpaca-outbound transfer; Alpaca's cash is
     /// shared, so a second one must wait.
     AlpacaOutboundElsewhere,
-    /// A startup candidate with no known corridor latches every corridor
-    /// until a restart.
+    /// A transfer whose corridor could not be read (at startup or at
+    /// runtime) latches every corridor until a restart.
     Unclassified,
 }
 
@@ -99,7 +99,8 @@ impl std::fmt::Display for ClaimRefusal {
                 formatter.write_str("another corridor holds an Alpaca-outbound transfer")
             }
             Self::Unclassified => formatter.write_str(
-                "an unclassified startup candidate latches every corridor until a restart",
+                "a transfer whose corridor could not be read latches every corridor until a \
+                 restart",
             ),
         }
     }
