@@ -102,6 +102,8 @@ pub(crate) async fn watch(live: RegistryLive, shutdown: CancellationToken) {
         };
         metrics::gauge!("registry_pending_restart").set(f64::from(pending_restart));
         metrics::gauge!("registry_invalid").set(f64::from(invalid.max(u8::from(!pinned_readable))));
-        last = Some(latest);
+        // A vanished pin is judged again next tick even when the latest
+        // bytes have not moved, so a restored pin clears the gauge.
+        last = pinned_readable.then_some(latest);
     }
 }
