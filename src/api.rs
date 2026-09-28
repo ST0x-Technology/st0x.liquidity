@@ -6987,10 +6987,40 @@ mod tests {
         assert_eq!(message, "Failed to recheck transfer");
 
         let (status, message) = usdc_recheck_error_response(&UsdcRecheckError::Transfer(Box::new(
-            UsdcTransferError::PreviouslyFailedAggregate { id },
+            UsdcTransferError::PreviouslyFailedAggregate { id: id.clone() },
         )));
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(message, "Failed to recheck transfer");
+
+        let relay = UsdcCorridor::HubRouted {
+            chain: Chain::Robinhood,
+            hop: HopKind::Relay,
+        };
+        let (status, message) = usdc_recheck_error_response(&UsdcRecheckError::Transfer(Box::new(
+            UsdcTransferError::CorridorMismatch {
+                id: id.clone(),
+                recorded: relay,
+                served: UsdcCorridor::BASE_CCTP,
+            },
+        )));
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(
+            message.starts_with("USDC transfer corridor mismatch"),
+            "got {message}"
+        );
+
+        let (status, message) = usdc_recheck_error_response(&UsdcRecheckError::Transfer(Box::new(
+            UsdcTransferError::CorridorNotServed {
+                id,
+                requested: relay,
+                served: UsdcCorridor::BASE_CCTP,
+            },
+        )));
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(
+            message.starts_with("USDC transfer corridor mismatch"),
+            "got {message}"
+        );
     }
 
     /// Seeds a `UsdcRebalance` (BaseToAlpaca) into a post-burn `BridgingFailed`
