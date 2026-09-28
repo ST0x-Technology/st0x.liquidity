@@ -35539,4 +35539,69 @@ mod tests {
             notifier.messages()
         );
     }
+
+    /// Releasing a transfer on a corridor this build does not serve frees
+    /// only that transfer's guard: a held Base transfer keeps Base blocked.
+    #[tokio::test]
+    async fn sweep_releasing_an_unserved_corridor_transfer_keeps_the_served_corridor_guard() {
+        let pool = crate::test_utils::setup_test_db().await;
+        let store = Arc::new(test_store::<UsdcRebalance>(pool.clone(), ()));
+        let base_id = UsdcRebalanceId(Uuid::new_v4());
+        seed_withdrawing_alpaca_to_base_on(&store, &base_id, usdc(400), UsdcCorridor::BASE_CCTP)
+            .await;
+        let robinhood_id = UsdcRebalanceId(Uuid::new_v4());
+        let amount = usdc(300);
+        for command in [
+            UsdcRebalanceCommand::BeginWithdrawal {
+                direction: RebalanceDirection::BaseToAlpaca,
+                corridor: ROBINHOOD_RELAY,
+                amount,
+                from_block: 1,
+            },
+            UsdcRebalanceCommand::Initiate {
+                direction: RebalanceDirection::BaseToAlpaca,
+                corridor: ROBINHOOD_RELAY,
+                amount,
+                withdrawal: TransferRef::OnchainTx(B256::repeat_byte(0x0a)),
+            },
+            UsdcRebalanceCommand::ConfirmWithdrawal {
+                withdrawal_tx: None,
+            },
+            UsdcRebalanceCommand::BeginBridging {
+                from_block: 2,
+                burn_amount: None,
+            },
+        ] {
+            store.send(&robinhood_id, command).await.unwrap();
+        }
+        let notifier = Arc::new(CapturingNotifier::default());
+        let trigger = make_unserved_corridor_trigger(&pool, store.clone(), notifier).await;
+        trigger.recover_usdc_guard(&pool, &store).await.unwrap();
+
+        store
+            .send(
+                &robinhood_id,
+                UsdcRebalanceCommand::FailBridging {
+                    reason: "operator failed the pre-burn transfer".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+        trigger
+            .expire_stuck_usdc_rebalances(Utc::now() + ChronoDuration::hours(2))
+            .await
+            .unwrap();
+
+        assert!(
+            !trigger
+                .usdc_tracking
+                .read()
+                .await
+                .contains_key(&robinhood_id)
+        );
+        assert!(
+            trigger.usdc_in_progress.load(Ordering::SeqCst),
+            "the held Base transfer must keep the Base guard"
+        );
+    }
 }
