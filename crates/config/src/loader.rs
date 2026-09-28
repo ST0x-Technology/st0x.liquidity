@@ -9560,7 +9560,8 @@ mod tests {
             TokenFile::Bytes(&tokens),
             &mut notices,
         )
-        .unwrap_err();
+        .err()
+        .expect("a schedule naming a retired symbol must be refused");
         assert!(
             matches!(
                 error,
