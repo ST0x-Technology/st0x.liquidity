@@ -3986,9 +3986,10 @@ fails closed before any send and leaves the transfer untouched; the error starts
 with "USDC transfer corridor mismatch" and names both corridors. Automation
 treats a recorded transfer on another corridor as permanent for the build: its
 job re-queues itself every 10 minutes without a retry cost, so a build that
-serves the corridor finds a job to resume it; startup recovery (even while a job
-is live) and the timeout sweep never re-arm it, and its guard stays held. A
-fresh job asking for another corridor has no transfer to hold: it retries,
+serves the corridor finds a job to resume it, until the transfer holds no guard
+(reconciled, say), when the job ends; startup recovery (even while a job is
+live) and the timeout sweep never re-arm it, and its guard stays held. A fresh
+job asking for another corridor has no transfer to hold: it retries,
 dead-letters, and its dead-letter alert pages once. Startup recovery pages once
 per transfer per run (the record is kept in memory) with "USDC transfer corridor
 mismatch: transfer {id} runs on the {corridor} corridor, which this build does

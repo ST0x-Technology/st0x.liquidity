@@ -25,7 +25,7 @@ use chrono::{DateTime, Utc};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use tracing::{error, warn};
+use tracing::{error, info, warn};
 
 use st0x_bridge::cctp::CctpError;
 use st0x_bridge::corridor::{UsdcCorridor, legacy_base_cctp};
@@ -358,7 +358,8 @@ where
 /// build does not serve: this build cannot move it, and a job that ended here
 /// would leave nothing to resume it after a roll-forward to a build that
 /// serves the corridor. Startup recovery holds the transfer and pages once;
-/// the timeout sweep retries that page until it is delivered.
+/// the timeout sweep retries that page until it is delivered. A transfer that
+/// no longer holds the guard (reconciled, say) needs no resume: its job ends.
 async fn intercept_unserved_corridor<Ctx, TaskJob>(
     job: &TaskJob,
     job_queue: &JobQueue<TaskJob>,
@@ -370,7 +371,19 @@ where
     TaskJob::Error: From<QueuePushError>,
 {
     match result {
-        Err(error @ UsdcTransferError::CorridorMismatch { .. }) => {
+        Err(
+            error @ UsdcTransferError::CorridorMismatch {
+                holds_guard: false, ..
+            },
+        ) => {
+            info!(target: "rebalance", %error, "USDC transfer holds no guard; job ends");
+            ControlFlow::Break(Ok(()))
+        }
+        Err(
+            error @ UsdcTransferError::CorridorMismatch {
+                holds_guard: true, ..
+            },
+        ) => {
             warn!(
                 target: "rebalance",
                 %error,
@@ -2598,6 +2611,7 @@ mod tests {
                         hop: HopKind::Relay,
                     },
                     served: UsdcCorridor::BASE_CCTP,
+                    holds_guard: true,
                 },
             }
         }

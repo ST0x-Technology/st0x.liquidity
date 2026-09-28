@@ -736,9 +736,10 @@ impl<
 
     /// Refuses, before any call, a transfer this service's corridor does not
     /// carry: one recorded on another corridor, or a fresh one asking for
-    /// another. The transfer is left untouched. A recorded one re-queues its
-    /// job for a build that serves it and the rebalancing service pages once;
-    /// a fresh one retries and dead-letters, which pages once.
+    /// another. The transfer is left untouched. A recorded one that holds the
+    /// guard re-queues its job for a build that serves it and the rebalancing
+    /// service pages once (one that holds none ends its job); a fresh one
+    /// retries and dead-letters, which pages once.
     fn require_served_corridor(
         &self,
         id: &UsdcRebalanceId,
@@ -746,11 +747,12 @@ impl<
         state: Option<&UsdcRebalance>,
     ) -> Result<(), UsdcTransferError> {
         let served = self.corridor;
-        let error = match state.map(UsdcRebalance::corridor) {
-            Some(recorded) if recorded != served => UsdcTransferError::CorridorMismatch {
+        let error = match state {
+            Some(state) if state.corridor() != served => UsdcTransferError::CorridorMismatch {
                 id: id.clone(),
-                recorded,
+                recorded: state.corridor(),
                 served,
+                holds_guard: state.holds_rebalance_guard(),
             },
             None if requested != served => UsdcTransferError::CorridorNotServed {
                 id: id.clone(),

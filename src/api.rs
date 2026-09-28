@@ -7012,6 +7012,7 @@ mod tests {
                 id: id.clone(),
                 recorded: relay,
                 served: UsdcCorridor::BASE_CCTP,
+                holds_guard: true,
             },
         )));
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);

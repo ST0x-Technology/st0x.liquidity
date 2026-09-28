@@ -35240,6 +35240,7 @@ mod tests {
                 id: id.clone(),
                 recorded: ROBINHOOD_RELAY,
                 served: UsdcCorridor::BASE_CCTP,
+                holds_guard: true,
             })
         }
     }

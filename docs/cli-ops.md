@@ -879,16 +879,17 @@ before the startup token approvals.
   corridor this build does not carry, for example after a rollback from a build
   that served it, or after the corridor config changed. This build cannot move
   its funds. The bot holds the transfer and its guard: its job re-queues itself
-  every 10 minutes (a warning log each time, no page), and startup and the
-  timeout sweep do not re-arm it. A job for a fresh transfer asking for that
-  corridor (nothing recorded yet) dead-letters instead, and its dead-letter
-  alert contains the same text. `transfer resume` and `transfer recheck` are
-  refused with messages that start with the same words. `transfer reconcile`
-  does not accept the pre-burn states such a transfer is usually in; do not try
-  it there. A held transfer in a reconcilable failed state can be reconciled as
-  usual, and the next sweep releases its guard. Deploy a build (and config) that
-  serves the named corridor; that build's worker picks up the queued job within
-  10 minutes and resumes the transfer where it stopped.
+  every 10 minutes (a warning log each time, no page) until the transfer holds
+  no guard (reconciled, say), when the job ends; startup and the timeout sweep
+  do not re-arm it. A job for a fresh transfer asking for that corridor (nothing
+  recorded yet) dead-letters instead, and its dead-letter alert contains the
+  same text. `transfer resume` and `transfer recheck` are refused with messages
+  that start with the same words. `transfer reconcile` does not accept the
+  pre-burn states such a transfer is usually in; do not try it there. A held
+  transfer in a reconcilable failed state can be reconciled as usual, and the
+  next sweep releases its guard. Deploy a build (and config) that serves the
+  named corridor; that build's worker picks up the queued job within 10 minutes
+  and resumes the transfer where it stopped.
 
 ### Clearing a dropped pending burn (`BridgingSubmitting` latch)
 

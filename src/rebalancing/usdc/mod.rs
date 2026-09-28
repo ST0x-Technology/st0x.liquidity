@@ -255,6 +255,9 @@ pub enum UsdcTransferError {
         id: UsdcRebalanceId,
         recorded: UsdcCorridor,
         served: UsdcCorridor,
+        /// Whether the transfer still holds the rebalance guard, so a build
+        /// that serves `recorded` must still resume it.
+        holds_guard: bool,
     },
     #[error(
         "USDC transfer corridor mismatch: transfer {id} asks for the {requested} corridor, \
