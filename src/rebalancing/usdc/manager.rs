@@ -16144,7 +16144,7 @@ mod tests {
         // No deposit transfer is mocked, so the leg sends, then fails at the
         // Alpaca poll.
         let error = manager
-            .resume_base_to_alpaca(&id, amount)
+            .resume_base_to_alpaca(&id, amount, UsdcCorridor::BASE_CCTP)
             .await
             .unwrap_err();
         assert!(
@@ -16196,7 +16196,7 @@ mod tests {
         record_signed_deposit_send(&cqrs, &other, other_send).await;
 
         let error = manager
-            .resume_base_to_alpaca(&id, amount)
+            .resume_base_to_alpaca(&id, amount, UsdcCorridor::BASE_CCTP)
             .await
             .unwrap_err();
 
