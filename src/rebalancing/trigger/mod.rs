@@ -36348,4 +36348,42 @@ mod tests {
             "got {delivered:?}"
         );
     }
+
+    /// A post-burn failure with an unreadable corridor pages its own
+    /// transfer even when startup already latched every corridor.
+    #[tokio::test]
+    async fn runtime_latch_after_a_startup_latch_pages_its_own_transfer() {
+        let pool = crate::test_utils::setup_test_db().await;
+        let store = test_store::<UsdcRebalance>(pool.clone(), ());
+        insert_unloadable_usdc_candidate(&pool).await;
+        let notifier = Arc::new(CapturingNotifier::default());
+        let trigger = make_trigger_with_inventory_config_and_notifier(
+            InventoryView::default(),
+            test_config(),
+            notifier.clone(),
+        )
+        .await;
+        trigger.recover_usdc_guard(&pool, &store).await.unwrap();
+
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        ReactorHarness::new(Arc::clone(&trigger))
+            .receive::<UsdcRebalance>(id.clone(), make_usdc_deposit_failed())
+            .await
+            .unwrap();
+
+        let pages = notifier.messages();
+        assert!(
+            pages
+                .iter()
+                .any(|page| page.starts_with("USDC rebalancing is LATCHED on startup")),
+            "got {pages:?}"
+        );
+        assert!(
+            pages.iter().any(|page| {
+                page.starts_with("USDC rebalancing is LATCHED on every corridor")
+                    && page.contains(&id.to_string())
+            }),
+            "got {pages:?}"
+        );
+    }
 }
