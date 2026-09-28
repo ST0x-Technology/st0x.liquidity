@@ -35985,23 +35985,7 @@ mod tests {
         seed_withdrawing_alpaca_to_base_on(&store, &base_id, usdc(400), UsdcCorridor::BASE_CCTP)
             .await;
 
-        // Direct INSERT into `events`: no command can produce an unoriginated
-        // first event, which replays to no aggregate.
-        let unloadable = UsdcRebalanceId(Uuid::new_v4());
-        let event = UsdcRebalanceEvent::BridgingInitiated {
-            burn_tx_hash: B256::repeat_byte(0xaa),
-            burned_at: Utc::now(),
-        };
-        sqlx::query(
-            "INSERT INTO events \
-             (aggregate_type, aggregate_id, sequence, event_type, event_version, payload, metadata) \
-             VALUES ('UsdcRebalance', ?, 0, 'UsdcRebalanceEvent::BridgingInitiated', '1.0', ?, '{}')",
-        )
-        .bind(unloadable.to_string())
-        .bind(serde_json::to_string(&event).unwrap())
-        .execute(&pool)
-        .await
-        .unwrap();
+        insert_unloadable_usdc_candidate(&pool).await;
 
         let service = make_trigger_with_inventory(InventoryView::default()).await;
         service.recover_usdc_guard(&pool, &store).await.unwrap();
@@ -36282,13 +36266,34 @@ mod tests {
         );
     }
 
-    /// While an unclassified transfer latches every corridor, a manual resume
-    /// is refused.
+    /// Seeds a USDC candidate whose events replay to no aggregate. Direct
+    /// INSERT into `events`: no command can produce an unoriginated first
+    /// event.
+    async fn insert_unloadable_usdc_candidate(pool: &SqlitePool) {
+        let event = UsdcRebalanceEvent::BridgingInitiated {
+            burn_tx_hash: B256::repeat_byte(0xaa),
+            burned_at: Utc::now(),
+        };
+        sqlx::query(
+            "INSERT INTO events \
+             (aggregate_type, aggregate_id, sequence, event_type, event_version, payload, metadata) \
+             VALUES ('UsdcRebalance', ?, 0, 'UsdcRebalanceEvent::BridgingInitiated', '1.0', ?, '{}')",
+        )
+        .bind(UsdcRebalanceId(Uuid::new_v4()).to_string())
+        .bind(serde_json::to_string(&event).unwrap())
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    /// While an unreadable transfer latches every corridor, a manual resume
+    /// is refused with that reason, not as a conflict with another holder.
     #[tokio::test]
     async fn manual_resume_is_refused_while_every_corridor_is_latched() {
         let (trigger, pool, store) = make_resume_trigger().await;
         let id = seed_converting_alpaca_to_base(&store).await;
-        trigger.usdc_guards.latch_unclassified();
+        insert_unloadable_usdc_candidate(&pool).await;
+        trigger.recover_usdc_guard(&pool, &store).await.unwrap();
 
         let error = trigger
             .resume_usdc_transfer(&pool, &id, RebalanceDirection::AlpacaToBase)
@@ -36308,22 +36313,7 @@ mod tests {
     async fn failed_startup_every_corridor_page_is_retried_by_the_sweep() {
         let pool = crate::test_utils::setup_test_db().await;
         let store = test_store::<UsdcRebalance>(pool.clone(), ());
-        // Direct INSERT into `events`: no command can produce an unoriginated
-        // first event, which replays to no aggregate.
-        let event = UsdcRebalanceEvent::BridgingInitiated {
-            burn_tx_hash: B256::repeat_byte(0xaa),
-            burned_at: Utc::now(),
-        };
-        sqlx::query(
-            "INSERT INTO events \
-             (aggregate_type, aggregate_id, sequence, event_type, event_version, payload, metadata) \
-             VALUES ('UsdcRebalance', ?, 0, 'UsdcRebalanceEvent::BridgingInitiated', '1.0', ?, '{}')",
-        )
-        .bind(UsdcRebalanceId(Uuid::new_v4()).to_string())
-        .bind(serde_json::to_string(&event).unwrap())
-        .execute(&pool)
-        .await
-        .unwrap();
+        insert_unloadable_usdc_candidate(&pool).await;
         let notifier = Arc::new(FlakyNotifier {
             remaining_failures: std::sync::atomic::AtomicUsize::new(1),
             delivered: std::sync::Mutex::new(Vec::new()),
