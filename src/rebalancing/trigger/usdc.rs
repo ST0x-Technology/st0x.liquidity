@@ -607,6 +607,7 @@ impl RebalancingService {
         }
 
         drop(event_sync_guard);
+        self.deliver_pending_latch_page().await;
 
         // A terminal USDC transfer cleared the in-progress claim, so we
         // cancel any pre-rebalance checks and push a fresh one against
@@ -683,14 +684,29 @@ impl RebalancingService {
                      be read. Repair the transfer's stored events, then restart the bot; \
                      only a restart lifts this latch."
                 );
-                if let Err(error) = self.notifier.notify(&message).await {
-                    warn!(target: "rebalance", ?error, "Failed to deliver the every-corridor latch page");
-                }
+                *self.pending_latch_page.write().await = Some(message);
             }
             return;
         };
 
         self.usdc_guards.hold(corridor.chain(), id, direction);
+    }
+
+    /// Sends the every-corridor latch page, if one is pending, outside the
+    /// USDC event lock; a failed delivery stays pending for the next sweep.
+    pub(super) async fn deliver_pending_latch_page(&self) {
+        let Some(message) = self.pending_latch_page.write().await.take() else {
+            return;
+        };
+
+        if let Err(error) = self.notifier.notify(&message).await {
+            warn!(
+                target: "rebalance",
+                ?error,
+                "Failed to deliver the every-corridor latch page; will retry next sweep"
+            );
+            self.pending_latch_page.write().await.get_or_insert(message);
+        }
     }
 
     async fn durable_corridor(

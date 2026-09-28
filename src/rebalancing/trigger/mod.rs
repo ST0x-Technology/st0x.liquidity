@@ -913,6 +913,8 @@ pub(crate) struct RebalancingService {
     /// Transfers on a corridor this build does not serve whose page was
     /// delivered, so the sweep pages once, not every tick.
     corridor_not_served_alerted: Arc<RwLock<HashSet<UsdcRebalanceId>>>,
+    /// The every-corridor latch page, until one delivery succeeds.
+    pending_latch_page: RwLock<Option<String>>,
     mint_event_sync: Arc<Mutex<()>>,
     redemption_event_sync: Arc<Mutex<()>>,
     usdc_event_sync: Arc<Mutex<()>>,
@@ -1106,6 +1108,7 @@ impl RebalancingService {
             post_burn_timeout_logged: Arc::new(RwLock::new(HashSet::new())),
             post_burn_timeout_alerted: Arc::new(RwLock::new(HashSet::new())),
             corridor_not_served_alerted: Arc::new(RwLock::new(HashSet::new())),
+            pending_latch_page: RwLock::new(None),
             mint_event_sync: Arc::new(Mutex::new(())),
             redemption_event_sync: Arc::new(Mutex::new(())),
             usdc_event_sync: Arc::new(Mutex::new(())),
@@ -1788,6 +1791,8 @@ impl RebalancingService {
         &self,
         now: DateTime<Utc>,
     ) -> Result<(), RebalancingServiceError> {
+        self.deliver_pending_latch_page().await;
+
         // The sweep relatches, clears, and re-arms under the guard an operator
         // operation may be mutating, and it runs from the check job, the
         // equity check, and inline on the snapshot reactor. Claim the driver
