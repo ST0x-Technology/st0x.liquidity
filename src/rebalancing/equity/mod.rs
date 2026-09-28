@@ -480,6 +480,10 @@ impl Raindex for PanickingRaindex {
         unimplemented!("PanickingRaindex: not available in CLI context")
     }
 
+    async fn tx_mined(&self, _: TxHash) -> Result<bool, RaindexError> {
+        unimplemented!("PanickingRaindex: not available in CLI context")
+    }
+
     async fn confirm_tx_receipt(&self, _: TxHash) -> Result<TransactionReceipt, RaindexError> {
         unimplemented!("PanickingRaindex: not available in CLI context")
     }
