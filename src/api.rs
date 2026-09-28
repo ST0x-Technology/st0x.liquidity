@@ -6762,6 +6762,7 @@ mod tests {
                 )]),
                 cash_reserved: None,
                 hedge_floor: st0x_execution::HedgeFloor::default(),
+                served_usdc_corridor: UsdcCorridor::BASE_CCTP,
             },
             vault_registry,
             std::collections::BTreeMap::from([(

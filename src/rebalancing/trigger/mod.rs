@@ -35306,6 +35306,7 @@ mod tests {
             job_queue: serving.transfer_usdc_to_hedging_queue.clone(),
             max_burn_revert_redrives: 5,
             notifier: notifier.clone(),
+            driver_gate: UsdcDriverGate::unpaused(),
         };
         job.perform(&unserved_build).await.unwrap();
 

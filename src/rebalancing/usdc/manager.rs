@@ -6830,7 +6830,7 @@ mod tests {
     use crate::conductor::job::{BackpressureStreak, Job};
     use crate::rebalancing::usdc::{
         TransferUsdcToMarketMaking, TransferUsdcToMarketMakingCtx,
-        TransferUsdcToMarketMakingJobQueue,
+        TransferUsdcToMarketMakingJobQueue, UsdcDriverGate,
     };
     use crate::telemetry::TelemetrySender;
     use crate::test_utils::{
@@ -26815,6 +26815,7 @@ mod tests {
             job_queue: TransferUsdcToMarketMakingJobQueue::new(&pool),
             max_burn_revert_redrives: 5,
             notifier: Arc::new(CapturingNotifier::default()),
+            driver_gate: UsdcDriverGate::unpaused(),
         };
         let job = TransferUsdcToMarketMaking {
             id,

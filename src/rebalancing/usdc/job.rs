@@ -3155,6 +3155,7 @@ mod tests {
             &self,
             _id: &UsdcRebalanceId,
             _amount: Usdc,
+            _corridor: UsdcCorridor,
         ) -> Result<(), UsdcTransferError> {
             self.record();
             Ok(())
@@ -3167,6 +3168,7 @@ mod tests {
             &self,
             _id: &UsdcRebalanceId,
             _amount: Usdc,
+            _corridor: UsdcCorridor,
         ) -> Result<(), UsdcTransferError> {
             self.record();
             Ok(())
@@ -3218,6 +3220,7 @@ mod tests {
             &self,
             _id: &UsdcRebalanceId,
             _amount: Usdc,
+            _corridor: UsdcCorridor,
         ) -> Result<(), UsdcTransferError> {
             self.entered.notify_one();
             self.release.notified().await;
@@ -3240,6 +3243,7 @@ mod tests {
         let job = TransferUsdcToHedging {
             id: UsdcRebalanceId(Uuid::new_v4()),
             amount: Usdc::new(float!(100)),
+            corridor: UsdcCorridor::BASE_CCTP,
             revert_redrive_attempts: 0,
             backpressure_streak: BackpressureStreak::default(),
         };
@@ -3262,6 +3266,7 @@ mod tests {
         let job = TransferUsdcToMarketMaking {
             id: UsdcRebalanceId(Uuid::new_v4()),
             amount: Usdc::new(float!(100)),
+            corridor: UsdcCorridor::BASE_CCTP,
             revert_redrive_attempts: 0,
             backpressure_streak: BackpressureStreak::default(),
         };
@@ -3295,6 +3300,7 @@ mod tests {
         let job = TransferUsdcToHedging {
             id: UsdcRebalanceId(Uuid::new_v4()),
             amount: Usdc::new(float!(100)),
+            corridor: UsdcCorridor::BASE_CCTP,
             revert_redrive_attempts: 0,
             backpressure_streak: BackpressureStreak::default(),
         };
@@ -7014,12 +7020,14 @@ mod tests {
             job_queue: TransferUsdcToHedgingJobQueue::new(&pool),
             max_burn_revert_redrives: 5,
             notifier: notifier.clone(),
+            driver_gate: UsdcDriverGate::unpaused(),
         };
         let market_making = TransferUsdcToMarketMakingCtx {
             transfer: Arc::new(TerminalAlpacaToBase(TerminalOutcome::CorridorMismatch)),
             job_queue: TransferUsdcToMarketMakingJobQueue::new(&pool),
             max_burn_revert_redrives: 5,
             notifier: notifier.clone(),
+            driver_gate: UsdcDriverGate::unpaused(),
         };
         let id = UsdcRebalanceId(Uuid::new_v4());
         let amount = Usdc::new(float!(100));
