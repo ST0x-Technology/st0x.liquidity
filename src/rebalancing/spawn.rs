@@ -9,6 +9,7 @@ use std::sync::Arc;
 use tracing::info;
 
 use st0x_bridge::cctp::{CctpBridge, CctpCorridor, CctpCtx, CctpError};
+use st0x_bridge::corridor::UsdcCorridor;
 use st0x_config::{ChainEquityAsset, OnchainWalletCtx};
 use st0x_event_sorcery::Store;
 use st0x_evm::Wallet;
@@ -101,6 +102,8 @@ pub(crate) struct RebalancerServices<Signer: Wallet> {
     broker: InstrumentedAlpacaBroker,
     wallet: Arc<AlpacaWalletService>,
     cctp: Arc<CctpBridge<Signer, Signer>>,
+    /// The cash corridor the CCTP pair carries.
+    corridor: UsdcCorridor,
     raindex: Arc<RaindexService<Signer>>,
     settlement: UsdcSettlementParams,
 }
@@ -123,6 +126,7 @@ impl<Signer: Wallet + Clone> RebalancerServices<Signer> {
             ethereum: EthereumWallet(ethereum_wallet),
             base: BaseWallet(base_wallet),
         } = wallets;
+        let usdc_corridor = corridor.usdc_corridor();
         let cctp = Arc::new(
             CctpBridge::try_from_ctx(CctpCtx {
                 corridor,
@@ -142,6 +146,7 @@ impl<Signer: Wallet + Clone> RebalancerServices<Signer> {
             broker,
             wallet,
             cctp,
+            corridor: usdc_corridor,
             raindex,
             settlement,
         })
@@ -169,7 +174,7 @@ impl<Signer: Wallet + Clone> RebalancerServices<Signer> {
                 self.cctp,
                 self.raindex,
                 usdc,
-                MarketMakingUsdcEndpoints::new(market_maker_wallet, usdc_vault_id),
+                MarketMakingUsdcEndpoints::new(self.corridor, market_maker_wallet, usdc_vault_id),
                 &self.settlement,
                 bot_gas_enqueuer,
             )
@@ -358,6 +363,7 @@ mod tests {
         let ctx = make_ctx();
 
         let trigger_config = RebalancingServiceConfig {
+            served_usdc_corridor: UsdcCorridor::BASE_CCTP,
             poll_freshness: PollFreshness::always_fresh(),
             inventory_staleness_bound: std::time::Duration::from_secs(300),
             cash_reserved: None,
@@ -389,6 +395,7 @@ mod tests {
         let ctx = make_ctx();
 
         let trigger_config = RebalancingServiceConfig {
+            served_usdc_corridor: UsdcCorridor::BASE_CCTP,
             poll_freshness: PollFreshness::always_fresh(),
             inventory_staleness_bound: std::time::Duration::from_secs(300),
             cash_reserved: None,
@@ -400,8 +407,8 @@ mod tests {
         };
 
         let usdc_threshold = trigger_config.usdc.expect("USDC threshold should be Some");
-        assert!(usdc_threshold.target.eq(float!(0.6)).unwrap());
-        assert!(usdc_threshold.deviation.eq(float!(0.15)).unwrap());
+        assert!(usdc_threshold.threshold.target.eq(float!(0.6)).unwrap());
+        assert!(usdc_threshold.threshold.deviation.eq(float!(0.15)).unwrap());
     }
 
     async fn make_services_with_mock_wallet(
@@ -452,6 +459,7 @@ mod tests {
         ));
 
         let services = RebalancerServices {
+            corridor: UsdcCorridor::BASE_CCTP,
             broker,
             wallet,
             cctp,

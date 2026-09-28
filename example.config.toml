@@ -333,7 +333,24 @@ max_burn_revert_redrives = 5
 # operator escape hatch for an issuance outage. Issuance secrets stay required
 # either way, so re-enabling is a pure config change.
 freeze_check = "enabled"
-usdc = { mode = "enabled", target = 0.5, deviation = 0.3 }
+
+# USDC rebalancing. `mode` switches new cash transfers on every corridor;
+# "disabled" keeps the corridor tables below (still validated) in place.
+[rebalancing.usdc]
+mode = "enabled"
+
+# One table per cash corridor, keyed by the chain whose vault it serves;
+# every corridor routes through the bot's Ethereum wallet, where Alpaca
+# deposits and withdraws. All three keys are required.
+# hop: how USDC crosses between that chain and Ethereum. "cctp" (Circle burn
+#   and mint) on Base. "relay" is reserved for Robinhood and refused by this
+#   build.
+# target: the chain vault's share of (that vault's USDC + Alpaca cash).
+# deviation: the band around target inside which nothing moves.
+[rebalancing.usdc.corridors.base]
+hop = "cctp"
+target = 0.5
+deviation = 0.3
 
 # Required: the per-chain equity allocation the planner runs from. `targets`
 # gives each hedged chain's share of every equity's total inventory (an equity
@@ -377,8 +394,9 @@ wrapped_equity_recovery = "disabled"
 
 [chains.base.trading.assets.cash]
 rebalancing = "enabled"
-# Single vault: vault_ids = "0xcd34"
+# Required here: [rebalancing.usdc.corridors.base] moves USDC into this vault.
 # Multiple vaults: vault_ids = ["0xcd34", "0xef56"]
+vault_ids = "0xcd34"
 # operational_limit = 10000.0
 
 # Optional — enables the Orders dashboard tab by querying the st0x REST API.
