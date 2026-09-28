@@ -6682,8 +6682,18 @@ mod tests {
         async fn recheck_deposit(
             &self,
             _id: &UsdcRebalanceId,
+            _operator_deposit_tx: Option<TxHash>,
         ) -> Result<RecheckOutcome, UsdcRecheckError> {
             Ok(RecheckOutcome::LeftUnchanged)
+        }
+
+        async fn verify_deposit_send_superseded(
+            &self,
+            _id: &UsdcRebalanceId,
+            _prepared: &st0x_evm::PreparedTransaction,
+            _superseding_tx: Option<TxHash>,
+        ) -> Result<(), DepositSendNotSuperseded> {
+            unimplemented!("LeftUnchangedUsdcRecheck: reconcile not used in this test")
         }
     }
 
@@ -6820,6 +6830,7 @@ mod tests {
         let Err((status, Json(body))) = recheck_transfer(
             State(state),
             Path(("usdc_bridge".to_string(), id.to_string())),
+            Query(RecheckQuery::default()),
         )
         .await
         else {

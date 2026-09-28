@@ -5261,6 +5261,7 @@ mod tests {
             job_queue: TransferUsdcToHedgingJobQueue::new(&pool),
             max_burn_revert_redrives: 5,
             notifier: notifier.clone(),
+            driver_gate: UsdcDriverGate::unpaused(),
         };
         let job = TransferUsdcToHedging {
             id: UsdcRebalanceId(Uuid::new_v4()),
