@@ -6585,19 +6585,18 @@ pub async fn verify_deposit_send_superseded<Helper: UsdcBridgeHelper + ?Sized>(
             })?,
         None => None,
     };
-    match recorded_by {
-        Some(recorded_by) => {
-            info!(target: "rebalance", %id, %superseding, %recorded_by, "Superseding tx is another transfer's deposit send");
-            Ok(())
-        }
-        None => Err(
+    let Some(recorded_by) = recorded_by else {
+        return Err(
             DepositSendNotSuperseded::SupersedingTxPaidTheDepositAddress {
                 superseding,
                 deposit_address,
                 paid,
             },
-        ),
-    }
+        );
+    };
+
+    info!(target: "rebalance", %id, %superseding, %recorded_by, "Superseding tx is another transfer's deposit send");
+    Ok(())
 }
 
 /// The account that signed the deposit send.
@@ -6725,6 +6724,7 @@ where
 mod tests {
     use alloy::consensus::{SignableTransaction as _, TxEip1559};
     use alloy::eips::eip2718::Encodable2718;
+    use alloy::eips::eip2930::AccessList;
     use alloy::node_bindings::Anvil;
     use alloy::primitives::{B256, Bytes, TxKind, address, b256, fixed_bytes};
     use alloy::providers::ext::AnvilApi as _;
@@ -16630,7 +16630,7 @@ mod tests {
             max_priority_fee_per_gas: 1_000_000_000,
             to: TxKind::Call(USDC_ADDRESS),
             value: U256::ZERO,
-            access_list: Default::default(),
+            access_list: AccessList::default(),
             input: Bytes::from(
                 IERC20::transferCall {
                     to: ALPACA_DEPOSIT_ADDRESS,
