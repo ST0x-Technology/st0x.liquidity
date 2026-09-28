@@ -11,7 +11,6 @@ use alloy::providers::Provider;
 use alloy::rpc::types::Log;
 use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
-use std::collections::HashSet;
 use std::sync::Arc;
 use tracing::{debug, error, info, warn};
 
@@ -19,7 +18,7 @@ use st0x_config::{Ctx, HedgedChain};
 use st0x_event_sorcery::{SendError, Store};
 use st0x_evm::{Chain, ReadOnlyEvm};
 use st0x_execution::alpaca_broker_api::AlpacaBrokerApiError;
-use st0x_execution::{ExecutionError, Executor, Permanence, Symbol};
+use st0x_execution::{ExecutionError, Executor, Permanence};
 use st0x_raindex::RaindexContracts;
 use st0x_registry::{SymbolCache, get_symbol_lock};
 
@@ -94,13 +93,6 @@ pub(crate) struct AccountantCtx<Node, Exec> {
     pub(crate) pool: SqlitePool,
     pub(crate) job_queue: DexTradeAccountingJobQueue,
     pub(crate) notifier: Arc<dyn Notifier>,
-    /// Chain and symbol pairs already paged for a fill on a trading disabled
-    /// asset, so an ongoing stream of such fills pages once per process, not
-    /// per fill (same cadence as hedge dead letter alerts). Each such fill is
-    /// kept out of the hedged position and recorded in `skipped_fills`. Keyed
-    /// per chain because each chain's asset table disables the symbol on its
-    /// own. A restart pages again.
-    pub(crate) disabled_asset_alerts: Arc<std::sync::Mutex<HashSet<(Chain, Symbol)>>>,
 }
 
 impl<Node, Exec> Job<AccountantCtx<Node, Exec>> for AccountForDexTrade
@@ -251,16 +243,15 @@ where
             )
             .await?;
 
-            // `AlreadyExcluded` pages too: the marker is durable before the
-            // page, so a process that dies in between redelivers into this
-            // outcome, and the fill's delta must still be surfaced. The per
-            // process dedup keeps any other redrive to one page per symbol.
+            // `AlreadyExcluded` alerts too: the marker is durable before the
+            // alert, so a process that dies in between redelivers into this
+            // outcome, and the fill must still be surfaced. A redrive logs the
+            // fill again; the alert rule deduplicates per chain and symbol.
             if let ExcludedFillOutcome::Excluded { detail }
             | ExcludedFillOutcome::AlreadyExcluded { detail } = outcome
             {
                 self.alert_disabled_asset_fill(
                     &ctx.notifier,
-                    &ctx.disabled_asset_alerts,
                     &trade,
                     chain_ctx.trading.chain,
                     &detail,
@@ -446,47 +437,31 @@ async fn persist_skipped_fill(
 }
 
 impl AccountForDexTrade {
-    /// Critical, deduplicated alert for a fill on a disabled asset. The flag
-    /// is the per symbol hedge kill switch, so the fill is never counter
-    /// traded, but the exposure it leaves must never be silent. `detail`
-    /// states the delta so the operator can cover it from the page alone.
-    /// Once per process per chain and symbol; delivery failure releases the
-    /// reservation so the next fill tries again.
+    /// Operational alert for every fill on a disabled asset. The flag is the
+    /// per symbol hedge kill switch, so the fill is never counter traded, but
+    /// the exposure it leaves must never be silent. `detail` states the delta
+    /// and its cover side. The bot keeps no alert state: the log based alert
+    /// metric extracts the kind, symbol and chain from the message, and the
+    /// alert rule deduplicates, silences and renotifies per chain and symbol.
+    /// `Fill on DISABLED asset <SYMBOL> (chain <chain>,` is that extraction
+    /// contract (t0.devops `observability-consumer`).
     async fn alert_disabled_asset_fill(
         &self,
         notifier: &Arc<dyn Notifier>,
-        alerted_symbols: &std::sync::Mutex<HashSet<(Chain, Symbol)>>,
         trade: &OnchainTrade,
         chain: Chain,
         detail: &str,
     ) {
-        let newly_reserved = {
-            let mut alerted = match alerted_symbols.lock() {
-                Ok(guard) => guard,
-                Err(poisoned) => poisoned.into_inner(),
-            };
-            alerted.insert((chain, trade.symbol.base().clone()))
-        };
-        if !newly_reserved {
-            return;
-        }
-
         let message = format!(
-            "Fill on DISABLED asset {symbol} (chain {chain}, tx {tx}): {detail}. Kept out \
-             of the hedged position and recorded in skipped_fills; cover the delta by \
-             hand. Further fills on this symbol and chain are not paged again until \
-             restart.",
+            "Fill on DISABLED asset {symbol} (chain {chain}, tx {tx}, log index {log_index}): \
+             {detail}. Kept out of the hedged position and recorded in skipped_fills; \
+             cover the delta by hand.",
             symbol = trade.symbol.base(),
             tx = self.trade.tx_hash,
+            log_index = trade.log_index,
         );
-        error!(target: "hedge", %message, "Disabled-asset fill");
         if let Err(error) = notifier.notify(&message).await {
-            warn!(target: "hedge", ?error, "Disabled-asset alert delivery failed");
-            let mut alerted = match alerted_symbols.lock() {
-                Ok(guard) => guard,
-                Err(poisoned) => poisoned.into_inner(),
-            };
-            alerted.remove(&(chain, trade.symbol.base().clone()));
+            warn!(target: "hedge", ?error, %message, "Disabled-asset alert delivery failed");
         }
     }
 }
@@ -1041,7 +1016,6 @@ mod tests {
             cache,
             cqrs,
             notifier: Arc::new(crate::alerts::LogNotifier),
-            disabled_asset_alerts: Arc::new(std::sync::Mutex::new(HashSet::new())),
             vault_registry,
             executor,
             pool,
@@ -1151,11 +1125,11 @@ mod tests {
         );
     }
 
-    /// The disabled-asset alert fires once per process per symbol; a second
-    /// fill on the same symbol stays silent, and a delivery failure releases
-    /// the reservation so the next fill re-pages.
+    /// Every fill on a disabled asset raises the alert, with no per process
+    /// dedup: deduplication belongs to the alert rule, keyed on the symbol and
+    /// chain the message names in the extraction format.
     #[tokio::test]
-    async fn disabled_asset_alert_pages_once_per_symbol() {
+    async fn every_disabled_asset_fill_raises_the_alert() {
         let (pool, apalis_pool) = setup_test_pools().await;
         let provider = ProviderBuilder::new().connect_mocked_client(Asserter::new());
         let executor = MockExecutorCtx.try_into_executor().await.unwrap();
@@ -1176,79 +1150,33 @@ mod tests {
         let trade = crate::test_utils::OnchainTradeBuilder::new().build();
 
         let notifier_arc: Arc<dyn Notifier> = notifier.clone();
-        job.alert_disabled_asset_fill(
-            &notifier_arc,
-            &ctx.disabled_asset_alerts,
-            &trade,
-            Chain::Base,
-            "Buy 5 AAPL at 150 USDC",
-        )
-        .await;
-        job.alert_disabled_asset_fill(
-            &notifier_arc,
-            &ctx.disabled_asset_alerts,
-            &trade,
-            Chain::Base,
-            "Buy 7 AAPL at 151 USDC",
-        )
-        .await;
-
-        assert_eq!(
-            notifier.messages().len(),
-            1,
-            "the second fill on the same disabled symbol must not re-page"
-        );
-        assert!(notifier.messages()[0].contains("DISABLED"));
-        assert!(
-            notifier.messages()[0].contains("Buy 5 AAPL at 150 USDC"),
-            "the page must carry the delta to cover: {}",
-            notifier.messages()[0]
-        );
-    }
-
-    /// The dedup key is chain and symbol: a symbol disabled on two hedged
-    /// chains pages once per chain, each message naming its own chain.
-    #[tokio::test]
-    async fn disabled_asset_alert_pages_per_chain() {
-        let (pool, apalis_pool) = setup_test_pools().await;
-        let provider = ProviderBuilder::new().connect_mocked_client(Asserter::new());
-        let executor = MockExecutorCtx.try_into_executor().await.unwrap();
-        let notifier = Arc::new(crate::alerts::CapturingNotifier::default());
-        let mut ctx = build_test_accountant_ctx(
-            pool,
-            &apalis_pool,
-            create_test_ctx_with_order_owner(Address::ZERO),
-            SymbolCache::default(),
-            provider,
-            executor,
-            ExecutionThreshold::whole_share(),
-        )
-        .await;
-        ctx.notifier = notifier.clone();
-
-        let job = test_job();
-        let trade = crate::test_utils::OnchainTradeBuilder::new().build();
-
-        let notifier_arc: Arc<dyn Notifier> = notifier.clone();
-        for chain in [Chain::Base, Chain::Ethereum, Chain::Ethereum] {
-            job.alert_disabled_asset_fill(
-                &notifier_arc,
-                &ctx.disabled_asset_alerts,
-                &trade,
-                chain,
-                "Buy 5 AAPL at 150 USDC",
-            )
-            .await;
+        for (chain, detail) in [
+            (Chain::Base, "Buy 5 AAPL at 150 USDC"),
+            (Chain::Base, "Buy 7 AAPL at 151 USDC"),
+            (Chain::Ethereum, "Buy 5 AAPL at 150 USDC"),
+        ] {
+            job.alert_disabled_asset_fill(&notifier_arc, &trade, chain, detail)
+                .await;
         }
 
         let messages = notifier.messages();
-        assert_eq!(
-            messages.len(),
-            2,
-            "one page per chain the disabled symbol filled on, deduplicated per chain"
+        assert_eq!(messages.len(), 3, "every fill alerts: {messages:?}");
+        assert!(
+            messages[0].starts_with("Fill on DISABLED asset AAPL (chain base,")
+                && messages[0].contains("Buy 5 AAPL at 150 USDC"),
+            "{}",
+            messages[0]
         );
-        assert!(messages[0].contains("chain base"));
-        assert!(messages[1].contains("chain ethereum"));
+        assert!(
+            messages[1].contains("Buy 7 AAPL at 151 USDC"),
+            "{}",
+            messages[1]
+        );
+        assert!(
+            messages[2].starts_with("Fill on DISABLED asset AAPL (chain ethereum,"),
+            "{}",
+            messages[2]
+        );
     }
 
     /// A job stamped with a chain no hedged entry covers fails loudly
@@ -2202,9 +2130,9 @@ mod tests {
             backpressure_streak: BackpressureStreak::default(),
         };
 
-        // decimals() for USDC and wtCOIN, once per perform (the run, the
-        // redrive, and the redelivery after a restart).
-        for _ in 0..3 {
+        // decimals() for USDC and wtCOIN, once per perform (the run and the
+        // redrive).
+        for _ in 0..2 {
             asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&6u8));
             asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&18u8));
         }
@@ -2306,7 +2234,12 @@ mod tests {
         assert_eq!(order_count, 0, "a disabled asset is never counter traded");
 
         let messages = notifier.messages();
-        assert_eq!(messages.len(), 1, "one page for the disabled asset fill");
+        assert_eq!(
+            messages.len(),
+            2,
+            "the run and the redrive each raise the alert, so a crash between the \
+             exclusion marker and the alert never loses it"
+        );
         assert!(
             !messages[0].contains("accumulating"),
             "the page must not claim the fill accumulates for a later hedge: {}",
@@ -2318,17 +2251,9 @@ mod tests {
             messages[0]
         );
 
-        // A process that died after the marker but before paging redelivers
-        // the job into a fresh process, which finds the fill already excluded.
-        // It must still page, or that fill's delta is never surfaced.
-        accountant_ctx.disabled_asset_alerts = Arc::new(std::sync::Mutex::new(HashSet::new()));
-        job.perform(&accountant_ctx).await.unwrap();
-
-        let messages = notifier.messages();
-        assert_eq!(messages.len(), 2, "the redelivery after a restart pages");
         assert!(
             messages[1].contains(&recorded[0].detail),
-            "the redelivered page must carry the recorded delta: {}",
+            "the redrive's alert must carry the recorded delta: {}",
             messages[1]
         );
     }

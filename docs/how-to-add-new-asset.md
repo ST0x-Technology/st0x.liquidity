@@ -206,7 +206,14 @@ chain's signing wallet, orderbook, `redemption_wallet` and
   when the bot accounts the fill, not when the fill lands on chain, so after
   enabling trading the bot hedges every fill it has not accounted yet, including
   fills that landed while trading was disabled but were still queued, not yet
-  backfilled, or landed during the restart.
+  backfilled, or landed during the restart. Every excluded fill logs
+  `Fill on
+  DISABLED asset <SYMBOL> (chain <chain>, ...)`, which alerts in
+  production once per chain and symbol. If trading was left disabled by mistake,
+  enabling it does not hedge the fills already excluded: sum that symbol and
+  chain's `trading_disabled` rows in `skipped_fills` and hedge them by hand. If
+  it is disabled on purpose and hedged by hand, silence the alert for that chain
+  and symbol.
 - `rebalancing`: Whether the bot auto-rebalances this asset between venues.
   Usually `"disabled"` at first.
 - `wrapped_equity_recovery`: Explicit opt-in for recovery of wrapped-equity

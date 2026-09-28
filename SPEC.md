@@ -1867,19 +1867,22 @@ event position).
   it for as long as any hedged chain enables the symbol, so flipping the switch
   mid incident does not stop the bot hedging exposure it already accounted. An
   excluded fill is still witnessed on its `OnChainTrade` and recorded in
-  `skipped_fills` with reason `trading_disabled`, and it raises a deduplicated
-  critical operational alert (once per process per chain and symbol), so the
-  exposure it leaves is never silent. The flag is read when the bot accounts the
-  fill, not when the fill lands on chain. Enabling the asset again therefore
-  hedges every fill the bot accounts from the restart on, including fills that
-  landed earlier but were not accounted yet: still queued, not yet backfilled
-  past the ingestion cutoff, or landing during the restart itself. Only fills
-  already recorded in `skipped_fills` with reason `trading_disabled` stay
-  excluded and are never hedged later; an operator covers that delta by hand
-  from those records. Excluded fills also never reach the PnL ledger, which
-  replays `Position` events, so PnL is incomplete for them and a manual cover
-  must be reconciled outside the ledger. Rebalancing is governed separately by
-  the asset's `rebalancing` flag.
+  `skipped_fills` with reason `trading_disabled`, and every such fill raises an
+  operational alert naming its symbol and chain
+  (`Fill on DISABLED asset
+  <SYMBOL> (chain <chain>, ...)`), so the exposure it
+  leaves is never silent. The bot keeps no alert state: the log based alert rule
+  deduplicates, silences and renotifies per chain and symbol. The flag is read
+  when the bot accounts the fill, not when the fill lands on chain. Enabling the
+  asset again therefore hedges every fill the bot accounts from the restart on,
+  including fills that landed earlier but were not accounted yet: still queued,
+  not yet backfilled past the ingestion cutoff, or landing during the restart
+  itself. Only fills already recorded in `skipped_fills` with reason
+  `trading_disabled` stay excluded and are never hedged later; an operator
+  covers that delta by hand from those records. Excluded fills also never reach
+  the PnL ledger, which replays `Position` events, so PnL is incomplete for them
+  and a manual cover must be reconciled outside the ledger. Rebalancing is
+  governed separately by the asset's `rebalancing` flag.
 
 ### Infrastructure and Deployment
 
