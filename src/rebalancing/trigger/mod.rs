@@ -2480,23 +2480,6 @@ impl RebalancingService {
                     UsdcRebalance::Withdrawing {
                         direction: RebalanceDirection::AlpacaToBase,
                         corridor,
-                        ..
-                    }
-                    | UsdcRebalance::WithdrawalComplete {
-                        direction: RebalanceDirection::AlpacaToBase,
-                        corridor,
-                        ..
-                    },
-                )) if corridor != self.config.served_usdc_corridor => {
-                    drop(tracking_guard);
-                    return Ok(Some(UsdcTimeoutCleanup::HeldForUnservedCorridor {
-                        corridor,
-                    }));
-                }
-                Ok(Some(
-                    UsdcRebalance::Withdrawing {
-                        direction: RebalanceDirection::AlpacaToBase,
-                        corridor,
                         amount,
                         ..
                     }
@@ -25373,27 +25356,6 @@ mod tests {
         stage: usdc::UsdcRebalanceStage,
         now: DateTime<Utc>,
     ) -> Arc<RebalancingService> {
-        make_trigger_with_timed_out_alpaca_to_base_tracking_and_notifier(
-            pool,
-            store,
-            id,
-            amount,
-            stage,
-            now,
-            Arc::new(LogNotifier),
-        )
-        .await
-    }
-
-    async fn make_trigger_with_timed_out_alpaca_to_base_tracking_and_notifier(
-        pool: &SqlitePool,
-        store: Arc<Store<UsdcRebalance>>,
-        id: &UsdcRebalanceId,
-        amount: Usdc,
-        stage: usdc::UsdcRebalanceStage,
-        now: DateTime<Utc>,
-        notifier: Arc<dyn crate::alerts::Notifier>,
-    ) -> Arc<RebalancingService> {
         let inventory = InventoryView::default()
             .with_usdc(usdc(500), usdc(900))
             .update_usdc(
@@ -25402,10 +25364,9 @@ mod tests {
             )
             .unwrap()
             .set_active_usdc_rebalance(id.clone());
-        let trigger = make_trigger_with_inventory_config_and_notifier(
+        let trigger = make_trigger_with_inventory_config(
             inventory,
             test_config_with_timeout(Duration::from_secs(1)),
-            notifier,
         )
         .await;
 
@@ -35158,53 +35119,6 @@ mod tests {
             .into_iter()
             .filter(|message| message.starts_with("USDC transfer corridor mismatch"))
             .collect()
-    }
-
-    /// A transfer on a corridor this build does not serve cannot progress:
-    /// re-arming it would dead-letter and page on every sweep. The sweep
-    /// holds it (guard kept) and pages once instead.
-    #[tokio::test]
-    async fn sweep_holds_a_transfer_on_a_corridor_this_build_does_not_serve() {
-        let now = Utc::now();
-        let pool = crate::test_utils::setup_test_db().await;
-        let store = Arc::new(test_store::<UsdcRebalance>(pool.clone(), ()));
-        let id = UsdcRebalanceId(Uuid::new_v4());
-        let amount = usdc(400);
-        seed_withdrawing_alpaca_to_base_on(&store, &id, amount, ROBINHOOD_RELAY).await;
-        let notifier = Arc::new(CapturingNotifier::default());
-        let trigger = make_trigger_with_timed_out_alpaca_to_base_tracking_and_notifier(
-            &pool,
-            store,
-            &id,
-            amount,
-            usdc::UsdcRebalanceStage::Initiated,
-            now,
-            notifier.clone(),
-        )
-        .await;
-
-        for _ in 0..3 {
-            trigger
-                .expire_stuck_usdc_rebalances(Utc::now())
-                .await
-                .unwrap();
-        }
-
-        assert_eq!(
-            count_pending_transfer_usdc_to_market_making_jobs(&trigger).await,
-            0,
-            "a transfer on a corridor this build does not serve must not be re-armed"
-        );
-        assert!(
-            trigger.usdc_in_progress.load(Ordering::SeqCst),
-            "the guard stays held for the operator"
-        );
-        assert!(trigger.usdc_tracking.read().await.contains_key(&id));
-        let pages = corridor_pages(&notifier);
-        assert_eq!(pages.len(), 1, "one page across sweeps, got {pages:?}");
-        assert!(pages[0].contains(&id.to_string()), "{}", pages[0]);
-        assert!(pages[0].contains("robinhood via relay"), "{}", pages[0]);
-        assert!(pages[0].contains("base via cctp"), "{}", pages[0]);
     }
 
     #[tokio::test]
