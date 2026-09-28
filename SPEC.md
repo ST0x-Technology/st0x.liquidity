@@ -1025,23 +1025,24 @@ not the stale enqueue-time one.
 ##### Overnight hedging (24/5)
 
 Overnight counter-trading is **opt-in per asset** via a required
-`overnight_counter_trading` field on each `[assets.equities.SYMBOL]` config
-block, independent from `extended_hours_counter_trading` (committed as
-`"disabled"`; absent assets are disabled, fail-closed). Overnight has a separate
-broker entitlement, a separate feed, and a separate risk profile, so it never
-piggybacks on the extended-hours flag. Disabling one asset — or all of them — is
-a config change only and does not disturb regular or extended-hours hedging. The
-protection bound for overnight limits is a separate `overnight_slippage_bps`,
-because the indicative feed's spreads are not comparable to tape-based
-extended-hours pricing. It follows the same configuration contract as
-`counter_trade_slippage_bps`: required whenever any asset enables overnight
-counter-trading, and startup validation rejects zero and out-of-range values
-(the accepted range matches `counter_trade_slippage_bps` — a 1–9,999 bps sanity
-bound, not a calibration to tape-session spreads, so it does not constrain
-legitimate overnight values; the type admits no negatives). The crossed
-reference is rounded to the broker tick by the same path as every other limit
-price — buys round up, sells round down — so the bound stays protective without
-going sub-tick aggressive.
+`overnight_counter_trading` field on each `[assets.equities.SYMBOL]` block in
+the token file (see "The token file"), independent from
+`extended_hours_counter_trading` (committed as `"disabled"`; absent assets are
+disabled, fail-closed). Overnight has a separate broker entitlement, a separate
+feed, and a separate risk profile, so it never piggybacks on the extended-hours
+flag. Disabling one asset, or all of them, is a token-file change only (in
+production, shipped with a `generation` bump) and does not disturb regular or
+extended-hours hedging. The protection bound for overnight limits is a separate
+`overnight_slippage_bps`, because the indicative feed's spreads are not
+comparable to tape-based extended-hours pricing. It follows the same
+configuration contract as `counter_trade_slippage_bps`: required whenever any
+asset enables overnight counter-trading, and startup validation rejects zero and
+out-of-range values (the accepted range matches `counter_trade_slippage_bps` — a
+1–9,999 bps sanity bound, not a calibration to tape-session spreads, so it does
+not constrain legitimate overnight values; the type admits no negatives). The
+crossed reference is rounded to the broker tick by the same path as every other
+limit price — buys round up, sells round down — so the bound stays protective
+without going sub-tick aggressive.
 
 **Eligibility.** Before an overnight placement, the bot checks its synced asset
 attributes: the asset must be `overnight_tradable`, not `overnight_halted`, and

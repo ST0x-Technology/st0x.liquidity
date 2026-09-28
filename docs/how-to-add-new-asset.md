@@ -259,11 +259,11 @@ gauge stays at 1 until the pin is bumped and released.
   and CI fails without it. `tokens-production-migration.toml` stays as it is; it
   is the frozen proof of the move from inline tables.
 
-Before a release, check the file against the config offline:
+Before a release, check the pinned copy against the config offline:
 
 ```bash
 cargo run --bin validate-config -- --config config/prod/st0x-hedge.toml \
-  --registry-file tokens.toml
+  --registry-file tests/fixtures/tokens-production-<generation>.toml
 ```
 
 ### Retiring an asset
