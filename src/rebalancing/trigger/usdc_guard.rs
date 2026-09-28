@@ -55,10 +55,9 @@ impl UsdcCashGuards {
     }
 
     /// Blocks every corridor until a restart: a transfer whose corridor
-    /// could not be read may hold any of them. Returns whether the latch
-    /// is new.
-    pub(super) fn latch_unclassified(&self) -> bool {
-        !std::mem::replace(&mut self.state().unclassified, true)
+    /// could not be read may hold any of them.
+    pub(super) fn latch_unclassified(&self) {
+        self.state().unclassified = true;
     }
 
     /// Whether a transfer whose corridor could not be read latches every

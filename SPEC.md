@@ -4706,10 +4706,10 @@ terminal states only.
   These indicate store inconsistency and require manual investigation. The
   running bot latches every corridor the same way when a post-burn failure's
   corridor cannot be read (no in-memory tracking and the aggregate does not
-  load); the latch lasts until a restart and pages once, retried by the timeout
-  sweep until delivered: "USDC rebalancing is LATCHED on every corridor with no
-  automated recovery". While any every-corridor latch is set, manual resumes are
-  refused.
+  load); the latch lasts until a restart and pages once per transfer, retried by
+  the timeout sweep until delivered: "USDC rebalancing is LATCHED on every
+  corridor with no automated recovery". While any every-corridor latch is set,
+  manual resumes are refused.
 
 Note: USDC (FiatToken v2.2) decrements even `U256::MAX` allowances in
 `transferFrom`. At realistic rebalancing sizes the allowance never drops below

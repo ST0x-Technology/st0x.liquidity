@@ -607,7 +607,7 @@ impl RebalancingService {
         }
 
         drop(event_sync_guard);
-        self.deliver_pending_latch_page().await;
+        self.deliver_pending_latch_pages().await;
 
         // A terminal USDC transfer cleared the in-progress claim, so we
         // cancel any pre-rebalance checks and push a fresh one against
@@ -677,14 +677,15 @@ impl RebalancingService {
                 "No corridor known for a post-burn terminal failure; latching every \
                  corridor's guard until a restart classifies it"
             );
-            if self.usdc_guards.latch_unclassified() {
+            self.usdc_guards.latch_unclassified();
+            if self.latch_paged.write().await.insert(id.clone()) {
                 let message = format!(
                     "USDC rebalancing is LATCHED on every corridor with no automated \
                      recovery: transfer {id} failed after its burn and its corridor cannot \
                      be read. Repair the transfer's stored events, then restart the bot; \
                      only a restart lifts this latch."
                 );
-                *self.pending_latch_page.write().await = Some(message);
+                self.pending_latch_pages.write().await.push_back(message);
             }
             return;
         };
@@ -692,20 +693,23 @@ impl RebalancingService {
         self.usdc_guards.hold(corridor.chain(), id, direction);
     }
 
-    /// Sends the every-corridor latch page, if one is pending, outside the
-    /// USDC event lock; a failed delivery stays pending for the next sweep.
-    pub(super) async fn deliver_pending_latch_page(&self) {
-        let Some(message) = self.pending_latch_page.write().await.take() else {
-            return;
-        };
+    /// Sends the pending every-corridor latch pages in order, outside the
+    /// USDC event lock; a failed delivery stays queued for the next sweep.
+    pub(super) async fn deliver_pending_latch_pages(&self) {
+        loop {
+            let Some(message) = self.pending_latch_pages.write().await.pop_front() else {
+                return;
+            };
 
-        if let Err(error) = self.notifier.notify(&message).await {
-            warn!(
-                target: "rebalance",
-                ?error,
-                "Failed to deliver the every-corridor latch page; will retry next sweep"
-            );
-            self.pending_latch_page.write().await.get_or_insert(message);
+            if let Err(error) = self.notifier.notify(&message).await {
+                warn!(
+                    target: "rebalance",
+                    ?error,
+                    "Failed to deliver an every-corridor latch page; will retry next sweep"
+                );
+                self.pending_latch_pages.write().await.push_front(message);
+                return;
+            }
         }
     }
 

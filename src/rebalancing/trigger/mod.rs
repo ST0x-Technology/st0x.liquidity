@@ -18,7 +18,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use metrics::counter;
 use sqlx::SqlitePool;
-use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::{Arc, PoisonError};
 use std::time::Duration;
 use tokio::sync::{Mutex, RwLock};
@@ -919,8 +919,11 @@ pub(crate) struct RebalancingService {
     /// Transfers on a corridor this build does not serve whose page was
     /// delivered, so the sweep pages once, not every tick.
     corridor_not_served_alerted: Arc<RwLock<HashSet<UsdcRebalanceId>>>,
-    /// The every-corridor latch page, until one delivery succeeds.
-    pending_latch_page: RwLock<Option<String>>,
+    /// Every-corridor latch pages (startup's and one per runtime transfer)
+    /// until each is delivered.
+    pending_latch_pages: RwLock<VecDeque<String>>,
+    /// Transfers whose runtime every-corridor latch page was queued.
+    latch_paged: RwLock<HashSet<UsdcRebalanceId>>,
     mint_event_sync: Arc<Mutex<()>>,
     redemption_event_sync: Arc<Mutex<()>>,
     usdc_event_sync: Arc<Mutex<()>>,
@@ -1114,7 +1117,8 @@ impl RebalancingService {
             post_burn_timeout_logged: Arc::new(RwLock::new(HashSet::new())),
             post_burn_timeout_alerted: Arc::new(RwLock::new(HashSet::new())),
             corridor_not_served_alerted: Arc::new(RwLock::new(HashSet::new())),
-            pending_latch_page: RwLock::new(None),
+            pending_latch_pages: RwLock::new(VecDeque::new()),
+            latch_paged: RwLock::new(HashSet::new()),
             mint_event_sync: Arc::new(Mutex::new(())),
             redemption_event_sync: Arc::new(Mutex::new(())),
             usdc_event_sync: Arc::new(Mutex::new(())),
@@ -1797,7 +1801,7 @@ impl RebalancingService {
         &self,
         now: DateTime<Utc>,
     ) -> Result<(), RebalancingServiceError> {
-        self.deliver_pending_latch_page().await;
+        self.deliver_pending_latch_pages().await;
 
         // The sweep relatches, clears, and re-arms under the guard an operator
         // operation may be mutating, and it runs from the check job, the
@@ -6915,11 +6919,11 @@ impl RebalancingService {
         );
 
         // The every-corridor latch lasts until a restart, so its page is
-        // retried by the sweep until delivered; a later runtime latch finds
-        // it pending and leaves it in place.
+        // queued and retried by the sweep until delivered; a later runtime
+        // latch queues its own transfer's page behind it.
         if unclassified {
-            *self.pending_latch_page.write().await = Some(message);
-            self.deliver_pending_latch_page().await;
+            self.pending_latch_pages.write().await.push_back(message);
+            self.deliver_pending_latch_pages().await;
         } else if let Err(error) = self.notifier.notify(&message).await {
             warn!(target: "rebalance", ?error, "Failed to deliver USDC startup-stranded alert");
         }
@@ -36204,7 +36208,7 @@ mod tests {
     }
 
     /// A post-burn failure whose corridor cannot be read latches every
-    /// corridor until a restart, and pages once so the operator knows.
+    /// corridor until a restart, and pages once per transfer.
     #[tokio::test]
     async fn unknown_corridor_post_burn_failure_latches_every_corridor_and_pages_once() {
         let notifier = Arc::new(CapturingNotifier::default());
@@ -36216,12 +36220,10 @@ mod tests {
         .await;
         let harness = ReactorHarness::new(Arc::clone(&trigger));
 
+        let id = UsdcRebalanceId(Uuid::new_v4());
         for _ in 0..2 {
             harness
-                .receive::<UsdcRebalance>(
-                    UsdcRebalanceId(Uuid::new_v4()),
-                    make_usdc_deposit_failed(),
-                )
+                .receive::<UsdcRebalance>(id.clone(), make_usdc_deposit_failed())
                 .await
                 .unwrap();
         }

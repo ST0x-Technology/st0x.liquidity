@@ -559,9 +559,9 @@ guard records the transfers that hold it. Who touches it, and when:
   holders from durable state (`holds_rebalance_guard`) and re-arms resumable
   jobs. A candidate that cannot be loaded or parsed latches every corridor until
   a restart classifies it; so does a post-burn failure whose corridor the
-  running bot cannot read, which pages once ("USDC rebalancing is LATCHED on
-  every corridor with no automated recovery"). Repair the transfer, then
-  restart.
+  running bot cannot read, which pages once per transfer ("USDC rebalancing is
+  LATCHED on every corridor with no automated recovery"). Repair the transfer,
+  then restart.
 - **Single-flight for manual commands**: the resume endpoint refuses while any
   live or retryable USDC job row exists on the transfer's corridor (either
   direction) or while another aggregate durably holds that corridor's guard (for
