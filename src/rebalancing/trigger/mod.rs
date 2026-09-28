@@ -8144,6 +8144,9 @@ mod tests {
         MintError, MintTransferError, ResumeEquityToMarketMaking, TransferEquityToMarketMakingCtx,
         TransferEquityToMarketMakingJobError,
     };
+    use crate::rebalancing::usdc::{
+        ResumeBaseToAlpaca, TransferUsdcToHedgingCtx, UsdcTransferError,
+    };
     use crate::test_utils::rebalancing_enabled_equities;
     use crate::tokenized_equity_mint::TokenizedEquityMintCommand;
     use crate::usdc_rebalance::{
@@ -35307,6 +35310,99 @@ mod tests {
             "only the corridor page, not the generic latched page: {:?}",
             notifier.messages()
         );
+    }
+
+    struct RefusingBaseToAlpaca;
+
+    #[async_trait]
+    impl ResumeBaseToAlpaca for RefusingBaseToAlpaca {
+        async fn resume_base_to_alpaca(
+            &self,
+            id: &UsdcRebalanceId,
+            _amount: Usdc,
+            _corridor: UsdcCorridor,
+        ) -> Result<(), UsdcTransferError> {
+            Err(UsdcTransferError::CorridorMismatch {
+                id: id.clone(),
+                recorded: ROBINHOOD_RELAY,
+                served: UsdcCorridor::BASE_CCTP,
+            })
+        }
+    }
+
+    /// A build that does not serve a post-burn transfer's corridor refuses
+    /// its job; after a roll-forward to a build that serves it, a job still
+    /// drives the transfer.
+    #[tokio::test]
+    async fn refused_unserved_corridor_job_resumes_after_roll_forward() {
+        let pool = crate::test_utils::setup_test_db().await;
+        let store = test_store::<UsdcRebalance>(pool.clone(), ());
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let amount = usdc(400);
+        let burn_tx = B256::repeat_byte(0x0b);
+        for command in [
+            UsdcRebalanceCommand::Initiate {
+                corridor: ROBINHOOD_RELAY,
+                direction: RebalanceDirection::BaseToAlpaca,
+                amount,
+                withdrawal: TransferRef::OnchainTx(burn_tx),
+            },
+            UsdcRebalanceCommand::ConfirmWithdrawal {
+                withdrawal_tx: None,
+            },
+            UsdcRebalanceCommand::InitiateBridging { burn_tx },
+            UsdcRebalanceCommand::TimeoutAttestation {
+                retry_deadline_at: Utc::now() + ChronoDuration::hours(1),
+            },
+        ] {
+            store.send(&id, command).await.unwrap();
+        }
+        let notifier = Arc::new(CapturingNotifier::default());
+        let serving = make_trigger_with_inventory_config_and_notifier(
+            InventoryView::default(),
+            RebalancingServiceConfig {
+                served_usdc_corridor: ROBINHOOD_RELAY,
+                ..test_config()
+            },
+            notifier.clone(),
+        )
+        .await;
+        let job = TransferUsdcToHedging {
+            corridor: ROBINHOOD_RELAY,
+            id: id.clone(),
+            amount,
+            revert_redrive_attempts: 0,
+            backpressure_streak: BackpressureStreak::default(),
+        };
+        serving
+            .transfer_usdc_to_hedging_queue
+            .clone()
+            .push(job.clone())
+            .await
+            .unwrap();
+        sqlx_apalis::query("UPDATE Jobs SET status = 'Done' WHERE job_type = ?")
+            .bind(std::any::type_name::<TransferUsdcToHedging>())
+            .execute(serving.transfer_usdc_to_hedging_queue.pool())
+            .await
+            .unwrap();
+        let unserved_build = TransferUsdcToHedgingCtx {
+            transfer: Arc::new(RefusingBaseToAlpaca),
+            timeout: Duration::from_secs(3600),
+            job_queue: serving.transfer_usdc_to_hedging_queue.clone(),
+            max_burn_revert_redrives: 5,
+            notifier: notifier.clone(),
+        };
+        job.perform(&unserved_build).await.unwrap();
+
+        serving.recover_usdc_guard(&pool, &store).await.unwrap();
+
+        assert_eq!(
+            count_pending_transfer_usdc_to_hedging_jobs(&serving).await,
+            1,
+            "a job must drive the transfer on the serving build"
+        );
+        assert!(serving.usdc_in_progress.load(Ordering::SeqCst));
+        assert_eq!(notifier.messages(), Vec::<String>::new());
     }
 
     async fn make_unserved_corridor_trigger(
