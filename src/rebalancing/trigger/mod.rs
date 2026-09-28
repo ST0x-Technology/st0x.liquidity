@@ -36125,7 +36125,7 @@ mod tests {
     /// an Alpaca-outbound transfer, by an Alpaca-outbound holder on any
     /// corridor; an inbound holder on another corridor does not refuse it.
     #[tokio::test]
-    async fn manual_resume_is_refused_only_by_a_holder_on_its_corridor() {
+    async fn manual_resume_is_refused_by_its_corridors_holder_or_an_outbound_one_elsewhere() {
         resume_base_alpaca_outbound_with_a_holder_on(
             ROBINHOOD_RELAY,
             RebalanceDirection::BaseToAlpaca,
@@ -36263,5 +36263,25 @@ mod tests {
             delivered[0].starts_with("USDC rebalancing is LATCHED on every corridor"),
             "got {delivered:?}"
         );
+    }
+
+    /// While an unclassified transfer latches every corridor, a manual resume
+    /// is refused.
+    #[tokio::test]
+    async fn manual_resume_is_refused_while_every_corridor_is_latched() {
+        let (trigger, pool, store) = make_resume_trigger().await;
+        let id = seed_converting_alpaca_to_base(&store).await;
+        trigger.usdc_guards.latch_unclassified();
+
+        let error = trigger
+            .resume_usdc_transfer(&pool, &id, RebalanceDirection::AlpacaToBase)
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(error, UsdcResumeError::GuardHeldElsewhere),
+            "got {error:?}"
+        );
+        assert!(market_making_job_rows(&trigger).await.is_empty());
     }
 }
