@@ -4940,16 +4940,20 @@ impl RebalancingService {
         // The id is minted before the claim so the guard records which
         // transfer holds it; a refused or undispatched claim leaves no row.
         let id = UsdcRebalanceId(Uuid::new_v4());
-        let Some(guard) = self
+        let guard = match self
             .usdc_guards
             .try_claim(chain, &id, operation.direction())
-        else {
-            debug!(
-                target: "rebalance",
-                corridor = %usdc.corridor,
-                "Skipped USDC trigger: the corridor's guard is held"
-            );
-            return;
+        {
+            Ok(guard) => guard,
+            Err(refusal) => {
+                debug!(
+                    target: "rebalance",
+                    corridor = %usdc.corridor,
+                    %refusal,
+                    "Skipped USDC trigger: the corridor's guard refused the claim"
+                );
+                return;
+            }
         };
 
         // Re-check immediately before dispatch: the poller may have engaged
@@ -5491,7 +5495,8 @@ impl RebalancingService {
         // resolves.
         let claim = self
             .usdc_guards
-            .try_claim(state.corridor().chain(), id, direction);
+            .try_claim(state.corridor().chain(), id, direction)
+            .ok();
 
         // Single-flight for concurrent duplicate resumes: two racing calls
         // for the same id can pass the read gates together (and a failed
@@ -35764,6 +35769,7 @@ mod tests {
             !trigger.usdc_guards.is_held(Chain::Robinhood),
             "a reconciled transfer must release the guard"
         );
+        assert!(!trigger.usdc_guards.is_held(Chain::Base));
         assert_eq!(corridor_pages(&notifier).len(), 1);
         assert_eq!(
             notifier.messages().len(),
@@ -35828,6 +35834,7 @@ mod tests {
             !trigger.usdc_guards.is_held(Chain::Robinhood),
             "a transfer that no longer holds the guard must release it"
         );
+        assert!(!trigger.usdc_guards.is_held(Chain::Base));
         assert!(!trigger.usdc_tracking.read().await.contains_key(&id));
         assert_eq!(
             notifier.messages().len(),

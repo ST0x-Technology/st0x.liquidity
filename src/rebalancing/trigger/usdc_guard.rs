@@ -27,10 +27,10 @@ impl UsdcCashGuards {
         chain: Chain,
         id: &UsdcRebalanceId,
         direction: RebalanceDirection,
-    ) -> Option<CashGuardClaim> {
+    ) -> Result<CashGuardClaim, ClaimRefusal> {
         let fresh = self.state().claim(chain, id, direction)?;
 
-        Some(CashGuardClaim {
+        Ok(CashGuardClaim {
             guards: Arc::clone(self),
             id: id.clone(),
             release_on_drop: fresh,
@@ -77,6 +77,33 @@ impl UsdcCashGuards {
     }
 }
 
+/// Why a corridor refused a claim.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ClaimRefusal {
+    /// Another transfer holds the corridor.
+    CorridorHeld,
+    /// Another corridor holds an Alpaca-outbound transfer; Alpaca's cash is
+    /// shared, so a second one must wait.
+    AlpacaOutboundElsewhere,
+    /// A startup candidate with no known corridor latches every corridor
+    /// until a restart.
+    Unclassified,
+}
+
+impl std::fmt::Display for ClaimRefusal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::CorridorHeld => formatter.write_str("another transfer holds the corridor"),
+            Self::AlpacaOutboundElsewhere => {
+                formatter.write_str("another corridor holds an Alpaca-outbound transfer")
+            }
+            Self::Unclassified => formatter.write_str(
+                "an unclassified startup candidate latches every corridor until a restart",
+            ),
+        }
+    }
+}
+
 /// A guard claimed by the trigger or a manual resume. Dropping it releases
 /// the claim unless it was defused after the transfer's job was queued.
 pub(super) struct CashGuardClaim {
@@ -106,17 +133,15 @@ struct CashGuardState {
 }
 
 impl CashGuardState {
-    /// Adds `id` to `chain`'s holders when admitted; `Some(true)` when the
+    /// Adds `id` to `chain`'s holders when admitted; `Ok(true)` when the
     /// hold is new.
     fn claim(
         &mut self,
         chain: Chain,
         id: &UsdcRebalanceId,
         direction: RebalanceDirection,
-    ) -> Option<bool> {
-        if !self.admits(chain, id, direction) {
-            return None;
-        }
+    ) -> Result<bool, ClaimRefusal> {
+        self.admits(chain, id, direction)?;
 
         let fresh = self
             .holders
@@ -125,12 +150,17 @@ impl CashGuardState {
             .insert(id.clone(), direction)
             .is_none();
 
-        Some(fresh)
+        Ok(fresh)
     }
 
-    fn admits(&self, chain: Chain, id: &UsdcRebalanceId, direction: RebalanceDirection) -> bool {
+    fn admits(
+        &self,
+        chain: Chain,
+        id: &UsdcRebalanceId,
+        direction: RebalanceDirection,
+    ) -> Result<(), ClaimRefusal> {
         if self.unclassified {
-            return false;
+            return Err(ClaimRefusal::Unclassified);
         }
 
         let chain_taken = self
@@ -138,12 +168,12 @@ impl CashGuardState {
             .get(&chain)
             .is_some_and(|holders| holders.keys().any(|holder| holder != id));
         if chain_taken {
-            return false;
+            return Err(ClaimRefusal::CorridorHeld);
         }
 
-        match direction {
-            RebalanceDirection::BaseToAlpaca => true,
-            RebalanceDirection::AlpacaToBase => !self
+        let outbound_elsewhere = match direction {
+            RebalanceDirection::BaseToAlpaca => false,
+            RebalanceDirection::AlpacaToBase => self
                 .holders
                 .iter()
                 .filter(|(held_chain, _)| **held_chain != chain)
@@ -151,7 +181,12 @@ impl CashGuardState {
                 .any(|(holder, held_direction)| {
                     holder != id && *held_direction == RebalanceDirection::AlpacaToBase
                 }),
+        };
+        if outbound_elsewhere {
+            return Err(ClaimRefusal::AlpacaOutboundElsewhere);
         }
+
+        Ok(())
     }
 }
 
@@ -206,7 +241,7 @@ mod tests {
 
         let second_claim =
             guards.try_claim(Chain::Base, &new_id(), RebalanceDirection::BaseToAlpaca);
-        assert!(second_claim.is_none());
+        assert!(matches!(second_claim, Err(ClaimRefusal::CorridorHeld)));
     }
 
     #[test]
@@ -225,7 +260,8 @@ mod tests {
                 RebalanceDirection::BaseToAlpaca,
             )
             .expect("another corridor must admit its own transfer");
-        let None = guards.try_claim(Chain::Base, &new_id(), RebalanceDirection::BaseToAlpaca)
+        let Err(ClaimRefusal::CorridorHeld) =
+            guards.try_claim(Chain::Base, &new_id(), RebalanceDirection::BaseToAlpaca)
         else {
             panic!("a second transfer on a held corridor must be refused");
         };
@@ -245,7 +281,7 @@ mod tests {
         let guards = Arc::new(UsdcCashGuards::default());
         guards.hold(Chain::Base, &new_id(), RebalanceDirection::AlpacaToBase);
 
-        let None = guards.try_claim(
+        let Err(ClaimRefusal::AlpacaOutboundElsewhere) = guards.try_claim(
             Chain::Robinhood,
             &new_id(),
             RebalanceDirection::AlpacaToBase,
