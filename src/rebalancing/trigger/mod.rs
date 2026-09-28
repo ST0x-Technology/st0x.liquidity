@@ -35965,4 +35965,62 @@ mod tests {
             "another corridor's holder must keep its guard"
         );
     }
+
+    /// The Jobs-table dedupe is per corridor: a live job on another corridor
+    /// does not block a Base enqueue, and a row queued before corridors
+    /// counts as Base.
+    #[tokio::test]
+    async fn usdc_enqueue_dedupe_ignores_a_live_job_on_another_corridor() {
+        let trigger = make_trigger_with_inventory(InventoryView::default()).await;
+        let robinhood_job = TransferUsdcToMarketMaking {
+            corridor: ROBINHOOD_RELAY,
+            id: UsdcRebalanceId(Uuid::new_v4()),
+            amount: usdc(400),
+            revert_redrive_attempts: 0,
+            backpressure_streak: BackpressureStreak::default(),
+        };
+        trigger
+            .transfer_usdc_to_market_making_queue
+            .clone()
+            .push(robinhood_job.clone())
+            .await
+            .unwrap();
+
+        assert!(
+            trigger
+                .enqueue_transfer_usdc_to_hedging(
+                    UsdcRebalanceId(Uuid::new_v4()),
+                    usdc(100),
+                    UsdcCorridor::BASE_CCTP,
+                )
+                .await,
+            "a live job on another corridor must not block a Base enqueue"
+        );
+
+        let pool = trigger.transfer_usdc_to_hedging_queue.pool();
+        sqlx_apalis::query("UPDATE Jobs SET status = 'Done' WHERE job_type = ?")
+            .bind(std::any::type_name::<TransferUsdcToHedging>())
+            .execute(pool)
+            .await
+            .unwrap();
+        let mut legacy = serde_json::to_value(&robinhood_job).unwrap();
+        legacy.as_object_mut().unwrap().remove("corridor");
+        sqlx_apalis::query("UPDATE Jobs SET job = ? WHERE job_type = ?")
+            .bind(serde_json::to_vec(&legacy).unwrap())
+            .bind(std::any::type_name::<TransferUsdcToMarketMaking>())
+            .execute(pool)
+            .await
+            .unwrap();
+
+        assert!(
+            !trigger
+                .enqueue_transfer_usdc_to_hedging(
+                    UsdcRebalanceId(Uuid::new_v4()),
+                    usdc(100),
+                    UsdcCorridor::BASE_CCTP,
+                )
+                .await,
+            "a live row queued before corridors must count as Base"
+        );
+    }
 }
