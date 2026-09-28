@@ -1794,7 +1794,17 @@ fn validate_config(
         .as_ref()
         .and_then(|pricing| pricing.trading_schedule.as_ref())
     {
-        schedule.validate(&config.assets)?;
+        // With `[registry]` and no token file supplied the per-symbol
+        // tables are absent, so only the schedule's own shape can be judged.
+        if config.registry.is_some() && config.assets.equities.symbols.is_empty() {
+            schedule.validate_shape()?;
+            startup_notices.push(StartupNotice::warning(
+                "trading schedule membership not checked: the per-symbol tables are in the \
+                 token file, pass --registry-file to cover it",
+            ));
+        } else {
+            schedule.validate(&config.assets)?;
+        }
     }
     let file_logging = match (&config.log_dir, &config.file_log_level) {
         (Some(directory), Some(level)) => {
@@ -2044,7 +2054,7 @@ pub async fn fetch_token_file(
 /// Judge a fresh copy of the token file against the config this instance runs.
 ///
 /// Parses, merges, and runs every rule boot runs on the config alone
-/// (`validate_config`, the allocation check included); the per-symbol rules
+/// (`validate_config`, which includes the allocation check); the per-symbol rules
 /// live in `validate_asset_tables` so they are on this path. What boot adds
 /// beyond that needs secrets or chain state, so a pass here does not
 /// promise a clean boot. Returns what differs from the running tables, or
@@ -2066,9 +2076,6 @@ pub fn registry_check(live: &RegistryLive, fresh: &[u8]) -> Result<Option<String
         source,
     })?;
     validate_config(&config, path, &mut Vec::new())?;
-    if let Some(rebalancing) = &config.rebalancing {
-        rebalancing.allocation()?.validate(&config.chains)?;
-    }
     Ok(registry::describe_change(&live.live, &projection))
 }
 
@@ -9440,6 +9447,34 @@ mod tests {
         .unwrap();
         assert!(live.is_some());
         validate_config(&config, config_path, &mut notices).unwrap();
+    }
+
+    /// Without the token file a schedule is judged on its shape only, and
+    /// the report says membership was not checked.
+    #[test]
+    fn a_schedule_without_the_token_file_is_judged_on_its_shape() {
+        let mut runtime: toml::Table =
+            toml::from_str(include_str!("../../../config/staging/st0x-hedge.toml")).unwrap();
+        let fragment: toml::Table =
+            toml::from_str(include_str!("../../../docs/trading-schedule/staging.toml")).unwrap();
+        runtime
+            .entry("pricing")
+            .or_insert_with(|| toml::Value::Table(toml::Table::new()))
+            .as_table_mut()
+            .unwrap()
+            .insert(
+                "trading_schedule".into(),
+                fragment["pricing"]["trading_schedule"].clone(),
+            );
+        let config: Config = toml::Value::Table(runtime).try_into().unwrap();
+        let mut notices = Vec::new();
+        validate_config(&config, Path::new("config.toml"), &mut notices).unwrap();
+        assert!(
+            notices
+                .iter()
+                .any(|notice| notice.message.contains("membership not checked")),
+            "{notices:?}"
+        );
     }
 
     /// The verify-migrations path, end to end: the symbols it sees are the

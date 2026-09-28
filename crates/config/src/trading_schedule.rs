@@ -64,10 +64,11 @@ impl TradingScheduleConfig {
         }
     }
 
-    pub(crate) fn validate(
-        &self,
-        assets: &HedgingAssets,
-    ) -> Result<(), TradingScheduleConfigError> {
+    /// The checks that need no per-symbol tables: timing and scope
+    /// identities. What `validate` runs before membership, and all a config
+    /// whose tables live in a token file that was not supplied can be
+    /// judged on.
+    pub(crate) fn validate_shape(&self) -> Result<(), TradingScheduleConfigError> {
         let durations = [
             self.poll_interval_secs,
             self.request_timeout_secs,
@@ -83,7 +84,6 @@ impl TradingScheduleConfig {
             return Err(TradingScheduleConfigError::Timing);
         }
         let mut scopes = HashSet::new();
-        let mut mapped = HashSet::new();
         for scope in &self.scopes {
             if scope.id.trim().is_empty()
                 || scope.profile_revision.trim().is_empty()
@@ -92,6 +92,17 @@ impl TradingScheduleConfig {
             {
                 return Err(TradingScheduleConfigError::Scope);
             }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn validate(
+        &self,
+        assets: &HedgingAssets,
+    ) -> Result<(), TradingScheduleConfigError> {
+        self.validate_shape()?;
+        let mut mapped = HashSet::new();
+        for scope in &self.scopes {
             for asset in &scope.assets {
                 let symbol = st0x_execution::Symbol::new(asset.clone())
                     .map_err(TradingScheduleMembershipError::from)?;
