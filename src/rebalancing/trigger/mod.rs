@@ -4863,6 +4863,25 @@ impl RebalancingService {
         Some((usdc, usdc_limit, reserved))
     }
 
+    /// Sizes the transfer the corridor's imbalance calls for, if any.
+    async fn size_usdc_operation(
+        &self,
+        usdc: &UsdcCorridorCtx,
+        usdc_limit: Option<Usdc>,
+        reserved: Option<Usd>,
+    ) -> Option<UsdcRebalanceOperation> {
+        usdc::check_imbalance_and_build_operation(
+            usdc.corridor.chain(),
+            &usdc.threshold,
+            &self.inventory,
+            usdc_limit,
+            reserved,
+        )
+        .await
+        .inspect_err(|skip| debug!(target: "rebalance", ?skip, "Skipped USDC trigger"))
+        .ok()
+    }
+
     /// Checks inventory for USDC imbalance and triggers operation if needed.
     pub(crate) async fn check_and_trigger_usdc(&self) {
         // Hold a claim on the driver for the whole check so an operator
@@ -4925,25 +4944,14 @@ impl RebalancingService {
             return;
         }
 
-        let Ok(operation) = usdc::check_imbalance_and_build_operation(
-            chain,
-            &usdc.threshold,
-            &self.inventory,
-            usdc_limit,
-            reserved,
-        )
-        .await
-        .inspect_err(|skip| debug!(target: "rebalance", ?skip, "Skipped USDC trigger")) else {
+        let Some(sized) = self.size_usdc_operation(&usdc, usdc_limit, reserved).await else {
             return;
         };
 
         // The id is minted before the claim so the guard records which
         // transfer holds it; a refused or undispatched claim leaves no row.
         let id = UsdcRebalanceId(Uuid::new_v4());
-        let guard = match self
-            .usdc_guards
-            .try_claim(chain, &id, operation.direction())
-        {
+        let guard = match self.usdc_guards.try_claim(chain, &id, sized.direction()) {
             Ok(guard) => guard,
             Err(refusal) => {
                 debug!(
@@ -4955,6 +4963,22 @@ impl RebalancingService {
                 return;
             }
         };
+
+        // Size again under the claim: a holder released between the read
+        // above and the claim may have settled funds that read did not see.
+        // A dropped claim releases on return.
+        let Some(operation) = self.size_usdc_operation(&usdc, usdc_limit, reserved).await else {
+            return;
+        };
+        if operation.direction() != sized.direction() {
+            debug!(
+                target: "rebalance",
+                ?sized,
+                ?operation,
+                "Skipped USDC trigger: the imbalance changed direction under the claim"
+            );
+            return;
+        }
 
         // Re-check immediately before dispatch: the poller may have engaged
         // the cash gate during the awaits in the imbalance build (mirrors
