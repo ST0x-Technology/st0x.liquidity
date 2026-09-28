@@ -5477,10 +5477,10 @@ impl RebalancingService {
             return Err(UsdcResumeError::AlreadyInFlight { row_id, age_secs });
         }
 
-        // Single-flight gate 2: another persisted rebalance still holding the
-        // durable guard refuses; this id's OWN latch (boot recovery re-latched
-        // it) is precisely what the operator is here to resolve.
-        if any_rebalance_holds_guard(pool, &store, Some(id)).await? {
+        // Single-flight gate 2: another persisted rebalance still holding this
+        // corridor's durable guard refuses; this id's OWN latch (boot recovery
+        // re-latched it) is precisely what the operator is here to resolve.
+        if any_rebalance_holds_guard(pool, &store, Some(id), state.corridor().chain()).await? {
             return Err(UsdcResumeError::GuardHeldElsewhere);
         }
 

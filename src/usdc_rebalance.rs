@@ -86,7 +86,7 @@ use uuid::Uuid;
 use st0x_bridge::corridor::{UsdcCorridor, legacy_base_cctp};
 use st0x_dto::{TransferOperation, UsdcBridgeOperation, UsdcBridgeStatus};
 use st0x_event_sorcery::{DomainEvent, EventSourced, SendError, Store, Table};
-use st0x_evm::PreparedTransaction;
+use st0x_evm::{Chain, PreparedTransaction};
 use st0x_execution::{AlpacaTransferId, ClientOrderId};
 use st0x_finance::{HasZero, Usdc};
 
@@ -2016,17 +2016,18 @@ pub(crate) async fn prepared_deposit_send_ids(
     }))
 }
 
-/// Whether any persisted USDC rebalance currently holds the single-rebalance
+/// Whether any persisted USDC rebalance currently holds `chain`'s corridor
 /// guard, optionally ignoring one id (`except` -- so a manual resume of that
 /// very id does not count its own latch as a conflict). Mirrors startup
 /// guard recovery's defensive posture: unparseable candidate ids and
-/// aggregates that fail to load count as holders, because treating them as
-/// clear could release a latch that still protects a possibly post-burn
-/// rebalance.
+/// aggregates that fail to load count as holders on every corridor, because
+/// treating them as clear could release a latch that still protects a
+/// possibly post-burn rebalance.
 pub(crate) async fn any_rebalance_holds_guard(
     pool: &SqlitePool,
     store: &Store<UsdcRebalance>,
     except: Option<&UsdcRebalanceId>,
+    chain: Chain,
 ) -> Result<bool, sqlx::Error> {
     let InterruptedUsdcRebalances { ids, unparseable } =
         interrupted_usdc_rebalance_ids(pool).await?;
@@ -2047,7 +2048,7 @@ pub(crate) async fn any_rebalance_holds_guard(
 
         match store.load(&id).await {
             Ok(Some(entity)) => {
-                if entity.holds_rebalance_guard() {
+                if entity.holds_rebalance_guard() && entity.corridor().chain() == chain {
                     return Ok(true);
                 }
             }
@@ -11690,7 +11691,7 @@ mod tests {
         let store = test_store::<UsdcRebalance>(pool.clone(), ());
 
         assert!(
-            !any_rebalance_holds_guard(&pool, &store, None)
+            !any_rebalance_holds_guard(&pool, &store, None, Chain::Base)
                 .await
                 .unwrap()
         );
@@ -11724,7 +11725,7 @@ mod tests {
         .await;
 
         assert!(
-            any_rebalance_holds_guard(&pool, &store, None)
+            any_rebalance_holds_guard(&pool, &store, None, Chain::Base)
                 .await
                 .unwrap()
         );
@@ -11754,7 +11755,7 @@ mod tests {
         .await;
 
         assert!(
-            !any_rebalance_holds_guard(&pool, &store, None)
+            !any_rebalance_holds_guard(&pool, &store, None, Chain::Base)
                 .await
                 .unwrap()
         );
@@ -11799,7 +11800,7 @@ mod tests {
         );
 
         assert!(
-            any_rebalance_holds_guard(&pool, &store, None)
+            any_rebalance_holds_guard(&pool, &store, None, Chain::Base)
                 .await
                 .unwrap(),
             "a candidate with events but no materialized state must count as \
@@ -11835,13 +11836,13 @@ mod tests {
 
         let requested = seed_through(&store, holder_commands()).await;
         assert!(
-            any_rebalance_holds_guard(&pool, &store, None)
+            any_rebalance_holds_guard(&pool, &store, None, Chain::Base)
                 .await
                 .unwrap(),
             "without an exclusion the holder must block"
         );
         assert!(
-            !any_rebalance_holds_guard(&pool, &store, Some(&requested))
+            !any_rebalance_holds_guard(&pool, &store, Some(&requested), Chain::Base)
                 .await
                 .unwrap(),
             "the requested id's own hold must be excluded"
@@ -11849,7 +11850,7 @@ mod tests {
 
         let _other_holder = seed_through(&store, holder_commands()).await;
         assert!(
-            any_rebalance_holds_guard(&pool, &store, Some(&requested))
+            any_rebalance_holds_guard(&pool, &store, Some(&requested), Chain::Base)
                 .await
                 .unwrap(),
             "a DIFFERENT guard holder must still block despite the exclusion"
