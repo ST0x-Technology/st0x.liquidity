@@ -66,10 +66,11 @@ impl UsdcCashGuards {
         self.state().unclassified
     }
 
+    /// Whether a transfer holds `chain`; the every-corridor latch is read
+    /// with [`Self::is_latched`].
     #[cfg(test)]
     pub(crate) fn is_held(&self, chain: Chain) -> bool {
-        let state = self.state();
-        state.unclassified || state.holders.contains_key(&chain)
+        self.state().holders.contains_key(&chain)
     }
 
     /// Stands in for every holder's terminal event.
@@ -302,5 +303,33 @@ mod tests {
                 RebalanceDirection::BaseToAlpaca,
             )
             .expect("an inbound transfer does not draw on Alpaca's cash");
+    }
+
+    #[test]
+    fn a_held_corridor_refuses_the_opposite_direction_too() {
+        let guards = Arc::new(UsdcCashGuards::default());
+        guards.hold(Chain::Base, &new_id(), RebalanceDirection::AlpacaToBase);
+
+        let Err(ClaimRefusal::CorridorHeld) =
+            guards.try_claim(Chain::Base, &new_id(), RebalanceDirection::BaseToAlpaca)
+        else {
+            panic!("both directions of a corridor share its guard");
+        };
+    }
+
+    #[test]
+    fn releasing_one_of_two_holders_keeps_the_corridor_held() {
+        let guards = Arc::new(UsdcCashGuards::default());
+        let first = new_id();
+        guards.hold(Chain::Base, &first, RebalanceDirection::BaseToAlpaca);
+        guards.hold(Chain::Base, &new_id(), RebalanceDirection::BaseToAlpaca);
+
+        guards.release(&first);
+
+        let Err(ClaimRefusal::CorridorHeld) =
+            guards.try_claim(Chain::Base, &new_id(), RebalanceDirection::BaseToAlpaca)
+        else {
+            panic!("the other holder must keep the corridor held");
+        };
     }
 }

@@ -27330,10 +27330,20 @@ mod tests {
         let service = make_trigger_with_inventory(InventoryView::default()).await;
         service.recover_usdc_guard(&pool, &store).await.unwrap();
 
-        assert!(
-            service.usdc_guards.is_held(Chain::Base),
-            "an unloadable guard-relevant candidate must hold the guard defensively"
-        );
+        assert!(service.usdc_guards.is_latched());
+        for chain in [Chain::Base, Chain::Robinhood] {
+            assert!(
+                matches!(
+                    service.usdc_guards.try_claim(
+                        chain,
+                        &UsdcRebalanceId(Uuid::new_v4()),
+                        RebalanceDirection::BaseToAlpaca,
+                    ),
+                    Err(ClaimRefusal::Unclassified)
+                ),
+                "the every-corridor latch must refuse a claim on {chain}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -27365,10 +27375,20 @@ mod tests {
         let service = make_trigger_with_inventory(InventoryView::default()).await;
         service.recover_usdc_guard(&pool, &store).await.unwrap();
 
-        assert!(
-            service.usdc_guards.is_held(Chain::Base),
-            "an unparseable guard-relevant candidate aggregate_id must hold the guard defensively"
-        );
+        assert!(service.usdc_guards.is_latched());
+        for chain in [Chain::Base, Chain::Robinhood] {
+            assert!(
+                matches!(
+                    service.usdc_guards.try_claim(
+                        chain,
+                        &UsdcRebalanceId(Uuid::new_v4()),
+                        RebalanceDirection::BaseToAlpaca,
+                    ),
+                    Err(ClaimRefusal::Unclassified)
+                ),
+                "the every-corridor latch must refuse a claim on {chain}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -27657,18 +27677,14 @@ mod tests {
             .await;
         let harness = ReactorHarness::new(Arc::clone(&trigger));
 
-        trigger
-            .usdc_guards
-            .hold(Chain::Base, &id, RebalanceDirection::BaseToAlpaca);
-
         harness
             .receive::<UsdcRebalance>(id.clone(), make_usdc_conversion_failed())
             .await
             .unwrap();
 
         assert!(
-            trigger.usdc_guards.is_held(Chain::Base),
-            "the durable fallback must preserve the guard for a genuinely \
+            trigger.usdc_guards.is_held(Chain::Base) && !trigger.usdc_guards.is_latched(),
+            "the durable fallback must hold the transfer's own corridor for a genuinely \
              post-burn (BaseToAlpaca post-deposit) conversion failure"
         );
     }
@@ -33662,7 +33678,9 @@ mod tests {
 
     #[tokio::test]
     async fn usdc_check_suppresses_duplicate_dispatch_when_in_progress() {
-        let inventory = InventoryView::default().with_usdc(usdc(100), usdc(900));
+        let inventory = InventoryView::default()
+            .with_usdc(usdc(100), usdc(900))
+            .with_withdrawable_cash_cents(90_000);
         let reactor = make_trigger_with_inventory(inventory).await;
         let trigger = reactor.clone();
 
@@ -36004,10 +36022,46 @@ mod tests {
         service.recover_usdc_guard(&pool, &store).await.unwrap();
         service.usdc_guards.release(&base_id);
 
-        assert!(service.usdc_guards.is_held(Chain::Base));
-        assert!(
-            service.usdc_guards.is_held(Chain::Robinhood),
-            "a candidate with no known corridor must block every corridor"
+        assert!(service.usdc_guards.is_latched());
+        for chain in [Chain::Base, Chain::Robinhood] {
+            assert!(
+                matches!(
+                    service.usdc_guards.try_claim(
+                        chain,
+                        &UsdcRebalanceId(Uuid::new_v4()),
+                        RebalanceDirection::BaseToAlpaca,
+                    ),
+                    Err(ClaimRefusal::Unclassified)
+                ),
+                "the every-corridor latch must refuse a claim on {chain}"
+            );
+        }
+    }
+
+    /// After a startup that latched every corridor, a real imbalance with
+    /// withdrawable cash enqueues nothing.
+    #[tokio::test]
+    async fn startup_every_corridor_latch_stops_the_trigger() {
+        let pool = crate::test_utils::setup_test_db().await;
+        let store = test_store::<UsdcRebalance>(pool.clone(), ());
+        insert_unloadable_usdc_candidate(&pool).await;
+        let trigger = make_trigger_with_inventory(
+            InventoryView::default()
+                .with_usdc(usdc(100), usdc(900))
+                .with_withdrawable_cash_cents(90_000),
+        )
+        .await;
+        trigger.recover_usdc_guard(&pool, &store).await.unwrap();
+
+        trigger.check_and_trigger_usdc().await;
+
+        assert_eq!(
+            count_pending_transfer_usdc_to_market_making_jobs(&trigger).await,
+            0
+        );
+        assert_eq!(
+            count_pending_transfer_usdc_to_hedging_jobs(&trigger).await,
+            0
         );
     }
 
@@ -36233,7 +36287,20 @@ mod tests {
                 .unwrap();
         }
 
-        assert!(trigger.usdc_guards.is_held(Chain::Robinhood));
+        assert!(trigger.usdc_guards.is_latched());
+        for chain in [Chain::Base, Chain::Robinhood] {
+            assert!(
+                matches!(
+                    trigger.usdc_guards.try_claim(
+                        chain,
+                        &UsdcRebalanceId(Uuid::new_v4()),
+                        RebalanceDirection::BaseToAlpaca,
+                    ),
+                    Err(ClaimRefusal::Unclassified)
+                ),
+                "the every-corridor latch must refuse a claim on {chain}"
+            );
+        }
         let pages = notifier
             .messages()
             .into_iter()
