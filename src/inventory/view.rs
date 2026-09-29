@@ -7790,7 +7790,7 @@ mod tests {
                 .cash_reconciliation_busy(InventoryScope::MarketMaking(Chain::Robinhood), now)
                 .unwrap(),
             None,
-            "a USDC rebalance moves only the primary chain's vault"
+            "a USDC rebalance moves only its corridor chain's vault"
         );
 
         let mut hedging = not_busy.clone();
