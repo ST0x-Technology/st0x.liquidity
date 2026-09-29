@@ -717,8 +717,12 @@ impl<W: Wallet> Raindex for RaindexService<W> {
             .await?)
     }
 
-    async fn discard_prepared_withdraw(&self, prepared: &PreparedTransaction) {
-        self.evm.discard_prepared(prepared).await;
+    async fn discard_prepared_withdraw(&self, tx_hash: TxHash) {
+        self.evm.discard_prepared(tx_hash).await;
+    }
+
+    async fn release_superseded_withdraw(&self, tx_hash: TxHash) {
+        self.evm.release_superseded(tx_hash).await;
     }
 
     async fn restore_submitted_withdrawal(
@@ -1449,8 +1453,12 @@ mod tests {
             unreachable!("prepare_withdraw must not broadcast")
         }
 
-        async fn discard_prepared(&self, _prepared: &PreparedTransaction) {
+        async fn discard_prepared(&self, _tx_hash: TxHash) {
             unreachable!("prepare_withdraw must not discard")
+        }
+
+        async fn release_superseded(&self, _tx_hash: TxHash) {
+            unreachable!("prepare_withdraw must not release a superseded transaction")
         }
 
         async fn restore_prepared(&self, _prepared: &PreparedTransaction) {

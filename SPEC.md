@@ -3719,7 +3719,10 @@ The operator `fail` verb (`transfer fail --kind redemption`) dispatches per
 state: a redemption stuck before tokens leave custody takes `FailTransfer`, a
 `TokensSent` redemption takes `FailDetection { failure: Operator { reason } }`,
 and a `Pending` redemption takes `RejectRedemption { reason }`. In every case
-the replayed `Failed` state materializes the operator's reason.
+the replayed `Failed` state materializes the operator's reason. The verb refuses
+a redemption with a signed vault withdrawal (`VaultWithdrawSubmitting` or
+`VaultWithdrawSubmitted`): the withdrawal can still mine, so the operator
+verifies it onchain and reconciles the redemption instead.
 
 Vault withdrawal submission is an irreversible uncertainty boundary. The
 orchestrator prepares and signs the transaction, then the pure aggregate
@@ -5944,18 +5947,44 @@ declared resolved by sending the `Reconcile { reason }` command, which emits
 `OperatorReconciled` and drives the aggregate to a terminal `Reconciled` state.
 Unlike USDC, the equity aggregates hold no in-progress guard, so the `Reconcile`
 command emits **no reactor effect and dispatches no inventory update** -- it is
-a pure bookkeeping terminal transition. One nuance for redemptions: a redemption
-that ended in `DetectionFailed` / `RedemptionRejected` has its stranded exposure
-seeded into live inflight at startup (see `symbols_with_stuck_redemptions`).
-Reconcile moves the latest event to `OperatorReconciled`, so that redemption is
-no longer seeded as stuck on the **next** restart; the running process's live
-inflight retains the startup-seeded amount until then. Mint failures and
-pre-send redemption failures settle inventory at failure time, so they need no
-such clearing. `Reconciled` is valid ONLY from `Failed`; every other state is
-rejected. The `Reconciled` state retains the identifying fields (symbol,
-quantity, original failure reason, request/redemption identifiers) so the
-dashboard projection still reports the real transfer, and maps to a distinct
-terminal `Reconciled` DTO status carrying `reconciled_at`, `failure_reason`, and
+a pure bookkeeping terminal transition. The one exception is the wallet nonce of
+a reconciled redemption's signed vault withdrawal, described below. One nuance
+for redemptions: a redemption that ended in `DetectionFailed` /
+`RedemptionRejected` has its stranded exposure seeded into live inflight at
+startup (see `symbols_with_stuck_redemptions`). Reconcile moves the latest event
+to `OperatorReconciled`, so that redemption is no longer seeded as stuck on the
+**next** restart; the running process's live inflight retains the startup-seeded
+amount until then. Mint failures and pre-send redemption failures settle
+inventory at failure time, so they need no such clearing. A mint's `Reconciled`
+is valid ONLY from `Failed`. A redemption's `Reconciled` is valid from `Failed`
+and from the withdrawal submission states (`VaultWithdrawPending`,
+`VaultWithdrawSubmitting`, `VaultWithdrawSubmitted`); every other state is
+rejected.
+
+A redemption reconciled from a submission state can still hold a wallet nonce
+reservation for its signed withdrawal. `Reconciled` retains that withdrawal's tx
+hash (`withdrawal_nonce_hash`), and the running bot releases the reservation by
+hash without a restart: the redemption's resume job releases it when it loads
+`Reconciled`, in `perform` and in its terminal attempt, and the timeout sweep
+enqueues a resume job for a reconcile it observes (a failed enqueue is kept and
+retried on later sweep ticks). The release is ownership-checked and idempotent.
+It does not cancel the signed withdrawal, so the operator reconciles only after
+another transaction from the bot wallet has mined at the withdrawal's nonce. A
+withdrawal that is only missing from a mempool can still mine, so the operator
+first sends a 0-value self-transfer at that nonce and waits for it to confirm. A
+withdrawal that itself mined and reverted, or mined with no matching vault
+transfer, already used the nonce and moved nothing, so the operator reconciles
+it directly with no replacement. In both cases a mined transaction already used
+the nonce, and that is what lets later sends proceed. The release is
+bookkeeping: it drops the bot's hold on the used nonce and does not rewind nonce
+allocation onto it. A prepared transaction discarded before broadcast (a
+persist-failure rollback) is different: its nonce is unused, so allocation is
+rewound to refill it.
+
+The `Reconciled` state retains the identifying fields (symbol, quantity,
+original failure reason, request/redemption identifiers) so the dashboard
+projection still reports the real transfer, and maps to a distinct terminal
+`Reconciled` DTO status carrying `reconciled_at`, `failure_reason`, and
 `reconcile_reason` -- distinguishable from genuine success (`Completed`) at the
 DTO level. The CLI surface is `transfer reconcile --kind mint|redemption`
 (alongside `--kind usdc`).

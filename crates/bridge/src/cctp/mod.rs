@@ -2234,8 +2234,12 @@ mod tests {
             self.inner.broadcast_prepared(prepared, note).await
         }
 
-        async fn discard_prepared(&self, prepared: &PreparedTransaction) {
-            self.inner.discard_prepared(prepared).await;
+        async fn discard_prepared(&self, tx_hash: TxHash) {
+            self.inner.discard_prepared(tx_hash).await;
+        }
+
+        async fn release_superseded(&self, tx_hash: TxHash) {
+            self.inner.release_superseded(tx_hash).await;
         }
 
         async fn restore_prepared(&self, prepared: &PreparedTransaction) {

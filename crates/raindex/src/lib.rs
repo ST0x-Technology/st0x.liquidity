@@ -235,9 +235,17 @@ pub trait Raindex: Send + Sync {
         &self,
         prepared: &PreparedTransaction,
     ) -> Result<TxHash, RaindexError>;
-    /// Releases the wallet-local reservation when a prepared withdrawal could
-    /// not be persisted and will never be broadcast.
-    async fn discard_prepared_withdraw(&self, prepared: &PreparedTransaction);
+    /// Releases the wallet-local nonce reservation held for a prepared
+    /// withdrawal that will never be broadcast (a persist-failure rollback), so
+    /// its unused nonce is refilled first. Ownership-checked and idempotent.
+    async fn discard_prepared_withdraw(&self, tx_hash: TxHash);
+
+    /// Releases the wallet-local nonce reservation held for a reconciled
+    /// withdrawal whose nonce another transaction has mined. Leaves nonce
+    /// allocation untouched. Ownership-checked and idempotent, so a repeated
+    /// reconcile observation is safe, and it also frees a legacy hash-only
+    /// withdrawal with no persisted prepared bytes.
+    async fn release_superseded_withdraw(&self, tx_hash: TxHash);
 
     /// Restores wallet-local ownership for a durably submitted withdrawal
     /// before any other wallet operation can allocate its nonce. Legacy

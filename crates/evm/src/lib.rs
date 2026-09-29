@@ -832,9 +832,18 @@ pub trait Wallet: Evm {
         prepared: &PreparedTransaction,
         note: &str,
     ) -> Result<TxHash, EvmError>;
-    /// Releases this prepared transaction's nonce reservation after persistence
-    /// failed and the transaction will never be broadcast.
-    async fn discard_prepared(&self, prepared: &PreparedTransaction);
+    /// Releases the wallet nonce reservation held for a prepared transaction
+    /// that will never be broadcast (a persist-failure rollback), and rewinds
+    /// allocation so its unused nonce is refilled first. Ownership-checked and
+    /// idempotent, so a repeated release of the same transaction is safe.
+    async fn discard_prepared(&self, tx_hash: TxHash);
+
+    /// Releases the wallet nonce reservation held for a prepared transaction
+    /// after another transaction from this wallet mined at its nonce. Unlike
+    /// [`discard_prepared`](Self::discard_prepared) it leaves allocation
+    /// untouched, because the chain has already used the nonce.
+    /// Ownership-checked and idempotent.
+    async fn release_superseded(&self, tx_hash: TxHash);
 
     /// Restores allocator and ownership state for an exact transaction loaded
     /// from durable storage before any new transaction can allocate its nonce.
@@ -1083,8 +1092,12 @@ impl<Inner: Wallet + ?Sized> Wallet for Arc<Inner> {
         (**self).broadcast_prepared(prepared, note).await
     }
 
-    async fn discard_prepared(&self, prepared: &PreparedTransaction) {
-        (**self).discard_prepared(prepared).await;
+    async fn discard_prepared(&self, tx_hash: TxHash) {
+        (**self).discard_prepared(tx_hash).await;
+    }
+
+    async fn release_superseded(&self, tx_hash: TxHash) {
+        (**self).release_superseded(tx_hash).await;
     }
 
     async fn restore_prepared(&self, prepared: &PreparedTransaction) {

@@ -664,8 +664,12 @@ mod tests {
             panic!("MockWallet::broadcast_prepared should not be called in job tests")
         }
 
-        async fn discard_prepared(&self, _prepared: &PreparedTransaction) {
+        async fn discard_prepared(&self, _tx_hash: TxHash) {
             panic!("MockWallet::discard_prepared should not be called in job tests");
+        }
+
+        async fn release_superseded(&self, _tx_hash: TxHash) {
+            panic!("MockWallet::release_superseded should not be called in job tests");
         }
 
         async fn restore_prepared(&self, _prepared: &PreparedTransaction) {

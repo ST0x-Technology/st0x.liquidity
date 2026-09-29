@@ -472,6 +472,11 @@ After force-failing, use `transfer reconcile` (see "Reconciling Stuck Failed
 Transfers" below) if the stranded funds were already handled out-of-band and the
 transfer should be marked resolved rather than left in `Failed`.
 
+`transfer fail --kind redemption` refuses a redemption with a signed vault
+withdrawal (`VaultWithdrawSubmitting` or `VaultWithdrawSubmitted`), because the
+withdrawal can still mine. Verify the withdrawal onchain and reconcile the
+redemption instead (see the `--kind redemption` notes below).
+
 ### Withdrawal poll inconclusive (Alpaca->Base stuck at `Withdrawing`)
 
 An Alpaca withdrawal poll that returns an indeterminate error (timeout, network
@@ -717,8 +722,28 @@ stox transfer reconcile --kind redemption --id <redemption-aggregate-id> \
   that ended in `DetectionFailed` / `RedemptionRejected` -- their stranded
   exposure is seeded into live inflight at startup, and reconcile clears that
   seeding only on the **next** bot restart (the running process keeps the seeded
-  amount until then). Valid only from `Failed`; a transfer in any other state is
-  rejected. The `--reason` is free text.
+  amount until then). A mint is valid only from `Failed`. A redemption is also
+  valid from `VaultWithdrawPending`, `VaultWithdrawSubmitting` and
+  `VaultWithdrawSubmitted`; a transfer in any other state is rejected. The
+  `--reason` is free text.
+- Reconciling a redemption with a signed vault withdrawal releases the wallet
+  nonce reservation of that withdrawal in the running bot, with no restart. The
+  release is bookkeeping only. It does not cancel the withdrawal, and it is the
+  mined replacement below that lets later sends proceed. Reconcile only after
+  another transaction from the bot wallet has mined at the withdrawal's nonce. A
+  withdrawal that is not pending on one node can still mine from another node's
+  mempool or a rebroadcast, so "not pending" is not enough. Send a 0-value
+  self-transfer from the bot wallet at the withdrawal's nonce, with fees above
+  the withdrawal's, and wait until it confirms. Then reconcile. If the
+  withdrawal itself mined and reverted, or mined with no matching vault
+  transfer, it already used the nonce and moved nothing: the bot cannot confirm
+  it and `fail` refuses it, so reconcile directly with no replacement. Only if
+  the withdrawal mined successfully, do not reconcile: the redemption must
+  continue. A live redrive confirms it by itself. If the give-up page fired (the
+  job budget is spent and no job remains), run
+  `stox transfer resume --kind
+  equity` or restart the bot so that a new resume
+  confirms it.
 
 ### Base->Alpaca deposit send pages
 

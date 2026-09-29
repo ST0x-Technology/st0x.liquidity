@@ -41,7 +41,7 @@ use turnkey_client::generated::{
 use turnkey_client::{RetryConfig, TurnkeyClientError};
 
 use crate::gcp_kms_stamper::{GcpKmsStamper, GcpKmsStamperError};
-use crate::inflight_nonces::InFlightNonces;
+use crate::inflight_nonces::{DiscardedNonce, InFlightNonces};
 use crate::nonce::ResettableNonceManager;
 use crate::submit::{
     broadcast_prepared, discard_prepared, prepare_with_nonce, release_in_flight_after_wait,
@@ -1161,6 +1161,7 @@ where
         prepare_with_nonce(
             &self.signing_provider,
             &self.nonce_manager,
+            &self.in_flight,
             &self.send_lock,
             self.address,
             contract,
@@ -1186,8 +1187,26 @@ where
         .await
     }
 
-    async fn discard_prepared(&self, prepared: &PreparedTransaction) {
-        discard_prepared(&self.nonce_manager, &self.send_lock, self.address, prepared).await;
+    async fn discard_prepared(&self, tx_hash: TxHash) {
+        discard_prepared(
+            &self.in_flight,
+            &self.send_lock,
+            self.address,
+            tx_hash,
+            DiscardedNonce::Unused,
+        )
+        .await;
+    }
+
+    async fn release_superseded(&self, tx_hash: TxHash) {
+        discard_prepared(
+            &self.in_flight,
+            &self.send_lock,
+            self.address,
+            tx_hash,
+            DiscardedNonce::Superseded,
+        )
+        .await;
     }
 
     async fn restore_prepared(&self, prepared: &PreparedTransaction) {

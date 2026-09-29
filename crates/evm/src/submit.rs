@@ -140,9 +140,9 @@ use futures::lock::Mutex;
 use std::cmp::Ordering;
 use std::time::Duration;
 use tokio::time::sleep;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
-use crate::inflight_nonces::{InFlightNonces, NonceOwnership};
+use crate::inflight_nonces::{DiscardedNonce, InFlightNonces, NonceOwnership};
 use crate::nonce::ResettableNonceManager;
 use crate::{EvmError, NextNonceHint, PreparedTransaction};
 
@@ -376,6 +376,7 @@ where
 pub(crate) async fn prepare_with_nonce<F, P>(
     submitter: &FillProvider<F, P, Ethereum>,
     nonce_manager: &ResettableNonceManager,
+    in_flight: &InFlightNonces,
     send_lock: &Mutex<()>,
     address: Address,
     contract: Address,
@@ -413,7 +414,15 @@ where
         }
     };
     debug_assert_eq!(envelope.nonce(), nonce);
-    Ok(PreparedTransaction::from_envelope(&envelope))
+    let prepared = PreparedTransaction::from_envelope(&envelope);
+    // Attribute the reserved nonce to this exact transaction at signing time,
+    // not only at broadcast. A withdrawal wedged in `VaultWithdrawSubmitting`
+    // (signed but never successfully broadcast) is a valid reconcile origin, and
+    // recording here lets the ownership-checked release drop its hold on
+    // reconcile, and a persist-failure rollback free its nonce, even when no
+    // broadcast or restart ever recorded it.
+    in_flight.record_durable(address, prepared.nonce(), prepared.tx_hash());
+    Ok(prepared)
 }
 
 async fn prepared_transaction_visible<P>(provider: &P, tx_hash: TxHash) -> bool
@@ -478,6 +487,11 @@ where
     nonce_manager
         .reserve_prepared_nonce(address, prepared.nonce())
         .await;
+    // Record the hash with the hold, before any early return. Persisted exact
+    // bytes retain their nonce through a definitive drop so durable recovery can
+    // rebroadcast them, and a hash-keyed release can always find the hold again,
+    // including one re-added by a stale rebroadcast after a reconcile.
+    in_flight.record_durable(address, prepared.nonce(), tx_hash);
 
     match provider.send_raw_transaction(prepared.raw()).await {
         Ok(_) => {}
@@ -497,34 +511,47 @@ where
         }
     }
 
-    // Persisted exact bytes retain their nonce through a definitive drop so
-    // durable recovery can rebroadcast them.
-    in_flight.record_durable(address, prepared.nonce(), tx_hash);
     info!(target: "wallet", %tx_hash, note, nonce = prepared.nonce(), "Prepared transaction broadcast");
     Ok(tx_hash)
 }
 
-/// Release the nonce reservation for a prepared transaction whose caller
-/// decided not to persist it, so a later send can reuse the nonce.
+/// Release a prepared transaction's nonce reservation, identified by its
+/// transaction hash. Ownership-checked: it releases only while the wallet's
+/// in-flight record still attributes the nonce to this exact transaction, so
+/// repeated releases of the same transaction (possibly after the nonce was
+/// reallocated) are safe. A stale repeat leaves intact whatever transaction has
+/// since taken the nonce. `discarded` decides whether allocation is rewound
+/// onto the freed nonce (see [`DiscardedNonce`]).
 ///
 /// Takes the wallet send lock so this cannot race a concurrent nonce
 /// assignment (see [`prepare_with_nonce`]).
 pub(crate) async fn discard_prepared(
-    nonce_manager: &ResettableNonceManager,
+    in_flight: &InFlightNonces,
     send_lock: &Mutex<()>,
     address: Address,
-    prepared: &PreparedTransaction,
+    tx_hash: TxHash,
+    discarded: DiscardedNonce,
 ) {
     let _guard = send_lock.lock().await;
-    nonce_manager
-        .release_prepared_nonce(address, prepared.nonce())
-        .await;
-    warn!(
-        target: "wallet",
-        tx_hash = %prepared.tx_hash(),
-        nonce = prepared.nonce(),
-        "Discarding unpersisted prepared transaction and releasing its nonce reservation"
-    );
+    if in_flight
+        .release_durable_by_hash(address, tx_hash, discarded)
+        .await
+    {
+        warn!(
+            target: "wallet",
+            %tx_hash,
+            ?discarded,
+            "Discarding prepared transaction and releasing its nonce reservation"
+        );
+    } else {
+        debug!(
+            target: "wallet",
+            %tx_hash,
+            ?discarded,
+            "Discarding prepared transaction that no longer holds a nonce reservation \
+             (already released or its nonce reallocated)"
+        );
+    }
 }
 
 /// Re-reserve the nonce of a persisted prepared transaction after restart and
@@ -1943,7 +1970,9 @@ mod tests {
         assert!(error.is_confirmation_pending());
         assert_eq!(
             in_flight.ownership(WALLET, STUCK_NONCE),
-            NonceOwnership::Unknown
+            NonceOwnership::Ours,
+            "the persisted bytes keep owning their nonce, so a hash-keyed release can \
+             still find the hold"
         );
         nonce_manager.set_next_nonce(WALLET, STUCK_NONCE).await;
         let unused_provider = ProviderBuilder::new().connect_mocked_client(Asserter::new());
@@ -2068,7 +2097,9 @@ mod tests {
         assert!(error.is_confirmation_pending());
         assert_eq!(
             in_flight.ownership(WALLET, STUCK_NONCE),
-            NonceOwnership::Unknown
+            NonceOwnership::Ours,
+            "the persisted bytes keep owning their nonce, so a hash-keyed release can \
+             still find the hold"
         );
     }
 

@@ -91,6 +91,7 @@ pub struct MockRaindex {
     restored_prepared_withdrawals: AtomicUsize,
     restore_submitted_withdrawal_calls: Mutex<Vec<(TxHash, bool)>>,
     fail_restore: bool,
+    released_superseded_withdrawals: Mutex<Vec<TxHash>>,
     withdrawals_mined: bool,
 }
 
@@ -162,6 +163,7 @@ impl MockRaindex {
             restored_prepared_withdrawals: AtomicUsize::new(0),
             restore_submitted_withdrawal_calls: Mutex::new(Vec::new()),
             fail_restore: false,
+            released_superseded_withdrawals: Mutex::new(Vec::new()),
             withdrawals_mined: false,
         }
     }
@@ -275,6 +277,17 @@ impl MockRaindex {
     pub(crate) fn restore_submitted_withdrawal_calls(&self) -> Vec<(TxHash, bool)> {
         let Ok(calls) = self.restore_submitted_withdrawal_calls.lock() else {
             panic!("mock restore-submitted-withdrawal mutex poisoned");
+        };
+        calls.clone()
+    }
+
+    /// Every withdrawal released via `release_superseded_withdraw`, by tx hash,
+    /// so a test can assert a reconciled withdrawal's nonce reservation was
+    /// released.
+    #[cfg(test)]
+    pub(crate) fn released_superseded_withdrawals(&self) -> Vec<TxHash> {
+        let Ok(calls) = self.released_superseded_withdrawals.lock() else {
+            panic!("mock released-superseded-withdrawals mutex poisoned");
         };
         calls.clone()
     }
@@ -399,7 +412,14 @@ impl Raindex for MockRaindex {
         }
     }
 
-    async fn discard_prepared_withdraw(&self, _prepared: &PreparedTransaction) {}
+    async fn discard_prepared_withdraw(&self, _tx_hash: TxHash) {}
+
+    async fn release_superseded_withdraw(&self, tx_hash: TxHash) {
+        let Ok(mut calls) = self.released_superseded_withdrawals.lock() else {
+            panic!("mock released-superseded-withdrawals mutex poisoned");
+        };
+        calls.push(tx_hash);
+    }
 
     async fn restore_submitted_withdrawal(
         &self,

@@ -19,7 +19,7 @@ use serde::Deserialize;
 use std::sync::Arc;
 use tracing::info;
 
-use crate::inflight_nonces::InFlightNonces;
+use crate::inflight_nonces::{DiscardedNonce, InFlightNonces};
 use crate::nonce::ResettableNonceManager;
 use crate::submit::{
     broadcast_prepared, discard_prepared, prepare_with_nonce, release_in_flight_after_wait,
@@ -202,6 +202,7 @@ where
         prepare_with_nonce(
             &self.signing_provider,
             &self.nonce_manager,
+            &self.in_flight,
             &self.send_lock,
             self.address(),
             contract,
@@ -227,12 +228,24 @@ where
         .await
     }
 
-    async fn discard_prepared(&self, prepared: &PreparedTransaction) {
+    async fn discard_prepared(&self, tx_hash: TxHash) {
         discard_prepared(
-            &self.nonce_manager,
+            &self.in_flight,
             &self.send_lock,
             self.address(),
-            prepared,
+            tx_hash,
+            DiscardedNonce::Unused,
+        )
+        .await;
+    }
+
+    async fn release_superseded(&self, tx_hash: TxHash) {
+        discard_prepared(
+            &self.in_flight,
+            &self.send_lock,
+            self.address(),
+            tx_hash,
+            DiscardedNonce::Superseded,
         )
         .await;
     }
@@ -657,7 +670,7 @@ mod tests {
             prepared.nonce().saturating_add(1),
             "a cold nonce cache must advance past the persisted transaction before another send"
         );
-        restarted_wallet.discard_prepared(&following).await;
+        restarted_wallet.discard_prepared(following.tx_hash()).await;
     }
 
     #[tokio::test]
@@ -692,7 +705,7 @@ mod tests {
             submitted_nonce.saturating_add(1),
             "hash-only recovery must restore pending nonce ownership before cache refill"
         );
-        restarted_wallet.discard_prepared(&following).await;
+        restarted_wallet.discard_prepared(following.tx_hash()).await;
     }
 
     #[tokio::test]
@@ -868,8 +881,139 @@ mod tests {
             expected_retry_nonce,
             "rolling back the failed later preparation must preserve the earlier reservation"
         );
-        wallet.discard_prepared(&retry).await;
-        wallet.discard_prepared(&earlier).await;
+        wallet.discard_prepared(retry.tx_hash()).await;
+        wallet.discard_prepared(earlier.tx_hash()).await;
+    }
+
+    #[tokio::test]
+    async fn discarding_a_never_broadcast_prepared_releases_its_nonce_for_reuse() {
+        // A persist-failure rollback: a withdrawal prepared and reserved but never
+        // broadcast must have its nonce released by discard even though no
+        // broadcast or restart ever recorded it. The reservation is attributed to
+        // the exact transaction at prepare time, so the ownership-checked discard
+        // can free it for reuse.
+        let (_anvil, wallet, _token_address, signer_address) = setup_anvil_with_token().await;
+        let prepared = wallet
+            .prepare_pending(signer_address, Bytes::new(), "prepared but never broadcast")
+            .await
+            .unwrap();
+        assert_eq!(
+            wallet.in_flight.ownership(signer_address, prepared.nonce()),
+            NonceOwnership::Ours,
+            "the reserved nonce must be attributed to this wallet at prepare time, \
+             before any broadcast"
+        );
+
+        wallet.discard_prepared(prepared.tx_hash()).await;
+
+        assert_eq!(
+            wallet.in_flight.ownership(signer_address, prepared.nonce()),
+            NonceOwnership::Unknown,
+            "discard must clear the in-flight record of the never-broadcast withdrawal"
+        );
+        let next_nonce = wallet
+            .nonce_manager
+            .get_next_nonce(wallet.provider(), signer_address)
+            .await
+            .unwrap();
+        assert_eq!(
+            next_nonce,
+            prepared.nonce(),
+            "discarding the never-broadcast reservation must free its nonce for reuse"
+        );
+    }
+
+    #[tokio::test]
+    async fn superseded_release_of_a_never_broadcast_prepared_keeps_allocation() {
+        // A reconcile of a withdrawal wedged in `VaultWithdrawSubmitting` (signed
+        // but never broadcast). The hold and in-flight record must go, but the
+        // operator already mined a replacement at the nonce, so the release must
+        // not make that nonce reusable.
+        let (_anvil, wallet, _token_address, signer_address) = setup_anvil_with_token().await;
+        let prepared = wallet
+            .prepare_pending(signer_address, Bytes::new(), "wedged before broadcast")
+            .await
+            .unwrap();
+        let cached_before = wallet.nonce_manager.peek_next_nonce(signer_address).await;
+        assert_eq!(
+            cached_before,
+            Some(prepared.nonce() + 1),
+            "the prepare must have advanced the cache past the withdrawal's nonce"
+        );
+
+        wallet.release_superseded(prepared.tx_hash()).await;
+
+        assert_eq!(
+            wallet.in_flight.ownership(signer_address, prepared.nonce()),
+            NonceOwnership::Unknown,
+            "the release must clear the in-flight record"
+        );
+        assert!(
+            !wallet
+                .nonce_manager
+                .release_occupied_nonce(signer_address, prepared.nonce()),
+            "the release must drop the allocator hold"
+        );
+        assert_eq!(
+            wallet.nonce_manager.peek_next_nonce(signer_address).await,
+            cached_before,
+            "a superseded release must not rewind allocation onto the used nonce"
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_rebroadcast_after_a_superseded_release_stays_releasable() {
+        // A resume row that loaded the withdrawal before the reconcile can
+        // rebroadcast it after the release. The mined replacement makes that
+        // fail as "nonce too low", and the hold it re-added must still be
+        // findable by hash so the next release removes it instead of leaking it.
+        let (_anvil, wallet, _token_address, signer_address) = setup_anvil_with_token().await;
+        let prepared = wallet
+            .prepare_pending(signer_address, Bytes::new(), "withdrawal to supersede")
+            .await
+            .unwrap();
+        wallet.release_superseded(prepared.tx_hash()).await;
+
+        // A different transaction at the same nonce: a 1 wei self-transfer, so
+        // it cannot be byte-identical to the empty-calldata prepared one.
+        wallet
+            .provider()
+            .send_transaction(
+                TransactionRequest::default()
+                    .from(signer_address)
+                    .to(signer_address)
+                    .value(U256::from(1))
+                    .nonce(prepared.nonce()),
+            )
+            .await
+            .unwrap()
+            .get_receipt()
+            .await
+            .unwrap();
+        let error = wallet
+            .broadcast_prepared(&prepared, "stale rebroadcast after reconcile")
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                EvmError::PreparedTransactionReconciliationPending { .. }
+            ),
+            "the superseded bytes cannot land; got: {error:?}"
+        );
+
+        wallet.release_superseded(prepared.tx_hash()).await;
+
+        assert_eq!(
+            wallet.in_flight.ownership(signer_address, prepared.nonce()),
+            NonceOwnership::Unknown
+        );
+        assert!(
+            !wallet
+                .nonce_manager
+                .release_occupied_nonce(signer_address, prepared.nonce()),
+            "the hold re-added by the stale rebroadcast must be released by hash"
+        );
     }
 
     /// Regression test threading the `in_flight` wiring through the

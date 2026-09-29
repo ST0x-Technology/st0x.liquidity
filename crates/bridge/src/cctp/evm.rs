@@ -916,7 +916,7 @@ impl<W: Wallet> CctpEndpoint<W> {
     }
 
     pub(super) async fn discard_usdc(&self, prepared: &PreparedTransaction) {
-        self.wallet.discard_prepared(prepared).await;
+        self.wallet.discard_prepared(prepared.tx_hash()).await;
     }
 
     pub(super) async fn restore_usdc(&self, prepared: &PreparedTransaction) {
