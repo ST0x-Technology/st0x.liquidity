@@ -12290,10 +12290,10 @@ mod tests {
         );
     }
 
-    /// The cash path still runs on the primary chain, so a corridor elsewhere
-    /// would size and guard transfers off the wrong vault.
+    /// The cash path runs on each corridor's own chain, so the corridor
+    /// rules never consult which chain is primary.
     #[test]
-    fn corridor_chain_other_than_primary_is_refused() {
+    fn corridor_rules_do_not_consult_the_primary_chain() {
         let mut config = prod_config();
         for (chain, primary) in [(Chain::Base, false), (Chain::Robinhood, true)] {
             config
@@ -12304,18 +12304,8 @@ mod tests {
                 .primary = primary;
         }
 
-        let error = corridor_chain_error(&config);
-
-        assert!(
-            matches!(
-                error,
-                CtxError::CorridorChainNotPrimary {
-                    chain: Chain::Base,
-                    primary: Chain::Robinhood,
-                }
-            ),
-            "got {error:?}"
-        );
+        validate_usdc_corridor_chains(&config.rebalancing.as_ref().unwrap().usdc, &config.chains)
+            .unwrap();
     }
 
     #[test]
