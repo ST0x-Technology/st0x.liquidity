@@ -7719,9 +7719,8 @@ mod tests {
             inflight
                 .cash_reconciliation_busy(InventoryScope::MarketMaking(Chain::Robinhood), now)
                 .unwrap(),
-            None,
-            "USDC rebalancing only reaches the primary chain, so Hedging inflight \
-             says nothing about another chain's vault"
+            Some(EquityReconcileBusy::Transfer),
+            "Hedging inflight with no known outbound transfer may be headed to any chain"
         );
 
         let robinhood_inflight = not_busy
@@ -8146,9 +8145,9 @@ mod tests {
         );
     }
 
-    /// USDC rebalancing moves cash only between Hedging and the primary
-    /// chain's vault, so that transfer must not starve another chain's cash
-    /// reading or advance its skip streak.
+    /// A USDC transfer moves cash only between Hedging and its corridor
+    /// chain's vault, so it must not starve another chain's cash reading or
+    /// advance its skip streak.
     #[test]
     fn onchain_usdc_snapshot_ignores_another_chains_transfer() {
         let now = Utc::now();
@@ -8171,12 +8170,20 @@ mod tests {
             ),
             (
                 "a broker withdrawal headed to the Base vault",
-                InventoryView::default().with_usdc_inflight(
-                    usdc_cents(50_000),
-                    Usdc::ZERO,
-                    Usdc::ZERO,
-                    usdc_cents(1_000),
-                ),
+                InventoryView::default()
+                    .with_usdc_inflight(
+                        usdc_cents(50_000),
+                        Usdc::ZERO,
+                        Usdc::ZERO,
+                        usdc_cents(1_000),
+                    )
+                    .set_active_usdc_rebalance(
+                        UsdcRebalanceId(Uuid::new_v4()),
+                        ActiveUsdcRebalance::Known {
+                            chain: Chain::Base,
+                            direction: RebalanceDirection::AlpacaToBase,
+                        },
+                    ),
             ),
         ] {
             let view = inflight
@@ -8212,11 +8219,10 @@ mod tests {
         }
     }
 
-    /// A completed USDC rebalance stamps `last_rebalancing`, which rejects
-    /// the primary vault's reads fetched before it. Another chain's vault
-    /// never moved, so its read from the same poll still applies.
+    /// A completed USDC rebalance stamps `last_rebalancing`, one value for
+    /// every chain, so a vault read on any chain fetched before it is skipped.
     #[test]
-    fn onchain_usdc_snapshot_ignores_another_chains_rebalancing() {
+    fn onchain_usdc_read_before_the_last_rebalancing_is_skipped_on_every_chain() {
         let now = Utc::now();
         let before_completion = now - Duration::seconds(5);
         let snapshot = |chain| InventorySnapshotEvent::OnchainUsdc {
@@ -8245,17 +8251,11 @@ mod tests {
             .apply_snapshot_event(&snapshot(Chain::Base), now)
             .unwrap();
 
-        assert_eq!(
-            view.usdc
-                .onchain
-                .get(&Chain::Robinhood)
-                .map(|balance| balance.available()),
-            Some(usdc_cents(700))
-        );
+        assert_eq!(view.usdc.onchain.get(&Chain::Robinhood), None);
         assert_eq!(
             view.onchain_usdc_snapshot_skip_streaks
                 .get(&Chain::Robinhood),
-            None
+            Some(&1)
         );
         assert_eq!(
             view.usdc_available(Venue::MarketMaking),
@@ -8265,6 +8265,56 @@ mod tests {
         assert_eq!(
             view.onchain_usdc_snapshot_skip_streaks.get(&Chain::Base),
             Some(&1)
+        );
+    }
+
+    /// Hedging inflight is attributed to the chain of the known
+    /// Alpaca-outbound transfer; with none known it may be headed anywhere.
+    #[test]
+    fn hedging_inflight_is_attributed_to_the_outbound_transfers_chain() {
+        let now = Utc::now();
+        let snapshot = |chain| InventorySnapshotEvent::OnchainUsdc {
+            chain,
+            usdc_balance: usdc_cents(700),
+            fetched_at: now,
+            block_number: None,
+        };
+        let withdrawing = InventoryView::default().with_usdc_inflight(
+            usdc_cents(50_000),
+            Usdc::ZERO,
+            Usdc::ZERO,
+            usdc_cents(1_000),
+        );
+
+        let to_robinhood = withdrawing
+            .clone()
+            .set_active_usdc_rebalance(
+                UsdcRebalanceId(Uuid::new_v4()),
+                ActiveUsdcRebalance::Known {
+                    chain: Chain::Robinhood,
+                    direction: RebalanceDirection::AlpacaToBase,
+                },
+            )
+            .apply_snapshot_event(&snapshot(Chain::Robinhood), now)
+            .unwrap()
+            .apply_snapshot_event(&snapshot(Chain::Base), now)
+            .unwrap();
+        assert_eq!(to_robinhood.usdc.onchain.get(&Chain::Robinhood), None);
+        assert_eq!(
+            to_robinhood.usdc_available(Venue::MarketMaking),
+            Some(usdc_cents(700)),
+            "a withdrawal headed to Robinhood says nothing about the Base vault"
+        );
+
+        let unattributed = withdrawing
+            .apply_snapshot_event(&snapshot(Chain::Robinhood), now)
+            .unwrap()
+            .apply_snapshot_event(&snapshot(Chain::Base), now)
+            .unwrap();
+        assert_eq!(unattributed.usdc.onchain.get(&Chain::Robinhood), None);
+        assert_eq!(
+            unattributed.usdc_available(Venue::MarketMaking),
+            Some(usdc_cents(50_000))
         );
     }
 
