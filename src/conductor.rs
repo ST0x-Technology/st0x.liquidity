@@ -4956,7 +4956,7 @@ pub enum FillAccountingOutcome {
 
 /// The recorded detail when `trade` is excluded because trading was disabled
 /// on its chain.
-async fn recorded_trading_disabled_detail(
+pub(crate) async fn recorded_trading_disabled_detail(
     pool: &SqlitePool,
     trade: &OnchainTrade,
 ) -> Result<Option<String>, TradeAccountingError> {
@@ -5231,8 +5231,12 @@ pub async fn account_for_fill_excluded_from_hedging(
 }
 
 /// Accounts and hedges a fill on an asset whose trading is enabled on the
-/// fill's own chain. Fills on a disabled asset never reach here: they go
-/// through `account_for_fill_excluded_from_hedging`.
+/// fill's own chain.
+///
+/// Fills on a disabled asset go through
+/// `account_for_fill_excluded_from_hedging` instead; a fill already recorded
+/// as excluded (redelivered after trading was enabled again) stays excluded
+/// and returns `Ok(None)` without a hedge.
 #[tracing::instrument(skip_all, level = tracing::Level::DEBUG)]
 pub async fn process_queued_trade<E: Executor>(
     executor: &E,

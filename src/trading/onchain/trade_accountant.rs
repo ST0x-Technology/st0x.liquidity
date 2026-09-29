@@ -32,6 +32,7 @@ use crate::conductor::job::{
 use crate::conductor::{
     ExcludedFillOutcome, TradeProcessingCqrs, VaultDiscoveryCtx,
     account_for_fill_excluded_from_hedging, discover_vaults_for_trade, process_queued_trade,
+    recorded_trading_disabled_detail,
 };
 use crate::offchain::order::PlaceOffchainOrderError;
 use crate::onchain::trade::{RaindexTradeEvent, TradeValidationError};
@@ -246,7 +247,9 @@ where
             // `AlreadyExcluded` alerts too: the marker is durable before the
             // alert, so a process that dies in between redelivers into this
             // outcome, and the fill must still be surfaced. A redrive logs the
-            // fill again; the alert rule deduplicates per chain and symbol.
+            // fill again; the alert rule deduplicates per chain and symbol. A
+            // redelivery after trading is enabled again takes the path below,
+            // which alerts the same way.
             if let ExcludedFillOutcome::Excluded { detail }
             | ExcludedFillOutcome::AlreadyExcluded { detail } = outcome
             {
@@ -262,6 +265,7 @@ where
             return Ok(());
         }
 
+        let alert_trade = trade.clone();
         match process_queued_trade(
             &ctx.executor,
             trade_event,
@@ -271,7 +275,25 @@ where
         )
         .await
         {
-            Ok(_) => Ok(()),
+            Ok(Some(_)) => Ok(()),
+            // No hedge: also the outcome of a fill excluded earlier and
+            // redelivered after trading was enabled again, for example after
+            // a crash between its exclusion marker and its alert. It stays
+            // excluded, so it must still be surfaced.
+            Ok(None) => {
+                if let Some(detail) =
+                    recorded_trading_disabled_detail(&ctx.cqrs.pool, &alert_trade).await?
+                {
+                    self.alert_disabled_asset_fill(
+                        &ctx.notifier,
+                        &alert_trade,
+                        chain_ctx.trading.chain,
+                        &detail,
+                    )
+                    .await;
+                }
+                Ok(())
+            }
             Err(error) => self.handle_process_queued_trade_error(ctx, error).await,
         }
     }
@@ -2130,9 +2152,9 @@ mod tests {
             backpressure_streak: BackpressureStreak::default(),
         };
 
-        // decimals() for USDC and wtCOIN, once per perform (the run and the
-        // redrive).
-        for _ in 0..2 {
+        // decimals() for USDC and wtCOIN, once per perform (the run, the
+        // redrive, and the redelivery after trading is enabled).
+        for _ in 0..3 {
             asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&6u8));
             asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&18u8));
         }
@@ -2256,6 +2278,33 @@ mod tests {
             "the redrive's alert must carry the recorded delta: {}",
             messages[1]
         );
+
+        // Trading enabled again, then redelivered (a crash between the
+        // exclusion marker and the alert): the fill stays excluded and must
+        // still be surfaced.
+        for chain_accounting in accountant_ctx.chains.values_mut() {
+            for asset in chain_accounting
+                .trading
+                .assets
+                .equities
+                .symbols
+                .values_mut()
+            {
+                asset.trading = OperationMode::Enabled;
+            }
+        }
+        job.perform(&accountant_ctx).await.unwrap();
+        let messages = notifier.messages();
+        assert_eq!(messages.len(), 3, "the redelivery after enabling alerts");
+        assert!(messages[2].contains(&recorded[0].detail), "{}", messages[2]);
+        let net = accountant_ctx
+            .cqrs
+            .position_projection
+            .load(&symbol)
+            .await
+            .unwrap()
+            .map_or(FractionalShares::ZERO, |position| position.net);
+        assert_eq!(net, FractionalShares::ZERO, "and it is still not hedged");
     }
 
     /// Secondary chains cap COIN at 0.01 shares while the primary Base table
