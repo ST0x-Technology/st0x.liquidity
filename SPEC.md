@@ -4702,9 +4702,11 @@ terminal states only.
   `TransferUsdcToMarketMaking` job for either state when no live job row exists.
 - **Unresolved/unparseable aggregate IDs**: Aggregates that are missing from the
   store or have unparseable IDs have no known corridor, so they latch every
-  corridor's guard until a restart can classify them, with an operator alert.
-  These indicate store inconsistency and require manual investigation. The
-  running bot latches every corridor the same way when a post-burn failure's
+  corridor's guard until a restart can classify them, with an operator alert
+  that leads with the every-corridor phrase below and says it was found at
+  startup (not the per-corridor "LATCHED on startup" phrase, which does not
+  page). These indicate store inconsistency and require manual investigation.
+  The running bot latches every corridor the same way when a post-burn failure's
   corridor cannot be read (no in-memory tracking and the aggregate does not
   load); the latch lasts until a restart and pages once per transfer, retried by
   the timeout sweep until delivered: "USDC rebalancing is LATCHED on every

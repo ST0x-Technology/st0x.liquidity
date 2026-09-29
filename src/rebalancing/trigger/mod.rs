@@ -6892,31 +6892,34 @@ impl RebalancingService {
         unparseable: &[String],
     ) {
         let unclassified = !unresolved_ids.is_empty() || !unparseable.is_empty();
-        let (latched, remedy) = if unclassified {
-            (
-                "every corridor".to_string(),
-                "A transfer the bot cannot load or parse blocks every corridor, and every \
-                 manual resume, until it is repaired and the bot restarts. Reconcile the \
-                 stranded transfers; repair the unreadable one and restart.",
+        // The every-corridor page leads with the runtime latch phrase, never
+        // the startup one: alerting classifies by phrase, and the startup
+        // kind does not page.
+        let message = if unclassified {
+            format!(
+                "USDC rebalancing is LATCHED on every corridor with no automated recovery: \
+                 found at startup. stranded={stranded_held_ids:?} \
+                 unresolved={unresolved_ids:?} unparseable={unparseable:?}. A transfer the \
+                 bot cannot load or parse blocks every corridor, and every manual resume, \
+                 until it is repaired and the bot restarts. Reconcile the stranded \
+                 transfers; repair the unreadable one and restart."
             )
         } else {
-            (
-                held.iter()
-                    .filter(|(id, _, _)| stranded_held_ids.contains(id))
-                    .map(|(_, corridor, _)| corridor.to_string())
-                    .collect::<BTreeSet<_>>()
-                    .into_iter()
-                    .collect::<Vec<_>>()
-                    .join(", "),
-                "Run `transfer resume` or `transfer reconcile` to unblock.",
+            let latched = held
+                .iter()
+                .filter(|(id, _, _)| stranded_held_ids.contains(id))
+                .map(|(_, corridor, _)| corridor.to_string())
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!(
+                "USDC rebalancing is LATCHED on startup with no automated recovery on \
+                 {latched}. stranded={stranded_held_ids:?} unresolved={unresolved_ids:?} \
+                 unparseable={unparseable:?}. Run `transfer resume` or `transfer reconcile` \
+                 to unblock. Rebalancing is blocked until manually resolved."
             )
         };
-        let message = format!(
-            "USDC rebalancing is LATCHED on startup with no automated recovery on \
-             {latched}. stranded={stranded_held_ids:?} unresolved={unresolved_ids:?} \
-             unparseable={unparseable:?}. {remedy} \
-             Rebalancing is blocked until manually resolved."
-        );
 
         // The every-corridor latch lasts until a restart, so its page is
         // queued and retried by the sweep until delivered; a later runtime
@@ -36357,9 +36360,15 @@ mod tests {
         let delivered = notifier.delivered.lock().unwrap().clone();
         assert_eq!(delivered.len(), 1, "got {delivered:?}");
         assert!(
-            delivered[0]
-                .starts_with("USDC rebalancing is LATCHED on startup with no automated recovery"),
+            delivered[0].starts_with(
+                "USDC rebalancing is LATCHED on every corridor with no automated recovery: \
+                 found at startup"
+            ),
             "got {delivered:?}"
+        );
+        assert!(
+            !delivered[0].contains("LATCHED on startup with no automated recovery"),
+            "the startup kind does not page: {delivered:?}"
         );
     }
 
@@ -36388,9 +36397,10 @@ mod tests {
         let pages = notifier.messages();
         assert_eq!(pages.len(), 2, "got {pages:?}");
         assert!(
-            pages
-                .iter()
-                .any(|page| page.starts_with("USDC rebalancing is LATCHED on startup")),
+            pages.iter().any(|page| page.starts_with(
+                "USDC rebalancing is LATCHED on every corridor with no automated recovery: \
+                     found at startup"
+            )),
             "got {pages:?}"
         );
         assert!(
