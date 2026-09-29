@@ -2776,7 +2776,6 @@ impl InventoryView {
     }
 
     /// Returns the aggregate ID of the in-flight USDC rebalance, if any.
-    #[cfg(test)]
     pub(crate) fn active_usdc_rebalance(&self) -> Option<&UsdcRebalanceId> {
         self.active_usdc_rebalance.as_ref()
     }

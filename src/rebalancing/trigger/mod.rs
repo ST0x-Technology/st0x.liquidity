@@ -6418,6 +6418,27 @@ impl RebalancingService {
     }
 
     /// Clears the in-progress flag for USDC rebalancing.
+    /// The USDC transfer other than `id` that the live guard tracks, if any:
+    /// the active rebalance, or a tracked one (restart recovery seeds tracking
+    /// for a guard holding transfer). The reactor clears the guard on any
+    /// clearable terminal without matching ids, so an operator write that
+    /// fails `id` must refuse while another transfer holds it.
+    pub(crate) async fn usdc_guard_held_by_other(
+        &self,
+        id: &UsdcRebalanceId,
+    ) -> Option<UsdcRebalanceId> {
+        let active = self.inventory.read().await.active_usdc_rebalance().cloned();
+        if let Some(active) = active.filter(|active| active != id) {
+            return Some(active);
+        }
+        self.usdc_tracking
+            .read()
+            .await
+            .keys()
+            .find(|tracked| *tracked != id)
+            .cloned()
+    }
+
     pub(crate) fn clear_usdc_in_progress(&self) {
         self.usdc_in_progress.store(false, Ordering::SeqCst);
     }

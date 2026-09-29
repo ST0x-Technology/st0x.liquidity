@@ -2560,8 +2560,33 @@ async fn fail_usdc_transfer(
 
     let _driver_paused = quiesce_usdc_driver(&handle.usdc_driver_pause, &id, None).await?;
 
+    refuse_while_usdc_guard_held_by_other(&handle.rebalancing_service, &id).await?;
     let response = fail_pre_burn_usdc_transfer(&handle.usdc_store, &id, reason).await?;
     Ok(Json(response))
+}
+
+/// Refuses to fail `id` while the live rebalancing guard belongs to another
+/// transfer. Failing `id` emits a clearable terminal, and the reactor clears
+/// the guard without matching ids, so it would release the other transfer's
+/// guard mid flight. Checked with the driver quiesced, so no new transfer can
+/// take the guard between this check and the send.
+async fn refuse_while_usdc_guard_held_by_other(
+    rebalancing_service: &RebalancingService,
+    id: &UsdcRebalanceId,
+) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+    let Some(holder) = rebalancing_service.usdc_guard_held_by_other(id).await else {
+        return Ok(());
+    };
+    warn!(%id, %holder, "Refused to fail a USDC transfer while another holds the guard");
+    Err((
+        StatusCode::CONFLICT,
+        Json(ErrorResponse {
+            error: format!(
+                "USDC transfer {holder} holds the rebalancing guard; failing {id} now would \
+                 release it. Retry once {holder} reaches a terminal state."
+            ),
+        }),
+    ))
 }
 
 /// The store-level half of [`fail_usdc_transfer`]: gates on
@@ -7929,6 +7954,60 @@ mod tests {
             !service.usdc_in_progress.load(Ordering::SeqCst),
             "the reactor must clear the live guard on reconcile, not just the durable state",
         );
+    }
+
+    /// Failing a stranded transfer X must not release the live guard another
+    /// transfer Y holds: the reactor clears the guard on X's clearable terminal
+    /// without matching ids. With Y latched through the wired reactor, failing X
+    /// is refused with 409, X is left as it was, and Y keeps the guard.
+    #[tokio::test]
+    async fn fail_usdc_refuses_while_another_transfer_holds_the_guard() {
+        let (pool, apalis_pool) = crate::test_utils::setup_test_pools().await;
+        let (service, store) =
+            crate::rebalancing::trigger::wire_usdc_reactor_store(&pool, &apalis_pool).await;
+        let stranded = UsdcRebalanceId(uuid::Uuid::new_v4());
+        seed_usdc_bridging_submitting(&pool, &stranded, false).await;
+        let in_flight = UsdcRebalanceId(uuid::Uuid::new_v4());
+        store
+            .send(
+                &in_flight,
+                UsdcRebalanceCommand::InitiateConversion {
+                    direction: RebalanceDirection::AlpacaToBase,
+                    amount: Usdc::new(float!(500)),
+                    order_id: st0x_execution::ClientOrderId::from_uuid(uuid::Uuid::new_v4()),
+                    corridor: UsdcCorridor::BASE_CCTP,
+                },
+            )
+            .await
+            .unwrap();
+        service.usdc_in_progress.store(true, Ordering::SeqCst);
+
+        let Err((status, Json(body))) =
+            refuse_while_usdc_guard_held_by_other(&service, &stranded).await
+        else {
+            panic!("failing X must be refused while Y holds the guard");
+        };
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert!(
+            body.error.contains(&in_flight.to_string()),
+            "{}",
+            body.error
+        );
+        assert!(
+            service.usdc_in_progress.load(Ordering::SeqCst),
+            "Y must keep the live guard"
+        );
+        assert!(
+            matches!(
+                load_usdc_rebalance(&pool, &stranded).await,
+                UsdcRebalance::BridgingSubmitting { .. }
+            ),
+            "a refused fail must leave X as it was"
+        );
+
+        refuse_while_usdc_guard_held_by_other(&service, &in_flight)
+            .await
+            .unwrap_or_else(|(status, Json(error))| panic!("{status}: {}", error.error));
     }
 
     #[tokio::test]
