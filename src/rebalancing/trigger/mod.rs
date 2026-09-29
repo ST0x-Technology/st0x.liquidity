@@ -2603,28 +2603,31 @@ impl RebalancingService {
                         // Both inventory mutations (inflight clear and active
                         // rebalance clear) are chained in a single lock
                         // acquisition so there is never a transient state where
-                        // inflight is zeroed but active_usdc_rebalance is still
+                        // inflight is zeroed but its active entry is still
                         // set.
                         tracking_guard.remove(id);
                         drop(tracking_guard);
 
                         let mut inventory = self.inventory.write().await;
-                        let result =
-                            if inventory.owns_usdc_rebalance_slot(id, tracking.corridor.chain()) {
-                                inventory
-                                    .clone()
-                                    .clear_usdc_inflight(tracking.source_venue(), now)
-                                    .map(|view| view.clear_active_usdc_rebalance(id))
-                            } else {
-                                Ok(inventory.clone())
-                            };
+                        let result = if inventory.active_usdc_rebalance_entry(id).is_some() {
+                            inventory
+                                .clone()
+                                .clear_usdc_inflight_at(
+                                    tracking.corridor.chain(),
+                                    tracking.source_venue(),
+                                    now,
+                                )
+                                .map(|view| view.clear_active_usdc_rebalance(id))
+                        } else {
+                            Ok(inventory.clone())
+                        };
 
                         match result {
                             Ok(updated) => *inventory = updated,
                             Err(error) => {
                                 drop(inventory);
                                 // In practice this branch cannot be triggered:
-                                // `clear_usdc_inflight` only fails when the
+                                // `clear_usdc_inflight_at` only fails when the
                                 // resulting inflight would be negative
                                 // (`Inventory::set_inflight` guards against
                                 // this), and zeroing inflight always produces a
@@ -2784,10 +2787,10 @@ impl RebalancingService {
         }
 
         let mut inventory = self.inventory.write().await;
-        if inventory.owns_usdc_rebalance_slot(id, tracking.corridor.chain()) {
+        if inventory.active_usdc_rebalance_entry(id).is_some() {
             *inventory = inventory
                 .clone()
-                .clear_usdc_inflight(tracking.source_venue(), now)?
+                .clear_usdc_inflight_at(tracking.corridor.chain(), tracking.source_venue(), now)?
                 .clear_active_usdc_rebalance(id);
         }
         drop(inventory);
@@ -17128,11 +17131,11 @@ mod tests {
         drop(inventory);
     }
 
-    /// Terminal settlement must credit the configured primary chain's
-    /// onchain slot: with inventory keyed under Ethereum, a Base-hardcoded
+    /// Terminal settlement must credit the transfer's corridor chain slot:
+    /// with the corridor and inventory keyed under Ethereum, a Base-hardcoded
     /// credit would leave the Ethereum slot at its seeded balance.
     #[tokio::test]
-    async fn terminal_deposit_credits_the_configured_primary_chain_slot() {
+    async fn terminal_deposit_credits_a_non_base_corridor_chain_slot() {
         let inventory =
             InventoryView::for_primary_chain(Chain::Ethereum).with_usdc(usdc(100), usdc(900));
         let trigger = make_trigger_with_inventory(inventory).await;
@@ -17142,7 +17145,7 @@ mod tests {
         harness
             .receive::<UsdcRebalance>(
                 id.clone(),
-                make_usdc_initiated(RebalanceDirection::AlpacaToBase, usdc(500)),
+                make_usdc_initiated_on(ETHEREUM_CCTP, RebalanceDirection::AlpacaToBase, usdc(500)),
             )
             .await
             .unwrap();
@@ -17168,11 +17171,11 @@ mod tests {
     }
 
     /// Cancelling a failed onchain-sourced rebalance must release and credit
-    /// back the configured primary chain's slot. The mid-flight assertion
+    /// back the transfer's corridor chain slot. The mid-flight assertion
     /// pins the debit to the Ethereum slot; the final one pins the
     /// cancel's release and credit-back to the same slot.
     #[tokio::test]
-    async fn terminal_cancel_releases_the_configured_primary_chain_slot() {
+    async fn terminal_cancel_releases_a_non_base_corridor_chain_slot() {
         let inventory =
             InventoryView::for_primary_chain(Chain::Ethereum).with_usdc(usdc(900), usdc(100));
         let trigger = make_trigger_with_inventory(inventory).await;
@@ -17181,12 +17184,12 @@ mod tests {
 
         trigger
             .usdc_guards
-            .hold(Chain::Base, &id, RebalanceDirection::BaseToAlpaca);
+            .hold(Chain::Ethereum, &id, RebalanceDirection::BaseToAlpaca);
 
         harness
             .receive::<UsdcRebalance>(
                 id.clone(),
-                make_usdc_initiated(RebalanceDirection::BaseToAlpaca, usdc(400)),
+                make_usdc_initiated_on(ETHEREUM_CCTP, RebalanceDirection::BaseToAlpaca, usdc(400)),
             )
             .await
             .unwrap();
@@ -20170,14 +20173,27 @@ mod tests {
     }
 
     fn make_usdc_initiated(direction: RebalanceDirection, amount: Usdc) -> UsdcRebalanceEvent {
+        make_usdc_initiated_on(UsdcCorridor::BASE_CCTP, direction, amount)
+    }
+
+    fn make_usdc_initiated_on(
+        corridor: UsdcCorridor,
+        direction: RebalanceDirection,
+        amount: Usdc,
+    ) -> UsdcRebalanceEvent {
         UsdcRebalanceEvent::Initiated {
-            corridor: UsdcCorridor::BASE_CCTP,
+            corridor,
             direction,
             amount,
             withdrawal_ref: TransferRef::OnchainTx(TxHash::random()),
             initiated_at: Utc::now(),
         }
     }
+
+    const ETHEREUM_CCTP: UsdcCorridor = UsdcCorridor::HubRouted {
+        chain: Chain::Ethereum,
+        hop: HopKind::Cctp,
+    };
 
     fn make_usdc_conversion_initiated(
         direction: RebalanceDirection,
@@ -24332,7 +24348,7 @@ mod tests {
         );
 
         // Source-venue inflight for BaseToAlpaca is MarketMaking (USDC left the
-        // Base chain). The sweep zeroes it via clear_usdc_inflight (inlined in
+        // Base chain). The sweep zeroes it via clear_usdc_inflight_at (inlined in
         // the Reconciled branch of cleanup_timed_out_usdc_rebalance).
         // active_usdc_rebalance must also be cleared (invariant from the
         // pre-burn timeout path; the Reconciled sweep path must match).
@@ -32675,7 +32691,7 @@ mod tests {
         // cash snapshots fetched before the stamp are rejected.
         let inventory = InventoryView::default()
             .with_usdc(usdc(500), usdc(500))
-            .clear_usdc_inflight(Venue::Hedging, now)
+            .clear_usdc_inflight_at(Chain::Base, Venue::Hedging, now)
             .unwrap();
 
         let reactor = make_trigger_with_inventory_and_registry(inventory, &symbol).await;
@@ -37528,7 +37544,7 @@ mod tests {
 
     /// Releasing another corridor's transfer, by its terminal event or by the
     /// sweep, leaves the in-flight Base transfer's inflight and active marker
-    /// alone: the inventory addresses only the primary chain.
+    /// alone: a release addresses only the released transfer's own entries.
     #[tokio::test]
     async fn releasing_another_corridors_transfer_keeps_the_base_transfers_inventory() {
         let pool = crate::test_utils::setup_test_db().await;

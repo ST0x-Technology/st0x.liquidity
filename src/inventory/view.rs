@@ -2752,14 +2752,16 @@ impl InventoryView {
         })
     }
 
-    pub(crate) fn clear_usdc_inflight(
+    /// Zeroes the USDC inflight at `venue` in `chain`'s slot: a transfer
+    /// releases the slot of its own corridor chain.
+    pub(crate) fn clear_usdc_inflight_at(
         self,
+        chain: Chain,
         venue: Venue,
         now: DateTime<Utc>,
     ) -> Result<Self, InventoryViewError> {
-        let cleared =
-            Inventory::set_inflight(venue, Usdc::ZERO)(self.usdc.clone(), self.primary_chain)?;
-        let cleared = Inventory::with_last_rebalancing(now)(cleared, self.primary_chain)?;
+        let cleared = Inventory::set_inflight(venue, Usdc::ZERO)(self.usdc.clone(), chain)?;
+        let cleared = Inventory::with_last_rebalancing(now)(cleared, chain)?;
 
         Ok(Self {
             usdc: cleared,
@@ -2841,12 +2843,12 @@ impl InventoryView {
         }
     }
 
-    /// Whether `id`, a transfer on `chain`, owns the USDC inflight and the
-    /// active marker: the inventory addresses only the primary chain, so a
-    /// transfer on another corridor, or one that is not active, must leave
-    /// them to their owner.
-    pub(crate) fn owns_usdc_rebalance_slot(&self, id: &UsdcRebalanceId, chain: Chain) -> bool {
-        chain == self.primary_chain && self.active_usdc_rebalances.contains_key(id)
+    /// The corridor chain and direction `id` was recorded with, if active.
+    pub(crate) fn active_usdc_rebalance_entry(
+        &self,
+        id: &UsdcRebalanceId,
+    ) -> Option<&ActiveUsdcRebalance> {
+        self.active_usdc_rebalances.get(id)
     }
 
     /// Clears `id`'s in-flight USDC rebalance entry, leaving any other one.
@@ -3128,17 +3130,27 @@ impl InventoryView {
     /// venue. The hedge-order sources are Hedging-only for the same reason
     /// as in the equity twin. Transfer busyness follows
     /// [`Self::usdc_inflight_busy`]; an active USDC rebalance is busy at
-    /// Hedging and at the primary chain, the only vault it moves.
+    /// Hedging and at its corridor chain, the only vault it moves, and one of
+    /// unknown corridor is busy at every chain.
     pub(crate) fn cash_reconciliation_busy(
         &self,
         scope: InventoryScope,
         fetched_at: DateTime<Utc>,
     ) -> Result<Option<EquityReconcileBusy>, FloatError> {
-        let rebalance_moves_scope = !self.active_usdc_rebalances.is_empty()
-            && match scope {
-                InventoryScope::Hedging => true,
-                InventoryScope::MarketMaking(chain) => chain == self.primary_chain,
-            };
+        let rebalance_moves_scope = match scope {
+            InventoryScope::Hedging => !self.active_usdc_rebalances.is_empty(),
+            InventoryScope::MarketMaking(chain) => {
+                self.active_usdc_rebalances
+                    .values()
+                    .any(|active| match active {
+                        ActiveUsdcRebalance::Known {
+                            chain: rebalance_chain,
+                            ..
+                        } => *rebalance_chain == chain,
+                        ActiveUsdcRebalance::Unknown => true,
+                    })
+            }
+        };
 
         if rebalance_moves_scope || self.usdc_inflight_busy(scope)? {
             return Ok(Some(EquityReconcileBusy::Transfer));
@@ -7360,7 +7372,7 @@ mod tests {
         let now = Utc::now();
         let view = InventoryView::default()
             .with_usdc(Usdc::ZERO, usdc_cents(50_000))
-            .clear_usdc_inflight(Venue::Hedging, now)
+            .clear_usdc_inflight_at(Chain::Base, Venue::Hedging, now)
             .unwrap();
 
         let wedged = view
