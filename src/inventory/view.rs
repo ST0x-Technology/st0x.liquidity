@@ -2226,10 +2226,9 @@ impl InventoryView {
     /// Whether tracked USDC inflight makes a cash reading at `scope`
     /// ambiguous. Any inflight is busy at Hedging, one side of every USDC
     /// transfer. A MarketMaking reading on `chain` is busy for inflight in
-    /// that chain's slot, or for Hedging inflight when `chain` is the
-    /// primary chain: USDC rebalancing moves cash only between Hedging and
-    /// the primary chain's vault, so a broker withdrawal in flight says
-    /// nothing about another chain's vault.
+    /// that chain's slot, or for Hedging inflight headed to `chain`: the
+    /// chain of the active Alpaca-outbound transfer, or every chain when no
+    /// such transfer is known.
     fn usdc_inflight_busy(&self, scope: InventoryScope) -> Result<bool, FloatError> {
         match scope {
             InventoryScope::Hedging => self.usdc.has_inflight(),
@@ -2250,15 +2249,38 @@ impl InventoryView {
                     .transpose()?
                     .unwrap_or(false);
 
-                Ok(slot_inflight || (hedging_inflight && chain == self.primary_chain))
+                Ok(slot_inflight || (hedging_inflight && self.hedging_inflight_may_reach(chain)))
             }
         }
     }
 
+    /// Whether Hedging USDC inflight may be headed to `chain`'s vault. It
+    /// records no destination, so it is attributed to the known
+    /// Alpaca-outbound transfers; an unknown transfer, or none known, may
+    /// reach any chain.
+    fn hedging_inflight_may_reach(&self, chain: Chain) -> bool {
+        let mut outbound_chains = Vec::new();
+        for active in self.active_usdc_rebalances.values() {
+            match active {
+                ActiveUsdcRebalance::Known {
+                    chain: outbound_chain,
+                    direction: RebalanceDirection::AlpacaToBase,
+                } => outbound_chains.push(*outbound_chain),
+                ActiveUsdcRebalance::Known {
+                    direction: RebalanceDirection::BaseToAlpaca,
+                    ..
+                } => {}
+                ActiveUsdcRebalance::Unknown => return true,
+            }
+        }
+
+        outbound_chains.is_empty() || outbound_chains.contains(&chain)
+    }
+
     /// The skip conditions of an ordinary MarketMaking cash snapshot on
-    /// `chain`: inflight per [`Self::usdc_inflight_busy`], or a primary-chain
-    /// read fetched before the last USDC rebalancing, the only vault a
-    /// rebalance moves. The `OnchainUsdc` arm applies the
+    /// `chain`: inflight per [`Self::usdc_inflight_busy`], or a read fetched
+    /// before the last USDC rebalancing, one timestamp for every corridor
+    /// chain. The `OnchainUsdc` arm applies the
     /// balance only when this admits it, so the streak and the block
     /// watermark follow exactly the snapshots the view took.
     fn onchain_usdc_snapshot_would_apply(
@@ -2270,8 +2292,7 @@ impl InventoryView {
             return Ok(false);
         }
 
-        if chain == self.primary_chain
-            && let Some(last_rebalancing) = self.usdc.last_rebalancing
+        if let Some(last_rebalancing) = self.usdc.last_rebalancing
             && fetched_at < last_rebalancing
         {
             debug!(
