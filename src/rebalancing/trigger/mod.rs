@@ -5047,7 +5047,10 @@ impl RebalancingService {
     /// transfer in the *other* direction. Querying only one job type would,
     /// after a restart, let an opposite-direction transfer run concurrently
     /// against the same funds -- churning capital and paying CCTP/withdrawal
-    /// fees twice. A row on another corridor does not count; a row queued
+    /// fees twice. A row on another corridor does not count, except that an
+    /// Alpaca-outbound request also counts an Alpaca-outbound row on any
+    /// corridor (Alpaca's cash is shared, and after a restart only the job
+    /// row remembers a transfer with no event yet); a row queued
     /// before corridors reads as Base via CCTP, and a row whose payload cannot
     /// be parsed counts for every corridor.
     ///
@@ -5074,6 +5077,7 @@ impl RebalancingService {
         pool: &apalis_sqlite::SqlitePool,
         usdc_store: Option<&Store<UsdcRebalance>>,
         chain: Chain,
+        direction: RebalanceDirection,
     ) -> Result<Option<(String, i64)>, sqlx_apalis::Error> {
         // Both job types carry `id` and `corridor` at the top level of their
         // JSON payload (apalis JsonCodec serializes the struct directly).
@@ -5084,11 +5088,13 @@ impl RebalancingService {
             corridor: UsdcCorridor,
         }
 
-        let rows: Vec<(String, i64, String, Vec<u8>)> = sqlx_apalis::query_as(
+        let outbound_job_type = std::any::type_name::<TransferUsdcToMarketMaking>();
+        let rows: Vec<(String, i64, String, Vec<u8>, String)> = sqlx_apalis::query_as(
             "SELECT id, \
                     CAST(strftime('%s', 'now') AS INTEGER) - run_at AS age_secs, \
                     status, \
-                    job \
+                    job, \
+                    job_type \
              FROM Jobs \
              WHERE job_type IN (?, ?) \
              AND (status IN ('Pending', 'Queued', 'Running') \
@@ -5096,13 +5102,19 @@ impl RebalancingService {
              ORDER BY run_at ASC",
         )
         .bind(std::any::type_name::<TransferUsdcToHedging>())
-        .bind(std::any::type_name::<TransferUsdcToMarketMaking>())
+        .bind(outbound_job_type)
         .fetch_all(pool)
         .await?;
 
-        for (row_id, age_secs, status, job_payload) in rows {
+        let counts_outbound_elsewhere = direction == RebalanceDirection::AlpacaToBase;
+        for (row_id, age_secs, status, job_payload, job_type) in rows {
             let aggregate_id = match serde_json::from_slice::<UsdcJobKey>(&job_payload) {
-                Ok(UsdcJobKey { id, corridor }) if corridor.chain() == chain => id,
+                Ok(UsdcJobKey { id, corridor })
+                    if corridor.chain() == chain
+                        || (counts_outbound_elsewhere && job_type == outbound_job_type) =>
+                {
+                    id
+                }
                 Ok(_) => continue,
                 Err(error) => {
                     warn!(
@@ -5272,8 +5284,13 @@ impl RebalancingService {
         let queue = self.transfer_usdc_to_hedging_queue.clone();
         let usdc_store = self.usdc_store.read().await.as_ref().map(Arc::clone);
 
-        match Self::in_flight_usdc_transfer(queue.pool(), usdc_store.as_deref(), corridor.chain())
-            .await
+        match Self::in_flight_usdc_transfer(
+            queue.pool(),
+            usdc_store.as_deref(),
+            corridor.chain(),
+            RebalanceDirection::BaseToAlpaca,
+        )
+        .await
         {
             Ok(Some((row_id, age_secs))) if age_secs >= STUCK_TRANSFER_WARN_AFTER_SECS => {
                 warn!(
@@ -5363,8 +5380,13 @@ impl RebalancingService {
         let queue = self.transfer_usdc_to_market_making_queue.clone();
         let usdc_store = self.usdc_store.read().await.as_ref().map(Arc::clone);
 
-        match Self::in_flight_usdc_transfer(queue.pool(), usdc_store.as_deref(), corridor.chain())
-            .await
+        match Self::in_flight_usdc_transfer(
+            queue.pool(),
+            usdc_store.as_deref(),
+            corridor.chain(),
+            RebalanceDirection::AlpacaToBase,
+        )
+        .await
         {
             Ok(Some((row_id, age_secs))) => {
                 debug!(
@@ -5521,12 +5543,17 @@ impl RebalancingService {
 
         // Single-flight gate 1: any live or retryable USDC transfer job row on
         // this corridor, in either direction, blocks a manual resume (both
-        // directions move funds through the same vault and wallet). Terminal
-        // rows do not.
+        // directions move funds through the same vault and wallet), and so
+        // does, for an Alpaca-outbound resume, an Alpaca-outbound row on any
+        // corridor. Terminal rows do not.
         let queue_pool = self.transfer_usdc_to_market_making_queue.pool();
-        if let Some((row_id, age_secs)) =
-            Self::in_flight_usdc_transfer(queue_pool, Some(&store), state.corridor().chain())
-                .await?
+        if let Some((row_id, age_secs)) = Self::in_flight_usdc_transfer(
+            queue_pool,
+            Some(&store),
+            state.corridor().chain(),
+            direction,
+        )
+        .await?
         {
             return Err(UsdcResumeError::AlreadyInFlight { row_id, age_secs });
         }
