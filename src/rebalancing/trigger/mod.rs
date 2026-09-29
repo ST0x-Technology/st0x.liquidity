@@ -36594,4 +36594,45 @@ mod tests {
         assert!(trigger.usdc_guards.is_held(Chain::Robinhood));
         assert!(!trigger.usdc_guards.is_latched());
     }
+
+    /// A live Alpaca-outbound job on another corridor blocks an
+    /// Alpaca-outbound enqueue, so the rule survives a restart, while an
+    /// inbound enqueue proceeds.
+    #[tokio::test]
+    async fn usdc_enqueue_dedupe_keeps_one_alpaca_outbound_job_across_corridors() {
+        let trigger = make_trigger_with_inventory(InventoryView::default()).await;
+        trigger
+            .transfer_usdc_to_market_making_queue
+            .clone()
+            .push(TransferUsdcToMarketMaking {
+                corridor: ROBINHOOD_RELAY,
+                id: UsdcRebalanceId(Uuid::new_v4()),
+                amount: usdc(400),
+                revert_redrive_attempts: 0,
+                backpressure_streak: BackpressureStreak::default(),
+            })
+            .await
+            .unwrap();
+
+        assert!(
+            !trigger
+                .enqueue_transfer_usdc_to_market_making(
+                    UsdcRebalanceId(Uuid::new_v4()),
+                    usdc(100),
+                    UsdcCorridor::BASE_CCTP,
+                )
+                .await,
+            "an Alpaca-outbound job on another corridor must block a second one"
+        );
+        assert!(
+            trigger
+                .enqueue_transfer_usdc_to_hedging(
+                    UsdcRebalanceId(Uuid::new_v4()),
+                    usdc(100),
+                    UsdcCorridor::BASE_CCTP,
+                )
+                .await,
+            "an inbound transfer does not draw on Alpaca's cash"
+        );
+    }
 }
