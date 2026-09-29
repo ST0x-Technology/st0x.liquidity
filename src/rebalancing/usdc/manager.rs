@@ -22694,7 +22694,7 @@ mod tests {
             Arc::new(MockBridge::new()),
             Arc::new(vault_service),
             cqrs.clone(),
-            MarketMakingUsdcEndpoints::new(recipient, TEST_VAULT_ID),
+            MarketMakingUsdcEndpoints::new(UsdcCorridor::BASE_CCTP, recipient, TEST_VAULT_ID),
             &test_settlement_params(),
             BotGasReceiptCostEnqueuer::Disabled,
         );

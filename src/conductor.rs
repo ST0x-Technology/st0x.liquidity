@@ -6982,7 +6982,7 @@ mod tests {
     use st0x_dto::Statement;
     use st0x_event_sorcery::{DomainEvent, Reconciler, StoreBuilder, test_store};
     use st0x_evm::local::RawPrivateKeyWallet;
-    use st0x_evm::{PreparedTransaction, USDC_BASE, USDC_ETHEREUM, USDC_HYPEREVM};
+    use st0x_evm::{USDC_BASE, USDC_ETHEREUM, USDC_HYPEREVM};
     use st0x_execution::{
         AlpacaAccountId, AlpacaBrokerApiMode, AlpacaBrokerAuth, Direction, EquityPosition,
         ExecutorOrderId, HedgeFloor, Inventory as ExecutionInventory, MarketOrder, MockExecutor,
