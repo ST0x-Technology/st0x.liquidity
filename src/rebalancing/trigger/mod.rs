@@ -36687,4 +36687,98 @@ mod tests {
             "an inbound transfer does not draw on Alpaca's cash"
         );
     }
+
+    /// Releasing another corridor's transfer, by its terminal event or by the
+    /// sweep, leaves the in-flight Base transfer's inflight and active marker
+    /// alone: the inventory addresses only the primary chain.
+    #[tokio::test]
+    async fn releasing_another_corridors_transfer_keeps_the_base_transfers_inventory() {
+        let pool = crate::test_utils::setup_test_db().await;
+        let store = Arc::new(test_store::<UsdcRebalance>(pool.clone(), ()));
+        let notifier = Arc::new(CapturingNotifier::default());
+        let trigger = make_unserved_corridor_trigger(&pool, store.clone(), notifier).await;
+        *trigger.inventory.write().await = InventoryView::default().with_usdc(usdc(900), usdc(100));
+        let harness = ReactorHarness::new(Arc::clone(&trigger));
+        let base_id = UsdcRebalanceId(Uuid::new_v4());
+        harness
+            .receive::<UsdcRebalance>(
+                base_id.clone(),
+                make_usdc_initiated(RebalanceDirection::BaseToAlpaca, usdc(400)),
+            )
+            .await
+            .unwrap();
+
+        let reconciled = UsdcRebalanceId(Uuid::new_v4());
+        trigger.usdc_tracking.write().await.insert(
+            reconciled.clone(),
+            usdc::UsdcRebalanceTracking {
+                corridor: ROBINHOOD_RELAY,
+                direction: RebalanceDirection::BaseToAlpaca,
+                initiated_amount: usdc(300),
+                bridged_amount_received: None,
+                stage: usdc::UsdcRebalanceStage::BridgingInitiated,
+                last_progress_at: Utc::now(),
+            },
+        );
+        harness
+            .receive::<UsdcRebalance>(
+                reconciled,
+                UsdcRebalanceEvent::OperatorReconciled {
+                    direction: RebalanceDirection::BaseToAlpaca,
+                    amount: usdc(300),
+                    reason: crate::usdc_rebalance::ReconcileReason::FundsMovedManually,
+                    initiated_at: Utc::now(),
+                    reconciled_at: Utc::now(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let swept = UsdcRebalanceId(Uuid::new_v4());
+        let burn_tx = B256::repeat_byte(0x0c);
+        for command in [
+            UsdcRebalanceCommand::Initiate {
+                corridor: ROBINHOOD_RELAY,
+                direction: RebalanceDirection::BaseToAlpaca,
+                amount: usdc(300),
+                withdrawal: TransferRef::OnchainTx(burn_tx),
+            },
+            UsdcRebalanceCommand::ConfirmWithdrawal {
+                withdrawal_tx: None,
+            },
+            UsdcRebalanceCommand::InitiateBridging { burn_tx },
+            UsdcRebalanceCommand::FailBridging {
+                reason: "stuck".to_string(),
+            },
+            UsdcRebalanceCommand::ReconcileStuckRebalance {
+                reason: crate::usdc_rebalance::ReconcileReason::FundsMovedManually,
+            },
+        ] {
+            store.send(&swept, command).await.unwrap();
+        }
+        trigger.usdc_tracking.write().await.insert(
+            swept,
+            usdc::UsdcRebalanceTracking {
+                corridor: ROBINHOOD_RELAY,
+                direction: RebalanceDirection::BaseToAlpaca,
+                initiated_amount: usdc(300),
+                bridged_amount_received: None,
+                stage: usdc::UsdcRebalanceStage::BridgingInitiated,
+                last_progress_at: Utc::now(),
+            },
+        );
+        trigger
+            .expire_stuck_usdc_rebalances(Utc::now())
+            .await
+            .unwrap();
+
+        let inventory = trigger.inventory.read().await;
+        assert_eq!(
+            inventory.usdc_inflight(Venue::MarketMaking),
+            Some(usdc(400)),
+            "the Base transfer's inflight must survive"
+        );
+        assert_eq!(inventory.active_usdc_rebalance(), Some(&base_id));
+        drop(inventory);
+    }
 }
