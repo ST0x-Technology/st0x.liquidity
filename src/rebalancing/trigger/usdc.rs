@@ -1,13 +1,14 @@
 //! USDC-specific trigger types and logic.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 
 use chrono::{DateTime, Utc};
 use rain_math_float::{Float, FloatError};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, trace, warn};
 
+use st0x_bridge::corridor::UsdcCorridor;
+use st0x_evm::Chain;
 use st0x_finance::{Usd, Usdc};
 
 use super::{RebalancingService, RebalancingServiceError};
@@ -24,6 +25,15 @@ use crate::usdc_rebalance::{RebalanceDirection, UsdcRebalanceEvent, UsdcRebalanc
 pub(super) enum UsdcRebalanceOperation {
     AlpacaToBase { amount: Usdc },
     BaseToAlpaca { amount: Usdc },
+}
+
+impl UsdcRebalanceOperation {
+    pub(super) const fn direction(self) -> RebalanceDirection {
+        match self {
+            Self::AlpacaToBase { .. } => RebalanceDirection::AlpacaToBase,
+            Self::BaseToAlpaca { .. } => RebalanceDirection::BaseToAlpaca,
+        }
+    }
 }
 
 /// Internal decision built inside the inventory read-lock, coupling each
@@ -64,6 +74,7 @@ impl std::fmt::Display for UsdcTrackingEvent {
 
 #[derive(Debug, Clone)]
 pub(super) struct UsdcRebalanceTracking {
+    pub(super) corridor: UsdcCorridor,
     pub(super) direction: RebalanceDirection,
     pub(super) initiated_amount: Usdc,
     pub(super) bridged_amount_received: Option<Usdc>,
@@ -134,6 +145,19 @@ impl UsdcRebalanceTracking {
         self.stage = stage;
         self.last_progress_at = last_progress_at;
     }
+}
+
+/// What the store says about a transfer's corridor.
+enum DurableCorridor {
+    Found {
+        corridor: UsdcCorridor,
+        direction: RebalanceDirection,
+        holds_guard: bool,
+    },
+    /// The aggregate has events but no state, or none at all.
+    Missing,
+    /// The load failed (or the store is not wired yet); retry later.
+    Unread,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -301,53 +325,14 @@ pub(crate) enum UsdcTriggerSkip {
     ArithmeticError,
 }
 
-/// RAII guard that holds a USDC in-progress claim.
-/// Automatically releases the claim on drop unless `defuse` is called.
-pub(super) struct InProgressGuard {
-    /// Shared reference to the in-progress flag for cleanup on drop.
-    in_progress: Arc<AtomicBool>,
-    /// When true, the guard will not release the claim on drop.
-    defused: bool,
-}
-
-impl InProgressGuard {
-    /// Attempts to claim the USDC in-progress slot.
-    /// Returns `None` if already claimed by another operation.
-    pub(super) fn try_claim(in_progress: Arc<AtomicBool>) -> Option<Self> {
-        let was_in_progress =
-            in_progress.compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst);
-
-        if was_in_progress.is_err() {
-            return None;
-        }
-
-        Some(Self {
-            in_progress,
-            defused: false,
-        })
-    }
-
-    /// Prevents the guard from releasing the claim on drop.
-    /// Call this after successfully sending the operation.
-    pub(super) fn defuse(mut self) {
-        self.defused = true;
-    }
-}
-
-impl Drop for InProgressGuard {
-    fn drop(&mut self) {
-        if !self.defused {
-            self.in_progress.store(false, Ordering::SeqCst);
-        }
-    }
-}
-
 /// Checks inventory for USDC imbalance and returns the appropriate bridging operation.
 ///
 /// Returns `UsdcRebalanceOperation::AlpacaToBase` if there's too much USDC in
 /// Alpaca that needs to be bridged to Base, or `BaseToAlpaca` if there's too
-/// much USDC on Base that needs to be bridged to Alpaca.
+/// much USDC on Base that needs to be bridged to Alpaca. `chain` is the
+/// corridor's chain.
 pub(super) async fn check_imbalance_and_build_operation(
+    chain: Chain,
     threshold: &ImbalanceThreshold,
     inventory: &Arc<BroadcastingInventory>,
     usdc_limit: Option<Usdc>,
@@ -356,11 +341,7 @@ pub(super) async fn check_imbalance_and_build_operation(
     let decision = {
         let inventory = inventory.read().await;
         let imbalance = inventory
-            .check_usdc_imbalance_with_gross_offchain(
-                inventory.primary_chain(),
-                threshold,
-                reserved,
-            )
+            .check_usdc_imbalance_with_gross_offchain(chain, threshold, reserved)
             .map_err(|error| {
                 warn!(
                     target: "rebalance",
@@ -611,6 +592,12 @@ impl RebalancingService {
         }
 
         let terminal_action = self.usdc_terminal_action(&id, &event).await;
+        // The inventory addresses only the primary chain: a transfer on
+        // another corridor never takes or clears its active marker.
+        let on_primary = match self.transfer_chain(&id).await {
+            Some(chain) => chain == self.inventory.read().await.primary_chain(),
+            None => true,
+        };
         let settlement_outcome = self
             .apply_usdc_rebalance_event(&id, &event, terminal_action)
             .await?;
@@ -618,18 +605,21 @@ impl RebalancingService {
         let is_clearable_terminal = terminal_action == UsdcTerminalAction::Clear;
         {
             let mut inventory = self.inventory.write().await;
-            *inventory = if is_clearable_terminal {
-                inventory.clone().clear_active_usdc_rebalance()
-            } else {
-                inventory.clone().set_active_usdc_rebalance(id.clone())
-            };
+            if is_clearable_terminal {
+                let chain = inventory.primary_chain();
+                if on_primary && inventory.owns_usdc_rebalance_slot(&id, chain) {
+                    *inventory = inventory.clone().clear_active_usdc_rebalance();
+                }
+            } else if on_primary {
+                *inventory = inventory.clone().set_active_usdc_rebalance(id.clone());
+            }
         }
         if is_clearable_terminal {
             self.usdc_tracking.write().await.remove(&id);
-            self.clear_usdc_in_progress();
-            debug!(target: "rebalance", "Cleared USDC in-progress flag after rebalance terminal event");
+            self.usdc_guards.release(&id);
+            debug!(target: "rebalance", %id, "Released the transfer's corridor guard after its terminal event");
         } else if terminal_action == UsdcTerminalAction::PreservePostBurn {
-            self.usdc_in_progress.store(true, Ordering::SeqCst);
+            self.keep_corridor_guard(&id).await;
             warn!(
                 target: "rebalance",
                 id = %id,
@@ -639,6 +629,7 @@ impl RebalancingService {
         }
 
         drop(event_sync_guard);
+        self.deliver_pending_latch_pages().await;
 
         // A terminal USDC transfer cleared the in-progress claim, so we
         // cancel any pre-rebalance checks and push a fresh one against
@@ -683,6 +674,139 @@ impl RebalancingService {
             UsdcTerminalAction::PreservePostBurn
         } else {
             UsdcTerminalAction::Clear
+        }
+    }
+
+    /// Keeps the corridor guard of a transfer whose funds are past the burn:
+    /// its corridor comes from tracking, else from its durable state. A
+    /// missing aggregate latches every corridor until a restart; a load
+    /// error blocks every corridor until the sweep reads it (fail closed).
+    async fn keep_corridor_guard(&self, id: &UsdcRebalanceId) {
+        let tracked = self
+            .usdc_tracking
+            .read()
+            .await
+            .get(id)
+            .map(|tracking| (tracking.corridor, tracking.direction));
+        let (corridor, direction) = match tracked {
+            Some(holder) => holder,
+            None => match self.durable_corridor(id).await {
+                DurableCorridor::Found {
+                    corridor,
+                    direction,
+                    ..
+                } => (corridor, direction),
+                DurableCorridor::Unread => {
+                    self.block_unread_corridor(id).await;
+                    return;
+                }
+                DurableCorridor::Missing => {
+                    self.latch_every_corridor_for(id).await;
+                    return;
+                }
+            },
+        };
+
+        self.usdc_guards.hold(corridor.chain(), id, direction);
+    }
+
+    /// Latches every corridor until a restart for a post-burn failure whose
+    /// aggregate is missing, queueing one page per transfer.
+    async fn latch_every_corridor_for(&self, id: &UsdcRebalanceId) {
+        warn!(
+            target: "rebalance",
+            %id,
+            "No corridor known for a post-burn terminal failure; latching every \
+             corridor's guard until a restart classifies it"
+        );
+        self.usdc_guards.latch_unclassified();
+        if self.latch_paged.write().await.insert(id.clone()) {
+            let message = format!(
+                "USDC rebalancing is LATCHED on every corridor with no automated \
+                 recovery: transfer {id} failed after its burn and its corridor cannot \
+                 be read. Repair the transfer's stored events, then restart the bot; \
+                 only a restart lifts this latch."
+            );
+            self.pending_latch_pages.write().await.push_back(message);
+        }
+    }
+
+    /// Blocks every corridor while `id`'s aggregate fails to load, queueing
+    /// one page per transfer; the sweep retries the load.
+    pub(super) async fn block_unread_corridor(&self, id: &UsdcRebalanceId) {
+        self.usdc_guards.block_unread(id);
+        if self.unread_paged.write().await.insert(id.clone()) {
+            let message = format!(
+                "USDC rebalancing is BLOCKED on every corridor: transfer {id} could not be \
+                 loaded to read its corridor (a store error, possibly transient). The \
+                 timeout sweep retries the load every tick and unblocks once it reads; retry \
+                 or restart the bot if it persists."
+            );
+            self.pending_latch_pages.write().await.push_back(message);
+        }
+    }
+
+    /// Retries the load of every transfer blocking all corridors: a loaded
+    /// one holds its own corridor when its state holds a guard, a missing
+    /// one latches every corridor until a restart, and a failed load waits
+    /// for the next sweep.
+    pub(super) async fn read_unread_corridors(&self) {
+        for id in self.usdc_guards.unread_ids() {
+            match self.durable_corridor(&id).await {
+                DurableCorridor::Unread => {}
+                DurableCorridor::Missing => {
+                    self.usdc_guards.resolve_unread(&id, None);
+                    self.latch_every_corridor_for(&id).await;
+                }
+                DurableCorridor::Found {
+                    corridor,
+                    direction,
+                    holds_guard,
+                } => {
+                    self.usdc_guards
+                        .resolve_unread(&id, holds_guard.then_some((corridor.chain(), direction)));
+                }
+            }
+        }
+    }
+
+    /// Sends the pending every-corridor latch pages in order, outside the
+    /// USDC event lock; a failed delivery stays queued for the next sweep.
+    pub(super) async fn deliver_pending_latch_pages(&self) {
+        loop {
+            let Some(message) = self.pending_latch_pages.write().await.pop_front() else {
+                return;
+            };
+
+            if let Err(error) = self.notifier.notify(&message).await {
+                warn!(
+                    target: "rebalance",
+                    ?error,
+                    "Failed to deliver an every-corridor latch page; will retry next sweep"
+                );
+                self.pending_latch_pages.write().await.push_front(message);
+                return;
+            }
+        }
+    }
+
+    async fn durable_corridor(&self, id: &UsdcRebalanceId) -> DurableCorridor {
+        let Some(store) = self.usdc_store.read().await.as_ref().map(Arc::clone) else {
+            warn!(target: "rebalance", %id, "No USDC store yet to read a transfer's corridor");
+            return DurableCorridor::Unread;
+        };
+
+        match store.load(id).await {
+            Ok(Some(entity)) => DurableCorridor::Found {
+                corridor: entity.corridor(),
+                direction: entity.direction(),
+                holds_guard: entity.holds_rebalance_guard(),
+            },
+            Ok(None) => DurableCorridor::Missing,
+            Err(error) => {
+                warn!(target: "rebalance", %id, ?error, "Failed to load a transfer's corridor");
+                DurableCorridor::Unread
+            }
         }
     }
 
@@ -810,16 +934,22 @@ impl RebalancingService {
 
         let outcome = match event {
             ConversionInitiated {
-                direction, amount, ..
+                direction,
+                corridor,
+                amount,
+                ..
             } => {
-                self.upsert_conversion_tracking(id, direction, *amount, event)
+                self.upsert_conversion_tracking(id, *corridor, direction, *amount, event)
                     .await;
                 UsdcSettlementOutcome::Reconciled
             }
             Initiated {
-                direction, amount, ..
+                direction,
+                corridor,
+                amount,
+                ..
             } => {
-                self.track_initiated_usdc_rebalance(id, direction, *amount, event)
+                self.track_initiated_usdc_rebalance(id, *corridor, direction, *amount, event)
                     .await?;
                 UsdcSettlementOutcome::Reconciled
             }
@@ -925,7 +1055,7 @@ impl RebalancingService {
             // updated here: defer the immediate imbalance check to the next
             // snapshot poll rather than reading stale inventory.
             OperatorReconciled { direction, .. } => {
-                self.reconcile_operator_resolved(direction, Utc::now())
+                self.reconcile_operator_resolved(id, direction, Utc::now())
                     .await?;
                 UsdcSettlementOutcome::DeferredToSnapshot
             }
@@ -943,22 +1073,45 @@ impl RebalancingService {
     /// file to apply the inflight side-effect when the live reactor processes
     /// the event.
     ///
+    /// Only a transfer that owns the primary chain's slot (see
+    /// `InventoryView::owns_usdc_rebalance_slot`) touches the inflight.
+    ///
     /// The timeout sweep in `mod.rs` does NOT call this function: it inlines
     /// `clear_usdc_inflight + clear_active_usdc_rebalance` in a single lock
     /// acquisition to avoid a transient state where inflight is zeroed but the
     /// active rebalance is still set.
     async fn reconcile_operator_resolved(
         &self,
+        id: &UsdcRebalanceId,
         direction: &RebalanceDirection,
         now: DateTime<Utc>,
     ) -> Result<(), RebalancingServiceError> {
+        let chain = match self.usdc_tracking.read().await.get(id) {
+            Some(tracking) => tracking.corridor.chain(),
+            None => self.inventory.read().await.primary_chain(),
+        };
         let mut inventory = self.inventory.write().await;
-        *inventory = inventory
-            .clone()
-            .clear_usdc_inflight(source_venue(*direction), now)?;
+        if inventory.owns_usdc_rebalance_slot(id, chain) {
+            *inventory = inventory
+                .clone()
+                .clear_usdc_inflight(source_venue(*direction), now)?;
+        }
         drop(inventory);
 
         Ok(())
+    }
+
+    /// The chain of `id`'s corridor: from tracking, else from the store;
+    /// `None` when neither knows it.
+    async fn transfer_chain(&self, id: &UsdcRebalanceId) -> Option<Chain> {
+        if let Some(tracking) = self.usdc_tracking.read().await.get(id) {
+            return Some(tracking.corridor.chain());
+        }
+
+        match self.durable_corridor(id).await {
+            DurableCorridor::Found { corridor, .. } => Some(corridor.chain()),
+            DurableCorridor::Missing | DurableCorridor::Unread => None,
+        }
     }
 
     async fn warn_if_post_burn_tracking_missing(&self, id: &UsdcRebalanceId) {
@@ -976,6 +1129,7 @@ impl RebalancingService {
     async fn track_initiated_usdc_rebalance(
         &self,
         id: &UsdcRebalanceId,
+        corridor: UsdcCorridor,
         direction: &RebalanceDirection,
         amount: Usdc,
         event: &UsdcRebalanceEvent,
@@ -996,6 +1150,7 @@ impl RebalancingService {
         let mut tracking = self.usdc_tracking.write().await;
         if let Some(existing) = tracking.get_mut(id) {
             let tracking_entry = UsdcRebalanceTracking {
+                corridor,
                 direction: *direction,
                 initiated_amount: amount,
                 bridged_amount_received: existing.bridged_amount_received,
@@ -1027,6 +1182,7 @@ impl RebalancingService {
         drop(tracking);
 
         let tracking_entry = UsdcRebalanceTracking {
+            corridor,
             direction: *direction,
             initiated_amount: amount,
             bridged_amount_received: None,
@@ -1051,6 +1207,7 @@ impl RebalancingService {
     async fn upsert_conversion_tracking(
         &self,
         id: &UsdcRebalanceId,
+        corridor: UsdcCorridor,
         direction: &RebalanceDirection,
         amount: Usdc,
         event: &UsdcRebalanceEvent,
@@ -1077,6 +1234,7 @@ impl RebalancingService {
         let mut tracking = self.usdc_tracking.write().await;
 
         if let Some(existing) = tracking.get_mut(id) {
+            existing.corridor = corridor;
             existing.direction = *direction;
             if !existing.source_transfer_started() {
                 existing.initiated_amount = amount;
@@ -1087,6 +1245,7 @@ impl RebalancingService {
         }
 
         let tracking_entry = UsdcRebalanceTracking {
+            corridor,
             direction: *direction,
             initiated_amount: amount,
             bridged_amount_received: None,
@@ -1456,43 +1615,6 @@ mod tests {
     use crate::inventory::InventoryView;
     use crate::usdc_rebalance::{ConversionAmounts, TransferRef};
 
-    #[test]
-    fn test_guard_releases_on_drop() {
-        let in_progress = Arc::new(AtomicBool::new(false));
-
-        {
-            let guard = InProgressGuard::try_claim(Arc::clone(&in_progress)).unwrap();
-            assert!(in_progress.load(Ordering::SeqCst));
-            drop(guard);
-        }
-
-        assert!(!in_progress.load(Ordering::SeqCst));
-    }
-
-    #[test]
-    fn test_guard_defuse_prevents_release() {
-        let in_progress = Arc::new(AtomicBool::new(false));
-
-        {
-            let guard = InProgressGuard::try_claim(Arc::clone(&in_progress)).unwrap();
-            assert!(in_progress.load(Ordering::SeqCst));
-            guard.defuse();
-        }
-
-        // Should still be in progress after defused guard dropped
-        assert!(in_progress.load(Ordering::SeqCst));
-    }
-
-    #[test]
-    fn test_guard_try_claim_fails_when_already_claimed() {
-        let in_progress = Arc::new(AtomicBool::new(false));
-
-        let _guard = InProgressGuard::try_claim(Arc::clone(&in_progress)).unwrap();
-
-        let second_claim = InProgressGuard::try_claim(Arc::clone(&in_progress));
-        assert!(second_claim.is_none());
-    }
-
     #[tokio::test]
     async fn test_balanced_inventory_returns_no_imbalance() {
         let (event_sender, _) = broadcast::channel::<Statement>(16);
@@ -1505,7 +1627,9 @@ mod tests {
             deviation: float!(0.2),
         };
 
-        let result = check_imbalance_and_build_operation(&threshold, &inventory, None, None).await;
+        let result =
+            check_imbalance_and_build_operation(Chain::Base, &threshold, &inventory, None, None)
+                .await;
 
         assert_eq!(result, Err(UsdcTriggerSkip::NoImbalance));
     }
@@ -1551,7 +1675,9 @@ mod tests {
             deviation: float!(0.2),
         };
 
-        let result = check_imbalance_and_build_operation(&threshold, &inventory, None, None).await;
+        let result =
+            check_imbalance_and_build_operation(Chain::Base, &threshold, &inventory, None, None)
+                .await;
 
         assert!(
             matches!(result, Err(UsdcTriggerSkip::BelowMinimumTransfer { excess }) if excess.inner().lt(float!(53)).unwrap_or(false)),
@@ -1574,7 +1700,9 @@ mod tests {
             deviation: float!(0.2),
         };
 
-        let result = check_imbalance_and_build_operation(&threshold, &inventory, None, None).await;
+        let result =
+            check_imbalance_and_build_operation(Chain::Base, &threshold, &inventory, None, None)
+                .await;
 
         assert_eq!(
             result,
@@ -1585,12 +1713,12 @@ mod tests {
         );
     }
 
-    /// The imbalance check must read the configured primary chain's USDC
-    /// slot, not `Chain::Base`: with the balance stored under Ethereum, a
+    /// The imbalance check must read the given corridor chain's USDC slot,
+    /// not `Chain::Base`: with the balance stored under Ethereum, a
     /// Base-hardcoded read would see no onchain venue and skip with
     /// `NoImbalance` instead of computing the excess.
     #[tokio::test]
-    async fn imbalance_check_reads_the_configured_primary_chain_slot() {
+    async fn imbalance_check_reads_the_corridor_chain_slot() {
         let inventory = InventoryView::for_primary_chain(Chain::Ethereum)
             .with_usdc(Usdc::new(float!(100)), Usdc::new(float!(500)))
             .with_withdrawable_cash_cents(50_000);
@@ -1602,7 +1730,14 @@ mod tests {
             deviation: float!(0.2),
         };
 
-        let result = check_imbalance_and_build_operation(&threshold, &inventory, None, None).await;
+        let result = check_imbalance_and_build_operation(
+            Chain::Ethereum,
+            &threshold,
+            &inventory,
+            None,
+            None,
+        )
+        .await;
 
         assert_eq!(
             result,
@@ -1629,7 +1764,9 @@ mod tests {
             deviation: float!(0.2),
         };
 
-        let result = check_imbalance_and_build_operation(&threshold, &inventory, None, None).await;
+        let result =
+            check_imbalance_and_build_operation(Chain::Base, &threshold, &inventory, None, None)
+                .await;
 
         assert_eq!(
             result,
@@ -1656,7 +1793,9 @@ mod tests {
             deviation: float!(0.2),
         };
 
-        let result = check_imbalance_and_build_operation(&threshold, &inventory, None, None).await;
+        let result =
+            check_imbalance_and_build_operation(Chain::Base, &threshold, &inventory, None, None)
+                .await;
 
         assert_eq!(
             result,
@@ -1680,8 +1819,14 @@ mod tests {
         };
         let usdc_limit = Some(Usdc::new(float!(100)));
 
-        let result =
-            check_imbalance_and_build_operation(&threshold, &inventory, usdc_limit, None).await;
+        let result = check_imbalance_and_build_operation(
+            Chain::Base,
+            &threshold,
+            &inventory,
+            usdc_limit,
+            None,
+        )
+        .await;
 
         assert_eq!(
             result,
@@ -1709,8 +1854,14 @@ mod tests {
             event_sender,
         ));
 
-        let first =
-            check_imbalance_and_build_operation(&threshold, &inventory, usdc_limit, None).await;
+        let first = check_imbalance_and_build_operation(
+            Chain::Base,
+            &threshold,
+            &inventory,
+            usdc_limit,
+            None,
+        )
+        .await;
         assert_eq!(
             first,
             Ok(UsdcRebalanceOperation::AlpacaToBase {
@@ -1729,8 +1880,14 @@ mod tests {
             event_sender,
         ));
 
-        let second =
-            check_imbalance_and_build_operation(&threshold, &after_first, usdc_limit, None).await;
+        let second = check_imbalance_and_build_operation(
+            Chain::Base,
+            &threshold,
+            &after_first,
+            usdc_limit,
+            None,
+        )
+        .await;
         assert_eq!(
             second,
             Err(UsdcTriggerSkip::NoImbalance),
@@ -1747,9 +1904,14 @@ mod tests {
             event_sender,
         ));
 
-        let third =
-            check_imbalance_and_build_operation(&threshold, &partially_resolved, usdc_limit, None)
-                .await;
+        let third = check_imbalance_and_build_operation(
+            Chain::Base,
+            &threshold,
+            &partially_resolved,
+            usdc_limit,
+            None,
+        )
+        .await;
         assert_eq!(
             third,
             Ok(UsdcRebalanceOperation::AlpacaToBase {
@@ -1775,8 +1937,14 @@ mod tests {
         };
         let usdc_limit = Some(Usdc::new(float!(30)));
 
-        let result =
-            check_imbalance_and_build_operation(&threshold, &inventory, usdc_limit, None).await;
+        let result = check_imbalance_and_build_operation(
+            Chain::Base,
+            &threshold,
+            &inventory,
+            usdc_limit,
+            None,
+        )
+        .await;
 
         assert!(
             matches!(
@@ -1807,8 +1975,14 @@ mod tests {
         };
         let usdc_limit = Some(Usdc::new(float!(52)));
 
-        let result =
-            check_imbalance_and_build_operation(&threshold, &inventory, usdc_limit, None).await;
+        let result = check_imbalance_and_build_operation(
+            Chain::Base,
+            &threshold,
+            &inventory,
+            usdc_limit,
+            None,
+        )
+        .await;
 
         assert!(
             matches!(
@@ -1836,6 +2010,7 @@ mod tests {
         };
 
         let result = check_imbalance_and_build_operation(
+            Chain::Base,
             &threshold,
             &inventory,
             None,
@@ -1867,6 +2042,7 @@ mod tests {
         };
 
         let result = check_imbalance_and_build_operation(
+            Chain::Base,
             &threshold,
             &inventory,
             None,
@@ -1895,6 +2071,7 @@ mod tests {
         };
 
         let result = check_imbalance_and_build_operation(
+            Chain::Base,
             &threshold,
             &inventory,
             None,
@@ -1928,6 +2105,7 @@ mod tests {
         };
 
         let result = check_imbalance_and_build_operation(
+            Chain::Base,
             &threshold,
             &inventory,
             None,
@@ -1961,6 +2139,7 @@ mod tests {
         };
 
         let result = check_imbalance_and_build_operation(
+            Chain::Base,
             &threshold,
             &inventory,
             None,
@@ -1995,8 +2174,14 @@ mod tests {
         };
         let reserved = Some(Usd::new(float!(250)));
 
-        let before =
-            check_imbalance_and_build_operation(&threshold, &inventory, None, reserved).await;
+        let before = check_imbalance_and_build_operation(
+            Chain::Base,
+            &threshold,
+            &inventory,
+            None,
+            reserved,
+        )
+        .await;
         assert_eq!(
             before,
             Err(UsdcTriggerSkip::MissingWithdrawableCash),
@@ -2015,8 +2200,14 @@ mod tests {
                 .with_withdrawable_cash_cents(35_210);
         }
 
-        let after =
-            check_imbalance_and_build_operation(&threshold, &inventory, None, reserved).await;
+        let after = check_imbalance_and_build_operation(
+            Chain::Base,
+            &threshold,
+            &inventory,
+            None,
+            reserved,
+        )
+        .await;
         assert_eq!(
             after,
             Ok(UsdcRebalanceOperation::AlpacaToBase {
@@ -2043,6 +2234,7 @@ mod tests {
         };
 
         let result = check_imbalance_and_build_operation(
+            Chain::Base,
             &threshold,
             &inventory,
             None,
@@ -2072,6 +2264,7 @@ mod tests {
         };
 
         let result = check_imbalance_and_build_operation(
+            Chain::Base,
             &threshold,
             &inventory,
             None,
@@ -2106,7 +2299,9 @@ mod tests {
             deviation: float!(0.2),
         };
 
-        let result = check_imbalance_and_build_operation(&threshold, &inventory, None, None).await;
+        let result =
+            check_imbalance_and_build_operation(Chain::Base, &threshold, &inventory, None, None)
+                .await;
 
         assert_eq!(
             result,
@@ -2137,7 +2332,9 @@ mod tests {
             deviation: float!(0.2),
         };
 
-        let result = check_imbalance_and_build_operation(&threshold, &inventory, None, None).await;
+        let result =
+            check_imbalance_and_build_operation(Chain::Base, &threshold, &inventory, None, None)
+                .await;
 
         assert_eq!(
             result,
@@ -2168,7 +2365,9 @@ mod tests {
             deviation: float!(0.2),
         };
 
-        let result = check_imbalance_and_build_operation(&threshold, &inventory, None, None).await;
+        let result =
+            check_imbalance_and_build_operation(Chain::Base, &threshold, &inventory, None, None)
+                .await;
 
         assert_eq!(
             result,
@@ -2198,8 +2397,14 @@ mod tests {
         };
         let usdc_limit = Some(Usdc::new(float!(200)));
 
-        let result =
-            check_imbalance_and_build_operation(&threshold, &inventory, usdc_limit, None).await;
+        let result = check_imbalance_and_build_operation(
+            Chain::Base,
+            &threshold,
+            &inventory,
+            usdc_limit,
+            None,
+        )
+        .await;
 
         assert_eq!(
             result,
@@ -2225,7 +2430,9 @@ mod tests {
             deviation: float!(0.2),
         };
 
-        let result = check_imbalance_and_build_operation(&threshold, &inventory, None, None).await;
+        let result =
+            check_imbalance_and_build_operation(Chain::Base, &threshold, &inventory, None, None)
+                .await;
 
         assert_eq!(
             result,
@@ -2252,7 +2459,9 @@ mod tests {
             deviation: float!(0.2),
         };
 
-        let result = check_imbalance_and_build_operation(&threshold, &inventory, None, None).await;
+        let result =
+            check_imbalance_and_build_operation(Chain::Base, &threshold, &inventory, None, None)
+                .await;
 
         assert_eq!(
             result,
@@ -2283,7 +2492,9 @@ mod tests {
             deviation: float!(0.2),
         };
 
-        let result = check_imbalance_and_build_operation(&threshold, &inventory, None, None).await;
+        let result =
+            check_imbalance_and_build_operation(Chain::Base, &threshold, &inventory, None, None)
+                .await;
 
         assert_eq!(
             result,
@@ -2698,6 +2909,7 @@ mod tests {
 
     fn tracking(direction: RebalanceDirection, stage: UsdcRebalanceStage) -> UsdcRebalanceTracking {
         UsdcRebalanceTracking {
+            corridor: UsdcCorridor::BASE_CCTP,
             direction,
             initiated_amount: Usdc::new(float!(100)),
             bridged_amount_received: None,
@@ -2879,6 +3091,7 @@ mod tests {
         use UsdcRebalanceStage::*;
 
         let tracking = |direction, stage| UsdcRebalanceTracking {
+            corridor: UsdcCorridor::BASE_CCTP,
             direction,
             initiated_amount: Usdc::new(float!(400.0)),
             bridged_amount_received: None,

@@ -1124,7 +1124,7 @@ fn classify_fail_bridging_reload(state: Option<&UsdcRebalance>) -> FailBridgingO
 /// NOT serve as a safety net here.
 ///
 /// The command is CLI-direct (no running bot required). The live in-memory
-/// `usdc_in_progress` guard is NOT cleared by this command. A bot restart is
+/// guard of the transfer's corridor is NOT cleared by this command. A bot restart is
 /// required: `recover_usdc_guard` on startup skips
 /// `BridgingFailed { burn_tx_hash: None }` (non-guard-holding) and does not
 /// re-latch the guard.

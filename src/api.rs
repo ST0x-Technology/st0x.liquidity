@@ -1967,7 +1967,7 @@ async fn resume_usdc_transfer(
 fn usdc_resume_error_response(error: &UsdcResumeError) -> (StatusCode, String) {
     use UsdcResumeError::{
         Aggregate, AlreadyInFlight, AlreadyTerminal, ApalisDatabase, CorridorNotServed, Database,
-        DirectionMismatch, GuardHeldElsewhere, NotFound, NotReady, Queue,
+        DirectionMismatch, EveryCorridorLatched, GuardHeldElsewhere, NotFound, NotReady, Queue,
     };
 
     match error {
@@ -1975,7 +1975,9 @@ fn usdc_resume_error_response(error: &UsdcResumeError) -> (StatusCode, String) {
         DirectionMismatch { .. } | AlreadyTerminal { .. } | CorridorNotServed { .. } => {
             (StatusCode::UNPROCESSABLE_ENTITY, error.to_string())
         }
-        AlreadyInFlight { .. } | GuardHeldElsewhere => (StatusCode::CONFLICT, error.to_string()),
+        AlreadyInFlight { .. } | GuardHeldElsewhere | EveryCorridorLatched => {
+            (StatusCode::CONFLICT, error.to_string())
+        }
         NotReady => (StatusCode::SERVICE_UNAVAILABLE, error.to_string()),
         Aggregate(_) | Database(_) | ApalisDatabase(_) | Queue(_) => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -6917,6 +6919,9 @@ mod tests {
         assert_eq!(status, StatusCode::CONFLICT);
 
         let (status, _) = usdc_resume_error_response(&UsdcResumeError::GuardHeldElsewhere);
+        assert_eq!(status, StatusCode::CONFLICT);
+
+        let (status, _) = usdc_resume_error_response(&UsdcResumeError::EveryCorridorLatched);
         assert_eq!(status, StatusCode::CONFLICT);
 
         let (status, _) = usdc_resume_error_response(&UsdcResumeError::NotReady);

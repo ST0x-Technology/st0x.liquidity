@@ -9,7 +9,7 @@
 //! share the same entry point — that uniformity is what makes recovery
 //! dispatch fall out of the standard transfer lifecycle.
 //!
-//! The global `usdc_in_progress` guard is cleared event-driven when the
+//! The transfer's corridor guard is released event-driven when the
 //! aggregate reaches a terminal state (success or a recorded failure), not by
 //! this worker. A transient failure that only schedules a retry, or an
 //! indeterminate failure that leaves the aggregate mid-flight (e.g. stalled at
@@ -4948,7 +4948,7 @@ mod tests {
         let error = Job::perform(&job, &ctx).await.unwrap_err();
 
         // The failure must propagate (not be swallowed) so apalis retries and the
-        // event-driven `usdc_in_progress` guard stays latched until the aggregate
+        // event-driven corridor guard stays latched until the aggregate
         // reaches a terminal state -- swallowing it would free the guard and let a
         // fresh transfer arm on top of a partial one.
         assert!(
