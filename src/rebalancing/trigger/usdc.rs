@@ -592,6 +592,12 @@ impl RebalancingService {
         }
 
         let terminal_action = self.usdc_terminal_action(&id, &event).await;
+        // The inventory addresses only the primary chain: a transfer on
+        // another corridor never takes or clears its active marker.
+        let on_primary = match self.transfer_chain(&id).await {
+            Some(chain) => chain == self.inventory.read().await.primary_chain(),
+            None => true,
+        };
         let settlement_outcome = self
             .apply_usdc_rebalance_event(&id, &event, terminal_action)
             .await?;
@@ -599,11 +605,14 @@ impl RebalancingService {
         let is_clearable_terminal = terminal_action == UsdcTerminalAction::Clear;
         {
             let mut inventory = self.inventory.write().await;
-            *inventory = if is_clearable_terminal {
-                inventory.clone().clear_active_usdc_rebalance()
-            } else {
-                inventory.clone().set_active_usdc_rebalance(id.clone())
-            };
+            if is_clearable_terminal {
+                let chain = inventory.primary_chain();
+                if on_primary && inventory.owns_usdc_rebalance_slot(&id, chain) {
+                    *inventory = inventory.clone().clear_active_usdc_rebalance();
+                }
+            } else if on_primary {
+                *inventory = inventory.clone().set_active_usdc_rebalance(id.clone());
+            }
         }
         if is_clearable_terminal {
             self.usdc_tracking.write().await.remove(&id);
@@ -1046,7 +1055,7 @@ impl RebalancingService {
             // updated here: defer the immediate imbalance check to the next
             // snapshot poll rather than reading stale inventory.
             OperatorReconciled { direction, .. } => {
-                self.reconcile_operator_resolved(direction, Utc::now())
+                self.reconcile_operator_resolved(id, direction, Utc::now())
                     .await?;
                 UsdcSettlementOutcome::DeferredToSnapshot
             }
@@ -1064,22 +1073,45 @@ impl RebalancingService {
     /// file to apply the inflight side-effect when the live reactor processes
     /// the event.
     ///
+    /// Only a transfer that owns the primary chain's slot (see
+    /// `InventoryView::owns_usdc_rebalance_slot`) touches the inflight.
+    ///
     /// The timeout sweep in `mod.rs` does NOT call this function: it inlines
     /// `clear_usdc_inflight + clear_active_usdc_rebalance` in a single lock
     /// acquisition to avoid a transient state where inflight is zeroed but the
     /// active rebalance is still set.
     async fn reconcile_operator_resolved(
         &self,
+        id: &UsdcRebalanceId,
         direction: &RebalanceDirection,
         now: DateTime<Utc>,
     ) -> Result<(), RebalancingServiceError> {
+        let chain = match self.usdc_tracking.read().await.get(id) {
+            Some(tracking) => tracking.corridor.chain(),
+            None => self.inventory.read().await.primary_chain(),
+        };
         let mut inventory = self.inventory.write().await;
-        *inventory = inventory
-            .clone()
-            .clear_usdc_inflight(source_venue(*direction), now)?;
+        if inventory.owns_usdc_rebalance_slot(id, chain) {
+            *inventory = inventory
+                .clone()
+                .clear_usdc_inflight(source_venue(*direction), now)?;
+        }
         drop(inventory);
 
         Ok(())
+    }
+
+    /// The chain of `id`'s corridor: from tracking, else from the store;
+    /// `None` when neither knows it.
+    async fn transfer_chain(&self, id: &UsdcRebalanceId) -> Option<Chain> {
+        if let Some(tracking) = self.usdc_tracking.read().await.get(id) {
+            return Some(tracking.corridor.chain());
+        }
+
+        match self.durable_corridor(id).await {
+            DurableCorridor::Found { corridor, .. } => Some(corridor.chain()),
+            DurableCorridor::Missing | DurableCorridor::Unread => None,
+        }
     }
 
     async fn warn_if_post_burn_tracking_missing(&self, id: &UsdcRebalanceId) {

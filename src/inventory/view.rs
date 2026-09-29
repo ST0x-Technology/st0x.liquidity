@@ -2805,6 +2805,14 @@ impl InventoryView {
         }
     }
 
+    /// Whether `id`, a transfer on `chain`, owns the USDC inflight and the
+    /// active marker: the inventory addresses only the primary chain, so a
+    /// transfer on another corridor, or one that is not the active rebalance,
+    /// must leave them to their owner.
+    pub(crate) fn owns_usdc_rebalance_slot(&self, id: &UsdcRebalanceId, chain: Chain) -> bool {
+        chain == self.primary_chain && self.active_usdc_rebalance.as_ref() == Some(id)
+    }
+
     /// Clears the in-flight USDC rebalance ID (no-op if already empty).
     pub(crate) fn clear_active_usdc_rebalance(self) -> Self {
         Self {

@@ -2425,10 +2425,15 @@ impl RebalancingService {
                         drop(tracking_guard);
 
                         let mut inventory = self.inventory.write().await;
-                        let result = inventory
-                            .clone()
-                            .clear_usdc_inflight(tracking.source_venue(), now)
-                            .map(InventoryView::clear_active_usdc_rebalance);
+                        let result =
+                            if inventory.owns_usdc_rebalance_slot(id, tracking.corridor.chain()) {
+                                inventory
+                                    .clone()
+                                    .clear_usdc_inflight(tracking.source_venue(), now)
+                                    .map(InventoryView::clear_active_usdc_rebalance)
+                            } else {
+                                Ok(inventory.clone())
+                            };
 
                         match result {
                             Ok(updated) => *inventory = updated,
@@ -2563,10 +2568,12 @@ impl RebalancingService {
         }
 
         let mut inventory = self.inventory.write().await;
-        *inventory = inventory
-            .clone()
-            .clear_usdc_inflight(tracking.source_venue(), now)?
-            .clear_active_usdc_rebalance();
+        if inventory.owns_usdc_rebalance_slot(id, tracking.corridor.chain()) {
+            *inventory = inventory
+                .clone()
+                .clear_usdc_inflight(tracking.source_venue(), now)?
+                .clear_active_usdc_rebalance();
+        }
         drop(inventory);
 
         self.timed_out_usdc_rebalances
@@ -20221,6 +20228,7 @@ mod tests {
 
     #[tokio::test]
     async fn timed_out_usdc_rebalance_clears_guards_and_ignores_late_events() {
+        let id = UsdcRebalanceId(Uuid::new_v4());
         let inventory = InventoryView::default()
             .with_usdc(usdc(100), usdc(900))
             .with_withdrawable_cash_cents(90_000)
@@ -20228,7 +20236,8 @@ mod tests {
                 Inventory::transfer(Venue::Hedging, TransferOp::Start, usdc(400)),
                 Utc::now(),
             )
-            .unwrap();
+            .unwrap()
+            .set_active_usdc_rebalance(id.clone());
         let reactor = make_trigger_with_inventory_config(
             inventory,
             test_config_with_timeout(Duration::from_secs(1)),
@@ -20236,7 +20245,6 @@ mod tests {
         .await;
         let trigger = reactor.clone();
         let harness = ReactorHarness::new(Arc::clone(&trigger));
-        let id = UsdcRebalanceId(Uuid::new_v4());
 
         trigger
             .usdc_guards
@@ -30900,6 +30908,7 @@ mod tests {
     #[tokio::test]
     async fn timed_out_usdc_cleanup_tombstones_before_late_conversion_event() {
         let now = Utc::now();
+        let id = UsdcRebalanceId(Uuid::new_v4());
         let inventory = InventoryView::default()
             .with_usdc(usdc(5000), usdc(5000))
             .update_usdc(
@@ -30911,9 +30920,9 @@ mod tests {
                 Inventory::transfer(Venue::Hedging, TransferOp::Start, usdc(300)),
                 now,
             )
-            .unwrap();
+            .unwrap()
+            .set_active_usdc_rebalance(id.clone());
         let trigger = make_trigger_with_inventory(inventory).await;
-        let id = UsdcRebalanceId(Uuid::new_v4());
 
         trigger.usdc_tracking.write().await.insert(
             id.clone(),
