@@ -562,7 +562,10 @@ guard records the transfers that hold it. Who touches it, and when:
   corridor with no automated recovery: found at startup"; so does a post-burn
   failure whose corridor the running bot cannot read, which pages once per
   transfer ("USDC rebalancing is LATCHED on every corridor with no automated
-  recovery"). Repair the transfer, then restart.
+  recovery"). Repair the transfer, then restart. A transfer whose aggregate
+  fails to load (a store error, possibly transient) instead blocks every
+  corridor until the timeout sweep reads it and pages "USDC rebalancing is
+  BLOCKED on every corridor"; retry or restart if it persists.
 - **Single-flight for manual commands**: the resume endpoint refuses while any
   live or retryable USDC job row exists on the transfer's corridor (either
   direction) or while another aggregate durably holds that corridor's guard (for
@@ -889,19 +892,22 @@ before the startup token approvals.
   transfer per run: a restart pages again): the transfer was recorded on a USDC
   corridor this build does not carry, for example after a rollback from a build
   that served it, or after the corridor config changed. This build cannot move
-  its funds. The bot holds the transfer and its corridor's guard (other
-  corridors keep running): its job re-queues itself every 10 minutes (a warning
-  log each time, no page) until the transfer holds no guard (reconciled, say),
-  when the job ends; startup and the timeout sweep do not re-arm it. A job for a
-  fresh transfer asking for that corridor (nothing recorded yet) dead-letters
-  instead, and its dead-letter alert contains the same text. `transfer resume`
-  and `transfer recheck` are refused with messages that start with the same
-  words. `transfer reconcile` does not accept the pre-burn states such a
-  transfer is usually in; do not try it there. A held transfer in a reconcilable
-  failed state can be reconciled as usual, and the next sweep releases its
-  guard. Deploy a build (and config) that serves the named corridor; that
-  build's worker picks up the queued job within 10 minutes and resumes the
-  transfer where it stopped.
+  its funds. The bot holds the transfer and its corridor's guard. Other
+  corridors keep running, except that an Alpaca-outbound held transfer blocks
+  Alpaca-outbound transfers on every corridor (the page says so), and an
+  unserved corridor on the served chain with another hop holds the served
+  corridor's guard, since guards are keyed by chain: its job re-queues itself
+  every 10 minutes (a warning log each time, no page) until the transfer holds
+  no guard (reconciled, say), when the job ends; startup and the timeout sweep
+  do not re-arm it. A job for a fresh transfer asking for that corridor (nothing
+  recorded yet) dead-letters instead, and its dead-letter alert contains the
+  same text. `transfer resume` and `transfer recheck` are refused with messages
+  that start with the same words. `transfer reconcile` does not accept the
+  pre-burn states such a transfer is usually in; do not try it there. A held
+  transfer in a reconcilable failed state can be reconciled as usual, and the
+  next sweep releases its guard. Deploy a build (and config) that serves the
+  named corridor; that build's worker picks up the queued job within 10 minutes
+  and resumes the transfer where it stopped.
 
 ### Clearing a dropped pending burn (`BridgingSubmitting` latch)
 

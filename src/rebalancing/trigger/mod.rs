@@ -2003,7 +2003,8 @@ impl RebalancingService {
                     direction,
                 } => {
                     self.usdc_guards.hold(corridor.chain(), &id, direction);
-                    self.page_unserved_corridor_once(&id, corridor).await;
+                    self.page_unserved_corridor_once(&id, corridor, direction)
+                        .await;
                 }
             }
         }
@@ -2015,7 +2016,12 @@ impl RebalancingService {
     /// corridor this build does not serve and holds that corridor's guard. The id
     /// is recorded before the send, so a concurrent caller does not page too,
     /// and removed again if delivery fails, so a later sweep retries.
-    async fn page_unserved_corridor_once(&self, id: &UsdcRebalanceId, corridor: UsdcCorridor) {
+    async fn page_unserved_corridor_once(
+        &self,
+        id: &UsdcRebalanceId,
+        corridor: UsdcCorridor,
+        direction: RebalanceDirection,
+    ) {
         if !self
             .corridor_not_served_alerted
             .write()
@@ -2026,11 +2032,17 @@ impl RebalancingService {
         }
 
         let served = self.config.served_usdc_corridor;
+        let outbound = match direction {
+            RebalanceDirection::AlpacaToBase => {
+                " Alpaca-outbound transfers are blocked on every corridor until it clears."
+            }
+            RebalanceDirection::BaseToAlpaca => "",
+        };
         let message = format!(
             "USDC transfer corridor mismatch: transfer {id} runs on the {corridor} corridor, \
              which this build does not serve (it serves {served}). It holds the {corridor} \
              guard and is not re-armed; deploy a build that serves {corridor} \
-             (docs/cli-ops.md)."
+             (docs/cli-ops.md).{outbound}"
         );
 
         if let Err(error) = self.notifier.notify(&message).await {
@@ -6598,7 +6610,7 @@ impl RebalancingService {
                     if entity.holds_rebalance_guard()
                         && entity.corridor() != self.config.served_usdc_corridor =>
                 {
-                    self.page_unserved_corridor_once(&id, entity.corridor())
+                    self.page_unserved_corridor_once(&id, entity.corridor(), entity.direction())
                         .await;
                     held_tracking.push((
                         id.clone(),
@@ -35791,8 +35803,16 @@ mod tests {
         let id = UsdcRebalanceId(Uuid::new_v4());
 
         tokio::join!(
-            trigger.page_unserved_corridor_once(&id, ROBINHOOD_RELAY),
-            trigger.page_unserved_corridor_once(&id, ROBINHOOD_RELAY),
+            trigger.page_unserved_corridor_once(
+                &id,
+                ROBINHOOD_RELAY,
+                RebalanceDirection::BaseToAlpaca
+            ),
+            trigger.page_unserved_corridor_once(
+                &id,
+                ROBINHOOD_RELAY,
+                RebalanceDirection::BaseToAlpaca
+            ),
         );
 
         assert_eq!(corridor_pages(&notifier.0).len(), 1);

@@ -4047,14 +4047,17 @@ job re-queues itself every 10 minutes without a retry cost, so a build that
 serves the corridor finds a job to resume it, until the transfer holds no guard
 (reconciled, say), when the job ends; startup recovery (even while a job is
 live) and the timeout sweep never re-arm it, and its corridor's guard stays
-held; other corridors are not blocked. A fresh job asking for another corridor
-has no transfer to hold: it retries, dead-letters, and its dead-letter alert
-pages once. Startup recovery pages once per transfer per run (the record is kept
-in memory) with "USDC transfer corridor mismatch: transfer {id} runs on the
-{corridor} corridor, which this build does not serve"; the timeout sweep retries
-that page until it is delivered and raises no other stall alert for the
-transfer. The next sweep releases its guard once it is reconciled, or once an
-operator moves it to a state that holds no guard (such as a pre-burn
+held. Other corridors keep running, with two limits: an Alpaca-outbound held
+transfer blocks Alpaca-outbound claims on every corridor (its page says so), and
+because guards are keyed by chain, an unserved corridor on the served chain with
+another hop holds the served corridor's own guard. A fresh job asking for
+another corridor has no transfer to hold: it retries, dead-letters, and its
+dead-letter alert pages once. Startup recovery pages once per transfer per run
+(the record is kept in memory) with "USDC transfer corridor mismatch: transfer
+{id} runs on the {corridor} corridor, which this build does not serve"; the
+timeout sweep retries that page until it is delivered and raises no other stall
+alert for the transfer. The next sweep releases its guard once it is reconciled,
+or once an operator moves it to a state that holds no guard (such as a pre-burn
 `BridgingFailed`). A manual `transfer resume` or `transfer recheck` is refused
 (422). The way out is a build that serves that corridor.
 
@@ -4705,13 +4708,17 @@ terminal states only.
   corridor's guard until a restart can classify them, with an operator alert
   that leads with the every-corridor phrase below and says it was found at
   startup (not the per-corridor "LATCHED on startup" phrase, which does not
-  page). These indicate store inconsistency and require manual investigation.
-  The running bot latches every corridor the same way when a post-burn failure's
-  corridor cannot be read (no in-memory tracking and the aggregate does not
-  load); the latch lasts until a restart and pages once per transfer, retried by
-  the timeout sweep until delivered: "USDC rebalancing is LATCHED on every
-  corridor with no automated recovery". While any every-corridor latch is set,
-  manual resumes are refused.
+  page). These indicate store inconsistency and require manual investigation. A
+  candidate whose load fails (a store error, possibly transient) does not latch:
+  it blocks every corridor only until the timeout sweep reads it, then holds its
+  own corridor, and pages once per transfer with "retry or restart"; the running
+  bot does the same for a post-burn failure whose aggregate fails to load. The
+  running bot latches every corridor like a missing candidate when a post-burn
+  failure's corridor cannot be read (no in-memory tracking and the aggregate
+  does not load); the latch lasts until a restart and pages once per transfer,
+  retried by the timeout sweep until delivered: "USDC rebalancing is LATCHED on
+  every corridor with no automated recovery". While any every-corridor latch is
+  set, manual resumes are refused.
 
 Note: USDC (FiatToken v2.2) decrements even `U256::MAX` allowances in
 `transferFrom`. At realistic rebalancing sizes the allowance never drops below
