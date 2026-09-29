@@ -3608,9 +3608,8 @@ impl RebalancingService {
                 // poll is forced through aggregate deduplication and replaces
                 // the slot from authoritative chain state before rebalancing
                 // can resume.
-                let (primary_chain, equity_reconciled, usdc_reconciled) = {
+                let (equity_reconciled, usdc_reconciled) = {
                     let mut inventory = self.inventory.write().await;
-                    let primary_chain = inventory.primary_chain();
                     let equity_slot_seeded =
                         inventory.onchain_equity_slot_seeded(&symbol, trade_id.chain);
                     let usdc_slot_seeded = inventory.onchain_usdc_slot_seeded(trade_id.chain);
@@ -3744,7 +3743,7 @@ impl RebalancingService {
                     }
                     *inventory = updated;
                     drop(inventory);
-                    (primary_chain, equity_reconciled, usdc_reconciled)
+                    (equity_reconciled, usdc_reconciled)
                 };
 
                 if !equity_reconciled {
@@ -3761,7 +3760,6 @@ impl RebalancingService {
                 self.schedule_fill_checks(
                     symbol,
                     trade_id.chain,
-                    primary_chain,
                     equity_reconciled,
                     usdc_reconciled,
                 )
@@ -4383,14 +4381,13 @@ impl RebalancingService {
     /// chain: a fill on a chain whose listing rebalances the symbol moves
     /// that chain's slot, so it schedules the symbol's check, while a
     /// hedge-only listing is prefunded and outside the planner's total. USDC
-    /// still rebalances on the primary chain only. A clamped leg waits for
-    /// the next pinned snapshot instead of sizing a transfer from an
-    /// acknowledged intermediate balance.
+    /// rebalances on the configured corridor's chain, so only a fill there
+    /// schedules its check. A clamped leg waits for the next pinned snapshot
+    /// instead of sizing a transfer from an acknowledged intermediate balance.
     async fn schedule_fill_checks(
         &self,
         symbol: Symbol,
         fill_chain: Chain,
-        primary_chain: Chain,
         equity_reconciled: bool,
         usdc_reconciled: bool,
     ) {
@@ -4402,7 +4399,12 @@ impl RebalancingService {
             self.equity_scheduler.enqueue_check(symbol).await;
         }
 
-        if fill_chain == primary_chain && usdc_reconciled {
+        let on_corridor_chain = self
+            .config
+            .usdc
+            .as_ref()
+            .is_some_and(|usdc| usdc.corridor.chain() == fill_chain);
+        if on_corridor_chain && usdc_reconciled {
             self.usdc_scheduler.enqueue_check().await;
         }
     }
