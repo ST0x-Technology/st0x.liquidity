@@ -328,6 +328,7 @@ mod tests {
     use alloy::primitives::U256;
     use alloy::providers::ext::AnvilApi as _;
     use alloy::providers::fillers::NonceManager as _;
+    use alloy::rpc::types::TransactionRequest;
     use alloy::sol;
     use alloy::sol_types::SolCall as _;
 
@@ -782,6 +783,61 @@ mod tests {
             next_nonce,
             prepared.nonce(),
             "discarding the never-broadcast reservation must free its nonce for reuse"
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_rebroadcast_after_a_superseded_release_stays_releasable() {
+        // A resume row that loaded the withdrawal before the reconcile can
+        // rebroadcast it after the release. The mined replacement makes that
+        // fail as "nonce too low", and the hold it re-added must still be
+        // findable by hash so the next release removes it instead of leaking it.
+        let (_anvil, wallet, _token_address, signer_address) = setup_anvil_with_token().await;
+        let prepared = wallet
+            .prepare_pending(signer_address, Bytes::new(), "withdrawal to supersede")
+            .await
+            .unwrap();
+        wallet.release_superseded(prepared.tx_hash()).await;
+
+        // A different transaction at the same nonce: a 1 wei self-transfer, so
+        // it cannot be byte-identical to the empty-calldata prepared one.
+        wallet
+            .provider()
+            .send_transaction(
+                TransactionRequest::default()
+                    .from(signer_address)
+                    .to(signer_address)
+                    .value(U256::from(1))
+                    .nonce(prepared.nonce()),
+            )
+            .await
+            .unwrap()
+            .get_receipt()
+            .await
+            .unwrap();
+        let error = wallet
+            .broadcast_prepared(&prepared, "stale rebroadcast after reconcile")
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                EvmError::PreparedTransactionReconciliationPending { .. }
+            ),
+            "the superseded bytes cannot land; got: {error:?}"
+        );
+
+        wallet.release_superseded(prepared.tx_hash()).await;
+
+        assert_eq!(
+            wallet.in_flight.ownership(signer_address, prepared.nonce()),
+            NonceOwnership::Unknown
+        );
+        assert!(
+            !wallet
+                .nonce_manager
+                .release_occupied_nonce(signer_address, prepared.nonce()),
+            "the hold re-added by the stale rebroadcast must be released by hash"
         );
     }
 

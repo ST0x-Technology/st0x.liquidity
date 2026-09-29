@@ -735,8 +735,11 @@ stox transfer reconcile --kind redemption --id <redemption-aggregate-id> \
   mempool or a rebroadcast, so "not pending" is not enough. Send a 0-value
   self-transfer from the bot wallet at the withdrawal's nonce, with fees above
   the withdrawal's, and wait until it confirms. Then reconcile. If the
-  withdrawal mined instead, do not reconcile: the next redrive continues the
-  redemption.
+  withdrawal itself mined and reverted, or mined with no matching vault
+  transfer, it already used the nonce and moved nothing: the bot cannot confirm
+  it and `fail` refuses it, so reconcile directly with no replacement. Only if
+  the withdrawal mined successfully, do not reconcile: the next redrive
+  continues the redemption.
 
 ### Base->Alpaca deposit send pages
 

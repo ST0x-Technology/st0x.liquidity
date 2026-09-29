@@ -414,6 +414,11 @@ where
     nonce_manager
         .reserve_prepared_nonce(address, prepared.nonce())
         .await;
+    // Record the hash with the hold, before any early return. Persisted exact
+    // bytes retain their nonce through a definitive drop so durable recovery can
+    // rebroadcast them, and a hash-keyed release can always find the hold again,
+    // including one re-added by a stale rebroadcast after a reconcile.
+    in_flight.record_durable(address, prepared.nonce(), tx_hash);
 
     match provider.send_raw_transaction(prepared.raw()).await {
         Ok(_) => {}
@@ -433,9 +438,6 @@ where
         }
     }
 
-    // Persisted exact bytes retain their nonce through a definitive drop so
-    // durable recovery can rebroadcast them.
-    in_flight.record_durable(address, prepared.nonce(), tx_hash);
     info!(target: "wallet", %tx_hash, note, nonce = prepared.nonce(), "Prepared transaction broadcast");
     Ok(tx_hash)
 }
@@ -1868,7 +1870,9 @@ mod tests {
         assert!(error.is_confirmation_pending());
         assert_eq!(
             in_flight.ownership(WALLET, STUCK_NONCE),
-            NonceOwnership::Unknown
+            NonceOwnership::Ours,
+            "the persisted bytes keep owning their nonce, so a hash-keyed release can \
+             still find the hold"
         );
         nonce_manager.set_next_nonce(WALLET, STUCK_NONCE).await;
         let unused_provider = ProviderBuilder::new().connect_mocked_client(Asserter::new());
@@ -1993,7 +1997,9 @@ mod tests {
         assert!(error.is_confirmation_pending());
         assert_eq!(
             in_flight.ownership(WALLET, STUCK_NONCE),
-            NonceOwnership::Unknown
+            NonceOwnership::Ours,
+            "the persisted bytes keep owning their nonce, so a hash-keyed release can \
+             still find the hold"
         );
     }
 
