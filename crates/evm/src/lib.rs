@@ -819,10 +819,10 @@ pub trait Wallet: Evm {
         prepared: &PreparedTransaction,
         note: &str,
     ) -> Result<TxHash, EvmError>;
-    /// Releases the wallet nonce reservation held for the withdrawal with this
-    /// transaction hash. Ownership-checked and idempotent, so it is safe for both
-    /// the persist-failure rollback (a just-prepared withdrawal that will never be
-    /// broadcast) and a repeated operator reconcile of a stuck withdrawal.
+    /// Releases the wallet nonce reservation held for the prepared transaction
+    /// with this transaction hash. Ownership-checked and idempotent, so it is
+    /// safe for both a persist-failure rollback (a just-prepared transaction that
+    /// will never be broadcast) and a repeated release of the same transaction.
     async fn discard_prepared(&self, tx_hash: TxHash);
 
     /// Restores allocator and ownership state for an exact transaction loaded

@@ -440,14 +440,12 @@ where
     Ok(tx_hash)
 }
 
-/// Release a withdrawal's nonce reservation, identified by its transaction hash.
-/// Ownership-checked: it releases only while the wallet's in-flight record still
-/// attributes the nonce to this exact transaction, so the persist-failure
-/// rollback and a repeated operator reconcile (observed by a sleeping redrive
-/// row, the timeout sweep, or apalis retries, possibly after the nonce was
-/// reallocated) are all safe. A stale repeat leaves intact whatever transaction
-/// has since taken the nonce, and a legacy hash-only withdrawal is released the
-/// same way.
+/// Release a prepared transaction's nonce reservation, identified by its
+/// transaction hash. Ownership-checked: it releases only while the wallet's
+/// in-flight record still attributes the nonce to this exact transaction, so a
+/// persist-failure rollback and repeated releases of the same transaction
+/// (possibly after the nonce was reallocated) are all safe. A stale repeat
+/// leaves intact whatever transaction has since taken the nonce.
 ///
 /// Takes the wallet send lock so this cannot race a concurrent nonce
 /// assignment (see [`prepare_with_nonce`]).
@@ -462,13 +460,13 @@ pub(crate) async fn discard_prepared(
         warn!(
             target: "wallet",
             %tx_hash,
-            "Discarding withdrawal and releasing its nonce reservation"
+            "Discarding prepared transaction and releasing its nonce reservation"
         );
     } else {
         debug!(
             target: "wallet",
             %tx_hash,
-            "Discarding withdrawal that no longer holds a nonce reservation \
+            "Discarding prepared transaction that no longer holds a nonce reservation \
              (already released or its nonce reallocated)"
         );
     }

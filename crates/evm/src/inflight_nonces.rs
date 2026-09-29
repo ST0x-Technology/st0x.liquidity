@@ -1,5 +1,5 @@
 //! Tracks nonces this wallet itself has assigned to transactions it has
-//! broadcast but not yet seen confirmed or proven dropped.
+//! signed or broadcast but not yet seen confirmed or proven dropped.
 //!
 //! [`ResettableNonceManager`](crate::nonce::ResettableNonceManager) owns the
 //! allocator's coherent set of prepared and broadcast-but-unconfirmed nonces.
@@ -21,7 +21,7 @@
 //! ## What this tracker can and cannot prove
 //!
 //! A nonce this process recorded is provably this wallet's own: it was
-//! assigned and broadcast by this tracker's own [`record`](InFlightNonces::record)
+//! assigned and signed or broadcast by this tracker's own [`record`](InFlightNonces::record)
 //! call. An *unrecorded* nonce, however, is not provably a co-signer's: after
 //! a restart, this wallet can have its own transactions still pending from
 //! before the restart, and this tracker starts empty with no way to tell
@@ -268,7 +268,7 @@ impl InFlightNonces {
     }
 
     /// Whether this wallet's own bookkeeping recognizes `nonce` as
-    /// currently occupied by a transaction it broadcast itself. See
+    /// currently occupied by a transaction it signed or broadcast itself. See
     /// [`NonceOwnership`] and the module doc for what each answer proves.
     pub(crate) fn ownership(&self, address: Address, nonce: u64) -> NonceOwnership {
         self.nonces

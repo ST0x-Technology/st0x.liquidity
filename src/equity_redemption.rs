@@ -1643,13 +1643,11 @@ impl EventSourced for EquityRedemption {
     // without this field replay into the legacy fail-closed state.
     // v9: `VaultWithdrawSubmitted` retains the prepared transaction through
     // confirmation so startup restores its nonce ownership before workers run.
-    // v10: `Reconciled` retained the prepared withdrawal so the running bot could
-    // release its wallet nonce reservation on operator reconcile.
-    // v11: `Reconciled` retains only the withdrawal's tx hash (not the full
-    // prepared bytes) and releases the nonce reservation by hash, so a legacy
-    // hash-only submission with no persisted prepared is also freed on reconcile.
+    // v10: `Reconciled` retains the withdrawal's tx hash so the running bot can
+    // release its wallet nonce reservation on operator reconcile, including a
+    // legacy hash-only submission with no persisted prepared transaction.
     // Additive; bumped to clear stale snapshots so they rebuild from events.
-    const SCHEMA_VERSION: u64 = 11;
+    const SCHEMA_VERSION: u64 = 10;
 
     fn originate(event: &Self::Event) -> Option<Self> {
         use EquityRedemptionEvent::*;

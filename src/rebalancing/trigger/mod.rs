@@ -22288,14 +22288,15 @@ mod tests {
         assert!(service.redemption_tracking.read().await.contains_key(&id));
     }
 
-    #[tokio::test]
-    async fn sweep_observes_durable_reconcile_of_submitting_redemption() {
-        // An operator's `transfer reconcile` writes `OperatorReconciled` through
-        // bare `send_command`, which the live reactor never observes. The timeout
-        // sweep must detect the durable `Reconciled` state and clear the guard,
-        // inflight, and tracking without a restart.
+    /// Seeds a `VaultWithdrawSubmitting` redemption through the reactor-wired
+    /// store, with the trigger holding its guard, then reconciles it
+    /// out-of-band through bare `send_command` as an operator's
+    /// `transfer reconcile` would, so only the timeout sweep can observe it.
+    async fn seed_out_of_band_reconciled_redemption(
+        label: &str,
+    ) -> (Arc<RebalancingService>, RedemptionAggregateId, Symbol) {
         let symbol = Symbol::new("tAAPL").unwrap();
-        let id = redemption_aggregate_id("swept-reconcile-submitting");
+        let id = redemption_aggregate_id(label);
         let inventory = InventoryView::default()
             .with_equity(symbol.clone(), shares(0), shares(0))
             .update_equity(
@@ -22380,6 +22381,18 @@ mod tests {
         .await
         .unwrap();
 
+        (service, id, symbol)
+    }
+
+    #[tokio::test]
+    async fn sweep_observes_durable_reconcile_of_submitting_redemption() {
+        // An operator's `transfer reconcile` writes `OperatorReconciled` through
+        // bare `send_command`, which the live reactor never observes. The timeout
+        // sweep must detect the durable `Reconciled` state and clear the guard,
+        // inflight, and tracking without a restart.
+        let (service, id, symbol) =
+            seed_out_of_band_reconciled_redemption("swept-reconcile-submitting").await;
+
         service.expire_stuck_redemptions(Utc::now()).await.unwrap();
 
         assert!(
@@ -22435,6 +22448,39 @@ mod tests {
             enqueued.aggregate_id, id,
             "the enqueued resume job must target the reconciled redemption"
         );
+    }
+
+    #[tokio::test]
+    async fn sweep_retains_the_nonce_release_job_when_its_enqueue_fails() {
+        // The sweep observes the durable reconcile, but the queue rejects the
+        // resume job that releases the withdrawal's nonce. The payload must stay
+        // in the pending set so a later tick retries it; dropping it would leave
+        // the nonce reserved until restart.
+        let (service, id, _symbol) =
+            seed_out_of_band_reconciled_redemption("swept-reconcile-enqueue-fails").await;
+        let ddl = format!(
+            "CREATE TRIGGER fail_hedging_push BEFORE INSERT ON Jobs \
+             WHEN NEW.job_type = '{}' \
+             BEGIN SELECT RAISE(ABORT, 'forced push failure'); END",
+            std::any::type_name::<TransferEquityToHedging>()
+        );
+        sqlx_apalis::query(&ddl)
+            .execute(service.transfer_equity_to_hedging_queue.pool())
+            .await
+            .unwrap();
+
+        service.expire_stuck_redemptions(Utc::now()).await.unwrap();
+
+        let pending = service
+            .pending_reconciled_nonce_release_jobs
+            .read()
+            .await
+            .clone();
+        assert_eq!(pending.len(), 1);
+        let retained = pending
+            .get(&id)
+            .expect("a failed enqueue must retain the resume job for a later tick");
+        assert_eq!(retained.aggregate_id, id);
     }
 
     #[tokio::test]

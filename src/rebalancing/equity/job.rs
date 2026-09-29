@@ -868,7 +868,7 @@ impl Job<TransferEquityToHedgingCtx> for TransferEquityToHedging {
                         target: "rebalance",
                         symbol = %self.symbol,
                         aggregate_id = %self.aggregate_id,
-                        "Released the reconciled withdrawal's nonce reservation"
+                        "Requested release of the reconciled withdrawal's nonce reservation"
                     ),
                     Err(error) => warn!(
                         target: "rebalance",
@@ -3213,7 +3213,7 @@ mod tests {
 
         // Seed a signed-but-unconfirmed withdrawal, then reconcile it out-of-band
         // (the operator verified it will never land). `Reconciled` retains the
-        // prepared withdrawal so the resume can release its nonce.
+        // withdrawal's tx hash so the resume can release its nonce.
         let id = redemption_aggregate_id("reconciled-nonce-release");
         let prepared = crate::equity_redemption::prepared_withdrawal_for_test();
         redemption_store
