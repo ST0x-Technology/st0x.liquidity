@@ -449,14 +449,20 @@ where
 ///
 /// Takes the wallet send lock so this cannot race a concurrent nonce
 /// assignment (see [`prepare_with_nonce`]).
-pub(crate) async fn discard_prepared(
+pub(crate) async fn discard_prepared<P>(
+    provider: &P,
     in_flight: &InFlightNonces,
     send_lock: &Mutex<()>,
     address: Address,
     tx_hash: TxHash,
-) {
+) where
+    P: Provider,
+{
     let _guard = send_lock.lock().await;
-    if in_flight.release_durable_by_hash(address, tx_hash).await {
+    if in_flight
+        .release_durable_by_hash(provider, address, tx_hash)
+        .await
+    {
         warn!(
             target: "wallet",
             %tx_hash,

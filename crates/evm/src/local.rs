@@ -229,7 +229,14 @@ where
     }
 
     async fn discard_prepared(&self, tx_hash: TxHash) {
-        discard_prepared(&self.in_flight, &self.send_lock, self.address(), tx_hash).await;
+        discard_prepared(
+            &self.provider,
+            &self.in_flight,
+            &self.send_lock,
+            self.address(),
+            tx_hash,
+        )
+        .await;
     }
 
     async fn restore_prepared(&self, prepared: &PreparedTransaction) {

@@ -728,12 +728,14 @@ stox transfer reconcile --kind redemption --id <redemption-aggregate-id> \
   `--reason` is free text.
 - Reconciling a redemption with a signed vault withdrawal releases the wallet
   nonce reservation of that withdrawal in the running bot, with no restart. The
-  release does not cancel the withdrawal. Reconcile only after you confirm that
-  the withdrawal can no longer mine: it is not pending, or another transaction
-  was mined from the bot wallet at its nonce. If it is still pending, replace it
-  at its nonce (a 0-value self-transfer at a higher fee) and wait for that
-  replacement to confirm first. Otherwise the bot's next signed send can queue
-  behind the stuck withdrawal again.
+  release does not cancel the withdrawal. Reconcile only after another
+  transaction from the bot wallet has mined at the withdrawal's nonce. A
+  withdrawal that is not pending on one node can still mine from another node's
+  mempool or a rebroadcast, so "not pending" is not enough. Send a 0-value
+  self-transfer from the bot wallet at the withdrawal's nonce, with fees above
+  the withdrawal's, and wait until it confirms. Then reconcile. If the
+  withdrawal mined instead, do not reconcile: the next redrive continues the
+  redemption.
 
 ### Base->Alpaca deposit send pages
 

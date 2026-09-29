@@ -1054,10 +1054,10 @@ impl Job<TransferEquityToHedgingCtx> for TransferEquityToHedging {
                 let message = format!(
                     "Equity redemption {} ({}) exhausted its transfer job budget while its \
                      Raindex vault withdrawal is unresolved, and no live job remains to drive \
-                     it. Verify the withdrawal onchain. If it is still pending, replace it at \
-                     its nonce and wait for the replacement to confirm. Once it can no longer \
-                     mine, reconcile it (`stox transfer reconcile --kind redemption --id {}`), \
-                     which releases its reservation and the wallet's hold on its nonce.",
+                     it. Verify the withdrawal onchain. To abandon it, send a 0-value \
+                     self-transfer at its nonce and wait for that to confirm; only then \
+                     reconcile it (`stox transfer reconcile --kind redemption --id {}`), which \
+                     releases its reservation and the wallet's hold on its nonce.",
                     self.aggregate_id, self.symbol, self.aggregate_id,
                 );
                 if let Err(alert_error) = ctx.notifier.notify(&message).await {

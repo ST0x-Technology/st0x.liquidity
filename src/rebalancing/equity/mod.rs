@@ -150,10 +150,10 @@ pub(crate) async fn withdrawal_reconciliation_redrive_delay(
                  prepared withdrawal signed at a fee the market then outran cannot confirm and \
                  is never fee-bumped, so later sends from this wallet queue behind its nonce. \
                  Automatic redrive continues at a slower cadence (guard held). Verify the \
-                 withdrawal on-chain. If it is still pending, replace it at its nonce and wait \
-                 for the replacement to confirm. Once it can no longer mine, reconcile the \
-                 redemption (`stox transfer reconcile --kind redemption --id {aggregate_id}`), \
-                 which releases its reservation and the wallet's hold on its nonce."
+                 withdrawal on-chain. To abandon it, send a 0-value self-transfer at its nonce \
+                 and wait for that to confirm; only then reconcile the redemption \
+                 (`stox transfer reconcile --kind redemption --id {aggregate_id}`), which \
+                 releases its reservation and the wallet's hold on its nonce."
             );
             if let Err(alert_error) = notifier.notify(&message).await {
                 warn!(

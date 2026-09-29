@@ -5969,8 +5969,9 @@ hash without a restart: the redemption's resume job releases it when it loads
 enqueues a resume job for a reconcile it observes (a failed enqueue is kept and
 retried on later sweep ticks). The release is ownership-checked and idempotent.
 It does not cancel the signed withdrawal, so the operator reconciles only after
-confirming that the withdrawal can no longer mine: it is no longer pending, or
-another transaction was mined at its nonce.
+another transaction from the bot wallet has mined at the withdrawal's nonce. A
+withdrawal that is only missing from a mempool can still mine, so the operator
+first sends a 0-value self-transfer at that nonce and waits for it to confirm.
 
 The `Reconciled` state retains the identifying fields (symbol, quantity,
 original failure reason, request/redemption identifiers) so the dashboard

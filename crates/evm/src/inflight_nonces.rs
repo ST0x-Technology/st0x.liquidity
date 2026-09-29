@@ -32,7 +32,9 @@
 //! [`ownership`](InFlightNonces::ownership) answers
 //! [`NonceOwnership::Unknown`], never a proven-foreign answer.
 
+use alloy::network::Network;
 use alloy::primitives::{Address, TxHash};
+use alloy::providers::Provider;
 use dashmap::DashMap;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -221,8 +223,9 @@ impl InFlightNonces {
     /// prepared transaction (e.g. reconciling a stuck vault withdrawal). Finds
     /// the nonce whose recorded hash set still contains `tx_hash`, removes that
     /// hash regardless of its drop policy, and when it was the nonce's last hash
-    /// releases the reservation and rewinds allocation so the freed nonce is
-    /// reused before any higher one.
+    /// releases the reservation. Allocation is rewound onto the freed nonce only
+    /// while the chain has not mined it (see
+    /// [`ResettableNonceManager::release_discarded_nonce`]).
     ///
     /// Keyed by hash, so it is safe against the two ways a reconcile can be
     /// observed more than once (a sleeping redrive row and the timeout sweep's
@@ -233,7 +236,16 @@ impl InFlightNonces {
     ///
     /// Callers must hold the wallet send lock across this operation.
     #[cfg(any(feature = "turnkey", feature = "local-signer"))]
-    pub(crate) async fn release_durable_by_hash(&self, address: Address, tx_hash: TxHash) -> bool {
+    pub(crate) async fn release_durable_by_hash<TProvider, TNetwork>(
+        &self,
+        provider: &TProvider,
+        address: Address,
+        tx_hash: TxHash,
+    ) -> bool
+    where
+        TProvider: Provider<TNetwork>,
+        TNetwork: Network,
+    {
         let released_nonce =
             {
                 let Some(mut record) = self.nonces.get_mut(&address) else {
@@ -259,7 +271,7 @@ impl InFlightNonces {
         match released_nonce {
             Some(nonce) => {
                 self.nonce_manager
-                    .release_nonce_and_rewind(address, nonce)
+                    .release_discarded_nonce(provider, address, nonce)
                     .await;
                 true
             }
@@ -280,7 +292,9 @@ impl InFlightNonces {
 
 #[cfg(test)]
 mod tests {
-    use alloy::primitives::address;
+    use alloy::primitives::{U64, address};
+    use alloy::providers::ProviderBuilder;
+    use alloy::providers::mock::Asserter;
 
     use super::*;
 
@@ -470,12 +484,18 @@ mod tests {
         let manager = ResettableNonceManager::default();
         let in_flight = InFlightNonces::new(manager.clone());
         let stuck_hash = TxHash::repeat_byte(0x91);
+        // Only the first release owns the nonce and reads the mined count.
+        let asserter = Asserter::new();
+        asserter.push_success(&U64::from(NONCE));
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
 
         in_flight.record_durable(ADDRESS, NONCE, stuck_hash);
         assert_eq!(in_flight.ownership(ADDRESS, NONCE), NonceOwnership::Ours);
 
         assert!(
-            in_flight.release_durable_by_hash(ADDRESS, stuck_hash).await,
+            in_flight
+                .release_durable_by_hash(&provider, ADDRESS, stuck_hash)
+                .await,
             "the first release still owns the nonce and must free the reservation"
         );
         assert_eq!(
@@ -489,7 +509,9 @@ mod tests {
         in_flight.record_durable(ADDRESS, NONCE, reused_hash);
 
         assert!(
-            !in_flight.release_durable_by_hash(ADDRESS, stuck_hash).await,
+            !in_flight
+                .release_durable_by_hash(&provider, ADDRESS, stuck_hash)
+                .await,
             "a repeat release for the already-released withdrawal must be a no-op"
         );
         assert_eq!(
