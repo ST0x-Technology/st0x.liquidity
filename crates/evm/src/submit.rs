@@ -346,8 +346,9 @@ where
     // Attribute the reserved nonce to this exact transaction at signing time,
     // not only at broadcast. A withdrawal wedged in `VaultWithdrawSubmitting`
     // (signed but never successfully broadcast) is a valid reconcile origin, and
-    // recording here lets the ownership-checked discard free its nonce on
-    // reconcile even when no broadcast or restart ever recorded it.
+    // recording here lets the ownership-checked release drop its hold on
+    // reconcile, and a persist-failure rollback free its nonce, even when no
+    // broadcast or restart ever recorded it.
     in_flight.record_durable(address, prepared.nonce(), prepared.tx_hash());
     Ok(prepared)
 }

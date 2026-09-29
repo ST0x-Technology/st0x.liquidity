@@ -750,11 +750,11 @@ mod tests {
 
     #[tokio::test]
     async fn discarding_a_never_broadcast_prepared_releases_its_nonce_for_reuse() {
-        // A withdrawal prepared and reserved but never broadcast (the wedged
-        // `VaultWithdrawSubmitting` reconcile origin) must have its nonce released
-        // by discard even though no broadcast or restart ever recorded it. The
-        // reservation is attributed to the exact transaction at prepare time, so
-        // the ownership-checked discard can free it.
+        // A persist-failure rollback: a withdrawal prepared and reserved but never
+        // broadcast must have its nonce released by discard even though no
+        // broadcast or restart ever recorded it. The reservation is attributed to
+        // the exact transaction at prepare time, so the ownership-checked discard
+        // can free it for reuse.
         let (_anvil, wallet, _token_address, signer_address) = setup_anvil_with_token().await;
         let prepared = wallet
             .prepare_pending(signer_address, Bytes::new(), "prepared but never broadcast")
@@ -783,6 +783,44 @@ mod tests {
             next_nonce,
             prepared.nonce(),
             "discarding the never-broadcast reservation must free its nonce for reuse"
+        );
+    }
+
+    #[tokio::test]
+    async fn superseded_release_of_a_never_broadcast_prepared_keeps_allocation() {
+        // A reconcile of a withdrawal wedged in `VaultWithdrawSubmitting` (signed
+        // but never broadcast). The hold and in-flight record must go, but the
+        // operator already mined a replacement at the nonce, so the release must
+        // not make that nonce reusable.
+        let (_anvil, wallet, _token_address, signer_address) = setup_anvil_with_token().await;
+        let prepared = wallet
+            .prepare_pending(signer_address, Bytes::new(), "wedged before broadcast")
+            .await
+            .unwrap();
+        let cached_before = wallet.nonce_manager.peek_next_nonce(signer_address).await;
+        assert_eq!(
+            cached_before,
+            Some(prepared.nonce() + 1),
+            "the prepare must have advanced the cache past the withdrawal's nonce"
+        );
+
+        wallet.release_superseded(prepared.tx_hash()).await;
+
+        assert_eq!(
+            wallet.in_flight.ownership(signer_address, prepared.nonce()),
+            NonceOwnership::Unknown,
+            "the release must clear the in-flight record"
+        );
+        assert!(
+            !wallet
+                .nonce_manager
+                .release_occupied_nonce(signer_address, prepared.nonce()),
+            "the release must drop the allocator hold"
+        );
+        assert_eq!(
+            wallet.nonce_manager.peek_next_nonce(signer_address).await,
+            cached_before,
+            "a superseded release must not rewind allocation onto the used nonce"
         );
     }
 

@@ -1057,8 +1057,11 @@ impl Job<TransferEquityToHedgingCtx> for TransferEquityToHedging {
                      Raindex vault withdrawal is unresolved, and no live job remains to drive \
                      it. Verify the withdrawal onchain. To abandon it, send a 0-value \
                      self-transfer at its nonce and wait for that to confirm (skip this if the \
-                     withdrawal itself mined and reverted); only then reconcile it (`stox transfer reconcile --kind redemption --id {}`), which \
-                     releases its reservation and the wallet's hold on its nonce.",
+                     withdrawal itself mined and reverted); only then reconcile it \
+                     (`stox transfer reconcile --kind redemption --id {}`), which releases its \
+                     reservation and the wallet's hold on its nonce. If the withdrawal mined \
+                     successfully, do not reconcile: run `stox transfer resume --kind equity` \
+                     or restart the bot so a new resume confirms it.",
                     self.aggregate_id, self.symbol, self.aggregate_id,
                 );
                 if let Err(alert_error) = ctx.notifier.notify(&message).await {

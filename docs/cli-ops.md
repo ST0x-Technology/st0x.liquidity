@@ -738,8 +738,12 @@ stox transfer reconcile --kind redemption --id <redemption-aggregate-id> \
   withdrawal itself mined and reverted, or mined with no matching vault
   transfer, it already used the nonce and moved nothing: the bot cannot confirm
   it and `fail` refuses it, so reconcile directly with no replacement. Only if
-  the withdrawal mined successfully, do not reconcile: the next redrive
-  continues the redemption.
+  the withdrawal mined successfully, do not reconcile: the redemption must
+  continue. A live redrive confirms it by itself. If the give-up page fired (the
+  job budget is spent and no job remains), run
+  `stox transfer resume --kind
+  equity` or restart the bot so that a new resume
+  confirms it.
 
 ### Base->Alpaca deposit send pages
 
