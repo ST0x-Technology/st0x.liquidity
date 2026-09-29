@@ -70,9 +70,8 @@ use crate::inventory::snapshot::{InventorySnapshot, InventorySnapshotEvent};
 use crate::inventory::view::InFlightEquityLocation;
 use crate::inventory::{
     BroadcastingInventory, Inventory, InventoryDivergenceGate, InventoryError, InventoryScope,
-    InventoryView, InventoryViewError, Operator, PendingRequestOwnership,
-    PendingRequestOwnershipSnapshot, PollFreshness, PortfolioAsset, PortfolioLocation, TransferOp,
-    Venue,
+    InventoryViewError, Operator, PendingRequestOwnership, PendingRequestOwnershipSnapshot,
+    PollFreshness, PortfolioAsset, PortfolioLocation, TransferOp, Venue,
 };
 use crate::native_gas::{ConfiguredGasReadiness, GasReadiness, TransferGasRoute};
 use crate::offchain::order::OffchainOrderId;
@@ -2615,7 +2614,7 @@ impl RebalancingService {
                                 inventory
                                     .clone()
                                     .clear_usdc_inflight(tracking.source_venue(), now)
-                                    .map(InventoryView::clear_active_usdc_rebalance)
+                                    .map(|view| view.clear_active_usdc_rebalance(id))
                             } else {
                                 Ok(inventory.clone())
                             };
@@ -2789,7 +2788,7 @@ impl RebalancingService {
             *inventory = inventory
                 .clone()
                 .clear_usdc_inflight(tracking.source_venue(), now)?
-                .clear_active_usdc_rebalance();
+                .clear_active_usdc_rebalance(id);
         }
         drop(inventory);
 
@@ -8697,7 +8696,7 @@ mod tests {
         InventorySnapshot, InventorySnapshotCommand, InventorySnapshotEvent, InventorySnapshotId,
     };
     use crate::inventory::view::{EquityReconcileBusy, InFlightEquityLocation, Operator};
-    use crate::inventory::{InventoryError, InventoryView, TransferOp, Venue};
+    use crate::inventory::{ActiveUsdcRebalance, InventoryError, InventoryView, TransferOp, Venue};
     use crate::mint_authorization::ConfiguredMintAuthorizer;
     use crate::offchain::order::OffchainOrderId;
     use crate::onchain::mock::MockRaindex;
@@ -18670,7 +18669,10 @@ mod tests {
                     Utc::now(),
                 )
                 .unwrap()
-                .set_active_usdc_rebalance(id.clone());
+                .set_active_usdc_rebalance(
+                    id.clone(),
+                    base_usdc_rebalance(RebalanceDirection::BaseToAlpaca),
+                );
         }
         trigger
             .usdc_guards
@@ -18739,7 +18741,10 @@ mod tests {
                     Utc::now(),
                 )
                 .unwrap()
-                .set_active_usdc_rebalance(id.clone());
+                .set_active_usdc_rebalance(
+                    id.clone(),
+                    base_usdc_rebalance(RebalanceDirection::AlpacaToBase),
+                );
         }
         trigger
             .usdc_guards
@@ -20157,6 +20162,13 @@ mod tests {
         Usdc::new(float!(&n.to_string()))
     }
 
+    fn base_usdc_rebalance(direction: RebalanceDirection) -> ActiveUsdcRebalance {
+        ActiveUsdcRebalance::Known {
+            chain: Chain::Base,
+            direction,
+        }
+    }
+
     fn make_usdc_initiated(direction: RebalanceDirection, amount: Usdc) -> UsdcRebalanceEvent {
         UsdcRebalanceEvent::Initiated {
             corridor: UsdcCorridor::BASE_CCTP,
@@ -20706,7 +20718,10 @@ mod tests {
                 Utc::now(),
             )
             .unwrap()
-            .set_active_usdc_rebalance(id.clone());
+            .set_active_usdc_rebalance(
+                id.clone(),
+                base_usdc_rebalance(RebalanceDirection::AlpacaToBase),
+            );
         let reactor = make_trigger_with_inventory_config(
             inventory,
             test_config_with_timeout(Duration::from_secs(1)),
@@ -24251,7 +24266,10 @@ mod tests {
                 now,
             )
             .unwrap()
-            .set_active_usdc_rebalance(id.clone());
+            .set_active_usdc_rebalance(
+                id.clone(),
+                base_usdc_rebalance(RebalanceDirection::BaseToAlpaca),
+            );
         let trigger = make_trigger_with_inventory_config(
             inventory,
             test_config_with_timeout(Duration::from_secs(1)),
@@ -24377,7 +24395,10 @@ mod tests {
                 now,
             )
             .unwrap()
-            .set_active_usdc_rebalance(id.clone());
+            .set_active_usdc_rebalance(
+                id.clone(),
+                base_usdc_rebalance(RebalanceDirection::BaseToAlpaca),
+            );
         let trigger = make_trigger_with_inventory_config(
             inventory,
             // Use a 30-minute timeout so that `last_progress_at = now` is
@@ -24496,7 +24517,10 @@ mod tests {
                 now,
             )
             .unwrap()
-            .set_active_usdc_rebalance(id.clone());
+            .set_active_usdc_rebalance(
+                id.clone(),
+                base_usdc_rebalance(RebalanceDirection::BaseToAlpaca),
+            );
         let trigger = make_trigger_with_inventory_config(
             inventory,
             test_config_with_timeout(Duration::from_secs(1800)),
@@ -24772,7 +24796,10 @@ mod tests {
                 now,
             )
             .unwrap()
-            .set_active_usdc_rebalance(id.clone());
+            .set_active_usdc_rebalance(
+                id.clone(),
+                base_usdc_rebalance(RebalanceDirection::BaseToAlpaca),
+            );
         let trigger = make_trigger_with_inventory_config(
             inventory,
             test_config_with_timeout(Duration::from_secs(1)),
@@ -25077,7 +25104,10 @@ mod tests {
                 now,
             )
             .unwrap()
-            .set_active_usdc_rebalance(id.clone());
+            .set_active_usdc_rebalance(
+                id.clone(),
+                base_usdc_rebalance(RebalanceDirection::AlpacaToBase),
+            );
         let trigger = make_trigger_with_inventory_config(
             inventory,
             test_config_with_timeout(Duration::from_secs(1)),
@@ -25561,7 +25591,10 @@ mod tests {
                 Utc::now(),
             )
             .unwrap()
-            .set_active_usdc_rebalance(id.clone());
+            .set_active_usdc_rebalance(
+                id.clone(),
+                base_usdc_rebalance(RebalanceDirection::BaseToAlpaca),
+            );
         let trigger = make_trigger_with_inventory_config(
             inventory,
             test_config_with_timeout(Duration::from_secs(1)),
@@ -25770,7 +25803,10 @@ mod tests {
                 Utc::now(),
             )
             .unwrap()
-            .set_active_usdc_rebalance(id.clone());
+            .set_active_usdc_rebalance(
+                id.clone(),
+                base_usdc_rebalance(RebalanceDirection::BaseToAlpaca),
+            );
         let trigger = make_trigger_with_inventory_config(
             inventory,
             test_config_with_timeout(Duration::from_secs(1)),
@@ -25918,7 +25954,10 @@ mod tests {
                 Utc::now(),
             )
             .unwrap()
-            .set_active_usdc_rebalance(id.clone());
+            .set_active_usdc_rebalance(
+                id.clone(),
+                base_usdc_rebalance(RebalanceDirection::AlpacaToBase),
+            );
         let trigger = make_trigger_with_inventory_config(
             inventory,
             test_config_with_timeout(Duration::from_secs(1)),
@@ -26521,7 +26560,10 @@ mod tests {
                 now,
             )
             .unwrap()
-            .set_active_usdc_rebalance(id.clone());
+            .set_active_usdc_rebalance(
+                id.clone(),
+                base_usdc_rebalance(RebalanceDirection::AlpacaToBase),
+            );
         let trigger = make_trigger_with_inventory_config(
             inventory,
             test_config_with_timeout(Duration::from_secs(1)),
@@ -31684,7 +31726,10 @@ mod tests {
                 now,
             )
             .unwrap()
-            .set_active_usdc_rebalance(id.clone());
+            .set_active_usdc_rebalance(
+                id.clone(),
+                base_usdc_rebalance(RebalanceDirection::BaseToAlpaca),
+            );
         let trigger = make_trigger_with_inventory(inventory).await;
 
         trigger.usdc_tracking.write().await.insert(
@@ -31764,7 +31809,10 @@ mod tests {
                 now,
             )
             .unwrap()
-            .set_active_usdc_rebalance(id.clone());
+            .set_active_usdc_rebalance(
+                id.clone(),
+                base_usdc_rebalance(RebalanceDirection::BaseToAlpaca),
+            );
         let trigger = make_trigger_with_inventory(inventory).await;
 
         trigger.usdc_tracking.write().await.insert(
@@ -32722,7 +32770,10 @@ mod tests {
         let symbol = Symbol::new("AAPL").unwrap();
         let inventory = InventoryView::default()
             .with_usdc(usdc(0), usdc(500))
-            .set_active_usdc_rebalance(UsdcRebalanceId(Uuid::new_v4()));
+            .set_active_usdc_rebalance(
+                UsdcRebalanceId(Uuid::new_v4()),
+                base_usdc_rebalance(RebalanceDirection::AlpacaToBase),
+            );
 
         let trigger = make_trigger_with_inventory_and_registry(inventory, &symbol).await;
 
@@ -34676,7 +34727,10 @@ mod tests {
         // was never rebuilt before the deposit settles.
         let inventory = InventoryView::default()
             .with_usdc(usdc(5000), usdc(5000))
-            .set_active_usdc_rebalance(id.clone());
+            .set_active_usdc_rebalance(
+                id.clone(),
+                base_usdc_rebalance(RebalanceDirection::AlpacaToBase),
+            );
         let trigger = make_trigger_with_inventory(inventory).await;
         let harness = ReactorHarness::new(Arc::clone(&trigger));
 
@@ -34771,7 +34825,10 @@ mod tests {
         // reservation was never rebuilt before the conversion settles.
         let inventory = InventoryView::default()
             .with_usdc(usdc(5000), usdc(5000))
-            .set_active_usdc_rebalance(id.clone());
+            .set_active_usdc_rebalance(
+                id.clone(),
+                base_usdc_rebalance(RebalanceDirection::BaseToAlpaca),
+            );
         let trigger = make_trigger_with_inventory(inventory).await;
         let harness = ReactorHarness::new(Arc::clone(&trigger));
 
@@ -34874,7 +34931,10 @@ mod tests {
                 Utc::now(),
             )
             .unwrap()
-            .set_active_usdc_rebalance(id.clone());
+            .set_active_usdc_rebalance(
+                id.clone(),
+                base_usdc_rebalance(RebalanceDirection::AlpacaToBase),
+            );
         let trigger = make_trigger_with_inventory(inventory).await;
         let harness = ReactorHarness::new(Arc::clone(&trigger));
 
@@ -34948,7 +35008,10 @@ mod tests {
         // underflows instead of confirm_inflight).
         let inventory = InventoryView::default()
             .with_usdc(usdc(5000), usdc(5000))
-            .set_active_usdc_rebalance(id.clone());
+            .set_active_usdc_rebalance(
+                id.clone(),
+                base_usdc_rebalance(RebalanceDirection::AlpacaToBase),
+            );
         let trigger = make_trigger_with_inventory(inventory).await;
         let harness = ReactorHarness::new(Arc::clone(&trigger));
 
@@ -35111,7 +35174,10 @@ mod tests {
         // inflight survived a restart.
         let inventory = InventoryView::default()
             .with_usdc_inflight(Usdc::ZERO, Usdc::ZERO, max_positive, max_positive)
-            .set_active_usdc_rebalance(id.clone());
+            .set_active_usdc_rebalance(
+                id.clone(),
+                base_usdc_rebalance(RebalanceDirection::AlpacaToBase),
+            );
         let trigger = make_trigger_with_inventory(inventory).await;
         let harness = ReactorHarness::new(Arc::clone(&trigger));
 

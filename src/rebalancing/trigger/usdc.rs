@@ -14,8 +14,8 @@ use st0x_finance::{Usd, Usdc};
 use super::{RebalancingService, RebalancingServiceError};
 use crate::conductor::job::{Job, JobQueue, Label, QueuePushError};
 use crate::inventory::{
-    BroadcastingInventory, Imbalance, ImbalanceThreshold, Inventory, InventoryError,
-    InventoryViewError, TransferOp, Venue,
+    ActiveUsdcRebalance, BroadcastingInventory, Imbalance, ImbalanceThreshold, Inventory,
+    InventoryError, InventoryViewError, TransferOp, Venue,
 };
 use crate::usdc_rebalance::{RebalanceDirection, UsdcRebalanceEvent, UsdcRebalanceId};
 
@@ -594,9 +594,12 @@ impl RebalancingService {
         let terminal_action = self.usdc_terminal_action(&id, &event).await;
         // The inventory addresses only the primary chain: a transfer on
         // another corridor never takes or clears its active marker.
-        let on_primary = match self.transfer_chain(&id).await {
-            Some(chain) => chain == self.inventory.read().await.primary_chain(),
-            None => true,
+        let active = self.active_usdc_rebalance(&id).await;
+        let on_primary = match active {
+            ActiveUsdcRebalance::Known { chain, .. } => {
+                chain == self.inventory.read().await.primary_chain()
+            }
+            ActiveUsdcRebalance::Unknown => true,
         };
         let settlement_outcome = self
             .apply_usdc_rebalance_event(&id, &event, terminal_action)
@@ -608,10 +611,12 @@ impl RebalancingService {
             if is_clearable_terminal {
                 let chain = inventory.primary_chain();
                 if on_primary && inventory.owns_usdc_rebalance_slot(&id, chain) {
-                    *inventory = inventory.clone().clear_active_usdc_rebalance();
+                    *inventory = inventory.clone().clear_active_usdc_rebalance(&id);
                 }
             } else if on_primary {
-                *inventory = inventory.clone().set_active_usdc_rebalance(id.clone());
+                *inventory = inventory
+                    .clone()
+                    .set_active_usdc_rebalance(id.clone(), active);
             }
         }
         if is_clearable_terminal {
@@ -1101,16 +1106,26 @@ impl RebalancingService {
         Ok(())
     }
 
-    /// The chain of `id`'s corridor: from tracking, else from the store;
-    /// `None` when neither knows it.
-    async fn transfer_chain(&self, id: &UsdcRebalanceId) -> Option<Chain> {
+    /// The corridor chain and direction of `id`: from tracking, else from the
+    /// store; `Unknown` when neither knows it.
+    async fn active_usdc_rebalance(&self, id: &UsdcRebalanceId) -> ActiveUsdcRebalance {
         if let Some(tracking) = self.usdc_tracking.read().await.get(id) {
-            return Some(tracking.corridor.chain());
+            return ActiveUsdcRebalance::Known {
+                chain: tracking.corridor.chain(),
+                direction: tracking.direction,
+            };
         }
 
         match self.durable_corridor(id).await {
-            DurableCorridor::Found { corridor, .. } => Some(corridor.chain()),
-            DurableCorridor::Missing | DurableCorridor::Unread => None,
+            DurableCorridor::Found {
+                corridor,
+                direction,
+                ..
+            } => ActiveUsdcRebalance::Known {
+                chain: corridor.chain(),
+                direction,
+            },
+            DurableCorridor::Missing | DurableCorridor::Unread => ActiveUsdcRebalance::Unknown,
         }
     }
 

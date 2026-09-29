@@ -22,7 +22,7 @@ use super::snapshot::InventorySnapshotEvent;
 use super::venue_balance::{InventoryError, VenueBalance};
 use crate::equity_redemption::RedemptionAggregateId;
 use crate::offchain::order::OffchainOrderId;
-use crate::usdc_rebalance::UsdcRebalanceId;
+use crate::usdc_rebalance::{RebalanceDirection, UsdcRebalanceId};
 
 /// Error type for inventory view operations.
 #[derive(Debug, thiserror::Error)]
@@ -168,6 +168,17 @@ pub(crate) enum EquityReconcileBusy {
 struct ActiveEquityTransfer<Id> {
     id: Id,
     chain: Chain,
+}
+
+/// The corridor chain and direction of an in-flight USDC rebalance, or
+/// `Unknown` when neither tracking nor the store names its corridor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) enum ActiveUsdcRebalance {
+    Known {
+        chain: Chain,
+        direction: RebalanceDirection,
+    },
+    Unknown,
 }
 
 /// Inventory at a pair of venues (onchain/offchain).
@@ -693,12 +704,13 @@ pub(crate) struct InventoryView {
     /// wallet polls cannot overwrite a fresher reading with a stale one.
     #[serde(default)]
     inflight_cash: HashMap<InFlightCashLocation, InFlightCashEntry>,
-    /// Aggregate ID of the in-flight USDC rebalance, if any.
+    /// In-flight USDC rebalances, keyed by aggregate ID, with the corridor
+    /// chain and direction each one moves.
     ///
-    /// Populated when a transfer initiates and cleared on terminal events.
-    /// Recovery uses this to load the stalled aggregate from its store.
+    /// Populated on a transfer's first non-terminal event and cleared on its
+    /// terminal event; a clear removes only its own entry.
     #[serde(default)]
-    active_usdc_rebalance: Option<UsdcRebalanceId>,
+    active_usdc_rebalances: HashMap<UsdcRebalanceId, ActiveUsdcRebalance>,
     /// In-flight equity mints, keyed by symbol, with the chain each mint
     /// deposits into.
     ///
@@ -1231,7 +1243,7 @@ impl Default for InventoryView {
             offchain_gross_usd_cents: None,
             alpaca_usdc: None,
             inflight_cash: HashMap::new(),
-            active_usdc_rebalance: None,
+            active_usdc_rebalances: HashMap::new(),
             active_mints: HashMap::new(),
             active_redemptions: HashMap::new(),
             inflight_equity: HashMap::new(),
@@ -1623,7 +1635,7 @@ impl InventoryView {
             offchain_gross_usd_cents: self.offchain_gross_usd_cents,
             alpaca_usdc: self.alpaca_usdc,
             inflight_cash: self.inflight_cash,
-            active_usdc_rebalance: self.active_usdc_rebalance,
+            active_usdc_rebalances: self.active_usdc_rebalances,
             active_mints: self.active_mints,
             active_redemptions: self.active_redemptions,
             inflight_equity: self.inflight_equity,
@@ -1675,7 +1687,7 @@ impl InventoryView {
             offchain_gross_usd_cents: self.offchain_gross_usd_cents,
             alpaca_usdc: self.alpaca_usdc,
             inflight_cash: self.inflight_cash,
-            active_usdc_rebalance: self.active_usdc_rebalance,
+            active_usdc_rebalances: self.active_usdc_rebalances,
             active_mints: self.active_mints,
             active_redemptions: self.active_redemptions,
             inflight_equity: self.inflight_equity,
@@ -2715,7 +2727,7 @@ impl InventoryView {
             offchain_gross_usd_cents: self.offchain_gross_usd_cents,
             alpaca_usdc: self.alpaca_usdc,
             inflight_cash: self.inflight_cash,
-            active_usdc_rebalance: self.active_usdc_rebalance,
+            active_usdc_rebalances: self.active_usdc_rebalances,
             active_mints: self.active_mints,
             active_redemptions: self.active_redemptions,
             inflight_equity: self.inflight_equity,
@@ -2758,7 +2770,7 @@ impl InventoryView {
             offchain_gross_usd_cents: self.offchain_gross_usd_cents,
             alpaca_usdc: self.alpaca_usdc,
             inflight_cash: self.inflight_cash,
-            active_usdc_rebalance: self.active_usdc_rebalance,
+            active_usdc_rebalances: self.active_usdc_rebalances,
             active_mints: self.active_mints,
             active_redemptions: self.active_redemptions,
             inflight_equity: self.inflight_equity,
@@ -2783,10 +2795,15 @@ impl InventoryView {
         })
     }
 
-    /// Returns the aggregate ID of the in-flight USDC rebalance, if any.
+    /// The sole in-flight USDC rebalance, if any; panics on more than one.
     #[cfg(test)]
     pub(crate) fn active_usdc_rebalance(&self) -> Option<&UsdcRebalanceId> {
-        self.active_usdc_rebalance.as_ref()
+        assert!(
+            self.active_usdc_rebalances.len() <= 1,
+            "expected at most one active USDC rebalance, got {:?}",
+            self.active_usdc_rebalances
+        );
+        self.active_usdc_rebalances.keys().next()
     }
 
     /// Returns the aggregate ID of the in-flight mint for `symbol`, if any.
@@ -2805,28 +2822,37 @@ impl InventoryView {
         self.active_redemptions.get(symbol).map(|active| &active.id)
     }
 
-    /// Records `id` as the in-flight USDC rebalance.
-    pub(crate) fn set_active_usdc_rebalance(self, id: UsdcRebalanceId) -> Self {
+    /// Records `id` as an in-flight USDC rebalance. A known corridor is never
+    /// downgraded to `Unknown` by a later event that cannot read it.
+    pub(crate) fn set_active_usdc_rebalance(
+        self,
+        id: UsdcRebalanceId,
+        entry: ActiveUsdcRebalance,
+    ) -> Self {
+        let mut active_usdc_rebalances = self.active_usdc_rebalances;
+        let slot = active_usdc_rebalances.entry(id).or_insert(entry);
+        if entry != ActiveUsdcRebalance::Unknown {
+            *slot = entry;
+        }
+
         Self {
-            active_usdc_rebalance: Some(id),
+            active_usdc_rebalances,
             ..self
         }
     }
 
     /// Whether `id`, a transfer on `chain`, owns the USDC inflight and the
     /// active marker: the inventory addresses only the primary chain, so a
-    /// transfer on another corridor, or one that is not the active rebalance,
-    /// must leave them to their owner.
+    /// transfer on another corridor, or one that is not active, must leave
+    /// them to their owner.
     pub(crate) fn owns_usdc_rebalance_slot(&self, id: &UsdcRebalanceId, chain: Chain) -> bool {
-        chain == self.primary_chain && self.active_usdc_rebalance.as_ref() == Some(id)
+        chain == self.primary_chain && self.active_usdc_rebalances.contains_key(id)
     }
 
-    /// Clears the in-flight USDC rebalance ID (no-op if already empty).
-    pub(crate) fn clear_active_usdc_rebalance(self) -> Self {
-        Self {
-            active_usdc_rebalance: None,
-            ..self
-        }
+    /// Clears `id`'s in-flight USDC rebalance entry, leaving any other one.
+    pub(crate) fn clear_active_usdc_rebalance(mut self, id: &UsdcRebalanceId) -> Self {
+        self.active_usdc_rebalances.remove(id);
+        self
     }
 
     /// Records `id` as the in-flight mint for `symbol`, depositing on `chain`.
@@ -3108,7 +3134,7 @@ impl InventoryView {
         scope: InventoryScope,
         fetched_at: DateTime<Utc>,
     ) -> Result<Option<EquityReconcileBusy>, FloatError> {
-        let rebalance_moves_scope = self.active_usdc_rebalance.is_some()
+        let rebalance_moves_scope = !self.active_usdc_rebalances.is_empty()
             && match scope {
                 InventoryScope::Hedging => true,
                 InventoryScope::MarketMaking(chain) => chain == self.primary_chain,
@@ -4012,7 +4038,7 @@ mod tests {
             offchain_gross_usd_cents: None,
             alpaca_usdc: None,
             inflight_cash: HashMap::new(),
-            active_usdc_rebalance: None,
+            active_usdc_rebalances: HashMap::new(),
             active_mints: HashMap::new(),
             active_redemptions: HashMap::new(),
             inflight_equity: HashMap::new(),
@@ -4057,7 +4083,7 @@ mod tests {
             offchain_gross_usd_cents: None,
             alpaca_usdc: None,
             inflight_cash: HashMap::new(),
-            active_usdc_rebalance: None,
+            active_usdc_rebalances: HashMap::new(),
             active_mints: HashMap::new(),
             active_redemptions: HashMap::new(),
             inflight_equity: HashMap::new(),
@@ -6192,7 +6218,7 @@ mod tests {
             offchain_gross_usd_cents: None,
             alpaca_usdc: None,
             inflight_cash: HashMap::new(),
-            active_usdc_rebalance: None,
+            active_usdc_rebalances: HashMap::new(),
             active_mints: HashMap::new(),
             active_redemptions: HashMap::new(),
             inflight_equity: HashMap::new(),
@@ -6259,7 +6285,7 @@ mod tests {
             offchain_gross_usd_cents: None,
             alpaca_usdc: None,
             inflight_cash: HashMap::new(),
-            active_usdc_rebalance: None,
+            active_usdc_rebalances: HashMap::new(),
             active_mints: HashMap::new(),
             active_redemptions: HashMap::new(),
             inflight_equity: HashMap::new(),
@@ -7495,7 +7521,13 @@ mod tests {
         let now = Utc::now();
         let view = InventoryView::default()
             .with_usdc(Usdc::ZERO, usdc_cents(50_000))
-            .set_active_usdc_rebalance(UsdcRebalanceId(Uuid::new_v4()));
+            .set_active_usdc_rebalance(
+                UsdcRebalanceId(Uuid::new_v4()),
+                ActiveUsdcRebalance::Known {
+                    chain: Chain::Base,
+                    direction: RebalanceDirection::AlpacaToBase,
+                },
+            );
 
         let result = view
             .apply_snapshot_event(&usd_reconciled_event(0, Some(usdc_cents(50_000)), now), now)
@@ -7565,6 +7597,36 @@ mod tests {
     }
 
     #[test]
+    fn clearing_one_transfers_marker_keeps_another() {
+        let base = UsdcRebalanceId(Uuid::new_v4());
+        let robinhood = UsdcRebalanceId(Uuid::new_v4());
+        let view = InventoryView::default()
+            .with_usdc(Usdc::ZERO, usdc_cents(50_000))
+            .set_active_usdc_rebalance(
+                base.clone(),
+                ActiveUsdcRebalance::Known {
+                    chain: Chain::Base,
+                    direction: RebalanceDirection::BaseToAlpaca,
+                },
+            )
+            .set_active_usdc_rebalance(
+                robinhood.clone(),
+                ActiveUsdcRebalance::Known {
+                    chain: Chain::Robinhood,
+                    direction: RebalanceDirection::AlpacaToBase,
+                },
+            )
+            .clear_active_usdc_rebalance(&robinhood);
+
+        assert_eq!(view.active_usdc_rebalance(), Some(&base));
+        assert_eq!(
+            view.cash_reconciliation_busy(InventoryScope::Hedging, Utc::now())
+                .unwrap(),
+            Some(EquityReconcileBusy::Transfer)
+        );
+    }
+
+    #[test]
     fn cash_reconciliation_busy_covers_each_busy_source() {
         let spym = Symbol::new("SPYM").unwrap();
         let now = Utc::now();
@@ -7627,9 +7689,13 @@ mod tests {
             "inflight in the Robinhood slot says nothing about the Base vault"
         );
 
-        let rebalancing = not_busy
-            .clone()
-            .set_active_usdc_rebalance(UsdcRebalanceId(Uuid::new_v4()));
+        let rebalancing = not_busy.clone().set_active_usdc_rebalance(
+            UsdcRebalanceId(Uuid::new_v4()),
+            ActiveUsdcRebalance::Known {
+                chain: Chain::Base,
+                direction: RebalanceDirection::AlpacaToBase,
+            },
+        );
         assert_eq!(
             rebalancing
                 .cash_reconciliation_busy(InventoryScope::Hedging, now)
