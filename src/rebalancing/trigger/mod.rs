@@ -37554,6 +37554,104 @@ mod tests {
         drop(inventory);
     }
 
+    /// A transfer on a non-primary corridor marks the broker cash busy and
+    /// reserves and settles in its own chain's slot, never the primary's.
+    #[tokio::test]
+    async fn non_primary_corridor_transfer_marks_cash_busy_and_moves_only_its_slot() {
+        let pool = crate::test_utils::setup_test_db().await;
+        let store = Arc::new(test_store::<UsdcRebalance>(pool.clone(), ()));
+        let notifier = Arc::new(CapturingNotifier::default());
+        let trigger = make_unserved_corridor_trigger(&pool, store, notifier).await;
+        *trigger.inventory.write().await = InventoryView::default()
+            .with_usdc(usdc(900), usdc(100))
+            .update_usdc_at(
+                Chain::Robinhood,
+                Inventory::available(Venue::MarketMaking, Operator::Add, usdc(500)),
+                Utc::now(),
+            )
+            .unwrap();
+        let harness = ReactorHarness::new(Arc::clone(&trigger));
+        let id = UsdcRebalanceId(Uuid::new_v4());
+
+        harness
+            .receive::<UsdcRebalance>(
+                id.clone(),
+                UsdcRebalanceEvent::Initiated {
+                    corridor: ROBINHOOD_RELAY,
+                    direction: RebalanceDirection::BaseToAlpaca,
+                    amount: usdc(300),
+                    withdrawal_ref: TransferRef::OnchainTx(TxHash::random()),
+                    initiated_at: Utc::now(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let inventory = trigger.inventory.read().await;
+        assert_eq!(
+            inventory
+                .cash_reconciliation_busy(InventoryScope::Hedging, Utc::now())
+                .unwrap(),
+            Some(EquityReconcileBusy::Transfer),
+            "the transfer must mark the broker cash busy"
+        );
+        assert_eq!(
+            inventory.onchain_usdc_inflight_at(Chain::Robinhood),
+            Some(usdc(300))
+        );
+        assert_eq!(
+            inventory.onchain_usdc_available_at(Chain::Robinhood),
+            Some(usdc(200))
+        );
+        assert_eq!(
+            inventory.usdc_inflight(Venue::MarketMaking),
+            Some(Usdc::ZERO)
+        );
+        assert_eq!(
+            inventory.usdc_available(Venue::MarketMaking),
+            Some(usdc(900))
+        );
+        drop(inventory);
+
+        harness
+            .receive::<UsdcRebalance>(
+                id,
+                make_usdc_conversion_confirmed(
+                    RebalanceDirection::BaseToAlpaca,
+                    usdc(300),
+                    usdc(299),
+                ),
+            )
+            .await
+            .unwrap();
+
+        let inventory = trigger.inventory.read().await;
+        assert_eq!(
+            inventory.onchain_usdc_inflight_at(Chain::Robinhood),
+            Some(Usdc::ZERO)
+        );
+        assert_eq!(
+            inventory.onchain_usdc_available_at(Chain::Robinhood),
+            Some(usdc(200))
+        );
+        assert_eq!(
+            inventory.usdc_inflight(Venue::MarketMaking),
+            Some(Usdc::ZERO)
+        );
+        assert_eq!(
+            inventory.usdc_available(Venue::MarketMaking),
+            Some(usdc(900))
+        );
+        assert_eq!(inventory.usdc_available(Venue::Hedging), Some(usdc(399)));
+        assert_eq!(
+            inventory
+                .cash_reconciliation_busy(InventoryScope::Hedging, Utc::now())
+                .unwrap(),
+            None
+        );
+        drop(inventory);
+    }
+
     /// A resume whose corridor another transfer still holds in memory (one
     /// already terminal on disk) becomes a holder too, so releasing the
     /// other one leaves the corridor held.

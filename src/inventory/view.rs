@@ -1462,6 +1462,14 @@ impl InventoryView {
             .map(VenueBalance::available)
     }
 
+    /// The market-making USDC in flight in an explicit chain's slot.
+    #[cfg(test)]
+    pub(crate) fn onchain_usdc_inflight_at(&self, chain: Chain) -> Option<Usdc> {
+        self.usdc
+            .get_venue(Venue::MarketMaking, chain)
+            .map(VenueBalance::inflight)
+    }
+
     /// Returns the USDC available balance at the given venue.
     pub(crate) fn usdc_available(&self, venue: Venue) -> Option<Usdc> {
         match venue {
