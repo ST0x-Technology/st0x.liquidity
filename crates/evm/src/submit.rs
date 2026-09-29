@@ -140,9 +140,9 @@ use futures::lock::Mutex;
 use std::cmp::Ordering;
 use std::time::Duration;
 use tokio::time::sleep;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
-use crate::inflight_nonces::{InFlightNonces, NonceOwnership};
+use crate::inflight_nonces::{DiscardedNonce, InFlightNonces, NonceOwnership};
 use crate::nonce::ResettableNonceManager;
 use crate::{EvmError, NextNonceHint, PreparedTransaction};
 
@@ -174,6 +174,74 @@ const NONCE_RETRY_BACKOFF: Duration = Duration::from_millis(500);
 /// is bounded -- see the module-level note on best-effort replacement.
 const FEE_BUMP_PCT_PER_ATTEMPT: u64 = 15;
 
+/// Headroom, in percent, added on top of `eth_estimateGas` when pinning a
+/// transaction's gas limit.
+///
+/// The estimate reflects state at estimation time, but the transaction
+/// executes against whatever state precedes it in its block. A fill that
+/// empties a Raindex vault in the same block turns our `deposit4`'s balance
+/// write from nonzero->nonzero (~2.9k gas) into zero->nonzero (~20k gas),
+/// and an unpadded estimate then runs out of gas and reverts.
+///
+/// Headroom is not free. A transaction that still runs out of gas burns its
+/// whole padded limit, and the node admits a transaction only when the
+/// sender holds `gas_limit * max_fee_per_gas`. Raising this raises both.
+///
+/// The padded limit is not capped at the chain's per-transaction or block gas
+/// limit. Every call we send estimates far below either, so a padded limit
+/// cannot reach them; a call estimating above two thirds of a cap would be
+/// rejected by the node.
+const GAS_LIMIT_HEADROOM_PCT: u64 = 50;
+
+/// Minimum absolute headroom, in gas, added on top of `eth_estimateGas`.
+///
+/// The race [`GAS_LIMIT_HEADROOM_PCT`] defends against has a fixed cost:
+/// one storage slot flipping from nonzero->nonzero (`SSTORE_RESET`, 2,900
+/// gas) to zero->nonzero (`SSTORE_SET`, 20,000 gas) adds 17,100 gas,
+/// whatever the rest of the transaction costs. A 50% pad reaches that only
+/// above a 34,200 gas estimate, so small sends such as an ERC20 transfer get
+/// this floor instead. It covers the whole `SSTORE_SET` cost of one slot.
+pub(crate) const GAS_LIMIT_HEADROOM_MIN: u64 = 20_000;
+
+/// Pad a gas estimate by the larger of [`GAS_LIMIT_HEADROOM_PCT`] (rounded
+/// up) and [`GAS_LIMIT_HEADROOM_MIN`], with checked arithmetic.
+pub(crate) fn pad_gas_estimate(estimate: u64) -> Result<u64, EvmError> {
+    let scaled = estimate
+        .checked_mul(100 + GAS_LIMIT_HEADROOM_PCT)
+        .map(|scaled| scaled.div_ceil(100));
+    let floored = estimate.checked_add(GAS_LIMIT_HEADROOM_MIN);
+
+    scaled
+        .zip(floored)
+        .map(|(scaled, floored)| scaled.max(floored))
+        .ok_or(EvmError::GasLimitOverflow { estimate })
+}
+
+/// Pin `tx`'s gas limit to the padded `eth_estimateGas` result (see
+/// [`pad_gas_estimate`]).
+///
+/// The estimate runs before the filler chain, so `tx` must carry `from`
+/// itself. `FillProvider::estimate_gas` sets it only when the provider has a
+/// `WalletFiller`, and [`TxSubmitter`] is implemented for any filler stack.
+///
+/// A pinned gas limit makes alloy's `GasFiller` skip its own estimate
+/// (`alloy-provider` `1.6.3`, `src/fillers/gas.rs`, `prepare_1559`), so a send
+/// still makes only one `eth_estimateGas` call. That filler then fetches the
+/// fee estimate after this call returns, instead of concurrently with it, so
+/// each send, retry, and resubmit holds the send lock for one more RPC round
+/// trip.
+async fn pin_padded_gas_limit<F, P>(
+    provider: &FillProvider<F, P, Ethereum>,
+    tx: TransactionRequest,
+) -> Result<TransactionRequest, EvmError>
+where
+    F: TxFiller<Ethereum>,
+    P: Provider<Ethereum>,
+{
+    let estimate = provider.estimate_gas(tx.clone()).await?;
+    Ok(tx.gas_limit(pad_gas_estimate(estimate)?))
+}
+
 /// Scale a fee value up by `pct` percent with checked arithmetic, rounding
 /// up.
 ///
@@ -197,7 +265,9 @@ fn bump_fee(value: u128, pct: u64) -> Result<u128, EvmError> {
 #[async_trait]
 pub(crate) trait TxSubmitter: Send + Sync {
     /// Fill and sign `tx` before broadcasting it, then return its locally
-    /// computed hash. Pre-set fields (nonce, fees) are respected.
+    /// computed hash. The gas limit is pinned to the padded
+    /// `eth_estimateGas` result (see [`GAS_LIMIT_HEADROOM_PCT`]). Other
+    /// pre-set fields (nonce, fees) are respected.
     ///
     /// Implementations must normalize an RPC "already known" response to
     /// success with that local hash: the exact signed envelope is known before
@@ -254,10 +324,10 @@ where
     P: Provider<Ethereum>,
 {
     async fn submit(&self, tx: TransactionRequest) -> Result<TxHash, EvmError> {
+        let tx = pin_padded_gas_limit(self, tx).await?;
+
         // `FillProvider::fill` runs the filler chain until all dependencies are
-        // satisfied (for example, WalletFiller sets `from` before GasFiller
-        // estimates against it), then returns the signed envelope without
-        // broadcasting.
+        // satisfied, then returns the signed envelope without broadcasting.
         let sendable = self.fill(tx).await?;
         let envelope = sendable
             .try_into_envelope()
@@ -306,6 +376,7 @@ where
 pub(crate) async fn prepare_with_nonce<F, P>(
     submitter: &FillProvider<F, P, Ethereum>,
     nonce_manager: &ResettableNonceManager,
+    in_flight: &InFlightNonces,
     send_lock: &Mutex<()>,
     address: Address,
     contract: Address,
@@ -320,10 +391,12 @@ where
         .reserve_next_unheld_nonce(submitter, address)
         .await?;
     let tx = TransactionRequest::default()
+        .from(address)
         .to(contract)
         .input(calldata.into())
         .nonce(nonce);
     let envelope_result: Result<_, EvmError> = async {
+        let tx = pin_padded_gas_limit(submitter, tx).await?;
         let sendable = submitter.fill(tx).await?;
         sendable
             .try_into_envelope()
@@ -341,7 +414,15 @@ where
         }
     };
     debug_assert_eq!(envelope.nonce(), nonce);
-    Ok(PreparedTransaction::from_envelope(&envelope))
+    let prepared = PreparedTransaction::from_envelope(&envelope);
+    // Attribute the reserved nonce to this exact transaction at signing time,
+    // not only at broadcast. A withdrawal wedged in `VaultWithdrawSubmitting`
+    // (signed but never successfully broadcast) is a valid reconcile origin, and
+    // recording here lets the ownership-checked release drop its hold on
+    // reconcile, and a persist-failure rollback free its nonce, even when no
+    // broadcast or restart ever recorded it.
+    in_flight.record_durable(address, prepared.nonce(), prepared.tx_hash());
+    Ok(prepared)
 }
 
 async fn prepared_transaction_visible<P>(provider: &P, tx_hash: TxHash) -> bool
@@ -406,6 +487,11 @@ where
     nonce_manager
         .reserve_prepared_nonce(address, prepared.nonce())
         .await;
+    // Record the hash with the hold, before any early return. Persisted exact
+    // bytes retain their nonce through a definitive drop so durable recovery can
+    // rebroadcast them, and a hash-keyed release can always find the hold again,
+    // including one re-added by a stale rebroadcast after a reconcile.
+    in_flight.record_durable(address, prepared.nonce(), tx_hash);
 
     match provider.send_raw_transaction(prepared.raw()).await {
         Ok(_) => {}
@@ -425,34 +511,47 @@ where
         }
     }
 
-    // Persisted exact bytes retain their nonce through a definitive drop so
-    // durable recovery can rebroadcast them.
-    in_flight.record_durable(address, prepared.nonce(), tx_hash);
     info!(target: "wallet", %tx_hash, note, nonce = prepared.nonce(), "Prepared transaction broadcast");
     Ok(tx_hash)
 }
 
-/// Release the nonce reservation for a prepared transaction whose caller
-/// decided not to persist it, so a later send can reuse the nonce.
+/// Release a prepared transaction's nonce reservation, identified by its
+/// transaction hash. Ownership-checked: it releases only while the wallet's
+/// in-flight record still attributes the nonce to this exact transaction, so
+/// repeated releases of the same transaction (possibly after the nonce was
+/// reallocated) are safe. A stale repeat leaves intact whatever transaction has
+/// since taken the nonce. `discarded` decides whether allocation is rewound
+/// onto the freed nonce (see [`DiscardedNonce`]).
 ///
 /// Takes the wallet send lock so this cannot race a concurrent nonce
 /// assignment (see [`prepare_with_nonce`]).
 pub(crate) async fn discard_prepared(
-    nonce_manager: &ResettableNonceManager,
+    in_flight: &InFlightNonces,
     send_lock: &Mutex<()>,
     address: Address,
-    prepared: &PreparedTransaction,
+    tx_hash: TxHash,
+    discarded: DiscardedNonce,
 ) {
     let _guard = send_lock.lock().await;
-    nonce_manager
-        .release_prepared_nonce(address, prepared.nonce())
-        .await;
-    warn!(
-        target: "wallet",
-        tx_hash = %prepared.tx_hash(),
-        nonce = prepared.nonce(),
-        "Discarding unpersisted prepared transaction and releasing its nonce reservation"
-    );
+    if in_flight
+        .release_durable_by_hash(address, tx_hash, discarded)
+        .await
+    {
+        warn!(
+            target: "wallet",
+            %tx_hash,
+            ?discarded,
+            "Discarding prepared transaction and releasing its nonce reservation"
+        );
+    } else {
+        debug!(
+            target: "wallet",
+            %tx_hash,
+            ?discarded,
+            "Discarding prepared transaction that no longer holds a nonce reservation \
+             (already released or its nonce reallocated)"
+        );
+    }
 }
 
 /// Re-reserve the nonce of a persisted prepared transaction after restart and
@@ -540,6 +639,7 @@ where
     let nonce = submitter.assign_nonce(nonce_manager, address).await?;
 
     let tx = TransactionRequest::default()
+        .from(address)
         .to(contract)
         .input(calldata.clone().into())
         .nonce(nonce);
@@ -975,6 +1075,7 @@ where
         let retry_nonce = submitter.assign_nonce(nonce_manager, address).await?;
 
         let retry_tx = TransactionRequest::default()
+            .from(address)
             .to(contract)
             .input(calldata.clone().into())
             .nonce(retry_nonce);
@@ -1122,6 +1223,7 @@ where
         let max_priority_fee_per_gas = bump_fee(estimate.max_priority_fee_per_gas, pct)?;
 
         let tx = TransactionRequest::default()
+            .from(address)
             .to(contract)
             .input(calldata.clone().into())
             .nonce(nonce)
@@ -1231,7 +1333,7 @@ mod tests {
     #[cfg(feature = "local-signer")]
     use alloy::network::TransactionBuilder;
     use alloy::node_bindings::Anvil;
-    use alloy::primitives::{Bloom, Bytes, TxHash, U256, address};
+    use alloy::primitives::{Bloom, Bytes, TxHash, U64, U256, address};
     use alloy::providers::ProviderBuilder;
     use alloy::providers::ext::AnvilApi;
     use alloy::providers::fillers::NonceManager;
@@ -1661,6 +1763,28 @@ mod tests {
     }
 
     #[test]
+    fn pad_gas_estimate_adds_headroom_rounding_up() {
+        assert_eq!(pad_gas_estimate(128_156).unwrap(), 192_234);
+        assert_eq!(pad_gas_estimate(40_001).unwrap(), 60_002);
+    }
+
+    #[test]
+    fn pad_gas_estimate_floors_small_estimates_at_one_slot_write() {
+        assert_eq!(pad_gas_estimate(21_000).unwrap(), 41_000);
+        assert_eq!(pad_gas_estimate(40_000).unwrap(), 60_000);
+    }
+
+    #[test]
+    fn pad_gas_estimate_overflow_is_a_hard_error() {
+        let error = pad_gas_estimate(u64::MAX).unwrap_err();
+
+        assert!(
+            matches!(error, EvmError::GasLimitOverflow { estimate } if estimate == u64::MAX),
+            "expected GasLimitOverflow, got {error:?}"
+        );
+    }
+
+    #[test]
     fn next_nonce_hint_parses_the_node_reported_nonce() {
         assert_eq!(
             nonce_too_low_with_hint().next_nonce_hint(),
@@ -1729,6 +1853,8 @@ mod tests {
     #[tokio::test]
     async fn signing_provider_recovers_local_hash_when_rpc_omits_it() {
         let asserter = Asserter::new();
+        let estimate = 21_000;
+        asserter.push_success(&U64::from(estimate));
         asserter.push_failure(ErrorPayload {
             code: -32000,
             message: Cow::Borrowed("already known"),
@@ -1741,11 +1867,11 @@ mod tests {
             .from(wallet.address())
             .to(CONTRACT)
             .nonce(0)
-            .gas_limit(21_000)
             .with_chain_id(1)
             .max_fee_per_gas(1_000_000_000)
             .max_priority_fee_per_gas(100_000_000);
-        let sendable = wallet.signing_provider().fill(tx.clone()).await.unwrap();
+        let padded_tx = tx.clone().gas_limit(pad_gas_estimate(estimate).unwrap());
+        let sendable = wallet.signing_provider().fill(padded_tx).await.unwrap();
         let envelope = sendable.try_into_envelope().unwrap();
         let expected_hash = keccak256(envelope.encoded_2718());
 
@@ -1844,7 +1970,9 @@ mod tests {
         assert!(error.is_confirmation_pending());
         assert_eq!(
             in_flight.ownership(WALLET, STUCK_NONCE),
-            NonceOwnership::Unknown
+            NonceOwnership::Ours,
+            "the persisted bytes keep owning their nonce, so a hash-keyed release can \
+             still find the hold"
         );
         nonce_manager.set_next_nonce(WALLET, STUCK_NONCE).await;
         let unused_provider = ProviderBuilder::new().connect_mocked_client(Asserter::new());
@@ -1969,7 +2097,9 @@ mod tests {
         assert!(error.is_confirmation_pending());
         assert_eq!(
             in_flight.ownership(WALLET, STUCK_NONCE),
-            NonceOwnership::Unknown
+            NonceOwnership::Ours,
+            "the persisted bytes keep owning their nonce, so a hash-keyed release can \
+             still find the hold"
         );
     }
 

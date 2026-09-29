@@ -150,10 +150,11 @@ pub(crate) async fn withdrawal_reconciliation_redrive_delay(
                  prepared withdrawal signed at a fee the market then outran cannot confirm and \
                  is never fee-bumped, so later sends from this wallet queue behind its nonce. \
                  Automatic redrive continues at a slower cadence (guard held). Verify the \
-                 withdrawal on-chain; if it can never confirm, reconcile the redemption \
-                 (`stox transfer reconcile --kind redemption --id {aggregate_id}`) to release its \
-                 reservation, then \
-                 restart the bot to clear the stuck wallet nonce so later sends proceed."
+                 withdrawal on-chain. To abandon it, send a 0-value self-transfer at its nonce \
+                 and wait for that to confirm (skip this if the withdrawal itself mined and \
+                 reverted); only then reconcile the redemption \
+                 (`stox transfer reconcile --kind redemption --id {aggregate_id}`), which \
+                 releases its reservation and the wallet's hold on its nonce."
             );
             if let Err(alert_error) = notifier.notify(&message).await {
                 warn!(
@@ -401,6 +402,37 @@ impl EquityTransferServices {
             bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
         }
     }
+
+    /// Test-only services whose `ConfirmWithdraw` resolves a withdrawal of
+    /// `amount` for `token` on Base, letting a redemption be driven to
+    /// `WithdrawnFromRaindex` (the earliest force-failable origin) and on to a
+    /// terminal `Failed` entirely through the aggregate command path, never a
+    /// direct `events` insert (docs/cqrs.md forbids those, including in tests).
+    #[cfg(test)]
+    pub(crate) fn confirming_withdrawal(token: Address, amount: U256) -> Self {
+        Self {
+            chains: BTreeMap::from([(
+                Chain::Base,
+                ChainEquityServices {
+                    wallet: Address::ZERO,
+                    raindex: Arc::new(
+                        crate::onchain::mock::MockRaindex::new()
+                            .with_withdraw_transfer(token, amount),
+                    ),
+                    vault_lookup: Arc::new(
+                        crate::vault_lookup::MockVaultLookup::new()
+                            .with_default_vault(RaindexVaultId(alloy::primitives::B256::ZERO)),
+                    ),
+                    tokenizer: Arc::new(st0x_tokenization::mock::MockTokenizer::new()),
+                    wrapper: Arc::new(st0x_wrapper::MockWrapper::new()),
+                    mint_authorizer: ConfiguredMintAuthorizer::Disabled,
+                    gas_readiness: ConfiguredGasReadiness::Unwired,
+                    equities: ChainEquities::default(),
+                },
+            )]),
+            bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
+        }
+    }
 }
 
 /// Panicking Raindex stub for CLI-only use. All methods panic.
@@ -445,7 +477,11 @@ impl Raindex for PanickingRaindex {
         unimplemented!("PanickingRaindex: not available in CLI context")
     }
 
-    async fn discard_prepared_withdraw(&self, _: &PreparedTransaction) {
+    async fn discard_prepared_withdraw(&self, _: TxHash) {
+        unimplemented!("PanickingRaindex: not available in CLI context")
+    }
+
+    async fn release_superseded_withdraw(&self, _: TxHash) {
         unimplemented!("PanickingRaindex: not available in CLI context")
     }
 
@@ -1670,7 +1706,7 @@ impl CrossVenueEquityTransfer {
             if matches!(self.redemption_store.load(aggregate_id).await, Ok(None)) {
                 chain_services
                     .raindex
-                    .discard_prepared_withdraw(&prepared)
+                    .discard_prepared_withdraw(prepared.tx_hash())
                     .await;
             }
             return Err(error.into());
@@ -1683,6 +1719,26 @@ impl CrossVenueEquityTransfer {
             .send(aggregate_id, EquityRedemptionCommand::ConfirmWithdraw)
             .await?;
 
+        Ok(())
+    }
+
+    /// Release the wallet nonce reservation a reconciled redemption's prepared
+    /// vault withdrawal still holds. The reconcile itself is pure bookkeeping
+    /// and never reaches the wallet, so the running bot releases the reservation
+    /// here the first time a resume observes the durable `Reconciled`. Another
+    /// transaction has already mined at the withdrawal's nonce, so allocation is
+    /// not rewound. The underlying release is idempotent, so a redriven or
+    /// duplicate observation is a harmless no-op.
+    pub(crate) async fn discard_reconciled_withdrawal(
+        &self,
+        chain: Chain,
+        tx_hash: TxHash,
+    ) -> Result<(), RedemptionError> {
+        self.services
+            .for_chain(chain)?
+            .raindex
+            .release_superseded_withdraw(tx_hash)
+            .await;
         Ok(())
     }
 

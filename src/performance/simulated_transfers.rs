@@ -867,7 +867,9 @@ impl Raindex for FixtureRaindex {
         Ok(prepared.tx_hash())
     }
 
-    async fn discard_prepared_withdraw(&self, _prepared: &PreparedTransaction) {}
+    async fn discard_prepared_withdraw(&self, _tx_hash: TxHash) {}
+
+    async fn release_superseded_withdraw(&self, _tx_hash: TxHash) {}
 
     async fn restore_submitted_withdrawal(
         &self,

@@ -1146,10 +1146,12 @@ fn classify_fail_bridging_reload(state: Option<&UsdcRebalance>) -> FailBridgingO
 /// This offline command writes directly to the local database and MUST run only
 /// while the bot is stopped. Its standalone store does not notify the running
 /// bot's reactor, so stopping the bot also eliminates the race with a worker
-/// advancing the transfer between preflight and send. When the bot is running,
-/// use the live `st0x-liquidity-client debug fail-usdc-transfer` command instead;
-/// that route quiesces the USDC driver and sends through the wired store so the
-/// in-memory guard is updated immediately.
+/// advancing the transfer between preflight and send, and the restart rebuilds
+/// the corridor guard from the durable state. For an AlpacaToBase transfer with
+/// the bot running, use the live `st0x-liquidity-client debug fail-usdc-transfer`
+/// command instead; that route quiesces the USDC driver and sends through the
+/// wired store so the in memory guard is updated immediately. The live route
+/// refuses BaseToAlpaca transfers, which stay with this command.
 pub(super) async fn fail_usdc_transfer_command<Writer: Write>(
     stdout: &mut Writer,
     id: Uuid,
@@ -6019,6 +6021,43 @@ mod tests {
         assert!(
             err_msg.contains("already completed"),
             "failing a completed redemption must refuse; got: {err_msg}"
+        );
+    }
+
+    /// A redemption whose vault withdrawal is broadcast but unconfirmed (nonce
+    /// reserved, and it may already have landed) must be reconciled, never
+    /// force failed. The `Failed` terminal drops the withdrawal hash and has no
+    /// resume job to observe a later reconcile, so force failing would strand
+    /// the reserved nonce. Mirrors the already refused `VaultWithdrawSubmitting`.
+    #[tokio::test]
+    async fn fail_transfer_redemption_refuses_submitted_withdrawal() {
+        let pool = setup_test_db().await;
+        let id = redemption_aggregate_id("cli-submitted-withdrawal");
+
+        seed_redemption_to_submitting(&pool, &id).await;
+        send_redemption_command(
+            &pool,
+            &id,
+            EquityRedemptionCommand::RecordWithdrawSubmission {
+                tx_hash: alloy::primitives::TxHash::ZERO,
+            },
+        )
+        .await;
+
+        let mut stdout = Vec::new();
+        let result = fail_transfer_fixture_command(
+            &mut stdout,
+            &pool,
+            TransferType::Redemption,
+            &id.to_string(),
+            &"should be refused".parse().unwrap(),
+        )
+        .await;
+
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("unresolved vault withdrawal submission"),
+            "failing a submitted withdrawal must refuse and steer to reconcile; got: {err_msg}"
         );
     }
 

@@ -122,6 +122,10 @@ and the system proves market fit.
   - The corridor is recorded on each transfer when it starts. A transfer
     recorded before corridors existed reads as Base via CCTP, the only route
     there was.
+  - Each corridor chain has its own cash guard: one transfer per corridor,
+    either direction, and at most one Alpaca-outbound transfer across all
+    corridors, because Alpaca's withdrawable cash and its USDC inflight are
+    shared. Releasing a transfer frees only the guard that transfer held.
 - **Complete Audit Trail**: All rebalancing operations tracked as events
   (CrossVenueEquityTransfer, CrossVenueCashTransfer)
 - **Integration**: Uses Alpaca for share/USDC management, Circle CCTP for
@@ -165,7 +169,7 @@ runs a fill watcher against its order book, accounts its fills and hedges them
 with offsetting broker orders. Exactly one hedged chain must set
 `primary = true` on that table -- the **primary** chain anchors USDC rebalancing
 and the operator defaults (Base). The corridor table names the cash chain; until
-each corridor has its own cash guard, the trigger, inventory and services of the
+cash inventory is per corridor chain, the trigger, inventory and services of the
 cash path still run on the primary chain, so a corridor keyed by another chain
 is refused at load; equity rebalancing, hedging and vault balance polling happen
 on every hedged chain. Vault balance polling runs once per hedged chain, each on
@@ -1981,8 +1985,8 @@ rule fails startup with a named error:
 6. `hop = "relay"` on any chain: this build has no Relay hop.
 7. USDC mode enabled and a chain that is not disabled, whose cash table enables
    rebalancing, has no corridor table: there is no implicit corridor.
-8. A corridor chain other than the primary chain, until each corridor has its
-   own cash guard.
+8. A corridor chain other than the primary chain, until the inventory addresses
+   each corridor's chain.
 9. Transitional: `target` or `deviation` still set directly under
    `[rebalancing.usdc]` and different from the corridor's value. The released
    image reads those two keys and ignores the corridor tables, so both stay in
@@ -2173,6 +2177,13 @@ profile generation that can be rolled back to. deploy-rs uses legacy
 (`nix-env`-style) profiles internally, not the new Nix CLI profiles. Old
 generations are cleaned up by the NixOS garbage collector on a configured
 schedule.
+
+Rollback floor for the per-corridor cash guard: a build before it keeps one
+guard for all corridors. Rolling back onto such a build is safe while only one
+corridor has run; once two corridors have run transfers at the same time, do not
+roll back below the first per-corridor release. It must therefore ship in a
+release before the first config that can run two corridors
+([RAI-2488](https://linear.app/makeitrain/issue/RAI-2488)).
 
 #### CI/CD Credential Management
 
@@ -3225,8 +3236,9 @@ arbitrary owner while another aggregate remains recoverable.
 The trigger enqueues at most one transfer per scope at a time, guarded both by
 an in-memory in-progress set and by a Jobs-table dedupe (the in-memory guard
 resets on restart; a non-terminal job row suppresses a duplicate enqueue). The
-equity dedupe is per-symbol and direction-independent; the USDC dedupe is global
-and direction-independent.
+equity dedupe is per-symbol and direction-independent; the USDC dedupe is per
+corridor and direction-independent, and a row queued before corridors counts as
+Base.
 
 **Bottom layer -- Lifecycle aggregates**: Event-sourced entities that track
 multi-step transfer progress. These are implementation details of their
@@ -3719,7 +3731,10 @@ The operator `fail` verb (`transfer fail --kind redemption`) dispatches per
 state: a redemption stuck before tokens leave custody takes `FailTransfer`, a
 `TokensSent` redemption takes `FailDetection { failure: Operator { reason } }`,
 and a `Pending` redemption takes `RejectRedemption { reason }`. In every case
-the replayed `Failed` state materializes the operator's reason.
+the replayed `Failed` state materializes the operator's reason. The verb refuses
+a redemption with a signed vault withdrawal (`VaultWithdrawSubmitting` or
+`VaultWithdrawSubmitted`): the withdrawal can still mine, so the operator
+verifies it onchain and reconciles the redemption instead.
 
 Vault withdrawal submission is an irreversible uncertainty boundary. The
 orchestrator prepares and signs the transaction, then the pure aggregate
@@ -4037,17 +4052,20 @@ treats a recorded transfer on another corridor as permanent for the build: its
 job re-queues itself every 10 minutes without a retry cost, so a build that
 serves the corridor finds a job to resume it, until the transfer holds no guard
 (reconciled, say), when the job ends; startup recovery (even while a job is
-live) and the timeout sweep never re-arm it, and its guard stays held. A fresh
-job asking for another corridor has no transfer to hold: it retries,
-dead-letters, and its dead-letter alert pages once. Startup recovery pages once
-per transfer per run (the record is kept in memory) with "USDC transfer corridor
-mismatch: transfer {id} runs on the {corridor} corridor, which this build does
-not serve"; the timeout sweep retries that page until it is delivered and raises
-no other stall alert for the transfer. The next sweep releases its guard once it
-is reconciled, or once an operator moves it to a state that holds no guard (such
-as a pre-burn `BridgingFailed`). A manual `transfer resume` or
-`transfer recheck` is refused (422). The way out is a build that serves that
-corridor.
+live) and the timeout sweep never re-arm it, and its corridor's guard stays
+held. Other corridors keep running, with two limits: an Alpaca-outbound held
+transfer blocks Alpaca-outbound claims on every corridor (its page says so), and
+because guards are keyed by chain, an unserved corridor on the served chain with
+another hop holds the served corridor's own guard. A fresh job asking for
+another corridor has no transfer to hold: it retries, dead-letters, and its
+dead-letter alert pages once. Startup recovery pages once per transfer per run
+(the record is kept in memory) with "USDC transfer corridor mismatch: transfer
+{id} runs on the {corridor} corridor, which this build does not serve"; the
+timeout sweep retries that page until it is delivered and raises no other stall
+alert for the transfer. The next sweep releases its guard once it is reconciled,
+or once an operator moves it to a state that holds no guard (such as a pre-burn
+`BridgingFailed`). A manual `transfer resume` or `transfer recheck` is refused
+(422). The way out is a build that serves that corridor.
 
 - `WithdrawalSubmitting`: scan the source chain for an already-mined withdrawal
   (`find_recent_withdrawal`) from the captured head and adopt it. An empty mined
@@ -4666,9 +4684,9 @@ transfer ID has not yet been persisted in that state (it is persisted only when
 `Withdrawing` is entered), so `resume_alpaca_to_base` returns
 `ResumeDirectionMismatch` and cannot reconstruct which Alpaca withdrawal to
 poll. When a crash leaves an aggregate in this state, `recover_usdc_guard`
-latches `usdc_in_progress` (no USDC rebalancing proceeds) and fires an operator
-alert via `self.notifier` so the operator is paged to run `transfer resume` or
-`transfer reconcile` manually.
+latches that transfer's corridor guard (no USDC rebalancing proceeds on it) and
+fires an operator alert via `self.notifier` so the operator is paged to run
+`transfer resume` or `transfer reconcile` manually.
 
 These states do NOT receive a tracking seed (unlike `DepositFailed` /
 `ConversionFailed` / `BridgingFailed{burn_tx=Some}`): seeding tracking for a
@@ -4692,8 +4710,21 @@ terminal states only.
   before submitting one. Startup recovery enqueues a fresh
   `TransferUsdcToMarketMaking` job for either state when no live job row exists.
 - **Unresolved/unparseable aggregate IDs**: Aggregates that are missing from the
-  store or have unparseable IDs also latch the guard with an operator alert.
-  These indicate store inconsistency and require manual investigation.
+  store or have unparseable IDs have no known corridor, so they latch every
+  corridor's guard until a restart can classify them, with an operator alert
+  that leads with the every-corridor phrase below and says it was found at
+  startup (not the per-corridor "LATCHED on startup" phrase, which does not
+  page). These indicate store inconsistency and require manual investigation. A
+  candidate whose load fails (a store error, possibly transient) does not latch:
+  it blocks every corridor only until the timeout sweep reads it, then holds its
+  own corridor, and pages once per transfer with "retry or restart"; the running
+  bot does the same for a post-burn failure whose aggregate fails to load. The
+  running bot latches every corridor like a missing candidate when a post-burn
+  failure's corridor cannot be read (no in-memory tracking and the aggregate
+  does not load); the latch lasts until a restart and pages once per transfer,
+  retried by the timeout sweep until delivered: "USDC rebalancing is LATCHED on
+  every corridor with no automated recovery". While any every-corridor latch is
+  set, manual resumes are refused.
 
 Note: USDC (FiatToken v2.2) decrements even `U256::MAX` allowances in
 `transferFrom`. At realistic rebalancing sizes the allowance never drops below
@@ -4781,16 +4812,16 @@ Alpaca to Base:
      Alpaca), not only clean not-settled answers. At or after the deadline, the
      redrive emits `FailBridging` instead of re-enqueueing, and the worker pages
      the operator with `SettlementRetryDeadlineElapsed`. The aggregate becomes a
-     pre-burn `BridgingFailed` that KEEPS the single-rebalance guard held: the
-     withdrawn funds are off Alpaca and may still land on-chain late, so a fresh
-     transfer must not start and mis-attribute them. The operator verifies where
-     the funds sit (Alpaca balance vs the market-maker wallet) and settles them
-     with `transfer reconcile --kind usdc`, which releases the guard. An
-     AlpacaToBase `BridgingFailed` is reconcile-eligible even without burn
-     evidence: `FailBridging` is only reachable after the withdrawal completed,
-     so the funds are provably off Alpaca. Without this deadline, a withdrawal
-     that never settles on-chain redrives every 30 seconds forever, with the
-     guard latched and no operator signal.
+     pre-burn `BridgingFailed` that KEEPS the corridor guard held: the withdrawn
+     funds are off Alpaca and may still land on-chain late, so a fresh transfer
+     must not start and mis-attribute them. The operator verifies where the
+     funds sit (Alpaca balance vs the market-maker wallet) and settles them with
+     `transfer reconcile --kind usdc`, which releases the guard. An AlpacaToBase
+     `BridgingFailed` is reconcile-eligible even without burn evidence:
+     `FailBridging` is only reachable after the withdrawal completed, so the
+     funds are provably off Alpaca. Without this deadline, a withdrawal that
+     never settles on-chain redrives every 30 seconds forever, with the guard
+     latched and no operator signal.
    - **Per-transfer credit:** after confirmation, read the withdrawal tx
      receipt. The credit is the sum of that transaction's USDC `Transfer` logs
      to the market-maker wallet, exact in USDC base units. The wallet balance is
@@ -5857,24 +5888,26 @@ balances back to the source venue's available balance. Failures after an
 irreversible handoff (for example, a CCTP burn) stay inflight until settlement
 or manual operator recovery.
 
-**Durable rebalancing guard**: The single-rebalance guard that blocks a new USDC
-rebalance while one is unsettled is reconstructed from persisted `UsdcRebalance`
-event state on startup, so a restart between a post-burn failure and settlement
-cannot re-open the re-burn window. Any aggregate not in a clearable-terminal
-state (success, or a failure whose funds never left the source venue) re-asserts
-the guard at boot and blocks new USDC rebalancing until it settles or an
-operator recovers it. The `holds_rebalance_guard` classifier decides this at
-boot; it is a separate, more defensive rule than the `is_reconcilable_failure`
-predicate that gates operator reconciliation. Startup re-arms idempotent
-transfer jobs only for states with a recorded burn: `Bridging`,
-`AwaitingAttestation`, `Attested`, and a post-burn BaseToAlpaca
-`BridgingFailed`. Startup never re-arms `WithdrawalComplete` or
-`BridgingSubmitting`: a re-drive there can submit a second burn. Reconcilable
-failures (`DepositFailed`, a `BridgingFailed` with burn evidence or in the
-AlpacaToBase direction, and a BaseToAlpaca `ConversionFailed`) keep the guard
-held until the operator settles them with `transfer reconcile --kind usdc`. All
-other guarded states keep the guard held and page the operator for manual
-recovery.
+**Durable rebalancing guard**: The per-corridor guard that blocks a new USDC
+rebalance on a corridor while one is unsettled there is reconstructed from
+persisted `UsdcRebalance` event state on startup, so a restart between a
+post-burn failure and settlement cannot re-open the re-burn window. Any
+aggregate not in a clearable-terminal state (success, or a failure whose funds
+never left the source venue) re-asserts its corridor's guard at boot and blocks
+new USDC rebalancing on that corridor until it settles or an operator recovers
+it. The `holds_rebalance_guard` classifier decides this at boot; it is a
+separate, more defensive rule than the `is_reconcilable_failure` predicate that
+gates operator reconciliation. Startup re-arms idempotent transfer jobs only for
+states with a recorded burn: `Bridging`, `AwaitingAttestation`, `Attested`, and
+a post-burn BaseToAlpaca `BridgingFailed`. Startup never re-arms
+`WithdrawalComplete` or `BridgingSubmitting`: a re-drive there can submit a
+second burn. Reconcilable failures (`DepositFailed`, a `BridgingFailed` with
+burn evidence or in the AlpacaToBase direction, and a BaseToAlpaca
+`ConversionFailed`) keep the guard held until the operator settles them with
+`transfer reconcile --kind usdc`. All other guarded states keep the guard held
+and page the operator for manual recovery. A candidate that cannot be loaded or
+parsed at boot, or a post-burn failure whose corridor the running bot cannot
+read, latches every corridor until a restart.
 
 **Operator recovery of a pre-burn stranded guard latch**: A USDC rebalance can
 become stranded in `WithdrawalComplete` (pre-bridging, no burn intent recorded)
@@ -5911,8 +5944,7 @@ transfer or adopt a burn between the preflight and the send. The route does not
 read the chain, so the onchain check above still applies. Both send the same
 `FailBridging` command; the eligibility gate (`pre_burn_fail_eligibility`) is
 the single source shared by both, so both refuse the same states after the burn.
-The live route additionally refuses every BaseToAlpaca transfer and any transfer
-while another one holds the guard.
+The live route additionally refuses every BaseToAlpaca transfer.
 
 The guard outcome depends on the direction. For a BaseToAlpaca transfer the
 vault withdrawal already moved the USDC to the market maker wallet, which the
@@ -5932,10 +5964,10 @@ post-burn states (`Bridging`, `AwaitingAttestation`, `Attested`, `Bridged`,
 `BridgingFailed` with a recorded `burn_tx_hash`). The two surfaces differ in how
 the in-memory guard is reconciled. The live route sends `FailBridging` through
 the conductor-built wired store, so the rebalancing reactor runs in process and
-keeps the in memory guard latched for the AlpacaToBase outcome, matching the
-reported `guardHeld`. It restages the transfer's tracking entry to the post burn
-shape startup recovery seeds, so the timeout sweep keeps the guard until the
-operator reconciles. The offline CLI writes through a standalone store the
+keeps the transfer's corridor guard held for the AlpacaToBase outcome, matching
+the reported `guardHeld`. It restages the transfer's tracking entry to the post
+burn shape startup recovery seeds, so the timeout sweep keeps the guard until
+the operator reconciles. The offline CLI writes through a standalone store the
 (stopped) bot's reactor never observes, so its outcome is reconciled on the next
 startup: `recover_usdc_guard` clears a non-guard-holding aggregate and
 re-latches an AlpacaToBase one until the operator reconciles. Either way, once
@@ -5974,18 +6006,44 @@ declared resolved by sending the `Reconcile { reason }` command, which emits
 `OperatorReconciled` and drives the aggregate to a terminal `Reconciled` state.
 Unlike USDC, the equity aggregates hold no in-progress guard, so the `Reconcile`
 command emits **no reactor effect and dispatches no inventory update** -- it is
-a pure bookkeeping terminal transition. One nuance for redemptions: a redemption
-that ended in `DetectionFailed` / `RedemptionRejected` has its stranded exposure
-seeded into live inflight at startup (see `symbols_with_stuck_redemptions`).
-Reconcile moves the latest event to `OperatorReconciled`, so that redemption is
-no longer seeded as stuck on the **next** restart; the running process's live
-inflight retains the startup-seeded amount until then. Mint failures and
-pre-send redemption failures settle inventory at failure time, so they need no
-such clearing. `Reconciled` is valid ONLY from `Failed`; every other state is
-rejected. The `Reconciled` state retains the identifying fields (symbol,
-quantity, original failure reason, request/redemption identifiers) so the
-dashboard projection still reports the real transfer, and maps to a distinct
-terminal `Reconciled` DTO status carrying `reconciled_at`, `failure_reason`, and
+a pure bookkeeping terminal transition. The one exception is the wallet nonce of
+a reconciled redemption's signed vault withdrawal, described below. One nuance
+for redemptions: a redemption that ended in `DetectionFailed` /
+`RedemptionRejected` has its stranded exposure seeded into live inflight at
+startup (see `symbols_with_stuck_redemptions`). Reconcile moves the latest event
+to `OperatorReconciled`, so that redemption is no longer seeded as stuck on the
+**next** restart; the running process's live inflight retains the startup-seeded
+amount until then. Mint failures and pre-send redemption failures settle
+inventory at failure time, so they need no such clearing. A mint's `Reconciled`
+is valid ONLY from `Failed`. A redemption's `Reconciled` is valid from `Failed`
+and from the withdrawal submission states (`VaultWithdrawPending`,
+`VaultWithdrawSubmitting`, `VaultWithdrawSubmitted`); every other state is
+rejected.
+
+A redemption reconciled from a submission state can still hold a wallet nonce
+reservation for its signed withdrawal. `Reconciled` retains that withdrawal's tx
+hash (`withdrawal_nonce_hash`), and the running bot releases the reservation by
+hash without a restart: the redemption's resume job releases it when it loads
+`Reconciled`, in `perform` and in its terminal attempt, and the timeout sweep
+enqueues a resume job for a reconcile it observes (a failed enqueue is kept and
+retried on later sweep ticks). The release is ownership-checked and idempotent.
+It does not cancel the signed withdrawal, so the operator reconciles only after
+another transaction from the bot wallet has mined at the withdrawal's nonce. A
+withdrawal that is only missing from a mempool can still mine, so the operator
+first sends a 0-value self-transfer at that nonce and waits for it to confirm. A
+withdrawal that itself mined and reverted, or mined with no matching vault
+transfer, already used the nonce and moved nothing, so the operator reconciles
+it directly with no replacement. In both cases a mined transaction already used
+the nonce, and that is what lets later sends proceed. The release is
+bookkeeping: it drops the bot's hold on the used nonce and does not rewind nonce
+allocation onto it. A prepared transaction discarded before broadcast (a
+persist-failure rollback) is different: its nonce is unused, so allocation is
+rewound to refill it.
+
+The `Reconciled` state retains the identifying fields (symbol, quantity,
+original failure reason, request/redemption identifiers) so the dashboard
+projection still reports the real transfer, and maps to a distinct terminal
+`Reconciled` DTO status carrying `reconciled_at`, `failure_reason`, and
 `reconcile_reason` -- distinguishable from genuine success (`Completed`) at the
 DTO level. The CLI surface is `transfer reconcile --kind mint|redemption`
 (alongside `--kind usdc`).

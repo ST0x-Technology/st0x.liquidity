@@ -86,7 +86,7 @@ use uuid::Uuid;
 use st0x_bridge::corridor::{UsdcCorridor, legacy_base_cctp};
 use st0x_dto::{TransferOperation, UsdcBridgeOperation, UsdcBridgeStatus};
 use st0x_event_sorcery::{DomainEvent, EventSourced, SendError, Store, Table};
-use st0x_evm::PreparedTransaction;
+use st0x_evm::{Chain, PreparedTransaction};
 use st0x_execution::{AlpacaTransferId, ClientOrderId};
 use st0x_finance::{HasZero, Usdc};
 
@@ -1608,8 +1608,8 @@ impl UsdcRebalance {
         }
     }
 
-    /// Whether an aggregate in this state should hold the single-rebalance
-    /// guard (`usdc_in_progress`) when the guard is reconstructed on startup.
+    /// Whether an aggregate in this state should hold its corridor's guard
+    /// (`usdc_guards`) when the guards are reconstructed on startup.
     ///
     /// True for any state where a rebalance is still in progress or stranded
     /// after a CCTP burn; false only for clearable-terminal states -- success,
@@ -1982,7 +1982,7 @@ impl UsdcRebalance {
 }
 
 /// Candidate `UsdcRebalance` aggregates whose latest event leaves them
-/// potentially holding the single-rebalance guard, for startup recovery, split
+/// potentially holding their corridor's guard, for startup recovery, split
 /// by whether their persisted `aggregate_id` parsed.
 ///
 /// `unparseable` rows cannot be loaded or classified, so the recovery path must
@@ -1995,7 +1995,7 @@ pub(crate) struct InterruptedUsdcRebalances {
 }
 
 /// Returns the candidate `UsdcRebalance` aggregates whose latest event leaves
-/// them potentially holding the single-rebalance guard, for startup recovery.
+/// them potentially holding their corridor's guard, for startup recovery.
 ///
 /// The `event_type` filter is a coarse pre-filter: it excludes only
 /// `WithdrawalFailed` (always pre-burn, reconciles to source) and keeps every
@@ -2102,17 +2102,21 @@ pub(crate) async fn prepared_deposit_send_ids(
     }))
 }
 
-/// Whether any persisted USDC rebalance currently holds the single-rebalance
-/// guard, optionally ignoring one id (`except` -- so a manual resume of that
-/// very id does not count its own latch as a conflict). Mirrors startup
+/// Whether any persisted USDC rebalance currently holds `chain`'s corridor
+/// guard, or, for an Alpaca-outbound `direction`, an Alpaca-outbound
+/// transfer's guard on any corridor (Alpaca's cash is shared), optionally
+/// ignoring one id (`except` -- so a manual resume of that very id does not
+/// count its own latch as a conflict). Mirrors startup
 /// guard recovery's defensive posture: unparseable candidate ids and
-/// aggregates that fail to load count as holders, because treating them as
-/// clear could release a latch that still protects a possibly post-burn
-/// rebalance.
+/// aggregates that fail to load count as holders on every corridor, because
+/// treating them as clear could release a latch that still protects a
+/// possibly post-burn rebalance.
 pub(crate) async fn any_rebalance_holds_guard(
     pool: &SqlitePool,
     store: &Store<UsdcRebalance>,
     except: Option<&UsdcRebalanceId>,
+    chain: Chain,
+    direction: RebalanceDirection,
 ) -> Result<bool, sqlx::Error> {
     let InterruptedUsdcRebalances { ids, unparseable } =
         interrupted_usdc_rebalance_ids(pool).await?;
@@ -2133,7 +2137,10 @@ pub(crate) async fn any_rebalance_holds_guard(
 
         match store.load(&id).await {
             Ok(Some(entity)) => {
-                if entity.holds_rebalance_guard() {
+                let conflicts = entity.corridor().chain() == chain
+                    || (direction == RebalanceDirection::AlpacaToBase
+                        && entity.direction() == RebalanceDirection::AlpacaToBase);
+                if entity.holds_rebalance_guard() && conflicts {
                     return Ok(true);
                 }
             }
@@ -4425,7 +4432,7 @@ impl UsdcRebalance {
     /// Reconciles a stuck post-burn rebalance to the guard-clearing terminal
     /// `Reconciled` state. The CCTP burn/mint already moved the funds off the
     /// source venue, so the operator settles them out-of-band and this clears
-    /// the `usdc_in_progress` guard rather than re-driving the failed leg.
+    /// the transfer's corridor guard rather than re-driving the failed leg.
     ///
     /// Valid only from a post-burn terminal failure that strands the guard with
     /// no other exit:
@@ -11776,9 +11783,15 @@ mod tests {
         let store = test_store::<UsdcRebalance>(pool.clone(), ());
 
         assert!(
-            !any_rebalance_holds_guard(&pool, &store, None)
-                .await
-                .unwrap()
+            !any_rebalance_holds_guard(
+                &pool,
+                &store,
+                None,
+                Chain::Base,
+                RebalanceDirection::BaseToAlpaca,
+            )
+            .await
+            .unwrap()
         );
     }
 
@@ -11810,9 +11823,15 @@ mod tests {
         .await;
 
         assert!(
-            any_rebalance_holds_guard(&pool, &store, None)
-                .await
-                .unwrap()
+            any_rebalance_holds_guard(
+                &pool,
+                &store,
+                None,
+                Chain::Base,
+                RebalanceDirection::BaseToAlpaca,
+            )
+            .await
+            .unwrap()
         );
     }
 
@@ -11840,9 +11859,15 @@ mod tests {
         .await;
 
         assert!(
-            !any_rebalance_holds_guard(&pool, &store, None)
-                .await
-                .unwrap()
+            !any_rebalance_holds_guard(
+                &pool,
+                &store,
+                None,
+                Chain::Base,
+                RebalanceDirection::BaseToAlpaca,
+            )
+            .await
+            .unwrap()
         );
     }
 
@@ -11885,9 +11910,15 @@ mod tests {
         );
 
         assert!(
-            any_rebalance_holds_guard(&pool, &store, None)
-                .await
-                .unwrap(),
+            any_rebalance_holds_guard(
+                &pool,
+                &store,
+                None,
+                Chain::Base,
+                RebalanceDirection::BaseToAlpaca,
+            )
+            .await
+            .unwrap(),
             "a candidate with events but no materialized state must count as \
              a guard holder"
         );
@@ -11921,23 +11952,41 @@ mod tests {
 
         let requested = seed_through(&store, holder_commands()).await;
         assert!(
-            any_rebalance_holds_guard(&pool, &store, None)
-                .await
-                .unwrap(),
+            any_rebalance_holds_guard(
+                &pool,
+                &store,
+                None,
+                Chain::Base,
+                RebalanceDirection::BaseToAlpaca,
+            )
+            .await
+            .unwrap(),
             "without an exclusion the holder must block"
         );
         assert!(
-            !any_rebalance_holds_guard(&pool, &store, Some(&requested))
-                .await
-                .unwrap(),
+            !any_rebalance_holds_guard(
+                &pool,
+                &store,
+                Some(&requested),
+                Chain::Base,
+                RebalanceDirection::BaseToAlpaca,
+            )
+            .await
+            .unwrap(),
             "the requested id's own hold must be excluded"
         );
 
         let _other_holder = seed_through(&store, holder_commands()).await;
         assert!(
-            any_rebalance_holds_guard(&pool, &store, Some(&requested))
-                .await
-                .unwrap(),
+            any_rebalance_holds_guard(
+                &pool,
+                &store,
+                Some(&requested),
+                Chain::Base,
+                RebalanceDirection::BaseToAlpaca,
+            )
+            .await
+            .unwrap(),
             "a DIFFERENT guard holder must still block despite the exclusion"
         );
     }
@@ -12010,7 +12059,7 @@ mod tests {
 
         // Recovered post-burn bridge (latest event BridgingCompletionRecovered,
         // state Bridged) -- mid-flight after un-fail, holds the guard, must be
-        // included so a crash before the deposit leg reasserts usdc_in_progress.
+        // included so a crash before the deposit leg reasserts its corridor guard.
         let recovered = seed_through(
             &store,
             vec![

@@ -19,7 +19,7 @@ use serde::Deserialize;
 use std::sync::Arc;
 use tracing::info;
 
-use crate::inflight_nonces::InFlightNonces;
+use crate::inflight_nonces::{DiscardedNonce, InFlightNonces};
 use crate::nonce::ResettableNonceManager;
 use crate::submit::{
     broadcast_prepared, discard_prepared, prepare_with_nonce, release_in_flight_after_wait,
@@ -202,6 +202,7 @@ where
         prepare_with_nonce(
             &self.signing_provider,
             &self.nonce_manager,
+            &self.in_flight,
             &self.send_lock,
             self.address(),
             contract,
@@ -227,12 +228,24 @@ where
         .await
     }
 
-    async fn discard_prepared(&self, prepared: &PreparedTransaction) {
+    async fn discard_prepared(&self, tx_hash: TxHash) {
         discard_prepared(
-            &self.nonce_manager,
+            &self.in_flight,
             &self.send_lock,
             self.address(),
-            prepared,
+            tx_hash,
+            DiscardedNonce::Unused,
+        )
+        .await;
+    }
+
+    async fn release_superseded(&self, tx_hash: TxHash) {
+        discard_prepared(
+            &self.in_flight,
+            &self.send_lock,
+            self.address(),
+            tx_hash,
+            DiscardedNonce::Superseded,
         )
         .await;
     }
@@ -315,11 +328,12 @@ mod tests {
     use alloy::primitives::U256;
     use alloy::providers::ext::AnvilApi as _;
     use alloy::providers::fillers::NonceManager as _;
+    use alloy::rpc::types::TransactionRequest;
     use alloy::sol;
     use alloy::sol_types::SolCall as _;
 
     use crate::inflight_nonces::NonceOwnership;
-    use crate::submit::release_in_flight_after_wait;
+    use crate::submit::{GAS_LIMIT_HEADROOM_MIN, pad_gas_estimate, release_in_flight_after_wait};
     use crate::{NoOpErrorRegistry, ReceiptWaitConfig, wait_for_receipt_with_config};
 
     use super::*;
@@ -472,6 +486,143 @@ mod tests {
         assert_eq!(after, amount);
     }
 
+    /// Reproduces a same-block state race: our transfer is estimated while
+    /// the recipient holds a balance, then the recipient empties it earlier in
+    /// the same block, so our write becomes zero->nonzero and costs more gas
+    /// than was estimated. The padded gas limit must absorb that.
+    #[tokio::test]
+    async fn padded_gas_limit_survives_state_change_before_inclusion() {
+        let (anvil, wallet, token_address, _signer) = setup_anvil_with_token().await;
+        let recipient = anvil.addresses()[1];
+        let recipient_key = anvil.keys()[1].clone();
+        let initial_balance = U256::from(1000);
+
+        wallet
+            .submit::<NoOpErrorRegistry, _>(
+                token_address,
+                IERC20::transferCall {
+                    to: recipient,
+                    amount: initial_balance,
+                },
+                "fund recipient",
+            )
+            .await
+            .unwrap();
+
+        let recipient_provider = ProviderBuilder::new()
+            .wallet(EthereumWallet::from(PrivateKeySigner::from(recipient_key)))
+            .connect_http(anvil.endpoint().parse().unwrap());
+        recipient_provider.anvil_set_auto_mine(false).await.unwrap();
+
+        let calldata = Bytes::from(
+            IERC20::transferCall {
+                to: recipient,
+                amount: U256::from(1),
+            }
+            .abi_encode(),
+        );
+        let unpadded_estimate = wallet
+            .provider()
+            .estimate_gas(
+                TransactionRequest::default()
+                    .from(wallet.address())
+                    .to(token_address)
+                    .input(calldata.clone().into()),
+            )
+            .await
+            .unwrap();
+
+        let tx_hash = wallet
+            .send_pending(token_address, calldata, "transfer raced by a drain")
+            .await
+            .unwrap();
+
+        // Higher tip so anvil orders the drain ahead of our pending transfer.
+        let drain = IERC20::new(token_address, &recipient_provider)
+            .transfer(Address::random(), initial_balance)
+            .max_priority_fee_per_gas(100_000_000_000)
+            .max_fee_per_gas(200_000_000_000)
+            .send()
+            .await
+            .unwrap();
+
+        recipient_provider.anvil_mine(Some(1), None).await.unwrap();
+
+        let drain_receipt = drain.get_receipt().await.unwrap();
+        let receipt = wallet.await_receipt(tx_hash).await.unwrap();
+
+        assert_eq!(receipt.block_number, drain_receipt.block_number);
+        assert!(
+            drain_receipt.transaction_index < receipt.transaction_index,
+            "the drain must execute first for the race to happen"
+        );
+        assert!(receipt.status(), "padded transfer must not run out of gas");
+        assert!(
+            receipt.gas_used > unpadded_estimate,
+            "the race must cost more than the unpadded estimate ({} <= {unpadded_estimate}), \
+             otherwise this test does not exercise the padding",
+            receipt.gas_used
+        );
+
+        // Measured on Anvil: estimate ~34.4k, so a 50% pad (~51.6k) would clear
+        // the ~17.1k slot flip by only a few hundred gas. The absolute floor
+        // applies instead and leaves ~2.9k (`SSTORE_SET - 17,100`).
+        let gas_limit = wallet
+            .provider()
+            .get_transaction_by_hash(tx_hash)
+            .await
+            .unwrap()
+            .unwrap()
+            .gas_limit();
+        assert_eq!(gas_limit, unpadded_estimate + GAS_LIMIT_HEADROOM_MIN);
+        let margin = gas_limit - receipt.gas_used;
+        assert!(
+            margin >= 2_000,
+            "padded limit {gas_limit} cleared the race ({} gas used) by only {margin} gas",
+            receipt.gas_used
+        );
+    }
+
+    #[tokio::test]
+    async fn prepared_transaction_pins_padded_gas_limit() {
+        let (anvil, wallet, token_address, _signer) = setup_anvil_with_token().await;
+        let calldata = Bytes::from(
+            IERC20::transferCall {
+                to: anvil.addresses()[1],
+                amount: U256::from(1),
+            }
+            .abi_encode(),
+        );
+        let unpadded_estimate = wallet
+            .provider()
+            .estimate_gas(
+                TransactionRequest::default()
+                    .from(wallet.address())
+                    .to(token_address)
+                    .input(calldata.clone().into()),
+            )
+            .await
+            .unwrap();
+
+        let prepared = wallet
+            .prepare_pending(token_address, calldata, "prepared transfer")
+            .await
+            .unwrap();
+        let tx_hash = wallet
+            .broadcast_prepared(&prepared, "prepared transfer")
+            .await
+            .unwrap();
+
+        let gas_limit = wallet
+            .provider()
+            .get_transaction_by_hash(tx_hash)
+            .await
+            .unwrap()
+            .unwrap()
+            .gas_limit();
+        assert_eq!(gas_limit, pad_gas_estimate(unpadded_estimate).unwrap());
+    }
+
     #[tokio::test]
     async fn concurrent_sends_use_distinct_nonces() {
         let (_anvil, wallet, _token_address, signer_address) = setup_anvil_with_token().await;
@@ -519,7 +670,7 @@ mod tests {
             prepared.nonce().saturating_add(1),
             "a cold nonce cache must advance past the persisted transaction before another send"
         );
-        restarted_wallet.discard_prepared(&following).await;
+        restarted_wallet.discard_prepared(following.tx_hash()).await;
     }
 
     #[tokio::test]
@@ -554,7 +705,7 @@ mod tests {
             submitted_nonce.saturating_add(1),
             "hash-only recovery must restore pending nonce ownership before cache refill"
         );
-        restarted_wallet.discard_prepared(&following).await;
+        restarted_wallet.discard_prepared(following.tx_hash()).await;
     }
 
     #[tokio::test]
@@ -730,8 +881,139 @@ mod tests {
             expected_retry_nonce,
             "rolling back the failed later preparation must preserve the earlier reservation"
         );
-        wallet.discard_prepared(&retry).await;
-        wallet.discard_prepared(&earlier).await;
+        wallet.discard_prepared(retry.tx_hash()).await;
+        wallet.discard_prepared(earlier.tx_hash()).await;
+    }
+
+    #[tokio::test]
+    async fn discarding_a_never_broadcast_prepared_releases_its_nonce_for_reuse() {
+        // A persist-failure rollback: a withdrawal prepared and reserved but never
+        // broadcast must have its nonce released by discard even though no
+        // broadcast or restart ever recorded it. The reservation is attributed to
+        // the exact transaction at prepare time, so the ownership-checked discard
+        // can free it for reuse.
+        let (_anvil, wallet, _token_address, signer_address) = setup_anvil_with_token().await;
+        let prepared = wallet
+            .prepare_pending(signer_address, Bytes::new(), "prepared but never broadcast")
+            .await
+            .unwrap();
+        assert_eq!(
+            wallet.in_flight.ownership(signer_address, prepared.nonce()),
+            NonceOwnership::Ours,
+            "the reserved nonce must be attributed to this wallet at prepare time, \
+             before any broadcast"
+        );
+
+        wallet.discard_prepared(prepared.tx_hash()).await;
+
+        assert_eq!(
+            wallet.in_flight.ownership(signer_address, prepared.nonce()),
+            NonceOwnership::Unknown,
+            "discard must clear the in-flight record of the never-broadcast withdrawal"
+        );
+        let next_nonce = wallet
+            .nonce_manager
+            .get_next_nonce(wallet.provider(), signer_address)
+            .await
+            .unwrap();
+        assert_eq!(
+            next_nonce,
+            prepared.nonce(),
+            "discarding the never-broadcast reservation must free its nonce for reuse"
+        );
+    }
+
+    #[tokio::test]
+    async fn superseded_release_of_a_never_broadcast_prepared_keeps_allocation() {
+        // A reconcile of a withdrawal wedged in `VaultWithdrawSubmitting` (signed
+        // but never broadcast). The hold and in-flight record must go, but the
+        // operator already mined a replacement at the nonce, so the release must
+        // not make that nonce reusable.
+        let (_anvil, wallet, _token_address, signer_address) = setup_anvil_with_token().await;
+        let prepared = wallet
+            .prepare_pending(signer_address, Bytes::new(), "wedged before broadcast")
+            .await
+            .unwrap();
+        let cached_before = wallet.nonce_manager.peek_next_nonce(signer_address).await;
+        assert_eq!(
+            cached_before,
+            Some(prepared.nonce() + 1),
+            "the prepare must have advanced the cache past the withdrawal's nonce"
+        );
+
+        wallet.release_superseded(prepared.tx_hash()).await;
+
+        assert_eq!(
+            wallet.in_flight.ownership(signer_address, prepared.nonce()),
+            NonceOwnership::Unknown,
+            "the release must clear the in-flight record"
+        );
+        assert!(
+            !wallet
+                .nonce_manager
+                .release_occupied_nonce(signer_address, prepared.nonce()),
+            "the release must drop the allocator hold"
+        );
+        assert_eq!(
+            wallet.nonce_manager.peek_next_nonce(signer_address).await,
+            cached_before,
+            "a superseded release must not rewind allocation onto the used nonce"
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_rebroadcast_after_a_superseded_release_stays_releasable() {
+        // A resume row that loaded the withdrawal before the reconcile can
+        // rebroadcast it after the release. The mined replacement makes that
+        // fail as "nonce too low", and the hold it re-added must still be
+        // findable by hash so the next release removes it instead of leaking it.
+        let (_anvil, wallet, _token_address, signer_address) = setup_anvil_with_token().await;
+        let prepared = wallet
+            .prepare_pending(signer_address, Bytes::new(), "withdrawal to supersede")
+            .await
+            .unwrap();
+        wallet.release_superseded(prepared.tx_hash()).await;
+
+        // A different transaction at the same nonce: a 1 wei self-transfer, so
+        // it cannot be byte-identical to the empty-calldata prepared one.
+        wallet
+            .provider()
+            .send_transaction(
+                TransactionRequest::default()
+                    .from(signer_address)
+                    .to(signer_address)
+                    .value(U256::from(1))
+                    .nonce(prepared.nonce()),
+            )
+            .await
+            .unwrap()
+            .get_receipt()
+            .await
+            .unwrap();
+        let error = wallet
+            .broadcast_prepared(&prepared, "stale rebroadcast after reconcile")
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                EvmError::PreparedTransactionReconciliationPending { .. }
+            ),
+            "the superseded bytes cannot land; got: {error:?}"
+        );
+
+        wallet.release_superseded(prepared.tx_hash()).await;
+
+        assert_eq!(
+            wallet.in_flight.ownership(signer_address, prepared.nonce()),
+            NonceOwnership::Unknown
+        );
+        assert!(
+            !wallet
+                .nonce_manager
+                .release_occupied_nonce(signer_address, prepared.nonce()),
+            "the hold re-added by the stale rebroadcast must be released by hash"
+        );
     }
 
     /// Regression test threading the `in_flight` wiring through the

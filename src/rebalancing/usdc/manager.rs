@@ -3356,7 +3356,7 @@ impl<
     /// long as `CctpEndpoint::recover_already_minted`'s probe loop keeps
     /// returning `MintRecoveryInconclusive` (e.g. a durably degraded RPC
     /// endpoint). The redrive itself stays unbounded and budget-free -- the
-    /// `usdc_in_progress` rebalancing guard stays held exactly as it would for
+    /// transfer's corridor guard stays held exactly as it would for
     /// a genuine in-flight transfer, since declaring a terminal failure on
     /// unobserved state (or on funds that may have already moved) would be
     /// wrong. What bounds it is the alert: `initiated_at`, threaded here from

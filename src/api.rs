@@ -1974,7 +1974,7 @@ async fn resume_usdc_transfer(
 fn usdc_resume_error_response(error: &UsdcResumeError) -> (StatusCode, String) {
     use UsdcResumeError::{
         Aggregate, AlreadyInFlight, AlreadyTerminal, ApalisDatabase, CorridorNotServed, Database,
-        DirectionMismatch, GuardHeldElsewhere, NotFound, NotReady, Queue,
+        DirectionMismatch, EveryCorridorLatched, GuardHeldElsewhere, NotFound, NotReady, Queue,
     };
 
     match error {
@@ -1982,7 +1982,9 @@ fn usdc_resume_error_response(error: &UsdcResumeError) -> (StatusCode, String) {
         DirectionMismatch { .. } | AlreadyTerminal { .. } | CorridorNotServed { .. } => {
             (StatusCode::UNPROCESSABLE_ENTITY, error.to_string())
         }
-        AlreadyInFlight { .. } | GuardHeldElsewhere => (StatusCode::CONFLICT, error.to_string()),
+        AlreadyInFlight { .. } | GuardHeldElsewhere | EveryCorridorLatched => {
+            (StatusCode::CONFLICT, error.to_string())
+        }
         NotReady => (StatusCode::SERVICE_UNAVAILABLE, error.to_string()),
         Aggregate(_) | Database(_) | ApalisDatabase(_) | Queue(_) => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -2251,8 +2253,7 @@ fn ops_command_error<Entity: EventSourced>(
 /// arms again a BaseToAlpaca `BridgingFailed` after its burn, and its job mints and
 /// records the recovery. So, like [`fail_usdc_transfer`], this runs under the
 /// resume lock (`409` on contention) with the USDC driver quiesced (`503`
-/// while a transfer executes) across the load and the send, and refuses
-/// (`409`) while another transfer holds the live guard.
+/// while a transfer executes) across the load and the send.
 ///
 /// Sends through the conductor-built wired store (from [`RecoveryHandle`]), so
 /// the `OperatorReconciled` event reaches the live reactor, which clears the
@@ -2294,7 +2295,6 @@ async fn reconcile_usdc_transfer(
 
     let _driver_paused = quiesce_usdc_driver(&handle.usdc_driver_pause, &id, None).await?;
 
-    refuse_while_usdc_guard_held_by_other(&handle.rebalancing_service, &id).await?;
     reconcile_stuck_usdc_transfer(
         &handle.usdc_store,
         handle.usdc_recheck.as_ref(),
@@ -2582,34 +2582,8 @@ async fn fail_usdc_transfer(
 
     let _driver_paused = quiesce_usdc_driver(&handle.usdc_driver_pause, &id, None).await?;
 
-    refuse_while_usdc_guard_held_by_other(&handle.rebalancing_service, &id).await?;
     let response = fail_pre_burn_usdc_transfer(&handle.usdc_store, &id, reason).await?;
     Ok(Json(response))
-}
-
-/// Refuses an operator terminal for `id` (fail or reconcile) while the live
-/// rebalancing guard belongs to another transfer. The reactor applies a
-/// terminal event to the guard and the active rebalance without matching ids,
-/// so it would release or take over the other transfer's guard mid flight.
-/// Checked with the driver quiesced, so no new transfer can take the guard
-/// between this check and the send.
-async fn refuse_while_usdc_guard_held_by_other(
-    rebalancing_service: &RebalancingService,
-    id: &UsdcRebalanceId,
-) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
-    let Some(holder) = rebalancing_service.usdc_guard_held_by_other(id).await else {
-        return Ok(());
-    };
-    warn!(%id, %holder, "Refused a USDC operator terminal while another transfer holds the guard");
-    Err((
-        StatusCode::CONFLICT,
-        Json(ErrorResponse {
-            error: format!(
-                "USDC transfer {holder} holds the rebalancing guard; acting on {id} now would \
-                 release it. Retry once {holder} reaches a terminal state."
-            ),
-        }),
-    ))
 }
 
 /// The store-level half of [`fail_usdc_transfer`]: gates on
@@ -3639,7 +3613,6 @@ pub(crate) fn routes(ops_api: Option<&OpsApiConfig>) -> Router<AppState> {
 mod tests {
     use std::net::SocketAddr;
     use std::sync::Arc;
-    use std::sync::atomic::Ordering;
 
     use alloy::primitives::{Address, IntoLogData, TxHash, address, fixed_bytes, uint};
     use alloy::providers::{ProviderBuilder, mock::Asserter};
@@ -7178,6 +7151,9 @@ mod tests {
         let (status, _) = usdc_resume_error_response(&UsdcResumeError::GuardHeldElsewhere);
         assert_eq!(status, StatusCode::CONFLICT);
 
+        let (status, _) = usdc_resume_error_response(&UsdcResumeError::EveryCorridorLatched);
+        assert_eq!(status, StatusCode::CONFLICT);
+
         let (status, _) = usdc_resume_error_response(&UsdcResumeError::NotReady);
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
 
@@ -7607,23 +7583,31 @@ mod tests {
             .unwrap();
     }
 
-    /// Seeds an `EquityRedemption` into the terminal `Failed` state via
-    /// `Redeem`, `RecordWithdrawSubmission`, then `FailTransfer`.
+    /// Seeds an `EquityRedemption` into the terminal `Failed` state entirely
+    /// through the aggregate command path (never a direct `events` insert; see
+    /// docs/cqrs.md): `Redeem` -> `RecordWithdrawSubmission` -> `ConfirmWithdraw`
+    /// (resolved by a confirming mock chain service) -> `FailTransfer`. A
+    /// broadcast submission can no longer be force failed, so the force fail
+    /// runs from `WithdrawnFromRaindex`, the earliest force-failable origin.
     async fn seed_redemption_failed(pool: &SqlitePool, id: &RedemptionAggregateId) {
+        use EquityRedemptionCommand::*;
+
+        let token = Address::ZERO;
+        let amount = U256::from(10_000_000_000_000_000_000_u128);
         let (store, _projection) = StoreBuilder::<EquityRedemption>::new(pool.clone())
-            .build(EquityTransferServices::panicking())
+            .build(EquityTransferServices::confirming_withdrawal(token, amount))
             .await
             .unwrap();
         store
             .send(
                 id,
-                EquityRedemptionCommand::Redeem {
-                    symbol: Symbol::new("AAPL").unwrap(),
+                Redeem {
                     chain: Chain::Base,
+                    symbol: Symbol::new("AAPL").unwrap(),
                     quantity: float!(10),
-                    token: Address::ZERO,
+                    token,
                     vault_id: st0x_raindex::RaindexVaultId(alloy::primitives::B256::ZERO),
-                    amount: U256::from(1000u64),
+                    amount,
                     from_block: 0,
                     prepared: crate::equity_redemption::prepared_withdrawal_for_test(),
                 },
@@ -7633,16 +7617,17 @@ mod tests {
         store
             .send(
                 id,
-                EquityRedemptionCommand::RecordWithdrawSubmission {
+                RecordWithdrawSubmission {
                     tx_hash: alloy::primitives::TxHash::ZERO,
                 },
             )
             .await
             .unwrap();
+        store.send(id, ConfirmWithdraw).await.unwrap();
         store
             .send(
                 id,
-                EquityRedemptionCommand::FailTransfer {
+                FailTransfer {
                     reason: "seed: transfer failed".to_string(),
                 },
             )
@@ -8043,18 +8028,31 @@ mod tests {
     }
 
     /// In-process proof that reconciling through the conductor-built wired store
-    /// reaches the live reactor: a latched running bot must have its in-memory
-    /// guard cleared by an `OperatorReconciled`, not left stale until a sweep or
-    /// restart. A standalone store would land `Reconciled` durably while leaving
-    /// the flag set.
+    /// reaches the live reactor: the corridor guard the reactor kept for a
+    /// failure after the burn must be released by an `OperatorReconciled`, not
+    /// left held until a sweep or restart. A standalone store would land
+    /// `Reconciled` durably while leaving the guard held.
     #[tokio::test]
     async fn reconcile_reactor_clears_the_live_guard() {
         let (pool, apalis_pool) = crate::test_utils::setup_test_pools().await;
         let (service, store) =
             crate::rebalancing::trigger::wire_usdc_reactor_store(&pool, &apalis_pool).await;
         let id = UsdcRebalanceId(uuid::Uuid::new_v4());
-        seed_usdc_bridging_failed(&pool, &id).await;
-        service.usdc_in_progress.store(true, Ordering::SeqCst);
+        seed_usdc_bridging_submitting(&pool, &id, false).await;
+        for command in [
+            UsdcRebalanceCommand::InitiateBridging {
+                burn_tx: TxHash::repeat_byte(0x33),
+            },
+            UsdcRebalanceCommand::FailBridging {
+                reason: "seed: bridge failed".to_string(),
+            },
+        ] {
+            store.send(&id, command).await.unwrap();
+        }
+        assert!(
+            service.usdc_guards.is_held(Chain::Base),
+            "the reactor must keep the corridor guard for a failure after the burn",
+        );
 
         let _ = reconcile_stuck_usdc_transfer(
             &store,
@@ -8067,63 +8065,9 @@ mod tests {
         .unwrap_or_else(|(status, Json(error))| panic!("{status}: {}", error.error));
 
         assert!(
-            !service.usdc_in_progress.load(Ordering::SeqCst),
-            "the reactor must clear the live guard on reconcile, not just the durable state",
+            !service.usdc_guards.is_held(Chain::Base),
+            "the reactor must release the corridor guard on reconcile, not just the durable state",
         );
-    }
-
-    /// Failing a stranded transfer X must not release the live guard another
-    /// transfer Y holds: the reactor clears the guard on X's clearable terminal
-    /// without matching ids. With Y latched through the wired reactor, failing X
-    /// is refused with 409, X is left as it was, and Y keeps the guard.
-    #[tokio::test]
-    async fn fail_usdc_refuses_while_another_transfer_holds_the_guard() {
-        let (pool, apalis_pool) = crate::test_utils::setup_test_pools().await;
-        let (service, store) =
-            crate::rebalancing::trigger::wire_usdc_reactor_store(&pool, &apalis_pool).await;
-        let stranded = UsdcRebalanceId(uuid::Uuid::new_v4());
-        seed_usdc_bridging_submitting(&pool, &stranded, false).await;
-        let in_flight = UsdcRebalanceId(uuid::Uuid::new_v4());
-        store
-            .send(
-                &in_flight,
-                UsdcRebalanceCommand::InitiateConversion {
-                    direction: RebalanceDirection::AlpacaToBase,
-                    amount: Usdc::new(float!(500)),
-                    order_id: st0x_execution::ClientOrderId::from_uuid(uuid::Uuid::new_v4()),
-                    corridor: UsdcCorridor::BASE_CCTP,
-                },
-            )
-            .await
-            .unwrap();
-        service.usdc_in_progress.store(true, Ordering::SeqCst);
-
-        let Err((status, Json(body))) =
-            refuse_while_usdc_guard_held_by_other(&service, &stranded).await
-        else {
-            panic!("failing X must be refused while Y holds the guard");
-        };
-        assert_eq!(status, StatusCode::CONFLICT);
-        assert!(
-            body.error.contains(&in_flight.to_string()),
-            "{}",
-            body.error
-        );
-        assert!(
-            service.usdc_in_progress.load(Ordering::SeqCst),
-            "Y must keep the live guard"
-        );
-        assert!(
-            matches!(
-                load_usdc_rebalance(&pool, &stranded).await,
-                UsdcRebalance::BridgingSubmitting { .. }
-            ),
-            "a refused fail must leave X as it was"
-        );
-
-        refuse_while_usdc_guard_held_by_other(&service, &in_flight)
-            .await
-            .unwrap_or_else(|(status, Json(error))| panic!("{status}: {}", error.error));
     }
 
     #[tokio::test]
@@ -8490,17 +8434,16 @@ mod tests {
 
     /// A BaseToAlpaca transfer past its vault withdrawal holds the USDC in the
     /// market maker wallet. Failing it through the wired store would let the
-    /// reactor credit that amount back to the vault, clear the guard and queue
-    /// a check that withdraws again, so the route refuses it: the live guard
-    /// stays latched and the aggregate is left as it was.
+    /// reactor credit that amount back to the vault, release the corridor guard
+    /// and queue a check that withdraws again, so the route refuses it before
+    /// any send: the aggregate is left as it was, so the reactor sees nothing.
     #[tokio::test]
-    async fn fail_pre_burn_refuses_base_to_alpaca_and_keeps_the_live_guard() {
+    async fn fail_pre_burn_refuses_base_to_alpaca_before_any_send() {
         let (pool, apalis_pool) = crate::test_utils::setup_test_pools().await;
-        let (service, store) =
+        let (_service, store) =
             crate::rebalancing::trigger::wire_usdc_reactor_store(&pool, &apalis_pool).await;
         let id = UsdcRebalanceId(uuid::Uuid::new_v4());
         seed_usdc_bridging_submitting(&pool, &id, false).await;
-        service.usdc_in_progress.store(true, Ordering::SeqCst);
 
         let Err((status, Json(error))) =
             fail_pre_burn_usdc_transfer(&store, &id, "burn never attempted".to_string()).await
@@ -8515,10 +8458,6 @@ mod tests {
             error.error
         );
         assert!(
-            service.usdc_in_progress.load(Ordering::SeqCst),
-            "the live guard must stay latched",
-        );
-        assert!(
             matches!(
                 load_usdc_rebalance(&pool, &id).await,
                 UsdcRebalance::BridgingSubmitting {
@@ -8531,7 +8470,7 @@ mod tests {
     }
 
     /// The AlpacaToBase counterpart: the withdrawal already moved funds off
-    /// Alpaca, so the reactor must KEEP the live guard latched (matching
+    /// Alpaca, so the reactor must hold the corridor guard (matching
     /// `guardHeld: true`) until the operator reconciles.
     #[tokio::test]
     async fn fail_pre_burn_reactor_keeps_the_live_guard_for_alpaca_to_base() {
@@ -8540,7 +8479,6 @@ mod tests {
             crate::rebalancing::trigger::wire_usdc_reactor_store(&pool, &apalis_pool).await;
         let id = UsdcRebalanceId(uuid::Uuid::new_v4());
         seed_usdc_alpaca_to_base_withdrawal_complete(&pool, &id).await;
-        service.usdc_in_progress.store(true, Ordering::SeqCst);
 
         let body = fail_pre_burn_usdc_transfer(&store, &id, "bridge never started".to_string())
             .await
@@ -8551,8 +8489,8 @@ mod tests {
             "AlpacaToBase pre-burn failure holds the guard"
         );
         assert!(
-            service.usdc_in_progress.load(Ordering::SeqCst),
-            "the reactor must keep the live guard latched until reconcile-usdc",
+            service.usdc_guards.is_held(Chain::Base),
+            "the reactor must hold the corridor guard until reconcile-usdc",
         );
     }
 

@@ -27,7 +27,8 @@ use st0x_config::{
 };
 use st0x_dto::Statement;
 use st0x_event_sorcery::{Projection, Store, StoreBuilder, test_store};
-use st0x_evm::{Chain, IERC20};
+use st0x_evm::local::RawPrivateKeyWallet;
+use st0x_evm::{Chain, IERC20, NoOpErrorRegistry, Wallet};
 use st0x_execution::{Direction, FractionalShares, Positive, Symbol};
 use st0x_finance::{Usd, Usdc};
 use st0x_float_macro::float;
@@ -175,22 +176,33 @@ fn mock_vault_lookup_for_symbol(symbol: &Symbol, token: Address) -> Arc<dyn Vaul
 
 /// Uses Anvil snapshot/revert to discover the deterministic tx_hash that will
 /// be produced by an ERC20 transfer. Anvil is deterministic: same sender +
-/// nonce + calldata = same tx_hash.
+/// nonce + calldata + gas fields = same tx_hash. Sends through the same wallet
+/// type the tokenizer uses so the gas limit it pins matches the real send.
 async fn discover_deterministic_tx_hash(
     provider: &impl Provider,
+    endpoint: &str,
+    key: &B256,
     token: Address,
     recipient: Address,
     amount: U256,
 ) -> TxHash {
     let snapshot_id = provider.anvil_snapshot().await.unwrap();
 
-    let erc20 = IERC20::new(token, provider);
-    let receipt = erc20
-        .transfer(recipient, amount)
-        .send()
-        .await
-        .unwrap()
-        .get_receipt()
+    let wallet = RawPrivateKeyWallet::new(
+        key,
+        ProviderBuilder::new().connect(endpoint).await.unwrap(),
+        1,
+    )
+    .unwrap();
+    let receipt = wallet
+        .submit::<NoOpErrorRegistry, _>(
+            token,
+            IERC20::transferCall {
+                to: recipient,
+                amount,
+            },
+            "discover redemption tx hash",
+        )
         .await
         .unwrap();
     let tx_hash = receipt.transaction_hash;
@@ -979,6 +991,8 @@ async fn equity_onchain_imbalance_triggers_redemption() {
 
     let expected_tx_hash = discover_deterministic_tx_hash(
         &provider,
+        &endpoint,
+        &key,
         token_address,
         TEST_REDEMPTION_WALLET,
         transfer_amount,
@@ -2472,7 +2486,7 @@ async fn usdc_operational_limits_cap_across_trigger_cycles() {
         }],
         "First transfer capped to $100",
     );
-    trigger.clear_usdc_in_progress();
+    trigger.usdc_guards.release_every_holder();
 
     // Simulate first transfer: 150 onchain, 850 offchain = 15% ratio
     // Still below 30% lower bound, excess = 500 - 150 = 350
@@ -2494,7 +2508,7 @@ async fn usdc_operational_limits_cap_across_trigger_cycles() {
         }],
         "Second transfer capped to $100",
     );
-    trigger.clear_usdc_in_progress();
+    trigger.usdc_guards.release_every_holder();
 
     // Simulate second transfer: 250 onchain, 750 offchain = 25% ratio
     // Still below 30% lower bound, excess = 500 - 250 = 250
@@ -2516,7 +2530,7 @@ async fn usdc_operational_limits_cap_across_trigger_cycles() {
         }],
         "Third transfer capped to $100",
     );
-    trigger.clear_usdc_in_progress();
+    trigger.usdc_guards.release_every_holder();
 
     // Simulate third transfer: 350 onchain, 650 offchain = 35% ratio
     // Now within [30%, 70%] band -> balanced, no more trigger
@@ -2542,7 +2556,7 @@ async fn usdc_operational_limits_cap_across_trigger_cycles() {
 /// skipped. After the guard is released (operation completes or fails), the
 /// trigger fires again.
 #[tokio::test]
-async fn usdc_in_progress_blocks_concurrent_triggers() {
+async fn usdc_guard_blocks_concurrent_triggers() {
     let (pool, apalis_pool) = setup_test_pools().await;
 
     // Large imbalance: 100 onchain, 900 offchain
@@ -2622,7 +2636,7 @@ async fn usdc_in_progress_blocks_concurrent_triggers() {
     );
 
     // Clear in-progress (simulates operation completion/failure)
-    trigger.clear_usdc_in_progress();
+    trigger.usdc_guards.release_every_holder();
 
     // Trigger fires again: same inventory, same excess = 400, capped to 100
     trigger.check_and_trigger_usdc().await;
