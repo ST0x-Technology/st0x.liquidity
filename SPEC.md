@@ -1985,15 +1985,13 @@ rule fails startup with a named error:
 6. `hop = "relay"` on any chain: this build has no Relay hop.
 7. USDC mode enabled and a chain that is not disabled, whose cash table enables
    rebalancing, has no corridor table: there is no implicit corridor.
-8. A corridor chain other than the primary chain, until the inventory addresses
-   each corridor's chain.
-9. Transitional: `target` or `deviation` still set directly under
+8. Transitional: `target` or `deviation` still set directly under
    `[rebalancing.usdc]` and different from the corridor's value. The released
    image reads those two keys and ignores the corridor tables, so both stay in
    the deployed config, equal, until a release that reads corridors is live; a
    later release refuses them by name.
-10. Corridor tables are validated when USDC mode is disabled too, so a typo is
-    caught on the day it is written, not on the day the mode is enabled.
+9. Corridor tables are validated when USDC mode is disabled too, so a typo is
+   caught on the day it is written, not on the day the mode is enabled.
 
 The hub (the Ethereum wallet), the CCTP domains and the USDC addresses are
 pinned in code per chain, never configured.

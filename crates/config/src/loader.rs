@@ -1930,21 +1930,12 @@ fn validate_config(
 }
 
 /// Checks the cash corridors against the chain tables: each corridor's chain
-/// is configured, enabled, holds a cash vault and is the primary (the cash
-/// path still runs there), and with USDC mode enabled every chain whose cash
-/// rebalances has a corridor.
+/// is configured, enabled and holds a cash vault, and with USDC mode enabled
+/// every chain whose cash rebalances has a corridor.
 fn validate_usdc_corridor_chains(
     usdc: &UsdcRebalancing,
     chains: &BTreeMap<Chain, ChainConfig>,
 ) -> Result<(), CtxError> {
-    let primary = chains.iter().find_map(|(chain, config)| {
-        config
-            .trading
-            .as_ref()
-            .is_some_and(|trading| trading.primary)
-            .then_some(*chain)
-    });
-
     for chain in usdc.corridors.keys().copied() {
         let Some(chain_config) = chains.get(&chain) else {
             return Err(CtxError::CorridorChainNotConfigured { chain });
@@ -1962,12 +1953,6 @@ fn validate_usdc_corridor_chains(
 
         if !has_cash_vault {
             return Err(CtxError::CorridorChainWithoutCashVault { chain });
-        }
-
-        if let Some(primary) = primary
-            && primary != chain
-        {
-            return Err(CtxError::CorridorChainNotPrimary { chain, primary });
         }
     }
 
@@ -3052,11 +3037,6 @@ pub enum CtxError {
     )]
     CashRebalancingWithoutCorridor { chain: Chain },
     #[error(
-        "[rebalancing.usdc.corridors.{chain}]: cash transfers still run on the primary \
-         chain, {primary}"
-    )]
-    CorridorChainNotPrimary { chain: Chain, primary: Chain },
-    #[error(
         "vault_ids in [chains.<name>.trading.assets.cash] is required for rebalancing \
          but not configured"
     )]
@@ -3165,7 +3145,6 @@ impl CtxError {
             Self::CorridorChainDisabled { .. } => "USDC corridor chain disabled",
             Self::CorridorChainWithoutCashVault { .. } => "USDC corridor chain without cash vault",
             Self::CashRebalancingWithoutCorridor { .. } => "cash rebalancing without USDC corridor",
-            Self::CorridorChainNotPrimary { .. } => "USDC corridor chain not primary",
             Self::MissingCashVaultId => "missing cash vault_ids",
             Self::ListedSymbolIsNotHedged { .. } => "listed symbol has no hedging policy",
             Self::HedgedSymbolIsNotListed { .. } => "hedged symbol is listed on no chain",
