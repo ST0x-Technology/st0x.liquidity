@@ -937,10 +937,10 @@ pub(crate) struct RebalancingService {
     post_burn_timeout_alerted: Arc<RwLock<HashSet<UsdcRebalanceId>>>,
     /// Ids of AlpacaToBase transfers the sweep holds before their burn that are
     /// already logged; the same one shot log as `post_burn_timeout_logged`.
-    held_before_burn_logged: Arc<RwLock<HashSet<UsdcRebalanceId>>>,
+    unconfirmed_burn_hold_logged: Arc<RwLock<HashSet<UsdcRebalanceId>>>,
     /// Ids of AlpacaToBase transfers held before their burn whose page was
     /// delivered; retried until then, as `post_burn_timeout_alerted` is.
-    held_before_burn_alerted: Arc<RwLock<HashSet<UsdcRebalanceId>>>,
+    unconfirmed_burn_hold_alerted: Arc<RwLock<HashSet<UsdcRebalanceId>>>,
     /// Transfers on a corridor this build does not serve whose page was
     /// delivered, so the sweep pages once, not every tick.
     corridor_not_served_alerted: Arc<RwLock<HashSet<UsdcRebalanceId>>>,
@@ -1006,12 +1006,12 @@ enum UsdcTimeoutCleanup {
         corridor: UsdcCorridor,
         amount: Usdc,
     },
-    /// An AlpacaToBase transfer stopped after its Alpaca withdrawal and before
-    /// any confirmed burn (see [`alpaca_to_base_hold_before_burn`]). The funds
-    /// are off Alpaca, so the guard stays held with no tombstone, and the page
-    /// names the stage and the recovery step instead of a burn that does not
-    /// exist.
-    HeldBeforeBurn {
+    /// An AlpacaToBase transfer stopped after its Alpaca withdrawal with no
+    /// confirmed burn (see [`alpaca_to_base_hold_without_confirmed_burn`]).
+    /// The funds are off Alpaca, so the guard stays held with no tombstone, and
+    /// the page names the stage and the recovery step instead of claiming a
+    /// burn timed out.
+    HeldWithoutConfirmedBurn {
         tracking: usdc::UsdcRebalanceTracking,
         elapsed: Duration,
         state: &'static str,
@@ -1037,12 +1037,13 @@ fn releases_tracked_guard(state: &UsdcRebalance, served_corridor: UsdcCorridor) 
     }
 }
 
-/// The recovery step for an AlpacaToBase transfer the sweep holds before its
-/// burn: its Alpaca withdrawal already moved the funds off Alpaca and no burn
-/// is confirmed, so clearing the guard as for a timed out transfer would let a
-/// new transfer start while those funds are unsettled. `None` for every other
-/// state.
-fn alpaca_to_base_hold_before_burn(state: &UsdcRebalance) -> Option<&'static str> {
+/// The recovery step for an AlpacaToBase transfer the sweep holds with no
+/// confirmed burn: its Alpaca withdrawal already moved the funds off Alpaca,
+/// so clearing the guard as for a timed out transfer would let a new transfer
+/// start while those funds are unsettled. Neither state proves that no burn
+/// was broadcast (a crash can lose an unrecorded one), so every step asks the
+/// operator to check the chain first. `None` for every other state.
+fn alpaca_to_base_hold_without_confirmed_burn(state: &UsdcRebalance) -> Option<&'static str> {
     match state {
         UsdcRebalance::BridgingSubmitting {
             direction: RebalanceDirection::AlpacaToBase,
@@ -1065,7 +1066,10 @@ fn alpaca_to_base_hold_before_burn(state: &UsdcRebalance) -> Option<&'static str
             burn_tx_hash: None,
             cctp_nonce: None,
             ..
-        } => Some("It failed before the burn; reconcile-usdc is required."),
+        } => Some(
+            "No burn is recorded, which does not prove none was broadcast: verify on chain \
+             that no burn left the wallet before running reconcile-usdc.",
+        ),
         _ => None,
     }
 }
@@ -1193,8 +1197,8 @@ impl RebalancingService {
             requested_stage_timeout_alerted: Arc::new(RwLock::new(HashSet::new())),
             post_burn_timeout_logged: Arc::new(RwLock::new(HashSet::new())),
             post_burn_timeout_alerted: Arc::new(RwLock::new(HashSet::new())),
-            held_before_burn_logged: Arc::new(RwLock::new(HashSet::new())),
-            held_before_burn_alerted: Arc::new(RwLock::new(HashSet::new())),
+            unconfirmed_burn_hold_logged: Arc::new(RwLock::new(HashSet::new())),
+            unconfirmed_burn_hold_alerted: Arc::new(RwLock::new(HashSet::new())),
             corridor_not_served_alerted: Arc::new(RwLock::new(HashSet::new())),
             pending_latch_pages: RwLock::new(VecDeque::new()),
             latch_paged: RwLock::new(HashSet::new()),
@@ -2071,13 +2075,13 @@ impl RebalancingService {
                         }
                     }
                 }
-                UsdcTimeoutCleanup::HeldBeforeBurn {
+                UsdcTimeoutCleanup::HeldWithoutConfirmedBurn {
                     tracking,
                     elapsed,
                     state,
                     recovery,
                 } => {
-                    self.hold_before_burn(&id, &tracking, elapsed, state, recovery)
+                    self.hold_without_confirmed_burn(&id, &tracking, elapsed, state, recovery)
                         .await;
                 }
                 UsdcTimeoutCleanup::ReArmAlpacaToBaseWithdrawal {
@@ -2125,11 +2129,11 @@ impl RebalancingService {
         Ok(())
     }
 
-    /// Holds the guard of an AlpacaToBase transfer stopped before its burn
-    /// ([`UsdcTimeoutCleanup::HeldBeforeBurn`]). Like the post burn hold, the
+    /// Holds the guard of an AlpacaToBase transfer with no confirmed burn
+    /// ([`UsdcTimeoutCleanup::HeldWithoutConfirmedBurn`]). Like the post burn hold, the
     /// entry is selected again on every sweep, so it logs once and retries the
     /// page until it is delivered.
-    async fn hold_before_burn(
+    async fn hold_without_confirmed_burn(
         &self,
         id: &UsdcRebalanceId,
         tracking: &usdc::UsdcRebalanceTracking,
@@ -2141,7 +2145,7 @@ impl RebalancingService {
             .hold(tracking.corridor.chain(), id, tracking.direction);
 
         let first_log = self
-            .held_before_burn_logged
+            .unconfirmed_burn_hold_logged
             .write()
             .await
             .insert(id.clone());
@@ -2153,24 +2157,24 @@ impl RebalancingService {
                 corridor = %tracking.corridor,
                 state,
                 ?elapsed,
-                "AlpacaToBase USDC transfer stopped before the CCTP burn with its \
+                "AlpacaToBase USDC transfer stopped with no confirmed CCTP burn and its \
                  funds off Alpaca; holding the trigger guard"
             );
         }
 
-        if !self.held_before_burn_alerted.read().await.contains(id) {
+        if !self.unconfirmed_burn_hold_alerted.read().await.contains(id) {
             match self
                 .notifier
                 .notify(&format!(
-                    "USDC transfer {id} on the {} corridor stopped in {state} before \
-                     the CCTP burn; its funds are off Alpaca. Guard held. Elapsed: \
+                    "USDC transfer {id} on the {} corridor stopped in {state} with no \
+                     confirmed CCTP burn; its funds are off Alpaca. Guard held. Elapsed: \
                      {elapsed:?}. {recovery}",
                     tracking.corridor,
                 ))
                 .await
             {
                 Ok(()) => {
-                    self.held_before_burn_alerted
+                    self.unconfirmed_burn_hold_alerted
                         .write()
                         .await
                         .insert(id.clone());
@@ -2179,8 +2183,8 @@ impl RebalancingService {
                     warn!(
                         target: "rebalance",
                         ?error,
-                        "Failed to deliver USDC stall alert for a transfer held \
-                         before its burn; will retry next sweep"
+                        "Failed to deliver USDC stall alert for a transfer held with \
+                         no confirmed burn; will retry next sweep"
                     );
                 }
             }
@@ -2655,14 +2659,14 @@ impl RebalancingService {
                         }));
                     }
                     Ok(Some(state)) => {
-                        // Restart recovery seeds an AlpacaToBase failure from
-                        // before the burn at `BridgingInitiated`, so it lands
+                        // Restart recovery seeds an AlpacaToBase failure with
+                        // no burn evidence at `BridgingInitiated`, so it lands
                         // here: hold it with its own page once timed out.
-                        if let Some(recovery) = alpaca_to_base_hold_before_burn(&state) {
+                        if let Some(recovery) = alpaca_to_base_hold_without_confirmed_burn(&state) {
                             if elapsed < self.config.transfer_timeout {
                                 return Ok(None);
                             }
-                            return Ok(Some(UsdcTimeoutCleanup::HeldBeforeBurn {
+                            return Ok(Some(UsdcTimeoutCleanup::HeldWithoutConfirmedBurn {
                                 tracking,
                                 elapsed,
                                 state: state.state_name(),
@@ -2753,9 +2757,9 @@ impl RebalancingService {
                 // hold the guard without a tombstone. A later operator
                 // `FailBridging` then still reaches the reactor.
                 Ok(Some(state)) => {
-                    if let Some(recovery) = alpaca_to_base_hold_before_burn(&state) {
+                    if let Some(recovery) = alpaca_to_base_hold_without_confirmed_burn(&state) {
                         drop(tracking_guard);
-                        return Ok(Some(UsdcTimeoutCleanup::HeldBeforeBurn {
+                        return Ok(Some(UsdcTimeoutCleanup::HeldWithoutConfirmedBurn {
                             tracking,
                             elapsed,
                             state: state.state_name(),
@@ -25307,12 +25311,16 @@ mod tests {
             "the transfer must stay the active rebalance",
         );
         assert!(
-            trigger.held_before_burn_alerted.read().await.contains(&id),
-            "the page must say the transfer stopped before the burn",
+            trigger
+                .unconfirmed_burn_hold_alerted
+                .read()
+                .await
+                .contains(&id),
+            "the page must say the transfer has no confirmed burn",
         );
         assert!(
             !trigger.post_burn_timeout_alerted.read().await.contains(&id),
-            "no burn happened, so the after burn stall page must not fire",
+            "no burn is recorded, so the after burn stall page must not fire",
         );
     }
 
@@ -25361,8 +25369,12 @@ mod tests {
             "the sweep must not tombstone a held transfer",
         );
         assert!(
-            service.held_before_burn_alerted.read().await.contains(&id),
-            "the sweep must page that the transfer stopped before the burn",
+            service
+                .unconfirmed_burn_hold_alerted
+                .read()
+                .await
+                .contains(&id),
+            "the sweep must page that the transfer has no confirmed burn",
         );
 
         store

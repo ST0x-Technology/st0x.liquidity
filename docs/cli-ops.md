@@ -672,13 +672,15 @@ stox transfer reconcile --kind redemption --id <redemption-aggregate-id> \
   post-burn `BridgingFailed` (one carrying a `burn_tx_hash` or `cctp_nonce`),
   any `AlpacaToBase` `BridgingFailed` (the withdrawal completed, so the funds
   left Alpaca even with no burn, e.g. the settlement deadline, a missing
-  withdrawal tx hash, or a withdrawal credit mismatch), a `BaseToAlpaca`
-  `ConversionFailed`, and a `BaseToAlpaca` `Bridged` with a signed deposit send
-  whose nonce you verified on chain is taken by a different mined tx (see
-  "Base->Alpaca deposit send pages"). Its `--reason` must be one of
-  `funds-moved-manually` or `deposit-credited-offline`; any other value is
-  rejected. Every other state is rejected, including `WithdrawalFailed` and an
-  `AlpacaToBase` `ConversionFailed`, whose funds never left Alpaca.
+  withdrawal tx hash, or a withdrawal credit mismatch; with no burn recorded,
+  first verify on chain that no burn left the market maker wallet, since a crash
+  can lose an unrecorded one), a `BaseToAlpaca` `ConversionFailed`, and a
+  `BaseToAlpaca` `Bridged` with a signed deposit send whose nonce you verified
+  on chain is taken by a different mined tx (see "Base->Alpaca deposit send
+  pages"). Its `--reason` must be one of `funds-moved-manually` or
+  `deposit-credited-offline`; any other value is rejected. Every other state is
+  rejected, including `WithdrawalFailed` and an `AlpacaToBase`
+  `ConversionFailed`, whose funds never left Alpaca.
 - `--kind usdc` is bookkeeping only: it moves no funds. Before you reconcile a
   post-burn `BridgingFailed`, finish the transfer by hand: (1) read the recorded
   nonce (`usedNonces`) on the destination chain (Base for `AlpacaToBase`,

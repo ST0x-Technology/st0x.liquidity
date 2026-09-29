@@ -4547,31 +4547,32 @@ enum BridgeStage { Burn, Attestation, Mint }
   rebalancing guard with no other exit -- `DepositFailed`, a `BridgingFailed`
   with burn evidence (a `burn_tx_hash` or `cctp_nonce` is recorded), any
   `AlpacaToBase` `BridgingFailed` (reachable only after the withdrawal
-  completed, so the funds are off Alpaca even without burn evidence), or a
-  `BaseToAlpaca` `ConversionFailed` (the post-deposit USDC->USD leg). The
-  `is_reconcilable_failure` predicate is the single source of this eligibility
-  rule. The one in-flight exception is a `BaseToAlpaca` `Bridged` with a signed
-  deposit send (`has_prepared_deposit_send`): the send is never re-signed, so
-  one that can never confirm has no other exit; the operator reconciles it once
-  they verified on chain that it will not land (see "BaseToAlpaca deposit
-  send"). Every other state is rejected: an in-progress transfer must be
-  resumed, and a failure whose funds never left the source venue reconciles to
-  source on its own. `Reconciled` is a clearing terminal -- it carries
-  **post-burn semantics**, meaning the reactor zeroes source-venue inflight
-  WITHOUT crediting `available` (the USDC was already burned via CCTP, so the
-  funds genuinely left the source venue; this is NOT a cancel, which would
-  wrongly credit `available`). See "Operator reconciliation of a stranded
-  post-burn failure" under Failure Handling. For a signed send, the operator
-  names the tx that took its nonce, and the API and CLI read it on chain before
-  the command: they refuse unless it is mined from the bot's Ethereum wallet at
-  the send's nonce, is not the send itself, has Ethereum's required
-  confirmations (`[chains.ethereum]`, not the primary chain's), and paid the
-  send's deposit address no USDC (a fee-bumped copy of the send did) unless
-  another transfer signed, attached or recorded it as its own deposit send.
-  Nonces are per sender, so they also refuse a send whose recovered signer is
-  not the configured Ethereum wallet (a key rotated out since). A missing
-  receipt for the send is never proof, since a lagging node shows none for a
-  send that mined.
+  completed, so the funds are off Alpaca even without burn evidence; with no
+  burn evidence the operator first verifies on chain that no unrecorded burn
+  left the market maker wallet), or a `BaseToAlpaca` `ConversionFailed` (the
+  post-deposit USDC->USD leg). The `is_reconcilable_failure` predicate is the
+  single source of this eligibility rule. The one in-flight exception is a
+  `BaseToAlpaca` `Bridged` with a signed deposit send
+  (`has_prepared_deposit_send`): the send is never re-signed, so one that can
+  never confirm has no other exit; the operator reconciles it once they verified
+  on chain that it will not land (see "BaseToAlpaca deposit send"). Every other
+  state is rejected: an in-progress transfer must be resumed, and a failure
+  whose funds never left the source venue reconciles to source on its own.
+  `Reconciled` is a clearing terminal -- it carries **post-burn semantics**,
+  meaning the reactor zeroes source-venue inflight WITHOUT crediting `available`
+  (the USDC was already burned via CCTP, so the funds genuinely left the source
+  venue; this is NOT a cancel, which would wrongly credit `available`). See
+  "Operator reconciliation of a stranded post-burn failure" under Failure
+  Handling. For a signed send, the operator names the tx that took its nonce,
+  and the API and CLI read it on chain before the command: they refuse unless it
+  is mined from the bot's Ethereum wallet at the send's nonce, is not the send
+  itself, has Ethereum's required confirmations (`[chains.ethereum]`, not the
+  primary chain's), and paid the send's deposit address no USDC (a fee-bumped
+  copy of the send did) unless another transfer signed, attached or recorded it
+  as its own deposit send. Nonces are per sender, so they also refuse a send
+  whose recovered signer is not the configured Ethereum wallet (a key rotated
+  out since). A missing receipt for the send is never proof, since a lagging
+  node shows none for a send that mined.
 
 ##### Integration Points
 
@@ -5968,13 +5969,16 @@ keeps the transfer's corridor guard held for the AlpacaToBase outcome, matching
 the reported `guardHeld`. The timeout sweep never clears the guard of an
 AlpacaToBase transfer past its withdrawal with no confirmed burn
 (`BridgingSubmitting`, or `BridgingFailed` with no burn): it holds the guard
-without a tombstone and pages once that the transfer stopped before the burn
-with its funds off Alpaca, naming the recovery step, until the operator
-reconciles. The offline CLI writes through a standalone store the (stopped)
-bot's reactor never observes, so its outcome is reconciled on the next startup:
-`recover_usdc_guard` clears a non-guard-holding aggregate and re-latches an
-AlpacaToBase one until the operator reconciles. Either way, once the guard is
-released automatic USDC rebalancing resumes.
+without a tombstone and pages once that the transfer has no confirmed burn and
+its funds are off Alpaca, naming the recovery step, until the operator
+reconciles. Neither state proves that no burn was broadcast: a crash between a
+burn's broadcast and its record leaves the same state. So before reconciling the
+operator verifies on chain that no burn left the market maker wallet. The
+offline CLI writes through a standalone store the (stopped) bot's reactor never
+observes, so its outcome is reconciled on the next startup: `recover_usdc_guard`
+clears a non-guard-holding aggregate and re-latches an AlpacaToBase one until
+the operator reconciles. Either way, once the guard is released automatic USDC
+rebalancing resumes.
 
 **Operator reconciliation of a stranded post-burn failure**: A USDC rebalance
 that fails after the CCTP burn holds the rebalancing guard, blocking further
