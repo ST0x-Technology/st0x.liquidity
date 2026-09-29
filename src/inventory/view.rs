@@ -7675,6 +7675,65 @@ mod tests {
     }
 
     #[test]
+    fn a_known_marker_is_never_downgraded_to_unknown() {
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let robinhood = ActiveUsdcRebalance::Known {
+            chain: Chain::Robinhood,
+            direction: RebalanceDirection::BaseToAlpaca,
+        };
+
+        let view = InventoryView::default()
+            .set_active_usdc_rebalance(id.clone(), robinhood)
+            .set_active_usdc_rebalance(id.clone(), ActiveUsdcRebalance::Unknown);
+
+        assert_eq!(view.active_usdc_rebalance_entry(&id), Some(&robinhood));
+    }
+
+    /// Hedging inflight next to a transfer of unknown corridor may be headed
+    /// to any chain, even when a known outbound transfer names Robinhood.
+    #[test]
+    fn unknown_marker_overrides_a_known_outbound_chain() {
+        let now = Utc::now();
+        let view = InventoryView::default()
+            .with_usdc_inflight(
+                usdc_cents(50_000),
+                Usdc::ZERO,
+                Usdc::ZERO,
+                usdc_cents(1_000),
+            )
+            .set_active_usdc_rebalance(
+                UsdcRebalanceId(Uuid::new_v4()),
+                ActiveUsdcRebalance::Known {
+                    chain: Chain::Robinhood,
+                    direction: RebalanceDirection::AlpacaToBase,
+                },
+            )
+            .set_active_usdc_rebalance(
+                UsdcRebalanceId(Uuid::new_v4()),
+                ActiveUsdcRebalance::Unknown,
+            )
+            .apply_snapshot_event(
+                &InventorySnapshotEvent::OnchainUsdc {
+                    chain: Chain::Base,
+                    usdc_balance: usdc_cents(700),
+                    fetched_at: now,
+                    block_number: None,
+                },
+                now,
+            )
+            .unwrap();
+
+        assert_eq!(
+            view.usdc_available(Venue::MarketMaking),
+            Some(usdc_cents(50_000))
+        );
+        assert_eq!(
+            view.onchain_usdc_snapshot_skip_streaks.get(&Chain::Base),
+            Some(&1)
+        );
+    }
+
+    #[test]
     fn clearing_one_transfers_marker_keeps_another() {
         let base = UsdcRebalanceId(Uuid::new_v4());
         let robinhood = UsdcRebalanceId(Uuid::new_v4());

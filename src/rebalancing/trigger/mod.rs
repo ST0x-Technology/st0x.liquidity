@@ -37670,6 +37670,67 @@ mod tests {
         drop(inventory);
     }
 
+    /// A resumed transfer with no tracking and no stored aggregate has no
+    /// known corridor, so it is busy at every chain until a tracked event
+    /// names its corridor.
+    #[tokio::test]
+    async fn unread_corridor_is_busy_everywhere_until_a_tracked_event_names_it() {
+        let pool = crate::test_utils::setup_test_db().await;
+        let store = Arc::new(test_store::<UsdcRebalance>(pool.clone(), ()));
+        let notifier = Arc::new(CapturingNotifier::default());
+        let trigger = make_unserved_corridor_trigger(&pool, store, notifier).await;
+        *trigger.inventory.write().await = InventoryView::default()
+            .with_usdc(usdc(900), usdc(100))
+            .update_usdc_at(
+                Chain::Robinhood,
+                Inventory::available(Venue::MarketMaking, Operator::Add, usdc(500)),
+                Utc::now(),
+            )
+            .unwrap();
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let base_busy = |inventory: &InventoryView| {
+            inventory
+                .cash_reconciliation_busy(InventoryScope::MarketMaking(Chain::Base), Utc::now())
+                .unwrap()
+        };
+
+        trigger
+            .on_usdc_rebalance(id.clone(), make_usdc_withdrawal_confirmed())
+            .await
+            .unwrap();
+
+        let inventory = trigger.inventory.read().await;
+        assert_eq!(
+            inventory.active_usdc_rebalance_entry(&id),
+            Some(&ActiveUsdcRebalance::Unknown)
+        );
+        assert_eq!(base_busy(&inventory), Some(EquityReconcileBusy::Transfer));
+        drop(inventory);
+
+        trigger
+            .on_usdc_rebalance(
+                id.clone(),
+                make_usdc_initiated_on(
+                    ROBINHOOD_RELAY,
+                    RebalanceDirection::BaseToAlpaca,
+                    usdc(300),
+                ),
+            )
+            .await
+            .unwrap();
+
+        let inventory = trigger.inventory.read().await;
+        assert_eq!(
+            inventory.active_usdc_rebalance_entry(&id),
+            Some(&ActiveUsdcRebalance::Known {
+                chain: Chain::Robinhood,
+                direction: RebalanceDirection::BaseToAlpaca,
+            })
+        );
+        assert_eq!(base_busy(&inventory), None);
+        drop(inventory);
+    }
+
     /// A transfer on a non-primary corridor marks the broker cash busy and
     /// reserves and settles in its own chain's slot, never the primary's.
     #[tokio::test]
