@@ -24486,6 +24486,77 @@ mod tests {
         );
     }
 
+    /// An AlpacaToBase `BridgingFailed` before the burn, from the live fail route or
+    /// the settlement deadline, holds the guard until `transfer reconcile`. The
+    /// reactor preserves it, and once its tracking entry is older than
+    /// `transfer_timeout` the sweep must still keep the guard rather than clear
+    /// it as a timed out transfer before the burn while the funds are off Alpaca.
+    #[tokio::test]
+    async fn sweep_keeps_the_guard_for_a_preserved_pre_burn_alpaca_to_base_failure() {
+        let now = Utc::now();
+        let pool = crate::test_utils::setup_test_db().await;
+        let store = Arc::new(test_store::<UsdcRebalance>(pool.clone(), ()));
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let amount = usdc(400);
+
+        seed_withdrawal_complete_alpaca_to_base(&store, &id, amount).await;
+        let reason = "operator: bridge never started".to_string();
+        store
+            .send(
+                &id,
+                UsdcRebalanceCommand::FailBridging {
+                    reason: reason.clone(),
+                },
+            )
+            .await
+            .unwrap();
+        let trigger = make_trigger_with_timed_out_alpaca_to_base_tracking(
+            &pool,
+            store,
+            &id,
+            amount,
+            usdc::UsdcRebalanceStage::WithdrawalConfirmed,
+            now,
+        )
+        .await;
+        trigger
+            .on_usdc_rebalance(
+                id.clone(),
+                UsdcRebalanceEvent::BridgingFailed {
+                    burn_tx_hash: None,
+                    cctp_nonce: None,
+                    reason,
+                    failed_at: now,
+                },
+            )
+            .await
+            .unwrap();
+
+        trigger
+            .expire_stuck_usdc_rebalances(now + ChronoDuration::seconds(5))
+            .await
+            .unwrap();
+
+        assert!(
+            trigger.usdc_in_progress.load(Ordering::SeqCst),
+            "the guard must stay held until the funds are reconciled",
+        );
+        assert!(
+            trigger.usdc_tracking.read().await.contains_key(&id),
+            "tracking must be kept so the sweep clears the guard after reconcile",
+        );
+        assert_eq!(
+            trigger
+                .inventory
+                .read()
+                .await
+                .active_usdc_rebalance()
+                .cloned(),
+            Some(id),
+            "the transfer must stay the active rebalance",
+        );
+    }
+
     /// Exercises the real restart-then-CLI-reconcile path end-to-end:
     /// `recover_usdc_guard` seeds tracking for a stranded `DepositFailed`
     /// aggregate (path 1), then the sweep detects the operator's CLI

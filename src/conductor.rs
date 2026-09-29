@@ -3623,6 +3623,7 @@ fn spawn_rebalancing_infrastructure<Signer: Wallet + Clone>(
             deps.pool.clone(),
             bot_gas_enqueuer.clone(),
             gas_readiness,
+            usdc_driver_gate.clone(),
         );
 
         // Before any job or the startup approvals can send from the Ethereum

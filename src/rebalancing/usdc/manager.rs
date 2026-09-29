@@ -36,6 +36,7 @@ use st0x_finance::{HasZero, Usd, Usdc};
 use st0x_float_macro::float;
 use st0x_raindex::{Raindex, RaindexError, RaindexService, RaindexVaultId};
 
+use super::driver_pause::UsdcDriverGate;
 use super::{DepositSendPending, UnresolvedDepositSend, UsdcTransferError};
 use crate::bot_gas::{BotGasOperationCategory, BotGasReceiptCostEnqueuer, RecordBotGasReceiptCost};
 use crate::inventory::view::alpaca_to_base_usdc_capacity;
@@ -415,6 +416,10 @@ pub struct CrossVenueCashTransfer<Signer: Wallet, B = CctpBridge<Signer, Signer>
     /// waits for a timed-out attempt's prepare and takes its persisted send
     /// instead of signing at the next nonce.
     deposit_send_prepare: Arc<tokio::sync::Mutex<()>>,
+    /// The USDC driver gate the conductor's workers claim. The detached burn
+    /// task claims through it too, so an operator pause waits for a burn
+    /// whose execution was cancelled. `None` where no operator pause exists.
+    driver_gate: Option<UsdcDriverGate>,
 }
 
 /// Where the Ethereum wallet credit ledger reads the open transfers from.
@@ -731,6 +736,7 @@ impl<
             bot_gas_enqueuer,
             credit_ledger: CreditLedger::Unwired,
             deposit_send_prepare: Arc::new(tokio::sync::Mutex::new(())),
+            driver_gate: None,
         }
     }
 
@@ -935,6 +941,15 @@ impl<
                 warn!(target: "rebalance", %credit_id, %withdrawal_tx, %error, "Could not convert the withdrawal tx credit for the credit ledger");
             })
             .ok()
+    }
+
+    /// Makes the detached burn task claim the driver `gate`, so an operator
+    /// pause cannot be confirmed while a burn broadcast or its record is
+    /// still running.
+    #[must_use]
+    pub(crate) fn with_driver_gate(mut self, gate: UsdcDriverGate) -> Self {
+        self.driver_gate = Some(gate);
+        self
     }
 
     /// Uses the supplied native-gas readiness check before starting a transfer.
@@ -5592,7 +5607,8 @@ impl<
     /// Broadcasts the burn and durably records its hash via `RecordPendingBurn`,
     /// on a detached task so a cancelling job timeout cannot drop the future
     /// between the (irreversible) broadcast and the record. The task captures only
-    /// owned values plus the shared `Arc`s, so it outlives a cancelled caller.
+    /// owned values plus the shared `Arc`s, so it outlives a cancelled caller,
+    /// and holds its own driver claim, so an operator pause waits for it too.
     /// Returns the broadcast tx hash once the hash is committed. The record is
     /// retried a bounded number of times; if every attempt fails the task returns
     /// the TERMINAL `BurnRecordFailed` (never a silent hash loss), and a JoinError
@@ -5617,8 +5633,13 @@ impl<
         let cctp_bridge = Arc::clone(&self.cctp_bridge);
         let cqrs = Arc::clone(&self.cqrs);
         let task_id = id.clone();
+        // Claimed while the calling execution still holds its own claim, and
+        // held by the task, so a pause confirmed after a cancelled execution
+        // still waits for the broadcast and the record.
+        let in_flight = self.driver_gate.as_ref().map(UsdcDriverGate::hold);
 
         tokio::spawn(async move {
+            let _in_flight = in_flight;
             // Clear any stale recorded burn hash BEFORE broadcasting, so that if recording THIS
             // burn's hash fails, the resume path sees `pending_burn_tx: None` and fails closed
             // instead of reburning off the stale hash (double-burn). A no-op (no event) on the

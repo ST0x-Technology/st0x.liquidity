@@ -19,7 +19,8 @@ use st0x_wrapper::WrappedEquity;
 
 use super::usdc::{
     CrossVenueCashTransfer, MarketMakingUsdcEndpoints, RecheckUsdcDeposit,
-    RestorePreparedDepositSends, ResumeAlpacaToBase, ResumeBaseToAlpaca, UsdcSettlementParams,
+    RestorePreparedDepositSends, ResumeAlpacaToBase, ResumeBaseToAlpaca, UsdcDriverGate,
+    UsdcSettlementParams,
 };
 use crate::bot_gas::BotGasReceiptCostEnqueuer;
 use crate::native_gas::GasReadiness;
@@ -166,6 +167,7 @@ impl<Signer: Wallet + Clone> RebalancerServices<Signer> {
         pool: SqlitePool,
         bot_gas_enqueuer: BotGasReceiptCostEnqueuer,
         gas_readiness: Arc<GasReadiness>,
+        driver_gate: UsdcDriverGate,
     ) -> UsdcTransferResumeHandles {
         let usdc = Arc::new(
             CrossVenueCashTransfer::new(
@@ -179,7 +181,8 @@ impl<Signer: Wallet + Clone> RebalancerServices<Signer> {
                 bot_gas_enqueuer,
             )
             .with_gas_readiness(gas_readiness)
-            .with_credit_ledger(pool),
+            .with_credit_ledger(pool)
+            .with_driver_gate(driver_gate),
         );
 
         let resume_base_to_alpaca: Arc<dyn ResumeBaseToAlpaca> = usdc.clone();
@@ -561,6 +564,7 @@ mod tests {
             pool,
             BotGasReceiptCostEnqueuer::Disabled,
             crate::native_gas::GasReadiness::always_ready_for_test(),
+            UsdcDriverGate::unpaused(),
         );
     }
 }

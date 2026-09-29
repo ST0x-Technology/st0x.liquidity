@@ -191,6 +191,20 @@ impl UsdcDriverGate {
         })
     }
 
+    /// Claims an in flight slot without checking the pause flag, for work an
+    /// execution spawns detached that must outlive a cancelled execution, such
+    /// as the burn broadcast and its record. Call it while the spawning
+    /// execution still holds its own claim: no pause can then have been
+    /// confirmed, so this only extends that claim to the detached work, and a
+    /// pause waits for the work to finish exactly as it waits for an
+    /// execution.
+    pub(crate) fn hold(&self) -> InFlight {
+        self.in_flight.send_modify(|count| *count += 1);
+        InFlight {
+            in_flight: self.in_flight.clone(),
+        }
+    }
+
     /// Test hook: whether a pause is requested or held.
     #[cfg(test)]
     pub(crate) fn is_paused(&self) -> bool {
@@ -434,6 +448,30 @@ mod tests {
         );
 
         drop(claim);
+        pauser.await.unwrap().unwrap();
+    }
+
+    /// A claim held by detached work outlives the execution that spawned it:
+    /// once the execution ends, a pause must still wait for the detached work,
+    /// so a burn broadcast cannot run under a confirmed pause.
+    #[tokio::test(start_paused = true)]
+    async fn a_held_claim_outlives_its_execution() {
+        let (control, gate) = usdc_driver_pause();
+        let control = Arc::new(control);
+
+        let execution = gate.enter().await;
+        let detached = gate.hold();
+        drop(execution);
+
+        let pauser_control = Arc::clone(&control);
+        let pauser = tokio::spawn(async move { pauser_control.pause().await.map(|_| ()) });
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert!(
+            !pauser.is_finished(),
+            "a pause must wait for the detached work after its execution ends"
+        );
+
+        drop(detached);
         pauser.await.unwrap().unwrap();
     }
 }

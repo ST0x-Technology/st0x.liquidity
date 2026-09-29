@@ -132,8 +132,10 @@ pub(crate) enum Debug {
         #[arg(long, value_parser = nonblank_reason)]
         reason: String,
     },
-    /// Mark a pre-burn USDC rebalance failed so the guard can be released.
-    /// Refuses post-burn states; verify on-chain that no burn landed first.
+    /// Mark an AlpacaToBase USDC rebalance failed before its burn; the guard
+    /// stays held until reconcile-usdc settles the withdrawn funds. Refuses
+    /// states after the burn and BaseToAlpaca transfers; verify onchain that
+    /// no burn landed first.
     FailUsdcTransfer {
         /// USDC rebalance id.
         id: String,

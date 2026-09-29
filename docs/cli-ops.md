@@ -570,10 +570,13 @@ Use `fail-usdc-transfer` when a USDC rebalance is stranded at
 `BridgingFailed` (pre-burn, `burn_tx_hash: None`). The guard outcome depends on
 the direction:
 
-- **BaseToAlpaca**: no funds left the source venue, so the failure is
-  non-guard-holding. The offline command clears the rebalancing guard on the
-  next bot restart; the live route clears it immediately through the wired
-  reactor.
+- **BaseToAlpaca**: the vault withdrawal already moved the USDC to the market
+  maker wallet, but the failure does not hold the guard. Only the offline
+  command handles this direction: the guard clears on the next bot restart,
+  which rebuilds the vault balance from chain, and the wallet USDC is moved back
+  by hand. The live route refuses it, because its reactor would credit the
+  amount back to the vault in memory and start a second withdrawal against a
+  vault that is lower by that amount.
 - **AlpacaToBase**: the withdrawal already moved the funds off Alpaca, so the
   failure KEEPS the guard -- releasing it would let a new transfer misattribute
   those funds. Settle the funds with `transfer reconcile --kind usdc`, which
@@ -581,23 +584,24 @@ the direction:
 
 **Stop the bot before running the offline `stox fail-usdc-transfer`** to
 eliminate the race where the bot advances the transfer to `Bridging` between the
-preflight and the send. The same operation is available against the live bot as
-`POST /liquidity-write/transfers/usdc/{id}/fail` (client:
-`st0x-liquidity-client debug fail-usdc-transfer <id> --reason ...`); that path
-runs under the resume lock with the USDC driver quiesced, so it does not need
-the bot stopped. It sends through the conductor's wired store, whose reactor
-updates the in-memory guard immediately: BaseToAlpaca clears it, while
-AlpacaToBase retains it until reconciliation. Live recovery therefore requires
-no bot restart; the `guardHeld` response reports the resulting state.
+preflight and the send. For AlpacaToBase the same operation is available against
+the live bot as `POST /liquidity-write/transfers/usdc/{id}/fail` (client:
+`st0x-liquidity-client --env <env> debug fail-usdc-transfer <id> --reason ...`);
+that path runs under the resume lock with the USDC driver quiesced, so it does
+not need the bot stopped. It refuses while another transfer holds the guard. It
+sends through the conductor's wired store, whose reactor keeps the in memory
+guard held until reconciliation, and the `guardHeld` response reports it. It
+does not look on chain, so the `BridgingSubmitting` check below still applies.
 
 `WithdrawalComplete` is unconditionally pre-burn: no CCTP burn has been
 broadcast yet, but the source withdrawal has completed in either direction. The
 guard outcome follows the direction split above. For AlpacaToBase the USDC left
 Alpaca and is expected in the market-maker wallet: the command does NOT release
 the guard -- settle the funds with `transfer reconcile --kind usdc`. For
-BaseToAlpaca the funds moved out of the Raindex vault but stayed on the
-market-making side: the failure reconciles to source and the guard clears on the
-next restart. The command is safe to run once the bot is stopped.
+BaseToAlpaca the funds moved out of the Raindex vault into the market maker
+wallet: the failure reconciles to source and the guard clears on the next
+restart, and the wallet USDC is moved back to the vault by hand. The offline
+command is safe to run once the bot is stopped.
 
 `BridgingSubmitting` is NOT unconditionally safe. A crash at this state may have
 already broadcast a CCTP burn whose `BridgingInitiated` event never persisted.
