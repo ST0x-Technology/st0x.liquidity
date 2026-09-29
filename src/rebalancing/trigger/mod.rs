@@ -5592,8 +5592,9 @@ impl RebalancingService {
         // holds (boot recovery re-latched it) stays held on drop. The
         // Alpaca-outbound rule and the every-corridor latch refuse like gate
         // 2. Another holder on this corridor does not: gate 2 proved it holds
-        // nothing durably, so it is a racing trigger claim, which the job-row
-        // dedupe resolves.
+        // nothing durably (a racing trigger claim, or one a separate process
+        // already made terminal), so this id joins it as a holder once the
+        // push succeeds.
         let claim = match self
             .usdc_guards
             .try_claim(state.corridor().chain(), id, direction)
@@ -5670,6 +5671,7 @@ impl RebalancingService {
                 if let Some(claim) = claim {
                     claim.defuse();
                 }
+                self.usdc_guards.hold(corridor.chain(), id, direction);
                 info!(
                     target: "rebalance",
                     %id,

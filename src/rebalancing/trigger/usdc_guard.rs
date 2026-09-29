@@ -212,14 +212,8 @@ impl CashGuardState {
             return Err(ClaimRefusal::CorridorUnread);
         }
 
-        let chain_taken = self
-            .holders
-            .get(&chain)
-            .is_some_and(|holders| holders.keys().any(|holder| holder != id));
-        if chain_taken {
-            return Err(ClaimRefusal::CorridorHeld);
-        }
-
+        // Checked before the corridor, so a caller that tolerates a held
+        // corridor (a manual resume) still meets the outbound rule.
         let outbound_elsewhere = match direction {
             RebalanceDirection::BaseToAlpaca => false,
             RebalanceDirection::AlpacaToBase => self
@@ -233,6 +227,14 @@ impl CashGuardState {
         };
         if outbound_elsewhere {
             return Err(ClaimRefusal::AlpacaOutboundElsewhere);
+        }
+
+        let chain_taken = self
+            .holders
+            .get(&chain)
+            .is_some_and(|holders| holders.keys().any(|holder| holder != id));
+        if chain_taken {
+            return Err(ClaimRefusal::CorridorHeld);
         }
 
         Ok(())
