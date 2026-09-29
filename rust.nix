@@ -62,7 +62,7 @@ let
         "sha256-dDsvRkrGXhfoFunvk6fwP+12fSsjiWYoxz/CzVVGpHA=";
       "git+https://github.com/ST0x-Technology/event-sorcery.git?tag=v0.3.0#5f88f1498aa565510fe20d9d0092f48a2f5b0615" =
         "sha256-Ycs/ycz9V0+dDHdADUiLs4xh1aSJvZjuks5/M1nbv9o=";
-      "git+https://github.com/ST0x-Technology/st0x.pricing-types?rev=152d7486ccc8a4b6c2750716415320c074e9f321#152d7486ccc8a4b6c2750716415320c074e9f321" =
+      "git+https://github.com/ST0x-Technology/st0x.pricing-types?tag=v0.8.0#152d7486ccc8a4b6c2750716415320c074e9f321" =
         "sha256-1YaWG9nrjIZq2zbA6vsTlriABrvKAavJLKaekGE1fQs=";
       "git+https://github.com/ST0x-Technology/st0x.finance?tag=v0.3.0#563f82511309dc30910ea40da1975edd0ef37736" =
         "sha256-DN/5I45GOMobUSAvBwJPGCWD1LuEQdIWJnNZQ/D6GKk=";
@@ -89,7 +89,7 @@ let
           src = pkgs.fetchgit {
             url = "https://github.com/ST0x-Technology/st0x.issuance.git";
             rev = issuanceRev;
-            hash = "sha256-9800S/vD14OwNslI26XgofB2IYzPb04Vonqmk1kOF+g=";
+            hash = "sha256-czJoEkUuhTNSsqtQ8CbK7YVBLpjQPMOIftVZ5TMBCQc=";
             fetchSubmodules = false;
             fetchLFS = true;
           };
@@ -228,6 +228,11 @@ in
         homepage = "https://github.com/ST0x-Technology/st0x.liquidity";
       };
     }
+    # Same compile-time commit the server reports from /health, so
+    # `st0x-cli --version` names the build an operator is actually running.
+    # The crate version cannot: it is the workspace `0.1.0` and has never
+    # tracked a release tag.
+    // pkgs.lib.optionalAttrs (gitCommit != null) { ST0X_GIT_COMMIT = gitCommit; }
   );
 
 }

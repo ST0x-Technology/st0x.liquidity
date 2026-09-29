@@ -22,7 +22,7 @@ use tokio::net::TcpListener;
 use tokio::sync::broadcast;
 use tokio::task::{AbortHandle, JoinError, JoinHandle};
 use tokio_util::sync::CancellationToken;
-use tokio_util::task::TaskTracker;
+use tokio_util::task::{AbortOnDropHandle, TaskTracker};
 use tracing::{debug, error, info, warn};
 use tracing_subscriber::Layer;
 
@@ -70,6 +70,7 @@ mod position;
 mod position_check;
 mod pricing_identity;
 mod rebalancing;
+mod registry_watch;
 mod startup;
 mod telemetry;
 mod trading;
@@ -123,7 +124,6 @@ pub use st0x_config::ExecutionThreshold;
 #[cfg(any(test, feature = "test-support"))]
 pub use st0x_config::{
     AllocationCtx, BotGasValuationConfig, ImbalanceThreshold, RebalancingCtx, RebalancingCtxError,
-    UsdcRebalancing,
 };
 #[cfg(any(test, feature = "test-support"))]
 pub use st0x_config::{
@@ -299,6 +299,14 @@ async fn run_bot_session_inner(
 
     let health = startup::HealthGate::default();
     let detached_tasks = TaskTracker::new();
+    // Owned by this session: the handle aborts the loop when this function
+    // returns on any path, so no second session ever shares its gauges.
+    let _registry_watch = ctx.registry.clone().map(|live| {
+        AbortOnDropHandle::new(tokio::spawn(registry_watch::watch(
+            live,
+            shutdown_token.clone(),
+        )))
+    });
     let state = AppState {
         ctx: ctx.clone(),
         pool: pools.cqrs.clone(),

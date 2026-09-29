@@ -649,11 +649,81 @@ stox transfer reconcile --kind redemption --id <redemption-aggregate-id> \
   post-burn `BridgingFailed` (one carrying a `burn_tx_hash` or `cctp_nonce`),
   any `AlpacaToBase` `BridgingFailed` (the withdrawal completed, so the funds
   left Alpaca even with no burn, e.g. the settlement deadline, a missing
-  withdrawal tx hash, or a withdrawal credit mismatch), and a `BaseToAlpaca`
-  `ConversionFailed`. Its `--reason` must be one of `funds-moved-manually` or
-  `deposit-credited-offline`; any other value is rejected. Every other state is
-  rejected, including `WithdrawalFailed` and an `AlpacaToBase`
-  `ConversionFailed`, whose funds never left Alpaca.
+  withdrawal tx hash, or a withdrawal credit mismatch), a `BaseToAlpaca`
+  `ConversionFailed`, and a `BaseToAlpaca` `Bridged` with a signed deposit send
+  whose nonce you verified on chain is taken by a different mined tx (see
+  "Base->Alpaca deposit send pages"). Its `--reason` must be one of
+  `funds-moved-manually` or `deposit-credited-offline`; any other value is
+  rejected. Every other state is rejected, including `WithdrawalFailed` and an
+  `AlpacaToBase` `ConversionFailed`, whose funds never left Alpaca.
+- `--kind usdc` is bookkeeping only: it moves no funds. Before you reconcile a
+  post-burn `BridgingFailed`, finish the transfer by hand: (1) read the recorded
+  nonce (`usedNonces`) on the destination chain (Base for `AlpacaToBase`,
+  Ethereum for `BaseToAlpaca`); a relayer can mint any burn. (2) If the nonce is
+  used, find its mint (the `MessageReceived` log for the nonce). If it is
+  unused, get the Circle attestation for the burn tx and mint it. (3) Finish the
+  funds leg: deposit the minted USDC to the vault on Base (`AlpacaToBase`), or
+  send it to Alpaca from Ethereum (`BaseToAlpaca`). (4) Verify that the funds
+  arrived, then reconcile.
+- An `Attested` resume whose CCTP nonce is used on chain but whose mint is not
+  in the bounded log scan (`MintNotFoundInScanWindow`) redrives when the nonce
+  read unused at the block below the scan's floor: the scan covers the mint, so
+  the log is only lagging. When that read fails (a node without state that old),
+  it redrives if the floor block was mined before the transfer started. When the
+  nonce was used below the floor, or the read failed and the floor is newer, the
+  mint can lie below it, and the resume marks the transfer `BridgingFailed` with
+  its burn tx and nonce kept, so `--kind usdc` accepts it. Find the mint on
+  chain (the `MessageReceived` log for the recorded nonce) and finish the funds
+  leg before you reconcile. A used nonce whose mint was found but cannot be
+  adopted (its log body differs from the recorded message, for example a relayer
+  minted a re-attested fast-transfer body; its tx reverted; or it has no
+  `MintAndWithdraw`) is marked `BridgingFailed` and pages the same way. A legacy
+  `Attested` transfer (no persisted message) whose nonce is used but whose
+  Circle re-poll keeps failing the same way (for example a malformed complete
+  answer) is marked `BridgingFailed` the same way. If that re-poll times out
+  while the nonce reads used (or the read fails), the transfer stays `Attested`
+  and redrives; if Circle keeps timing out, the 4-hour mint recovery alert
+  pages. A mint outside the scan pages with "the CCTP mint cannot be resolved
+  automatically" in both directions, and the bot stops retrying it: find the
+  mint and finish the funds leg, then reconcile with `--kind usdc`. A
+  BaseToAlpaca `BridgingFailed` recovery (for example after a restart) that
+  reads the nonce used but cannot find its mint applies the same floor rule: it
+  redrives while the rule places the mint inside its scan, and otherwise pages
+  the same way and stops. One that finds the mint but cannot adopt it also pages
+  the same way and stops, so it never adopts a relayer mint and sends the USDC
+  to Alpaca after you did. After a manual send to Alpaca, run
+  `transfer reconcile --kind usdc` right away: until then every restart re-runs
+  the recovery. The legacy re-poll latch pages with the same text for
+  AlpacaToBase only. A BaseToAlpaca latch for the legacy re-poll, or for a
+  message that can never mint, does not page: its retry may still adopt or mint
+  and send the deposit, so do not move the funds by hand while it retries; the
+  job's dead-letter alert says when it gave up.
+- An `AlpacaToBase` transfer whose Circle attestation poll fails hard (or, for a
+  legacy `Attested` transfer, whose re-poll fails with the nonce unused) is
+  marked `BridgingFailed` and pages with "the burned USDC cannot be minted
+  automatically". The bot did not mint, but it did not read the nonce either,
+  and a relayer may have minted the burn: get the attestation for the burn tx,
+  check its nonce on Base, and mint it only if the nonce is unused. Then deposit
+  the USDC to the vault and reconcile with `--kind usdc`.
+- An `AlpacaToBase` transfer whose Base mint fails hard (for example a
+  `receiveMessage` revert with the nonce still unused after the recovery window)
+  is marked `BridgingFailed` and pages with "the CCTP mint on Base did not
+  complete". Check the recorded nonce on Base: if it is used, find its mint; if
+  not, get the attestation for the burn tx and mint it on Base. Then deposit the
+  USDC to the vault and reconcile with `--kind usdc`.
+- An `AlpacaToBase` `Attested` transfer whose persisted CCTP message cannot be
+  used (a corrupt envelope) or can never mint on Base (a placeholder nonce, a
+  truncated message, another destination domain) is marked `BridgingFailed` with
+  its burn tx kept and pages with "the recorded CCTP message cannot mint on
+  Base". The bot did not read the nonce: get the Circle attestation for the burn
+  tx and mint it on Base (if the nonce is already used, find that mint instead).
+  Then deposit the USDC to the vault and reconcile with `--kind usdc`.
+- An `AlpacaToBase` `Attested` transfer whose attestation (persisted, or
+  re-polled from Circle for a legacy transfer) carries a nonce other than the
+  recorded `cctp_nonce` is marked `BridgingFailed` and pages with "the attested
+  CCTP message does not match the recorded nonce". Check which message the burn
+  tx produced and whether its nonce was minted on Base (mint it if not). Then
+  deposit the USDC to the vault and reconcile with `--kind usdc`.
 - `--kind mint` / `--kind redemption` mark an equity transfer stuck in `Failed`
   as terminal `Reconciled`. This is a pure bookkeeping transition: it emits no
   reactor effect and dispatches no inventory update. One nuance for redemptions
@@ -662,6 +732,177 @@ stox transfer reconcile --kind redemption --id <redemption-aggregate-id> \
   seeding only on the **next** bot restart (the running process keeps the seeded
   amount until then). Valid only from `Failed`; a transfer in any other state is
   rejected. The `--reason` is free text.
+
+### Base->Alpaca deposit send pages
+
+The bot signs the Alpaca deposit send and persists the signed tx
+(`DepositSendPrepared`) before it broadcasts it, and records the send tx
+(`DepositInitiated`) once it is confirmed. Every retry broadcasts those same
+bytes, so it never sends a second time for the same transfer. At startup it
+reserves the nonce of every signed send still on `Bridged` and rebroadcasts it,
+before the startup token approvals.
+
+- **"signed deposit send <tx> is not confirmed yet ... It has stayed unconfirmed
+  for ..."** (`DepositSendReconciliationPending`, paged every 30 minutes once 4
+  hours have passed since the send was signed): the transfer stays `Bridged`,
+  holds the guard, and the job keeps broadcasting the same bytes. The bot never
+  re-signs or fee-bumps it. Check `<tx>` on chain:
+  - Confirmed: do nothing. The next redrive continues the deposit.
+  - No receipt, and the bot wallet's `latest` nonce is past the send's nonce: a
+    different tx took the nonce, so the send can never mine. Settle it (below).
+  - Pending, or dropped while the nonce is still free: it will not confirm at
+    its current fee, but it can still mine when fees drop, and the bot keeps
+    rebroadcasting it. Do **not** move the USDC or reconcile yet: that can move
+    the minted USDC twice. Wait for fees to drop, or cancel the send. There is
+    no CLI command for the cancel yet; do it by hand:
+    1. Read the send's nonce from `<tx>` on a block explorer, or from the
+       database:
+
+       ```sql
+       SELECT json_extract(payload, '$.DepositSendPrepared.prepared.nonce')
+       FROM events
+       WHERE aggregate_id = '<id>'
+         AND event_type = 'UsdcRebalanceEvent::DepositSendPrepared';
+       ```
+
+    2. From the bot's Ethereum wallet (its signer), send a 0-value ETH transfer
+       to the wallet itself at that nonce, with `maxFeePerGas` and
+       `maxPriorityFeePerGas` at least 10% above `<tx>`'s and `maxFeePerGas`
+       above the current base fee. Never fee-bump the send itself (the same USDC
+       transfer at a higher fee): that moves the USDC to Alpaca, and reconcile
+       refuses it.
+    3. Wait until the cancel has Ethereum's required confirmations
+       (`[chains.ethereum] required_confirmations`). If `<tx>` mined instead, do
+       nothing: the next redrive continues the deposit.
+  - To settle, only once a different tx is mined at the send's nonce: move the
+    minted USDC to Alpaca by hand if needed, then
+    `stox transfer reconcile --kind usdc --id <id> --reason <reason> --superseding-tx <cancel>`
+    (valid for a Base->Alpaca `Bridged` with a signed send; the API takes
+    `supersedingTx` in the body; both refuse it for a transfer with no signed
+    send, the API with `400`), then restart the bot to release the send's nonce
+    so later sends from the wallet proceed. `<cancel>` is the hash of the tx
+    that took the send's nonce. Reconcile reads it on the bot's Ethereum node
+    and refuses (the API with `409`) unless it is mined from the bot wallet, at
+    the send's nonce, is not `<tx>` itself, has Ethereum's required
+    confirmations, and paid the Alpaca deposit address no USDC (a fee-bumped
+    copy of the send did, so the deposit went through) unless another transfer
+    signed, attached or recorded it as its own deposit send (the deposit address
+    is shared, so another transfer's send can take the nonce); each refusal
+    names the failed check. No receipt for `<tx>` is not proof: a lagging node
+    shows none for a send that did mine. "could not read superseding tx" (the
+    API: `502`) and "could not check whether another transfer recorded
+    superseding tx" (the API: `500`) are transient; retry. The send must also be
+    signed by the bot's configured Ethereum wallet, since nonces are per sender:
+    a send signed by a key rotated out since is refused with "deposit send <tx>
+    was signed by <signer>, not the bot's Ethereum wallet"; cancel it from that
+    key and run the CLI reconcile configured with that key.
+- **"Could not list signed Alpaca deposit sends at startup"** or **"Could not
+  load a transfer with a signed Alpaca deposit send at startup"**
+  (`operational_alert`): the bot started without reserving that send's nonce, so
+  it skipped the Ethereum startup token approvals and stale-allowance revokes on
+  that start (the **"Startup token approvals deferred"** warning below). A job
+  can still take the nonce; the transfer's rebroadcast reserves it again when it
+  resumes. Fix the database read and restart; if the page above fires later,
+  follow it.
+- **"Signed Alpaca deposit sends with unparseable transfer ids were not restored
+  at startup"** (`operational_alert`, the raw ids in `unparseable`): a
+  `UsdcRebalance` event row with a signed send has an `aggregate_id` that is not
+  a transfer id. No job or CLI command can drive it, so its nonce is never
+  reserved, and no rebroadcast reserves it later. Startup skips the Ethereum
+  token approvals and stale-allowance revokes while the row is there. Read the
+  signed send from the row:
+
+  ```sql
+  SELECT sequence, event_type, payload
+  FROM events
+  WHERE aggregate_type = 'UsdcRebalance' AND aggregate_id = '<raw id>'
+  ORDER BY sequence;
+  ```
+
+  Check its tx hash on chain. If it mined, the minted USDC went to Alpaca:
+  account for it by hand. If it has no receipt and the wallet's `latest` nonce
+  is past its nonce, it can never mine and nothing moved. If it is pending, or
+  its nonce is still free, cancel it at its nonce as in the steps above so it
+  cannot move USDC later. Every restart pages again while the row is there.
+- **"Could not rebroadcast a signed Alpaca deposit send at startup"**
+  (`operational_alert`, with `id`, `tx` and `nonce`): the bot keeps the send's
+  nonce reserved and started without the Ethereum startup token approvals and
+  stale-allowance revokes (the **"Startup token approvals deferred"** warning
+  below names the chain). The transfer's resume broadcasts the send again. Read
+  the `error`: an RPC fault clears by itself; for a send that will never
+  confirm, follow the not-confirmed page above.
+- **"Startup token approvals deferred on this chain"** (warning, not a page,
+  target `orderbook`, with `chain`): a signed send restored at startup on that
+  chain (an Alpaca deposit send, or a vault withdrawal) is not mined yet: its
+  rebroadcast failed, or it is pending, possibly at a fee too low to confirm. An
+  approval would wait behind its nonce, so startup grants none there and skips
+  that chain's stale-allowance revokes. Wraps and deposits still approve on
+  demand. The `rebalance` log names the send: "Restored Alpaca deposit send is
+  not mined yet at startup" (with `id` and `tx`), "Restored vault withdrawal is
+  not mined yet at startup" (with `redemption_id` and `tx_hash`), or a
+  rebroadcast page: the deposit send page above, or **"Equity redemption `<id>`
+  has a signed vault withdrawal ... that could not be rebroadcast at startup"**,
+  whose resume job broadcasts the withdrawal again. If the send stays pending,
+  it will not confirm at its fee: for a deposit send follow the not-confirmed
+  page above (wait for fees to drop, or cancel it at its nonce).
+- **"Cannot tell whether a signed Alpaca deposit send was persisted"**
+  (`operational_alert`): a `PrepareDepositSend` write failed and the reload that
+  checks it failed too. The bot keeps the send's nonce reserved, so later sends
+  from the Ethereum wallet wait behind it. Fix the database, then restart the
+  bot: startup reserves the nonce again only if the send was persisted.
+- **"deposit marked failed for operator reconciliation"**
+  (`DepositSendUnresolved`): the transfer is `DepositFailed`, holds the guard,
+  and the job does not retry. The page names the cause and the step:
+  - "the signed deposit send <tx> was mined reverted": the send moved nothing.
+    The minted USDC is still in the Ethereum wallet. Move it by hand, then
+    `transfer reconcile --kind usdc`.
+  - "no deposit send was recorded, but send <tx> of the same amount ...": only a
+    transfer that reached `Bridged` before the bot persisted signed sends. The
+    transfer has no `deposit_ref`. Find this transfer's own send on chain (from
+    the bot wallet to Alpaca's deposit address, `amount_received`, after the
+    mint). The bot already skipped every same-amount send another transfer
+    signed, attached or recorded, but the named send can still belong to another
+    transfer: check that it is this transfer's. If Alpaca credited it, run
+    `stox transfer recheck --kind usdc --id <id> --deposit-tx <hash>`. The bot
+    attaches the tx only if it moved exactly the transfer's amount from the bot
+    wallet to the deposit address, is confirmed, is mined at or after the
+    transfer's mint (an older send is refused with "deposit tx <hash> is in
+    block <n>, before ... mint"), and no other transfer recorded it; then it
+    confirms the deposit and runs the USDC->USD conversion. A hash that is not
+    mined (a typo, or a send still pending) is refused at once with "deposit tx
+    <hash> is not mined on Ethereum"; check the hash. If no send landed, move
+    the USDC by hand and `transfer reconcile --kind usdc` (reconcile does not
+    convert USDC to USD).
+- **"withdrawal tx <tx> is already recorded by USDC rebalance <other>"**
+  (`WithdrawalTxAlreadyRecorded`, Alpaca->Base): Alpaca reported a withdrawal tx
+  that another transfer already recorded, so it did not pay this one. The
+  transfer is marked `BridgingFailed` with no burn and the job stops. Find where
+  this withdrawal's USDC went (Alpaca's transfer record, the Ethereum wallet),
+  settle it by hand, then `transfer reconcile --kind usdc`.
+- **"Open USDC transfers share one Alpaca withdrawal tx; it paid only one of
+  them"** (credit ledger `operational_alert`): two open Alpaca->Base transfers
+  recorded the same withdrawal tx, which can happen only when both confirmed at
+  the same moment. Find which withdrawal the tx paid at Alpaca. The other
+  transfer was credited from a tx that did not pay it, so its burn can spend
+  another transfer's USDC: find where its withdrawal went, settle it by hand,
+  and reconcile it with `--kind usdc`.
+- **"USDC transfer corridor mismatch: transfer <id> runs on the <corridor>
+  corridor, which this build does not serve"** (`operational_alert`, once per
+  transfer per run: a restart pages again): the transfer was recorded on a USDC
+  corridor this build does not carry, for example after a rollback from a build
+  that served it, or after the corridor config changed. This build cannot move
+  its funds. The bot holds the transfer and its guard: its job re-queues itself
+  every 10 minutes (a warning log each time, no page) until the transfer holds
+  no guard (reconciled, say), when the job ends; startup and the timeout sweep
+  do not re-arm it. A job for a fresh transfer asking for that corridor (nothing
+  recorded yet) dead-letters instead, and its dead-letter alert contains the
+  same text. `transfer resume` and `transfer recheck` are refused with messages
+  that start with the same words. `transfer reconcile` does not accept the
+  pre-burn states such a transfer is usually in; do not try it there. A held
+  transfer in a reconcilable failed state can be reconciled as usual, and the
+  next sweep releases its guard. Deploy a build (and config) that serves the
+  named corridor; that build's worker picks up the queued job within 10 minutes
+  and resumes the transfer where it stopped.
 
 ### Clearing a dropped pending burn (`BridgingSubmitting` latch)
 

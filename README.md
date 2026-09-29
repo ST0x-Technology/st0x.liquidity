@@ -175,6 +175,11 @@ cargo run --bin validate-config -- --config config/prod/st0x-hedge.toml
 cargo run --bin validate-config -- --config path/to/config.toml --secrets path/to/secrets.toml
 ```
 
+A config that names `[registry]` keeps its per-symbol tables in the token file
+in the bucket. `validate-config` never reads the bucket: pass a local copy with
+`--registry-file tokens.toml` to check those tables too. Without it the config
+is judged without them, and the report says so.
+
 Without `--secrets` it judges the config file alone: schema (unknown keys are
 rejected), the port, chain, asset and `[rebalancing]` cross-field rules, and
 every value the config carries on its own. What it cannot see is what the
