@@ -97,9 +97,11 @@ and confusing.
   hands them out through `ChainRegistry::hedged`. The TOML key stays `trading`.
 - **Transport chain**: a chain with no trading table -- RPC and confirmations
   only, used as a cash corridor's hub (see USDC Corridor).
-- **Primary chain**: THE hedged chain that sets `primary = true`. It is the
-  chain the bot rebalances automatically and the endpoint of the cash corridor.
-  Its vault inventory is polled like every hedged chain's.
+- **Primary chain**: THE hedged chain that sets `primary = true`. The cash
+  transfer executors run on its orderbook and vault, so for now it is the only
+  chain a cash corridor may be keyed by; the USDC inventory state (inflight,
+  busy marker) is kept per corridor chain. Its vault inventory is polled like
+  every hedged chain's.
 - **Secondary chain**: any other hedged chain. Prefunded: its fills are hedged
   and its vault inventory is polled, but it is not rebalanced.
 
