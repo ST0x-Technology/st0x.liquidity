@@ -127,27 +127,32 @@ auto-recovery will retry the failed mint on startup.
 
 ---
 
-## Step 4: Add the Asset to the Liquidity Bot Config
+## Step 4: Add the Asset to the Token File
 
-The liquidity bot (this repo) needs the asset in its config file to start
-trading and hedging it.
+The liquidity bot (this repo) reads its per-symbol tables from the token file
+that `st0x.registry` publishes to `gs://t0-artifacts-tokens/<env>/tokens.toml`
+(`t0/<env>.toml` in that repository). The bot's configs,
+`config/staging/st0x-hedge.toml` and `config/prod/st0x-hedge.toml`, name that
+file under `[registry]` and must not carry a per-symbol table themselves: a
+config that does is refused at startup.
 
-### 4a. Edit the config file
+### 4a. Edit the token file
 
-**Staging:** `config/staging/st0x-hedge.toml` **Production:**
-`config/prod/st0x-hedge.toml`
-
-Add two sections. The first says where the asset is listed on-chain, so it goes
-under the chain that lists it. The second says how the bot hedges it, which is
-independent of any chain -- there is one broker account and one position per
-symbol.
+Edit `t0/staging.toml` (or `t0/production.toml`) in `st0x.registry`. The bot
+takes two tables per asset. The first says where the asset is listed on-chain,
+so it goes under the chain that lists it. The second says how the bot hedges it,
+which is independent of any chain -- there is one broker account and one
+position per symbol. Other services own other keys on the same tables (the
+file's header lists them). The bot takes its own keys and ignores the others;
+which keys may appear, and their spelling, is checked by `st0x.registry`'s CI
+(`t0/check.jq`) before the file is published, not by the bot.
 
 ```toml
-[chains.base.trading.assets.equities.SGOV]
+[chains.base.assets.equities.SGOV]
 trading = "disabled"                          # "enabled" or "disabled"
 rebalancing = "disabled"                      # "enabled" or "disabled"
 wrapped_equity_recovery = "disabled"          # "enabled" or "disabled"
-vault_id = "0xfab"                            # Raindex vault ID (can omit for auto-discovery)
+vault_ids = ["0xfab"]                         # Raindex vault IDs (required when rebalancing = "enabled")
 tokenized_equity = "0xc941C1506B7555Ba8C506Fb6c9b9CC259902d612"
 tokenized_equity_derivative = "0x78c31580c97101694c70022c83d570150c11e935"
 
@@ -157,6 +162,10 @@ extended_hours_counter_trading = "disabled"   # "enabled" or "disabled"
 
 Both are required: a symbol listed on a chain with no hedging policy, or a
 hedging policy for a symbol listed on no chain, fails startup.
+
+A chain the token file lists the asset on must be declared with a
+`[chains.<name>.trading]` table in the bot's config, or the bot refuses the
+file.
 
 The chain table the asset goes under decides what the bot uses for it: that
 chain's signing wallet, orderbook, `redemption_wallet` and
@@ -206,7 +215,14 @@ chain's signing wallet, orderbook, `redemption_wallet` and
   when the bot accounts the fill, not when the fill lands on chain, so after
   enabling trading the bot hedges every fill it has not accounted yet, including
   fills that landed while trading was disabled but were still queued, not yet
-  backfilled, or landed during the restart.
+  backfilled, or landed during the restart. Every excluded fill logs
+  `Fill on
+  DISABLED asset <SYMBOL> (chain <chain>, ...)`, which alerts in
+  production once per chain and symbol. If trading was left disabled by mistake,
+  enabling it does not hedge the fills already excluded: sum that symbol and
+  chain's `trading_disabled` rows in `skipped_fills` and hedge them by hand. If
+  it is disabled on purpose and hedged by hand, silence the alert for that chain
+  and symbol.
 - `rebalancing`: Whether the bot auto-rebalances this asset between venues.
   Usually `"disabled"` at first.
 - `wrapped_equity_recovery`: Explicit opt-in for recovery of wrapped-equity
@@ -218,17 +234,59 @@ chain's signing wallet, orderbook, `redemption_wallet` and
   bot to place offsetting broker trades outside regular market hours;
   `"disabled"` restricts counter-trading to regular session only. Must be
   specified for every equity entry.
-- `vault_id`: The Raindex vault ID. Can be omitted to let the bot discover it
-  automatically.
+- `vault_ids`: The Raindex vault IDs. Required when `rebalancing = "enabled"`:
+  the bot refuses a token file with a rebalancing row that has none. With
+  rebalancing disabled they can be omitted, and the bot discovers the vaults
+  from its trade events.
 - `tokenized_equity`: The base token contract address.
 - `tokenized_equity_derivative`: The wrapped token contract address.
 
-### 4b. Commit, PR, and deploy
+### 4b. Publish, then roll the bot
 
-This is a config-only change. Create a PR, merge it, and deploy. The bot will
-pick up the new asset on restart.
+Merge the `st0x.registry` change; its CI publishes the file. The bot never
+applies a new copy while it runs: its `registry_pending_restart` gauge goes to 1
+when the latest published copy differs from the one it runs, and
+`registry_invalid` goes to 1 when the copy its next start would read (the pinned
+generation in production, the latest copy in staging) would be refused.
+`registry_latest_refused` goes to 1 when the latest copy would be refused, so in
+production a bad copy shows before the pin is bumped to it. In production a
+restart alone changes nothing: it loads the pinned generation again, so the
+gauge stays at 1 until the pin is bumped and released.
 
-**Tip:** Start with `trading = "disabled"` first. Deploy, verify the bot sees
+- **Staging** reads the latest copy on every start, so the next restart picks
+  the asset up. That includes a crash restart, and no deploy gate runs on it:
+  whatever is published is what the next staging start runs.
+- **Production** pins `generation` under `[registry]` in
+  `config/prod/st0x-hedge.toml`. Set it to the new generation
+  (`gcloud storage objects describe gs://t0-artifacts-tokens/production/tokens.toml`)
+  in a liquidity PR and release it. In the same PR copy that object to
+  `tests/fixtures/tokens-production-<generation>.toml`
+  (`gcloud storage cp 'gs://t0-artifacts-tokens/production/tokens.toml#<generation>' tests/fixtures/tokens-production-<generation>.toml`):
+  the tests that describe what production runs read the fixture the pin names,
+  and CI fails without it. `tokens-production-migration.toml` stays as it is; it
+  is the frozen proof of the move from inline tables.
+
+Before a release, check the pinned copy against the config offline:
+
+```bash
+cargo run --bin validate-config -- --config config/prod/st0x-hedge.toml \
+  --registry-file tests/fixtures/tokens-production-<generation>.toml
+```
+
+### Retiring an asset
+
+One config change. List the symbol under `[assets.equities] retired_symbols` in
+the bot's config and release that. From then on the bot ignores the token file's
+rows for that symbol, so the merged config never has it both configured and
+retired, and `verify-migrations` still finds every symbol the database
+references either configured or retired. Remove its rows from `t0/<env>.toml` in
+`st0x.registry` whenever convenient afterwards; for production that lands with
+the next `generation` bump. Never remove the rows first: the database would then
+reference a symbol that is neither configured nor retired. Nothing enforces this
+order. Staging loads the latest copy on any restart without a deploy gate, so
+rows removed too early take effect at the next staging start.
+
+**Tip:** Start with `trading = "disabled"` first. Publish, verify the bot sees
 the asset, then enable trading in a follow-up change.
 
 ---
@@ -246,7 +304,7 @@ For adding asset **XYZ**:
 - [ ] Wait for Alpaca to refresh their tokencache (or ask them to force it)
 - [ ] Test a mint via the liquidity bot CLI:
       `stox alpaca-tokenize -t <token_addr> -s XYZ -q 1 -r <receiving_wallet>`
-- [ ] Add config entry to `config/staging/st0x-hedge.toml` (disabled first)
+- [ ] Add the asset to `t0/staging.toml` in `st0x.registry` (disabled first)
 - [ ] On each hedged chain where the asset is listed: that chain's own
       `tokenized_equity_derivative`, and Turnkey approval policies for that
       chain's id
@@ -256,9 +314,10 @@ For adding asset **XYZ**:
       mode, the orchestrator entry for that chain (see step 4a) and the Turnkey
       `MintAuth` policy for that chain's id and orchestrator; the first
       orchestrator-mode mint fails at signing without it
-- [ ] Deploy to staging, verify bot sees the asset
-- [ ] Enable trading in config, deploy again
-- [ ] Repeat for production when staging looks good
+- [ ] Restart staging, verify bot sees the asset
+- [ ] Enable trading in the token file, restart again
+- [ ] Repeat for production when staging looks good, bumping `generation` in
+      `config/prod/st0x-hedge.toml` in a release
 
 ---
 

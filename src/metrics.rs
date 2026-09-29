@@ -42,6 +42,27 @@ pub(crate) fn setup() -> Result<PrometheusHandle, BuildError> {
         "Shares the last position scan wanted to hedge but could not place, by symbol; the \
          floor's residual plus any other preflight shortfall"
     );
+    metrics::describe_gauge!(
+        "registry_pending_restart",
+        "1 while the latest token file in the bucket differs from the per-symbol tables this \
+         instance runs; without a pinned generation a roll picks it up, with one the pin must \
+         move in a release"
+    );
+    metrics::describe_gauge!(
+        "registry_invalid",
+        "1 while the copy the next roll reads (the pinned generation, else the latest) would \
+         be refused at boot or is gone"
+    );
+    metrics::describe_gauge!(
+        "registry_latest_refused",
+        "1 while the latest token file in the bucket would be refused at boot or cannot be \
+         read (gone, refused to the service account, too large); with a pinned generation, \
+         the copy a pin bump would move to"
+    );
+    metrics::describe_counter!(
+        "registry_fetch_errors_total",
+        "Refresh reads of the token file that failed"
+    );
     metrics::describe_counter!(
         "equity_plan_declined_total",
         "Equity allocation plans that chose no operation, by reason (within_band, \

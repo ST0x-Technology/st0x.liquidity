@@ -16,6 +16,7 @@ mod orchestrator;
 mod order_poller;
 mod pricing;
 mod rebalancing;
+pub mod registry;
 mod telemetry;
 mod threshold;
 mod trading_schedule;
@@ -46,8 +47,9 @@ pub use order_poller::OrderPollerCtx;
 pub use pricing::{PricingApiKey, PricingAuth, PricingConfig, PricingCtx, PricingCtxError};
 pub use rebalancing::{
     ALPACA_MINIMUM_WITHDRAWAL, ALPACA_TO_BASE_MINIMUM_TRANSFER, RebalancingConfig, RebalancingCtx,
-    RebalancingCtxError, UsdcRebalancing,
+    RebalancingCtxError, UsdcCorridorConfig, UsdcCorridorCtx, UsdcRebalancing,
 };
+pub use registry::{RegistryLive, RegistrySource, TokenFile};
 pub use telemetry::{
     ExtraLayer, FileLogGuard, FileLogging, TelemetryConfig, TelemetryCtx, TelemetryError,
     TelemetryGuard, mk_env_filter, setup_tracing,

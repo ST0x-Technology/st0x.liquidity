@@ -75,6 +75,7 @@
 use alloy::primitives::{B256, TxHash};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use itertools::{Either, Itertools};
 use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
 use std::fmt::{Display, Formatter};
@@ -82,8 +83,10 @@ use std::str::FromStr;
 use tracing::warn;
 use uuid::Uuid;
 
+use st0x_bridge::corridor::{UsdcCorridor, legacy_base_cctp};
 use st0x_dto::{TransferOperation, UsdcBridgeOperation, UsdcBridgeStatus};
 use st0x_event_sorcery::{DomainEvent, EventSourced, SendError, Store, Table};
+use st0x_evm::PreparedTransaction;
 use st0x_execution::{AlpacaTransferId, ClientOrderId};
 use st0x_finance::{HasZero, Usdc};
 
@@ -203,6 +206,12 @@ pub enum UsdcRebalanceError {
     /// Attempted to initiate when already in progress
     #[error("Rebalancing has already been initiated")]
     AlreadyInitiated,
+    /// A command named another corridor than the one the transfer started on.
+    #[error("transfer runs on the {recorded} corridor, not {requested}")]
+    CorridorMismatch {
+        recorded: UsdcCorridor,
+        requested: UsdcCorridor,
+    },
     /// Conversion has not been initiated yet
     #[error("Conversion has not been initiated")]
     ConversionNotInitiated,
@@ -275,6 +284,17 @@ pub enum UsdcRebalanceError {
     /// Bridging has not been completed yet
     #[error("Bridging has not been completed")]
     BridgingNotCompleted,
+    /// A deposit send was already started for this transfer; another one
+    /// could send the minted USDC twice.
+    #[error("a deposit send was already started for this transfer")]
+    DepositSendAlreadyStarted,
+    /// A deposit tx other than the persisted signed send's, which is the only
+    /// send this transfer can make.
+    #[error("deposit tx {recorded} does not match the prepared deposit send hash {prepared}")]
+    PreparedDepositHashMismatch { recorded: TxHash, prepared: TxHash },
+    /// The deposit send tx is already recorded and is never replaced.
+    #[error("deposit send {recorded} is already recorded for this transfer")]
+    DepositSendAlreadyRecorded { recorded: TxHash },
     /// Deposit has not been initiated yet
     #[error("Deposit has not been initiated")]
     DepositNotInitiated,
@@ -303,6 +323,7 @@ pub enum UsdcRebalanceCommand {
     /// Valid only from `Uninitialized` state.
     InitiateConversion {
         direction: RebalanceDirection,
+        corridor: UsdcCorridor,
         amount: Usdc,
         order_id: ClientOrderId,
     },
@@ -312,6 +333,7 @@ pub enum UsdcRebalanceCommand {
     #[cfg(any(test, feature = "test-support"))]
     InitiateConversionAt {
         direction: RebalanceDirection,
+        corridor: UsdcCorridor,
         amount: Usdc,
         order_id: ClientOrderId,
         initiated_at: DateTime<Utc>,
@@ -353,6 +375,7 @@ pub enum UsdcRebalanceCommand {
     /// `ConversionComplete` (AlpacaToBase).
     BeginWithdrawal {
         direction: RebalanceDirection,
+        corridor: UsdcCorridor,
         amount: Usdc,
         from_block: u64,
     },
@@ -362,6 +385,7 @@ pub enum UsdcRebalanceCommand {
     #[cfg(any(test, feature = "test-support"))]
     BeginWithdrawalAt {
         direction: RebalanceDirection,
+        corridor: UsdcCorridor,
         amount: Usdc,
         from_block: u64,
         submitting_at: DateTime<Utc>,
@@ -370,6 +394,7 @@ pub enum UsdcRebalanceCommand {
     /// transaction. Valid only from `WithdrawalSubmitting` state.
     Initiate {
         direction: RebalanceDirection,
+        corridor: UsdcCorridor,
         amount: Usdc,
         withdrawal: TransferRef,
     },
@@ -379,6 +404,7 @@ pub enum UsdcRebalanceCommand {
     #[cfg(any(test, feature = "test-support"))]
     InitiateAt {
         direction: RebalanceDirection,
+        corridor: UsdcCorridor,
         amount: Usdc,
         withdrawal: TransferRef,
         initiated_at: DateTime<Utc>,
@@ -434,8 +460,9 @@ pub enum UsdcRebalanceCommand {
     /// Record the Circle attestation. Valid from `Bridging` or
     /// `AwaitingAttestation` state.
     /// The cctp_nonce is extracted from the attested message (not the burn tx, which has placeholder).
-    /// `mint_scan_from_block` is the destination chain head captured before the mint,
-    /// bounding the crash-safe resume scan that adopts an already-submitted mint.
+    /// `mint_scan_from_block` is the destination chain head captured before the mint.
+    /// The resume lookup for the mint of this transfer's nonce starts at the lower of
+    /// it less a small margin and a fixed lookback from the head.
     ReceiveAttestation {
         attestation: Vec<u8>,
         cctp_nonce: B256,
@@ -478,6 +505,10 @@ pub enum UsdcRebalanceCommand {
         fee_collected: Usdc,
         minted_at: DateTime<Utc>,
     },
+    /// Persist the signed BaseToAlpaca deposit send before its first
+    /// broadcast. Pure: the orchestrator signs, then broadcasts only once this
+    /// is durable. Valid only from a BaseToAlpaca `Bridged` with no send.
+    PrepareDepositSend { prepared: PreparedTransaction },
     /// Start deposit to destination. Valid only from `Bridged` state.
     InitiateDeposit { deposit: TransferRef },
     /// Test/fixture-only: identical to `InitiateDeposit` but takes
@@ -510,7 +541,8 @@ pub enum UsdcRebalanceCommand {
         amount_received: Usdc,
         fee_collected: Usdc,
     },
-    /// Record deposit failure. Valid only from `DepositInitiated` state.
+    /// Record deposit failure. Valid from `DepositInitiated`, and from a
+    /// BaseToAlpaca `Bridged` whose deposit send cannot be resolved.
     FailDeposit { reason: String },
     /// Recover a BaseToAlpaca `DepositFailed` whose Alpaca deposit actually
     /// settled after the polling deadline (the provider completed the
@@ -521,6 +553,10 @@ pub enum UsdcRebalanceCommand {
     /// ref. Driven by `transfer recheck` after verifying the exact transfer
     /// at Alpaca.
     RecoverDeposit,
+    /// Record an operator-verified deposit send on a BaseToAlpaca
+    /// `DepositFailed` that failed with no send recorded, so `transfer
+    /// recheck` can verify it at Alpaca. Valid only from that state.
+    AttachDepositSend { send_tx: TxHash },
     /// Reconcile a USDC rebalance stranded in the post-burn terminal
     /// `DepositFailed` state to a guard-clearing terminal `Reconciled` state.
     /// The minted USDC was handled out-of-band, so this resolves the transfer
@@ -539,6 +575,9 @@ pub enum UsdcRebalanceEvent {
     /// Conversion operation started (USD<->USDC). Records direction, amount, and order ID.
     ConversionInitiated {
         direction: RebalanceDirection,
+        /// Absent from events recorded before corridors existed.
+        #[serde(default = "legacy_base_cctp")]
+        corridor: UsdcCorridor,
         amount: Usdc,
         order_id: ClientOrderId,
         initiated_at: DateTime<Utc>,
@@ -562,6 +601,9 @@ pub enum UsdcRebalanceEvent {
     /// Captures the chain head for crash-safe recovery.
     WithdrawalSubmitting {
         direction: RebalanceDirection,
+        /// Absent from events recorded before corridors existed.
+        #[serde(default = "legacy_base_cctp")]
+        corridor: UsdcCorridor,
         amount: Usdc,
         from_block: u64,
         submitting_at: DateTime<Utc>,
@@ -569,6 +611,9 @@ pub enum UsdcRebalanceEvent {
     /// Rebalancing operation started. Records direction, amount, and withdrawal reference.
     Initiated {
         direction: RebalanceDirection,
+        /// Absent from events recorded before corridors existed.
+        #[serde(default = "legacy_base_cctp")]
+        corridor: UsdcCorridor,
         amount: Usdc,
         withdrawal_ref: TransferRef,
         initiated_at: DateTime<Utc>,
@@ -615,11 +660,11 @@ pub enum UsdcRebalanceEvent {
     PendingBurnCleared { cleared_at: DateTime<Utc> },
     /// Circle attestation received. Enables minting on destination chain.
     /// The cctp_nonce is extracted from the attested message (the real nonce, not the placeholder).
-    /// `mint_scan_from_block` is the destination chain head captured before the mint,
-    /// persisted so a crash-safe resume scan for an already-submitted mint is bounded.
-    /// It is `None` for events persisted before this field existed: such a resume
-    /// has no bound and must reconcile manually rather than scan from genesis,
-    /// which could adopt an unrelated mint to the same wallet.
+    /// `mint_scan_from_block` is the destination chain head captured before the mint.
+    /// The resume lookup for the mint of this transfer's nonce starts at the lower of
+    /// it less a small margin and a fixed lookback from the head. It is `None` for events persisted
+    /// before this field existed: such a resume scans the lookback alone instead of
+    /// scanning from genesis.
     BridgeAttestationReceived {
         attestation: Vec<u8>,
         cctp_nonce: B256,
@@ -648,6 +693,12 @@ pub enum UsdcRebalanceEvent {
         /// CCTP fee collected during the bridge
         fee_collected: Usdc,
         minted_at: DateTime<Utc>,
+    },
+    /// The signed BaseToAlpaca deposit send was persisted while in `Bridged`,
+    /// before its first broadcast.
+    DepositSendPrepared {
+        prepared: PreparedTransaction,
+        prepared_at: DateTime<Utc>,
     },
     /// Bridging failed. Preserves burn data when available for debugging.
     BridgingFailed {
@@ -688,6 +739,12 @@ pub enum UsdcRebalanceEvent {
     /// `BridgingCompletionRecovered`; recorded by `transfer recheck` after
     /// verifying the exact transfer at Alpaca.
     DepositCompletionRecovered { recovered_at: DateTime<Utc> },
+    /// An operator attached the verified deposit send to a BaseToAlpaca
+    /// `DepositFailed` that had none recorded.
+    DepositSendAttached {
+        send_tx: TxHash,
+        attached_at: DateTime<Utc>,
+    },
     /// An operator reconciled a post-burn `DepositFailed` rebalance to the
     /// guard-clearing terminal `Reconciled` state. Carries `direction` so the
     /// reactor derives the source venue without in-memory tracking (which may
@@ -727,6 +784,7 @@ impl DomainEvent for UsdcRebalanceEvent {
             }
             Self::AttestationTimedOut { .. } => "UsdcRebalanceEvent::AttestationTimedOut",
             Self::Bridged { .. } => "UsdcRebalanceEvent::Bridged",
+            Self::DepositSendPrepared { .. } => "UsdcRebalanceEvent::DepositSendPrepared",
             Self::BridgingFailed { .. } => "UsdcRebalanceEvent::BridgingFailed",
             Self::BridgingCompletionRecovered { .. } => {
                 "UsdcRebalanceEvent::BridgingCompletionRecovered"
@@ -737,6 +795,7 @@ impl DomainEvent for UsdcRebalanceEvent {
             Self::DepositCompletionRecovered { .. } => {
                 "UsdcRebalanceEvent::DepositCompletionRecovered"
             }
+            Self::DepositSendAttached { .. } => "UsdcRebalanceEvent::DepositSendAttached",
             Self::OperatorReconciled { .. } => "UsdcRebalanceEvent::OperatorReconciled",
         }
         .to_string()
@@ -744,6 +803,36 @@ impl DomainEvent for UsdcRebalanceEvent {
 
     fn event_version(&self) -> String {
         "2.0".to_string()
+    }
+}
+
+/// Progress of a BaseToAlpaca deposit send while the transfer is `Bridged`.
+///
+/// The signed send is persisted before its first broadcast, so every retry
+/// broadcasts the same bytes and a second send cannot exist.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub enum DepositSend {
+    /// No send was signed.
+    #[default]
+    NotStarted,
+    /// Signed and persisted; it may not have been broadcast yet. Its tx is
+    /// `prepared.tx_hash()`.
+    Prepared {
+        prepared: PreparedTransaction,
+        prepared_at: DateTime<Utc>,
+    },
+}
+
+impl DepositSend {
+    /// The signed send and when it was persisted, unless none was signed.
+    pub fn prepared(&self) -> Option<(&PreparedTransaction, DateTime<Utc>)> {
+        match self {
+            Self::NotStarted => None,
+            Self::Prepared {
+                prepared,
+                prepared_at,
+            } => Some((prepared, *prepared_at)),
+        }
     }
 }
 
@@ -756,6 +845,8 @@ pub enum UsdcRebalance {
     /// USD/USDC conversion has been initiated (AlpacaToBase: USD->USDC, BaseToAlpaca: USDC->USD)
     Converting {
         direction: RebalanceDirection,
+        #[serde(default = "legacy_base_cctp")]
+        corridor: UsdcCorridor,
         amount: Usdc,
         order_id: ClientOrderId,
         initiated_at: DateTime<Utc>,
@@ -763,6 +854,8 @@ pub enum UsdcRebalance {
     /// Conversion has completed, ready for next phase
     ConversionComplete {
         direction: RebalanceDirection,
+        #[serde(default = "legacy_base_cctp")]
+        corridor: UsdcCorridor,
         /// Originally requested amount
         amount: Usdc,
         conversion: ConversionAmounts,
@@ -772,6 +865,8 @@ pub enum UsdcRebalance {
     /// Conversion has failed (terminal state)
     ConversionFailed {
         direction: RebalanceDirection,
+        #[serde(default = "legacy_base_cctp")]
+        corridor: UsdcCorridor,
         amount: Usdc,
         order_id: ClientOrderId,
         reason: String,
@@ -783,6 +878,8 @@ pub enum UsdcRebalance {
     /// call so resume can scan for an already-submitted withdrawal.
     WithdrawalSubmitting {
         direction: RebalanceDirection,
+        #[serde(default = "legacy_base_cctp")]
+        corridor: UsdcCorridor,
         amount: Usdc,
         from_block: u64,
         initiated_at: DateTime<Utc>,
@@ -790,6 +887,8 @@ pub enum UsdcRebalance {
     /// Withdrawal from source has been initiated
     Withdrawing {
         direction: RebalanceDirection,
+        #[serde(default = "legacy_base_cctp")]
+        corridor: UsdcCorridor,
         amount: Usdc,
         withdrawal_ref: TransferRef,
         initiated_at: DateTime<Utc>,
@@ -797,6 +896,8 @@ pub enum UsdcRebalance {
     /// Withdrawal from source has been confirmed, ready for bridging
     WithdrawalComplete {
         direction: RebalanceDirection,
+        #[serde(default = "legacy_base_cctp")]
+        corridor: UsdcCorridor,
         amount: Usdc,
         initiated_at: DateTime<Utc>,
         confirmed_at: DateTime<Utc>,
@@ -813,6 +914,8 @@ pub enum UsdcRebalance {
     /// Withdrawal from source has failed (terminal state)
     WithdrawalFailed {
         direction: RebalanceDirection,
+        #[serde(default = "legacy_base_cctp")]
+        corridor: UsdcCorridor,
         amount: Usdc,
         withdrawal_ref: TransferRef,
         reason: String,
@@ -824,6 +927,8 @@ pub enum UsdcRebalance {
     /// call so resume can scan for an already-submitted burn.
     BridgingSubmitting {
         direction: RebalanceDirection,
+        #[serde(default = "legacy_base_cctp")]
+        corridor: UsdcCorridor,
         amount: Usdc,
         from_block: u64,
         initiated_at: DateTime<Utc>,
@@ -843,6 +948,8 @@ pub enum UsdcRebalance {
     /// Note: cctp_nonce is not available here - it's only known after attestation.
     Bridging {
         direction: RebalanceDirection,
+        #[serde(default = "legacy_base_cctp")]
+        corridor: UsdcCorridor,
         amount: Usdc,
         burn_tx_hash: TxHash,
         initiated_at: DateTime<Utc>,
@@ -853,6 +960,8 @@ pub enum UsdcRebalance {
     /// non-terminal and the apalis transfer job can retry until the deadline.
     AwaitingAttestation {
         direction: RebalanceDirection,
+        #[serde(default = "legacy_base_cctp")]
+        corridor: UsdcCorridor,
         amount: Usdc,
         burn_tx_hash: TxHash,
         initiated_at: DateTime<Utc>,
@@ -862,6 +971,8 @@ pub enum UsdcRebalance {
     /// Circle attestation has been received, ready for minting on destination chain
     Attested {
         direction: RebalanceDirection,
+        #[serde(default = "legacy_base_cctp")]
+        corridor: UsdcCorridor,
         amount: Usdc,
         burn_tx_hash: TxHash,
         cctp_nonce: B256,
@@ -871,9 +982,10 @@ pub enum UsdcRebalance {
         /// Circle. `None` for transfers whose `BridgeAttestationReceived` predates
         /// this field: such a resume falls back to re-polling Circle.
         message: Option<Vec<u8>>,
-        /// Destination chain head captured before the mint, bounding the
-        /// crash-safe resume scan that adopts an already-submitted mint. `None`
-        /// for transfers whose `BridgeAttestationReceived` predates this field.
+        /// Destination chain head captured before the mint. The resume lookup
+        /// for the mint of this transfer's nonce starts at the lower of it less a
+        /// small margin and a fixed lookback from the head. `None` for transfers whose
+        /// `BridgeAttestationReceived` predates this field.
         mint_scan_from_block: Option<u64>,
         initiated_at: DateTime<Utc>,
         attested_at: DateTime<Utc>,
@@ -881,6 +993,8 @@ pub enum UsdcRebalance {
     /// USDC has been minted on destination chain via CCTP
     Bridged {
         direction: RebalanceDirection,
+        #[serde(default = "legacy_base_cctp")]
+        corridor: UsdcCorridor,
         /// Originally requested amount (before CCTP fee)
         amount: Usdc,
         /// Actual USDC received on destination chain (from MintAndWithdraw event)
@@ -891,10 +1005,16 @@ pub enum UsdcRebalance {
         mint_tx_hash: TxHash,
         initiated_at: DateTime<Utc>,
         minted_at: DateTime<Utc>,
+        /// Progress of the BaseToAlpaca deposit send. `NotStarted` for
+        /// snapshots from before this field existed.
+        #[serde(default)]
+        deposit_send: DepositSend,
     },
     /// Bridging has failed (terminal state)
     BridgingFailed {
         direction: RebalanceDirection,
+        #[serde(default = "legacy_base_cctp")]
+        corridor: UsdcCorridor,
         amount: Usdc,
         burn_tx_hash: Option<TxHash>,
         cctp_nonce: Option<B256>,
@@ -905,6 +1025,8 @@ pub enum UsdcRebalance {
     /// Deposit to destination has been initiated
     DepositInitiated {
         direction: RebalanceDirection,
+        #[serde(default = "legacy_base_cctp")]
+        corridor: UsdcCorridor,
         amount: Usdc,
         burn_tx_hash: TxHash,
         mint_tx_hash: TxHash,
@@ -915,6 +1037,8 @@ pub enum UsdcRebalance {
     /// Deposit has been confirmed (terminal state)
     DepositConfirmed {
         direction: RebalanceDirection,
+        #[serde(default = "legacy_base_cctp")]
+        corridor: UsdcCorridor,
         amount: Usdc,
         burn_tx_hash: TxHash,
         mint_tx_hash: TxHash,
@@ -924,6 +1048,8 @@ pub enum UsdcRebalance {
     /// Deposit has failed (terminal state)
     DepositFailed {
         direction: RebalanceDirection,
+        #[serde(default = "legacy_base_cctp")]
+        corridor: UsdcCorridor,
         amount: Usdc,
         burn_tx_hash: TxHash,
         mint_tx_hash: TxHash,
@@ -939,6 +1065,8 @@ pub enum UsdcRebalance {
     /// transfer rather than a zero-value one starting at `reconciled_at`.
     Reconciled {
         direction: RebalanceDirection,
+        #[serde(default = "legacy_base_cctp")]
+        corridor: UsdcCorridor,
         amount: Usdc,
         reason: ReconcileReason,
         /// The original failure message from the source terminal state.
@@ -951,6 +1079,29 @@ pub enum UsdcRebalance {
 }
 
 impl UsdcRebalance {
+    /// The corridor the transfer started on, kept by every transition.
+    pub(crate) const fn corridor(&self) -> UsdcCorridor {
+        match self {
+            Self::Converting { corridor, .. }
+            | Self::ConversionComplete { corridor, .. }
+            | Self::ConversionFailed { corridor, .. }
+            | Self::WithdrawalSubmitting { corridor, .. }
+            | Self::Withdrawing { corridor, .. }
+            | Self::WithdrawalComplete { corridor, .. }
+            | Self::WithdrawalFailed { corridor, .. }
+            | Self::BridgingSubmitting { corridor, .. }
+            | Self::Bridging { corridor, .. }
+            | Self::AwaitingAttestation { corridor, .. }
+            | Self::Attested { corridor, .. }
+            | Self::Bridged { corridor, .. }
+            | Self::BridgingFailed { corridor, .. }
+            | Self::DepositInitiated { corridor, .. }
+            | Self::DepositConfirmed { corridor, .. }
+            | Self::DepositFailed { corridor, .. }
+            | Self::Reconciled { corridor, .. } => *corridor,
+        }
+    }
+
     /// The state's variant name, for operator-facing diagnostics (e.g. the
     /// `transfer recheck` refusal naming the state it cannot recover).
     pub(crate) const fn state_name(&self) -> &'static str {
@@ -975,12 +1126,52 @@ impl UsdcRebalance {
         }
     }
 
+    /// A BaseToAlpaca `Bridged` with a signed deposit send. An operator may
+    /// reconcile it once a different tx is mined at its nonce: the send is
+    /// never re-signed or fee-bumped, and one stuck below the market fee can
+    /// still mine until its nonce is taken.
+    pub fn has_prepared_deposit_send(&self) -> bool {
+        self.prepared_deposit_send().is_some()
+    }
+
+    /// The signed deposit send of a BaseToAlpaca `Bridged`, if there is one.
+    pub fn prepared_deposit_send(&self) -> Option<&PreparedTransaction> {
+        match self {
+            Self::Bridged {
+                direction: RebalanceDirection::BaseToAlpaca,
+                deposit_send,
+                ..
+            } => deposit_send.prepared().map(|(prepared, _)| prepared),
+            Self::Converting { .. }
+            | Self::ConversionComplete { .. }
+            | Self::ConversionFailed { .. }
+            | Self::WithdrawalSubmitting { .. }
+            | Self::Withdrawing { .. }
+            | Self::WithdrawalComplete { .. }
+            | Self::WithdrawalFailed { .. }
+            | Self::BridgingSubmitting { .. }
+            | Self::Bridging { .. }
+            | Self::AwaitingAttestation { .. }
+            | Self::Attested { .. }
+            | Self::BridgingFailed { .. }
+            | Self::Bridged {
+                direction: RebalanceDirection::AlpacaToBase,
+                ..
+            }
+            | Self::DepositInitiated { .. }
+            | Self::DepositConfirmed { .. }
+            | Self::DepositFailed { .. }
+            | Self::Reconciled { .. } => None,
+        }
+    }
+
     /// Whether a failed rebalance is one `transfer reconcile --kind usdc`
     /// accepts: a post-burn failure, or an AlpacaToBase `BridgingFailed`
     /// (post-withdrawal, so the funds are off Alpaca even without burn
     /// evidence -- the settlement-retry-deadline terminal).
     ///
-    /// The SINGLE source of the reconcile-eligibility rule: the
+    /// The SINGLE source of the failure half of the reconcile-eligibility rule
+    /// (the in-flight half is [`has_prepared_deposit_send`](Self::has_prepared_deposit_send)): the
     /// `transition_reconcile_stuck_rebalance` guard, the `OperatorReconciled`
     /// apply guard, the CLI preflight, and the dashboard DTO all call this
     /// predicate rather than mirroring the condition. The match is
@@ -1244,6 +1435,7 @@ impl UsdcRebalance {
 
             Self::Reconciled {
                 direction,
+                corridor: _,
                 amount,
                 reason,
                 failure_reason,
@@ -1277,13 +1469,13 @@ impl UsdcRebalance {
 
     /// USDC this transfer was credited with that may still sit in the shared
     /// Ethereum wallet: credited from its delivering tx and not yet sent on.
-    /// A BaseToAlpaca credit leaves with the Alpaca deposit send
-    /// (`DepositInitiated`). An AlpacaToBase credit arrives with the withdrawal
-    /// tx Alpaca reported and leaves with the burn, and
-    /// `BridgingSubmitting` cannot tell whether it has: a recorded burn may
-    /// be unmined, and with no recorded hash the burn may be unsent or
-    /// broadcast with its hash lost (`BurnRecordFailed`, an inconclusive
-    /// submit).
+    /// A BaseToAlpaca credit leaves with the Alpaca deposit send: in flight
+    /// once the send is signed (`Prepared`), gone at `DepositInitiated`. An
+    /// AlpacaToBase credit arrives with the withdrawal tx Alpaca reported and
+    /// leaves with the burn, and `BridgingSubmitting` cannot tell whether it
+    /// has: a recorded burn may be unmined, and with no recorded hash the burn
+    /// may be unsent or broadcast with its hash lost (`BurnRecordFailed`, an
+    /// inconclusive submit).
     pub(crate) fn ethereum_wallet_credit(&self) -> Option<EthereumWalletCredit> {
         match self {
             Self::WithdrawalComplete {
@@ -1303,8 +1495,13 @@ impl UsdcRebalance {
             Self::Bridged {
                 direction: RebalanceDirection::BaseToAlpaca,
                 amount_received,
+                deposit_send,
                 ..
-            } => Some(EthereumWalletCredit::Held(*amount_received)),
+            } => Some(match deposit_send {
+                DepositSend::NotStarted => EthereumWalletCredit::Held(*amount_received),
+                // A signed send may be on chain, mined or not yet.
+                DepositSend::Prepared { .. } => EthereumWalletCredit::InFlight(*amount_received),
+            }),
             Self::BridgingSubmitting { .. }
             | Self::Bridged { .. }
             | Self::Converting { .. }
@@ -1753,12 +1950,14 @@ pub(crate) async fn interrupted_usdc_rebalance_ids(
                'UsdcRebalanceEvent::BridgeAttestationReceived', \
                'UsdcRebalanceEvent::AttestationTimedOut', \
                'UsdcRebalanceEvent::Bridged', \
+               'UsdcRebalanceEvent::DepositSendPrepared', \
                'UsdcRebalanceEvent::BridgingFailed', \
                'UsdcRebalanceEvent::BridgingCompletionRecovered', \
                'UsdcRebalanceEvent::DepositInitiated', \
                'UsdcRebalanceEvent::DepositConfirmed', \
                'UsdcRebalanceEvent::DepositCompletionRecovered', \
-               'UsdcRebalanceEvent::DepositFailed' \
+               'UsdcRebalanceEvent::DepositFailed', \
+               'UsdcRebalanceEvent::DepositSendAttached' \
            ) \
          ORDER BY latest.aggregate_id",
     )
@@ -1783,6 +1982,38 @@ pub(crate) async fn interrupted_usdc_rebalance_ids(
     }
 
     Ok(InterruptedUsdcRebalances { ids, unparseable })
+}
+
+/// The `UsdcRebalance` aggregates whose latest event leaves a signed deposit
+/// send in `Bridged` (`DepositSendPrepared`), so
+/// startup can reserve those sends' nonces before any other send takes them.
+/// Unparseable ids are returned apart, for the caller to page.
+pub(crate) async fn prepared_deposit_send_ids(
+    pool: &SqlitePool,
+) -> Result<(Vec<UsdcRebalanceId>, Vec<String>), sqlx::Error> {
+    let rows: Vec<String> = sqlx::query_scalar(
+        "WITH latest AS ( \
+             SELECT aggregate_id, MAX(sequence) AS max_seq \
+             FROM events \
+             WHERE aggregate_type = 'UsdcRebalance' \
+             GROUP BY aggregate_id \
+         ) \
+         SELECT latest.aggregate_id \
+         FROM events last_ev \
+         INNER JOIN latest \
+             ON last_ev.aggregate_id = latest.aggregate_id \
+            AND last_ev.sequence = latest.max_seq \
+         WHERE last_ev.aggregate_type = 'UsdcRebalance' \
+           AND last_ev.event_type = 'UsdcRebalanceEvent::DepositSendPrepared' \
+         ORDER BY latest.aggregate_id",
+    )
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows.into_iter().partition_map(|raw| {
+        raw.parse::<UsdcRebalanceId>()
+            .map_or_else(|_| Either::Right(raw), Either::Left)
+    }))
 }
 
 /// Whether any persisted USDC rebalance currently holds the single-rebalance
@@ -1918,6 +2149,63 @@ pub(crate) async fn open_ethereum_credits(
     Ok(credits)
 }
 
+/// Another `UsdcRebalance` whose `WithdrawalConfirmed` already recorded
+/// `withdrawal_tx`, as its persisted aggregate id. A withdrawal tx pays one
+/// transfer, so a second transfer must not be credited from it.
+pub(crate) async fn withdrawal_tx_recorded_elsewhere(
+    pool: &SqlitePool,
+    id: &UsdcRebalanceId,
+    withdrawal_tx: TxHash,
+) -> Result<Option<String>, sqlx::Error> {
+    sqlx::query_scalar(
+        "SELECT aggregate_id FROM events \
+         WHERE aggregate_type = 'UsdcRebalance' \
+           AND event_type = 'UsdcRebalanceEvent::WithdrawalConfirmed' \
+           AND aggregate_id != ? \
+           AND json_extract(payload, '$.WithdrawalConfirmed.withdrawal_tx') = ? \
+         ORDER BY rowid \
+         LIMIT 1",
+    )
+    .bind(id.to_string())
+    .bind(format!("{withdrawal_tx:#x}"))
+    .fetch_optional(pool)
+    .await
+}
+
+/// Another `UsdcRebalance` that recorded `send_tx` as its Alpaca deposit send,
+/// as its persisted aggregate id. A send pays one transfer only.
+pub(crate) async fn deposit_send_recorded_elsewhere(
+    pool: &SqlitePool,
+    id: &UsdcRebalanceId,
+    send_tx: TxHash,
+) -> Result<Option<String>, sqlx::Error> {
+    let send_tx = format!("{send_tx:#x}");
+    sqlx::query_scalar(
+        "SELECT aggregate_id FROM events \
+         WHERE aggregate_type = 'UsdcRebalance' \
+           AND aggregate_id != ? \
+           AND ( \
+               (event_type = 'UsdcRebalanceEvent::DepositSendPrepared' \
+                AND json_extract(payload, '$.DepositSendPrepared.prepared.tx_hash') = ?) \
+               OR (event_type = 'UsdcRebalanceEvent::DepositSendAttached' \
+                AND json_extract(payload, '$.DepositSendAttached.send_tx') = ?) \
+               OR (event_type = 'UsdcRebalanceEvent::DepositInitiated' \
+                AND json_extract(payload, '$.DepositInitiated.deposit_ref.OnchainTx') = ?) \
+               OR (event_type = 'UsdcRebalanceEvent::DepositFailed' \
+                AND json_extract(payload, '$.DepositFailed.deposit_ref.OnchainTx') = ?) \
+           ) \
+         ORDER BY rowid \
+         LIMIT 1",
+    )
+    .bind(id.to_string())
+    .bind(&send_tx)
+    .bind(&send_tx)
+    .bind(&send_tx)
+    .bind(&send_tx)
+    .fetch_optional(pool)
+    .await
+}
+
 /// The `UsdcRebalance` aggregates whose latest event leaves them in a state
 /// that can hold Ethereum wallet credit (`WithdrawalComplete`,
 /// `BridgingSubmitting`, `Bridged`), so the credit ledger does not replay
@@ -1942,6 +2230,7 @@ async fn ethereum_credit_candidate_ids(pool: &SqlitePool) -> Result<Vec<String>,
                'UsdcRebalanceEvent::PendingBurnRecorded', \
                'UsdcRebalanceEvent::PendingBurnCleared', \
                'UsdcRebalanceEvent::Bridged', \
+               'UsdcRebalanceEvent::DepositSendPrepared', \
                'UsdcRebalanceEvent::BridgingCompletionRecovered' \
            ) \
          ORDER BY latest.aggregate_id",
@@ -2009,18 +2298,28 @@ impl EventSourced for UsdcRebalance {
     // the command, event and states; serde ignores it in legacy payloads.
     // `WithdrawalComplete` also carries `withdrawal_ref` now, so the reported
     // withdrawal fees can be read again.
-    const SCHEMA_VERSION: u64 = 10;
+    // v11: `Bridged` carries `deposit_send`, the BaseToAlpaca deposit send
+    // progress set by the new `DepositSendPrepared` event (the signed send,
+    // persisted before broadcast). Legacy events and snapshots default it to
+    // `NotStarted`.
+    // v12: every state and the originating events (`ConversionInitiated`,
+    // `WithdrawalSubmitting`, `Initiated`) carry the transfer's `corridor`.
+    // Legacy events and snapshots read as Base via CCTP, the only corridor
+    // there was.
+    const SCHEMA_VERSION: u64 = 12;
 
     fn originate(event: &Self::Event) -> Option<Self> {
         use UsdcRebalanceEvent::*;
         match event {
             ConversionInitiated {
                 direction,
+                corridor,
                 amount,
                 order_id,
                 initiated_at,
             } => Some(Self::Converting {
                 direction: *direction,
+                corridor: *corridor,
                 amount: *amount,
                 order_id: order_id.clone(),
                 initiated_at: *initiated_at,
@@ -2028,11 +2327,13 @@ impl EventSourced for UsdcRebalance {
 
             WithdrawalSubmitting {
                 direction,
+                corridor,
                 amount,
                 from_block,
                 submitting_at,
             } => Some(Self::WithdrawalSubmitting {
                 direction: *direction,
+                corridor: *corridor,
                 amount: *amount,
                 from_block: *from_block,
                 initiated_at: *submitting_at,
@@ -2040,11 +2341,13 @@ impl EventSourced for UsdcRebalance {
 
             Initiated {
                 direction,
+                corridor,
                 amount,
                 withdrawal_ref,
                 initiated_at,
             } => Some(Self::Withdrawing {
                 direction: *direction,
+                corridor: *corridor,
                 amount: *amount,
                 withdrawal_ref: withdrawal_ref.clone(),
                 initiated_at: *initiated_at,
@@ -2069,9 +2372,14 @@ impl EventSourced for UsdcRebalance {
                     order_id,
                     ..
                 },
-                Self::DepositConfirmed { initiated_at, .. },
+                Self::DepositConfirmed {
+                    corridor,
+                    initiated_at,
+                    ..
+                },
             ) => Self::Converting {
                 direction: *direction,
+                corridor: *corridor,
                 amount: *amount,
                 order_id: order_id.clone(),
                 initiated_at: *initiated_at,
@@ -2085,12 +2393,14 @@ impl EventSourced for UsdcRebalance {
                 },
                 Self::Converting {
                     direction,
+                    corridor,
                     amount,
                     initiated_at,
                     ..
                 },
             ) => Self::ConversionComplete {
                 direction: *direction,
+                corridor: *corridor,
                 amount: *amount,
                 conversion: *conversion,
                 initiated_at: *initiated_at,
@@ -2101,6 +2411,7 @@ impl EventSourced for UsdcRebalance {
                 ConversionFailed { reason, failed_at },
                 Self::Converting {
                     direction,
+                    corridor,
                     amount,
                     order_id,
                     initiated_at,
@@ -2108,6 +2419,7 @@ impl EventSourced for UsdcRebalance {
                 },
             ) => Self::ConversionFailed {
                 direction: *direction,
+                corridor: *corridor,
                 amount: *amount,
                 order_id: order_id.clone(),
                 reason: reason.clone(),
@@ -2119,12 +2431,14 @@ impl EventSourced for UsdcRebalance {
                 WithdrawalSubmitting { from_block, .. },
                 Self::ConversionComplete {
                     direction,
+                    corridor,
                     conversion,
                     initiated_at,
                     ..
                 },
             ) => Self::WithdrawalSubmitting {
                 direction: *direction,
+                corridor: *corridor,
                 amount: conversion.received_amount,
                 from_block: *from_block,
                 initiated_at: *initiated_at,
@@ -2137,10 +2451,14 @@ impl EventSourced for UsdcRebalance {
                     ..
                 },
                 Self::WithdrawalSubmitting {
-                    direction, amount, ..
+                    direction,
+                    corridor,
+                    amount,
+                    ..
                 },
             ) => Self::Withdrawing {
                 direction: *direction,
+                corridor: *corridor,
                 amount: *amount,
                 withdrawal_ref: withdrawal_ref.clone(),
                 // Use the event's initiated_at (set by transition_initiate_withdrawal to
@@ -2158,11 +2476,13 @@ impl EventSourced for UsdcRebalance {
                 },
                 Self::ConversionComplete {
                     direction,
+                    corridor,
                     conversion,
                     ..
                 },
             ) => Self::Withdrawing {
                 direction: *direction,
+                corridor: *corridor,
                 amount: conversion.received_amount,
                 withdrawal_ref: withdrawal_ref.clone(),
                 initiated_at: *withdrawal_initiated_at,
@@ -2175,12 +2495,14 @@ impl EventSourced for UsdcRebalance {
                 },
                 Self::Withdrawing {
                     direction,
+                    corridor,
                     amount,
                     withdrawal_ref,
                     initiated_at,
                 },
             ) => Self::WithdrawalComplete {
                 direction: *direction,
+                corridor: *corridor,
                 amount: *amount,
                 initiated_at: *initiated_at,
                 confirmed_at: *confirmed_at,
@@ -2192,6 +2514,7 @@ impl EventSourced for UsdcRebalance {
                 WithdrawalFailed { reason, failed_at },
                 Self::Withdrawing {
                     direction,
+                    corridor,
                     amount,
                     withdrawal_ref,
                     initiated_at,
@@ -2199,6 +2522,7 @@ impl EventSourced for UsdcRebalance {
                 },
             ) => Self::WithdrawalFailed {
                 direction: *direction,
+                corridor: *corridor,
                 amount: *amount,
                 withdrawal_ref: withdrawal_ref.clone(),
                 reason: reason.clone(),
@@ -2218,6 +2542,7 @@ impl EventSourced for UsdcRebalance {
                 },
                 Self::WithdrawalComplete {
                     direction,
+                    corridor,
                     amount,
                     initiated_at,
                     ..
@@ -2227,6 +2552,7 @@ impl EventSourced for UsdcRebalance {
                 PendingBurnCleared { .. },
                 Self::BridgingSubmitting {
                     direction,
+                    corridor,
                     amount,
                     from_block,
                     initiated_at,
@@ -2235,6 +2561,7 @@ impl EventSourced for UsdcRebalance {
                 },
             ) => Self::BridgingSubmitting {
                 direction: *direction,
+                corridor: *corridor,
                 amount: *amount,
                 from_block: *from_block,
                 initiated_at: *initiated_at,
@@ -2246,6 +2573,7 @@ impl EventSourced for UsdcRebalance {
                 PendingBurnRecorded { burn_tx, .. },
                 Self::BridgingSubmitting {
                     direction,
+                    corridor,
                     amount,
                     from_block,
                     initiated_at,
@@ -2254,6 +2582,7 @@ impl EventSourced for UsdcRebalance {
                 },
             ) => Self::BridgingSubmitting {
                 direction: *direction,
+                corridor: *corridor,
                 amount: *amount,
                 from_block: *from_block,
                 initiated_at: *initiated_at,
@@ -2268,6 +2597,7 @@ impl EventSourced for UsdcRebalance {
                 },
                 Self::BridgingSubmitting {
                     direction,
+                    corridor,
                     amount,
                     initiated_at,
                     burn_amount,
@@ -2275,6 +2605,7 @@ impl EventSourced for UsdcRebalance {
                 },
             ) => Self::Bridging {
                 direction: *direction,
+                corridor: *corridor,
                 // Carry the actual burned amount (what was received after Alpaca
                 // withdrawal fees) into post-burn states so DTOs, recovery
                 // classification, and reconciliation see what was really burned,
@@ -2293,12 +2624,14 @@ impl EventSourced for UsdcRebalance {
                 },
                 Self::WithdrawalComplete {
                     direction,
+                    corridor,
                     amount,
                     initiated_at,
                     ..
                 },
             ) => Self::Bridging {
                 direction: *direction,
+                corridor: *corridor,
                 amount: *amount,
                 burn_tx_hash: *burn_tx_hash,
                 initiated_at: *initiated_at,
@@ -2315,6 +2648,7 @@ impl EventSourced for UsdcRebalance {
                 },
                 Self::Bridging {
                     direction,
+                    corridor,
                     amount,
                     burn_tx_hash,
                     initiated_at,
@@ -2322,6 +2656,7 @@ impl EventSourced for UsdcRebalance {
                 }
                 | Self::AwaitingAttestation {
                     direction,
+                    corridor,
                     amount,
                     burn_tx_hash,
                     initiated_at,
@@ -2329,6 +2664,7 @@ impl EventSourced for UsdcRebalance {
                 },
             ) => Self::Attested {
                 direction: *direction,
+                corridor: *corridor,
                 amount: *amount,
                 burn_tx_hash: *burn_tx_hash,
                 cctp_nonce: *cctp_nonce,
@@ -2347,6 +2683,7 @@ impl EventSourced for UsdcRebalance {
                 },
                 Self::Bridging {
                     direction,
+                    corridor,
                     amount,
                     burn_tx_hash: state_burn_tx_hash,
                     initiated_at,
@@ -2354,6 +2691,7 @@ impl EventSourced for UsdcRebalance {
                 },
             ) if burn_tx_hash == state_burn_tx_hash => Self::AwaitingAttestation {
                 direction: *direction,
+                corridor: *corridor,
                 amount: *amount,
                 burn_tx_hash: *burn_tx_hash,
                 initiated_at: *initiated_at,
@@ -2370,6 +2708,7 @@ impl EventSourced for UsdcRebalance {
                 },
                 Self::Attested {
                     direction,
+                    corridor,
                     amount,
                     burn_tx_hash,
                     initiated_at,
@@ -2377,6 +2716,7 @@ impl EventSourced for UsdcRebalance {
                 },
             ) => Self::Bridged {
                 direction: *direction,
+                corridor: *corridor,
                 amount: *amount,
                 amount_received: *amount_received,
                 fee_collected: *fee_collected,
@@ -2384,6 +2724,7 @@ impl EventSourced for UsdcRebalance {
                 mint_tx_hash: *mint_tx_hash,
                 initiated_at: *initiated_at,
                 minted_at: *minted_at,
+                deposit_send: DepositSend::NotStarted,
             },
 
             // Un-fail a post-burn `BridgingFailed` whose mint landed on-chain.
@@ -2399,6 +2740,7 @@ impl EventSourced for UsdcRebalance {
                 },
                 Self::BridgingFailed {
                     direction,
+                    corridor,
                     amount,
                     burn_tx_hash: Some(burn_tx_hash),
                     initiated_at,
@@ -2406,6 +2748,7 @@ impl EventSourced for UsdcRebalance {
                 },
             ) => Self::Bridged {
                 direction: *direction,
+                corridor: *corridor,
                 amount: *amount,
                 amount_received: *amount_received,
                 fee_collected: *fee_collected,
@@ -2413,6 +2756,7 @@ impl EventSourced for UsdcRebalance {
                 mint_tx_hash: *mint_tx_hash,
                 initiated_at: *initiated_at,
                 minted_at: *recovered_at,
+                deposit_send: DepositSend::NotStarted,
             },
 
             (
@@ -2424,36 +2768,42 @@ impl EventSourced for UsdcRebalance {
                 },
                 Self::WithdrawalComplete {
                     direction,
+                    corridor,
                     amount,
                     initiated_at,
                     ..
                 }
                 | Self::BridgingSubmitting {
                     direction,
+                    corridor,
                     amount,
                     initiated_at,
                     ..
                 }
                 | Self::Bridging {
                     direction,
+                    corridor,
                     amount,
                     initiated_at,
                     ..
                 }
                 | Self::AwaitingAttestation {
                     direction,
+                    corridor,
                     amount,
                     initiated_at,
                     ..
                 }
                 | Self::Attested {
                     direction,
+                    corridor,
                     amount,
                     initiated_at,
                     ..
                 },
             ) => Self::BridgingFailed {
                 direction: *direction,
+                corridor: *corridor,
                 amount: *amount,
                 burn_tx_hash: *burn_tx_hash,
                 cctp_nonce: *cctp_nonce,
@@ -2463,12 +2813,46 @@ impl EventSourced for UsdcRebalance {
             },
 
             (
+                DepositSendPrepared {
+                    prepared,
+                    prepared_at,
+                },
+                Self::Bridged {
+                    direction,
+                    corridor,
+                    amount,
+                    amount_received,
+                    fee_collected,
+                    burn_tx_hash,
+                    mint_tx_hash,
+                    initiated_at,
+                    minted_at,
+                    deposit_send: DepositSend::NotStarted,
+                },
+            ) => Self::Bridged {
+                direction: *direction,
+                corridor: *corridor,
+                amount: *amount,
+                amount_received: *amount_received,
+                fee_collected: *fee_collected,
+                burn_tx_hash: *burn_tx_hash,
+                mint_tx_hash: *mint_tx_hash,
+                initiated_at: *initiated_at,
+                minted_at: *minted_at,
+                deposit_send: DepositSend::Prepared {
+                    prepared: prepared.clone(),
+                    prepared_at: *prepared_at,
+                },
+            },
+
+            (
                 DepositInitiated {
                     deposit_ref,
                     deposit_initiated_at,
                 },
                 Self::Bridged {
                     direction,
+                    corridor,
                     amount_received,
                     burn_tx_hash,
                     mint_tx_hash,
@@ -2477,6 +2861,7 @@ impl EventSourced for UsdcRebalance {
                 },
             ) => Self::DepositInitiated {
                 direction: *direction,
+                corridor: *corridor,
                 amount: *amount_received,
                 burn_tx_hash: *burn_tx_hash,
                 mint_tx_hash: *mint_tx_hash,
@@ -2492,6 +2877,7 @@ impl EventSourced for UsdcRebalance {
                 },
                 Self::DepositInitiated {
                     direction,
+                    corridor,
                     amount,
                     burn_tx_hash,
                     mint_tx_hash,
@@ -2500,6 +2886,7 @@ impl EventSourced for UsdcRebalance {
                 },
             ) => Self::DepositConfirmed {
                 direction: *direction,
+                corridor: *corridor,
                 amount: *amount,
                 burn_tx_hash: *burn_tx_hash,
                 mint_tx_hash: *mint_tx_hash,
@@ -2515,7 +2902,17 @@ impl EventSourced for UsdcRebalance {
                 },
                 Self::DepositInitiated {
                     direction,
+                    corridor,
                     amount,
+                    burn_tx_hash,
+                    mint_tx_hash,
+                    initiated_at,
+                    ..
+                }
+                | Self::Bridged {
+                    direction,
+                    corridor,
+                    amount_received: amount,
                     burn_tx_hash,
                     mint_tx_hash,
                     initiated_at,
@@ -2523,10 +2920,38 @@ impl EventSourced for UsdcRebalance {
                 },
             ) => Self::DepositFailed {
                 direction: *direction,
+                corridor: *corridor,
                 amount: *amount,
                 burn_tx_hash: *burn_tx_hash,
                 mint_tx_hash: *mint_tx_hash,
                 deposit_ref: deposit_ref.clone(),
+                reason: reason.clone(),
+                initiated_at: *initiated_at,
+                failed_at: *failed_at,
+            },
+
+            // Records the operator-verified send on a BaseToAlpaca
+            // `DepositFailed` that had none.
+            (
+                DepositSendAttached { send_tx, .. },
+                Self::DepositFailed {
+                    direction: RebalanceDirection::BaseToAlpaca,
+                    corridor,
+                    amount,
+                    burn_tx_hash,
+                    mint_tx_hash,
+                    deposit_ref: None,
+                    reason,
+                    initiated_at,
+                    failed_at,
+                },
+            ) => Self::DepositFailed {
+                direction: RebalanceDirection::BaseToAlpaca,
+                corridor: *corridor,
+                amount: *amount,
+                burn_tx_hash: *burn_tx_hash,
+                mint_tx_hash: *mint_tx_hash,
+                deposit_ref: Some(TransferRef::OnchainTx(*send_tx)),
                 reason: reason.clone(),
                 initiated_at: *initiated_at,
                 failed_at: *failed_at,
@@ -2540,6 +2965,7 @@ impl EventSourced for UsdcRebalance {
                 DepositCompletionRecovered { recovered_at },
                 Self::DepositFailed {
                     direction: RebalanceDirection::BaseToAlpaca,
+                    corridor,
                     amount,
                     burn_tx_hash,
                     mint_tx_hash,
@@ -2549,6 +2975,7 @@ impl EventSourced for UsdcRebalance {
                 },
             ) => Self::DepositConfirmed {
                 direction: RebalanceDirection::BaseToAlpaca,
+                corridor: *corridor,
                 amount: *amount,
                 burn_tx_hash: *burn_tx_hash,
                 mint_tx_hash: *mint_tx_hash,
@@ -2588,6 +3015,7 @@ impl EventSourced for UsdcRebalance {
                         ..
                     } => Self::Reconciled {
                         direction: *direction,
+                        corridor: state.corridor(),
                         amount: *amount,
                         reason: *reason,
                         failure_reason: Some(failure_reason.clone()),
@@ -2603,9 +3031,22 @@ impl EventSourced for UsdcRebalance {
                         ..
                     } if state.is_reconcilable_failure() => Self::Reconciled {
                         direction: *direction,
+                        corridor: state.corridor(),
                         amount: *amount,
                         reason: *reason,
                         failure_reason: Some(failure_reason.clone()),
+                        initiated_at: *initiated_at,
+                        reconciled_at: *reconciled_at,
+                    },
+
+                    // A signed deposit send an operator verified will never
+                    // confirm: nothing failed, so there is no failure reason.
+                    Self::Bridged { .. } if state.has_prepared_deposit_send() => Self::Reconciled {
+                        direction: *direction,
+                        corridor: state.corridor(),
+                        amount: *amount,
+                        reason: *reason,
+                        failure_reason: None,
                         initiated_at: *initiated_at,
                         reconciled_at: *reconciled_at,
                     },
@@ -2650,10 +3091,12 @@ impl EventSourced for UsdcRebalance {
         match command {
             InitiateConversion {
                 direction,
+                corridor,
                 amount,
                 order_id,
             } => Ok(vec![ConversionInitiated {
                 direction,
+                corridor,
                 amount,
                 order_id,
                 initiated_at: Utc::now(),
@@ -2662,11 +3105,13 @@ impl EventSourced for UsdcRebalance {
             #[cfg(any(test, feature = "test-support"))]
             InitiateConversionAt {
                 direction,
+                corridor,
                 amount,
                 order_id,
                 initiated_at,
             } => Ok(vec![ConversionInitiated {
                 direction,
+                corridor,
                 amount,
                 order_id,
                 initiated_at,
@@ -2674,24 +3119,40 @@ impl EventSourced for UsdcRebalance {
 
             BeginWithdrawal {
                 direction,
+                corridor,
                 amount,
                 from_block,
-            } => Self::begin_withdrawal_init_events(direction, amount, from_block, Utc::now()),
+            } => Self::begin_withdrawal_init_events(
+                direction,
+                corridor,
+                amount,
+                from_block,
+                Utc::now(),
+            ),
 
             #[cfg(any(test, feature = "test-support"))]
             BeginWithdrawalAt {
                 direction,
+                corridor,
                 amount,
                 from_block,
                 submitting_at,
-            } => Self::begin_withdrawal_init_events(direction, amount, from_block, submitting_at),
+            } => Self::begin_withdrawal_init_events(
+                direction,
+                corridor,
+                amount,
+                from_block,
+                submitting_at,
+            ),
 
             Initiate {
                 direction,
+                corridor,
                 amount,
                 withdrawal,
             } => Ok(vec![Initiated {
                 direction,
+                corridor,
                 amount,
                 withdrawal_ref: withdrawal,
                 initiated_at: Utc::now(),
@@ -2700,11 +3161,13 @@ impl EventSourced for UsdcRebalance {
             #[cfg(any(test, feature = "test-support"))]
             InitiateAt {
                 direction,
+                corridor,
                 amount,
                 withdrawal,
                 initiated_at,
             } => Ok(vec![Initiated {
                 direction,
+                corridor,
                 amount,
                 withdrawal_ref: withdrawal,
                 initiated_at,
@@ -2746,11 +3209,13 @@ impl EventSourced for UsdcRebalance {
             #[cfg(any(test, feature = "test-support"))]
             ConfirmBridgingAt { .. } => Err(UsdcRebalanceError::AttestationNotReceived),
 
-            InitiateDeposit { .. } => Err(UsdcRebalanceError::BridgingNotCompleted),
+            InitiateDeposit { .. } | PrepareDepositSend { .. } => {
+                Err(UsdcRebalanceError::BridgingNotCompleted)
+            }
             #[cfg(any(test, feature = "test-support"))]
             InitiateDepositAt { .. } => Err(UsdcRebalanceError::BridgingNotCompleted),
 
-            ConfirmDeposit | FailDeposit { .. } | RecoverDeposit => {
+            ConfirmDeposit | FailDeposit { .. } | RecoverDeposit | AttachDepositSend { .. } => {
                 Err(UsdcRebalanceError::DepositNotInitiated)
             }
             #[cfg(any(test, feature = "test-support"))]
@@ -2797,29 +3262,45 @@ impl EventSourced for UsdcRebalance {
 
             BeginWithdrawal {
                 direction,
+                corridor,
                 amount,
                 from_block,
-            } => self.transition_begin_withdrawal(direction, amount, from_block, Utc::now()),
+            } => {
+                self.require_corridor(corridor)?;
+                self.transition_begin_withdrawal(direction, amount, from_block, Utc::now())
+            }
             #[cfg(any(test, feature = "test-support"))]
             BeginWithdrawalAt {
                 direction,
+                corridor,
                 amount,
                 from_block,
                 submitting_at,
-            } => self.transition_begin_withdrawal(direction, amount, from_block, submitting_at),
+            } => {
+                self.require_corridor(corridor)?;
+                self.transition_begin_withdrawal(direction, amount, from_block, submitting_at)
+            }
 
             Initiate {
                 direction,
+                corridor,
                 amount,
                 withdrawal,
-            } => self.transition_initiate_withdrawal(direction, amount, withdrawal, Utc::now()),
+            } => {
+                self.require_corridor(corridor)?;
+                self.transition_initiate_withdrawal(direction, amount, withdrawal, Utc::now())
+            }
             #[cfg(any(test, feature = "test-support"))]
             InitiateAt {
                 direction,
+                corridor,
                 amount,
                 withdrawal,
                 initiated_at,
-            } => self.transition_initiate_withdrawal(direction, amount, withdrawal, initiated_at),
+            } => {
+                self.require_corridor(corridor)?;
+                self.transition_initiate_withdrawal(direction, amount, withdrawal, initiated_at)
+            }
 
             ConfirmWithdrawal { withdrawal_tx } => {
                 self.transition_confirm_withdrawal(withdrawal_tx, Utc::now())
@@ -2850,6 +3331,7 @@ impl EventSourced for UsdcRebalance {
             }
 
             RecordPendingBurn { burn_tx } => self.transition_record_pending_burn(burn_tx),
+            PrepareDepositSend { prepared } => self.transition_prepare_deposit_send(prepared),
             ClearPendingBurn => self.transition_clear_pending_burn(),
 
             ReceiveAttestation {
@@ -2925,6 +3407,7 @@ impl EventSourced for UsdcRebalance {
 
             FailDeposit { reason } => self.transition_fail_deposit(reason),
             RecoverDeposit => self.transition_recover_deposit(),
+            AttachDepositSend { send_tx } => self.transition_attach_deposit_send(send_tx),
             ReconcileStuckRebalance { reason } => self.transition_reconcile_stuck_rebalance(reason),
         }
     }
@@ -2995,6 +3478,7 @@ impl UsdcRebalance {
         }
         Ok(vec![ConversionInitiated {
             direction: *direction,
+            corridor: self.corridor(),
             amount: *amount,
             order_id,
             initiated_at,
@@ -3007,6 +3491,7 @@ impl UsdcRebalance {
     /// sibling, which differ only in the timestamp source.
     fn begin_withdrawal_init_events(
         direction: RebalanceDirection,
+        corridor: UsdcCorridor,
         amount: Usdc,
         from_block: u64,
         submitting_at: DateTime<Utc>,
@@ -3027,10 +3512,25 @@ impl UsdcRebalance {
         }
         Ok(vec![UsdcRebalanceEvent::WithdrawalSubmitting {
             direction,
+            corridor,
             amount,
             from_block,
             submitting_at,
         }])
+    }
+
+    /// Refuses a command naming another corridor than the transfer's.
+    fn require_corridor(&self, requested: UsdcCorridor) -> Result<(), UsdcRebalanceError> {
+        let recorded = self.corridor();
+
+        if requested == recorded {
+            return Ok(());
+        }
+
+        Err(UsdcRebalanceError::CorridorMismatch {
+            recorded,
+            requested,
+        })
     }
 
     /// Records withdrawal intent (the chain head) before the on-chain
@@ -3073,6 +3573,7 @@ impl UsdcRebalance {
         }
         Ok(vec![WithdrawalSubmitting {
             direction,
+            corridor: self.corridor(),
             amount: conversion.received_amount,
             from_block,
             submitting_at,
@@ -3122,6 +3623,7 @@ impl UsdcRebalance {
         }
         Ok(vec![Initiated {
             direction,
+            corridor: self.corridor(),
             amount: *expected_amount,
             withdrawal_ref: withdrawal,
             initiated_at,
@@ -3569,6 +4071,61 @@ impl UsdcRebalance {
         }
     }
 
+    /// Persists the signed BaseToAlpaca deposit send before its broadcast.
+    fn transition_prepare_deposit_send(
+        &self,
+        prepared: PreparedTransaction,
+    ) -> Result<Vec<UsdcRebalanceEvent>, UsdcRebalanceError> {
+        use UsdcRebalanceEvent::*;
+        match self.base_to_alpaca_deposit_send("PrepareDepositSend")? {
+            DepositSend::NotStarted => Ok(vec![DepositSendPrepared {
+                prepared,
+                prepared_at: Utc::now(),
+            }]),
+            DepositSend::Prepared { .. } => Err(UsdcRebalanceError::DepositSendAlreadyStarted),
+        }
+    }
+
+    /// The deposit send of a BaseToAlpaca `Bridged`, or the error `command`
+    /// gets from any other state.
+    fn base_to_alpaca_deposit_send(
+        &self,
+        command: &str,
+    ) -> Result<DepositSend, UsdcRebalanceError> {
+        match self {
+            Self::Bridged {
+                direction: RebalanceDirection::BaseToAlpaca,
+                deposit_send,
+                ..
+            } => Ok(deposit_send.clone()),
+            Self::Converting { .. }
+            | Self::ConversionComplete { .. }
+            | Self::ConversionFailed { .. }
+            | Self::WithdrawalSubmitting { .. }
+            | Self::Withdrawing { .. }
+            | Self::WithdrawalComplete { .. }
+            | Self::BridgingSubmitting { .. }
+            | Self::WithdrawalFailed { .. }
+            | Self::Bridging { .. }
+            | Self::AwaitingAttestation { .. }
+            | Self::Attested { .. }
+            | Self::BridgingFailed { .. } => Err(UsdcRebalanceError::BridgingNotCompleted),
+            // An AlpacaToBase deposit goes into the Base vault, not through
+            // the shared Ethereum wallet.
+            Self::Bridged {
+                direction: RebalanceDirection::AlpacaToBase,
+                ..
+            }
+            | Self::DepositInitiated { .. }
+            | Self::DepositConfirmed { .. }
+            | Self::DepositFailed { .. }
+            | Self::Reconciled { .. } => Err(UsdcRebalanceError::InvalidCommand {
+                command: command.to_string(),
+                state: format!("{self:?}"),
+            }),
+        }
+    }
+
     fn transition_initiate_deposit(
         &self,
         deposit: TransferRef,
@@ -3588,10 +4145,30 @@ impl UsdcRebalance {
             | Self::AwaitingAttestation { .. }
             | Self::Attested { .. }
             | Self::BridgingFailed { .. } => Err(UsdcRebalanceError::BridgingNotCompleted),
-            Self::Bridged { .. } => Ok(vec![DepositInitiated {
-                deposit_ref: deposit,
-                deposit_initiated_at,
-            }]),
+            Self::Bridged { deposit_send, .. } => {
+                // A signed send is the only send this transfer can make.
+                if let Some((prepared, _)) = deposit_send.prepared() {
+                    let TransferRef::OnchainTx(recorded) = &deposit else {
+                        return Err(UsdcRebalanceError::InvalidCommand {
+                            command: "InitiateDeposit".to_string(),
+                            state: "Bridged with a signed deposit send, given a non-onchain \
+                                    deposit ref"
+                                .to_string(),
+                        });
+                    };
+                    if *recorded != prepared.tx_hash() {
+                        return Err(UsdcRebalanceError::PreparedDepositHashMismatch {
+                            recorded: *recorded,
+                            prepared: prepared.tx_hash(),
+                        });
+                    }
+                }
+
+                Ok(vec![DepositInitiated {
+                    deposit_ref: deposit,
+                    deposit_initiated_at,
+                }])
+            }
             Self::DepositInitiated { .. }
             | Self::DepositConfirmed { .. }
             | Self::DepositFailed { .. }
@@ -3652,7 +4229,24 @@ impl UsdcRebalance {
             | Self::AwaitingAttestation { .. }
             | Self::Attested { .. }
             | Self::BridgingFailed { .. }
-            | Self::Bridged { .. } => Err(UsdcRebalanceError::DepositNotInitiated),
+            | Self::Bridged {
+                direction: RebalanceDirection::AlpacaToBase,
+                ..
+            } => Err(UsdcRebalanceError::DepositNotInitiated),
+            // A Base->Alpaca deposit send that cannot be resolved: the minted
+            // USDC may have left the wallet, so it fails post-mint for
+            // reconciliation, keeping the signed send if there is one.
+            Self::Bridged {
+                direction: RebalanceDirection::BaseToAlpaca,
+                deposit_send,
+                ..
+            } => Ok(vec![DepositFailed {
+                deposit_ref: deposit_send
+                    .prepared()
+                    .map(|(prepared, _)| TransferRef::OnchainTx(prepared.tx_hash())),
+                reason,
+                failed_at: Utc::now(),
+            }]),
             Self::DepositInitiated { deposit_ref, .. } => Ok(vec![DepositFailed {
                 deposit_ref: Some(deposit_ref.clone()),
                 reason,
@@ -3663,6 +4257,36 @@ impl UsdcRebalance {
             | Self::Reconciled { .. } => Err(UsdcRebalanceError::InvalidCommand {
                 command: "FailDeposit".to_string(),
                 state: format!("{self:?}"),
+            }),
+        }
+    }
+
+    /// Attaches an operator-verified send to a BaseToAlpaca `DepositFailed`
+    /// with none recorded. A recorded send is never replaced.
+    fn transition_attach_deposit_send(
+        &self,
+        send_tx: TxHash,
+    ) -> Result<Vec<UsdcRebalanceEvent>, UsdcRebalanceError> {
+        use UsdcRebalanceEvent::*;
+        match self {
+            Self::DepositFailed {
+                direction: RebalanceDirection::BaseToAlpaca,
+                deposit_ref: None,
+                ..
+            } => Ok(vec![DepositSendAttached {
+                send_tx,
+                attached_at: Utc::now(),
+            }]),
+            Self::DepositFailed {
+                direction: RebalanceDirection::BaseToAlpaca,
+                deposit_ref: Some(TransferRef::OnchainTx(recorded)),
+                ..
+            } => Err(UsdcRebalanceError::DepositSendAlreadyRecorded {
+                recorded: *recorded,
+            }),
+            _ => Err(UsdcRebalanceError::InvalidCommand {
+                command: "AttachDepositSend".to_string(),
+                state: "not a BaseToAlpaca DepositFailed with no on-chain deposit ref".to_string(),
             }),
         }
     }
@@ -3720,8 +4344,8 @@ impl UsdcRebalance {
     /// Valid only from a post-burn terminal failure that strands the guard with
     /// no other exit:
     ///
-    /// - `DepositFailed` -- only reachable from `DepositInitiated`, hence always
-    ///   post-mint.
+    /// - `DepositFailed` -- only reachable after the mint (from
+    ///   `DepositInitiated` or a BaseToAlpaca `Bridged`), hence always post-mint.
     /// - `BridgingFailed` with a recorded `burn_tx_hash` or `cctp_nonce` -- both
     ///   are only ever populated after the burn reaches CCTP, so either proves
     ///   the failure is post-burn (mirrors the reactor's post-burn classifier).
@@ -3768,6 +4392,12 @@ impl UsdcRebalance {
                 initiated_at,
                 ..
             } if self.is_reconcilable_failure() => (*direction, *amount, *initiated_at),
+            Self::Bridged {
+                direction,
+                amount,
+                initiated_at,
+                ..
+            } if self.has_prepared_deposit_send() => (*direction, *amount, *initiated_at),
             _ => {
                 return Err(UsdcRebalanceError::InvalidCommand {
                     command: "ReconcileStuckRebalance".to_string(),
@@ -3793,7 +4423,9 @@ mod tests {
     use std::collections::HashSet;
     use uuid::Uuid;
 
+    use st0x_bridge::corridor::HopKind;
     use st0x_event_sorcery::{LifecycleError, Store, TestHarness, replay, test_store};
+    use st0x_evm::Chain;
     use st0x_float_macro::float;
 
     use super::*;
@@ -3868,6 +4500,7 @@ mod tests {
 
         let state = replay::<UsdcRebalance>(vec![
             UsdcRebalanceEvent::Initiated {
+                corridor: UsdcCorridor::BASE_CCTP,
                 direction: RebalanceDirection::BaseToAlpaca,
                 amount: Usdc::new(float!(100)),
                 withdrawal_ref: TransferRef::OnchainTx(burn_tx),
@@ -3912,6 +4545,7 @@ mod tests {
         let burn_tx =
             fixed_bytes!("0x0000000000000000000000000000000000000000000000000000000000000001");
         let mut snapshot = to_value(UsdcRebalance::Attested {
+            corridor: UsdcCorridor::BASE_CCTP,
             direction: RebalanceDirection::BaseToAlpaca,
             amount: Usdc::new(float!(100)),
             burn_tx_hash: burn_tx,
@@ -3956,6 +4590,7 @@ mod tests {
         let events = TestHarness::<UsdcRebalance>::with(())
             .given_no_previous_events()
             .when(UsdcRebalanceCommand::Initiate {
+                corridor: UsdcCorridor::BASE_CCTP,
                 direction: RebalanceDirection::AlpacaToBase,
                 amount: Usdc::new(float!(1000.00)),
                 withdrawal: TransferRef::AlpacaId(transfer_id),
@@ -3988,6 +4623,7 @@ mod tests {
         let events = TestHarness::<UsdcRebalance>::with(())
             .given_no_previous_events()
             .when(UsdcRebalanceCommand::Initiate {
+                corridor: UsdcCorridor::BASE_CCTP,
                 direction: RebalanceDirection::BaseToAlpaca,
                 amount: Usdc::new(float!(500.50)),
                 withdrawal: TransferRef::OnchainTx(tx_hash),
@@ -4018,12 +4654,14 @@ mod tests {
 
         let error = TestHarness::<UsdcRebalance>::with(())
             .given(vec![UsdcRebalanceEvent::Initiated {
+                corridor: UsdcCorridor::BASE_CCTP,
                 direction: RebalanceDirection::AlpacaToBase,
                 amount: Usdc::new(float!(1000.00)),
                 withdrawal_ref: TransferRef::AlpacaId(transfer_id),
                 initiated_at: Utc::now(),
             }])
             .when(UsdcRebalanceCommand::Initiate {
+                corridor: UsdcCorridor::BASE_CCTP,
                 direction: RebalanceDirection::BaseToAlpaca,
                 amount: Usdc::new(float!(500.00)),
                 withdrawal: TransferRef::AlpacaId(transfer_id),
@@ -4052,12 +4690,14 @@ mod tests {
     fn initiated_event_on_withdrawing_produces_failed_state() {
         let error = replay::<UsdcRebalance>(vec![
             UsdcRebalanceEvent::Initiated {
+                corridor: UsdcCorridor::BASE_CCTP,
                 direction: RebalanceDirection::AlpacaToBase,
                 amount: Usdc::new(float!(1000.00)),
                 withdrawal_ref: TransferRef::AlpacaId(AlpacaTransferId::from(Uuid::new_v4())),
                 initiated_at: Utc::now(),
             },
             UsdcRebalanceEvent::Initiated {
+                corridor: UsdcCorridor::BASE_CCTP,
                 direction: RebalanceDirection::BaseToAlpaca,
                 amount: Usdc::new(float!(500.00)),
                 withdrawal_ref: TransferRef::OnchainTx(fixed_bytes!(
@@ -4076,6 +4716,7 @@ mod tests {
         let events = TestHarness::<UsdcRebalance>::with(())
             .given_no_previous_events()
             .when(UsdcRebalanceCommand::BeginWithdrawal {
+                corridor: UsdcCorridor::BASE_CCTP,
                 direction: RebalanceDirection::BaseToAlpaca,
                 amount: Usdc::new(float!(500.00)),
                 from_block: 42,
@@ -4103,6 +4744,7 @@ mod tests {
         let error = TestHarness::<UsdcRebalance>::with(())
             .given_no_previous_events()
             .when(UsdcRebalanceCommand::BeginWithdrawal {
+                corridor: UsdcCorridor::BASE_CCTP,
                 direction: RebalanceDirection::AlpacaToBase,
                 amount: Usdc::new(float!(500.00)),
                 from_block: 42,
@@ -4123,12 +4765,14 @@ mod tests {
 
         let events = TestHarness::<UsdcRebalance>::with(())
             .given(vec![UsdcRebalanceEvent::WithdrawalSubmitting {
+                corridor: UsdcCorridor::BASE_CCTP,
                 direction: RebalanceDirection::BaseToAlpaca,
                 amount: Usdc::new(float!(500.00)),
                 from_block: 42,
                 submitting_at: Utc::now(),
             }])
             .when(UsdcRebalanceCommand::Initiate {
+                corridor: UsdcCorridor::BASE_CCTP,
                 direction: RebalanceDirection::BaseToAlpaca,
                 amount: Usdc::new(float!(500.00)),
                 withdrawal: TransferRef::OnchainTx(tx_hash),
@@ -4150,12 +4794,14 @@ mod tests {
 
         let error = TestHarness::<UsdcRebalance>::with(())
             .given(vec![UsdcRebalanceEvent::WithdrawalSubmitting {
+                corridor: UsdcCorridor::BASE_CCTP,
                 direction: RebalanceDirection::BaseToAlpaca,
                 amount: Usdc::new(float!(500.00)),
                 from_block: 42,
                 submitting_at: Utc::now(),
             }])
             .when(UsdcRebalanceCommand::Initiate {
+                corridor: UsdcCorridor::BASE_CCTP,
                 direction: RebalanceDirection::BaseToAlpaca,
                 amount: Usdc::new(float!(999.00)),
                 withdrawal: TransferRef::OnchainTx(tx_hash),
@@ -4174,6 +4820,7 @@ mod tests {
         let events = TestHarness::<UsdcRebalance>::with(())
             .given(vec![
                 UsdcRebalanceEvent::Initiated {
+                    corridor: UsdcCorridor::BASE_CCTP,
                     direction: RebalanceDirection::BaseToAlpaca,
                     amount: Usdc::new(float!(500.00)),
                     withdrawal_ref: TransferRef::OnchainTx(fixed_bytes!(
@@ -4208,6 +4855,7 @@ mod tests {
         let events = TestHarness::<UsdcRebalance>::with(())
             .given(vec![
                 UsdcRebalanceEvent::Initiated {
+                    corridor: UsdcCorridor::BASE_CCTP,
                     direction: RebalanceDirection::BaseToAlpaca,
                     amount: Usdc::new(float!(500.00)),
                     withdrawal_ref: TransferRef::OnchainTx(fixed_bytes!(
@@ -4243,6 +4891,7 @@ mod tests {
 
         let staged = vec![
             UsdcRebalanceEvent::Initiated {
+                corridor: UsdcCorridor::BASE_CCTP,
                 direction: RebalanceDirection::BaseToAlpaca,
                 amount: Usdc::new(float!(500.00)),
                 withdrawal_ref: TransferRef::OnchainTx(fixed_bytes!(
@@ -4312,6 +4961,7 @@ mod tests {
 
         let staged = vec![
             UsdcRebalanceEvent::Initiated {
+                corridor: UsdcCorridor::BASE_CCTP,
                 direction: RebalanceDirection::BaseToAlpaca,
                 amount: Usdc::new(float!(500.00)),
                 withdrawal_ref: TransferRef::OnchainTx(fixed_bytes!(
@@ -4382,6 +5032,7 @@ mod tests {
         let error = TestHarness::<UsdcRebalance>::with(())
             .given(vec![
                 UsdcRebalanceEvent::Initiated {
+                    corridor: UsdcCorridor::BASE_CCTP,
                     direction: RebalanceDirection::BaseToAlpaca,
                     amount: Usdc::new(float!(500.00)),
                     withdrawal_ref: TransferRef::OnchainTx(fixed_bytes!(
@@ -4419,6 +5070,7 @@ mod tests {
 
         let staged = vec![
             UsdcRebalanceEvent::Initiated {
+                corridor: UsdcCorridor::BASE_CCTP,
                 direction: RebalanceDirection::BaseToAlpaca,
                 amount: Usdc::new(float!(500.00)),
                 withdrawal_ref: TransferRef::OnchainTx(fixed_bytes!(
@@ -4481,6 +5133,7 @@ mod tests {
         let events = TestHarness::<UsdcRebalance>::with(())
             .given(vec![
                 UsdcRebalanceEvent::Initiated {
+                    corridor: UsdcCorridor::BASE_CCTP,
                     direction: RebalanceDirection::BaseToAlpaca,
                     amount: Usdc::new(float!(500.00)),
                     withdrawal_ref: TransferRef::OnchainTx(fixed_bytes!(
@@ -4519,6 +5172,7 @@ mod tests {
         let error = TestHarness::<UsdcRebalance>::with(())
             .given(vec![
                 UsdcRebalanceEvent::Initiated {
+                    corridor: UsdcCorridor::BASE_CCTP,
                     direction: RebalanceDirection::BaseToAlpaca,
                     amount: Usdc::new(float!(500.00)),
                     withdrawal_ref: TransferRef::OnchainTx(fixed_bytes!(
@@ -4559,6 +5213,7 @@ mod tests {
         let error = TestHarness::<UsdcRebalance>::with(())
             .given(vec![
                 UsdcRebalanceEvent::Initiated {
+                    corridor: UsdcCorridor::BASE_CCTP,
                     direction: RebalanceDirection::BaseToAlpaca,
                     amount: Usdc::new(float!(500.00)),
                     withdrawal_ref: TransferRef::OnchainTx(fixed_bytes!(
@@ -4593,6 +5248,7 @@ mod tests {
     #[test]
     fn bridging_submitting_snapshot_without_pending_burn_tx_deserializes_to_none() {
         let mut snapshot = to_value(UsdcRebalance::BridgingSubmitting {
+            corridor: UsdcCorridor::BASE_CCTP,
             direction: RebalanceDirection::BaseToAlpaca,
             amount: Usdc::new(float!(100.00)),
             from_block: 42,
@@ -4626,12 +5282,14 @@ mod tests {
     fn intent_first_event_sequence_replays_through_withdrawal_and_bridging() {
         let state = replay::<UsdcRebalance>(vec![
             UsdcRebalanceEvent::WithdrawalSubmitting {
+                corridor: UsdcCorridor::BASE_CCTP,
                 direction: RebalanceDirection::BaseToAlpaca,
                 amount: Usdc::new(float!(500.00)),
                 from_block: 42,
                 submitting_at: Utc::now(),
             },
             UsdcRebalanceEvent::Initiated {
+                corridor: UsdcCorridor::BASE_CCTP,
                 direction: RebalanceDirection::BaseToAlpaca,
                 amount: Usdc::new(float!(500.00)),
                 withdrawal_ref: TransferRef::OnchainTx(fixed_bytes!(
@@ -4668,6 +5326,7 @@ mod tests {
         let events = TestHarness::<UsdcRebalance>::with(())
             .given(vec![
                 UsdcRebalanceEvent::Initiated {
+                    corridor: UsdcCorridor::BASE_CCTP,
                     direction: RebalanceDirection::AlpacaToBase,
                     amount: Usdc::new(float!(1000.00)),
                     withdrawal_ref: TransferRef::AlpacaId(AlpacaTransferId::from(Uuid::new_v4())),
@@ -4704,6 +5363,7 @@ mod tests {
         // Replay the emitted event and verify the aggregate state matches.
         let state = replay::<UsdcRebalance>(vec![
             UsdcRebalanceEvent::Initiated {
+                corridor: UsdcCorridor::BASE_CCTP,
                 direction: RebalanceDirection::AlpacaToBase,
                 amount: Usdc::new(float!(1000.00)),
                 withdrawal_ref: TransferRef::AlpacaId(AlpacaTransferId::from(Uuid::new_v4())),
@@ -4745,6 +5405,7 @@ mod tests {
 
         let state = replay::<UsdcRebalance>(vec![
             UsdcRebalanceEvent::Initiated {
+                corridor: UsdcCorridor::BASE_CCTP,
                 direction: RebalanceDirection::AlpacaToBase,
                 amount: nominal,
                 withdrawal_ref: TransferRef::AlpacaId(AlpacaTransferId::from(Uuid::new_v4())),
@@ -4783,6 +5444,7 @@ mod tests {
 
         let state = replay::<UsdcRebalance>(vec![
             UsdcRebalanceEvent::Initiated {
+                corridor: UsdcCorridor::BASE_CCTP,
                 direction: RebalanceDirection::AlpacaToBase,
                 amount: nominal,
                 withdrawal_ref: TransferRef::AlpacaId(AlpacaTransferId::from(Uuid::new_v4())),
@@ -4823,6 +5485,7 @@ mod tests {
         let error = TestHarness::<UsdcRebalance>::with(())
             .given(vec![
                 UsdcRebalanceEvent::Initiated {
+                    corridor: UsdcCorridor::BASE_CCTP,
                     direction: RebalanceDirection::AlpacaToBase,
                     amount: nominal,
                     withdrawal_ref: TransferRef::AlpacaId(AlpacaTransferId::from(Uuid::new_v4())),
@@ -4860,6 +5523,7 @@ mod tests {
         let error = TestHarness::<UsdcRebalance>::with(())
             .given(vec![
                 UsdcRebalanceEvent::Initiated {
+                    corridor: UsdcCorridor::BASE_CCTP,
                     direction: RebalanceDirection::AlpacaToBase,
                     amount: nominal,
                     withdrawal_ref: TransferRef::AlpacaId(AlpacaTransferId::from(Uuid::new_v4())),
@@ -4893,6 +5557,7 @@ mod tests {
 
         let events = TestHarness::<UsdcRebalance>::with(())
             .given(vec![UsdcRebalanceEvent::Initiated {
+                corridor: UsdcCorridor::BASE_CCTP,
                 direction: RebalanceDirection::AlpacaToBase,
                 amount: Usdc::new(float!(1000.00)),
                 withdrawal_ref: TransferRef::AlpacaId(transfer_id),
@@ -4934,6 +5599,7 @@ mod tests {
         let error = TestHarness::<UsdcRebalance>::with(())
             .given(vec![
                 UsdcRebalanceEvent::Initiated {
+                    corridor: UsdcCorridor::BASE_CCTP,
                     direction: RebalanceDirection::AlpacaToBase,
                     amount: Usdc::new(float!(1000.00)),
                     withdrawal_ref: TransferRef::AlpacaId(transfer_id),
@@ -4962,6 +5628,7 @@ mod tests {
 
         let events = TestHarness::<UsdcRebalance>::with(())
             .given(vec![UsdcRebalanceEvent::Initiated {
+                corridor: UsdcCorridor::BASE_CCTP,
                 direction: RebalanceDirection::AlpacaToBase,
                 amount: Usdc::new(float!(1000.00)),
                 withdrawal_ref: TransferRef::AlpacaId(transfer_id),
@@ -5003,6 +5670,7 @@ mod tests {
         let error = TestHarness::<UsdcRebalance>::with(())
             .given(vec![
                 UsdcRebalanceEvent::Initiated {
+                    corridor: UsdcCorridor::BASE_CCTP,
                     direction: RebalanceDirection::AlpacaToBase,
                     amount: Usdc::new(float!(1000.00)),
                     withdrawal_ref: TransferRef::AlpacaId(transfer_id),
@@ -5032,6 +5700,7 @@ mod tests {
         let error = TestHarness::<UsdcRebalance>::with(())
             .given(vec![
                 UsdcRebalanceEvent::Initiated {
+                    corridor: UsdcCorridor::BASE_CCTP,
                     direction: RebalanceDirection::AlpacaToBase,
                     amount: Usdc::new(float!(1000.00)),
                     withdrawal_ref: TransferRef::AlpacaId(transfer_id),
@@ -5063,6 +5732,7 @@ mod tests {
         let events = TestHarness::<UsdcRebalance>::with(())
             .given(vec![
                 UsdcRebalanceEvent::Initiated {
+                    corridor: UsdcCorridor::BASE_CCTP,
                     direction: RebalanceDirection::AlpacaToBase,
                     amount: Usdc::new(float!(1000.00)),
                     withdrawal_ref: TransferRef::AlpacaId(transfer_id),
@@ -5101,6 +5771,7 @@ mod tests {
         let events = TestHarness::<UsdcRebalance>::with(())
             .given(vec![
                 UsdcRebalanceEvent::Initiated {
+                    corridor: UsdcCorridor::BASE_CCTP,
                     direction: RebalanceDirection::AlpacaToBase,
                     amount: Usdc::new(float!(1000.00)),
                     withdrawal_ref: TransferRef::AlpacaId(transfer_id),
@@ -5140,6 +5811,7 @@ mod tests {
 
         let state = replay::<UsdcRebalance>(vec![
             UsdcRebalanceEvent::Initiated {
+                corridor: UsdcCorridor::BASE_CCTP,
                 direction: RebalanceDirection::BaseToAlpaca,
                 amount: Usdc::new(float!(1000.00)),
                 withdrawal_ref: TransferRef::OnchainTx(BURN_TX),
@@ -5184,6 +5856,7 @@ mod tests {
 
         let state = replay::<UsdcRebalance>(vec![
             UsdcRebalanceEvent::Initiated {
+                corridor: UsdcCorridor::BASE_CCTP,
                 direction: RebalanceDirection::BaseToAlpaca,
                 amount: Usdc::new(float!(1000.00)),
                 withdrawal_ref: TransferRef::OnchainTx(BURN_TX),
@@ -5254,6 +5927,7 @@ mod tests {
 
         let error = TestHarness::<UsdcRebalance>::with(())
             .given(vec![UsdcRebalanceEvent::Initiated {
+                corridor: UsdcCorridor::BASE_CCTP,
                 direction: RebalanceDirection::AlpacaToBase,
                 amount: Usdc::new(float!(1000.00)),
                 withdrawal_ref: TransferRef::AlpacaId(transfer_id),
@@ -5280,6 +5954,7 @@ mod tests {
         let error = TestHarness::<UsdcRebalance>::with(())
             .given(vec![
                 UsdcRebalanceEvent::Initiated {
+                    corridor: UsdcCorridor::BASE_CCTP,
                     direction: RebalanceDirection::AlpacaToBase,
                     amount: Usdc::new(float!(1000.00)),
                     withdrawal_ref: TransferRef::AlpacaId(transfer_id),
@@ -5311,6 +5986,7 @@ mod tests {
         let error = TestHarness::<UsdcRebalance>::with(())
             .given(vec![
                 UsdcRebalanceEvent::Initiated {
+                    corridor: UsdcCorridor::BASE_CCTP,
                     direction: RebalanceDirection::AlpacaToBase,
                     amount: Usdc::new(float!(1000.00)),
                     withdrawal_ref: TransferRef::AlpacaId(transfer_id),
@@ -5348,6 +6024,7 @@ mod tests {
         let events = TestHarness::<UsdcRebalance>::with(())
             .given(vec![
                 UsdcRebalanceEvent::Initiated {
+                    corridor: UsdcCorridor::BASE_CCTP,
                     direction: RebalanceDirection::AlpacaToBase,
                     amount: Usdc::new(float!(1000.00)),
                     withdrawal_ref: TransferRef::AlpacaId(transfer_id),
@@ -5405,6 +6082,7 @@ mod tests {
             fixed_bytes!("0x0000000000000000000000000000000000000000000000000000000000000001");
         let initiated_at = Utc::now();
         let bridging = UsdcRebalance::Bridging {
+            corridor: UsdcCorridor::BASE_CCTP,
             direction: RebalanceDirection::BaseToAlpaca,
             amount: Usdc::new(float!(1000)),
             burn_tx_hash: burn_tx,
@@ -5453,6 +6131,7 @@ mod tests {
         let amount = Usdc::new(float!(750));
 
         let bridging = UsdcRebalance::Bridging {
+            corridor: UsdcCorridor::BASE_CCTP,
             direction: RebalanceDirection::BaseToAlpaca,
             amount,
             burn_tx_hash: burn_tx,
@@ -5466,6 +6145,7 @@ mod tests {
         );
 
         let awaiting = UsdcRebalance::AwaitingAttestation {
+            corridor: UsdcCorridor::BASE_CCTP,
             direction: RebalanceDirection::AlpacaToBase,
             amount,
             burn_tx_hash: burn_tx,
@@ -5480,6 +6160,7 @@ mod tests {
         );
 
         let attested = UsdcRebalance::Attested {
+            corridor: UsdcCorridor::BASE_CCTP,
             direction: RebalanceDirection::AlpacaToBase,
             amount,
             burn_tx_hash: burn_tx,
@@ -5499,6 +6180,7 @@ mod tests {
         // A confirmed mint is terminal for the transfer leg: re-arming it would
         // double-drive an already-bridged transfer, so it must classify as None.
         let bridged = UsdcRebalance::Bridged {
+            corridor: UsdcCorridor::BASE_CCTP,
             direction: RebalanceDirection::BaseToAlpaca,
             amount,
             amount_received: amount,
@@ -5507,6 +6189,7 @@ mod tests {
             mint_tx_hash: burn_tx,
             initiated_at: now,
             minted_at: now,
+            deposit_send: DepositSend::NotStarted,
         };
         assert_eq!(
             bridged.resumable_post_burn_transfer(),
@@ -5519,6 +6202,7 @@ mod tests {
         // it must classify as None and be left to crash-safe scan/operator
         // recovery -- never auto-re-armed.
         let submitting = UsdcRebalance::BridgingSubmitting {
+            corridor: UsdcCorridor::BASE_CCTP,
             direction: RebalanceDirection::BaseToAlpaca,
             amount,
             from_block: 100,
@@ -5535,6 +6219,7 @@ mod tests {
         // A post-burn BaseToAlpaca BridgingFailed is recoverable (RAI-906): the
         // resume path re-checks the mint and un-fails it, so it must be re-armed.
         let post_burn_failed = UsdcRebalance::BridgingFailed {
+            corridor: UsdcCorridor::BASE_CCTP,
             direction: RebalanceDirection::BaseToAlpaca,
             amount,
             burn_tx_hash: Some(burn_tx),
@@ -5551,6 +6236,7 @@ mod tests {
 
         // A pre-burn failure has no mint to adopt -- not re-armable.
         let pre_burn_failed = UsdcRebalance::BridgingFailed {
+            corridor: UsdcCorridor::BASE_CCTP,
             direction: RebalanceDirection::BaseToAlpaca,
             amount,
             burn_tx_hash: None,
@@ -5568,6 +6254,7 @@ mod tests {
         // AlpacaToBase recovery is not yet implemented -- left for manual
         // reconciliation rather than auto-re-armed into an unsupported path.
         let alpaca_to_base_failed = UsdcRebalance::BridgingFailed {
+            corridor: UsdcCorridor::BASE_CCTP,
             direction: RebalanceDirection::AlpacaToBase,
             amount,
             burn_tx_hash: Some(burn_tx),
@@ -5621,6 +6308,7 @@ mod tests {
         let amount = Usdc::new(float!(321));
 
         let bridged = UsdcRebalance::Bridged {
+            corridor: UsdcCorridor::BASE_CCTP,
             direction: RebalanceDirection::AlpacaToBase,
             amount,
             amount_received: Usdc::new(float!(320)),
@@ -5629,10 +6317,12 @@ mod tests {
             mint_tx_hash: burn_tx,
             initiated_at: now,
             minted_at: now,
+            deposit_send: DepositSend::NotStarted,
         };
         assert_eq!(bridged.direction(), RebalanceDirection::AlpacaToBase);
 
         let conversion_complete = UsdcRebalance::ConversionComplete {
+            corridor: UsdcCorridor::BASE_CCTP,
             direction: RebalanceDirection::BaseToAlpaca,
             amount,
             conversion: par_conversion(Usdc::new(float!(999))),
@@ -5645,6 +6335,7 @@ mod tests {
         );
 
         let deposit_failed = UsdcRebalance::DepositFailed {
+            corridor: UsdcCorridor::BASE_CCTP,
             direction: RebalanceDirection::AlpacaToBase,
             amount,
             burn_tx_hash: burn_tx,
@@ -5668,6 +6359,7 @@ mod tests {
         let requested = Usdc::new(float!(321));
 
         let bridged = UsdcRebalance::Bridged {
+            corridor: UsdcCorridor::BASE_CCTP,
             direction: RebalanceDirection::AlpacaToBase,
             amount: requested,
             amount_received: Usdc::new(float!(320)),
@@ -5676,6 +6368,7 @@ mod tests {
             mint_tx_hash: burn_tx,
             initiated_at: now,
             minted_at: now,
+            deposit_send: DepositSend::NotStarted,
         };
         assert_eq!(
             bridged.amount(),
@@ -5684,6 +6377,7 @@ mod tests {
         );
 
         let conversion_failed = UsdcRebalance::ConversionFailed {
+            corridor: UsdcCorridor::BASE_CCTP,
             direction: RebalanceDirection::BaseToAlpaca,
             amount: requested,
             order_id: ClientOrderId::from_uuid(Uuid::from_u128(11)),
@@ -5694,6 +6388,7 @@ mod tests {
         assert_eq!(conversion_failed.amount(), requested);
 
         let conversion_complete = UsdcRebalance::ConversionComplete {
+            corridor: UsdcCorridor::BASE_CCTP,
             direction: RebalanceDirection::BaseToAlpaca,
             amount: requested,
             conversion: par_conversion(Usdc::new(float!(319))),
@@ -5707,6 +6402,7 @@ mod tests {
         );
 
         let deposit_failed = UsdcRebalance::DepositFailed {
+            corridor: UsdcCorridor::BASE_CCTP,
             direction: RebalanceDirection::AlpacaToBase,
             amount: requested,
             burn_tx_hash: burn_tx,
@@ -5723,6 +6419,7 @@ mod tests {
         );
 
         let bridging_submitting_with_burn = UsdcRebalance::BridgingSubmitting {
+            corridor: UsdcCorridor::BASE_CCTP,
             direction: RebalanceDirection::AlpacaToBase,
             amount: requested,
             from_block: 100,
@@ -5737,6 +6434,7 @@ mod tests {
         );
 
         let bridging_submitting_legacy = UsdcRebalance::BridgingSubmitting {
+            corridor: UsdcCorridor::BASE_CCTP,
             direction: RebalanceDirection::AlpacaToBase,
             amount: requested,
             from_block: 100,
@@ -5751,6 +6449,7 @@ mod tests {
         );
 
         let converting = UsdcRebalance::Converting {
+            corridor: UsdcCorridor::BASE_CCTP,
             direction: RebalanceDirection::BaseToAlpaca,
             amount: requested,
             order_id: ClientOrderId::from_uuid(Uuid::from_u128(12)),
@@ -5763,6 +6462,7 @@ mod tests {
         );
 
         let bridging = UsdcRebalance::Bridging {
+            corridor: UsdcCorridor::BASE_CCTP,
             direction: RebalanceDirection::AlpacaToBase,
             amount: requested,
             burn_tx_hash: burn_tx,
@@ -5801,6 +6501,7 @@ mod tests {
 
         let error = TestHarness::<UsdcRebalance>::with(())
             .given(vec![UsdcRebalanceEvent::Initiated {
+                corridor: UsdcCorridor::BASE_CCTP,
                 direction: RebalanceDirection::AlpacaToBase,
                 amount: Usdc::new(float!(1000.00)),
                 withdrawal_ref: TransferRef::AlpacaId(transfer_id),
@@ -5828,6 +6529,7 @@ mod tests {
         let error = TestHarness::<UsdcRebalance>::with(())
             .given(vec![
                 UsdcRebalanceEvent::Initiated {
+                    corridor: UsdcCorridor::BASE_CCTP,
                     direction: RebalanceDirection::AlpacaToBase,
                     amount: Usdc::new(float!(1000.00)),
                     withdrawal_ref: TransferRef::AlpacaId(transfer_id),
@@ -5860,6 +6562,7 @@ mod tests {
         let error = TestHarness::<UsdcRebalance>::with(())
             .given(vec![
                 UsdcRebalanceEvent::Initiated {
+                    corridor: UsdcCorridor::BASE_CCTP,
                     direction: RebalanceDirection::AlpacaToBase,
                     amount: Usdc::new(float!(1000.00)),
                     withdrawal_ref: TransferRef::AlpacaId(transfer_id),
@@ -5894,6 +6597,7 @@ mod tests {
         let error = TestHarness::<UsdcRebalance>::with(())
             .given(vec![
                 UsdcRebalanceEvent::Initiated {
+                    corridor: UsdcCorridor::BASE_CCTP,
                     direction: RebalanceDirection::AlpacaToBase,
                     amount: Usdc::new(float!(1000.00)),
                     withdrawal_ref: TransferRef::AlpacaId(transfer_id),
@@ -5941,6 +6645,7 @@ mod tests {
         let events = TestHarness::<UsdcRebalance>::with(())
             .given(vec![
                 UsdcRebalanceEvent::Initiated {
+                    corridor: UsdcCorridor::BASE_CCTP,
                     direction: RebalanceDirection::AlpacaToBase,
                     amount: Usdc::new(float!(1000.00)),
                     withdrawal_ref: TransferRef::AlpacaId(transfer_id),
@@ -5993,6 +6698,7 @@ mod tests {
         let error = TestHarness::<UsdcRebalance>::with(())
             .given(vec![
                 UsdcRebalanceEvent::Initiated {
+                    corridor: UsdcCorridor::BASE_CCTP,
                     direction: RebalanceDirection::AlpacaToBase,
                     amount: Usdc::new(float!(1000.00)),
                     withdrawal_ref: TransferRef::AlpacaId(transfer_id),
@@ -6028,6 +6734,7 @@ mod tests {
         let events = TestHarness::<UsdcRebalance>::with(())
             .given(vec![
                 UsdcRebalanceEvent::Initiated {
+                    corridor: UsdcCorridor::BASE_CCTP,
                     direction: RebalanceDirection::AlpacaToBase,
                     amount: Usdc::new(float!(1000.00)),
                     withdrawal_ref: TransferRef::AlpacaId(transfer_id),
@@ -6069,6 +6776,7 @@ mod tests {
         let events = TestHarness::<UsdcRebalance>::with(())
             .given(vec![
                 UsdcRebalanceEvent::Initiated {
+                    corridor: UsdcCorridor::BASE_CCTP,
                     direction: RebalanceDirection::AlpacaToBase,
                     amount: Usdc::new(float!(1000.00)),
                     withdrawal_ref: TransferRef::AlpacaId(transfer_id),
@@ -6119,6 +6827,7 @@ mod tests {
         let events = TestHarness::<UsdcRebalance>::with(())
             .given(vec![
                 UsdcRebalanceEvent::Initiated {
+                    corridor: UsdcCorridor::BASE_CCTP,
                     direction: RebalanceDirection::AlpacaToBase,
                     amount: Usdc::new(float!(1000.00)),
                     withdrawal_ref: TransferRef::AlpacaId(transfer_id),
@@ -6170,6 +6879,7 @@ mod tests {
         let events = TestHarness::<UsdcRebalance>::with(())
             .given(vec![
                 UsdcRebalanceEvent::Initiated {
+                    corridor: UsdcCorridor::BASE_CCTP,
                     direction: RebalanceDirection::AlpacaToBase,
                     amount: Usdc::new(float!(1000.00)),
                     withdrawal_ref: TransferRef::AlpacaId(transfer_id),
@@ -6222,6 +6932,7 @@ mod tests {
         let events = TestHarness::<UsdcRebalance>::with(())
             .given(vec![
                 UsdcRebalanceEvent::Initiated {
+                    corridor: UsdcCorridor::BASE_CCTP,
                     direction: RebalanceDirection::AlpacaToBase,
                     amount: Usdc::new(float!(1000.00)),
                     withdrawal_ref: TransferRef::AlpacaId(transfer_id),
@@ -6273,6 +6984,7 @@ mod tests {
         let error = TestHarness::<UsdcRebalance>::with(())
             .given(vec![
                 UsdcRebalanceEvent::Initiated {
+                    corridor: UsdcCorridor::BASE_CCTP,
                     direction: RebalanceDirection::AlpacaToBase,
                     amount: Usdc::new(float!(1000.00)),
                     withdrawal_ref: TransferRef::AlpacaId(transfer_id),
@@ -6327,6 +7039,7 @@ mod tests {
         let error = TestHarness::<UsdcRebalance>::with(())
             .given(vec![
                 UsdcRebalanceEvent::Initiated {
+                    corridor: UsdcCorridor::BASE_CCTP,
                     direction: RebalanceDirection::AlpacaToBase,
                     amount: Usdc::new(float!(1000.00)),
                     withdrawal_ref: TransferRef::AlpacaId(transfer_id),
@@ -6375,6 +7088,7 @@ mod tests {
         let error = TestHarness::<UsdcRebalance>::with(())
             .given(vec![
                 UsdcRebalanceEvent::Initiated {
+                    corridor: UsdcCorridor::BASE_CCTP,
                     direction: RebalanceDirection::AlpacaToBase,
                     amount: Usdc::new(float!(1000.00)),
                     withdrawal_ref: TransferRef::AlpacaId(transfer_id),
@@ -6421,6 +7135,7 @@ mod tests {
         let events = TestHarness::<UsdcRebalance>::with(())
             .given(vec![
                 UsdcRebalanceEvent::Initiated {
+                    corridor: UsdcCorridor::BASE_CCTP,
                     direction: RebalanceDirection::AlpacaToBase,
                     amount: Usdc::new(float!(1000.00)),
                     withdrawal_ref: TransferRef::AlpacaId(transfer_id),
@@ -6481,6 +7196,7 @@ mod tests {
         let events = TestHarness::<UsdcRebalance>::with(())
             .given(vec![
                 UsdcRebalanceEvent::Initiated {
+                    corridor: UsdcCorridor::BASE_CCTP,
                     direction: RebalanceDirection::BaseToAlpaca,
                     amount: Usdc::new(float!(500.00)),
                     withdrawal_ref: TransferRef::AlpacaId(transfer_id),
@@ -6536,6 +7252,7 @@ mod tests {
         let error = TestHarness::<UsdcRebalance>::with(())
             .given(vec![
                 UsdcRebalanceEvent::Initiated {
+                    corridor: UsdcCorridor::BASE_CCTP,
                     direction: RebalanceDirection::AlpacaToBase,
                     amount: Usdc::new(float!(1000.00)),
                     withdrawal_ref: TransferRef::AlpacaId(transfer_id),
@@ -6583,6 +7300,7 @@ mod tests {
         let events = TestHarness::<UsdcRebalance>::with(())
             .given(vec![
                 UsdcRebalanceEvent::Initiated {
+                    corridor: UsdcCorridor::BASE_CCTP,
                     direction: RebalanceDirection::AlpacaToBase,
                     amount: Usdc::new(float!(1000.00)),
                     withdrawal_ref: TransferRef::AlpacaId(transfer_id),
@@ -6637,6 +7355,7 @@ mod tests {
         let error = TestHarness::<UsdcRebalance>::with(())
             .given(vec![
                 UsdcRebalanceEvent::Initiated {
+                    corridor: UsdcCorridor::BASE_CCTP,
                     direction: RebalanceDirection::AlpacaToBase,
                     amount: Usdc::new(float!(1000.00)),
                     withdrawal_ref: TransferRef::AlpacaId(transfer_id),
@@ -6688,6 +7407,7 @@ mod tests {
         let events = TestHarness::<UsdcRebalance>::with(())
             .given(vec![
                 UsdcRebalanceEvent::Initiated {
+                    corridor: UsdcCorridor::BASE_CCTP,
                     direction: RebalanceDirection::BaseToAlpaca,
                     amount: Usdc::new(float!(500.00)),
                     withdrawal_ref: TransferRef::AlpacaId(transfer_id),
@@ -6754,6 +7474,7 @@ mod tests {
         let events = TestHarness::<UsdcRebalance>::with(())
             .given(vec![
                 UsdcRebalanceEvent::Initiated {
+                    corridor: UsdcCorridor::BASE_CCTP,
                     direction: RebalanceDirection::AlpacaToBase,
                     amount: Usdc::new(float!(1000.00)),
                     withdrawal_ref: TransferRef::AlpacaId(transfer_id),
@@ -6816,6 +7537,7 @@ mod tests {
         let events = TestHarness::<UsdcRebalance>::with(())
             .given(vec![
                 UsdcRebalanceEvent::Initiated {
+                    corridor: UsdcCorridor::BASE_CCTP,
                     direction: RebalanceDirection::AlpacaToBase,
                     amount: Usdc::new(float!(10000.00)),
                     withdrawal_ref: TransferRef::AlpacaId(transfer_id),
@@ -6871,6 +7593,7 @@ mod tests {
         let events = TestHarness::<UsdcRebalance>::with(())
             .given(vec![
                 UsdcRebalanceEvent::Initiated {
+                    corridor: UsdcCorridor::BASE_CCTP,
                     direction: RebalanceDirection::BaseToAlpaca,
                     amount: Usdc::new(float!(5000.00)),
                     withdrawal_ref: TransferRef::OnchainTx(withdrawal_tx),
@@ -6918,6 +7641,7 @@ mod tests {
         let error = TestHarness::<UsdcRebalance>::with(())
             .given(vec![
                 UsdcRebalanceEvent::Initiated {
+                    corridor: UsdcCorridor::BASE_CCTP,
                     direction: RebalanceDirection::AlpacaToBase,
                     amount: Usdc::new(float!(100.00)),
                     withdrawal_ref: TransferRef::AlpacaId(AlpacaTransferId::from(Uuid::new_v4())),
@@ -6948,6 +7672,7 @@ mod tests {
         let error = TestHarness::<UsdcRebalance>::with(())
             .given(vec![
                 UsdcRebalanceEvent::Initiated {
+                    corridor: UsdcCorridor::BASE_CCTP,
                     direction: RebalanceDirection::AlpacaToBase,
                     amount: Usdc::new(float!(100.00)),
                     withdrawal_ref: TransferRef::AlpacaId(AlpacaTransferId::from(Uuid::new_v4())),
@@ -6976,6 +7701,7 @@ mod tests {
         let error = TestHarness::<UsdcRebalance>::with(())
             .given(vec![
                 UsdcRebalanceEvent::Initiated {
+                    corridor: UsdcCorridor::BASE_CCTP,
                     direction: RebalanceDirection::AlpacaToBase,
                     amount: Usdc::new(float!(100.00)),
                     withdrawal_ref: TransferRef::AlpacaId(AlpacaTransferId::from(Uuid::new_v4())),
@@ -7021,6 +7747,7 @@ mod tests {
         let error = TestHarness::<UsdcRebalance>::with(())
             .given(vec![
                 UsdcRebalanceEvent::Initiated {
+                    corridor: UsdcCorridor::BASE_CCTP,
                     direction: RebalanceDirection::AlpacaToBase,
                     amount: Usdc::new(float!(100.00)),
                     withdrawal_ref: TransferRef::AlpacaId(AlpacaTransferId::from(Uuid::new_v4())),
@@ -7068,6 +7795,7 @@ mod tests {
         // landed: RecoverBridging un-fails it back to Bridged.
         let history = vec![
             UsdcRebalanceEvent::Initiated {
+                corridor: UsdcCorridor::BASE_CCTP,
                 direction: RebalanceDirection::BaseToAlpaca,
                 amount: Usdc::new(float!(100.00)),
                 withdrawal_ref: TransferRef::OnchainTx(burn_tx),
@@ -7147,6 +7875,7 @@ mod tests {
         let error = TestHarness::<UsdcRebalance>::with(())
             .given(vec![
                 UsdcRebalanceEvent::Initiated {
+                    corridor: UsdcCorridor::BASE_CCTP,
                     direction: RebalanceDirection::BaseToAlpaca,
                     amount: Usdc::new(float!(100.00)),
                     withdrawal_ref: TransferRef::OnchainTx(fixed_bytes!(
@@ -7190,6 +7919,7 @@ mod tests {
         let error = TestHarness::<UsdcRebalance>::with(())
             .given(vec![
                 UsdcRebalanceEvent::Initiated {
+                    corridor: UsdcCorridor::BASE_CCTP,
                     direction: RebalanceDirection::BaseToAlpaca,
                     amount: Usdc::new(float!(100.00)),
                     withdrawal_ref: TransferRef::OnchainTx(fixed_bytes!(
@@ -7283,6 +8013,7 @@ mod tests {
             &mut history,
             |event| matches!(event, UsdcRebalanceEvent::Initiated { .. }),
             UsdcRebalanceEvent::Initiated {
+                corridor: UsdcCorridor::BASE_CCTP,
                 direction: RebalanceDirection::AlpacaToBase,
                 amount: Usdc::new(float!(100.00)),
                 withdrawal_ref: TransferRef::AlpacaId(AlpacaTransferId::from(Uuid::new_v4())),
@@ -7461,6 +8192,7 @@ mod tests {
 
         vec![
             UsdcRebalanceEvent::Initiated {
+                corridor: UsdcCorridor::BASE_CCTP,
                 direction: RebalanceDirection::BaseToAlpaca,
                 amount: Usdc::new(float!(100.00)),
                 withdrawal_ref: TransferRef::OnchainTx(burn_tx),
@@ -7513,6 +8245,7 @@ mod tests {
 
         vec![
             UsdcRebalanceEvent::Initiated {
+                corridor: UsdcCorridor::BASE_CCTP,
                 direction: RebalanceDirection::BaseToAlpaca,
                 amount: Usdc::new(float!(100.00)),
                 withdrawal_ref: TransferRef::OnchainTx(burn_tx),
@@ -7546,6 +8279,7 @@ mod tests {
 
         vec![
             UsdcRebalanceEvent::Initiated {
+                corridor: UsdcCorridor::BASE_CCTP,
                 direction: RebalanceDirection::BaseToAlpaca,
                 amount: Usdc::new(float!(100.00)),
                 withdrawal_ref: TransferRef::OnchainTx(burn_tx),
@@ -7581,6 +8315,7 @@ mod tests {
                 deposit_confirmed_at: Utc::now(),
             },
             UsdcRebalanceEvent::ConversionInitiated {
+                corridor: UsdcCorridor::BASE_CCTP,
                 direction: RebalanceDirection::BaseToAlpaca,
                 amount: Usdc::new(float!(99.99)),
                 order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
@@ -7680,6 +8415,7 @@ mod tests {
 
         vec![
             UsdcRebalanceEvent::ConversionInitiated {
+                corridor: UsdcCorridor::BASE_CCTP,
                 direction: RebalanceDirection::AlpacaToBase,
                 amount,
                 order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
@@ -7691,6 +8427,7 @@ mod tests {
                 converted_at: Utc::now(),
             },
             UsdcRebalanceEvent::Initiated {
+                corridor: UsdcCorridor::BASE_CCTP,
                 direction: RebalanceDirection::AlpacaToBase,
                 amount,
                 withdrawal_ref: TransferRef::AlpacaId(AlpacaTransferId::from(Uuid::new_v4())),
@@ -7812,6 +8549,7 @@ mod tests {
     #[test]
     fn reconciled_does_not_hold_rebalance_guard() {
         let reconciled = UsdcRebalance::Reconciled {
+            corridor: UsdcCorridor::BASE_CCTP,
             direction: RebalanceDirection::BaseToAlpaca,
             amount: Usdc::new(float!(100.00)),
             reason: ReconcileReason::FundsMovedManually,
@@ -7828,6 +8566,7 @@ mod tests {
     #[test]
     fn reconciled_direction_reads_persisted_direction() {
         let reconciled = UsdcRebalance::Reconciled {
+            corridor: UsdcCorridor::BASE_CCTP,
             direction: RebalanceDirection::AlpacaToBase,
             amount: Usdc::new(float!(100.00)),
             reason: ReconcileReason::DepositCreditedOffline,
@@ -7922,6 +8661,7 @@ mod tests {
         let error = TestHarness::<UsdcRebalance>::with(())
             .given(vec![
                 UsdcRebalanceEvent::Initiated {
+                    corridor: UsdcCorridor::BASE_CCTP,
                     direction: RebalanceDirection::BaseToAlpaca,
                     amount: Usdc::new(float!(100.00)),
                     withdrawal_ref: TransferRef::OnchainTx(burn_tx),
@@ -7971,6 +8711,7 @@ mod tests {
         let error = TestHarness::<UsdcRebalance>::with(())
             .given(vec![
                 UsdcRebalanceEvent::Initiated {
+                    corridor: UsdcCorridor::BASE_CCTP,
                     direction: RebalanceDirection::BaseToAlpaca,
                     amount: Usdc::new(float!(100.00)),
                     withdrawal_ref: TransferRef::OnchainTx(burn_tx),
@@ -8018,6 +8759,7 @@ mod tests {
     async fn reconcile_stuck_rebalance_rejected_from_initiated() {
         let error = TestHarness::<UsdcRebalance>::with(())
             .given(vec![UsdcRebalanceEvent::Initiated {
+                corridor: UsdcCorridor::BASE_CCTP,
                 direction: RebalanceDirection::BaseToAlpaca,
                 amount: Usdc::new(float!(100.00)),
                 withdrawal_ref: TransferRef::OnchainTx(fixed_bytes!(
@@ -8074,6 +8816,7 @@ mod tests {
         let error = TestHarness::<UsdcRebalance>::with(())
             .given(vec![
                 UsdcRebalanceEvent::Initiated {
+                    corridor: UsdcCorridor::BASE_CCTP,
                     direction: RebalanceDirection::BaseToAlpaca,
                     amount: Usdc::new(float!(100.00)),
                     withdrawal_ref: TransferRef::OnchainTx(burn_tx),
@@ -8110,6 +8853,7 @@ mod tests {
         let error = TestHarness::<UsdcRebalance>::with(())
             .given(vec![
                 UsdcRebalanceEvent::ConversionInitiated {
+                    corridor: UsdcCorridor::BASE_CCTP,
                     direction: RebalanceDirection::AlpacaToBase,
                     amount: Usdc::new(float!(100.00)),
                     order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
@@ -8142,6 +8886,7 @@ mod tests {
         let error = TestHarness::<UsdcRebalance>::with(())
             .given(vec![
                 UsdcRebalanceEvent::Initiated {
+                    corridor: UsdcCorridor::BASE_CCTP,
                     direction: RebalanceDirection::AlpacaToBase,
                     amount: Usdc::new(float!(100.00)),
                     withdrawal_ref: TransferRef::AlpacaId(AlpacaTransferId::from(Uuid::new_v4())),
@@ -8198,6 +8943,7 @@ mod tests {
         let error = TestHarness::<UsdcRebalance>::with(())
             .given(vec![
                 UsdcRebalanceEvent::Initiated {
+                    corridor: UsdcCorridor::BASE_CCTP,
                     direction: RebalanceDirection::AlpacaToBase,
                     amount: Usdc::new(float!(100.00)),
                     withdrawal_ref: TransferRef::AlpacaId(AlpacaTransferId::from(Uuid::new_v4())),
@@ -8234,6 +8980,7 @@ mod tests {
                 },
             ])
             .when(UsdcRebalanceCommand::Initiate {
+                corridor: UsdcCorridor::BASE_CCTP,
                 direction: RebalanceDirection::AlpacaToBase,
                 amount: Usdc::new(float!(100.00)),
                 withdrawal: TransferRef::AlpacaId(AlpacaTransferId::from(Uuid::new_v4())),
@@ -8257,6 +9004,7 @@ mod tests {
         let error = TestHarness::<UsdcRebalance>::with(())
             .given(vec![
                 UsdcRebalanceEvent::Initiated {
+                    corridor: UsdcCorridor::BASE_CCTP,
                     direction: RebalanceDirection::AlpacaToBase,
                     amount: Usdc::new(float!(100.00)),
                     withdrawal_ref: TransferRef::AlpacaId(AlpacaTransferId::from(Uuid::new_v4())),
@@ -8309,6 +9057,7 @@ mod tests {
         let events = TestHarness::<UsdcRebalance>::with(())
             .given_no_previous_events()
             .when(UsdcRebalanceCommand::InitiateConversion {
+                corridor: UsdcCorridor::BASE_CCTP,
                 direction: RebalanceDirection::AlpacaToBase,
                 amount: Usdc::new(float!(1000.00)),
                 order_id: order_id.clone(),
@@ -8338,12 +9087,14 @@ mod tests {
 
         let error = TestHarness::<UsdcRebalance>::with(())
             .given(vec![UsdcRebalanceEvent::ConversionInitiated {
+                corridor: UsdcCorridor::BASE_CCTP,
                 direction: RebalanceDirection::AlpacaToBase,
                 amount: Usdc::new(float!(1000.00)),
                 order_id,
                 initiated_at: Utc::now(),
             }])
             .when(UsdcRebalanceCommand::InitiateConversion {
+                corridor: UsdcCorridor::BASE_CCTP,
                 direction: RebalanceDirection::AlpacaToBase,
                 amount: Usdc::new(float!(500.00)),
                 order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
@@ -8364,6 +9115,7 @@ mod tests {
 
         let events = TestHarness::<UsdcRebalance>::with(())
             .given(vec![UsdcRebalanceEvent::ConversionInitiated {
+                corridor: UsdcCorridor::BASE_CCTP,
                 direction: RebalanceDirection::AlpacaToBase,
                 amount: Usdc::new(float!(1000.00)),
                 order_id,
@@ -8403,6 +9155,7 @@ mod tests {
         let error = TestHarness::<UsdcRebalance>::with(())
             .given(vec![
                 UsdcRebalanceEvent::ConversionInitiated {
+                    corridor: UsdcCorridor::BASE_CCTP,
                     direction: RebalanceDirection::AlpacaToBase,
                     amount: Usdc::new(float!(1000.00)),
                     order_id,
@@ -8432,6 +9185,7 @@ mod tests {
 
         let events = TestHarness::<UsdcRebalance>::with(())
             .given(vec![UsdcRebalanceEvent::ConversionInitiated {
+                corridor: UsdcCorridor::BASE_CCTP,
                 direction: RebalanceDirection::AlpacaToBase,
                 amount: Usdc::new(float!(1000.00)),
                 order_id,
@@ -8473,6 +9227,7 @@ mod tests {
         let error = TestHarness::<UsdcRebalance>::with(())
             .given(vec![
                 UsdcRebalanceEvent::ConversionInitiated {
+                    corridor: UsdcCorridor::BASE_CCTP,
                     direction: RebalanceDirection::AlpacaToBase,
                     amount: Usdc::new(float!(1000.00)),
                     order_id,
@@ -8505,6 +9260,7 @@ mod tests {
         let events = TestHarness::<UsdcRebalance>::with(())
             .given(vec![
                 UsdcRebalanceEvent::ConversionInitiated {
+                    corridor: UsdcCorridor::BASE_CCTP,
                     direction: RebalanceDirection::AlpacaToBase,
                     amount: Usdc::new(float!(1000.00)),
                     order_id,
@@ -8517,6 +9273,7 @@ mod tests {
                 },
             ])
             .when(UsdcRebalanceCommand::Initiate {
+                corridor: UsdcCorridor::BASE_CCTP,
                 direction: RebalanceDirection::AlpacaToBase,
                 amount: received_amount,
                 withdrawal: TransferRef::AlpacaId(transfer_id),
@@ -8537,6 +9294,7 @@ mod tests {
         let error = TestHarness::<UsdcRebalance>::with(())
             .given(vec![
                 UsdcRebalanceEvent::ConversionInitiated {
+                    corridor: UsdcCorridor::BASE_CCTP,
                     direction: RebalanceDirection::AlpacaToBase,
                     amount: Usdc::new(float!(1000.00)),
                     order_id,
@@ -8549,6 +9307,7 @@ mod tests {
                 },
             ])
             .when(UsdcRebalanceCommand::Initiate {
+                corridor: UsdcCorridor::BASE_CCTP,
                 direction: RebalanceDirection::AlpacaToBase,
                 amount: Usdc::new(float!(999.00)),
                 withdrawal: TransferRef::AlpacaId(transfer_id),
@@ -8577,6 +9336,7 @@ mod tests {
         let events = TestHarness::<UsdcRebalance>::with(())
             .given(vec![
                 UsdcRebalanceEvent::Initiated {
+                    corridor: UsdcCorridor::BASE_CCTP,
                     direction: RebalanceDirection::BaseToAlpaca,
                     amount: Usdc::new(float!(1000.00)),
                     withdrawal_ref: TransferRef::OnchainTx(burn_tx),
@@ -8646,6 +9406,7 @@ mod tests {
         let error = TestHarness::<UsdcRebalance>::with(())
             .given(vec![
                 UsdcRebalanceEvent::Initiated {
+                    corridor: UsdcCorridor::BASE_CCTP,
                     direction: RebalanceDirection::AlpacaToBase,
                     amount: Usdc::new(float!(1000.00)),
                     withdrawal_ref: TransferRef::AlpacaId(AlpacaTransferId::from(Uuid::new_v4())),
@@ -8721,6 +9482,7 @@ mod tests {
         let error = TestHarness::<UsdcRebalance>::with(())
             .given(vec![
                 UsdcRebalanceEvent::Initiated {
+                    corridor: UsdcCorridor::BASE_CCTP,
                     direction: RebalanceDirection::BaseToAlpaca,
                     amount: Usdc::new(float!(1000.00)),
                     withdrawal_ref: TransferRef::OnchainTx(burn_tx),
@@ -8786,6 +9548,7 @@ mod tests {
         let events = TestHarness::<UsdcRebalance>::with(())
             .given_no_previous_events()
             .when(UsdcRebalanceCommand::InitiateConversionAt {
+                corridor: UsdcCorridor::BASE_CCTP,
                 direction: RebalanceDirection::AlpacaToBase,
                 amount: Usdc::new(float!(1000.00)),
                 order_id,
@@ -8813,6 +9576,7 @@ mod tests {
 
         let events = TestHarness::<UsdcRebalance>::with(())
             .given(vec![UsdcRebalanceEvent::ConversionInitiated {
+                corridor: UsdcCorridor::BASE_CCTP,
                 direction: RebalanceDirection::AlpacaToBase,
                 amount: Usdc::new(float!(1000.00)),
                 order_id,
@@ -8847,6 +9611,7 @@ mod tests {
         let events = TestHarness::<UsdcRebalance>::with(())
             .given(vec![
                 UsdcRebalanceEvent::Initiated {
+                    corridor: UsdcCorridor::BASE_CCTP,
                     direction: RebalanceDirection::BaseToAlpaca,
                     amount: Usdc::new(float!(1000.00)),
                     withdrawal_ref: TransferRef::OnchainTx(burn_tx),
@@ -8908,6 +9673,7 @@ mod tests {
         let events = TestHarness::<UsdcRebalance>::with(())
             .given_no_previous_events()
             .when(UsdcRebalanceCommand::BeginWithdrawalAt {
+                corridor: UsdcCorridor::BASE_CCTP,
                 direction: RebalanceDirection::BaseToAlpaca,
                 amount: Usdc::new(float!(500.00)),
                 from_block: 42,
@@ -8934,12 +9700,14 @@ mod tests {
 
         let events = TestHarness::<UsdcRebalance>::with(())
             .given(vec![UsdcRebalanceEvent::WithdrawalSubmitting {
+                corridor: UsdcCorridor::BASE_CCTP,
                 direction: RebalanceDirection::BaseToAlpaca,
                 amount: Usdc::new(float!(500.00)),
                 from_block: 42,
                 submitting_at: Utc::now(),
             }])
             .when(UsdcRebalanceCommand::InitiateAt {
+                corridor: UsdcCorridor::BASE_CCTP,
                 direction: RebalanceDirection::BaseToAlpaca,
                 amount: Usdc::new(float!(500.00)),
                 withdrawal: TransferRef::AlpacaId(transfer_id),
@@ -8966,6 +9734,7 @@ mod tests {
 
         let events = TestHarness::<UsdcRebalance>::with(())
             .given(vec![UsdcRebalanceEvent::Initiated {
+                corridor: UsdcCorridor::BASE_CCTP,
                 direction: RebalanceDirection::BaseToAlpaca,
                 amount: Usdc::new(float!(500.00)),
                 withdrawal_ref: TransferRef::AlpacaId(transfer_id),
@@ -8997,6 +9766,7 @@ mod tests {
         let events = TestHarness::<UsdcRebalance>::with(())
             .given(vec![
                 UsdcRebalanceEvent::Initiated {
+                    corridor: UsdcCorridor::BASE_CCTP,
                     direction: RebalanceDirection::BaseToAlpaca,
                     amount: Usdc::new(float!(500.00)),
                     withdrawal_ref: TransferRef::AlpacaId(transfer_id),
@@ -9036,6 +9806,7 @@ mod tests {
         let events = TestHarness::<UsdcRebalance>::with(())
             .given(vec![
                 UsdcRebalanceEvent::Initiated {
+                    corridor: UsdcCorridor::BASE_CCTP,
                     direction: RebalanceDirection::BaseToAlpaca,
                     amount: Usdc::new(float!(500.00)),
                     withdrawal_ref: TransferRef::AlpacaId(transfer_id),
@@ -9071,6 +9842,7 @@ mod tests {
         let events = TestHarness::<UsdcRebalance>::with(())
             .given(vec![
                 UsdcRebalanceEvent::Initiated {
+                    corridor: UsdcCorridor::BASE_CCTP,
                     direction: RebalanceDirection::BaseToAlpaca,
                     amount: Usdc::new(float!(500.00)),
                     withdrawal_ref: TransferRef::AlpacaId(transfer_id),
@@ -9118,6 +9890,7 @@ mod tests {
         let events = TestHarness::<UsdcRebalance>::with(())
             .given(vec![
                 UsdcRebalanceEvent::Initiated {
+                    corridor: UsdcCorridor::BASE_CCTP,
                     direction: RebalanceDirection::BaseToAlpaca,
                     amount: Usdc::new(float!(500.00)),
                     withdrawal_ref: TransferRef::AlpacaId(transfer_id),
@@ -9171,6 +9944,7 @@ mod tests {
         let events = TestHarness::<UsdcRebalance>::with(())
             .given(vec![
                 UsdcRebalanceEvent::Initiated {
+                    corridor: UsdcCorridor::BASE_CCTP,
                     direction: RebalanceDirection::BaseToAlpaca,
                     amount: Usdc::new(float!(500.00)),
                     withdrawal_ref: TransferRef::AlpacaId(transfer_id),
@@ -9228,6 +10002,7 @@ mod tests {
         let events = TestHarness::<UsdcRebalance>::with(())
             .given(vec![
                 UsdcRebalanceEvent::Initiated {
+                    corridor: UsdcCorridor::BASE_CCTP,
                     direction: RebalanceDirection::BaseToAlpaca,
                     amount: Usdc::new(float!(500.00)),
                     withdrawal_ref: TransferRef::AlpacaId(transfer_id),
@@ -9287,6 +10062,7 @@ mod tests {
         let events = TestHarness::<UsdcRebalance>::with(())
             .given(vec![
                 UsdcRebalanceEvent::Initiated {
+                    corridor: UsdcCorridor::BASE_CCTP,
                     direction: RebalanceDirection::BaseToAlpaca,
                     amount: Usdc::new(float!(1000.00)),
                     withdrawal_ref: TransferRef::OnchainTx(burn_tx),
@@ -9322,6 +10098,7 @@ mod tests {
                     deposit_confirmed_at: Utc::now(),
                 },
                 UsdcRebalanceEvent::ConversionInitiated {
+                    corridor: UsdcCorridor::BASE_CCTP,
                     direction: RebalanceDirection::BaseToAlpaca,
                     amount: Usdc::new(float!(1000.00)),
                     order_id,
@@ -9357,6 +10134,7 @@ mod tests {
 
         let state = replay::<UsdcRebalance>(vec![
             UsdcRebalanceEvent::Initiated {
+                corridor: UsdcCorridor::BASE_CCTP,
                 direction: RebalanceDirection::BaseToAlpaca,
                 amount: Usdc::new(float!(1000.00)),
                 withdrawal_ref: TransferRef::OnchainTx(burn_tx),
@@ -9392,6 +10170,7 @@ mod tests {
                 deposit_confirmed_at,
             },
             UsdcRebalanceEvent::ConversionInitiated {
+                corridor: UsdcCorridor::BASE_CCTP,
                 direction: RebalanceDirection::BaseToAlpaca,
                 amount: Usdc::new(float!(999.99)),
                 order_id,
@@ -9432,6 +10211,7 @@ mod tests {
         let withdrawal_initiated_at = original_initiated_at + chrono::Duration::seconds(60);
         let state = replay::<UsdcRebalance>(vec![
             UsdcRebalanceEvent::ConversionInitiated {
+                corridor: UsdcCorridor::BASE_CCTP,
                 direction: RebalanceDirection::AlpacaToBase,
                 amount: Usdc::new(float!(1000.00)),
                 order_id,
@@ -9443,6 +10223,7 @@ mod tests {
                 converted_at: conversion_completed_at,
             },
             UsdcRebalanceEvent::Initiated {
+                corridor: UsdcCorridor::BASE_CCTP,
                 direction: RebalanceDirection::AlpacaToBase,
                 amount: Usdc::new(float!(999.99)),
                 withdrawal_ref: TransferRef::AlpacaId(AlpacaTransferId::from(Uuid::new_v4())),
@@ -9487,12 +10268,14 @@ mod tests {
     fn conversion_initiated_on_withdrawing_produces_failed_state() {
         let error = replay::<UsdcRebalance>(vec![
             UsdcRebalanceEvent::Initiated {
+                corridor: UsdcCorridor::BASE_CCTP,
                 direction: RebalanceDirection::AlpacaToBase,
                 amount: Usdc::new(float!(1000.00)),
                 withdrawal_ref: TransferRef::AlpacaId(AlpacaTransferId::from(Uuid::new_v4())),
                 initiated_at: Utc::now(),
             },
             UsdcRebalanceEvent::ConversionInitiated {
+                corridor: UsdcCorridor::BASE_CCTP,
                 direction: RebalanceDirection::AlpacaToBase,
                 amount: Usdc::new(float!(1000.00)),
                 order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
@@ -9509,6 +10292,7 @@ mod tests {
         let id = UsdcRebalanceId(Uuid::new_v4());
         let initiated_at = Utc::now();
         let state = UsdcRebalance::Converting {
+            corridor: UsdcCorridor::BASE_CCTP,
             direction: RebalanceDirection::AlpacaToBase,
             amount: Usdc::new(float!(500)),
             order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
@@ -9540,6 +10324,7 @@ mod tests {
         let burn_tx =
             fixed_bytes!("0x0000000000000000000000000000000000000000000000000000000000000002");
         let state = UsdcRebalance::Bridging {
+            corridor: UsdcCorridor::BASE_CCTP,
             direction: RebalanceDirection::BaseToAlpaca,
             amount: Usdc::new(float!(2000)),
             burn_tx_hash: burn_tx,
@@ -9568,6 +10353,7 @@ mod tests {
         let initiated_at = Utc::now();
         let timed_out_at = initiated_at + chrono::Duration::minutes(5);
         let state = UsdcRebalance::AwaitingAttestation {
+            corridor: UsdcCorridor::BASE_CCTP,
             direction: RebalanceDirection::BaseToAlpaca,
             amount: Usdc::new(float!(2000)),
             burn_tx_hash: BURN_TX,
@@ -9596,6 +10382,7 @@ mod tests {
         let mint_tx =
             fixed_bytes!("0x0000000000000000000000000000000000000000000000000000000000000004");
         let state = UsdcRebalance::DepositConfirmed {
+            corridor: UsdcCorridor::BASE_CCTP,
             direction: RebalanceDirection::AlpacaToBase,
             amount: Usdc::new(float!(1000)),
             burn_tx_hash: burn_tx,
@@ -9627,6 +10414,7 @@ mod tests {
         let mint_tx =
             fixed_bytes!("0x0000000000000000000000000000000000000000000000000000000000000004");
         let state = UsdcRebalance::DepositConfirmed {
+            corridor: UsdcCorridor::BASE_CCTP,
             direction: RebalanceDirection::BaseToAlpaca,
             amount: Usdc::new(float!(1000)),
             burn_tx_hash: burn_tx,
@@ -9651,6 +10439,7 @@ mod tests {
         let initiated_at = Utc::now();
         let converted_at = initiated_at + chrono::Duration::seconds(30);
         let state = UsdcRebalance::ConversionComplete {
+            corridor: UsdcCorridor::BASE_CCTP,
             direction: RebalanceDirection::AlpacaToBase,
             amount: Usdc::new(float!(500)),
             conversion: conversion(Usdc::new(float!(500)), Usdc::new(float!(499))),
@@ -9675,6 +10464,7 @@ mod tests {
         let initiated_at = Utc::now();
         let converted_at = initiated_at + chrono::Duration::seconds(30);
         let state = UsdcRebalance::ConversionComplete {
+            corridor: UsdcCorridor::BASE_CCTP,
             direction: RebalanceDirection::BaseToAlpaca,
             amount: Usdc::new(float!(500)),
             conversion: conversion(Usdc::new(float!(500)), Usdc::new(float!(499))),
@@ -9706,6 +10496,7 @@ mod tests {
         let mint_tx =
             fixed_bytes!("0x0000000000000000000000000000000000000000000000000000000000000006");
         let state = UsdcRebalance::DepositFailed {
+            corridor: UsdcCorridor::BASE_CCTP,
             direction: RebalanceDirection::BaseToAlpaca,
             amount: Usdc::new(float!(750)),
             burn_tx_hash: burn_tx,
@@ -9738,6 +10529,7 @@ mod tests {
         let initiated_at = Utc::now();
         let failed_at = initiated_at + chrono::Duration::seconds(60);
         let state = UsdcRebalance::WithdrawalFailed {
+            corridor: UsdcCorridor::BASE_CCTP,
             direction: RebalanceDirection::AlpacaToBase,
             amount: Usdc::new(float!(750)),
             withdrawal_ref: TransferRef::AlpacaId(AlpacaTransferId::from(Uuid::new_v4())),
@@ -9772,6 +10564,7 @@ mod tests {
         let burn_tx =
             fixed_bytes!("0x0000000000000000000000000000000000000000000000000000000000000007");
         let state = UsdcRebalance::BridgingFailed {
+            corridor: UsdcCorridor::BASE_CCTP,
             direction: RebalanceDirection::BaseToAlpaca,
             amount: Usdc::new(float!(750)),
             burn_tx_hash: Some(burn_tx),
@@ -9805,6 +10598,7 @@ mod tests {
         let initiated_at = Utc::now();
         let failed_at = initiated_at + chrono::Duration::seconds(60);
         let state = UsdcRebalance::BridgingFailed {
+            corridor: UsdcCorridor::BASE_CCTP,
             direction: RebalanceDirection::BaseToAlpaca,
             amount: Usdc::new(float!(750)),
             burn_tx_hash: None,
@@ -9838,6 +10632,7 @@ mod tests {
         let initiated_at = Utc::now();
         let failed_at = initiated_at + chrono::Duration::seconds(60);
         let state = UsdcRebalance::BridgingFailed {
+            corridor: UsdcCorridor::BASE_CCTP,
             direction: RebalanceDirection::AlpacaToBase,
             amount: Usdc::new(float!(750)),
             burn_tx_hash: None,
@@ -9873,6 +10668,7 @@ mod tests {
         let initiated_at = Utc::now();
         let failed_at = initiated_at + chrono::Duration::seconds(60);
         let state = UsdcRebalance::ConversionFailed {
+            corridor: UsdcCorridor::BASE_CCTP,
             direction: RebalanceDirection::BaseToAlpaca,
             amount: Usdc::new(float!(750)),
             order_id: ClientOrderId::from_uuid(Uuid::from_u128(13)),
@@ -9905,6 +10701,7 @@ mod tests {
         let initiated_at = Utc::now();
         let failed_at = initiated_at + chrono::Duration::seconds(60);
         let state = UsdcRebalance::ConversionFailed {
+            corridor: UsdcCorridor::BASE_CCTP,
             direction: RebalanceDirection::AlpacaToBase,
             amount: Usdc::new(float!(750)),
             order_id: ClientOrderId::from_uuid(Uuid::from_u128(14)),
@@ -9937,6 +10734,7 @@ mod tests {
         let initiated_at = "2026-01-01T00:00:00Z".parse::<DateTime<Utc>>().unwrap();
         let reconciled_at = "2026-01-02T00:00:00Z".parse::<DateTime<Utc>>().unwrap();
         let state = UsdcRebalance::Reconciled {
+            corridor: UsdcCorridor::BASE_CCTP,
             direction: RebalanceDirection::BaseToAlpaca,
             amount: Usdc::new(float!(750)),
             reason: ReconcileReason::FundsMovedManually,
@@ -9977,6 +10775,7 @@ mod tests {
         let id = UsdcRebalanceId(Uuid::new_v4());
         let initiated_at = Utc::now();
         let state = UsdcRebalance::Withdrawing {
+            corridor: UsdcCorridor::BASE_CCTP,
             direction: RebalanceDirection::AlpacaToBase,
             amount: Usdc::new(float!(1000)),
             withdrawal_ref: TransferRef::AlpacaId(AlpacaTransferId::from(Uuid::new_v4())),
@@ -10004,6 +10803,7 @@ mod tests {
         let initiated_at = Utc::now();
         let confirmed_at = initiated_at + chrono::Duration::seconds(45);
         let state = UsdcRebalance::WithdrawalComplete {
+            corridor: UsdcCorridor::BASE_CCTP,
             direction: RebalanceDirection::AlpacaToBase,
             amount: Usdc::new(float!(800)),
             initiated_at,
@@ -10031,6 +10831,7 @@ mod tests {
         let burn_tx =
             fixed_bytes!("0x0000000000000000000000000000000000000000000000000000000000000007");
         let state = UsdcRebalance::Attested {
+            corridor: UsdcCorridor::BASE_CCTP,
             direction: RebalanceDirection::BaseToAlpaca,
             amount: Usdc::new(float!(1500)),
             burn_tx_hash: burn_tx,
@@ -10067,6 +10868,7 @@ mod tests {
         let mint_tx =
             fixed_bytes!("0x0000000000000000000000000000000000000000000000000000000000000009");
         let state = UsdcRebalance::Bridged {
+            corridor: UsdcCorridor::BASE_CCTP,
             direction: RebalanceDirection::AlpacaToBase,
             amount: Usdc::new(float!(2000)),
             amount_received: Usdc::new(float!(1998)),
@@ -10075,6 +10877,7 @@ mod tests {
             mint_tx_hash: mint_tx,
             initiated_at,
             minted_at,
+            deposit_send: DepositSend::NotStarted,
         };
 
         let dto = state.to_dto(&id);
@@ -10102,6 +10905,7 @@ mod tests {
         let mint_tx =
             fixed_bytes!("0x000000000000000000000000000000000000000000000000000000000000000b");
         let state = UsdcRebalance::DepositInitiated {
+            corridor: UsdcCorridor::BASE_CCTP,
             direction: RebalanceDirection::BaseToAlpaca,
             amount: Usdc::new(float!(3000)),
             burn_tx_hash: burn_tx,
@@ -10145,6 +10949,7 @@ mod tests {
         let amount = Usdc::new(float!(100));
         let credited = Usdc::new(float!(99.99));
         let burn_intent = |direction, pending_burn_tx| BridgingSubmitting {
+            corridor: UsdcCorridor::BASE_CCTP,
             direction,
             amount,
             from_block: 1,
@@ -10153,6 +10958,7 @@ mod tests {
             pending_burn_tx,
         };
         let minted = |direction| Bridged {
+            corridor: UsdcCorridor::BASE_CCTP,
             direction,
             amount,
             amount_received: credited,
@@ -10161,6 +10967,7 @@ mod tests {
             mint_tx_hash: MINT_TX,
             initiated_at: now,
             minted_at: now,
+            deposit_send: DepositSend::NotStarted,
         };
 
         assert_eq!(
@@ -10180,7 +10987,29 @@ mod tests {
             Some(EthereumWalletCredit::Held(credited))
         );
         assert_eq!(minted(AlpacaToBase).ethereum_wallet_credit(), None);
+        // A signed deposit send may already have left the wallet.
+        let sending = |deposit_send| Bridged {
+            corridor: UsdcCorridor::BASE_CCTP,
+            direction: BaseToAlpaca,
+            amount,
+            amount_received: credited,
+            fee_collected: Usdc::new(float!(0.01)),
+            burn_tx_hash: BURN_TX,
+            mint_tx_hash: MINT_TX,
+            initiated_at: now,
+            minted_at: now,
+            deposit_send,
+        };
+        assert_eq!(
+            sending(DepositSend::Prepared {
+                prepared: PreparedTransaction::for_test(BURN_TX, 0),
+                prepared_at: now,
+            })
+            .ethereum_wallet_credit(),
+            Some(EthereumWalletCredit::InFlight(credited))
+        );
         let withdrawn = |withdrawal_tx| WithdrawalComplete {
+            corridor: UsdcCorridor::BASE_CCTP,
             direction: AlpacaToBase,
             amount,
             initiated_at: now,
@@ -10198,6 +11027,7 @@ mod tests {
         assert_eq!(withdrawn(None).ethereum_wallet_credit(), None);
         assert_eq!(
             DepositInitiated {
+                corridor: UsdcCorridor::BASE_CCTP,
                 direction: BaseToAlpaca,
                 amount,
                 burn_tx_hash: BURN_TX,
@@ -10224,6 +11054,7 @@ mod tests {
         // In-progress states hold the guard, pre- and post-burn, both directions.
         assert!(
             Converting {
+                corridor: UsdcCorridor::BASE_CCTP,
                 direction: AlpacaToBase,
                 amount,
                 order_id,
@@ -10233,6 +11064,7 @@ mod tests {
         );
         assert!(
             Withdrawing {
+                corridor: UsdcCorridor::BASE_CCTP,
                 direction: BaseToAlpaca,
                 amount,
                 withdrawal_ref: withdrawal_ref.clone(),
@@ -10242,6 +11074,7 @@ mod tests {
         );
         assert!(
             WithdrawalComplete {
+                corridor: UsdcCorridor::BASE_CCTP,
                 direction: AlpacaToBase,
                 amount,
                 initiated_at: now,
@@ -10253,6 +11086,7 @@ mod tests {
         );
         assert!(
             Bridging {
+                corridor: UsdcCorridor::BASE_CCTP,
                 direction: BaseToAlpaca,
                 amount,
                 burn_tx_hash: BURN_TX,
@@ -10263,6 +11097,7 @@ mod tests {
         );
         assert!(
             AwaitingAttestation {
+                corridor: UsdcCorridor::BASE_CCTP,
                 direction: BaseToAlpaca,
                 amount,
                 burn_tx_hash: BURN_TX,
@@ -10274,6 +11109,7 @@ mod tests {
         );
         assert!(
             Attested {
+                corridor: UsdcCorridor::BASE_CCTP,
                 direction: AlpacaToBase,
                 amount,
                 burn_tx_hash: BURN_TX,
@@ -10288,6 +11124,7 @@ mod tests {
         );
         assert!(
             Bridged {
+                corridor: UsdcCorridor::BASE_CCTP,
                 direction: BaseToAlpaca,
                 amount,
                 amount_received: amount,
@@ -10296,11 +11133,13 @@ mod tests {
                 mint_tx_hash: MINT_TX,
                 initiated_at: now,
                 minted_at: now,
+                deposit_send: DepositSend::NotStarted,
             }
             .holds_rebalance_guard()
         );
         assert!(
             DepositInitiated {
+                corridor: UsdcCorridor::BASE_CCTP,
                 direction: AlpacaToBase,
                 amount,
                 burn_tx_hash: BURN_TX,
@@ -10314,6 +11153,7 @@ mod tests {
         // Deposit failure is post-burn/post-mint -> holds the guard.
         assert!(
             DepositFailed {
+                corridor: UsdcCorridor::BASE_CCTP,
                 direction: BaseToAlpaca,
                 amount,
                 burn_tx_hash: BURN_TX,
@@ -10332,6 +11172,7 @@ mod tests {
         // terminal); a fresh transfer must not start until reconcile.
         assert!(
             BridgingFailed {
+                corridor: UsdcCorridor::BASE_CCTP,
                 direction: AlpacaToBase,
                 amount,
                 burn_tx_hash: Some(BURN_TX),
@@ -10344,6 +11185,7 @@ mod tests {
         );
         assert!(
             BridgingFailed {
+                corridor: UsdcCorridor::BASE_CCTP,
                 direction: AlpacaToBase,
                 amount,
                 burn_tx_hash: None,
@@ -10369,6 +11211,7 @@ mod tests {
         // in progress); BaseToAlpaca is the post-deposit terminal success.
         assert!(
             ConversionComplete {
+                corridor: UsdcCorridor::BASE_CCTP,
                 direction: AlpacaToBase,
                 amount,
                 conversion: par_conversion(amount),
@@ -10379,6 +11222,7 @@ mod tests {
         );
         assert!(
             !ConversionComplete {
+                corridor: UsdcCorridor::BASE_CCTP,
                 direction: BaseToAlpaca,
                 amount,
                 conversion: par_conversion(amount),
@@ -10392,6 +11236,7 @@ mod tests {
         // post-deposit USDC->USD conversion ahead.
         assert!(
             !DepositConfirmed {
+                corridor: UsdcCorridor::BASE_CCTP,
                 direction: AlpacaToBase,
                 amount,
                 burn_tx_hash: BURN_TX,
@@ -10403,6 +11248,7 @@ mod tests {
         );
         assert!(
             DepositConfirmed {
+                corridor: UsdcCorridor::BASE_CCTP,
                 direction: BaseToAlpaca,
                 amount,
                 burn_tx_hash: BURN_TX,
@@ -10418,6 +11264,7 @@ mod tests {
         // conversion is post-mint (hold).
         assert!(
             !ConversionFailed {
+                corridor: UsdcCorridor::BASE_CCTP,
                 direction: AlpacaToBase,
                 amount,
                 order_id: order_id.clone(),
@@ -10429,6 +11276,7 @@ mod tests {
         );
         assert!(
             ConversionFailed {
+                corridor: UsdcCorridor::BASE_CCTP,
                 direction: BaseToAlpaca,
                 amount,
                 order_id,
@@ -10441,6 +11289,7 @@ mod tests {
         // Withdrawal failure is always pre-burn -> clears.
         assert!(
             !WithdrawalFailed {
+                corridor: UsdcCorridor::BASE_CCTP,
                 direction: BaseToAlpaca,
                 amount,
                 withdrawal_ref: TransferRef::OnchainTx(BURN_TX),
@@ -10466,6 +11315,7 @@ mod tests {
         let withdrawal_ref = TransferRef::OnchainTx(BURN_TX);
 
         let deposit_failed_bta = DepositFailed {
+            corridor: UsdcCorridor::BASE_CCTP,
             direction: BaseToAlpaca,
             amount,
             burn_tx_hash: BURN_TX,
@@ -10485,6 +11335,7 @@ mod tests {
         assert_eq!(last_progress_at, now, "DepositFailed(BtA): timestamp");
 
         let deposit_failed_atb = DepositFailed {
+            corridor: UsdcCorridor::BASE_CCTP,
             direction: AlpacaToBase,
             amount,
             burn_tx_hash: BURN_TX,
@@ -10504,6 +11355,7 @@ mod tests {
         assert_eq!(last_progress_at, now, "DepositFailed(AtB): timestamp");
 
         let conversion_failed_bta = ConversionFailed {
+            corridor: UsdcCorridor::BASE_CCTP,
             direction: BaseToAlpaca,
             amount,
             order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
@@ -10521,6 +11373,7 @@ mod tests {
         assert_eq!(last_progress_at, now, "ConversionFailed(BtA): timestamp");
 
         let bridging_failed_atb = BridgingFailed {
+            corridor: UsdcCorridor::BASE_CCTP,
             direction: AlpacaToBase,
             amount,
             burn_tx_hash: Some(BURN_TX),
@@ -10560,6 +11413,7 @@ mod tests {
         // Guard-holding in-progress states: self-recover via reactor/apalis.
         assert_eq!(
             Converting {
+                corridor: UsdcCorridor::BASE_CCTP,
                 direction: AlpacaToBase,
                 amount,
                 order_id: order_id.clone(),
@@ -10571,6 +11425,7 @@ mod tests {
         );
         assert_eq!(
             Converting {
+                corridor: UsdcCorridor::BASE_CCTP,
                 direction: BaseToAlpaca,
                 amount,
                 order_id: order_id.clone(),
@@ -10582,6 +11437,7 @@ mod tests {
         );
         assert_eq!(
             Withdrawing {
+                corridor: UsdcCorridor::BASE_CCTP,
                 direction: BaseToAlpaca,
                 amount,
                 withdrawal_ref: withdrawal_ref.clone(),
@@ -10593,6 +11449,7 @@ mod tests {
         );
         assert_eq!(
             Bridging {
+                corridor: UsdcCorridor::BASE_CCTP,
                 direction: BaseToAlpaca,
                 amount,
                 burn_tx_hash: BURN_TX,
@@ -10605,6 +11462,7 @@ mod tests {
         );
         assert_eq!(
             Bridged {
+                corridor: UsdcCorridor::BASE_CCTP,
                 direction: BaseToAlpaca,
                 amount,
                 amount_received: amount,
@@ -10613,6 +11471,7 @@ mod tests {
                 mint_tx_hash: MINT_TX,
                 initiated_at: now,
                 minted_at: now,
+                deposit_send: DepositSend::NotStarted,
             }
             .guard_recovery_tracking_data(),
             None,
@@ -10620,6 +11479,7 @@ mod tests {
         );
         assert_eq!(
             DepositInitiated {
+                corridor: UsdcCorridor::BASE_CCTP,
                 direction: AlpacaToBase,
                 amount,
                 burn_tx_hash: BURN_TX,
@@ -10634,6 +11494,7 @@ mod tests {
         );
         assert_eq!(
             DepositConfirmed {
+                corridor: UsdcCorridor::BASE_CCTP,
                 direction: BaseToAlpaca,
                 amount,
                 burn_tx_hash: BURN_TX,
@@ -10648,6 +11509,7 @@ mod tests {
         // ConversionFailed(AlpacaToBase): pre-withdrawal leg, not guard-holding.
         assert_eq!(
             ConversionFailed {
+                corridor: UsdcCorridor::BASE_CCTP,
                 direction: AlpacaToBase,
                 amount,
                 order_id,
@@ -10663,6 +11525,7 @@ mod tests {
         // startup; seeding would wedge its DepositConfirmed path.
         assert_eq!(
             BridgingFailed {
+                corridor: UsdcCorridor::BASE_CCTP,
                 direction: BaseToAlpaca,
                 amount,
                 burn_tx_hash: Some(BURN_TX),
@@ -10678,6 +11541,7 @@ mod tests {
         // BridgingFailed(burn_tx=None): pre-burn, not guard-holding.
         assert_eq!(
             BridgingFailed {
+                corridor: UsdcCorridor::BASE_CCTP,
                 direction: BaseToAlpaca,
                 amount,
                 burn_tx_hash: None,
@@ -10695,6 +11559,7 @@ mod tests {
         // wedge their DepositConfirmed path.
         assert_eq!(
             ConversionComplete {
+                corridor: UsdcCorridor::BASE_CCTP,
                 direction: BaseToAlpaca,
                 amount,
                 conversion: par_conversion(amount),
@@ -10707,6 +11572,7 @@ mod tests {
         );
         assert_eq!(
             WithdrawalSubmitting {
+                corridor: UsdcCorridor::BASE_CCTP,
                 direction: BaseToAlpaca,
                 amount,
                 from_block: 1,
@@ -10718,6 +11584,7 @@ mod tests {
         );
         assert_eq!(
             WithdrawalComplete {
+                corridor: UsdcCorridor::BASE_CCTP,
                 direction: BaseToAlpaca,
                 amount,
                 initiated_at: now,
@@ -10731,6 +11598,7 @@ mod tests {
         );
         assert_eq!(
             BridgingSubmitting {
+                corridor: UsdcCorridor::BASE_CCTP,
                 direction: BaseToAlpaca,
                 amount,
                 from_block: 1,
@@ -10744,6 +11612,7 @@ mod tests {
         );
         assert_eq!(
             AwaitingAttestation {
+                corridor: UsdcCorridor::BASE_CCTP,
                 direction: BaseToAlpaca,
                 amount,
                 burn_tx_hash: BURN_TX,
@@ -10757,6 +11626,7 @@ mod tests {
         );
         assert_eq!(
             Attested {
+                corridor: UsdcCorridor::BASE_CCTP,
                 direction: BaseToAlpaca,
                 amount,
                 burn_tx_hash: BURN_TX,
@@ -10774,6 +11644,7 @@ mod tests {
         // Non-guard-holding terminal states.
         assert_eq!(
             Reconciled {
+                corridor: UsdcCorridor::BASE_CCTP,
                 direction: BaseToAlpaca,
                 amount,
                 reason: ReconcileReason::FundsMovedManually,
@@ -10787,6 +11658,7 @@ mod tests {
         );
         assert_eq!(
             WithdrawalFailed {
+                corridor: UsdcCorridor::BASE_CCTP,
                 direction: BaseToAlpaca,
                 amount,
                 withdrawal_ref,
@@ -10835,6 +11707,7 @@ mod tests {
             &store,
             vec![
                 UsdcRebalanceCommand::Initiate {
+                    corridor: UsdcCorridor::BASE_CCTP,
                     direction: RebalanceDirection::BaseToAlpaca,
                     amount: Usdc::new(float!(400.0)),
                     withdrawal: TransferRef::OnchainTx(BURN_TX),
@@ -10868,6 +11741,7 @@ mod tests {
             &store,
             vec![
                 UsdcRebalanceCommand::Initiate {
+                    corridor: UsdcCorridor::BASE_CCTP,
                     direction: RebalanceDirection::BaseToAlpaca,
                     amount: Usdc::new(float!(400.0)),
                     withdrawal: TransferRef::OnchainTx(BURN_TX),
@@ -10944,6 +11818,7 @@ mod tests {
         let holder_commands = || {
             vec![
                 UsdcRebalanceCommand::Initiate {
+                    corridor: UsdcCorridor::BASE_CCTP,
                     direction: RebalanceDirection::BaseToAlpaca,
                     amount: Usdc::new(float!(400.0)),
                     withdrawal: TransferRef::OnchainTx(BURN_TX),
@@ -10993,6 +11868,7 @@ mod tests {
             &store,
             vec![
                 UsdcRebalanceCommand::Initiate {
+                    corridor: UsdcCorridor::BASE_CCTP,
                     direction: RebalanceDirection::BaseToAlpaca,
                     amount,
                     withdrawal: TransferRef::OnchainTx(BURN_TX),
@@ -11009,6 +11885,7 @@ mod tests {
             &store,
             vec![
                 UsdcRebalanceCommand::Initiate {
+                    corridor: UsdcCorridor::BASE_CCTP,
                     direction: RebalanceDirection::BaseToAlpaca,
                     amount,
                     withdrawal: TransferRef::OnchainTx(BURN_TX),
@@ -11029,6 +11906,7 @@ mod tests {
             &store,
             vec![
                 UsdcRebalanceCommand::Initiate {
+                    corridor: UsdcCorridor::BASE_CCTP,
                     direction: RebalanceDirection::BaseToAlpaca,
                     amount,
                     withdrawal: TransferRef::OnchainTx(BURN_TX),
@@ -11051,6 +11929,7 @@ mod tests {
             &store,
             vec![
                 UsdcRebalanceCommand::Initiate {
+                    corridor: UsdcCorridor::BASE_CCTP,
                     direction: RebalanceDirection::BaseToAlpaca,
                     amount,
                     withdrawal: TransferRef::OnchainTx(BURN_TX),
@@ -11082,6 +11961,7 @@ mod tests {
             &store,
             vec![
                 UsdcRebalanceCommand::Initiate {
+                    corridor: UsdcCorridor::BASE_CCTP,
                     direction: RebalanceDirection::BaseToAlpaca,
                     amount,
                     withdrawal: TransferRef::OnchainTx(BURN_TX),
@@ -11120,6 +12000,7 @@ mod tests {
             &store,
             vec![
                 UsdcRebalanceCommand::Initiate {
+                    corridor: UsdcCorridor::BASE_CCTP,
                     direction: RebalanceDirection::BaseToAlpaca,
                     amount,
                     withdrawal: TransferRef::OnchainTx(BURN_TX),
@@ -11140,6 +12021,7 @@ mod tests {
         let withdrawing = seed_through(
             &store,
             vec![UsdcRebalanceCommand::Initiate {
+                corridor: UsdcCorridor::BASE_CCTP,
                 direction: RebalanceDirection::BaseToAlpaca,
                 amount,
                 withdrawal: TransferRef::OnchainTx(BURN_TX),
@@ -11179,6 +12061,7 @@ mod tests {
 
         let events = TestHarness::<UsdcRebalance>::with(())
             .given(vec![UsdcRebalanceEvent::Initiated {
+                corridor: UsdcCorridor::BASE_CCTP,
                 direction: RebalanceDirection::AlpacaToBase,
                 amount: Usdc::new(float!(100.00)),
                 withdrawal_ref: TransferRef::AlpacaId(transfer_id),
@@ -11198,6 +12081,7 @@ mod tests {
 
         let state = replay::<UsdcRebalance>(vec![
             UsdcRebalanceEvent::Initiated {
+                corridor: UsdcCorridor::BASE_CCTP,
                 direction: RebalanceDirection::AlpacaToBase,
                 amount: Usdc::new(float!(100.00)),
                 withdrawal_ref: TransferRef::AlpacaId(transfer_id),
@@ -11220,6 +12104,7 @@ mod tests {
 
         let events = TestHarness::<UsdcRebalance>::with(())
             .given(vec![UsdcRebalanceEvent::Initiated {
+                corridor: UsdcCorridor::BASE_CCTP,
                 direction: RebalanceDirection::BaseToAlpaca,
                 amount: Usdc::new(float!(100.00)),
                 withdrawal_ref: TransferRef::AlpacaId(transfer_id),
@@ -11239,6 +12124,7 @@ mod tests {
 
         let state = replay::<UsdcRebalance>(vec![
             UsdcRebalanceEvent::Initiated {
+                corridor: UsdcCorridor::BASE_CCTP,
                 direction: RebalanceDirection::BaseToAlpaca,
                 amount: Usdc::new(float!(100.00)),
                 withdrawal_ref: TransferRef::AlpacaId(transfer_id),
@@ -11285,6 +12171,7 @@ mod tests {
         let tx_hash =
             fixed_bytes!("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
         let mut snapshot = to_value(UsdcRebalance::WithdrawalComplete {
+            corridor: UsdcCorridor::BASE_CCTP,
             direction: RebalanceDirection::AlpacaToBase,
             amount: Usdc::new(float!(100.00)),
             initiated_at: Utc::now(),
@@ -11369,6 +12256,7 @@ mod tests {
     #[test]
     fn bridging_submitting_snapshot_without_burn_amount_deserializes_to_none() {
         let mut snapshot = to_value(UsdcRebalance::BridgingSubmitting {
+            corridor: UsdcCorridor::BASE_CCTP,
             direction: RebalanceDirection::AlpacaToBase,
             amount: Usdc::new(float!(100.00)),
             from_block: 42,
@@ -11405,6 +12293,7 @@ mod tests {
         let events = TestHarness::<UsdcRebalance>::with(())
             .given(vec![
                 UsdcRebalanceEvent::Initiated {
+                    corridor: UsdcCorridor::BASE_CCTP,
                     direction: RebalanceDirection::AlpacaToBase,
                     amount: Usdc::new(float!(200.00)),
                     withdrawal_ref: TransferRef::AlpacaId(transfer_id),
@@ -11430,6 +12319,7 @@ mod tests {
 
         let state = replay::<UsdcRebalance>(vec![
             UsdcRebalanceEvent::Initiated {
+                corridor: UsdcCorridor::BASE_CCTP,
                 direction: RebalanceDirection::AlpacaToBase,
                 amount: Usdc::new(float!(200.00)),
                 withdrawal_ref: TransferRef::AlpacaId(transfer_id),
@@ -11466,6 +12356,7 @@ mod tests {
         let events = TestHarness::<UsdcRebalance>::with(())
             .given(vec![
                 UsdcRebalanceEvent::Initiated {
+                    corridor: UsdcCorridor::BASE_CCTP,
                     direction: RebalanceDirection::AlpacaToBase,
                     amount: Usdc::new(float!(200.00)),
                     withdrawal_ref: TransferRef::AlpacaId(transfer_id),
@@ -11493,6 +12384,7 @@ mod tests {
 
         let state = replay::<UsdcRebalance>(vec![
             UsdcRebalanceEvent::Initiated {
+                corridor: UsdcCorridor::BASE_CCTP,
                 direction: RebalanceDirection::AlpacaToBase,
                 amount: Usdc::new(float!(200.00)),
                 withdrawal_ref: TransferRef::AlpacaId(transfer_id),
@@ -11527,6 +12419,7 @@ mod tests {
 
     fn bridging_submitting_base_to_alpaca() -> UsdcRebalance {
         UsdcRebalance::BridgingSubmitting {
+            corridor: UsdcCorridor::BASE_CCTP,
             direction: RebalanceDirection::BaseToAlpaca,
             amount: Usdc::new(float!(100)),
             from_block: 1,
@@ -11538,6 +12431,7 @@ mod tests {
 
     fn bridging_submitting_alpaca_to_base() -> UsdcRebalance {
         UsdcRebalance::BridgingSubmitting {
+            corridor: UsdcCorridor::BASE_CCTP,
             direction: RebalanceDirection::AlpacaToBase,
             amount: Usdc::new(float!(100)),
             from_block: 1,
@@ -11549,6 +12443,7 @@ mod tests {
 
     fn withdrawal_submitting_base_to_alpaca() -> UsdcRebalance {
         UsdcRebalance::WithdrawalSubmitting {
+            corridor: UsdcCorridor::BASE_CCTP,
             direction: RebalanceDirection::BaseToAlpaca,
             amount: Usdc::new(float!(100)),
             from_block: 1,
@@ -11558,6 +12453,7 @@ mod tests {
 
     fn withdrawal_submitting_alpaca_to_base() -> UsdcRebalance {
         UsdcRebalance::WithdrawalSubmitting {
+            corridor: UsdcCorridor::BASE_CCTP,
             direction: RebalanceDirection::AlpacaToBase,
             amount: Usdc::new(float!(100)),
             from_block: 1,
@@ -11615,6 +12511,7 @@ mod tests {
     fn withdrawing_alpaca_to_base_is_resumable_mid_flight_data() {
         let amount = Usdc::new(float!(100));
         let state = UsdcRebalance::Withdrawing {
+            corridor: UsdcCorridor::BASE_CCTP,
             direction: RebalanceDirection::AlpacaToBase,
             amount,
             withdrawal_ref: TransferRef::AlpacaId(AlpacaTransferId::from(Uuid::new_v4())),
@@ -11634,6 +12531,7 @@ mod tests {
     #[test]
     fn withdrawing_alpaca_to_base_onchain_ref_is_not_resumable_mid_flight_data() {
         let state = UsdcRebalance::Withdrawing {
+            corridor: UsdcCorridor::BASE_CCTP,
             direction: RebalanceDirection::AlpacaToBase,
             amount: Usdc::new(float!(100)),
             withdrawal_ref: TransferRef::OnchainTx(alloy::primitives::TxHash::ZERO),
@@ -11655,6 +12553,7 @@ mod tests {
     fn withdrawal_complete_alpaca_to_base_is_resumable_mid_flight_data() {
         let amount = Usdc::new(float!(100));
         let state = UsdcRebalance::WithdrawalComplete {
+            corridor: UsdcCorridor::BASE_CCTP,
             direction: RebalanceDirection::AlpacaToBase,
             amount,
             initiated_at: Utc::now(),
@@ -11676,6 +12575,7 @@ mod tests {
     #[test]
     fn withdrawing_base_to_alpaca_is_not_resumable_mid_flight_data() {
         let state = UsdcRebalance::Withdrawing {
+            corridor: UsdcCorridor::BASE_CCTP,
             direction: RebalanceDirection::BaseToAlpaca,
             amount: Usdc::new(float!(100)),
             withdrawal_ref: TransferRef::OnchainTx(alloy::primitives::TxHash::ZERO),
@@ -11694,6 +12594,7 @@ mod tests {
     #[test]
     fn withdrawal_complete_base_to_alpaca_is_not_resumable_mid_flight_data() {
         let state = UsdcRebalance::WithdrawalComplete {
+            corridor: UsdcCorridor::BASE_CCTP,
             direction: RebalanceDirection::BaseToAlpaca,
             amount: Usdc::new(float!(100)),
             initiated_at: Utc::now(),
@@ -11740,6 +12641,7 @@ mod tests {
 
         let prior_events = vec![
             UsdcRebalanceEvent::ConversionInitiated {
+                corridor: UsdcCorridor::BASE_CCTP,
                 direction: RebalanceDirection::AlpacaToBase,
                 amount,
                 order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
@@ -11758,6 +12660,7 @@ mod tests {
         let new_events = TestHarness::<UsdcRebalance>::with(())
             .given(prior_events.clone())
             .when(UsdcRebalanceCommand::Initiate {
+                corridor: UsdcCorridor::BASE_CCTP,
                 direction: RebalanceDirection::AlpacaToBase,
                 amount,
                 withdrawal: TransferRef::AlpacaId(transfer_id),
@@ -11812,6 +12715,7 @@ mod tests {
     #[test]
     fn is_resumable_mid_flight_data_none_for_post_burn_bridging() {
         let state = UsdcRebalance::Bridging {
+            corridor: UsdcCorridor::BASE_CCTP,
             direction: RebalanceDirection::BaseToAlpaca,
             amount: Usdc::new(float!(100)),
             burn_tx_hash: alloy::primitives::TxHash::ZERO,
@@ -11828,6 +12732,7 @@ mod tests {
     #[test]
     fn is_resumable_mid_flight_data_none_for_terminal_bridging_failed() {
         let state = UsdcRebalance::BridgingFailed {
+            corridor: UsdcCorridor::BASE_CCTP,
             direction: RebalanceDirection::BaseToAlpaca,
             amount: Usdc::new(float!(100)),
             burn_tx_hash: None,
@@ -11841,5 +12746,756 @@ mod tests {
             None,
             "BridgingFailed (terminal) must not be mid-flight resumable"
         );
+    }
+
+    const DEPOSIT_SEND_TX: TxHash =
+        fixed_bytes!("0x00000000000000000000000000000000000000000000000000000000000000cc");
+
+    fn bridged_events(direction: RebalanceDirection) -> Vec<UsdcRebalanceEvent> {
+        vec![
+            UsdcRebalanceEvent::Initiated {
+                corridor: UsdcCorridor::BASE_CCTP,
+                direction,
+                amount: Usdc::new(float!(100)),
+                withdrawal_ref: TransferRef::OnchainTx(BURN_TX),
+                initiated_at: Utc::now(),
+            },
+            UsdcRebalanceEvent::WithdrawalConfirmed {
+                confirmed_at: Utc::now(),
+                withdrawal_tx: None,
+            },
+            UsdcRebalanceEvent::BridgingInitiated {
+                burn_tx_hash: BURN_TX,
+                burned_at: Utc::now(),
+            },
+            UsdcRebalanceEvent::BridgeAttestationReceived {
+                attestation: vec![0x01],
+                cctp_nonce: TEST_CCTP_NONCE,
+                message: None,
+                mint_scan_from_block: Some(1),
+                attested_at: Utc::now(),
+            },
+            UsdcRebalanceEvent::Bridged {
+                mint_tx_hash: MINT_TX,
+                amount_received: Usdc::new(float!(99.99)),
+                fee_collected: Usdc::new(float!(0.01)),
+                minted_at: Utc::now(),
+            },
+        ]
+    }
+
+    fn prepared_send() -> PreparedTransaction {
+        PreparedTransaction::for_test(DEPOSIT_SEND_TX, 7)
+    }
+
+    fn deposit_send_prepared() -> UsdcRebalanceEvent {
+        UsdcRebalanceEvent::DepositSendPrepared {
+            prepared: prepared_send(),
+            prepared_at: Utc::now(),
+        }
+    }
+
+    fn bridged_with(extra: Vec<UsdcRebalanceEvent>) -> Vec<UsdcRebalanceEvent> {
+        [bridged_events(RebalanceDirection::BaseToAlpaca), extra].concat()
+    }
+
+    #[tokio::test]
+    async fn prepare_deposit_send_persists_the_signed_send_before_broadcast() {
+        let staged = bridged_events(RebalanceDirection::BaseToAlpaca);
+
+        let events = TestHarness::<UsdcRebalance>::with(())
+            .given(staged.clone())
+            .when(UsdcRebalanceCommand::PrepareDepositSend {
+                prepared: prepared_send(),
+            })
+            .await
+            .events();
+
+        let [
+            UsdcRebalanceEvent::DepositSendPrepared {
+                prepared,
+                prepared_at,
+            },
+        ] = events.as_slice()
+        else {
+            panic!("Expected one DepositSendPrepared event, got {events:?}");
+        };
+        assert_eq!(*prepared, prepared_send());
+        let state = replay::<UsdcRebalance>([staged, events.clone()].concat())
+            .unwrap()
+            .unwrap();
+        let UsdcRebalance::Bridged { deposit_send, .. } = state else {
+            panic!("Expected Bridged, got {state:?}");
+        };
+        assert_eq!(
+            deposit_send,
+            DepositSend::Prepared {
+                prepared: prepared_send(),
+                prepared_at: *prepared_at,
+            }
+        );
+    }
+
+    /// Only one signed send per transfer: a second could move the minted
+    /// USDC twice.
+    #[tokio::test]
+    async fn prepare_deposit_send_refuses_a_second_send() {
+        let error = TestHarness::<UsdcRebalance>::with(())
+            .given(bridged_with(vec![deposit_send_prepared()]))
+            .when(UsdcRebalanceCommand::PrepareDepositSend {
+                prepared: PreparedTransaction::for_test(TxHash::with_last_byte(0xdd), 8),
+            })
+            .await
+            .then_expect_error();
+
+        assert!(matches!(
+            error,
+            LifecycleError::Apply(UsdcRebalanceError::DepositSendAlreadyStarted)
+        ));
+    }
+
+    /// The signed send is the only send this transfer can make, so the
+    /// deposit it initiates must be that send.
+    #[tokio::test]
+    async fn initiate_deposit_refuses_a_tx_other_than_the_prepared_send() {
+        let other_send = TxHash::with_last_byte(0xdd);
+
+        let error = TestHarness::<UsdcRebalance>::with(())
+            .given(bridged_with(vec![deposit_send_prepared()]))
+            .when(UsdcRebalanceCommand::InitiateDeposit {
+                deposit: TransferRef::OnchainTx(other_send),
+            })
+            .await
+            .then_expect_error();
+
+        let LifecycleError::Apply(UsdcRebalanceError::PreparedDepositHashMismatch {
+            recorded,
+            prepared,
+        }) = error
+        else {
+            panic!("Expected PreparedDepositHashMismatch, got {error:?}");
+        };
+        assert_eq!(recorded, other_send);
+        assert_eq!(prepared, DEPOSIT_SEND_TX);
+    }
+
+    /// A BaseToAlpaca deposit send that cannot be resolved fails from
+    /// `Bridged` into a reconcilable, guard-holding `DepositFailed` that keeps
+    /// the signed send, so `transfer recheck` can poll Alpaca by it.
+    #[tokio::test]
+    async fn fail_deposit_from_bridged_keeps_the_signed_send() {
+        let staged = bridged_with(vec![deposit_send_prepared()]);
+
+        let events = TestHarness::<UsdcRebalance>::with(())
+            .given(staged.clone())
+            .when(UsdcRebalanceCommand::FailDeposit {
+                reason: "recorded deposit send reverted".to_string(),
+            })
+            .await
+            .events();
+
+        let [UsdcRebalanceEvent::DepositFailed { deposit_ref, .. }] = events.as_slice() else {
+            panic!("Expected one DepositFailed event, got {events:?}");
+        };
+        assert_eq!(*deposit_ref, Some(TransferRef::OnchainTx(DEPOSIT_SEND_TX)));
+
+        let state = replay::<UsdcRebalance>([staged, events].concat())
+            .unwrap()
+            .unwrap();
+        let UsdcRebalance::DepositFailed {
+            amount,
+            mint_tx_hash,
+            ..
+        } = &state
+        else {
+            panic!("Expected DepositFailed, got {state:?}");
+        };
+        assert_eq!(*amount, Usdc::new(float!(99.99)));
+        assert_eq!(*mint_tx_hash, MINT_TX);
+        assert!(state.is_reconcilable_failure());
+        assert!(state.holds_rebalance_guard());
+    }
+
+    #[tokio::test]
+    async fn fail_deposit_from_bridged_before_a_broadcast_keeps_the_signed_send() {
+        let events = TestHarness::<UsdcRebalance>::with(())
+            .given(bridged_with(vec![deposit_send_prepared()]))
+            .when(UsdcRebalanceCommand::FailDeposit {
+                reason: "signed send never confirmed".to_string(),
+            })
+            .await
+            .events();
+
+        let [UsdcRebalanceEvent::DepositFailed { deposit_ref, .. }] = events.as_slice() else {
+            panic!("Expected one DepositFailed event, got {events:?}");
+        };
+        assert_eq!(*deposit_ref, Some(TransferRef::OnchainTx(DEPOSIT_SEND_TX)));
+    }
+
+    #[tokio::test]
+    async fn fail_deposit_from_bridged_without_a_signed_send_has_no_deposit_ref() {
+        let events = TestHarness::<UsdcRebalance>::with(())
+            .given(bridged_with(vec![]))
+            .when(UsdcRebalanceCommand::FailDeposit {
+                reason: "no signed send".to_string(),
+            })
+            .await
+            .events();
+
+        let [UsdcRebalanceEvent::DepositFailed { deposit_ref, .. }] = events.as_slice() else {
+            panic!("Expected one DepositFailed event, got {events:?}");
+        };
+        assert_eq!(*deposit_ref, None);
+    }
+
+    /// A signed send that will never confirm (its nonce taken by another tx)
+    /// stays `Bridged`; the operator reconciles it once verified on chain.
+    #[tokio::test]
+    async fn reconcile_settles_a_bridged_transfer_with_a_signed_deposit_send() {
+        let staged = bridged_with(vec![deposit_send_prepared()]);
+
+        let events = TestHarness::<UsdcRebalance>::with(())
+            .given(staged.clone())
+            .when(UsdcRebalanceCommand::ReconcileStuckRebalance {
+                reason: ReconcileReason::FundsMovedManually,
+            })
+            .await
+            .events();
+
+        let state = replay::<UsdcRebalance>([staged, events].concat())
+            .unwrap()
+            .unwrap();
+        let UsdcRebalance::Reconciled { failure_reason, .. } = &state else {
+            panic!("Expected Reconciled, got {state:?}");
+        };
+        assert_eq!(*failure_reason, None);
+        assert!(!state.holds_rebalance_guard());
+    }
+
+    #[tokio::test]
+    async fn reconcile_refuses_a_bridged_transfer_without_a_signed_deposit_send() {
+        let error = TestHarness::<UsdcRebalance>::with(())
+            .given(bridged_with(vec![]))
+            .when(UsdcRebalanceCommand::ReconcileStuckRebalance {
+                reason: ReconcileReason::FundsMovedManually,
+            })
+            .await
+            .then_expect_error();
+
+        assert!(matches!(
+            error,
+            LifecycleError::Apply(UsdcRebalanceError::InvalidCommand { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn fail_deposit_rejects_an_alpaca_to_base_bridged() {
+        let error = TestHarness::<UsdcRebalance>::with(())
+            .given(bridged_events(RebalanceDirection::AlpacaToBase))
+            .when(UsdcRebalanceCommand::FailDeposit {
+                reason: "not a Base->Alpaca deposit send".to_string(),
+            })
+            .await
+            .then_expect_error();
+
+        assert!(matches!(
+            error,
+            LifecycleError::Apply(UsdcRebalanceError::DepositNotInitiated)
+        ));
+    }
+
+    #[tokio::test]
+    async fn attach_deposit_send_gives_a_deposit_failed_without_a_ref_the_operator_tx() {
+        let staged = [
+            bridged_events(RebalanceDirection::BaseToAlpaca),
+            vec![UsdcRebalanceEvent::DepositFailed {
+                deposit_ref: None,
+                reason: "deposit send not recorded".to_string(),
+                failed_at: Utc::now(),
+            }],
+        ]
+        .concat();
+
+        let events = TestHarness::<UsdcRebalance>::with(())
+            .given(staged.clone())
+            .when(UsdcRebalanceCommand::AttachDepositSend {
+                send_tx: DEPOSIT_SEND_TX,
+            })
+            .await
+            .events();
+
+        let state = replay::<UsdcRebalance>([staged, events].concat())
+            .unwrap()
+            .unwrap();
+        let UsdcRebalance::DepositFailed { deposit_ref, .. } = &state else {
+            panic!("Expected DepositFailed, got {state:?}");
+        };
+        assert_eq!(*deposit_ref, Some(TransferRef::OnchainTx(DEPOSIT_SEND_TX)));
+        assert!(state.holds_rebalance_guard());
+    }
+
+    #[tokio::test]
+    async fn attach_deposit_send_never_replaces_a_recorded_send() {
+        let other_send =
+            fixed_bytes!("0x00000000000000000000000000000000000000000000000000000000000000dd");
+
+        let error = TestHarness::<UsdcRebalance>::with(())
+            .given(bridged_with(vec![
+                deposit_send_prepared(),
+                UsdcRebalanceEvent::DepositFailed {
+                    deposit_ref: Some(TransferRef::OnchainTx(DEPOSIT_SEND_TX)),
+                    reason: "recorded send reverted".to_string(),
+                    failed_at: Utc::now(),
+                },
+            ]))
+            .when(UsdcRebalanceCommand::AttachDepositSend {
+                send_tx: other_send,
+            })
+            .await
+            .then_expect_error();
+
+        assert!(matches!(
+            error,
+            LifecycleError::Apply(UsdcRebalanceError::DepositSendAlreadyRecorded { recorded })
+                if recorded == DEPOSIT_SEND_TX
+        ));
+    }
+
+    #[test]
+    fn bridged_snapshot_without_deposit_send_deserializes_to_not_started() {
+        let now = Utc::now();
+        let mut snapshot = to_value(UsdcRebalance::Bridged {
+            corridor: UsdcCorridor::BASE_CCTP,
+            direction: RebalanceDirection::BaseToAlpaca,
+            amount: Usdc::new(float!(100)),
+            amount_received: Usdc::new(float!(99.99)),
+            fee_collected: Usdc::new(float!(0.01)),
+            burn_tx_hash: BURN_TX,
+            mint_tx_hash: MINT_TX,
+            initiated_at: now,
+            minted_at: now,
+            deposit_send: DepositSend::Prepared {
+                prepared: prepared_send(),
+                prepared_at: now,
+            },
+        })
+        .unwrap();
+        snapshot
+            .get_mut("Bridged")
+            .and_then(|value| value.as_object_mut())
+            .unwrap()
+            .remove("deposit_send");
+
+        let UsdcRebalance::Bridged { deposit_send, .. } =
+            from_value::<UsdcRebalance>(snapshot).unwrap()
+        else {
+            panic!("expected Bridged");
+        };
+        assert_eq!(deposit_send, DepositSend::NotStarted);
+    }
+
+    /// Each event carrying a deposit send hash records that send for its
+    /// transfer on its own, so the lookup must match every one of them.
+    #[tokio::test]
+    async fn deposit_send_recorded_elsewhere_matches_every_event_carrying_the_send() {
+        let pool = crate::test_utils::setup_test_db().await;
+        let now = Utc::now();
+        let events = |send_tx| {
+            [
+                UsdcRebalanceEvent::DepositSendPrepared {
+                    prepared: PreparedTransaction::for_test(send_tx, 7),
+                    prepared_at: now,
+                },
+                UsdcRebalanceEvent::DepositSendAttached {
+                    send_tx,
+                    attached_at: now,
+                },
+                UsdcRebalanceEvent::DepositInitiated {
+                    deposit_ref: TransferRef::OnchainTx(send_tx),
+                    deposit_initiated_at: now,
+                },
+                UsdcRebalanceEvent::DepositFailed {
+                    deposit_ref: Some(TransferRef::OnchainTx(send_tx)),
+                    reason: "unresolved deposit send".to_string(),
+                    failed_at: now,
+                },
+            ]
+        };
+
+        for shape in 0..events(TxHash::ZERO).len() {
+            let send_tx = TxHash::random();
+            let event = events(send_tx)[shape].clone();
+            let recorder = UsdcRebalanceId(Uuid::new_v4());
+            crate::test_utils::persist_event::<UsdcRebalance>(
+                &pool,
+                &recorder.to_string(),
+                1,
+                &event,
+            )
+            .await;
+
+            let other = UsdcRebalanceId(Uuid::new_v4());
+            assert_eq!(
+                deposit_send_recorded_elsewhere(&pool, &other, send_tx)
+                    .await
+                    .unwrap(),
+                Some(recorder.to_string()),
+                "{} records the send",
+                event.event_type(),
+            );
+            assert_eq!(
+                deposit_send_recorded_elsewhere(&pool, &recorder, send_tx)
+                    .await
+                    .unwrap(),
+                None,
+                "{}: a transfer's own record is not elsewhere",
+                event.event_type(),
+            );
+        }
+    }
+
+    /// A corridor no transfer defaults to, so a test that ends on it proves
+    /// the corridor was carried, not filled in by the legacy default.
+    const ROBINHOOD_RELAY: UsdcCorridor = UsdcCorridor::HubRouted {
+        chain: Chain::Robinhood,
+        hop: HopKind::Relay,
+    };
+
+    /// Events recorded before corridors existed read as Base via CCTP, the
+    /// only route there was.
+    #[test]
+    fn legacy_originating_events_read_as_base_via_cctp() {
+        let order_id = ClientOrderId::from_uuid(Uuid::new_v4());
+        let legacy_events = [
+            json!({"ConversionInitiated": {
+                "direction": "AlpacaToBase",
+                "amount": "1000",
+                "order_id": order_id,
+                "initiated_at": "2026-01-01T00:00:00Z"
+            }}),
+            json!({"WithdrawalSubmitting": {
+                "direction": "BaseToAlpaca",
+                "amount": "1000",
+                "from_block": 42,
+                "submitting_at": "2026-01-01T00:00:00Z"
+            }}),
+            json!({"Initiated": {
+                "direction": "BaseToAlpaca",
+                "amount": "1000",
+                "withdrawal_ref": {"OnchainTx": B256::ZERO},
+                "initiated_at": "2026-01-01T00:00:00Z"
+            }}),
+        ];
+
+        for legacy_event in legacy_events {
+            let event: UsdcRebalanceEvent = from_value(legacy_event.clone())
+                .unwrap_or_else(|error| panic!("{legacy_event} must deserialize: {error}"));
+
+            let corridor = match event {
+                UsdcRebalanceEvent::ConversionInitiated { corridor, .. }
+                | UsdcRebalanceEvent::WithdrawalSubmitting { corridor, .. }
+                | UsdcRebalanceEvent::Initiated { corridor, .. } => corridor,
+                other => panic!("unexpected event {other:?}"),
+            };
+
+            assert_eq!(corridor, UsdcCorridor::BASE_CCTP, "for {legacy_event}");
+        }
+    }
+
+    #[test]
+    fn originating_events_record_the_corridor_on_the_wire() {
+        let events = [
+            UsdcRebalanceEvent::ConversionInitiated {
+                direction: RebalanceDirection::AlpacaToBase,
+                corridor: ROBINHOOD_RELAY,
+                amount: Usdc::new(float!(100)),
+                order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
+                initiated_at: Utc::now(),
+            },
+            UsdcRebalanceEvent::WithdrawalSubmitting {
+                direction: RebalanceDirection::BaseToAlpaca,
+                corridor: ROBINHOOD_RELAY,
+                amount: Usdc::new(float!(100)),
+                from_block: 1,
+                submitting_at: Utc::now(),
+            },
+            UsdcRebalanceEvent::Initiated {
+                direction: RebalanceDirection::BaseToAlpaca,
+                corridor: ROBINHOOD_RELAY,
+                amount: Usdc::new(float!(100)),
+                withdrawal_ref: TransferRef::OnchainTx(B256::ZERO),
+                initiated_at: Utc::now(),
+            },
+        ];
+
+        for event in events {
+            let serialized = to_value(&event).unwrap();
+            let payload = serialized.as_object().unwrap().values().next().unwrap();
+
+            assert_eq!(
+                payload["corridor"],
+                json!({"HubRouted": {"chain": "robinhood", "hop": "relay"}}),
+                "for {serialized}"
+            );
+        }
+    }
+
+    /// A snapshot written before corridors existed loads as Base via CCTP.
+    #[test]
+    fn legacy_state_snapshot_reads_as_base_via_cctp() {
+        let mut snapshot = to_value(UsdcRebalance::Withdrawing {
+            direction: RebalanceDirection::AlpacaToBase,
+            corridor: ROBINHOOD_RELAY,
+            amount: Usdc::new(float!(100)),
+            withdrawal_ref: TransferRef::AlpacaId(AlpacaTransferId::from(Uuid::new_v4())),
+            initiated_at: Utc::now(),
+        })
+        .unwrap();
+        snapshot
+            .get_mut("Withdrawing")
+            .and_then(|value| value.as_object_mut())
+            .unwrap()
+            .remove("corridor");
+
+        let state = from_value::<UsdcRebalance>(snapshot).unwrap();
+
+        assert_eq!(state.corridor(), UsdcCorridor::BASE_CCTP);
+    }
+
+    #[test]
+    fn legacy_stream_replays_to_bridged_on_base_via_cctp() {
+        let burn_tx = B256::repeat_byte(0x0b);
+        let mint_tx = B256::repeat_byte(0x0c);
+        let events = [
+            json!({"Initiated": {
+                "direction": "BaseToAlpaca",
+                "amount": "100",
+                "withdrawal_ref": {"OnchainTx": B256::repeat_byte(0x0a)},
+                "initiated_at": "2026-01-01T00:00:00Z"
+            }}),
+            json!({"WithdrawalConfirmed": {"confirmed_at": "2026-01-01T00:01:00Z"}}),
+            json!({"BridgingInitiated": {
+                "burn_tx_hash": burn_tx,
+                "burned_at": "2026-01-01T00:02:00Z"
+            }}),
+            json!({"BridgeAttestationReceived": {
+                "attestation": [1, 2, 3],
+                "cctp_nonce": TEST_CCTP_NONCE,
+                "attested_at": "2026-01-01T00:03:00Z"
+            }}),
+            json!({"Bridged": {
+                "mint_tx_hash": mint_tx,
+                "amount_received": "99.99",
+                "fee_collected": "0.01",
+                "minted_at": "2026-01-01T00:04:00Z"
+            }}),
+        ]
+        .into_iter()
+        .map(|event| from_value::<UsdcRebalanceEvent>(event).unwrap())
+        .collect::<Vec<_>>();
+
+        let state = replay::<UsdcRebalance>(events).unwrap().unwrap();
+
+        let UsdcRebalance::Bridged { corridor, .. } = state else {
+            panic!("expected Bridged, got {state:?}");
+        };
+        assert_eq!(corridor, UsdcCorridor::BASE_CCTP);
+    }
+
+    #[test]
+    fn alpaca_to_base_keeps_its_corridor_to_deposit_confirmed() {
+        let burn_tx = B256::repeat_byte(0x0b);
+        let amount = Usdc::new(float!(100));
+
+        let state = replay::<UsdcRebalance>(vec![
+            UsdcRebalanceEvent::ConversionInitiated {
+                direction: RebalanceDirection::AlpacaToBase,
+                corridor: ROBINHOOD_RELAY,
+                amount,
+                order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
+                initiated_at: Utc::now(),
+            },
+            UsdcRebalanceEvent::ConversionConfirmed {
+                direction: RebalanceDirection::AlpacaToBase,
+                conversion: ConversionAmounts::new(amount, amount),
+                converted_at: Utc::now(),
+            },
+            UsdcRebalanceEvent::WithdrawalSubmitting {
+                direction: RebalanceDirection::AlpacaToBase,
+                corridor: ROBINHOOD_RELAY,
+                amount,
+                from_block: 1,
+                submitting_at: Utc::now(),
+            },
+            UsdcRebalanceEvent::Initiated {
+                direction: RebalanceDirection::AlpacaToBase,
+                corridor: ROBINHOOD_RELAY,
+                amount,
+                withdrawal_ref: TransferRef::AlpacaId(AlpacaTransferId::from(Uuid::new_v4())),
+                initiated_at: Utc::now(),
+            },
+            UsdcRebalanceEvent::WithdrawalConfirmed {
+                confirmed_at: Utc::now(),
+                withdrawal_tx: None,
+            },
+            UsdcRebalanceEvent::BridgingInitiated {
+                burn_tx_hash: burn_tx,
+                burned_at: Utc::now(),
+            },
+            UsdcRebalanceEvent::BridgeAttestationReceived {
+                attestation: vec![1],
+                cctp_nonce: TEST_CCTP_NONCE,
+                message: None,
+                mint_scan_from_block: None,
+                attested_at: Utc::now(),
+            },
+            UsdcRebalanceEvent::Bridged {
+                mint_tx_hash: B256::repeat_byte(0x0c),
+                amount_received: amount,
+                fee_collected: Usdc::new(float!(0)),
+                minted_at: Utc::now(),
+            },
+            UsdcRebalanceEvent::DepositInitiated {
+                deposit_ref: TransferRef::OnchainTx(B256::repeat_byte(0x0d)),
+                deposit_initiated_at: Utc::now(),
+            },
+            UsdcRebalanceEvent::DepositConfirmed {
+                direction: RebalanceDirection::AlpacaToBase,
+                deposit_confirmed_at: Utc::now(),
+            },
+        ])
+        .unwrap()
+        .unwrap();
+
+        let UsdcRebalance::DepositConfirmed { corridor, .. } = state else {
+            panic!("expected DepositConfirmed, got {state:?}");
+        };
+        assert_eq!(corridor, ROBINHOOD_RELAY);
+    }
+
+    fn base_to_alpaca_deposit_confirmed(corridor: UsdcCorridor) -> Vec<UsdcRebalanceEvent> {
+        let amount = Usdc::new(float!(100));
+
+        vec![
+            UsdcRebalanceEvent::WithdrawalSubmitting {
+                direction: RebalanceDirection::BaseToAlpaca,
+                corridor,
+                amount,
+                from_block: 1,
+                submitting_at: Utc::now(),
+            },
+            UsdcRebalanceEvent::Initiated {
+                direction: RebalanceDirection::BaseToAlpaca,
+                corridor,
+                amount,
+                withdrawal_ref: TransferRef::OnchainTx(B256::repeat_byte(0x0a)),
+                initiated_at: Utc::now(),
+            },
+            UsdcRebalanceEvent::WithdrawalConfirmed {
+                confirmed_at: Utc::now(),
+                withdrawal_tx: None,
+            },
+            UsdcRebalanceEvent::BridgingInitiated {
+                burn_tx_hash: B256::repeat_byte(0x0b),
+                burned_at: Utc::now(),
+            },
+            UsdcRebalanceEvent::BridgeAttestationReceived {
+                attestation: vec![1],
+                cctp_nonce: TEST_CCTP_NONCE,
+                message: None,
+                mint_scan_from_block: None,
+                attested_at: Utc::now(),
+            },
+            UsdcRebalanceEvent::Bridged {
+                mint_tx_hash: B256::repeat_byte(0x0c),
+                amount_received: amount,
+                fee_collected: Usdc::new(float!(0)),
+                minted_at: Utc::now(),
+            },
+            UsdcRebalanceEvent::DepositInitiated {
+                deposit_ref: TransferRef::OnchainTx(B256::repeat_byte(0x0d)),
+                deposit_initiated_at: Utc::now(),
+            },
+            UsdcRebalanceEvent::DepositConfirmed {
+                direction: RebalanceDirection::BaseToAlpaca,
+                deposit_confirmed_at: Utc::now(),
+            },
+        ]
+    }
+
+    /// The post-deposit conversion is not an originating event: it repeats
+    /// the transfer's corridor instead of taking one from the command.
+    #[tokio::test]
+    async fn post_deposit_conversion_keeps_the_transfers_corridor() {
+        let events = TestHarness::<UsdcRebalance>::with(())
+            .given(base_to_alpaca_deposit_confirmed(ROBINHOOD_RELAY))
+            .when(UsdcRebalanceCommand::InitiatePostDepositConversion {
+                order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
+                amount: Usdc::new(float!(100)),
+            })
+            .await
+            .events();
+
+        let [UsdcRebalanceEvent::ConversionInitiated { corridor, .. }] = events.as_slice() else {
+            panic!("expected one ConversionInitiated, got {events:?}");
+        };
+        assert_eq!(*corridor, ROBINHOOD_RELAY);
+
+        let mut replayed = base_to_alpaca_deposit_confirmed(ROBINHOOD_RELAY);
+        replayed.extend(events);
+        let state = replay::<UsdcRebalance>(replayed).unwrap().unwrap();
+        assert_eq!(state.corridor(), ROBINHOOD_RELAY);
+    }
+
+    /// A started transfer's corridor is fixed: a later command naming another
+    /// one is refused instead of moving funds on the wrong route.
+    #[tokio::test]
+    async fn initiate_on_another_corridor_than_recorded_is_refused() {
+        let error = TestHarness::<UsdcRebalance>::with(())
+            .given(vec![UsdcRebalanceEvent::WithdrawalSubmitting {
+                direction: RebalanceDirection::BaseToAlpaca,
+                corridor: ROBINHOOD_RELAY,
+                amount: Usdc::new(float!(100)),
+                from_block: 1,
+                submitting_at: Utc::now(),
+            }])
+            .when(UsdcRebalanceCommand::Initiate {
+                direction: RebalanceDirection::BaseToAlpaca,
+                corridor: UsdcCorridor::BASE_CCTP,
+                amount: Usdc::new(float!(100)),
+                withdrawal: TransferRef::OnchainTx(B256::repeat_byte(0x0a)),
+            })
+            .await
+            .then_expect_error();
+
+        assert!(
+            matches!(
+                error,
+                LifecycleError::Apply(UsdcRebalanceError::CorridorMismatch {
+                    recorded: ROBINHOOD_RELAY,
+                    requested: UsdcCorridor::BASE_CCTP,
+                })
+            ),
+            "got {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn fresh_withdrawal_records_the_commanded_corridor() {
+        let events = TestHarness::<UsdcRebalance>::with(())
+            .given_no_previous_events()
+            .when(UsdcRebalanceCommand::BeginWithdrawal {
+                direction: RebalanceDirection::BaseToAlpaca,
+                corridor: ROBINHOOD_RELAY,
+                amount: Usdc::new(float!(100)),
+                from_block: 1,
+            })
+            .await
+            .events();
+
+        let [UsdcRebalanceEvent::WithdrawalSubmitting { corridor, .. }] = events.as_slice() else {
+            panic!("expected one WithdrawalSubmitting, got {events:?}");
+        };
+        assert_eq!(*corridor, ROBINHOOD_RELAY);
     }
 }

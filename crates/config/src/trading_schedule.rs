@@ -64,10 +64,11 @@ impl TradingScheduleConfig {
         }
     }
 
-    pub(crate) fn validate(
-        &self,
-        assets: &HedgingAssets,
-    ) -> Result<(), TradingScheduleConfigError> {
+    /// The checks that need no per-symbol tables: timing and scope
+    /// identities. What `validate` runs before membership, and all a config
+    /// whose tables live in a token file that was not supplied can be
+    /// judged on.
+    pub(crate) fn validate_shape(&self) -> Result<(), TradingScheduleConfigError> {
         let durations = [
             self.poll_interval_secs,
             self.request_timeout_secs,
@@ -83,7 +84,6 @@ impl TradingScheduleConfig {
             return Err(TradingScheduleConfigError::Timing);
         }
         let mut scopes = HashSet::new();
-        let mut mapped = HashSet::new();
         for scope in &self.scopes {
             if scope.id.trim().is_empty()
                 || scope.profile_revision.trim().is_empty()
@@ -92,6 +92,17 @@ impl TradingScheduleConfig {
             {
                 return Err(TradingScheduleConfigError::Scope);
             }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn validate(
+        &self,
+        assets: &HedgingAssets,
+    ) -> Result<(), TradingScheduleConfigError> {
+        self.validate_shape()?;
+        let mut mapped = HashSet::new();
+        for scope in &self.scopes {
             for asset in &scope.assets {
                 let symbol = st0x_execution::Symbol::new(asset.clone())
                     .map_err(TradingScheduleMembershipError::from)?;
@@ -170,17 +181,22 @@ mod tests {
 
     #[test]
     fn rollout_fragments_match_runtime_asset_eligibility() {
-        for (runtime, fragment) in [
+        for (runtime, tokens, fragment) in [
             (
                 include_str!("../../../config/prod/st0x-hedge.toml"),
+                crate::registry::fixtures::pinned_production_tokens(),
                 include_str!("../../../docs/trading-schedule/prod.toml"),
             ),
             (
                 include_str!("../../../config/staging/st0x-hedge.toml"),
+                crate::registry::fixtures::read("tokens-staging.toml"),
                 include_str!("../../../docs/trading-schedule/staging.toml"),
             ),
         ] {
-            let runtime: toml::Value = toml::from_str(runtime).unwrap();
+            let mut runtime: toml::Table = toml::from_str(runtime).unwrap();
+            let tokens =
+                crate::registry::project(&crate::registry::parse(&tokens).unwrap()).unwrap();
+            crate::registry::merge(&mut runtime, &tokens).unwrap();
             let assets: HedgingAssets = runtime["assets"].clone().try_into().unwrap();
             let fragment: toml::Value = toml::from_str(fragment).unwrap();
             let config: TradingScheduleConfig = fragment["pricing"]["trading_schedule"]

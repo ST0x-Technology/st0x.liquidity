@@ -26,8 +26,10 @@ use tracing::{debug, error, info, trace, warn};
 use uuid::Uuid;
 
 use rain_math_float::Float;
+use st0x_bridge::corridor::UsdcCorridor;
 use st0x_config::{
     AllocationCtx, ChainAssets, ChainEquityAsset, ExecutionThreshold, OperationMode, TargetShare,
+    UsdcCorridorCtx,
 };
 use st0x_event_sorcery::{
     AggregateError, EntityList, LifecycleError, Projection, ProjectionError, Reactor, SendError,
@@ -56,8 +58,8 @@ use crate::inventory::projection::InventoryProjectionError;
 use crate::inventory::snapshot::{InventorySnapshot, InventorySnapshotEvent};
 use crate::inventory::view::InFlightEquityLocation;
 use crate::inventory::{
-    BroadcastingInventory, ImbalanceThreshold, Inventory, InventoryDivergenceGate, InventoryError,
-    InventoryScope, InventoryView, InventoryViewError, Operator, PendingRequestOwnership,
+    BroadcastingInventory, Inventory, InventoryDivergenceGate, InventoryError, InventoryScope,
+    InventoryView, InventoryViewError, Operator, PendingRequestOwnership,
     PendingRequestOwnershipSnapshot, PollFreshness, PortfolioAsset, PortfolioLocation, TransferOp,
     Venue,
 };
@@ -208,6 +210,15 @@ pub(crate) enum UsdcResumeError {
     GuardHeldElsewhere,
     #[error("USDC rebalancing stores are not wired yet (conductor still starting)")]
     NotReady,
+    #[error(
+        "USDC transfer corridor mismatch: transfer {id} runs on the {recorded} corridor, \
+         this build serves {served}; nothing was enqueued"
+    )]
+    CorridorNotServed {
+        id: UsdcRebalanceId,
+        recorded: UsdcCorridor,
+        served: UsdcCorridor,
+    },
     #[error("aggregate error: {0}")]
     Aggregate(#[source] Box<st0x_event_sorcery::SendError<UsdcRebalance>>),
     #[error(transparent)]
@@ -269,7 +280,12 @@ pub(crate) struct RebalancingServiceConfig {
     /// Bound on the age of a chain's inventory snapshot before that chain's
     /// imbalance evaluations are skipped as stale.
     pub(crate) inventory_staleness_bound: Duration,
-    pub(crate) usdc: Option<ImbalanceThreshold>,
+    /// The corridor new cash transfers run on and its band; `None` while
+    /// USDC mode is disabled.
+    pub(crate) usdc: Option<UsdcCorridorCtx>,
+    /// The corridor this build's cash transfer service carries, whatever the
+    /// USDC mode. A transfer recorded on another one is held, never re-armed.
+    pub(crate) served_usdc_corridor: UsdcCorridor,
     pub(crate) transfer_timeout: Duration,
     /// Every hedged chain's asset table and minimum. The planner slots a
     /// symbol on each chain that rebalances it; the USDC trigger reads the
@@ -899,6 +915,9 @@ pub(crate) struct RebalancingService {
     /// silence the page about stranded funds: the alert is re-attempted on every
     /// sweep until one delivery succeeds, while the error log stays one-shot.
     post_burn_timeout_alerted: Arc<RwLock<HashSet<UsdcRebalanceId>>>,
+    /// Transfers on a corridor this build does not serve whose page was
+    /// delivered, so the sweep pages once, not every tick.
+    corridor_not_served_alerted: Arc<RwLock<HashSet<UsdcRebalanceId>>>,
     mint_event_sync: Arc<Mutex<()>>,
     redemption_event_sync: Arc<Mutex<()>>,
     usdc_event_sync: Arc<Mutex<()>>,
@@ -951,8 +970,24 @@ enum UsdcTimeoutCleanup {
     ReArmAlpacaToBaseWithdrawal {
         tracking: usdc::UsdcRebalanceTracking,
         elapsed: Duration,
+        corridor: UsdcCorridor,
         amount: Usdc,
     },
+    /// A transfer on a corridor this build does not serve: a re-armed job
+    /// could only be refused, so the guard stays held and the page is
+    /// retried until delivered, instead of any generic stall alert.
+    HeldForUnservedCorridor { corridor: UsdcCorridor },
+}
+
+/// Whether a tracked transfer's durable state lets the sweep release its
+/// guard: `Reconciled`, or a state holding no guard on a corridor this build
+/// does not serve (an operator failed it before its burn, say), which no
+/// other path would ever release.
+fn releases_tracked_guard(state: &UsdcRebalance, served_corridor: UsdcCorridor) -> bool {
+    match state {
+        UsdcRebalance::Reconciled { .. } => true,
+        held => held.corridor() != served_corridor && !held.holds_rebalance_guard(),
+    }
 }
 
 /// Outcome of examining a tracked redemption during the timeout sweep.
@@ -1009,6 +1044,7 @@ enum RearmPolicy {
 struct RearmCandidate {
     id: UsdcRebalanceId,
     direction: RebalanceDirection,
+    corridor: UsdcCorridor,
     amount: Usdc,
     policy: RearmPolicy,
 }
@@ -1077,6 +1113,7 @@ impl RebalancingService {
             requested_stage_timeout_alerted: Arc::new(RwLock::new(HashSet::new())),
             post_burn_timeout_logged: Arc::new(RwLock::new(HashSet::new())),
             post_burn_timeout_alerted: Arc::new(RwLock::new(HashSet::new())),
+            corridor_not_served_alerted: Arc::new(RwLock::new(HashSet::new())),
             mint_event_sync: Arc::new(Mutex::new(())),
             redemption_event_sync: Arc::new(Mutex::new(())),
             usdc_event_sync: Arc::new(Mutex::new(())),
@@ -1944,6 +1981,7 @@ impl RebalancingService {
                 UsdcTimeoutCleanup::ReArmAlpacaToBaseWithdrawal {
                     tracking,
                     elapsed,
+                    corridor,
                     amount,
                 } => {
                     // An Alpaca-to-Base pre-burn state timed out with no live job:
@@ -1963,16 +2001,53 @@ impl RebalancingService {
                         .push(TransferUsdcToMarketMaking {
                             id: id.clone(),
                             amount,
+                            corridor,
                             revert_redrive_attempts: 0,
                             backpressure_streak: BackpressureStreak::default(),
                         })
                         .await?;
                     self.usdc_in_progress.store(true, Ordering::SeqCst);
                 }
+                UsdcTimeoutCleanup::HeldForUnservedCorridor { corridor } => {
+                    self.usdc_in_progress.store(true, Ordering::SeqCst);
+                    self.page_unserved_corridor_once(&id, corridor).await;
+                }
             }
         }
 
         Ok(())
+    }
+
+    /// Pages once per transfer (retried until delivered) that it runs on a
+    /// corridor this build does not serve and is held with its guard. The id
+    /// is recorded before the send, so a concurrent caller does not page too,
+    /// and removed again if delivery fails, so a later sweep retries.
+    async fn page_unserved_corridor_once(&self, id: &UsdcRebalanceId, corridor: UsdcCorridor) {
+        if !self
+            .corridor_not_served_alerted
+            .write()
+            .await
+            .insert(id.clone())
+        {
+            return;
+        }
+
+        let served = self.config.served_usdc_corridor;
+        let message = format!(
+            "USDC transfer corridor mismatch: transfer {id} runs on the {corridor} corridor, \
+             which this build does not serve (it serves {served}). Held with its guard and \
+             not re-armed; deploy a build that serves {corridor} (docs/cli-ops.md)."
+        );
+
+        if let Err(error) = self.notifier.notify(&message).await {
+            self.corridor_not_served_alerted.write().await.remove(id);
+            warn!(
+                target: "rebalance",
+                %id,
+                ?error,
+                "Failed to deliver the unserved-corridor page; will retry next sweep"
+            );
+        }
     }
 
     /// Whether a USDC transfer apalis row for `id` exists in *either* direction in
@@ -2312,6 +2387,7 @@ impl RebalancingService {
         };
 
         if tracking.is_post_burn() {
+            let served_corridor = self.config.served_usdc_corridor;
             // Post-burn: check durable state FIRST, regardless of elapsed time.
             // The Reconciled check is always safe: it only fires when the
             // aggregate is actually Reconciled and clearing the guard at that
@@ -2322,8 +2398,10 @@ impl RebalancingService {
             let usdc_store = self.usdc_store.read().await.as_ref().map(Arc::clone);
             if let Some(store) = usdc_store {
                 match store.load(id).await {
-                    Ok(Some(UsdcRebalance::Reconciled { .. })) => {
-                        // Durable state is Reconciled: the CLI's separate-process
+                    Ok(Some(state)) if releases_tracked_guard(&state, served_corridor) => {
+                        // Durable state is Reconciled (or, on a corridor this
+                        // build does not serve, any state that holds no guard):
+                        // the CLI's separate-process
                         // store emitted OperatorReconciled but the live reactor
                         // never saw it. Apply the side-effect here: zero the
                         // source-venue inflight and clear the active rebalance.
@@ -2381,6 +2459,13 @@ impl RebalancingService {
                             .await
                             .insert(id.clone(), now);
                         return Ok(Some(UsdcTimeoutCleanup::Cleared { tracking, elapsed }));
+                    }
+                    Ok(Some(state))
+                        if state.corridor() != served_corridor && state.holds_rebalance_guard() =>
+                    {
+                        return Ok(Some(UsdcTimeoutCleanup::HeldForUnservedCorridor {
+                            corridor: state.corridor(),
+                        }));
                     }
                     Ok(Some(_) | None) => {
                         // Guard-holding state or aggregate not yet in store:
@@ -2440,11 +2525,13 @@ impl RebalancingService {
                 Ok(Some(
                     UsdcRebalance::Withdrawing {
                         direction: RebalanceDirection::AlpacaToBase,
+                        corridor,
                         amount,
                         ..
                     }
                     | UsdcRebalance::WithdrawalComplete {
                         direction: RebalanceDirection::AlpacaToBase,
+                        corridor,
                         amount,
                         ..
                     },
@@ -2453,6 +2540,7 @@ impl RebalancingService {
                     return Ok(Some(UsdcTimeoutCleanup::ReArmAlpacaToBaseWithdrawal {
                         tracking,
                         elapsed,
+                        corridor,
                         amount,
                     }));
                 }
@@ -4793,8 +4881,8 @@ impl RebalancingService {
     fn usdc_rebalancing_params(
         &self,
         chain: Chain,
-    ) -> Option<(ImbalanceThreshold, Option<Usdc>, Option<Usd>)> {
-        let threshold = self.config.usdc.as_ref()?;
+    ) -> Option<(UsdcCorridorCtx, Option<Usdc>, Option<Usd>)> {
+        let usdc = self.config.usdc?;
 
         let cash = self.config.chains.get(&chain)?.assets.cash.as_ref()?;
         if cash.rebalancing != OperationMode::Enabled {
@@ -4804,7 +4892,7 @@ impl RebalancingService {
         let usdc_limit = cash.operational_limit.map(Positive::inner);
         let reserved = self.config.cash_reserved.map(Positive::inner);
 
-        Some((*threshold, usdc_limit, reserved))
+        Some((usdc, usdc_limit, reserved))
     }
 
     /// Checks inventory for USDC imbalance and triggers operation if needed.
@@ -4819,7 +4907,7 @@ impl RebalancingService {
         self.expire_stuck_operations_with_logging().await;
 
         let chain = self.inventory.read().await.primary_chain();
-        let Some((threshold, usdc_limit, reserved)) = self.usdc_rebalancing_params(chain) else {
+        let Some((usdc, usdc_limit, reserved)) = self.usdc_rebalancing_params(chain) else {
             return;
         };
 
@@ -4875,7 +4963,7 @@ impl RebalancingService {
         };
 
         let Ok(operation) = usdc::check_imbalance_and_build_operation(
-            &threshold,
+            &usdc.threshold,
             &self.inventory,
             usdc_limit,
             reserved,
@@ -4905,10 +4993,12 @@ impl RebalancingService {
 
         let dispatched = match operation {
             UsdcRebalanceOperation::BaseToAlpaca { amount } => {
-                self.enqueue_transfer_usdc_to_hedging(amount).await
+                self.enqueue_transfer_usdc_to_hedging(amount, usdc.corridor)
+                    .await
             }
             UsdcRebalanceOperation::AlpacaToBase { amount } => {
-                self.enqueue_transfer_usdc_to_market_making(amount).await
+                self.enqueue_transfer_usdc_to_market_making(amount, usdc.corridor)
+                    .await
             }
         };
 
@@ -5135,7 +5225,7 @@ impl RebalancingService {
     /// check a crash between `queue.push` and the first persisted
     /// `UsdcRebalance` event would let the next imbalance check enqueue a second
     /// job for the same imbalance.
-    async fn enqueue_transfer_usdc_to_hedging(&self, amount: Usdc) -> bool {
+    async fn enqueue_transfer_usdc_to_hedging(&self, amount: Usdc, corridor: UsdcCorridor) -> bool {
         // A non-terminal row in flight longer than this is treated as likely
         // stuck: the suppression is logged at warn (with the row id and age) so
         // it is actionable, rather than silently starving the hedge side with
@@ -5189,6 +5279,7 @@ impl RebalancingService {
             .push(TransferUsdcToHedging {
                 id: id.clone(),
                 amount,
+                corridor,
                 revert_redrive_attempts: 0,
                 backpressure_streak: BackpressureStreak::default(),
             })
@@ -5225,7 +5316,11 @@ impl RebalancingService {
     /// a crash between `queue.push` and the first persisted
     /// `UsdcRebalance` event would let the next imbalance check enqueue a
     /// second job for the same rebalance.
-    async fn enqueue_transfer_usdc_to_market_making(&self, amount: Usdc) -> bool {
+    async fn enqueue_transfer_usdc_to_market_making(
+        &self,
+        amount: Usdc,
+        corridor: UsdcCorridor,
+    ) -> bool {
         let queue = self.transfer_usdc_to_market_making_queue.clone();
         let usdc_store = self.usdc_store.read().await.as_ref().map(Arc::clone);
 
@@ -5260,6 +5355,7 @@ impl RebalancingService {
             .push(TransferUsdcToMarketMaking {
                 id: id.clone(),
                 amount,
+                corridor,
                 revert_redrive_attempts: 0,
                 backpressure_streak: BackpressureStreak::default(),
             })
@@ -5329,6 +5425,14 @@ impl RebalancingService {
             return Err(UsdcResumeError::DirectionMismatch {
                 id: id.clone(),
                 persisted: state.direction(),
+            });
+        }
+
+        if state.corridor() != self.config.served_usdc_corridor {
+            return Err(UsdcResumeError::CorridorNotServed {
+                id: id.clone(),
+                recorded: state.corridor(),
+                served: self.config.served_usdc_corridor,
             });
         }
 
@@ -5411,6 +5515,7 @@ impl RebalancingService {
         let idempotency_key = resume_idempotency_key(id, existing_rows);
 
         let amount = state.amount();
+        let corridor = state.corridor();
         let push = match direction {
             RebalanceDirection::AlpacaToBase => {
                 self.transfer_usdc_to_market_making_queue
@@ -5420,6 +5525,7 @@ impl RebalancingService {
                         TransferUsdcToMarketMaking {
                             id: id.clone(),
                             amount,
+                            corridor,
                             revert_redrive_attempts: 0,
                             backpressure_streak: BackpressureStreak::default(),
                         },
@@ -5434,6 +5540,7 @@ impl RebalancingService {
                         TransferUsdcToHedging {
                             id: id.clone(),
                             amount,
+                            corridor,
                             revert_redrive_attempts: 0,
                             backpressure_streak: BackpressureStreak::default(),
                         },
@@ -6439,6 +6546,28 @@ impl RebalancingService {
         let mut rearm_candidates = Vec::new();
         for id in candidate_ids {
             match usdc_store.load(&id).await {
+                // No job or re-arm can move it here, live job or not: hold
+                // the guard and page before any other classification. The
+                // post-burn-shaped seed makes the sweep check it every tick:
+                // it retries the page and releases the guard once reconciled.
+                Ok(Some(entity))
+                    if entity.holds_rebalance_guard()
+                        && entity.corridor() != self.config.served_usdc_corridor =>
+                {
+                    self.page_unserved_corridor_once(&id, entity.corridor())
+                        .await;
+                    held_tracking.push((
+                        id.clone(),
+                        usdc::UsdcRebalanceTracking {
+                            direction: entity.direction(),
+                            initiated_amount: entity.amount(),
+                            bridged_amount_received: None,
+                            stage: usdc::UsdcRebalanceStage::BridgingInitiated,
+                            last_progress_at: Utc::now(),
+                        },
+                    ));
+                    held_ids.push(id);
+                }
                 Ok(Some(entity)) => {
                     if entity.holds_rebalance_guard() {
                         held_ids.push(id.clone());
@@ -6527,6 +6656,7 @@ impl RebalancingService {
                         rearm_candidates.push(RearmCandidate {
                             id,
                             direction,
+                            corridor: entity.corridor(),
                             amount,
                             policy,
                         });
@@ -6619,6 +6749,7 @@ impl RebalancingService {
                         rearm_candidates.push(RearmCandidate {
                             id,
                             direction,
+                            corridor: entity.corridor(),
                             amount,
                             policy,
                         });
@@ -6791,6 +6922,7 @@ impl RebalancingService {
         for RearmCandidate {
             id,
             direction,
+            corridor,
             amount,
             policy,
         } in candidates
@@ -6833,6 +6965,7 @@ impl RebalancingService {
                         .push(TransferUsdcToHedging {
                             id: id.clone(),
                             amount,
+                            corridor,
                             revert_redrive_attempts: 0,
                             backpressure_streak: BackpressureStreak::default(),
                         })
@@ -6844,6 +6977,7 @@ impl RebalancingService {
                         .push(TransferUsdcToMarketMaking {
                             id: id.clone(),
                             amount,
+                            corridor,
                             revert_redrive_attempts: 0,
                             backpressure_streak: BackpressureStreak::default(),
                         })
@@ -8036,8 +8170,10 @@ mod tests {
     use futures_util::poll;
     use rain_math_float::Float;
     use sqlx::SqlitePool;
+    use st0x_bridge::corridor::HopKind;
     use st0x_config::{
-        ChainCashAsset, ChainEquities, ChainEquityAsset, ExecutionThreshold, OperationMode,
+        ChainCashAsset, ChainEquities, ChainEquityAsset, ExecutionThreshold, ImbalanceThreshold,
+        OperationMode,
     };
     use st0x_dto::Statement;
     use st0x_event_sorcery::{
@@ -8085,6 +8221,9 @@ mod tests {
     use crate::rebalancing::equity::{
         MintError, MintTransferError, ResumeEquityToMarketMaking, TransferEquityToMarketMakingCtx,
         TransferEquityToMarketMakingJobError,
+    };
+    use crate::rebalancing::usdc::{
+        ResumeBaseToAlpaca, TransferUsdcToHedgingCtx, UsdcTransferError,
     };
     use crate::test_utils::rebalancing_enabled_equities;
     use crate::tokenized_equity_mint::TokenizedEquityMintCommand;
@@ -8162,14 +8301,18 @@ mod tests {
 
     fn test_config() -> RebalancingServiceConfig {
         RebalancingServiceConfig {
+            served_usdc_corridor: UsdcCorridor::BASE_CCTP,
             poll_freshness: PollFreshness::always_fresh(),
             inventory_staleness_bound: Duration::from_secs(300),
             cash_reserved: None,
             hedge_floor: HedgeFloor::default(),
             allocation: AllocationCtx::base_test(),
-            usdc: Some(ImbalanceThreshold {
-                target: float!(0.5),
-                deviation: float!(0.2),
+            usdc: Some(UsdcCorridorCtx {
+                corridor: UsdcCorridor::BASE_CCTP,
+                threshold: ImbalanceThreshold {
+                    target: float!(0.5),
+                    deviation: float!(0.2),
+                },
             }),
             transfer_timeout: Duration::from_secs(30 * 60),
             chains: BTreeMap::from([(
@@ -11280,6 +11423,7 @@ mod tests {
 
         let trigger = RebalancingService::new(
             RebalancingServiceConfig {
+                served_usdc_corridor: UsdcCorridor::BASE_CCTP,
                 poll_freshness: PollFreshness::always_fresh(),
                 inventory_staleness_bound: Duration::from_secs(300),
                 cash_reserved: None,
@@ -16981,6 +17125,7 @@ mod tests {
             .send(
                 &id,
                 UsdcRebalanceCommand::InitiateConversion {
+                    corridor: UsdcCorridor::BASE_CCTP,
                     direction: RebalanceDirection::AlpacaToBase,
                     amount: usdc(400),
                     order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
@@ -17055,6 +17200,7 @@ mod tests {
         let id = UsdcRebalanceId(Uuid::new_v4());
         for command in [
             UsdcRebalanceCommand::Initiate {
+                corridor: UsdcCorridor::BASE_CCTP,
                 direction: RebalanceDirection::BaseToAlpaca,
                 amount: usdc(400),
                 withdrawal: TransferRef::OnchainTx(burn_tx),
@@ -17103,6 +17249,7 @@ mod tests {
             .transfer_usdc_to_hedging_queue
             .clone()
             .push(TransferUsdcToHedging {
+                corridor: UsdcCorridor::BASE_CCTP,
                 id: UsdcRebalanceId(Uuid::new_v4()),
                 amount: usdc(50),
                 revert_redrive_attempts: 0,
@@ -17137,6 +17284,7 @@ mod tests {
         let other = UsdcRebalanceId(Uuid::new_v4());
         for command in [
             UsdcRebalanceCommand::Initiate {
+                corridor: UsdcCorridor::BASE_CCTP,
                 direction: RebalanceDirection::BaseToAlpaca,
                 amount: usdc(400),
                 withdrawal: TransferRef::OnchainTx(burn_tx),
@@ -17206,6 +17354,7 @@ mod tests {
             .transfer_usdc_to_market_making_queue
             .clone()
             .push(TransferUsdcToMarketMaking {
+                corridor: UsdcCorridor::BASE_CCTP,
                 id: id.clone(),
                 amount: usdc(400),
                 revert_redrive_attempts: 0,
@@ -17248,6 +17397,7 @@ mod tests {
             .send(
                 &id,
                 UsdcRebalanceCommand::Initiate {
+                    corridor: UsdcCorridor::BASE_CCTP,
                     direction: RebalanceDirection::BaseToAlpaca,
                     amount: usdc(400),
                     withdrawal: TransferRef::OnchainTx(fixed_bytes!(
@@ -17305,6 +17455,7 @@ mod tests {
                 .push_idempotent(
                     &resume_idempotency_key(&id, 0),
                     TransferUsdcToMarketMaking {
+                        corridor: UsdcCorridor::BASE_CCTP,
                         id: id.clone(),
                         amount: usdc(400),
                         revert_redrive_attempts: 0,
@@ -18019,6 +18170,7 @@ mod tests {
             .send(
                 &id,
                 UsdcRebalanceCommand::Initiate {
+                    corridor: UsdcCorridor::BASE_CCTP,
                     direction: RebalanceDirection::BaseToAlpaca,
                     amount: usdc(400),
                     withdrawal: TransferRef::OnchainTx(burn_tx),
@@ -19375,6 +19527,7 @@ mod tests {
 
     fn make_usdc_initiated(direction: RebalanceDirection, amount: Usdc) -> UsdcRebalanceEvent {
         UsdcRebalanceEvent::Initiated {
+            corridor: UsdcCorridor::BASE_CCTP,
             direction,
             amount,
             withdrawal_ref: TransferRef::OnchainTx(TxHash::random()),
@@ -19387,6 +19540,7 @@ mod tests {
         amount: Usdc,
     ) -> UsdcRebalanceEvent {
         UsdcRebalanceEvent::ConversionInitiated {
+            corridor: UsdcCorridor::BASE_CCTP,
             direction,
             amount,
             order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
@@ -20007,6 +20161,7 @@ mod tests {
         let mut queue = trigger.transfer_usdc_to_hedging_queue.clone();
         queue
             .push(TransferUsdcToHedging {
+                corridor: UsdcCorridor::BASE_CCTP,
                 id: id.clone(),
                 amount: usdc(400),
                 revert_redrive_attempts: 0,
@@ -20138,6 +20293,7 @@ mod tests {
         let mut queue = trigger.transfer_usdc_to_hedging_queue.clone();
         queue
             .push(TransferUsdcToHedging {
+                corridor: UsdcCorridor::BASE_CCTP,
                 id: id.clone(),
                 amount: usdc(400),
                 revert_redrive_attempts: 0,
@@ -20173,6 +20329,7 @@ mod tests {
             .transfer_usdc_to_market_making_queue
             .clone()
             .push(TransferUsdcToMarketMaking {
+                corridor: UsdcCorridor::BASE_CCTP,
                 id: id.clone(),
                 amount: usdc(400),
                 revert_redrive_attempts: 0,
@@ -20203,6 +20360,7 @@ mod tests {
         let mut queue = trigger.transfer_usdc_to_hedging_queue.clone();
         queue
             .push(TransferUsdcToHedging {
+                corridor: UsdcCorridor::BASE_CCTP,
                 id: id.clone(),
                 amount: usdc(400),
                 revert_redrive_attempts: 0,
@@ -20263,6 +20421,7 @@ mod tests {
         let mut queue = trigger.transfer_usdc_to_hedging_queue.clone();
         queue
             .push(TransferUsdcToHedging {
+                corridor: UsdcCorridor::BASE_CCTP,
                 id: id.clone(),
                 amount: usdc(400),
                 revert_redrive_attempts: 0,
@@ -20322,6 +20481,7 @@ mod tests {
         let mut queue = trigger.transfer_usdc_to_hedging_queue.clone();
         queue
             .push(TransferUsdcToHedging {
+                corridor: UsdcCorridor::BASE_CCTP,
                 id: id.clone(),
                 amount: usdc(400),
                 revert_redrive_attempts: 0,
@@ -20362,6 +20522,7 @@ mod tests {
             .transfer_usdc_to_hedging_queue
             .clone()
             .push(TransferUsdcToHedging {
+                corridor: UsdcCorridor::BASE_CCTP,
                 id: UsdcRebalanceId(Uuid::new_v4()),
                 amount: usdc(100),
                 revert_redrive_attempts: 0,
@@ -20375,7 +20536,7 @@ mod tests {
         // guard resets on restart, so running them concurrently would churn
         // capital and pay fees twice.
         let enqueued = service
-            .enqueue_transfer_usdc_to_market_making(usdc(100))
+            .enqueue_transfer_usdc_to_market_making(usdc(100), UsdcCorridor::BASE_CCTP)
             .await;
 
         assert!(
@@ -20393,6 +20554,7 @@ mod tests {
             .transfer_usdc_to_market_making_queue
             .clone()
             .push(TransferUsdcToMarketMaking {
+                corridor: UsdcCorridor::BASE_CCTP,
                 id: UsdcRebalanceId(Uuid::new_v4()),
                 amount: usdc(100),
                 revert_redrive_attempts: 0,
@@ -20401,7 +20563,9 @@ mod tests {
             .await
             .unwrap();
 
-        let enqueued = service.enqueue_transfer_usdc_to_hedging(usdc(100)).await;
+        let enqueued = service
+            .enqueue_transfer_usdc_to_hedging(usdc(100), UsdcCorridor::BASE_CCTP)
+            .await;
 
         assert!(
             !enqueued,
@@ -20421,6 +20585,7 @@ mod tests {
             .transfer_usdc_to_hedging_queue
             .clone()
             .push(TransferUsdcToHedging {
+                corridor: UsdcCorridor::BASE_CCTP,
                 id: UsdcRebalanceId(Uuid::new_v4()),
                 amount: usdc(100),
                 revert_redrive_attempts: 0,
@@ -20439,7 +20604,7 @@ mod tests {
         .unwrap();
 
         let enqueued = service
-            .enqueue_transfer_usdc_to_market_making(usdc(100))
+            .enqueue_transfer_usdc_to_market_making(usdc(100), UsdcCorridor::BASE_CCTP)
             .await;
 
         assert!(
@@ -20458,6 +20623,7 @@ mod tests {
             .transfer_usdc_to_hedging_queue
             .clone()
             .push(TransferUsdcToHedging {
+                corridor: UsdcCorridor::BASE_CCTP,
                 id: UsdcRebalanceId(Uuid::new_v4()),
                 amount: usdc(100),
                 revert_redrive_attempts: 0,
@@ -20473,7 +20639,7 @@ mod tests {
             .unwrap();
 
         let enqueued = service
-            .enqueue_transfer_usdc_to_market_making(usdc(100))
+            .enqueue_transfer_usdc_to_market_making(usdc(100), UsdcCorridor::BASE_CCTP)
             .await;
 
         assert!(!enqueued, "a Running USDC transfer must block enqueue");
@@ -20487,6 +20653,7 @@ mod tests {
             .send(
                 id,
                 UsdcRebalanceCommand::Initiate {
+                    corridor: UsdcCorridor::BASE_CCTP,
                     direction: RebalanceDirection::BaseToAlpaca,
                     amount: usdc(100),
                     withdrawal: TransferRef::OnchainTx(TxHash::default()),
@@ -20511,6 +20678,7 @@ mod tests {
             .send(
                 id,
                 UsdcRebalanceCommand::Initiate {
+                    corridor: UsdcCorridor::BASE_CCTP,
                     direction: RebalanceDirection::BaseToAlpaca,
                     amount: usdc(100),
                     withdrawal: TransferRef::OnchainTx(TxHash::default()),
@@ -20555,6 +20723,7 @@ mod tests {
             .transfer_usdc_to_market_making_queue
             .clone()
             .push(TransferUsdcToMarketMaking {
+                corridor: UsdcCorridor::BASE_CCTP,
                 id: id.clone(),
                 amount: usdc(100),
                 revert_redrive_attempts: 0,
@@ -20572,7 +20741,9 @@ mod tests {
         .unwrap();
         attach_stores(&service, pool, usdc_store).await;
 
-        let enqueued = service.enqueue_transfer_usdc_to_hedging(usdc(100)).await;
+        let enqueued = service
+            .enqueue_transfer_usdc_to_hedging(usdc(100), UsdcCorridor::BASE_CCTP)
+            .await;
 
         assert!(
             enqueued,
@@ -20604,6 +20775,7 @@ mod tests {
             .transfer_usdc_to_hedging_queue
             .clone()
             .push(TransferUsdcToHedging {
+                corridor: UsdcCorridor::BASE_CCTP,
                 id: id.clone(),
                 amount: usdc(100),
                 revert_redrive_attempts: 0,
@@ -20622,7 +20794,7 @@ mod tests {
         attach_stores(&service, pool, usdc_store).await;
 
         let enqueued = service
-            .enqueue_transfer_usdc_to_market_making(usdc(100))
+            .enqueue_transfer_usdc_to_market_making(usdc(100), UsdcCorridor::BASE_CCTP)
             .await;
 
         assert!(
@@ -20656,6 +20828,7 @@ mod tests {
             .transfer_usdc_to_hedging_queue
             .clone()
             .push(TransferUsdcToHedging {
+                corridor: UsdcCorridor::BASE_CCTP,
                 id: id.clone(),
                 amount: usdc(100),
                 revert_redrive_attempts: 0,
@@ -20674,7 +20847,7 @@ mod tests {
         attach_stores(&service, pool, usdc_store).await;
 
         let enqueued = service
-            .enqueue_transfer_usdc_to_market_making(usdc(100))
+            .enqueue_transfer_usdc_to_market_making(usdc(100), UsdcCorridor::BASE_CCTP)
             .await;
 
         assert!(
@@ -20700,6 +20873,7 @@ mod tests {
             .transfer_usdc_to_hedging_queue
             .clone()
             .push(TransferUsdcToHedging {
+                corridor: UsdcCorridor::BASE_CCTP,
                 id: UsdcRebalanceId(Uuid::new_v4()),
                 amount: usdc(100),
                 revert_redrive_attempts: 0,
@@ -20718,7 +20892,7 @@ mod tests {
 
         // Do NOT call set_stores: usdc_store stays None.
         let enqueued = service
-            .enqueue_transfer_usdc_to_market_making(usdc(100))
+            .enqueue_transfer_usdc_to_market_making(usdc(100), UsdcCorridor::BASE_CCTP)
             .await;
 
         assert!(
@@ -20740,6 +20914,7 @@ mod tests {
             .transfer_usdc_to_hedging_queue
             .clone()
             .push(TransferUsdcToHedging {
+                corridor: UsdcCorridor::BASE_CCTP,
                 id: UsdcRebalanceId(Uuid::new_v4()),
                 amount: usdc(100),
                 revert_redrive_attempts: 0,
@@ -20758,7 +20933,7 @@ mod tests {
         attach_stores(&service, pool, usdc_store).await;
 
         let enqueued = service
-            .enqueue_transfer_usdc_to_market_making(usdc(100))
+            .enqueue_transfer_usdc_to_market_making(usdc(100), UsdcCorridor::BASE_CCTP)
             .await;
 
         assert!(
@@ -20784,6 +20959,7 @@ mod tests {
             .transfer_usdc_to_market_making_queue
             .clone()
             .push(TransferUsdcToMarketMaking {
+                corridor: UsdcCorridor::BASE_CCTP,
                 id: UsdcRebalanceId(Uuid::new_v4()),
                 amount: usdc(100),
                 revert_redrive_attempts: 0,
@@ -20805,7 +20981,9 @@ mod tests {
 
         attach_stores(&service, pool, usdc_store).await;
 
-        let enqueued = service.enqueue_transfer_usdc_to_hedging(usdc(100)).await;
+        let enqueued = service
+            .enqueue_transfer_usdc_to_hedging(usdc(100), UsdcCorridor::BASE_CCTP)
+            .await;
 
         assert!(
             !enqueued,
@@ -20831,6 +21009,7 @@ mod tests {
                 .transfer_usdc_to_hedging_queue
                 .clone()
                 .push(TransferUsdcToHedging {
+                    corridor: UsdcCorridor::BASE_CCTP,
                     id: zombie_id.clone(),
                     amount: usdc(100),
                     revert_redrive_attempts: 0,
@@ -20850,7 +21029,7 @@ mod tests {
         attach_stores(&service, pool, usdc_store).await;
 
         let enqueued = service
-            .enqueue_transfer_usdc_to_market_making(usdc(100))
+            .enqueue_transfer_usdc_to_market_making(usdc(100), UsdcCorridor::BASE_CCTP)
             .await;
 
         assert!(enqueued, "all zombies cleared: enqueue must succeed");
@@ -20875,6 +21054,7 @@ mod tests {
             .transfer_usdc_to_hedging_queue
             .clone()
             .push(TransferUsdcToHedging {
+                corridor: UsdcCorridor::BASE_CCTP,
                 id: UsdcRebalanceId(Uuid::new_v4()),
                 amount: usdc(100),
                 revert_redrive_attempts: 0,
@@ -20893,7 +21073,7 @@ mod tests {
         .unwrap();
 
         let enqueued = service
-            .enqueue_transfer_usdc_to_market_making(usdc(100))
+            .enqueue_transfer_usdc_to_market_making(usdc(100), UsdcCorridor::BASE_CCTP)
             .await;
 
         assert!(
@@ -20910,6 +21090,7 @@ mod tests {
             .transfer_usdc_to_hedging_queue
             .clone()
             .push(TransferUsdcToHedging {
+                corridor: UsdcCorridor::BASE_CCTP,
                 id: UsdcRebalanceId(Uuid::new_v4()),
                 amount: usdc(100),
                 revert_redrive_attempts: 0,
@@ -20928,7 +21109,7 @@ mod tests {
         .unwrap();
 
         let enqueued = service
-            .enqueue_transfer_usdc_to_market_making(usdc(100))
+            .enqueue_transfer_usdc_to_market_making(usdc(100), UsdcCorridor::BASE_CCTP)
             .await;
 
         assert!(enqueued, "a Done job must NOT suppress a new transfer");
@@ -20942,6 +21123,7 @@ mod tests {
             .transfer_usdc_to_hedging_queue
             .clone()
             .push(TransferUsdcToHedging {
+                corridor: UsdcCorridor::BASE_CCTP,
                 id: UsdcRebalanceId(Uuid::new_v4()),
                 amount: usdc(100),
                 revert_redrive_attempts: 0,
@@ -20960,7 +21142,7 @@ mod tests {
         .unwrap();
 
         let enqueued = service
-            .enqueue_transfer_usdc_to_market_making(usdc(100))
+            .enqueue_transfer_usdc_to_market_making(usdc(100), UsdcCorridor::BASE_CCTP)
             .await;
 
         assert!(enqueued, "a Killed job must NOT suppress a new transfer");
@@ -20978,6 +21160,7 @@ mod tests {
             .transfer_usdc_to_hedging_queue
             .clone()
             .push(TransferUsdcToHedging {
+                corridor: UsdcCorridor::BASE_CCTP,
                 id: zombie_id,
                 amount: usdc(100),
                 revert_redrive_attempts: 0,
@@ -21017,7 +21200,7 @@ mod tests {
         attach_stores(&service, aggregate_pool, usdc_store).await;
 
         let enqueued = service
-            .enqueue_transfer_usdc_to_market_making(usdc(100))
+            .enqueue_transfer_usdc_to_market_making(usdc(100), UsdcCorridor::BASE_CCTP)
             .await;
 
         assert!(
@@ -21044,6 +21227,7 @@ mod tests {
             .transfer_usdc_to_market_making_queue
             .clone()
             .push(TransferUsdcToMarketMaking {
+                corridor: UsdcCorridor::BASE_CCTP,
                 id: zombie_id.clone(),
                 amount: usdc(100),
                 revert_redrive_attempts: 0,
@@ -21068,6 +21252,7 @@ mod tests {
             .transfer_usdc_to_hedging_queue
             .clone()
             .push(TransferUsdcToHedging {
+                corridor: UsdcCorridor::BASE_CCTP,
                 id: live_id.clone(),
                 amount: usdc(100),
                 revert_redrive_attempts: 0,
@@ -21079,7 +21264,7 @@ mod tests {
         attach_stores(&service, pool, usdc_store).await;
 
         let enqueued = service
-            .enqueue_transfer_usdc_to_market_making(usdc(100))
+            .enqueue_transfer_usdc_to_market_making(usdc(100), UsdcCorridor::BASE_CCTP)
             .await;
 
         assert!(
@@ -21110,6 +21295,7 @@ mod tests {
             .transfer_usdc_to_hedging_queue
             .clone()
             .push(TransferUsdcToHedging {
+                corridor: UsdcCorridor::BASE_CCTP,
                 id: UsdcRebalanceId(Uuid::new_v4()),
                 amount: usdc(100),
                 revert_redrive_attempts: 0,
@@ -21165,6 +21351,7 @@ mod tests {
             .transfer_usdc_to_hedging_queue
             .clone()
             .push(TransferUsdcToHedging {
+                corridor: UsdcCorridor::BASE_CCTP,
                 id: id.clone(),
                 amount: usdc(100),
                 revert_redrive_attempts: 0,
@@ -23063,6 +23250,7 @@ mod tests {
         let mut queue = trigger.transfer_usdc_to_market_making_queue.clone();
         queue
             .push(TransferUsdcToMarketMaking {
+                corridor: UsdcCorridor::BASE_CCTP,
                 id: id.clone(),
                 amount: usdc(400),
                 revert_redrive_attempts: 0,
@@ -24273,6 +24461,7 @@ mod tests {
             .transfer_usdc_to_market_making_queue
             .clone()
             .push(TransferUsdcToMarketMaking {
+                corridor: UsdcCorridor::BASE_CCTP,
                 id: id.clone(),
                 amount,
                 revert_redrive_attempts: 0,
@@ -24523,6 +24712,7 @@ mod tests {
             .send(
                 &id,
                 UsdcRebalanceCommand::Initiate {
+                    corridor: UsdcCorridor::BASE_CCTP,
                     direction: RebalanceDirection::BaseToAlpaca,
                     amount: usdc(400),
                     withdrawal: TransferRef::OnchainTx(burn_tx),
@@ -24717,6 +24907,7 @@ mod tests {
             .send(
                 &id,
                 UsdcRebalanceCommand::Initiate {
+                    corridor: UsdcCorridor::BASE_CCTP,
                     direction: RebalanceDirection::AlpacaToBase,
                     amount: usdc(400),
                     withdrawal: TransferRef::OnchainTx(burn_tx),
@@ -25055,6 +25246,7 @@ mod tests {
             .send(
                 &id,
                 UsdcRebalanceCommand::Initiate {
+                    corridor: UsdcCorridor::BASE_CCTP,
                     direction: RebalanceDirection::BaseToAlpaca,
                     amount: usdc(400),
                     withdrawal: TransferRef::OnchainTx(burn_tx),
@@ -25116,6 +25308,7 @@ mod tests {
             .send(
                 &id,
                 UsdcRebalanceCommand::Initiate {
+                    corridor: UsdcCorridor::BASE_CCTP,
                     direction: RebalanceDirection::BaseToAlpaca,
                     amount: usdc(400),
                     withdrawal: TransferRef::OnchainTx(burn_tx),
@@ -25166,6 +25359,7 @@ mod tests {
             .send(
                 id,
                 UsdcRebalanceCommand::Initiate {
+                    corridor: UsdcCorridor::BASE_CCTP,
                     direction: RebalanceDirection::BaseToAlpaca,
                     amount,
                     withdrawal: TransferRef::OnchainTx(burn_tx),
@@ -25208,6 +25402,7 @@ mod tests {
             .send(
                 id,
                 UsdcRebalanceCommand::BeginWithdrawal {
+                    corridor: UsdcCorridor::BASE_CCTP,
                     direction: RebalanceDirection::BaseToAlpaca,
                     amount,
                     from_block: 10,
@@ -25229,6 +25424,7 @@ mod tests {
             .send(
                 id,
                 UsdcRebalanceCommand::InitiateConversion {
+                    corridor: UsdcCorridor::BASE_CCTP,
                     direction: RebalanceDirection::AlpacaToBase,
                     amount,
                     order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
@@ -25249,6 +25445,7 @@ mod tests {
             .send(
                 id,
                 UsdcRebalanceCommand::BeginWithdrawal {
+                    corridor: UsdcCorridor::BASE_CCTP,
                     direction: RebalanceDirection::AlpacaToBase,
                     amount,
                     from_block: 10,
@@ -25268,12 +25465,22 @@ mod tests {
         id: &UsdcRebalanceId,
         amount: Usdc,
     ) {
+        seed_withdrawing_alpaca_to_base_on(store, id, amount, UsdcCorridor::BASE_CCTP).await;
+    }
+
+    async fn seed_withdrawing_alpaca_to_base_on(
+        store: &Store<UsdcRebalance>,
+        id: &UsdcRebalanceId,
+        amount: Usdc,
+        corridor: UsdcCorridor,
+    ) {
         let transfer_id = AlpacaTransferId::from(Uuid::new_v4());
 
         store
             .send(
                 id,
                 UsdcRebalanceCommand::InitiateConversion {
+                    corridor,
                     direction: RebalanceDirection::AlpacaToBase,
                     amount,
                     order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
@@ -25294,6 +25501,7 @@ mod tests {
             .send(
                 id,
                 UsdcRebalanceCommand::Initiate {
+                    corridor,
                     direction: RebalanceDirection::AlpacaToBase,
                     amount,
                     withdrawal: TransferRef::AlpacaId(transfer_id),
@@ -25464,6 +25672,7 @@ mod tests {
             .transfer_usdc_to_market_making_queue
             .clone()
             .push(TransferUsdcToMarketMaking {
+                corridor: UsdcCorridor::BASE_CCTP,
                 id: id.clone(),
                 amount,
                 revert_redrive_attempts: 0,
@@ -25506,6 +25715,7 @@ mod tests {
             .transfer_usdc_to_market_making_queue
             .clone()
             .push(TransferUsdcToMarketMaking {
+                corridor: UsdcCorridor::BASE_CCTP,
                 id: id.clone(),
                 amount,
                 revert_redrive_attempts: 0,
@@ -25556,6 +25766,7 @@ mod tests {
             .transfer_usdc_to_market_making_queue
             .clone()
             .push(TransferUsdcToMarketMaking {
+                corridor: UsdcCorridor::BASE_CCTP,
                 id: id.clone(),
                 amount,
                 revert_redrive_attempts: 0,
@@ -25608,6 +25819,7 @@ mod tests {
             .transfer_usdc_to_market_making_queue
             .clone()
             .push(TransferUsdcToMarketMaking {
+                corridor: UsdcCorridor::BASE_CCTP,
                 id: id.clone(),
                 amount,
                 revert_redrive_attempts: 0,
@@ -25771,6 +25983,7 @@ mod tests {
             .send(
                 id,
                 UsdcRebalanceCommand::InitiateConversion {
+                    corridor: UsdcCorridor::BASE_CCTP,
                     direction: RebalanceDirection::AlpacaToBase,
                     amount,
                     order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
@@ -25791,6 +26004,7 @@ mod tests {
             .send(
                 id,
                 UsdcRebalanceCommand::BeginWithdrawal {
+                    corridor: UsdcCorridor::BASE_CCTP,
                     direction: RebalanceDirection::AlpacaToBase,
                     amount,
                     from_block: 10,
@@ -25802,6 +26016,7 @@ mod tests {
             .send(
                 id,
                 UsdcRebalanceCommand::Initiate {
+                    corridor: UsdcCorridor::BASE_CCTP,
                     direction: RebalanceDirection::AlpacaToBase,
                     amount,
                     withdrawal: TransferRef::OnchainTx(withdrawal_tx),
@@ -25931,6 +26146,7 @@ mod tests {
             .transfer_usdc_to_hedging_queue
             .clone()
             .push(TransferUsdcToHedging {
+                corridor: UsdcCorridor::BASE_CCTP,
                 id: id.clone(),
                 amount,
                 revert_redrive_attempts: 0,
@@ -25968,6 +26184,7 @@ mod tests {
             .transfer_usdc_to_hedging_queue
             .clone()
             .push(TransferUsdcToHedging {
+                corridor: UsdcCorridor::BASE_CCTP,
                 id: id.clone(),
                 amount,
                 revert_redrive_attempts: 0,
@@ -26021,6 +26238,7 @@ mod tests {
             .transfer_usdc_to_hedging_queue
             .clone()
             .push(TransferUsdcToHedging {
+                corridor: UsdcCorridor::BASE_CCTP,
                 id: id.clone(),
                 amount,
                 revert_redrive_attempts: 0,
@@ -26092,6 +26310,7 @@ mod tests {
             .transfer_usdc_to_market_making_queue
             .clone()
             .push(TransferUsdcToMarketMaking {
+                corridor: UsdcCorridor::BASE_CCTP,
                 id: id.clone(),
                 amount,
                 revert_redrive_attempts: 0,
@@ -26166,6 +26385,7 @@ mod tests {
             .transfer_usdc_to_hedging_queue
             .clone()
             .push(TransferUsdcToHedging {
+                corridor: UsdcCorridor::BASE_CCTP,
                 id: id.clone(),
                 amount,
                 revert_redrive_attempts: 0,
@@ -26225,6 +26445,7 @@ mod tests {
             .transfer_usdc_to_market_making_queue
             .clone()
             .push(TransferUsdcToMarketMaking {
+                corridor: UsdcCorridor::BASE_CCTP,
                 id: id.clone(),
                 amount,
                 revert_redrive_attempts: 0,
@@ -26260,6 +26481,7 @@ mod tests {
             .send(
                 id,
                 UsdcRebalanceCommand::Initiate {
+                    corridor: UsdcCorridor::BASE_CCTP,
                     direction,
                     amount,
                     withdrawal: TransferRef::OnchainTx(burn_tx),
@@ -26310,6 +26532,7 @@ mod tests {
             .send(
                 id,
                 UsdcRebalanceCommand::Initiate {
+                    corridor: UsdcCorridor::BASE_CCTP,
                     direction,
                     amount,
                     withdrawal: TransferRef::OnchainTx(burn_tx),
@@ -26386,6 +26609,7 @@ mod tests {
             .send(
                 id,
                 UsdcRebalanceCommand::Initiate {
+                    corridor: UsdcCorridor::BASE_CCTP,
                     direction,
                     amount,
                     withdrawal: TransferRef::OnchainTx(burn_tx),
@@ -26489,6 +26713,7 @@ mod tests {
         let mut queue = service.transfer_usdc_to_hedging_queue.clone();
         queue
             .push(TransferUsdcToHedging {
+                corridor: UsdcCorridor::BASE_CCTP,
                 id: id.clone(),
                 amount: usdc(400),
                 revert_redrive_attempts: 0,
@@ -26538,6 +26763,7 @@ mod tests {
             .transfer_usdc_to_hedging_queue
             .clone()
             .push(TransferUsdcToHedging {
+                corridor: UsdcCorridor::BASE_CCTP,
                 id: id.clone(),
                 amount: usdc(400),
                 revert_redrive_attempts: 0,
@@ -26636,6 +26862,7 @@ mod tests {
             .transfer_usdc_to_hedging_queue
             .clone()
             .push(TransferUsdcToHedging {
+                corridor: UsdcCorridor::BASE_CCTP,
                 id: id.clone(),
                 amount: usdc(400),
                 revert_redrive_attempts: 0,
@@ -26689,6 +26916,7 @@ mod tests {
             .transfer_usdc_to_hedging_queue
             .clone()
             .push(TransferUsdcToHedging {
+                corridor: UsdcCorridor::BASE_CCTP,
                 id: id.clone(),
                 amount: usdc(400),
                 revert_redrive_attempts: 0,
@@ -26736,6 +26964,7 @@ mod tests {
             .transfer_usdc_to_hedging_queue
             .clone()
             .push(TransferUsdcToHedging {
+                corridor: UsdcCorridor::BASE_CCTP,
                 id: id.clone(),
                 amount: usdc(400),
                 revert_redrive_attempts: 0,
@@ -26785,6 +27014,7 @@ mod tests {
             .transfer_usdc_to_hedging_queue
             .clone()
             .push(TransferUsdcToHedging {
+                corridor: UsdcCorridor::BASE_CCTP,
                 id: id.clone(),
                 amount: usdc(400),
                 revert_redrive_attempts: 0,
@@ -26865,6 +27095,7 @@ mod tests {
             .send(
                 &id,
                 UsdcRebalanceCommand::Initiate {
+                    corridor: UsdcCorridor::BASE_CCTP,
                     direction: RebalanceDirection::BaseToAlpaca,
                     amount: usdc(400),
                     withdrawal: TransferRef::OnchainTx(withdrawal),
@@ -27015,6 +27246,7 @@ mod tests {
             .receive::<UsdcRebalance>(
                 id.clone(),
                 UsdcRebalanceEvent::ConversionInitiated {
+                    corridor: UsdcCorridor::BASE_CCTP,
                     direction: RebalanceDirection::BaseToAlpaca,
                     amount: usdc(400),
                     order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
@@ -27072,6 +27304,7 @@ mod tests {
             .receive::<UsdcRebalance>(
                 id.clone(),
                 UsdcRebalanceEvent::ConversionInitiated {
+                    corridor: UsdcCorridor::BASE_CCTP,
                     direction: RebalanceDirection::AlpacaToBase,
                     amount: usdc(400),
                     order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
@@ -27141,6 +27374,7 @@ mod tests {
             .send(
                 &id,
                 UsdcRebalanceCommand::InitiateConversion {
+                    corridor: UsdcCorridor::BASE_CCTP,
                     direction: RebalanceDirection::AlpacaToBase,
                     amount: usdc(400),
                     order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
@@ -27209,6 +27443,7 @@ mod tests {
         // and deposit all completed; the USDC->USD conversion failed last.
         for command in [
             UsdcRebalanceCommand::Initiate {
+                corridor: UsdcCorridor::BASE_CCTP,
                 direction: RebalanceDirection::BaseToAlpaca,
                 amount: usdc(400),
                 withdrawal: TransferRef::OnchainTx(burn_tx),
@@ -27521,6 +27756,7 @@ mod tests {
         let schedulers = RebalancingSchedulers::new(&apalis_pool);
         let trigger = RebalancingService::new(
             RebalancingServiceConfig {
+                served_usdc_corridor: UsdcCorridor::BASE_CCTP,
                 poll_freshness: PollFreshness::always_fresh(),
                 inventory_staleness_bound: Duration::from_secs(300),
                 cash_reserved: None,
@@ -27631,6 +27867,7 @@ mod tests {
             .send(
                 &id,
                 UsdcRebalanceCommand::Initiate {
+                    corridor: UsdcCorridor::BASE_CCTP,
                     direction: RebalanceDirection::BaseToAlpaca,
                     amount: Usdc::new(float!(500)),
                     withdrawal: TransferRef::OnchainTx(tx_hash),
@@ -27724,6 +27961,7 @@ mod tests {
             .send(
                 &id,
                 UsdcRebalanceCommand::Initiate {
+                    corridor: UsdcCorridor::BASE_CCTP,
                     direction: RebalanceDirection::AlpacaToBase,
                     amount: Usdc::new(float!(1000)),
                     withdrawal: TransferRef::AlpacaId(transfer_id),
@@ -27813,6 +28051,7 @@ mod tests {
             .send(
                 &id,
                 UsdcRebalanceCommand::Initiate {
+                    corridor: UsdcCorridor::BASE_CCTP,
                     direction: RebalanceDirection::AlpacaToBase,
                     amount: Usdc::new(float!(100)),
                     withdrawal: TransferRef::AlpacaId(transfer_id),
@@ -27856,6 +28095,7 @@ mod tests {
             .send(
                 &id,
                 UsdcRebalanceCommand::Initiate {
+                    corridor: UsdcCorridor::BASE_CCTP,
                     direction: RebalanceDirection::AlpacaToBase,
                     amount: Usdc::new(float!(100)),
                     withdrawal: TransferRef::AlpacaId(transfer_id),
@@ -27914,6 +28154,7 @@ mod tests {
             .send(
                 &id,
                 UsdcRebalanceCommand::InitiateConversion {
+                    corridor: UsdcCorridor::BASE_CCTP,
                     direction: RebalanceDirection::AlpacaToBase,
                     amount: Usdc::new(float!(100)),
                     order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
@@ -27988,6 +28229,7 @@ mod tests {
             .receive::<UsdcRebalance>(
                 id.clone(),
                 UsdcRebalanceEvent::Initiated {
+                    corridor: UsdcCorridor::BASE_CCTP,
                     direction: RebalanceDirection::AlpacaToBase,
                     amount: Usdc::new(float!(1000)),
                     withdrawal_ref: TransferRef::OnchainTx(tx_hash),
@@ -28041,6 +28283,7 @@ mod tests {
             .send(
                 &id,
                 UsdcRebalanceCommand::Initiate {
+                    corridor: UsdcCorridor::BASE_CCTP,
                     direction: RebalanceDirection::BaseToAlpaca,
                     amount: Usdc::new(float!(500)),
                     withdrawal: TransferRef::OnchainTx(tx_hash),
@@ -30468,6 +30711,7 @@ mod tests {
             .on_usdc_rebalance(
                 id.clone(),
                 UsdcRebalanceEvent::ConversionInitiated {
+                    corridor: UsdcCorridor::BASE_CCTP,
                     direction: RebalanceDirection::BaseToAlpaca,
                     amount: usdc(700),
                     order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
@@ -30558,6 +30802,7 @@ mod tests {
                 .on_usdc_rebalance(
                     task_id,
                     UsdcRebalanceEvent::ConversionInitiated {
+                        corridor: UsdcCorridor::BASE_CCTP,
                         direction: RebalanceDirection::BaseToAlpaca,
                         amount: usdc(700),
                         order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
@@ -35013,5 +35258,465 @@ mod tests {
              later snapshot polls keep healing"
         );
         drop(inventory);
+    }
+
+    /// The dispatched job names the configured corridor, not a default.
+    #[tokio::test]
+    async fn usdc_transfer_job_carries_the_configured_corridor() {
+        let corridor = UsdcCorridor::HubRouted {
+            chain: Chain::Robinhood,
+            hop: HopKind::Relay,
+        };
+        let config = RebalancingServiceConfig {
+            usdc: Some(UsdcCorridorCtx {
+                corridor,
+                threshold: ImbalanceThreshold {
+                    target: float!(0.5),
+                    deviation: float!(0.2),
+                },
+            }),
+            ..test_config()
+        };
+        let inventory = InventoryView::default()
+            .with_usdc(usdc(100), usdc(900))
+            .with_withdrawable_cash_cents(90_000);
+        let trigger = make_trigger_with_inventory_config(inventory, config).await;
+
+        trigger.check_and_trigger_usdc().await;
+
+        let job = pending_transfer_usdc_to_market_making_job(&trigger).await;
+        assert_eq!(job.corridor, corridor);
+    }
+
+    const ROBINHOOD_RELAY: UsdcCorridor = UsdcCorridor::HubRouted {
+        chain: Chain::Robinhood,
+        hop: HopKind::Relay,
+    };
+
+    fn corridor_pages(notifier: &CapturingNotifier) -> Vec<String> {
+        notifier
+            .messages()
+            .into_iter()
+            .filter(|message| message.starts_with("USDC transfer corridor mismatch"))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn startup_holds_a_transfer_on_a_corridor_this_build_does_not_serve() {
+        let pool = crate::test_utils::setup_test_db().await;
+        let store = test_store::<UsdcRebalance>(pool.clone(), ());
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        seed_withdrawing_alpaca_to_base_on(&store, &id, usdc(400), ROBINHOOD_RELAY).await;
+        let notifier = Arc::new(CapturingNotifier::default());
+        let service = make_trigger_with_inventory_config_and_notifier(
+            InventoryView::default(),
+            test_config(),
+            notifier.clone(),
+        )
+        .await;
+
+        service.recover_usdc_guard(&pool, &store).await.unwrap();
+
+        assert_eq!(
+            count_pending_transfer_usdc_to_market_making_jobs(&service).await,
+            0,
+            "a transfer on a corridor this build does not serve must not be re-armed"
+        );
+        assert!(service.usdc_in_progress.load(Ordering::SeqCst));
+        let pages = corridor_pages(&notifier);
+        assert_eq!(pages.len(), 1, "got {pages:?}");
+        assert!(pages[0].contains(&id.to_string()), "{}", pages[0]);
+    }
+
+    #[tokio::test]
+    async fn manual_resume_refuses_a_transfer_on_a_corridor_this_build_does_not_serve() {
+        let (trigger, pool, store) = make_resume_trigger().await;
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        seed_withdrawing_alpaca_to_base_on(&store, &id, usdc(400), ROBINHOOD_RELAY).await;
+
+        let error = trigger
+            .resume_usdc_transfer(&pool, &id, RebalanceDirection::AlpacaToBase)
+            .await
+            .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .starts_with("USDC transfer corridor mismatch"),
+            "got {error}"
+        );
+        assert!(
+            market_making_job_rows(&trigger).await.is_empty(),
+            "a refused resume must not enqueue anything"
+        );
+    }
+
+    /// A live job cannot move a transfer on a corridor this build does not
+    /// serve (it only re-queues itself), so startup pages for it even though
+    /// a job still owns it.
+    #[tokio::test]
+    async fn startup_pages_for_a_live_job_on_a_corridor_this_build_does_not_serve() {
+        let pool = crate::test_utils::setup_test_db().await;
+        let store = test_store::<UsdcRebalance>(pool.clone(), ());
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let amount = usdc(400);
+        store
+            .send(
+                &id,
+                UsdcRebalanceCommand::InitiateConversion {
+                    corridor: ROBINHOOD_RELAY,
+                    direction: RebalanceDirection::AlpacaToBase,
+                    amount,
+                    order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
+                },
+            )
+            .await
+            .unwrap();
+        let notifier = Arc::new(CapturingNotifier::default());
+        let service = make_trigger_with_inventory_config_and_notifier(
+            InventoryView::default(),
+            test_config(),
+            notifier.clone(),
+        )
+        .await;
+        service
+            .transfer_usdc_to_market_making_queue
+            .clone()
+            .push(TransferUsdcToMarketMaking {
+                corridor: ROBINHOOD_RELAY,
+                id: id.clone(),
+                amount,
+                revert_redrive_attempts: 0,
+                backpressure_streak: BackpressureStreak::default(),
+            })
+            .await
+            .unwrap();
+
+        service.recover_usdc_guard(&pool, &store).await.unwrap();
+
+        assert!(service.usdc_in_progress.load(Ordering::SeqCst));
+        let pages = corridor_pages(&notifier);
+        assert_eq!(pages.len(), 1, "got {pages:?}");
+        assert!(pages[0].contains(&id.to_string()), "{}", pages[0]);
+        assert_eq!(
+            notifier.messages().len(),
+            1,
+            "only the corridor page, not the generic latched page: {:?}",
+            notifier.messages()
+        );
+    }
+
+    struct RefusingBaseToAlpaca;
+
+    #[async_trait]
+    impl ResumeBaseToAlpaca for RefusingBaseToAlpaca {
+        async fn resume_base_to_alpaca(
+            &self,
+            id: &UsdcRebalanceId,
+            _amount: Usdc,
+            _corridor: UsdcCorridor,
+        ) -> Result<(), UsdcTransferError> {
+            Err(UsdcTransferError::CorridorMismatch {
+                id: id.clone(),
+                recorded: ROBINHOOD_RELAY,
+                served: UsdcCorridor::BASE_CCTP,
+                holds_guard: true,
+            })
+        }
+    }
+
+    /// A build that does not serve a post-burn transfer's corridor refuses
+    /// its job; after a roll-forward to a build that serves it, a job still
+    /// drives the transfer.
+    #[tokio::test]
+    async fn refused_unserved_corridor_job_resumes_after_roll_forward() {
+        let pool = crate::test_utils::setup_test_db().await;
+        let store = test_store::<UsdcRebalance>(pool.clone(), ());
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let amount = usdc(400);
+        let burn_tx = B256::repeat_byte(0x0b);
+        for command in [
+            UsdcRebalanceCommand::Initiate {
+                corridor: ROBINHOOD_RELAY,
+                direction: RebalanceDirection::BaseToAlpaca,
+                amount,
+                withdrawal: TransferRef::OnchainTx(burn_tx),
+            },
+            UsdcRebalanceCommand::ConfirmWithdrawal {
+                withdrawal_tx: None,
+            },
+            UsdcRebalanceCommand::InitiateBridging { burn_tx },
+            UsdcRebalanceCommand::TimeoutAttestation {
+                retry_deadline_at: Utc::now() + ChronoDuration::hours(1),
+            },
+        ] {
+            store.send(&id, command).await.unwrap();
+        }
+        let notifier = Arc::new(CapturingNotifier::default());
+        let serving = make_trigger_with_inventory_config_and_notifier(
+            InventoryView::default(),
+            RebalancingServiceConfig {
+                served_usdc_corridor: ROBINHOOD_RELAY,
+                ..test_config()
+            },
+            notifier.clone(),
+        )
+        .await;
+        let job = TransferUsdcToHedging {
+            corridor: ROBINHOOD_RELAY,
+            id: id.clone(),
+            amount,
+            revert_redrive_attempts: 0,
+            backpressure_streak: BackpressureStreak::default(),
+        };
+        serving
+            .transfer_usdc_to_hedging_queue
+            .clone()
+            .push(job.clone())
+            .await
+            .unwrap();
+        sqlx_apalis::query("UPDATE Jobs SET status = 'Done' WHERE job_type = ?")
+            .bind(std::any::type_name::<TransferUsdcToHedging>())
+            .execute(serving.transfer_usdc_to_hedging_queue.pool())
+            .await
+            .unwrap();
+        let unserved_build = TransferUsdcToHedgingCtx {
+            transfer: Arc::new(RefusingBaseToAlpaca),
+            timeout: Duration::from_secs(3600),
+            job_queue: serving.transfer_usdc_to_hedging_queue.clone(),
+            max_burn_revert_redrives: 5,
+            notifier: notifier.clone(),
+            driver_gate: UsdcDriverGate::unpaused(),
+        };
+        job.perform(&unserved_build).await.unwrap();
+
+        serving.recover_usdc_guard(&pool, &store).await.unwrap();
+
+        assert_eq!(
+            count_pending_transfer_usdc_to_hedging_jobs(&serving).await,
+            1,
+            "a job must drive the transfer on the serving build"
+        );
+        assert!(serving.usdc_in_progress.load(Ordering::SeqCst));
+        assert_eq!(notifier.messages(), Vec::<String>::new());
+    }
+
+    /// Yields once before capturing, so a concurrent caller runs while a page
+    /// is in flight.
+    #[derive(Default)]
+    struct YieldingNotifier(CapturingNotifier);
+
+    #[async_trait]
+    impl crate::alerts::Notifier for YieldingNotifier {
+        async fn notify(&self, message: &str) -> Result<(), crate::alerts::NotifierError> {
+            tokio::task::yield_now().await;
+            self.0.notify(message).await
+        }
+    }
+
+    /// Startup and a sweep can page the same transfer at once; only one of
+    /// them may send.
+    #[tokio::test]
+    async fn concurrent_unserved_corridor_pages_send_once() {
+        let notifier = Arc::new(YieldingNotifier::default());
+        let trigger = make_trigger_with_inventory_config_and_notifier(
+            InventoryView::default(),
+            test_config(),
+            notifier.clone(),
+        )
+        .await;
+        let id = UsdcRebalanceId(Uuid::new_v4());
+
+        tokio::join!(
+            trigger.page_unserved_corridor_once(&id, ROBINHOOD_RELAY),
+            trigger.page_unserved_corridor_once(&id, ROBINHOOD_RELAY),
+        );
+
+        assert_eq!(corridor_pages(&notifier.0).len(), 1);
+    }
+
+    async fn make_unserved_corridor_trigger(
+        pool: &SqlitePool,
+        store: Arc<Store<UsdcRebalance>>,
+        notifier: Arc<dyn crate::alerts::Notifier>,
+    ) -> Arc<RebalancingService> {
+        let trigger = make_trigger_with_inventory_config_and_notifier(
+            InventoryView::default(),
+            test_config(),
+            notifier,
+        )
+        .await;
+        trigger
+            .set_stores(
+                Arc::new(test_store::<TokenizedEquityMint>(
+                    pool.clone(),
+                    crate::rebalancing::equity::EquityTransferServices::panicking(),
+                )),
+                Arc::new(test_store::<EquityRedemption>(
+                    pool.clone(),
+                    crate::rebalancing::equity::EquityTransferServices::panicking(),
+                )),
+                store,
+            )
+            .await;
+        trigger
+    }
+
+    /// A corridor page that fails at startup is retried by the sweep until it
+    /// is delivered, then never sent again.
+    #[tokio::test]
+    async fn startup_corridor_page_that_fails_is_retried_by_the_sweep() {
+        let pool = crate::test_utils::setup_test_db().await;
+        let store = Arc::new(test_store::<UsdcRebalance>(pool.clone(), ()));
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        store
+            .send(
+                &id,
+                UsdcRebalanceCommand::InitiateConversion {
+                    corridor: ROBINHOOD_RELAY,
+                    direction: RebalanceDirection::AlpacaToBase,
+                    amount: usdc(400),
+                    order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
+                },
+            )
+            .await
+            .unwrap();
+        let notifier = Arc::new(FlakyNotifier {
+            remaining_failures: std::sync::atomic::AtomicUsize::new(1),
+            delivered: std::sync::Mutex::new(Vec::new()),
+        });
+        let trigger = make_unserved_corridor_trigger(&pool, store.clone(), notifier.clone()).await;
+
+        trigger.recover_usdc_guard(&pool, &store).await.unwrap();
+        assert_eq!(notifier.delivered.lock().unwrap().len(), 0);
+
+        for _ in 0..2 {
+            trigger
+                .expire_stuck_usdc_rebalances(Utc::now())
+                .await
+                .unwrap();
+        }
+
+        let delivered = notifier.delivered.lock().unwrap().clone();
+        assert_eq!(delivered.len(), 1, "got {delivered:?}");
+        assert!(
+            delivered[0].starts_with("USDC transfer corridor mismatch"),
+            "only the corridor page, got {delivered:?}"
+        );
+        assert!(trigger.usdc_in_progress.load(Ordering::SeqCst));
+    }
+
+    /// An operator reconcile of a held transfer on an unserved corridor
+    /// releases the guard on the next sweep, as for any reconciled transfer.
+    #[tokio::test]
+    async fn reconciled_unserved_corridor_transfer_releases_the_guard_on_the_next_sweep() {
+        let pool = crate::test_utils::setup_test_db().await;
+        let store = Arc::new(test_store::<UsdcRebalance>(pool.clone(), ()));
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        seed_withdrawing_alpaca_to_base_on(&store, &id, usdc(400), ROBINHOOD_RELAY).await;
+        for command in [
+            UsdcRebalanceCommand::ConfirmWithdrawal {
+                withdrawal_tx: None,
+            },
+            UsdcRebalanceCommand::FailBridging {
+                reason: "withdrawn funds need the operator".to_string(),
+            },
+        ] {
+            store.send(&id, command).await.unwrap();
+        }
+        let notifier = Arc::new(CapturingNotifier::default());
+        let trigger = make_unserved_corridor_trigger(&pool, store.clone(), notifier.clone()).await;
+        trigger.recover_usdc_guard(&pool, &store).await.unwrap();
+        assert!(trigger.usdc_in_progress.load(Ordering::SeqCst));
+
+        store
+            .send(
+                &id,
+                UsdcRebalanceCommand::ReconcileStuckRebalance {
+                    reason: crate::usdc_rebalance::ReconcileReason::FundsMovedManually,
+                },
+            )
+            .await
+            .unwrap();
+        trigger
+            .expire_stuck_usdc_rebalances(Utc::now())
+            .await
+            .unwrap();
+
+        assert!(
+            !trigger.usdc_in_progress.load(Ordering::SeqCst),
+            "a reconciled transfer must release the guard"
+        );
+        assert_eq!(corridor_pages(&notifier).len(), 1);
+        assert_eq!(
+            notifier.messages().len(),
+            1,
+            "no page besides the corridor one: {:?}",
+            notifier.messages()
+        );
+    }
+
+    /// An operator failing a held unserved-corridor transfer before its burn
+    /// leaves a state that holds no guard and cannot be reconciled: the next
+    /// sweep releases the guard instead of re-latching it or paging a stall.
+    #[tokio::test]
+    async fn failed_pre_burn_unserved_corridor_transfer_releases_the_guard_on_the_next_sweep() {
+        let pool = crate::test_utils::setup_test_db().await;
+        let store = Arc::new(test_store::<UsdcRebalance>(pool.clone(), ()));
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let amount = usdc(400);
+        for command in [
+            UsdcRebalanceCommand::BeginWithdrawal {
+                direction: RebalanceDirection::BaseToAlpaca,
+                corridor: ROBINHOOD_RELAY,
+                amount,
+                from_block: 1,
+            },
+            UsdcRebalanceCommand::Initiate {
+                direction: RebalanceDirection::BaseToAlpaca,
+                corridor: ROBINHOOD_RELAY,
+                amount,
+                withdrawal: TransferRef::OnchainTx(B256::repeat_byte(0x0a)),
+            },
+            UsdcRebalanceCommand::ConfirmWithdrawal {
+                withdrawal_tx: None,
+            },
+            UsdcRebalanceCommand::BeginBridging {
+                from_block: 2,
+                burn_amount: None,
+            },
+        ] {
+            store.send(&id, command).await.unwrap();
+        }
+        let notifier = Arc::new(CapturingNotifier::default());
+        let trigger = make_unserved_corridor_trigger(&pool, store.clone(), notifier.clone()).await;
+        trigger.recover_usdc_guard(&pool, &store).await.unwrap();
+        assert!(trigger.usdc_in_progress.load(Ordering::SeqCst));
+
+        store
+            .send(
+                &id,
+                UsdcRebalanceCommand::FailBridging {
+                    reason: "operator failed the pre-burn transfer".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+        trigger
+            .expire_stuck_usdc_rebalances(Utc::now() + ChronoDuration::hours(2))
+            .await
+            .unwrap();
+
+        assert!(
+            !trigger.usdc_in_progress.load(Ordering::SeqCst),
+            "a transfer that no longer holds the guard must release it"
+        );
+        assert!(!trigger.usdc_tracking.read().await.contains_key(&id));
+        assert_eq!(
+            notifier.messages().len(),
+            1,
+            "only the startup corridor page: {:?}",
+            notifier.messages()
+        );
     }
 }

@@ -7264,6 +7264,7 @@ dependencies = [
  "bon",
  "chrono",
  "clap",
+ "httpmock",
  "itertools 0.14.0",
  "opentelemetry",
  "opentelemetry-appender-tracing",
@@ -7509,7 +7510,7 @@ dependencies = [
 [[package]]
 name = "st0x-issuance-client"
 version = "0.1.0"
-source = "git+https://github.com/ST0x-Technology/st0x.issuance.git?branch=2026-08-06-mint-authorization-client-dto#5c7dabf5f9f50145960d590e3f40cdc430710773"
+source = "git+https://github.com/ST0x-Technology/st0x.issuance.git?tag=v0.13.3#acec0d92e2e7583060bd7df53c30cafc9055ea9e"
 dependencies = [
  "reqwest 0.12.28",
  "st0x-issuance-dto",
@@ -7520,7 +7521,7 @@ dependencies = [
 [[package]]
 name = "st0x-issuance-dto"
 version = "0.1.0"
-source = "git+https://github.com/ST0x-Technology/st0x.issuance.git?branch=2026-08-06-mint-authorization-client-dto#5c7dabf5f9f50145960d590e3f40cdc430710773"
+source = "git+https://github.com/ST0x-Technology/st0x.issuance.git?tag=v0.13.3#acec0d92e2e7583060bd7df53c30cafc9055ea9e"
 dependencies = [
  "alloy-primitives",
  "serde",
@@ -7548,7 +7549,7 @@ dependencies = [
 [[package]]
 name = "st0x-pricing-types"
 version = "0.8.0"
-source = "git+https://github.com/ST0x-Technology/st0x.pricing-types?rev=152d7486ccc8a4b6c2750716415320c074e9f321#152d7486ccc8a4b6c2750716415320c074e9f321"
+source = "git+https://github.com/ST0x-Technology/st0x.pricing-types?tag=v0.8.0#152d7486ccc8a4b6c2750716415320c074e9f321"
 dependencies = [
  "chrono",
  "serde",

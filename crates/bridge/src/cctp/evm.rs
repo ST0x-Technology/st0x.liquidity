@@ -1,10 +1,11 @@
 //! Single-chain CCTP operations.
 
+use alloy::consensus::Transaction as _;
 use alloy::primitives::{Address, B256, Bytes, FixedBytes, TxHash, U256};
 use alloy::providers::Provider;
 use alloy::rpc::types::{Filter, TransactionReceipt};
 use alloy::sol;
-use alloy::sol_types::SolEvent;
+use alloy::sol_types::{SolCall, SolEvent};
 use std::num::NonZeroU32;
 use std::time::{Duration, Instant};
 use tokio::time::{MissedTickBehavior, interval};
@@ -13,13 +14,13 @@ use tracing::{debug, info, trace, warn};
 #[cfg(test)]
 use st0x_evm::Evm;
 use st0x_evm::{
-    EvmError, IntoErrorRegistry, NODE_SYNC_MAX_ATTEMPTS, NODE_SYNC_POLL_INTERVAL, Wallet,
-    wait_for_node_sync,
+    Chain, EvmError, IntoErrorRegistry, NODE_SYNC_MAX_ATTEMPTS, NODE_SYNC_POLL_INTERVAL,
+    PreparedTransaction, Wallet, wait_for_node_sync,
 };
 
 use super::{
-    CctpError, CctpReceivedMessage, FAST_TRANSFER_THRESHOLD, MessageTransmitterV2, MintReceipt,
-    TokenMessengerV2, parse_received_message,
+    CctpError, CctpReceivedMessage, FAST_TRANSFER_THRESHOLD, MessageTransmitterV2, MinedTx,
+    MintReceipt, MintScanFloorCheck, TokenMessengerV2, UsdcTransferStatus, parse_received_message,
 };
 use crate::BridgeDirection;
 
@@ -75,26 +76,51 @@ const SCAN_RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_millis
 /// trusted as a true absence (the burn lands at/after `from_block`).
 const SCAN_FINALITY_MARGIN: u64 = 2;
 
-/// Number of [`CCTP_RECOVERY_LOG_BLOCK_CHUNK`]-sized chunks
-/// [`CctpEndpoint::reconstruct_existing_mint`]'s retry scans backward from
-/// the current head before giving up, bounding a single scan attempt's cost.
-///
-/// This floor is safe specifically because `reconstruct_existing_mint` only
-/// runs after [`CctpEndpoint::recover_already_minted`]'s probe loop has
-/// itself just observed `usedNonces()` flip to consumed, within the current
-/// recovery window (production: ~2 minutes). The matching `MessageReceived`
-/// log is therefore necessarily within the last few chunks of the current
-/// head, not somewhere deep in chain history, so three chunks (60,000
-/// blocks -- many hours even on a fast chain like Base) is a wide margin
-/// over the sub-minute recency this bound relies on, while still cutting a
-/// worst-case scan from thousands of chunks to three.
-///
-/// [`CctpEndpoint::find_existing_mint`]'s own scan is NOT bounded by this:
-/// it is a proactive check run during crash-recovery resume, which may be
-/// re-checking a transfer that stalled for an arbitrary, unbounded amount of
-/// time (e.g. days, waiting on an operator) before this code ever runs, so
-/// the "the mint is recent" argument above does not hold there.
-const RECONSTRUCTION_SCAN_LOOKBACK_CHUNKS: u64 = 3;
+/// How far back [`CctpEndpoint::reconstruct_existing_mint`] scans from the
+/// head. It runs only after [`CctpEndpoint::recover_already_minted`] saw
+/// `usedNonces()` flip to consumed within its ~2 minute window, so the log is
+/// within minutes of the head; this bounds the cost of a lagging node.
+const RECONSTRUCTION_SCAN_LOOKBACK: Duration = Duration::from_secs(33 * 60 * 60 + 20 * 60);
+
+/// How far back [`CctpEndpoint::find_existing_mint`] always looks from the
+/// head, below a captured floor too: that floor is read after Circle attests,
+/// so a relayer's mint can predate it. Above the 24 h attestation deadline; a
+/// mint older than both is left to the operator.
+const MINT_SCAN_LOOKBACK: Duration = Duration::from_secs(33 * 60 * 60 + 20 * 60);
+
+/// How far below a captured floor [`CctpEndpoint::find_existing_mint`] scans,
+/// for a relayer mint between Circle's attestation and the floor capture. The
+/// bot polls attestations every 5 s, so this is many polls and job retries.
+const CAPTURED_FLOOR_MARGIN: Duration = Duration::from_secs(10 * 60);
+
+/// The mint scan bounds in one chain's blocks: the time spans above divided
+/// by the chain's fastest block cadence, rounded up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ScanWindow {
+    pub(crate) floor_margin: u64,
+    pub(crate) mint_lookback: u64,
+    pub(crate) reconstruction_lookback: u64,
+}
+
+impl ScanWindow {
+    pub(crate) const fn for_chain(chain: Chain) -> Self {
+        let interval = whole_millis(chain.min_block_interval());
+
+        Self {
+            floor_margin: whole_millis(CAPTURED_FLOOR_MARGIN).div_ceil(interval),
+            mint_lookback: whole_millis(MINT_SCAN_LOOKBACK).div_ceil(interval),
+            reconstruction_lookback: whole_millis(RECONSTRUCTION_SCAN_LOOKBACK).div_ceil(interval),
+        }
+    }
+}
+
+/// Whole milliseconds in `duration`, saturating far above any span here.
+const fn whole_millis(duration: Duration) -> u64 {
+    duration
+        .as_secs()
+        .saturating_mul(1000)
+        .saturating_add(duration.subsec_millis() as u64)
+}
 
 /// Delay between the `usedNonces()` probes that
 /// [`CctpEvm::recover_already_minted`] runs after a failed `receiveMessage`.
@@ -163,6 +189,21 @@ impl MintRecoveryConfig {
         Self {
             probe_interval: MINT_RECOVERY_PROBE_INTERVAL,
             probes: MINT_RECOVERY_PROBES,
+        }
+    }
+
+    /// Two probes 10 ms apart, for downstream tests (via
+    /// [`with_fast_mint_recovery_policy`][fast_policy]).
+    ///
+    /// [fast_policy]: super::CctpBridge::with_fast_mint_recovery_policy
+    #[cfg(any(test, feature = "test-support"))]
+    pub(super) const fn fast() -> Self {
+        Self {
+            probe_interval: Duration::from_millis(10),
+            probes: match NonZeroU32::new(2) {
+                Some(probes) => probes,
+                None => panic!("fast mint recovery probes must be non-zero"),
+            },
         }
     }
 }
@@ -256,6 +297,8 @@ pub(crate) struct CctpEndpoint<W: Wallet> {
     message_transmitter_address: Address,
     /// Wallet for submitting write transactions
     wallet: W,
+    /// Mint scan bounds in this chain's blocks.
+    scan_window: ScanWindow,
     /// Poll interval between `eth_blockNumber` calls in [`wait_for_node_sync`].
     ///
     /// Production always uses [`NODE_SYNC_POLL_INTERVAL`]. Tests override it to
@@ -281,6 +324,7 @@ impl<W: Wallet> CctpEndpoint<W> {
     /// The wallet's provider is used for read-only view calls.
     /// The wallet itself handles signing and submission of write transactions.
     pub(crate) fn new(
+        chain: Chain,
         usdc: Address,
         token_messenger: Address,
         message_transmitter: Address,
@@ -291,6 +335,7 @@ impl<W: Wallet> CctpEndpoint<W> {
             token_messenger_address: token_messenger,
             message_transmitter_address: message_transmitter,
             wallet,
+            scan_window: ScanWindow::for_chain(chain),
             node_sync_poll_interval: NODE_SYNC_POLL_INTERVAL,
             burn_drop_config: BurnDropConfig::defaults(),
             mint_recovery_config: MintRecoveryConfig::defaults(),
@@ -653,8 +698,7 @@ impl<W: Wallet> CctpEndpoint<W> {
     /// is provably this transfer's -- not merely a same-amount burn from the same
     /// wallet to a different destination. The head is captured before the burn, so
     /// this transfer's burn lands strictly after `from_block`; the scan excludes the
-    /// `from_block` block itself so an earlier identical burn is never adopted --
-    /// consistent with [`find_recent_mint`](Self::find_recent_mint).
+    /// `from_block` block itself so an earlier identical burn is never adopted.
     ///
     /// Returns `Ok(None)` ONLY when the queried node is confirmations-deep past
     /// `from_block` and repeated scans agree the burn is absent; a node that may
@@ -714,53 +758,6 @@ impl<W: Wallet> CctpEndpoint<W> {
         Err(CctpError::ScanInconclusive { from_block })
     }
 
-    /// Scans for a `MintAndWithdraw` event minting to `recipient` strictly after
-    /// `from_block`, returning the receipt of the most recent match.
-    ///
-    /// Used for crash-safe mint recovery: a transfer records the destination
-    /// chain head before submitting the mint, so on resume this detects an
-    /// already-submitted mint instead of re-minting (which reverts on the
-    /// already-used CCTP nonce). The mint is recorded strictly after the captured
-    /// head, so the scan excludes the head block itself -- this bounds the window
-    /// to blocks mined after capture and prevents adopting an earlier mint to the
-    /// same wallet. Matching on `mintRecipient` and `mintToken` plus this bound
-    /// and the single-in-flight invariant (one USDC rebalance at a time) guarantees the
-    /// match is the resuming transfer's mint. The event carries the actual amount
-    /// received and fee collected, so the adopted mint records the same inventory
-    /// figures a fresh mint would.
-    pub(super) async fn find_recent_mint(
-        &self,
-        recipient: Address,
-        from_block: u64,
-    ) -> Result<Option<MintReceipt>, CctpError> {
-        let filter = Filter::new()
-            .from_block(from_block)
-            .address(self.token_messenger_address)
-            .event_signature(TokenMessengerV2::MintAndWithdraw::SIGNATURE_HASH);
-
-        let logs = self.wallet.provider().get_logs(&filter).await?;
-
-        for log in logs.iter().rev() {
-            let decoded = log.log_decode::<TokenMessengerV2::MintAndWithdraw>()?;
-            let event = decoded.data();
-
-            if event.mintRecipient == recipient
-                && event.mintToken == self.usdc_address
-                && log.block_number.is_some_and(|block| block > from_block)
-                && let Some(tx_hash) = log.transaction_hash
-            {
-                debug!(target: "bridge", %tx_hash, from_block, "Found existing mint during resume");
-                return Ok(Some(MintReceipt {
-                    tx: tx_hash,
-                    amount: event.amount,
-                    fee_collected: event.feeCollected,
-                }));
-            }
-        }
-
-        Ok(None)
-    }
-
     /// Returns the current head of this endpoint's chain.
     pub(super) async fn current_block(&self) -> Result<u64, CctpError> {
         Ok(self.wallet.provider().get_block_number().await?)
@@ -768,7 +765,7 @@ impl<W: Wallet> CctpEndpoint<W> {
 
     /// Returns the block in which `tx_hash` was mined on this endpoint's chain.
     ///
-    /// Used to derive the lower bound for [`find_recent_usdc_transfer`] from the
+    /// Used to derive the lower bound for [`find_recent_usdc_transfers`] from the
     /// known mint tx: the deposit send to Alpaca lands at or after the mint's
     /// block, so the mint block bounds the transfer scan exactly the way the
     /// captured head bounds [`find_recent_burn`]. Confirmation-aware: it polls via
@@ -810,6 +807,43 @@ impl<W: Wallet> CctpEndpoint<W> {
         Ok(Some(head.saturating_sub(tx_block).saturating_add(1)))
     }
 
+    /// Returns the sender, nonce and confirmations of `tx_hash`, or `None`
+    /// while this endpoint's node shows no receipt or no transaction for it,
+    /// or the receipt's block is not the canonical block at its height.
+    /// Confirmations follow [`tx_confirmations`](Self::tx_confirmations).
+    pub(super) async fn mined_tx(&self, tx_hash: TxHash) -> Result<Option<MinedTx>, CctpError> {
+        let provider = self.wallet.provider();
+        let Some(receipt) = provider.get_transaction_receipt(tx_hash).await? else {
+            return Ok(None);
+        };
+
+        let (Some(tx_block), Some(receipt_block_hash)) = (receipt.block_number, receipt.block_hash)
+        else {
+            return Ok(None);
+        };
+
+        // Reads are not pinned to one node, so a lagging node can serve a
+        // receipt from a reorged-out block while the head comes from another:
+        // count confirmations only for a receipt in the canonical block.
+        let canonical = provider.get_block_by_number(tx_block.into()).await?;
+        if canonical.is_none_or(|block| block.header.hash != receipt_block_hash) {
+            warn!(target: "bridge", %tx_hash, tx_block, %receipt_block_hash, "Receipt block is not the canonical block at its height; treating the tx as not mined");
+            return Ok(None);
+        }
+
+        let Some(tx) = provider.get_transaction_by_hash(tx_hash).await? else {
+            return Ok(None);
+        };
+
+        let head = provider.get_block_number().await?;
+
+        Ok(Some(MinedTx {
+            from: receipt.from,
+            nonce: tx.nonce(),
+            confirmations: head.saturating_sub(tx_block).saturating_add(1),
+        }))
+    }
+
     /// Sums the USDC `Transfer` logs in `tx_hash`'s receipt that pay `recipient`:
     /// what that transaction credited to `recipient`, exact in base units.
     pub(super) async fn usdc_credited_in_tx(
@@ -819,58 +853,115 @@ impl<W: Wallet> CctpEndpoint<W> {
     ) -> Result<U256, CctpError> {
         let receipt = self.wallet.await_receipt(tx_hash).await?;
 
-        usdc_credit_in_receipt(&receipt, self.usdc_address, recipient)
+        usdc_credit_in_receipt(&receipt, self.usdc_address, None, recipient)
     }
 
-    /// Sends `amount` of this endpoint's USDC from the wallet to `to`, waiting
-    /// for the configured confirmation depth, and returns the transfer tx hash.
+    /// Like [`usdc_credited_in_tx`](Self::usdc_credited_in_tx), counting only
+    /// the `Transfer` logs from `sender`. The hash comes from an operator, so
+    /// one with no receipt yet is refused at once (`TxNotMined`) instead of
+    /// waiting out the receipt wait's drop grace or timeout.
+    pub(super) async fn usdc_sent_in_tx(
+        &self,
+        tx_hash: TxHash,
+        sender: Address,
+        recipient: Address,
+    ) -> Result<U256, CctpError> {
+        if self
+            .wallet
+            .provider()
+            .get_transaction_receipt(tx_hash)
+            .await?
+            .is_none()
+        {
+            return Err(CctpError::TxNotMined { tx_hash });
+        }
+
+        let receipt = self.wallet.await_receipt(tx_hash).await?;
+
+        usdc_credit_in_receipt(&receipt, self.usdc_address, Some(sender), recipient)
+    }
+
+    /// Signs a transfer of `amount` of this endpoint's USDC from the wallet to
+    /// `to` without broadcasting it, reserving its nonce.
     ///
     /// This is the fund-moving leg of a BaseToAlpaca deposit: the CCTP mint
     /// credits the bot wallet, and this transfer forwards the minted USDC to
-    /// Alpaca's deposit address. Reuses [`Wallet::submit`] so nonce handling and
-    /// confirmation depth match every other write path; a revert is decoded via
-    /// `Registry`.
-    pub(super) async fn send_usdc<Registry: IntoErrorRegistry>(
+    /// Alpaca's deposit address. The caller persists the signed transfer
+    /// before [`broadcast_usdc`](Self::broadcast_usdc) sends it, so every
+    /// retry sends the same bytes and no second transfer can exist.
+    pub(super) async fn prepare_usdc(
         &self,
         to: Address,
         amount: U256,
-    ) -> Result<TxHash, CctpError> {
-        let receipt = self
-            .wallet
-            .submit::<Registry, _>(
+    ) -> Result<PreparedTransaction, EvmError> {
+        self.wallet
+            .prepare_pending(
                 self.usdc_address,
-                IERC20::transferCall { to, amount },
+                Bytes::from(IERC20::transferCall { to, amount }.abi_encode()),
                 "USDC deposit to Alpaca",
             )
-            .await?;
-
-        Ok(receipt.transaction_hash)
+            .await
     }
 
-    /// Scans for a USDC `Transfer(from, to, value == amount)` at or after
-    /// `from_block`, returning the most recent matching transaction hash.
+    /// Broadcasts a transfer signed by [`prepare_usdc`](Self::prepare_usdc).
+    /// Idempotent: a repeat sends the same bytes, and "already known" is
+    /// success.
+    pub(super) async fn broadcast_usdc(
+        &self,
+        prepared: &PreparedTransaction,
+    ) -> Result<TxHash, EvmError> {
+        self.wallet
+            .broadcast_prepared(prepared, "USDC deposit to Alpaca")
+            .await
+    }
+
+    pub(super) async fn discard_usdc(&self, prepared: &PreparedTransaction) {
+        self.wallet.discard_prepared(prepared.tx_hash()).await;
+    }
+
+    pub(super) async fn restore_usdc(&self, prepared: &PreparedTransaction) {
+        self.wallet.restore_prepared(prepared).await;
+    }
+
+    /// Awaits the receipt of a transfer broadcast by
+    /// [`broadcast_usdc`](Self::broadcast_usdc) to the wallet's confirmation depth.
+    /// A revert (decoded via `Registry`) and a drop are reported as statuses;
+    /// any other error leaves the outcome unknown.
+    pub(super) async fn confirm_usdc<Registry: IntoErrorRegistry>(
+        &self,
+        tx_hash: TxHash,
+    ) -> Result<UsdcTransferStatus, CctpError> {
+        match self.wallet.confirm::<Registry>(tx_hash).await {
+            Ok(_) => Ok(UsdcTransferStatus::Confirmed),
+            Err(error) if error.is_revert() => Ok(UsdcTransferStatus::Reverted),
+            Err(error) if error.is_transaction_dropped() => Ok(UsdcTransferStatus::Dropped),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    /// Scans for USDC `Transfer(from, to, value == amount)` events at or after
+    /// `from_block`, returning every matching transaction hash, newest first.
     ///
-    /// Crash-safe deposit-send recovery: the BaseToAlpaca deposit leg records the
-    /// mint block before sending USDC to Alpaca, so on resume this detects an
-    /// already-submitted send instead of re-sending (which would forward the
-    /// minted USDC twice). The deposit send lands at or after the mint, so the
-    /// match is bounded to `from_block` (the mint's block) onward. Matching on the
-    /// indexed `(from, to)` topics plus the exact `value` -- combined with the
-    /// single-USDC-rebalance-in-flight invariant -- guarantees an adopted transfer
-    /// is this deposit's, not an unrelated same-amount transfer.
+    /// Detects a legacy unrecorded deposit send: a BaseToAlpaca transfer that
+    /// reached `Bridged` without a persisted signed send may already have sent
+    /// the minted USDC, so resume refuses to send again when a match is not
+    /// another transfer's send. The send lands at or after the mint, so the
+    /// match is bounded to `from_block` (the mint's block) onward. Matching on
+    /// `(from, to, value)` cannot tell this transfer's send from another
+    /// transfer's same-amount send, so a match is never adopted.
     ///
-    /// Returns `Ok(None)` ONLY when the queried node is confirmations-deep past
+    /// Returns an empty list ONLY when the queried node is confirmations-deep past
     /// `from_block` and repeated scans agree the transfer is absent; a node that
     /// may be lagging (the dRPC load-balancing hazard) yields a retryable
     /// [`CctpError::ScanInconclusive`], so the caller never re-sends off a single
     /// stale empty `eth_getLogs`.
-    pub(super) async fn find_recent_usdc_transfer(
+    pub(super) async fn find_recent_usdc_transfers(
         &self,
         from: Address,
         to: Address,
         amount: U256,
         from_block: u64,
-    ) -> Result<Option<TxHash>, CctpError> {
+    ) -> Result<Vec<TxHash>, CctpError> {
         let from_topic = FixedBytes::<32>::left_padding_from(from.as_slice());
         let to_topic = FixedBytes::<32>::left_padding_from(to.as_slice());
         let filter = Filter::new()
@@ -883,6 +974,7 @@ impl<W: Wallet> CctpEndpoint<W> {
         for attempt in 1..=SCAN_ATTEMPTS {
             let logs = self.wallet.provider().get_logs(&filter).await?;
 
+            let mut matches = Vec::new();
             for log in logs.iter().rev() {
                 let decoded = log.log_decode::<IERC20::Transfer>()?;
                 let event = decoded.data();
@@ -891,9 +983,13 @@ impl<W: Wallet> CctpEndpoint<W> {
                     && log.block_number.is_some_and(|block| block >= from_block)
                     && let Some(tx_hash) = log.transaction_hash
                 {
-                    debug!(target: "bridge", %tx_hash, from_block, "Found existing USDC deposit transfer during resume");
-                    return Ok(Some(tx_hash));
+                    matches.push(tx_hash);
                 }
+            }
+
+            if !matches.is_empty() {
+                debug!(target: "bridge", ?matches, from_block, "Found existing USDC deposit transfers during resume");
+                return Ok(matches);
             }
 
             // A single empty eth_getLogs from a load-balanced node is not
@@ -905,7 +1001,7 @@ impl<W: Wallet> CctpEndpoint<W> {
             let caught_up = head >= from_block.saturating_add(SCAN_FINALITY_MARGIN);
 
             if caught_up && attempt == SCAN_ATTEMPTS {
-                return Ok(None);
+                return Ok(Vec::new());
             }
 
             if attempt < SCAN_ATTEMPTS {
@@ -966,10 +1062,19 @@ impl<W: Wallet> CctpEndpoint<W> {
     /// here. Used proactively by crash-recovery resume, before minting.
     /// [`recover_already_minted`](Self::recover_already_minted) does not call
     /// this directly -- see its own doc for why.
+    ///
+    /// The log scan for a consumed nonce is floored at the lower of
+    /// `scan_from_block` less [`CAPTURED_FLOOR_MARGIN`] and
+    /// [`MINT_SCAN_LOOKBACK`] below the head, both in this chain's blocks.
+    /// A log still missing after the lag retries is
+    /// [`CctpError::MintNotFoundInScanWindow`], which carries whether the
+    /// nonce was used below the floor so the caller can tell index lag from a
+    /// mint below the floor. The scan never walks to genesis.
     pub(super) async fn find_existing_mint<Registry: IntoErrorRegistry>(
         &self,
         direction: BridgeDirection,
         message: &[u8],
+        scan_from_block: Option<u64>,
     ) -> Result<Option<MintReceipt>, CctpError> {
         let received_message = validate_message_shape(message, direction)?;
 
@@ -982,12 +1087,22 @@ impl<W: Wallet> CctpEndpoint<W> {
             return Ok(None);
         }
 
-        // No lower bound: a crash-recovery resume may be re-checking a
-        // transfer that stalled for an unbounded amount of time before this
-        // runs, so the mint cannot be assumed recent here -- unlike
-        // `reconstruct_existing_mint`'s bounded retry (see
-        // `RECONSTRUCTION_SCAN_LOOKBACK_CHUNKS`'s doc).
-        self.locate_mint_receipt(&received_message, None)
+        let lookback_floor = self
+            .current_block()
+            .await?
+            .saturating_sub(self.scan_window.mint_lookback);
+
+        // A relayer can mint before the floor was captured (burns name no
+        // destination caller), so a captured floor is lowered by a margin and
+        // never scans less than the bounded lookback. Matching is by nonce, so
+        // a lower floor cannot adopt another mint.
+        let from_block = scan_from_block.map_or(lookback_floor, |captured| {
+            captured
+                .saturating_sub(self.scan_window.floor_margin)
+                .min(lookback_floor)
+        });
+
+        self.locate_mint_in_scan_window::<Registry>(&received_message, from_block)
             .await
             .map(Some)
     }
@@ -1004,7 +1119,7 @@ impl<W: Wallet> CctpEndpoint<W> {
     /// multi-minute recovery window would multiply its cost by the probe
     /// count for no benefit, since this cheap view call already gives an
     /// authoritative answer.
-    async fn is_nonce_used<Registry: IntoErrorRegistry>(
+    pub(super) async fn is_nonce_used<Registry: IntoErrorRegistry>(
         &self,
         nonce: B256,
     ) -> Result<bool, EvmError> {
@@ -1019,6 +1134,31 @@ impl<W: Wallet> CctpEndpoint<W> {
         Ok(!nonce_used.is_zero())
     }
 
+    /// Whether `nonce` is consumed, read over the mint recovery probe window.
+    ///
+    /// One read can come from a load-balanced node behind the block holding
+    /// the mint, so "unused" is returned only once every probe reads it unused.
+    /// The first consumed read returns `true`; a failed read is returned as-is.
+    pub(super) async fn is_nonce_used_across_probes<Registry: IntoErrorRegistry>(
+        &self,
+        nonce: B256,
+    ) -> Result<bool, EvmError> {
+        let mut poll = interval(self.mint_recovery_config.probe_interval);
+        poll.set_missed_tick_behavior(MissedTickBehavior::Delay);
+
+        for probe in 1..=self.mint_recovery_config.probes.get() {
+            poll.tick().await;
+
+            if self.is_nonce_used::<Registry>(nonce).await? {
+                return Ok(true);
+            }
+
+            debug!(target: "bridge", %nonce, probe, "CCTP nonce reads unused");
+        }
+
+        Ok(false)
+    }
+
     /// Locates and validates the mint receipt for a message whose nonce
     /// [`is_nonce_used`](Self::is_nonce_used) already confirmed consumed.
     /// Scans for the `MessageReceived` log matching the attested source
@@ -1026,12 +1166,11 @@ impl<W: Wallet> CctpEndpoint<W> {
     /// `MintAndWithdraw`.
     ///
     /// `min_block` floors the backward scan; passed straight through to
-    /// [`find_received_message_tx`](Self::find_received_message_tx), see its
-    /// doc for when a floor is (and is not) safe to pass.
+    /// [`find_received_message_tx`](Self::find_received_message_tx).
     async fn locate_mint_receipt(
         &self,
         received_message: &CctpReceivedMessage<'_>,
-        min_block: Option<u64>,
+        min_block: u64,
     ) -> Result<MintReceipt, CctpError> {
         let (tx_hash, message_received_log_index) = self
             .find_received_message_tx(
@@ -1076,14 +1215,14 @@ impl<W: Wallet> CctpEndpoint<W> {
     /// call already reflects -- up to `SCAN_ATTEMPTS` times spaced
     /// `SCAN_RETRY_BACKOFF` apart, the same dRPC-lag tolerance
     /// [`find_recent_burn`](Self::find_recent_burn) and
-    /// [`find_recent_usdc_transfer`](Self::find_recent_usdc_transfer) already
+    /// [`find_recent_usdc_transfers`](Self::find_recent_usdc_transfers) already
     /// apply to their own `get_logs` scans. This runs at most once per
     /// `recover_already_minted` call (not once per probe). Each retry's scan
-    /// is additionally floored at [`RECONSTRUCTION_SCAN_LOOKBACK_CHUNKS`]
-    /// chunks behind the current head (falling back to an unbounded scan if
-    /// the head read itself fails), so `SCAN_ATTEMPTS` retries are genuinely
+    /// is additionally floored at [`RECONSTRUCTION_SCAN_LOOKBACK`] behind the
+    /// current head, so `SCAN_ATTEMPTS` retries are genuinely
     /// a handful of quick attempts instead of each one repeating a full
-    /// backward walk to genesis.
+    /// backward walk to genesis. A failed head read is returned as-is: there is
+    /// no floor to scan from, and the caller redrives.
     ///
     /// Any other failure means the nonce is authoritatively consumed but the
     /// receipt could not be validated (a reverted mint tx, a mismatched log, a
@@ -1091,25 +1230,112 @@ impl<W: Wallet> CctpEndpoint<W> {
     /// [`CctpError::MintRecoveryInconclusive`] rather than a false "never
     /// minted" terminal failure, since the authoritative nonce read already
     /// proved the mint landed.
-    async fn reconstruct_existing_mint(
+    async fn reconstruct_existing_mint<Registry: IntoErrorRegistry>(
         &self,
         received_message: &CctpReceivedMessage<'_>,
     ) -> Result<MintReceipt, CctpError> {
-        let min_block = match self.current_block().await {
-            Ok(head) => Some(head.saturating_sub(
-                CCTP_RECOVERY_LOG_BLOCK_CHUNK.saturating_mul(RECONSTRUCTION_SCAN_LOOKBACK_CHUNKS),
-            )),
-            Err(error) => {
-                warn!(
-                    target: "bridge",
-                    ?error,
-                    "Failed to read the chain head to floor the reconstruction scan; \
-                     falling back to an unbounded backward scan for this attempt"
-                );
-                None
-            }
+        let min_block = self
+            .current_block()
+            .await?
+            .saturating_sub(self.scan_window.reconstruction_lookback);
+
+        self.locate_mint_in_scan_window::<Registry>(received_message, min_block)
+            .await
+    }
+
+    /// [`locate_mint_receipt_with_lag_retries`](Self::locate_mint_receipt_with_lag_retries),
+    /// reporting a log still missing as [`CctpError::MintNotFoundInScanWindow`]
+    /// with the [`check_mint_scan_floor`](Self::check_mint_scan_floor) result.
+    async fn locate_mint_in_scan_window<Registry: IntoErrorRegistry>(
+        &self,
+        received_message: &CctpReceivedMessage<'_>,
+        from_block: u64,
+    ) -> Result<MintReceipt, CctpError> {
+        let nonce = match self
+            .locate_mint_receipt_with_lag_retries(received_message, from_block)
+            .await
+        {
+            Err(CctpError::AlreadyMintedMessageNotFound { nonce }) => nonce,
+            located => return located,
         };
 
+        let floor_check = self
+            .check_mint_scan_floor::<Registry>(nonce, from_block)
+            .await?;
+
+        warn!(
+            target: "bridge",
+            %nonce,
+            from_block,
+            ?floor_check,
+            "CCTP nonce consumed but its mint is not in the scan window"
+        );
+        Err(CctpError::MintNotFoundInScanWindow {
+            nonce,
+            from_block,
+            floor_check,
+        })
+    }
+
+    /// Where the mint of the consumed `nonce` lies relative to a scan floored
+    /// at `from_block`, from a `usedNonces()` read at the block below it. A
+    /// failed read (e.g. a node without state that old) falls back to the
+    /// floor block's timestamp rather than failing the lookup.
+    async fn check_mint_scan_floor<Registry: IntoErrorRegistry>(
+        &self,
+        nonce: B256,
+        from_block: u64,
+    ) -> Result<MintScanFloorCheck, CctpError> {
+        // A scan from genesis covers every block.
+        let Some(below_floor) = from_block.checked_sub(1) else {
+            return Ok(MintScanFloorCheck::MintInScanWindow);
+        };
+
+        match self
+            .wallet
+            .call_at::<Registry, _>(
+                self.message_transmitter_address,
+                MessageTransmitterV2::usedNoncesCall(nonce),
+                below_floor,
+            )
+            .await
+        {
+            Ok(nonce_used) if nonce_used.is_zero() => Ok(MintScanFloorCheck::MintInScanWindow),
+            Ok(_) => Ok(MintScanFloorCheck::MintBelowScanFloor),
+            Err(historical_read_error) => {
+                warn!(
+                    target: "bridge",
+                    %nonce,
+                    below_floor,
+                    ?historical_read_error,
+                    "usedNonces() read below the mint scan floor failed; \
+                     falling back to the floor block's timestamp"
+                );
+
+                let from_block_timestamp = self
+                    .wallet
+                    .provider()
+                    .get_block_by_number(from_block.into())
+                    .await?
+                    .ok_or(CctpError::MintScanFloorBlockMissing { block: from_block })?
+                    .header
+                    .timestamp;
+
+                Ok(MintScanFloorCheck::Unverified {
+                    from_block_timestamp,
+                })
+            }
+        }
+    }
+
+    /// [`locate_mint_receipt`](Self::locate_mint_receipt), retrying only
+    /// [`CctpError::AlreadyMintedMessageNotFound`] (log-index lag behind the
+    /// node's own `usedNonces()` answer) up to `SCAN_ATTEMPTS` times.
+    async fn locate_mint_receipt_with_lag_retries(
+        &self,
+        received_message: &CctpReceivedMessage<'_>,
+        min_block: u64,
+    ) -> Result<MintReceipt, CctpError> {
         let mut attempt = 1;
 
         loop {
@@ -1250,7 +1476,7 @@ impl<W: Wallet> CctpEndpoint<W> {
                     // negative exactly like the case this function exists to
                     // prevent.
                     return self
-                        .reconstruct_existing_mint(&received_message)
+                        .reconstruct_existing_mint::<Registry>(&received_message)
                         .await
                         .map_err(|reconstruction_error| CctpError::MintRecoveryInconclusive {
                             recovery_error: Box::new(reconstruction_error),
@@ -1315,24 +1541,16 @@ impl<W: Wallet> CctpEndpoint<W> {
     /// its hash alongside the matched `MessageReceived` log index (used to
     /// correlate the right `MintAndWithdraw` within a multicall transaction).
     ///
-    /// `min_block` floors how far back the scan walks: `None` (used by
-    /// [`find_existing_mint`](Self::find_existing_mint)'s proactive
-    /// crash-recovery check) leaves it unbounded, walking all the way to
-    /// block 0 if needed, since that caller may be re-checking a transfer
-    /// that stalled for an unbounded amount of time. `Some(block)` (used by
-    /// [`reconstruct_existing_mint`](Self::reconstruct_existing_mint)'s
-    /// retry, see [`RECONSTRUCTION_SCAN_LOOKBACK_CHUNKS`]) stops the walk
-    /// there instead, since that caller only runs immediately after this
-    /// same recovery attempt's own probe loop observed the nonce become
-    /// consumed, so the matching log cannot be older than the floor. A hard
-    /// limit is deliberately omitted in the unbounded case to avoid failing
-    /// recovery when a deep reorg or lagging node pushes the log back.
+    /// `min_block` floors how far back the scan walks:
+    /// [`find_existing_mint`](Self::find_existing_mint)'s floor, or
+    /// [`RECONSTRUCTION_SCAN_LOOKBACK`] below the head for
+    /// the reconstruction that just saw the nonce become consumed.
     async fn find_received_message_tx(
         &self,
         source_domain: u32,
         nonce: B256,
         message_body: &[u8],
-        min_block: Option<u64>,
+        min_block: u64,
     ) -> Result<(TxHash, u64), CctpError> {
         let latest = self
             .wallet
@@ -1346,7 +1564,7 @@ impl<W: Wallet> CctpEndpoint<W> {
         // inverted range is rejected outright by most providers and would be
         // charged against the caller's scan attempts as if the mint were
         // missing.
-        let floor = min_block.unwrap_or(0).min(latest);
+        let floor = min_block.min(latest);
         let mut to_block = latest;
         let mut saw_nonce = false;
 
@@ -1489,7 +1707,7 @@ impl<W: Wallet> CctpEndpoint<W> {
     /// probe cadence. Test-only: lets recovery tests drive a short interval
     /// and probe count against real awaited state instead of racing or
     /// pausing the production multi-minute window.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     #[must_use]
     pub(super) fn with_mint_recovery_config(mut self, config: MintRecoveryConfig) -> Self {
         self.mint_recovery_config = config;
@@ -1531,12 +1749,14 @@ fn validate_message_shape(
     Ok(received_message)
 }
 
-/// Sums the `usdc` `Transfer` logs in `receipt` that pay `recipient`. A log
-/// carrying the `Transfer` topic that does not decode fails the read: skipping
-/// it would undercredit the transfer silently.
+/// Sums the `usdc` `Transfer` logs in `receipt` that pay `recipient`, from
+/// `sender` only when one is given. A log carrying the `Transfer` topic that
+/// does not decode fails the read: skipping it would undercredit the
+/// transfer silently.
 fn usdc_credit_in_receipt(
     receipt: &TransactionReceipt,
     usdc: Address,
+    sender: Option<Address>,
     recipient: Address,
 ) -> Result<U256, CctpError> {
     let tx_hash = receipt.transaction_hash;
@@ -1554,7 +1774,7 @@ fn usdc_credit_in_receipt(
         })
         .try_fold(U256::ZERO, |credited, transfer| {
             let transfer = transfer?;
-            if transfer.to != recipient {
+            if transfer.to != recipient || sender.is_some_and(|sender| transfer.from != sender) {
                 return Ok(credited);
             }
 
@@ -1768,7 +1988,7 @@ mod tests {
         ]);
 
         assert_eq!(
-            usdc_credit_in_receipt(&receipt, USDC, WALLET).unwrap(),
+            usdc_credit_in_receipt(&receipt, USDC, None, WALLET).unwrap(),
             U256::from(1_000_000u64)
         );
     }
@@ -1785,7 +2005,7 @@ mod tests {
         ]);
 
         assert_eq!(
-            usdc_credit_in_receipt(&receipt, USDC, WALLET).unwrap(),
+            usdc_credit_in_receipt(&receipt, USDC, None, WALLET).unwrap(),
             U256::from(1_000_000u64)
         );
     }
@@ -1797,7 +2017,7 @@ mod tests {
             transfer_log(USDC, WALLET, U256::from(1u64)),
         ]);
 
-        let error = usdc_credit_in_receipt(&receipt, USDC, WALLET).unwrap_err();
+        let error = usdc_credit_in_receipt(&receipt, USDC, None, WALLET).unwrap_err();
 
         assert!(
             matches!(error, CctpError::UsdcCreditOverflow { tx_hash } if tx_hash == TxHash::ZERO),
@@ -1827,7 +2047,7 @@ mod tests {
             malformed,
         ]);
 
-        let error = usdc_credit_in_receipt(&receipt, USDC, WALLET).unwrap_err();
+        let error = usdc_credit_in_receipt(&receipt, USDC, None, WALLET).unwrap_err();
 
         assert!(
             matches!(error, CctpError::UsdcTransferLogDecode { tx_hash, .. } if tx_hash == TxHash::ZERO),
@@ -1914,5 +2134,27 @@ mod tests {
         let sync_result: Result<(), CctpError> = Ok(());
 
         apply_sync_result(original, sync_result).unwrap();
+    }
+
+    /// Base keeps the block counts it had before the windows became time
+    /// spans; Ethereum's 12 s blocks give the same spans in fewer blocks.
+    #[test]
+    fn scan_windows_in_blocks_per_chain() {
+        assert_eq!(
+            ScanWindow::for_chain(Chain::Base),
+            ScanWindow {
+                floor_margin: 300,
+                mint_lookback: 60_000,
+                reconstruction_lookback: 60_000,
+            }
+        );
+        assert_eq!(
+            ScanWindow::for_chain(Chain::Ethereum),
+            ScanWindow {
+                floor_margin: 50,
+                mint_lookback: 10_000,
+                reconstruction_lookback: 10_000,
+            }
+        );
     }
 }

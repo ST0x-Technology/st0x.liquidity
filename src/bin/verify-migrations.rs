@@ -9,8 +9,12 @@
 //! ```text
 //! snapshot="$(nix run .#prodDbSnapshot)"
 //! cargo run --bin verify-migrations -- --db "$snapshot" \
-//!   --config config/prod/st0x-hedge.toml
+//!   --config config/prod/st0x-hedge.toml --registry-file tokens.toml
 //! ```
+//!
+//! The equity symbols live in the token file the config's `[registry]`
+//! names. On the VM it is read from the bucket; elsewhere pass a local
+//! copy with `--registry-file`.
 //!
 //! Exits 0 if migrations applied cleanly and every persisted aggregate
 //! still replays under current code; exits 1 otherwise.
@@ -19,7 +23,9 @@ use std::path::PathBuf;
 
 use clap::Parser;
 
-use st0x_config::{DeploymentSymbolPolicy, load_deployment_symbol_policy};
+use st0x_config::{
+    DeploymentSymbolPolicy, TokenFile, fetch_token_file, load_deployment_symbol_policy,
+};
 use st0x_hedge::migration_verification::verify_migrations;
 
 #[derive(Parser)]
@@ -33,13 +39,33 @@ struct Args {
     /// with the durable state in `db`.
     #[arg(long)]
     config: PathBuf,
+    /// A local copy of the token file the config's `[registry]` names,
+    /// read instead of the bucket.
+    #[arg(long)]
+    registry_file: Option<PathBuf>,
 }
 
 #[tokio::main]
 async fn main() -> std::process::ExitCode {
-    let Args { db, config } = Args::parse();
+    let Args {
+        db,
+        config,
+        registry_file,
+    } = Args::parse();
 
-    let symbol_policy = match load_deployment_symbol_policy(&config) {
+    let tokens = match fetch_token_file(&config, registry_file.as_deref()).await {
+        Ok(tokens) => tokens,
+        Err(error) => {
+            eprintln!("Failed to read the token file: {error}");
+            print_error_sources(&error);
+            return std::process::ExitCode::FAILURE;
+        }
+    };
+    let tokens = tokens
+        .as_deref()
+        .map_or(TokenFile::Skipped, TokenFile::Bytes);
+
+    let symbol_policy = match load_deployment_symbol_policy(&config, tokens) {
         Ok(policy) => policy,
         Err(error) => {
             eprintln!("Failed to load deployment symbol policy: {error}");

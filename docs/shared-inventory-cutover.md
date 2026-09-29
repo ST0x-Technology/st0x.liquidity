@@ -314,9 +314,12 @@ OPERATOR_ROLE preflight failed
 Failed to revoke stale orderbook allowance (non-fatal)
 ```
 
-Managed startup can submit generic token approvals before it revokes stale
-OrderBook allowances. Wait for startup and every revocation receipt to finish
-before checking the final onchain allowance values.
+Managed startup restores and rebroadcasts the signed sends persisted before the
+restart, then revokes stale OrderBook allowances, then submits generic token
+approvals. A chain with a restored send that is not mined yet gets neither on
+that start (`Startup token approvals deferred` warning): wait for that send,
+then restart so the revokes run before this check. Wait for startup and every
+revocation receipt to finish before checking the final onchain allowance values.
 
 ### 2. Verify stale OrderBook allowances
 
