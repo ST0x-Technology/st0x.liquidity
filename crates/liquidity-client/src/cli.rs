@@ -571,7 +571,10 @@ mod tests {
             };
             assert_eq!(chain.wire_name(), expected);
         }
-        assert!(debug(&["process-tx", "0xabc", "--chain", "solana"]).is_err());
+        let Err(error) = debug(&["process-tx", "0xabc", "--chain", "solana"]) else {
+            panic!("--chain solana must be refused");
+        };
+        assert_eq!(error.kind(), clap::error::ErrorKind::InvalidValue);
     }
 
     /// The nested groups: every flag on `position set` / `release-hedge` and
