@@ -147,6 +147,19 @@ impl UsdcRebalanceTracking {
     }
 }
 
+/// What the store says about a transfer's corridor.
+enum DurableCorridor {
+    Found {
+        corridor: UsdcCorridor,
+        direction: RebalanceDirection,
+        holds_guard: bool,
+    },
+    /// The aggregate has events but no state, or none at all.
+    Missing,
+    /// The load failed (or the store is not wired yet); retry later.
+    Unread,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum UsdcTerminalAction {
     NotTerminal,
@@ -656,8 +669,9 @@ impl RebalancingService {
     }
 
     /// Keeps the corridor guard of a transfer whose funds are past the burn:
-    /// its corridor comes from tracking, else from its durable state. With
-    /// neither, every corridor stays latched (fail closed).
+    /// its corridor comes from tracking, else from its durable state. A
+    /// missing aggregate latches every corridor until a restart; a load
+    /// error blocks every corridor until the sweep reads it (fail closed).
     async fn keep_corridor_guard(&self, id: &UsdcRebalanceId) {
         let tracked = self
             .usdc_tracking
@@ -665,32 +679,86 @@ impl RebalancingService {
             .await
             .get(id)
             .map(|tracking| (tracking.corridor, tracking.direction));
-        let holder = match tracked {
-            Some(holder) => Some(holder),
-            None => self.durable_corridor(id).await,
-        };
-
-        let Some((corridor, direction)) = holder else {
-            warn!(
-                target: "rebalance",
-                %id,
-                "No corridor known for a post-burn terminal failure; latching every \
-                 corridor's guard until a restart classifies it"
-            );
-            self.usdc_guards.latch_unclassified();
-            if self.latch_paged.write().await.insert(id.clone()) {
-                let message = format!(
-                    "USDC rebalancing is LATCHED on every corridor with no automated \
-                     recovery: transfer {id} failed after its burn and its corridor cannot \
-                     be read. Repair the transfer's stored events, then restart the bot; \
-                     only a restart lifts this latch."
-                );
-                self.pending_latch_pages.write().await.push_back(message);
-            }
-            return;
+        let (corridor, direction) = match tracked {
+            Some(holder) => holder,
+            None => match self.durable_corridor(id).await {
+                DurableCorridor::Found {
+                    corridor,
+                    direction,
+                    ..
+                } => (corridor, direction),
+                DurableCorridor::Unread => {
+                    self.block_unread_corridor(id).await;
+                    return;
+                }
+                DurableCorridor::Missing => {
+                    self.latch_every_corridor_for(id).await;
+                    return;
+                }
+            },
         };
 
         self.usdc_guards.hold(corridor.chain(), id, direction);
+    }
+
+    /// Latches every corridor until a restart for a post-burn failure whose
+    /// aggregate is missing, queueing one page per transfer.
+    async fn latch_every_corridor_for(&self, id: &UsdcRebalanceId) {
+        warn!(
+            target: "rebalance",
+            %id,
+            "No corridor known for a post-burn terminal failure; latching every \
+             corridor's guard until a restart classifies it"
+        );
+        self.usdc_guards.latch_unclassified();
+        if self.latch_paged.write().await.insert(id.clone()) {
+            let message = format!(
+                "USDC rebalancing is LATCHED on every corridor with no automated \
+                 recovery: transfer {id} failed after its burn and its corridor cannot \
+                 be read. Repair the transfer's stored events, then restart the bot; \
+                 only a restart lifts this latch."
+            );
+            self.pending_latch_pages.write().await.push_back(message);
+        }
+    }
+
+    /// Blocks every corridor while `id`'s aggregate fails to load, queueing
+    /// one page per transfer; the sweep retries the load.
+    pub(super) async fn block_unread_corridor(&self, id: &UsdcRebalanceId) {
+        self.usdc_guards.block_unread(id);
+        if self.unread_paged.write().await.insert(id.clone()) {
+            let message = format!(
+                "USDC rebalancing is BLOCKED on every corridor: transfer {id} could not be \
+                 loaded to read its corridor (a store error, possibly transient). The \
+                 timeout sweep retries the load every tick and unblocks once it reads; retry \
+                 or restart the bot if it persists."
+            );
+            self.pending_latch_pages.write().await.push_back(message);
+        }
+    }
+
+    /// Retries the load of every transfer blocking all corridors: a loaded
+    /// one holds its own corridor when its state holds a guard, a missing
+    /// one latches every corridor until a restart, and a failed load waits
+    /// for the next sweep.
+    pub(super) async fn read_unread_corridors(&self) {
+        for id in self.usdc_guards.unread_ids() {
+            match self.durable_corridor(&id).await {
+                DurableCorridor::Unread => {}
+                DurableCorridor::Missing => {
+                    self.usdc_guards.resolve_unread(&id, None);
+                    self.latch_every_corridor_for(&id).await;
+                }
+                DurableCorridor::Found {
+                    corridor,
+                    direction,
+                    holds_guard,
+                } => {
+                    self.usdc_guards
+                        .resolve_unread(&id, holds_guard.then_some((corridor.chain(), direction)));
+                }
+            }
+        }
     }
 
     /// Sends the pending every-corridor latch pages in order, outside the
@@ -713,16 +781,22 @@ impl RebalancingService {
         }
     }
 
-    async fn durable_corridor(
-        &self,
-        id: &UsdcRebalanceId,
-    ) -> Option<(UsdcCorridor, RebalanceDirection)> {
-        let store = self.usdc_store.read().await.as_ref().map(Arc::clone)?;
+    async fn durable_corridor(&self, id: &UsdcRebalanceId) -> DurableCorridor {
+        let Some(store) = self.usdc_store.read().await.as_ref().map(Arc::clone) else {
+            warn!(target: "rebalance", %id, "No USDC store yet to read a transfer's corridor");
+            return DurableCorridor::Unread;
+        };
+
         match store.load(id).await {
-            Ok(entity) => entity.map(|entity| (entity.corridor(), entity.direction())),
+            Ok(Some(entity)) => DurableCorridor::Found {
+                corridor: entity.corridor(),
+                direction: entity.direction(),
+                holds_guard: entity.holds_rebalance_guard(),
+            },
+            Ok(None) => DurableCorridor::Missing,
             Err(error) => {
                 warn!(target: "rebalance", %id, ?error, "Failed to load a transfer's corridor");
-                None
+                DurableCorridor::Unread
             }
         }
     }

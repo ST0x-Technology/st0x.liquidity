@@ -6,7 +6,7 @@
 //! shared. A release removes only its own transfer, so it never frees a guard
 //! another transfer still holds.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use st0x_evm::Chain;
@@ -60,6 +60,35 @@ impl UsdcCashGuards {
         self.state().unclassified = true;
     }
 
+    /// Blocks every corridor while `id`'s aggregate fails to load (a store
+    /// error, possibly transient); [`Self::resolve_unread`] lifts it.
+    pub(super) fn block_unread(&self, id: &UsdcRebalanceId) {
+        self.state().unread.insert(id.clone());
+    }
+
+    /// Transfers blocking every corridor until their aggregate loads.
+    pub(super) fn unread_ids(&self) -> Vec<UsdcRebalanceId> {
+        self.state().unread.iter().cloned().collect()
+    }
+
+    /// Lifts `id`'s unread block, holding `holder`'s chain for it when the
+    /// loaded state still holds a guard.
+    pub(super) fn resolve_unread(
+        &self,
+        id: &UsdcRebalanceId,
+        holder: Option<(Chain, RebalanceDirection)>,
+    ) {
+        let mut state = self.state();
+        state.unread.remove(id);
+        if let Some((chain, direction)) = holder {
+            state
+                .holders
+                .entry(chain)
+                .or_default()
+                .insert(id.clone(), direction);
+        }
+    }
+
     /// Whether a transfer whose corridor could not be read latches every
     /// corridor.
     pub(super) fn is_latched(&self) -> bool {
@@ -95,6 +124,9 @@ pub(super) enum ClaimRefusal {
     /// A transfer whose corridor could not be read (at startup or at
     /// runtime) latches every corridor until a restart.
     Unclassified,
+    /// A transfer's aggregate failed to load; every corridor waits until
+    /// the sweep reads it.
+    CorridorUnread,
 }
 
 impl std::fmt::Display for ClaimRefusal {
@@ -104,6 +136,10 @@ impl std::fmt::Display for ClaimRefusal {
             Self::AlpacaOutboundElsewhere => {
                 formatter.write_str("another corridor holds an Alpaca-outbound transfer")
             }
+            Self::CorridorUnread => formatter.write_str(
+                "a transfer's aggregate failed to load; every corridor waits for the sweep to \
+                 read it",
+            ),
             Self::Unclassified => formatter.write_str(
                 "a transfer whose corridor could not be read latches every corridor until a \
                  restart",
@@ -138,6 +174,7 @@ impl Drop for CashGuardClaim {
 struct CashGuardState {
     holders: BTreeMap<Chain, HashMap<UsdcRebalanceId, RebalanceDirection>>,
     unclassified: bool,
+    unread: HashSet<UsdcRebalanceId>,
 }
 
 impl CashGuardState {
@@ -169,6 +206,10 @@ impl CashGuardState {
     ) -> Result<(), ClaimRefusal> {
         if self.unclassified {
             return Err(ClaimRefusal::Unclassified);
+        }
+
+        if !self.unread.is_empty() {
+            return Err(ClaimRefusal::CorridorUnread);
         }
 
         let chain_taken = self

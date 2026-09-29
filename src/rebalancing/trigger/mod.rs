@@ -924,6 +924,8 @@ pub(crate) struct RebalancingService {
     pending_latch_pages: RwLock<VecDeque<String>>,
     /// Transfers whose runtime every-corridor latch page was queued.
     latch_paged: RwLock<HashSet<UsdcRebalanceId>>,
+    /// Transfers whose load-error page was queued.
+    unread_paged: RwLock<HashSet<UsdcRebalanceId>>,
     mint_event_sync: Arc<Mutex<()>>,
     redemption_event_sync: Arc<Mutex<()>>,
     usdc_event_sync: Arc<Mutex<()>>,
@@ -1119,6 +1121,7 @@ impl RebalancingService {
             corridor_not_served_alerted: Arc::new(RwLock::new(HashSet::new())),
             pending_latch_pages: RwLock::new(VecDeque::new()),
             latch_paged: RwLock::new(HashSet::new()),
+            unread_paged: RwLock::new(HashSet::new()),
             mint_event_sync: Arc::new(Mutex::new(())),
             redemption_event_sync: Arc::new(Mutex::new(())),
             usdc_event_sync: Arc::new(Mutex::new(())),
@@ -1815,6 +1818,8 @@ impl RebalancingService {
             );
             return Ok(());
         };
+
+        self.read_unread_corridors().await;
 
         // Select ids to examine this tick. The selection is intentionally broad:
         //
@@ -5549,7 +5554,9 @@ impl RebalancingService {
         {
             Ok(claim) => Some(claim),
             Err(ClaimRefusal::CorridorHeld) => None,
-            Err(refusal @ ClaimRefusal::AlpacaOutboundElsewhere) => {
+            Err(
+                refusal @ (ClaimRefusal::AlpacaOutboundElsewhere | ClaimRefusal::CorridorUnread),
+            ) => {
                 warn!(target: "rebalance", %id, %refusal, "Manual USDC resume refused");
                 return Err(UsdcResumeError::GuardHeldElsewhere);
             }
@@ -6807,13 +6814,16 @@ impl RebalancingService {
                     );
                     unresolved_ids.push(id);
                 }
+                // A load error may be transient (a busy store): block every
+                // corridor only until the sweep reads the aggregate.
                 Err(error) => {
                     error!(
                         target: "rebalance",
                         %id, ?error,
-                        "Failed to load USDC rebalance candidate on startup; holding guard defensively"
+                        "Failed to load USDC rebalance candidate on startup; blocking every \
+                         corridor until the sweep reads it"
                     );
-                    unresolved_ids.push(id);
+                    self.block_unread_corridor(&id).await;
                 }
             }
         }
@@ -6824,6 +6834,8 @@ impl RebalancingService {
         // resumable aggregate always holds the guard, so this set is non-empty
         // only when `held` is too. Propagates on failure so startup recovery
         // fails fast rather than coming up with a latched guard and no driving job.
+        self.deliver_pending_latch_pages().await;
+
         let stranded_after_exhaustion = self.rearm_stranded_transfers(rearm_candidates).await?;
         stranded_held_ids.extend(stranded_after_exhaustion);
 
@@ -36270,12 +36282,9 @@ mod tests {
     async fn unknown_corridor_post_burn_failure_latches_every_corridor_and_pages_once_per_transfer()
     {
         let notifier = Arc::new(CapturingNotifier::default());
-        let trigger = make_trigger_with_inventory_config_and_notifier(
-            InventoryView::default(),
-            test_config(),
-            notifier.clone(),
-        )
-        .await;
+        let pool = crate::test_utils::setup_test_db().await;
+        let store = Arc::new(test_store::<UsdcRebalance>(pool.clone(), ()));
+        let trigger = make_unserved_corridor_trigger(&pool, store, notifier.clone()).await;
         let harness = ReactorHarness::new(Arc::clone(&trigger));
 
         let first = UsdcRebalanceId(Uuid::new_v4());
@@ -36327,12 +36336,9 @@ mod tests {
             remaining_failures: std::sync::atomic::AtomicUsize::new(1),
             delivered: std::sync::Mutex::new(Vec::new()),
         });
-        let trigger = make_trigger_with_inventory_config_and_notifier(
-            InventoryView::default(),
-            test_config(),
-            notifier.clone(),
-        )
-        .await;
+        let pool = crate::test_utils::setup_test_db().await;
+        let store = Arc::new(test_store::<UsdcRebalance>(pool.clone(), ()));
+        let trigger = make_unserved_corridor_trigger(&pool, store, notifier.clone()).await;
         let harness = ReactorHarness::new(Arc::clone(&trigger));
 
         harness
@@ -36444,15 +36450,10 @@ mod tests {
     #[tokio::test]
     async fn runtime_latch_after_a_startup_latch_pages_its_own_transfer() {
         let pool = crate::test_utils::setup_test_db().await;
-        let store = test_store::<UsdcRebalance>(pool.clone(), ());
+        let store = Arc::new(test_store::<UsdcRebalance>(pool.clone(), ()));
         insert_unloadable_usdc_candidate(&pool).await;
         let notifier = Arc::new(CapturingNotifier::default());
-        let trigger = make_trigger_with_inventory_config_and_notifier(
-            InventoryView::default(),
-            test_config(),
-            notifier.clone(),
-        )
-        .await;
+        let trigger = make_unserved_corridor_trigger(&pool, store.clone(), notifier.clone()).await;
         trigger.recover_usdc_guard(&pool, &store).await.unwrap();
 
         let id = UsdcRebalanceId(Uuid::new_v4());
