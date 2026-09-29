@@ -468,6 +468,9 @@ stox transfer fail --kind mint --id <issuer-request-id> --reason "rejected by pr
 stox transfer fail --kind redemption --id <redemption-aggregate-id> --reason "stuck, handled manually"
 ```
 
+Without container access, the same route is reachable through IAP with
+`st0x-liquidity-client --env <env> debug fail-equity-transfer <mint|redemption> <id> --reason ...`.
+
 After force-failing, use `transfer reconcile` (see "Reconciling Stuck Failed
 Transfers" below) if the stranded funds were already handled out-of-band and the
 transfer should be marked resolved rather than left in `Failed`.
@@ -586,24 +589,38 @@ Use `fail-usdc-transfer` when a USDC rebalance is stranded at
 `BridgingFailed` (pre-burn, `burn_tx_hash: None`). The guard outcome depends on
 the direction:
 
-- **BaseToAlpaca**: no funds left the source venue, so the failure is
-  non-guard-holding. The rebalancing guard clears on the next bot restart.
+- **BaseToAlpaca**: the vault withdrawal already moved the USDC to the market
+  maker wallet, but the failure does not hold the guard. Only the offline
+  command handles this direction: the guard clears on the next bot restart,
+  which rebuilds the vault balance from chain, and the wallet USDC is moved back
+  by hand. The live route refuses it, because its reactor would credit the
+  amount back to the vault in memory and start a second withdrawal against a
+  vault that is lower by that amount.
 - **AlpacaToBase**: the withdrawal already moved the funds off Alpaca, so the
   failure KEEPS the guard -- releasing it would let a new transfer misattribute
   those funds. Settle the funds with `transfer reconcile --kind usdc`, which
-  releases the guard; a restart re-latches it until then.
+  releases the guard; both live recovery and restart keep it latched until then.
 
-**Stop the bot before running this command** to eliminate the race where the bot
-advances the transfer to `Bridging` between the preflight and the send.
+**Stop the bot before running the offline `stox fail-usdc-transfer`** to
+eliminate the race where the bot advances the transfer to `Bridging` between the
+preflight and the send. For AlpacaToBase the same operation is available against
+the live bot as `POST /liquidity-write/transfers/usdc/{id}/fail` (client:
+`st0x-liquidity-client --env <env> debug fail-usdc-transfer <id> --reason ...`);
+that path runs under the resume lock with the USDC driver quiesced, so it does
+not need the bot stopped. It sends through the conductor's wired store, whose
+reactor keeps the transfer's corridor guard held until reconciliation, and the
+`guardHeld` response reports it. It does not look on chain, so the
+`BridgingSubmitting` check below still applies.
 
 `WithdrawalComplete` is unconditionally pre-burn: no CCTP burn has been
 broadcast yet, but the source withdrawal has completed in either direction. The
 guard outcome follows the direction split above. For AlpacaToBase the USDC left
 Alpaca and is expected in the market-maker wallet: the command does NOT release
 the guard -- settle the funds with `transfer reconcile --kind usdc`. For
-BaseToAlpaca the funds moved out of the Raindex vault but stayed on the
-market-making side: the failure reconciles to source and the guard clears on the
-next restart. The command is safe to run once the bot is stopped.
+BaseToAlpaca the funds moved out of the Raindex vault into the market maker
+wallet: the failure reconciles to source and the guard clears on the next
+restart, and the wallet USDC is moved back to the vault by hand. The offline
+command is safe to run once the bot is stopped.
 
 `BridgingSubmitting` is NOT unconditionally safe. A crash at this state may have
 already broadcast a CCTP burn whose `BridgingInitiated` event never persisted.
@@ -655,13 +672,15 @@ stox transfer reconcile --kind redemption --id <redemption-aggregate-id> \
   post-burn `BridgingFailed` (one carrying a `burn_tx_hash` or `cctp_nonce`),
   any `AlpacaToBase` `BridgingFailed` (the withdrawal completed, so the funds
   left Alpaca even with no burn, e.g. the settlement deadline, a missing
-  withdrawal tx hash, or a withdrawal credit mismatch), a `BaseToAlpaca`
-  `ConversionFailed`, and a `BaseToAlpaca` `Bridged` with a signed deposit send
-  whose nonce you verified on chain is taken by a different mined tx (see
-  "Base->Alpaca deposit send pages"). Its `--reason` must be one of
-  `funds-moved-manually` or `deposit-credited-offline`; any other value is
-  rejected. Every other state is rejected, including `WithdrawalFailed` and an
-  `AlpacaToBase` `ConversionFailed`, whose funds never left Alpaca.
+  withdrawal tx hash, or a withdrawal credit mismatch; with no burn recorded,
+  first verify on chain that no burn left the market maker wallet, since a crash
+  can lose an unrecorded one), a `BaseToAlpaca` `ConversionFailed`, and a
+  `BaseToAlpaca` `Bridged` with a signed deposit send whose nonce you verified
+  on chain is taken by a different mined tx (see "Base->Alpaca deposit send
+  pages"). Its `--reason` must be one of `funds-moved-manually` or
+  `deposit-credited-offline`; any other value is rejected. Every other state is
+  rejected, including `WithdrawalFailed` and an `AlpacaToBase`
+  `ConversionFailed`, whose funds never left Alpaca.
 - `--kind usdc` is bookkeeping only: it moves no funds. Before you reconcile a
   post-burn `BridgingFailed`, finish the transfer by hand: (1) read the recorded
   nonce (`usedNonces`) on the destination chain (Base for `AlpacaToBase`,
@@ -803,6 +822,8 @@ before the startup token approvals.
   - To settle, only once a different tx is mined at the send's nonce: move the
     minted USDC to Alpaca by hand if needed, then
     `stox transfer reconcile --kind usdc --id <id> --reason <reason> --superseding-tx <cancel>`
+    (or, against the live bot,
+    `st0x-liquidity-client --env <env> debug reconcile-usdc <id> --reason <reason> --superseding-tx <cancel>`)
     (valid for a Base->Alpaca `Bridged` with a signed send; the API takes
     `supersedingTx` in the body; both refuse it for a transfer with no signed
     send, the API with `400`), then restart the bot to release the send's nonce
@@ -889,10 +910,11 @@ before the startup token approvals.
     mint). The bot already skipped every same-amount send another transfer
     signed, attached or recorded, but the named send can still belong to another
     transfer: check that it is this transfer's. If Alpaca credited it, run
-    `stox transfer recheck --kind usdc --id <id> --deposit-tx <hash>`. The bot
-    attaches the tx only if it moved exactly the transfer's amount from the bot
-    wallet to the deposit address, is confirmed, is mined at or after the
-    transfer's mint (an older send is refused with "deposit tx <hash> is in
+    `stox transfer recheck --kind usdc --id <id> --deposit-tx <hash>` (or
+    `st0x-liquidity-client --env <env> debug recheck usdc <id> --deposit-tx <hash>`).
+    The bot attaches the tx only if it moved exactly the transfer's amount from
+    the bot wallet to the deposit address, is confirmed, is mined at or after
+    the transfer's mint (an older send is refused with "deposit tx <hash> is in
     block <n>, before ... mint"), and no other transfer recorded it; then it
     confirms the deposit and runs the USDC->USD conversion. A hash that is not
     mined (a typo, or a send still pending) is refused at once with "deposit tx
