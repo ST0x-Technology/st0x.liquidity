@@ -35584,6 +35584,11 @@ mod tests {
         let pages = corridor_pages(&notifier);
         assert_eq!(pages.len(), 1, "got {pages:?}");
         assert!(pages[0].contains(&id.to_string()), "{}", pages[0]);
+        assert!(
+            pages[0].contains("Alpaca-outbound transfers are blocked on every corridor"),
+            "a held Alpaca-outbound transfer blocks every corridor's outbound claims: {}",
+            pages[0]
+        );
     }
 
     #[tokio::test]
