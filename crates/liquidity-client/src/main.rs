@@ -164,15 +164,23 @@ async fn dispatch<A: TokenSource + Sync>(
             client.get(&path, &args.params).await?
         }
         Command::Debug(Debug::Resume) => client.post("/transfers/resume", &[]).await?,
-        Command::Debug(Debug::Recheck { kind, id }) => {
+        Command::Debug(Debug::Recheck {
+            kind,
+            id,
+            deposit_tx,
+        }) => {
             let kind = match kind {
                 RecheckTransferType::Mint => "equity_mint",
                 RecheckTransferType::Redemption => "equity_redemption",
                 RecheckTransferType::Usdc => "usdc_bridge",
             };
             let id = encode_segment(&id);
+            let params: Vec<(String, String)> = deposit_tx
+                .map(|tx| ("deposit_tx".to_owned(), tx))
+                .into_iter()
+                .collect();
             client
-                .post(&format!("/transfers/recheck/{kind}/{id}"), &[])
+                .post(&format!("/transfers/recheck/{kind}/{id}"), &params)
                 .await?
         }
         Command::Debug(Debug::ResumeUsdc { direction, id }) => {
@@ -185,12 +193,19 @@ async fn dispatch<A: TokenSource + Sync>(
                 .post(&format!("/transfers/usdc/resume/{direction}/{id}"), &[])
                 .await?
         }
-        Command::Debug(Debug::ReconcileUsdc { id, reason }) => {
+        Command::Debug(Debug::ReconcileUsdc {
+            id,
+            reason,
+            superseding_tx,
+        }) => {
             let id = encode_segment(&id);
             client
                 .post_json(
                     &format!("/transfers/usdc/{id}/reconcile"),
-                    &wire::ReconcileUsdcRequest { reason },
+                    &wire::ReconcileUsdcRequest {
+                        reason,
+                        superseding_tx,
+                    },
                 )
                 .await?
         }
@@ -459,6 +474,7 @@ mod tests {
             let request = request_for(Command::Debug(Debug::Recheck {
                 kind,
                 id: "abc".to_owned(),
+                deposit_tx: None,
             }))
             .await?;
             assert_eq!(
@@ -466,6 +482,24 @@ mod tests {
                 format!("POST /liquidity-write/transfers/recheck/{segment}/abc HTTP/1.1")
             );
         }
+        Ok(())
+    }
+
+    /// A USDC recheck sends the operator's deposit tx as the `deposit_tx`
+    /// query parameter the bot reads.
+    #[tokio::test]
+    async fn recheck_sends_the_deposit_tx_as_its_query_parameter()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let request = request_for(Command::Debug(Debug::Recheck {
+            kind: RecheckTransferType::Usdc,
+            id: "abc".to_owned(),
+            deposit_tx: Some("0xdeposit".to_owned()),
+        }))
+        .await?;
+        assert_eq!(
+            request_line(&request),
+            "POST /liquidity-write/transfers/recheck/usdc_bridge/abc?deposit_tx=0xdeposit HTTP/1.1"
+        );
         Ok(())
     }
 
@@ -489,6 +523,7 @@ mod tests {
         let request = request_for(Command::Debug(Debug::ReconcileUsdc {
             id: "abc".to_owned(),
             reason: ReconcileUsdcReason::DepositCreditedOffline,
+            superseding_tx: None,
         }))
         .await?;
         assert_eq!(
@@ -498,6 +533,27 @@ mod tests {
         assert_eq!(
             request_body(&request),
             serde_json::json!({ "reason": "deposit-credited-offline" })
+        );
+        Ok(())
+    }
+
+    /// A superseding tx travels as the camelCase `supersedingTx` the bot's
+    /// reconcile body reads.
+    #[tokio::test]
+    async fn reconcile_usdc_sends_the_superseding_tx_when_given()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let request = request_for(Command::Debug(Debug::ReconcileUsdc {
+            id: "abc".to_owned(),
+            reason: ReconcileUsdcReason::FundsMovedManually,
+            superseding_tx: Some("0xcancel".to_owned()),
+        }))
+        .await?;
+        assert_eq!(
+            request_body(&request),
+            serde_json::json!({
+                "reason": "funds-moved-manually",
+                "supersedingTx": "0xcancel",
+            })
         );
         Ok(())
     }

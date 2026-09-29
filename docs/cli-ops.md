@@ -820,6 +820,8 @@ before the startup token approvals.
   - To settle, only once a different tx is mined at the send's nonce: move the
     minted USDC to Alpaca by hand if needed, then
     `stox transfer reconcile --kind usdc --id <id> --reason <reason> --superseding-tx <cancel>`
+    (or, against the live bot,
+    `st0x-liquidity-client --env <env> debug reconcile-usdc <id> --reason <reason> --superseding-tx <cancel>`)
     (valid for a Base->Alpaca `Bridged` with a signed send; the API takes
     `supersedingTx` in the body; both refuse it for a transfer with no signed
     send, the API with `400`), then restart the bot to release the send's nonce
@@ -906,10 +908,11 @@ before the startup token approvals.
     mint). The bot already skipped every same-amount send another transfer
     signed, attached or recorded, but the named send can still belong to another
     transfer: check that it is this transfer's. If Alpaca credited it, run
-    `stox transfer recheck --kind usdc --id <id> --deposit-tx <hash>`. The bot
-    attaches the tx only if it moved exactly the transfer's amount from the bot
-    wallet to the deposit address, is confirmed, is mined at or after the
-    transfer's mint (an older send is refused with "deposit tx <hash> is in
+    `stox transfer recheck --kind usdc --id <id> --deposit-tx <hash>` (or
+    `st0x-liquidity-client --env <env> debug recheck usdc <id> --deposit-tx <hash>`).
+    The bot attaches the tx only if it moved exactly the transfer's amount from
+    the bot wallet to the deposit address, is confirmed, is mined at or after
+    the transfer's mint (an older send is refused with "deposit tx <hash> is in
     block <n>, before ... mint"), and no other transfer recorded it; then it
     confirms the deposit and runs the USDC->USD conversion. A hash that is not
     mined (a typo, or a send still pending) is refused at once with "deposit tx

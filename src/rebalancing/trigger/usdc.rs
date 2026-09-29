@@ -1038,7 +1038,6 @@ impl RebalancingService {
                     // guard stays held (not clearable), so the outcome value is
                     // unused by the caller's enqueue gate.
                     self.warn_if_post_burn_tracking_missing(id).await;
-                    self.restage_preserved_pre_burn_failure(id, event).await;
                     UsdcSettlementOutcome::Reconciled
                 } else {
                     self.cancel_tracked_usdc_rebalance(id).await?
@@ -1100,31 +1099,6 @@ impl RebalancingService {
         drop(inventory);
 
         Ok(())
-    }
-
-    /// Moves the tracking entry of a failure preserved before the burn to the
-    /// post burn stage startup guard recovery seeds, stamped with the failure
-    /// time. Only an AlpacaToBase `BridgingFailed` is preserved before the
-    /// burn: the withdrawal already moved the funds off Alpaca. Left at its
-    /// stage, the entry would be past `transfer_timeout` on the next sweep,
-    /// which would clear the guard as for a transfer that timed out before the
-    /// burn. At the post burn stage, the sweep keeps the guard until
-    /// `transfer reconcile` lands `Reconciled`.
-    async fn restage_preserved_pre_burn_failure(
-        &self,
-        id: &UsdcRebalanceId,
-        event: &UsdcRebalanceEvent,
-    ) {
-        let UsdcRebalanceEvent::BridgingFailed { failed_at, .. } = event else {
-            return;
-        };
-
-        if let Some(tracking) = self.usdc_tracking.write().await.get_mut(id)
-            && !tracking.is_post_burn()
-        {
-            tracking.stage = UsdcRebalanceStage::BridgingInitiated;
-            tracking.last_progress_at = *failed_at;
-        }
     }
 
     /// The chain of `id`'s corridor: from tracking, else from the store;

@@ -94,6 +94,12 @@ pub(crate) enum Debug {
         kind: RecheckTransferType,
         /// Aggregate id path segment.
         id: String,
+        /// USDC only: the deposit tx to attach, for a BaseToAlpaca
+        /// `DepositFailed` with no recorded deposit ref. Sent as the
+        /// `deposit_tx` query parameter; the bot refuses it for mint and
+        /// redemption.
+        #[arg(long)]
+        deposit_tx: Option<String>,
     },
     /// Enqueue a manual resume of one USDC rebalance on the bot's transfer
     /// worker.
@@ -111,6 +117,11 @@ pub(crate) enum Debug {
         /// Audit reason, from the fixed vocabulary the bot accepts.
         #[arg(long, value_enum)]
         reason: ReconcileUsdcReason,
+        /// The tx mined at a signed deposit send's nonce, for a BaseToAlpaca
+        /// `Bridged` transfer whose send was cancelled; the bot verifies it on
+        /// chain before reconciling.
+        #[arg(long)]
+        superseding_tx: Option<String>,
     },
     /// Reconcile a failed equity mint or redemption to OperatorReconciled.
     ReconcileEquity {
@@ -459,7 +470,23 @@ mod tests {
             Debug::ReconcileUsdc {
                 id,
                 reason: ReconcileUsdcReason::FundsMovedManually,
+                superseding_tx: None,
             } if id == "abc"
+        ));
+        assert!(matches!(
+            debug(&[
+                "reconcile-usdc",
+                "abc",
+                "--reason",
+                "funds-moved-manually",
+                "--superseding-tx",
+                "0xcancel"
+            ])
+            .unwrap(),
+            Debug::ReconcileUsdc {
+                superseding_tx: Some(tx),
+                ..
+            } if tx == "0xcancel"
         ));
         assert!(matches!(
             debug(&["reconcile-equity", "redemption", "abc", "--reason", "settled"]).unwrap(),

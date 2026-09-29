@@ -10,6 +10,10 @@ use serde::Serialize;
 #[serde(rename_all = "camelCase")]
 pub(crate) struct ReconcileUsdcRequest {
     pub(crate) reason: ReconcileUsdcReason,
+    /// The tx that took a signed deposit send's nonce; omitted when absent,
+    /// as the bot's `#[serde(default)]` expects.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) superseding_tx: Option<String>,
 }
 
 /// The fixed reason vocabulary a USDC reconcile accepts, kebab-cased on the

@@ -5965,13 +5965,16 @@ post-burn states (`Bridging`, `AwaitingAttestation`, `Attested`, `Bridged`,
 the in-memory guard is reconciled. The live route sends `FailBridging` through
 the conductor-built wired store, so the rebalancing reactor runs in process and
 keeps the transfer's corridor guard held for the AlpacaToBase outcome, matching
-the reported `guardHeld`. It restages the transfer's tracking entry to the post
-burn shape startup recovery seeds, so the timeout sweep keeps the guard until
-the operator reconciles. The offline CLI writes through a standalone store the
-(stopped) bot's reactor never observes, so its outcome is reconciled on the next
-startup: `recover_usdc_guard` clears a non-guard-holding aggregate and
-re-latches an AlpacaToBase one until the operator reconciles. Either way, once
-the guard is released automatic USDC rebalancing resumes.
+the reported `guardHeld`. The timeout sweep never clears the guard of an
+AlpacaToBase transfer past its withdrawal with no confirmed burn
+(`BridgingSubmitting`, or `BridgingFailed` with no burn): it holds the guard
+without a tombstone and pages once that the transfer stopped before the burn
+with its funds off Alpaca, naming the recovery step, until the operator
+reconciles. The offline CLI writes through a standalone store the (stopped)
+bot's reactor never observes, so its outcome is reconciled on the next startup:
+`recover_usdc_guard` clears a non-guard-holding aggregate and re-latches an
+AlpacaToBase one until the operator reconciles. Either way, once the guard is
+released automatic USDC rebalancing resumes.
 
 **Operator reconciliation of a stranded post-burn failure**: A USDC rebalance
 that fails after the CCTP burn holds the rebalancing guard, blocking further

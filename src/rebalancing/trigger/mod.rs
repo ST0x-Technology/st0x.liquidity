@@ -935,6 +935,12 @@ pub(crate) struct RebalancingService {
     /// silence the page about stranded funds: the alert is re-attempted on every
     /// sweep until one delivery succeeds, while the error log stays one-shot.
     post_burn_timeout_alerted: Arc<RwLock<HashSet<UsdcRebalanceId>>>,
+    /// Ids of AlpacaToBase transfers the sweep holds before their burn that are
+    /// already logged; the same one shot log as `post_burn_timeout_logged`.
+    held_before_burn_logged: Arc<RwLock<HashSet<UsdcRebalanceId>>>,
+    /// Ids of AlpacaToBase transfers held before their burn whose page was
+    /// delivered; retried until then, as `post_burn_timeout_alerted` is.
+    held_before_burn_alerted: Arc<RwLock<HashSet<UsdcRebalanceId>>>,
     /// Transfers on a corridor this build does not serve whose page was
     /// delivered, so the sweep pages once, not every tick.
     corridor_not_served_alerted: Arc<RwLock<HashSet<UsdcRebalanceId>>>,
@@ -1000,6 +1006,17 @@ enum UsdcTimeoutCleanup {
         corridor: UsdcCorridor,
         amount: Usdc,
     },
+    /// An AlpacaToBase transfer stopped after its Alpaca withdrawal and before
+    /// any confirmed burn (see [`alpaca_to_base_hold_before_burn`]). The funds
+    /// are off Alpaca, so the guard stays held with no tombstone, and the page
+    /// names the stage and the recovery step instead of a burn that does not
+    /// exist.
+    HeldBeforeBurn {
+        tracking: usdc::UsdcRebalanceTracking,
+        elapsed: Duration,
+        state: &'static str,
+        recovery: &'static str,
+    },
     /// A transfer on a corridor this build does not serve: a re-armed job
     /// could only be refused, so the guard stays held and the page is
     /// retried until delivered, instead of any generic stall alert.
@@ -1017,6 +1034,39 @@ fn releases_tracked_guard(state: &UsdcRebalance, served_corridor: UsdcCorridor) 
     match state {
         UsdcRebalance::Reconciled { .. } => true,
         held => held.corridor() != served_corridor && !held.holds_rebalance_guard(),
+    }
+}
+
+/// The recovery step for an AlpacaToBase transfer the sweep holds before its
+/// burn: its Alpaca withdrawal already moved the funds off Alpaca and no burn
+/// is confirmed, so clearing the guard as for a timed out transfer would let a
+/// new transfer start while those funds are unsettled. `None` for every other
+/// state.
+fn alpaca_to_base_hold_before_burn(state: &UsdcRebalance) -> Option<&'static str> {
+    match state {
+        UsdcRebalance::BridgingSubmitting {
+            direction: RebalanceDirection::AlpacaToBase,
+            pending_burn_tx: None,
+            ..
+        } => Some(
+            "Verify on chain that no burn was broadcast, then run fail-usdc-transfer and \
+             reconcile-usdc.",
+        ),
+        UsdcRebalance::BridgingSubmitting {
+            direction: RebalanceDirection::AlpacaToBase,
+            pending_burn_tx: Some(_),
+            ..
+        } => Some(
+            "A burn was recorded but not confirmed: run resume-usdc to adopt or await it, or \
+             clear-pending-burn once it is verified dropped.",
+        ),
+        UsdcRebalance::BridgingFailed {
+            direction: RebalanceDirection::AlpacaToBase,
+            burn_tx_hash: None,
+            cctp_nonce: None,
+            ..
+        } => Some("It failed before the burn; reconcile-usdc is required."),
+        _ => None,
     }
 }
 
@@ -1143,6 +1193,8 @@ impl RebalancingService {
             requested_stage_timeout_alerted: Arc::new(RwLock::new(HashSet::new())),
             post_burn_timeout_logged: Arc::new(RwLock::new(HashSet::new())),
             post_burn_timeout_alerted: Arc::new(RwLock::new(HashSet::new())),
+            held_before_burn_logged: Arc::new(RwLock::new(HashSet::new())),
+            held_before_burn_alerted: Arc::new(RwLock::new(HashSet::new())),
             corridor_not_served_alerted: Arc::new(RwLock::new(HashSet::new())),
             pending_latch_pages: RwLock::new(VecDeque::new()),
             latch_paged: RwLock::new(HashSet::new()),
@@ -2019,6 +2071,15 @@ impl RebalancingService {
                         }
                     }
                 }
+                UsdcTimeoutCleanup::HeldBeforeBurn {
+                    tracking,
+                    elapsed,
+                    state,
+                    recovery,
+                } => {
+                    self.hold_before_burn(&id, &tracking, elapsed, state, recovery)
+                        .await;
+                }
                 UsdcTimeoutCleanup::ReArmAlpacaToBaseWithdrawal {
                     tracking,
                     elapsed,
@@ -2062,6 +2123,68 @@ impl RebalancingService {
         }
 
         Ok(())
+    }
+
+    /// Holds the guard of an AlpacaToBase transfer stopped before its burn
+    /// ([`UsdcTimeoutCleanup::HeldBeforeBurn`]). Like the post burn hold, the
+    /// entry is selected again on every sweep, so it logs once and retries the
+    /// page until it is delivered.
+    async fn hold_before_burn(
+        &self,
+        id: &UsdcRebalanceId,
+        tracking: &usdc::UsdcRebalanceTracking,
+        elapsed: Duration,
+        state: &'static str,
+        recovery: &'static str,
+    ) {
+        self.usdc_guards
+            .hold(tracking.corridor.chain(), id, tracking.direction);
+
+        let first_log = self
+            .held_before_burn_logged
+            .write()
+            .await
+            .insert(id.clone());
+
+        if first_log {
+            error!(
+                target: "rebalance",
+                aggregate_id = %id,
+                corridor = %tracking.corridor,
+                state,
+                ?elapsed,
+                "AlpacaToBase USDC transfer stopped before the CCTP burn with its \
+                 funds off Alpaca; holding the trigger guard"
+            );
+        }
+
+        if !self.held_before_burn_alerted.read().await.contains(id) {
+            match self
+                .notifier
+                .notify(&format!(
+                    "USDC transfer {id} on the {} corridor stopped in {state} before \
+                     the CCTP burn; its funds are off Alpaca. Guard held. Elapsed: \
+                     {elapsed:?}. {recovery}",
+                    tracking.corridor,
+                ))
+                .await
+            {
+                Ok(()) => {
+                    self.held_before_burn_alerted
+                        .write()
+                        .await
+                        .insert(id.clone());
+                }
+                Err(error) => {
+                    warn!(
+                        target: "rebalance",
+                        ?error,
+                        "Failed to deliver USDC stall alert for a transfer held \
+                         before its burn; will retry next sweep"
+                    );
+                }
+            }
+        }
     }
 
     /// Pages once per transfer (retried until delivered) that it runs on a
@@ -2531,9 +2654,25 @@ impl RebalancingService {
                             direction: state.direction(),
                         }));
                     }
-                    Ok(Some(_) | None) => {
-                        // Guard-holding state or aggregate not yet in store:
-                        // fall through to the timeout gate below.
+                    Ok(Some(state)) => {
+                        // Restart recovery seeds an AlpacaToBase failure from
+                        // before the burn at `BridgingInitiated`, so it lands
+                        // here: hold it with its own page once timed out.
+                        if let Some(recovery) = alpaca_to_base_hold_before_burn(&state) {
+                            if elapsed < self.config.transfer_timeout {
+                                return Ok(None);
+                            }
+                            return Ok(Some(UsdcTimeoutCleanup::HeldBeforeBurn {
+                                tracking,
+                                elapsed,
+                                state: state.state_name(),
+                                recovery,
+                            }));
+                        }
+                    }
+                    Ok(None) => {
+                        // Aggregate not yet in store: fall through to the
+                        // timeout gate below.
                     }
                     Err(load_error) => {
                         // Store read failed (I/O error, deserialization error,
@@ -2608,7 +2747,23 @@ impl RebalancingService {
                         amount,
                     }));
                 }
-                Ok(_) => {}
+                // Past the withdrawal with no confirmed burn: arming a job again
+                // would fail closed or drive a recorded burn under the operator,
+                // and clearing would release funds that are off Alpaca, so
+                // hold the guard without a tombstone. A later operator
+                // `FailBridging` then still reaches the reactor.
+                Ok(Some(state)) => {
+                    if let Some(recovery) = alpaca_to_base_hold_before_burn(&state) {
+                        drop(tracking_guard);
+                        return Ok(Some(UsdcTimeoutCleanup::HeldBeforeBurn {
+                            tracking,
+                            elapsed,
+                            state: state.state_name(),
+                            recovery,
+                        }));
+                    }
+                }
+                Ok(None) => {}
                 Err(load_error) => {
                     // Store read failed. Fail safe: skip cleanup so a
                     // possibly-retryable Alpaca-to-Base aggregate does not
@@ -25148,8 +25303,92 @@ mod tests {
                 .await
                 .active_usdc_rebalance()
                 .cloned(),
-            Some(id),
+            Some(id.clone()),
             "the transfer must stay the active rebalance",
+        );
+        assert!(
+            trigger.held_before_burn_alerted.read().await.contains(&id),
+            "the page must say the transfer stopped before the burn",
+        );
+        assert!(
+            !trigger.post_burn_timeout_alerted.read().await.contains(&id),
+            "no burn happened, so the after burn stall page must not fire",
+        );
+    }
+
+    /// An AlpacaToBase transfer stranded in `BridgingSubmitting` with no
+    /// recorded burn and no job: the sweep past `transfer_timeout` must hold
+    /// its guard without a tombstone, so the operator's later `FailBridging`
+    /// (what the live fail route sends) still reaches the reactor and the
+    /// guard stays held until reconcile.
+    #[tokio::test]
+    async fn sweep_holds_a_stranded_alpaca_to_base_bridging_submitting_for_the_fail_route() {
+        let (pool, apalis_pool) = crate::test_utils::setup_test_pools().await;
+        let (service, store) = wire_usdc_reactor_store(&pool, &apalis_pool).await;
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        seed_withdrawal_complete_alpaca_to_base(&store, &id, usdc(400)).await;
+        store
+            .send(
+                &id,
+                UsdcRebalanceCommand::BeginBridging {
+                    from_block: 2,
+                    burn_amount: None,
+                },
+            )
+            .await
+            .unwrap();
+        // The trigger's claim for this transfer.
+        service
+            .usdc_guards
+            .hold(Chain::Base, &id, RebalanceDirection::AlpacaToBase);
+
+        let past_timeout = Utc::now() + ChronoDuration::minutes(31);
+        service
+            .expire_stuck_usdc_rebalances(past_timeout)
+            .await
+            .unwrap();
+
+        assert!(
+            service.usdc_guards.is_held(Chain::Base),
+            "the sweep must hold the guard while the funds are off Alpaca",
+        );
+        assert!(
+            !service
+                .timed_out_usdc_rebalances
+                .read()
+                .await
+                .contains_key(&id),
+            "the sweep must not tombstone a held transfer",
+        );
+        assert!(
+            service.held_before_burn_alerted.read().await.contains(&id),
+            "the sweep must page that the transfer stopped before the burn",
+        );
+
+        store
+            .send(
+                &id,
+                UsdcRebalanceCommand::FailBridging {
+                    reason: "operator: burn never broadcast".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+        service
+            .expire_stuck_usdc_rebalances(past_timeout)
+            .await
+            .unwrap();
+
+        assert!(
+            matches!(
+                store.load(&id).await.unwrap(),
+                Some(UsdcRebalance::BridgingFailed { .. })
+            ),
+            "the failure must land",
+        );
+        assert!(
+            service.usdc_guards.is_held(Chain::Base),
+            "the guard must stay held after the failure until reconcile",
         );
     }
 
