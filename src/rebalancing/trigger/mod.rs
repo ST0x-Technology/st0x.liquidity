@@ -37718,6 +37718,152 @@ mod tests {
         drop(inventory);
     }
 
+    /// An Alpaca-to-Base transfer on the Robinhood corridor lands its USDC
+    /// in the Robinhood vault, not the primary chain's.
+    #[tokio::test]
+    async fn alpaca_to_base_settle_credits_the_corridor_chains_vault() {
+        let trigger = make_trigger_with_inventory(
+            InventoryView::default()
+                .with_usdc(usdc(100), usdc(900))
+                .update_usdc_at(
+                    Chain::Robinhood,
+                    Inventory::available(Venue::MarketMaking, Operator::Add, usdc(50)),
+                    Utc::now(),
+                )
+                .unwrap(),
+        )
+        .await;
+        let id = UsdcRebalanceId(Uuid::new_v4());
+
+        for event in [
+            UsdcRebalanceEvent::Initiated {
+                corridor: ROBINHOOD_RELAY,
+                direction: RebalanceDirection::AlpacaToBase,
+                amount: usdc(300),
+                withdrawal_ref: TransferRef::OnchainTx(TxHash::random()),
+                initiated_at: Utc::now(),
+            },
+            make_usdc_bridged_with_amounts(usdc(299), usdc(1)),
+            make_usdc_deposit_confirmed(RebalanceDirection::AlpacaToBase),
+        ] {
+            trigger.on_usdc_rebalance(id.clone(), event).await.unwrap();
+        }
+
+        let inventory = trigger.inventory.read().await;
+        assert_eq!(
+            inventory.onchain_usdc_available_at(Chain::Robinhood),
+            Some(usdc(349))
+        );
+        assert_eq!(
+            inventory.usdc_available(Venue::MarketMaking),
+            Some(usdc(100))
+        );
+        assert_eq!(inventory.usdc_available(Venue::Hedging), Some(usdc(600)));
+        assert_eq!(inventory.usdc_inflight(Venue::Hedging), Some(Usdc::ZERO));
+        drop(inventory);
+    }
+
+    /// The pre-burn timeout of a Robinhood transfer releases its own slot and
+    /// marker; the live Base transfer keeps its inflight and marker.
+    #[tokio::test]
+    async fn sweep_clears_a_timed_out_transfers_own_chain_slot() {
+        let now = Utc::now();
+        let base_id = UsdcRebalanceId(Uuid::new_v4());
+        let robinhood_id = UsdcRebalanceId(Uuid::new_v4());
+        let start = |amount| Inventory::transfer(Venue::MarketMaking, TransferOp::Start, amount);
+        let inventory = InventoryView::default()
+            .with_usdc(usdc(900), usdc(900))
+            .update_usdc_at(
+                Chain::Robinhood,
+                Inventory::available(Venue::MarketMaking, Operator::Add, usdc(500)),
+                now,
+            )
+            .unwrap()
+            .update_usdc_at(Chain::Base, start(usdc(400)), now)
+            .unwrap()
+            .update_usdc_at(Chain::Robinhood, start(usdc(300)), now)
+            .unwrap()
+            .set_active_usdc_rebalance(
+                base_id.clone(),
+                base_usdc_rebalance(RebalanceDirection::BaseToAlpaca),
+            )
+            .set_active_usdc_rebalance(
+                robinhood_id.clone(),
+                ActiveUsdcRebalance::Known {
+                    chain: Chain::Robinhood,
+                    direction: RebalanceDirection::BaseToAlpaca,
+                },
+            );
+        let trigger = make_trigger_with_inventory(inventory).await;
+        trigger.usdc_tracking.write().await.insert(
+            robinhood_id.clone(),
+            usdc::UsdcRebalanceTracking {
+                corridor: ROBINHOOD_RELAY,
+                direction: RebalanceDirection::BaseToAlpaca,
+                initiated_amount: usdc(300),
+                bridged_amount_received: None,
+                stage: usdc::UsdcRebalanceStage::WithdrawalConfirmed,
+                last_progress_at: now - ChronoDuration::minutes(40),
+            },
+        );
+
+        let cleanup = trigger
+            .cleanup_timed_out_usdc_rebalance(&robinhood_id, now)
+            .await
+            .unwrap();
+
+        assert!(
+            matches!(cleanup, Some(UsdcTimeoutCleanup::Cleared { .. })),
+            "got {cleanup:?}"
+        );
+        let inventory = trigger.inventory.read().await;
+        assert_eq!(
+            inventory.onchain_usdc_inflight_at(Chain::Robinhood),
+            Some(Usdc::ZERO)
+        );
+        assert_eq!(
+            inventory.usdc_inflight(Venue::MarketMaking),
+            Some(usdc(400))
+        );
+        assert_eq!(inventory.active_usdc_rebalance(), Some(&base_id));
+        drop(inventory);
+    }
+
+    /// An operator reconcile of a transfer this process never tracked has no
+    /// known corridor, so it reserved nothing here and releases nothing: the
+    /// live Base transfer's broker inflight stays.
+    #[tokio::test]
+    async fn operator_reconcile_without_tracking_touches_no_inflight() {
+        let untracked = UsdcRebalanceId(Uuid::new_v4());
+        let trigger = make_trigger_with_inventory(
+            InventoryView::default()
+                .with_usdc(usdc(100), usdc(900))
+                .set_active_usdc_rebalance(untracked.clone(), ActiveUsdcRebalance::Unknown),
+        )
+        .await;
+        let base_id = UsdcRebalanceId(Uuid::new_v4());
+        trigger
+            .on_usdc_rebalance(
+                base_id.clone(),
+                make_usdc_initiated(RebalanceDirection::AlpacaToBase, usdc(400)),
+            )
+            .await
+            .unwrap();
+
+        trigger
+            .on_usdc_rebalance(
+                untracked,
+                make_usdc_operator_reconciled(RebalanceDirection::AlpacaToBase),
+            )
+            .await
+            .unwrap();
+
+        let inventory = trigger.inventory.read().await;
+        assert_eq!(inventory.usdc_inflight(Venue::Hedging), Some(usdc(400)));
+        assert_eq!(inventory.active_usdc_rebalance(), Some(&base_id));
+        drop(inventory);
+    }
+
     /// A resume whose corridor another transfer still holds in memory (one
     /// already terminal on disk) becomes a holder too, so releasing the
     /// other one leaves the corridor held.

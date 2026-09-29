@@ -7597,6 +7597,51 @@ mod tests {
     }
 
     #[test]
+    fn cash_busy_marker_on_one_chain_leaves_the_others_quiet() {
+        let now = Utc::now();
+        let view = InventoryView::default().with_usdc(Usdc::ZERO, usdc_cents(50_000));
+        let busy_at =
+            |view: &InventoryView, scope| view.cash_reconciliation_busy(scope, now).unwrap();
+
+        let robinhood = view.clone().set_active_usdc_rebalance(
+            UsdcRebalanceId(Uuid::new_v4()),
+            ActiveUsdcRebalance::Known {
+                chain: Chain::Robinhood,
+                direction: RebalanceDirection::BaseToAlpaca,
+            },
+        );
+        assert_eq!(
+            busy_at(&robinhood, InventoryScope::Hedging),
+            Some(EquityReconcileBusy::Transfer)
+        );
+        assert_eq!(
+            busy_at(&robinhood, InventoryScope::MarketMaking(Chain::Robinhood)),
+            Some(EquityReconcileBusy::Transfer)
+        );
+        assert_eq!(
+            busy_at(&robinhood, InventoryScope::MarketMaking(Chain::Base)),
+            None,
+            "a Robinhood transfer never moves the Base vault"
+        );
+
+        let unknown = view.set_active_usdc_rebalance(
+            UsdcRebalanceId(Uuid::new_v4()),
+            ActiveUsdcRebalance::Unknown,
+        );
+        for scope in [
+            InventoryScope::Hedging,
+            InventoryScope::MarketMaking(Chain::Base),
+            InventoryScope::MarketMaking(Chain::Robinhood),
+        ] {
+            assert_eq!(
+                busy_at(&unknown, scope),
+                Some(EquityReconcileBusy::Transfer),
+                "a transfer of unknown corridor is busy at {scope:?}"
+            );
+        }
+    }
+
+    #[test]
     fn clearing_one_transfers_marker_keeps_another() {
         let base = UsdcRebalanceId(Uuid::new_v4());
         let robinhood = UsdcRebalanceId(Uuid::new_v4());
