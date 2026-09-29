@@ -728,8 +728,9 @@ stox transfer reconcile --kind redemption --id <redemption-aggregate-id> \
   `--reason` is free text.
 - Reconciling a redemption with a signed vault withdrawal releases the wallet
   nonce reservation of that withdrawal in the running bot, with no restart. The
-  release does not cancel the withdrawal. Reconcile only after another
-  transaction from the bot wallet has mined at the withdrawal's nonce. A
+  release is bookkeeping only. It does not cancel the withdrawal, and it is the
+  mined replacement below that lets later sends proceed. Reconcile only after
+  another transaction from the bot wallet has mined at the withdrawal's nonce. A
   withdrawal that is not pending on one node can still mine from another node's
   mempool or a rebroadcast, so "not pending" is not enough. Send a 0-value
   self-transfer from the bot wallet at the withdrawal's nonce, with fees above

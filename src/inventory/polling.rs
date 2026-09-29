@@ -2188,6 +2188,10 @@ mod tests {
             panic!("MockEthereumWallet::discard_prepared should not be called in polling tests");
         }
 
+        async fn release_superseded(&self, _tx_hash: TxHash) {
+            panic!("MockEthereumWallet::release_superseded should not be called in polling tests");
+        }
+
         async fn restore_prepared(&self, _prepared: &PreparedTransaction) {
             panic!("MockEthereumWallet::restore_prepared should not be called in polling tests");
         }
@@ -2261,6 +2265,10 @@ mod tests {
 
         async fn discard_prepared(&self, _tx_hash: TxHash) {
             panic!("MockBaseWallet::discard_prepared should not be called in polling tests");
+        }
+
+        async fn release_superseded(&self, _tx_hash: TxHash) {
+            panic!("MockBaseWallet::release_superseded should not be called in polling tests");
         }
 
         async fn restore_prepared(&self, _prepared: &PreparedTransaction) {

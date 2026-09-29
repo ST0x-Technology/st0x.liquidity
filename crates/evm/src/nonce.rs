@@ -47,7 +47,7 @@ use dashmap::DashMap;
 use futures::lock::Mutex;
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use tracing::{trace, warn};
+use tracing::trace;
 
 /// Nonce manager that caches nonces locally and supports cache
 /// invalidation and seeding for resilience against external nonce
@@ -213,59 +213,6 @@ impl ResettableNonceManager {
             // at or below it.
             if let Some(current) = *cached {
                 *cached = Some(current.min(nonce));
-            }
-        }
-    }
-
-    /// Releases the nonce of a discarded prepared transaction, rewinding the
-    /// allocation cache onto it only while the chain has not mined that nonce.
-    ///
-    /// A discard covers two cases. A persist-failure rollback discards a
-    /// just-prepared transaction whose nonce is at or above the mined `latest`
-    /// and was never used, so the gap is refilled exactly as in
-    /// [`release_nonce_and_rewind`](Self::release_nonce_and_rewind). An operator
-    /// reconcile discards a stuck transaction only after another transaction was
-    /// mined at its nonce, so rewinding onto it would sign the next send at a
-    /// nonce the chain has passed and fail with "nonce too low". A failed chain
-    /// read clears the cache instead, so the next send fetches `latest` from the
-    /// chain, as after a restart.
-    ///
-    /// Callers must hold the wallet send lock across this operation.
-    #[cfg(any(feature = "turnkey", feature = "local-signer"))]
-    pub(crate) async fn release_discarded_nonce<TProvider, TNetwork>(
-        &self,
-        provider: &TProvider,
-        address: Address,
-        nonce: u64,
-    ) where
-        TProvider: Provider<TNetwork>,
-        TNetwork: Network,
-    {
-        let slot = self.slot(address);
-        let mut cached = slot.lock().await;
-        if !self.release_occupied_nonce(address, nonce) {
-            return;
-        }
-
-        match provider.get_transaction_count(address).latest().await {
-            Ok(latest) if latest > nonce => {
-                trace!(
-                    %address, nonce, latest,
-                    "Discarded nonce is already mined; keeping the allocation cache"
-                );
-            }
-            Ok(_) => {
-                if let Some(current) = *cached {
-                    *cached = Some(current.min(nonce));
-                }
-            }
-            Err(error) => {
-                warn!(
-                    %address, nonce, %error,
-                    "Could not read the mined nonce for a discarded transaction; \
-                     clearing the allocation cache so the next send refetches it"
-                );
-                *cached = None;
             }
         }
     }
@@ -781,73 +728,6 @@ mod tests {
             reserved, 7,
             "a lagging pending must not lower the prepared nonce below the mined latest"
         );
-    }
-
-    /// Seeds a warm cache at `NEXT` with `DISCARDED` reserved, then discards
-    /// it against a chain whose mined `latest` read is `latest`.
-    #[cfg(any(feature = "turnkey", feature = "local-signer"))]
-    async fn discard_against_latest(latest: Option<u64>) -> ResettableNonceManager {
-        use alloy::primitives::U64;
-        use alloy::providers::mock::Asserter;
-
-        let asserter = Asserter::new();
-        match latest {
-            Some(latest) => asserter.push_success(&U64::from(latest)),
-            None => asserter.push_failure_msg("node unavailable"),
-        }
-        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
-        let manager = ResettableNonceManager::default();
-        manager.set_next_nonce(Address::ZERO, NEXT).await;
-        manager
-            .reserve_prepared_nonce(Address::ZERO, DISCARDED)
-            .await;
-
-        manager
-            .release_discarded_nonce(&provider, Address::ZERO, DISCARDED)
-            .await;
-        assert!(
-            !manager.release_occupied_nonce(Address::ZERO, DISCARDED),
-            "the discard must release the reservation"
-        );
-        manager
-    }
-
-    #[cfg(any(feature = "turnkey", feature = "local-signer"))]
-    const DISCARDED: u64 = 5;
-    #[cfg(any(feature = "turnkey", feature = "local-signer"))]
-    const NEXT: u64 = 8;
-
-    #[cfg(any(feature = "turnkey", feature = "local-signer"))]
-    #[tokio::test]
-    async fn discarding_an_unmined_nonce_rewinds_onto_it() {
-        // A persist-failure rollback: the chain has not reached the discarded
-        // nonce, so the gap must be refilled before any higher nonce is used.
-        let manager = discard_against_latest(Some(DISCARDED)).await;
-
-        assert_eq!(
-            manager.peek_next_nonce(Address::ZERO).await,
-            Some(DISCARDED)
-        );
-    }
-
-    #[cfg(any(feature = "turnkey", feature = "local-signer"))]
-    #[tokio::test]
-    async fn discarding_a_mined_nonce_keeps_the_cache() {
-        // An operator reconcile after a replacement mined at the discarded
-        // nonce: rewinding onto it would sign the next send at a used nonce.
-        let manager = discard_against_latest(Some(DISCARDED + 1)).await;
-
-        assert_eq!(manager.peek_next_nonce(Address::ZERO).await, Some(NEXT));
-    }
-
-    #[cfg(any(feature = "turnkey", feature = "local-signer"))]
-    #[tokio::test]
-    async fn discard_clears_the_cache_when_the_mined_nonce_is_unreadable() {
-        // Without the mined count the discard cannot tell a free nonce from a
-        // used one, so the next send must refetch `latest` from the chain.
-        let manager = discard_against_latest(None).await;
-
-        assert_eq!(manager.peek_next_nonce(Address::ZERO).await, None);
     }
 
     #[tokio::test]

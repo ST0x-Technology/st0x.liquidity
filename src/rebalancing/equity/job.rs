@@ -697,8 +697,9 @@ pub(crate) trait ResumeEquityToHedging: Send + Sync + 'static {
     /// Release the wallet nonce reservation a prepared vault withdrawal still
     /// holds after its redemption was reconciled out-of-band. A reconcile is
     /// pure bookkeeping and never touches the wallet, so without this the
-    /// reservation survives until a restart and later sends from that wallet
-    /// queue behind the freed nonce.
+    /// reservation survives until a restart. The operator reconciles only after
+    /// another transaction mined at the withdrawal's nonce, so the release
+    /// leaves nonce allocation untouched.
     ///
     /// Defaults to a no-op: only the production [`CrossVenueEquityTransfer`]
     /// holds a wallet, so a resume double without one has no reservation to
@@ -3210,7 +3211,7 @@ mod tests {
             .expect("a reconciled redemption must terminate cleanly");
 
         assert_eq!(
-            raindex.discard_prepared_withdrawal_calls(),
+            raindex.released_superseded_withdrawals(),
             vec![prepared.tx_hash()],
             "a resume observing the durable Reconciled must release the withdrawal's \
              nonce reservation exactly once"
@@ -3234,7 +3235,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            raindex.discard_prepared_withdrawal_calls(),
+            raindex.released_superseded_withdrawals(),
             vec![prepared.tx_hash()],
             "the terminal attempt of a reconciled redemption must release the \
              withdrawal's nonce reservation"

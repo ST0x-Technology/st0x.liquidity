@@ -480,6 +480,10 @@ impl Raindex for PanickingRaindex {
         unimplemented!("PanickingRaindex: not available in CLI context")
     }
 
+    async fn release_superseded_withdraw(&self, _: TxHash) {
+        unimplemented!("PanickingRaindex: not available in CLI context")
+    }
+
     async fn restore_submitted_withdrawal(
         &self,
         _: TxHash,
@@ -1719,10 +1723,11 @@ impl CrossVenueEquityTransfer {
 
     /// Release the wallet nonce reservation a reconciled redemption's prepared
     /// vault withdrawal still holds. The reconcile itself is pure bookkeeping
-    /// and never reaches the wallet, so the running bot frees the nonce here the
-    /// first time a resume observes the durable `Reconciled`. The underlying
-    /// release is idempotent, so a redriven or duplicate observation is a
-    /// harmless no-op.
+    /// and never reaches the wallet, so the running bot releases the reservation
+    /// here the first time a resume observes the durable `Reconciled`. Another
+    /// transaction has already mined at the withdrawal's nonce, so allocation is
+    /// not rewound. The underlying release is idempotent, so a redriven or
+    /// duplicate observation is a harmless no-op.
     pub(crate) async fn discard_reconciled_withdrawal(
         &self,
         chain: Chain,
@@ -1731,7 +1736,7 @@ impl CrossVenueEquityTransfer {
         self.services
             .for_chain(chain)?
             .raindex
-            .discard_prepared_withdraw(tx_hash)
+            .release_superseded_withdraw(tx_hash)
             .await;
         Ok(())
     }

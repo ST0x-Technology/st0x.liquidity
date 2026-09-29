@@ -5972,6 +5972,11 @@ It does not cancel the signed withdrawal, so the operator reconciles only after
 another transaction from the bot wallet has mined at the withdrawal's nonce. A
 withdrawal that is only missing from a mempool can still mine, so the operator
 first sends a 0-value self-transfer at that nonce and waits for it to confirm.
+That mined replacement is what lets later sends proceed. The release is
+bookkeeping: it drops the bot's hold on the used nonce and does not rewind nonce
+allocation onto it. A prepared transaction discarded before broadcast (a
+persist-failure rollback) is different: its nonce is unused, so allocation is
+rewound to refill it.
 
 The `Reconciled` state retains the identifying fields (symbol, quantity,
 original failure reason, request/redemption identifiers) so the dashboard

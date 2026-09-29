@@ -142,7 +142,7 @@ use std::time::Duration;
 use tokio::time::sleep;
 use tracing::{debug, error, info, warn};
 
-use crate::inflight_nonces::{InFlightNonces, NonceOwnership};
+use crate::inflight_nonces::{DiscardedNonce, InFlightNonces, NonceOwnership};
 use crate::nonce::ResettableNonceManager;
 use crate::{EvmError, NextNonceHint, PreparedTransaction};
 
@@ -442,36 +442,37 @@ where
 
 /// Release a prepared transaction's nonce reservation, identified by its
 /// transaction hash. Ownership-checked: it releases only while the wallet's
-/// in-flight record still attributes the nonce to this exact transaction, so a
-/// persist-failure rollback and repeated releases of the same transaction
-/// (possibly after the nonce was reallocated) are all safe. A stale repeat
-/// leaves intact whatever transaction has since taken the nonce.
+/// in-flight record still attributes the nonce to this exact transaction, so
+/// repeated releases of the same transaction (possibly after the nonce was
+/// reallocated) are safe. A stale repeat leaves intact whatever transaction has
+/// since taken the nonce. `discarded` decides whether allocation is rewound
+/// onto the freed nonce (see [`DiscardedNonce`]).
 ///
 /// Takes the wallet send lock so this cannot race a concurrent nonce
 /// assignment (see [`prepare_with_nonce`]).
-pub(crate) async fn discard_prepared<P>(
-    provider: &P,
+pub(crate) async fn discard_prepared(
     in_flight: &InFlightNonces,
     send_lock: &Mutex<()>,
     address: Address,
     tx_hash: TxHash,
-) where
-    P: Provider,
-{
+    discarded: DiscardedNonce,
+) {
     let _guard = send_lock.lock().await;
     if in_flight
-        .release_durable_by_hash(provider, address, tx_hash)
+        .release_durable_by_hash(address, tx_hash, discarded)
         .await
     {
         warn!(
             target: "wallet",
             %tx_hash,
+            ?discarded,
             "Discarding prepared transaction and releasing its nonce reservation"
         );
     } else {
         debug!(
             target: "wallet",
             %tx_hash,
+            ?discarded,
             "Discarding prepared transaction that no longer holds a nonce reservation \
              (already released or its nonce reallocated)"
         );

@@ -92,6 +92,12 @@ impl Wallet for StubWallet {
         );
     }
 
+    async fn release_superseded(&self, _tx_hash: TxHash) {
+        panic!(
+            "StubWallet::release_superseded called - use a real wallet in tests that need transactions"
+        );
+    }
+
     async fn restore_prepared(&self, _prepared: &PreparedTransaction) {
         panic!(
             "StubWallet::restore_prepared called - use a real wallet in tests that need transactions"
