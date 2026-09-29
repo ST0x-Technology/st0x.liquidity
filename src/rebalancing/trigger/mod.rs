@@ -36478,4 +36478,119 @@ mod tests {
             "got {pages:?}"
         );
     }
+
+    /// Replaces the latest event payload of `id` with one that does not
+    /// deserialize, so `Store::load` fails; returns the original payload.
+    async fn break_latest_usdc_event(pool: &SqlitePool, id: &UsdcRebalanceId) -> String {
+        let original: String = sqlx::query_scalar(
+            "SELECT payload FROM events WHERE aggregate_id = ? ORDER BY sequence DESC LIMIT 1",
+        )
+        .bind(id.to_string())
+        .fetch_one(pool)
+        .await
+        .unwrap();
+        set_latest_usdc_event_payload(pool, id, "{\"NotAnEvent\":{}}").await;
+        original
+    }
+
+    async fn set_latest_usdc_event_payload(pool: &SqlitePool, id: &UsdcRebalanceId, payload: &str) {
+        sqlx::query(
+            "UPDATE events SET payload = ? WHERE aggregate_id = ? AND sequence = \
+             (SELECT MAX(sequence) FROM events WHERE aggregate_id = ?)",
+        )
+        .bind(payload)
+        .bind(id.to_string())
+        .bind(id.to_string())
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    fn assert_every_corridor_blocked_but_not_latched(trigger: &RebalancingService) {
+        assert!(
+            !trigger.usdc_guards.is_latched(),
+            "a store error must not latch every corridor until a restart"
+        );
+        let Err(_) = trigger.usdc_guards.try_claim(
+            Chain::Base,
+            &UsdcRebalanceId(Uuid::new_v4()),
+            RebalanceDirection::BaseToAlpaca,
+        ) else {
+            panic!("a transfer whose corridor could not be loaded must block new claims");
+        };
+    }
+
+    /// A startup candidate whose load fails blocks every corridor only until
+    /// the sweep can read it, then holds its own corridor.
+    #[tokio::test]
+    async fn startup_load_error_blocks_every_corridor_until_the_sweep_reads_it() {
+        let pool = crate::test_utils::setup_test_db().await;
+        let store = Arc::new(test_store::<UsdcRebalance>(pool.clone(), ()));
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        seed_withdrawing_alpaca_to_base_on(&store, &id, usdc(400), ROBINHOOD_RELAY).await;
+        let original = break_latest_usdc_event(&pool, &id).await;
+        let notifier = Arc::new(CapturingNotifier::default());
+        let trigger = make_unserved_corridor_trigger(&pool, store.clone(), notifier.clone()).await;
+
+        trigger.recover_usdc_guard(&pool, &store).await.unwrap();
+        assert_every_corridor_blocked_but_not_latched(&trigger);
+        let pages = notifier.messages();
+        assert!(
+            pages
+                .iter()
+                .any(|page| page.contains(&id.to_string()) && page.contains("retry or restart")),
+            "got {pages:?}"
+        );
+
+        set_latest_usdc_event_payload(&pool, &id, &original).await;
+        trigger
+            .expire_stuck_usdc_rebalances(Utc::now())
+            .await
+            .unwrap();
+
+        assert!(trigger.usdc_guards.is_held(Chain::Robinhood));
+        trigger
+            .usdc_guards
+            .try_claim(
+                Chain::Base,
+                &UsdcRebalanceId(Uuid::new_v4()),
+                RebalanceDirection::BaseToAlpaca,
+            )
+            .expect("Base is free once the transfer's corridor is read");
+    }
+
+    /// A post-burn failure whose aggregate fails to load blocks every
+    /// corridor only until the sweep can read it, then holds its own.
+    #[tokio::test]
+    async fn runtime_load_error_blocks_every_corridor_until_the_sweep_reads_it() {
+        let pool = crate::test_utils::setup_test_db().await;
+        let store = Arc::new(test_store::<UsdcRebalance>(pool.clone(), ()));
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        seed_withdrawing_alpaca_to_base_on(&store, &id, usdc(400), ROBINHOOD_RELAY).await;
+        let notifier = Arc::new(CapturingNotifier::default());
+        let trigger = make_unserved_corridor_trigger(&pool, store.clone(), notifier.clone()).await;
+        let original = break_latest_usdc_event(&pool, &id).await;
+
+        ReactorHarness::new(Arc::clone(&trigger))
+            .receive::<UsdcRebalance>(id.clone(), make_usdc_deposit_failed())
+            .await
+            .unwrap();
+        assert_every_corridor_blocked_but_not_latched(&trigger);
+        let pages = notifier.messages();
+        assert!(
+            pages
+                .iter()
+                .any(|page| page.contains(&id.to_string()) && page.contains("retry or restart")),
+            "got {pages:?}"
+        );
+
+        set_latest_usdc_event_payload(&pool, &id, &original).await;
+        trigger
+            .expire_stuck_usdc_rebalances(Utc::now())
+            .await
+            .unwrap();
+
+        assert!(trigger.usdc_guards.is_held(Chain::Robinhood));
+        assert!(!trigger.usdc_guards.is_latched());
+    }
 }
