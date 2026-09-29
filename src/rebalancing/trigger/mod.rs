@@ -15638,11 +15638,55 @@ mod tests {
 
     /// A fill on a secondary chain whose listing rebalances the symbol moves
     /// that chain's own slot and so its deviation from its target, which the
-    /// planner manages: it asks for the symbol's equity check. USDC still
-    /// rebalances on the primary chain only.
+    /// planner manages: it asks for the symbol's equity check. USDC
+    /// rebalances only on the configured corridor's chain, Base here.
     #[tokio::test]
     async fn rebalancing_secondary_chain_fill_schedules_the_equity_check() {
         let symbol = Symbol::new("AAPL").unwrap();
+        let trigger = hyperevm_fill_trigger(&symbol, test_config()).await;
+
+        assert_eq!(
+            count_pending_equity_check_jobs(&trigger).await,
+            1,
+            "a rebalancing secondary's fill must schedule the symbol's equity check"
+        );
+        assert_eq!(
+            count_pending_usdc_check_jobs(&trigger).await,
+            0,
+            "a fill off the corridor chain must not schedule the USDC check"
+        );
+    }
+
+    /// A fill on the cash corridor's chain moves that chain's vault cash, so
+    /// it schedules the USDC check even when the chain is not the primary.
+    #[tokio::test]
+    async fn corridor_chain_fill_schedules_the_usdc_check() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let config = RebalancingServiceConfig {
+            usdc: Some(UsdcCorridorCtx {
+                corridor: UsdcCorridor::HubRouted {
+                    chain: Chain::HyperEvm,
+                    hop: HopKind::Relay,
+                },
+                threshold: ImbalanceThreshold {
+                    target: float!(0.5),
+                    deviation: float!(0.2),
+                },
+            }),
+            ..test_config()
+        };
+
+        let trigger = hyperevm_fill_trigger(&symbol, config).await;
+
+        assert_eq!(count_pending_usdc_check_jobs(&trigger).await, 1);
+    }
+
+    /// Seeds a HyperEVM slot whose listing rebalances `symbol`, then applies
+    /// a HyperEVM fill.
+    async fn hyperevm_fill_trigger(
+        symbol: &Symbol,
+        mut config: RebalancingServiceConfig,
+    ) -> Arc<RebalancingService> {
         let now = Utc::now();
         let inventory = InventoryView::default()
             .with_equity(symbol.clone(), shares(50), shares(50))
@@ -15667,7 +15711,6 @@ mod tests {
                 now,
             )
             .unwrap();
-        let mut config = test_config();
         config.chains.insert(
             Chain::HyperEvm,
             ChainRebalancingConfig::for_test(ChainAssets {
@@ -15675,9 +15718,9 @@ mod tests {
                 cash: None,
             }),
         );
-        let reactor = make_trigger_with_inventory_registry_and_wrappers(
+        let trigger = make_trigger_with_inventory_registry_and_wrappers(
             inventory,
-            &symbol,
+            symbol,
             BTreeMap::from([
                 (
                     Chain::Base,
@@ -15691,10 +15734,8 @@ mod tests {
             config,
         )
         .await;
-        let trigger = reactor.clone();
-        let harness = ReactorHarness::new(reactor.clone());
 
-        harness
+        ReactorHarness::new(trigger.clone())
             .receive::<Position>(
                 symbol.clone(),
                 make_onchain_fill_on_chain(shares(10), Direction::Buy, Chain::HyperEvm),
@@ -15702,16 +15743,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(
-            count_pending_equity_check_jobs(&trigger).await,
-            1,
-            "a rebalancing secondary's fill must schedule the symbol's equity check"
-        );
-        assert_eq!(
-            count_pending_usdc_check_jobs(&trigger).await,
-            0,
-            "USDC rebalancing still runs on the primary chain only"
-        );
+        trigger
     }
 
     /// Before a hedged secondary's first poll, no snapshot has seeded its
