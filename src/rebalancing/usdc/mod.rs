@@ -19,14 +19,14 @@ pub(crate) use job::{
 };
 #[cfg(test)]
 pub(crate) use manager::RecoveredCctpMint;
+pub(crate) use manager::{
+    CctpMintRecoveryError, RecheckUsdcDeposit, RecoverCctpMint, RecoveredMintAmounts,
+    RestorePreparedDepositSends, RestoredDepositSends, UsdcRecheckError, u256_to_usdc,
+};
 pub use manager::{
     CrossVenueCashTransfer, DepositSendNotSuperseded, EthereumChainMissing,
     MarketMakingUsdcEndpoints, UsdcSettlementParams, deposit_send_required_confirmations,
     verify_deposit_send_superseded,
-};
-pub(crate) use manager::{
-    CctpMintRecoveryError, RecheckUsdcDeposit, RecoverCctpMint, RecoveredMintAmounts,
-    RestorePreparedDepositSends, RestoredDepositSends, UsdcRecheckError, u256_to_usdc,
 };
 
 use std::time::Duration;

@@ -10094,9 +10094,13 @@ mod tests {
             )
             .await
             .map(|_| ()),
-            "recheck" => recheck_transfer(State(state), Path(("usdc_bridge".to_string(), id)))
-                .await
-                .map(|_| ()),
+            "recheck" => recheck_transfer(
+                State(state),
+                Path(("usdc_bridge".to_string(), id)),
+                Query(RecheckQuery::default()),
+            )
+            .await
+            .map(|_| ()),
             "fail-usdc" => fail_usdc_transfer(State(state), Path(id), fail_usdc_request())
                 .await
                 .map(|_| ()),

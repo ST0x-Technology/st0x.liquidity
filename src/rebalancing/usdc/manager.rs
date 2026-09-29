@@ -628,6 +628,7 @@ fn repeating_mint_failure(
         | CctpError::BurnTxPending { .. }
         | CctpError::Http(_)
         | CctpError::AttestationTimeout { .. }
+        | CctpError::AttestationNotReady { .. }
         | CctpError::MessageSentEventNotFound { .. }
         | CctpError::MintAndWithdrawEventNotFound
         | CctpError::TxReceiptMissingBlock { .. }
