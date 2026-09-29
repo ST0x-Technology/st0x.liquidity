@@ -36790,4 +36790,64 @@ mod tests {
         assert_eq!(inventory.active_usdc_rebalance(), Some(&base_id));
         drop(inventory);
     }
+
+    /// A resume whose corridor another transfer still holds in memory (one
+    /// already terminal on disk) becomes a holder too, so releasing the
+    /// other one leaves the corridor held.
+    #[tokio::test]
+    async fn manual_resume_holds_its_corridor_after_the_push() {
+        let (trigger, pool, store) = make_resume_trigger().await;
+        let id = seed_converting_alpaca_to_base(&store).await;
+        let stale = UsdcRebalanceId(Uuid::new_v4());
+        trigger
+            .usdc_guards
+            .hold(Chain::Base, &stale, RebalanceDirection::BaseToAlpaca);
+
+        trigger
+            .resume_usdc_transfer(&pool, &id, RebalanceDirection::AlpacaToBase)
+            .await
+            .unwrap();
+        trigger.usdc_guards.release(&stale);
+
+        assert!(
+            matches!(
+                trigger.usdc_guards.try_claim(
+                    Chain::Base,
+                    &UsdcRebalanceId(Uuid::new_v4()),
+                    RebalanceDirection::BaseToAlpaca,
+                ),
+                Err(ClaimRefusal::CorridorHeld)
+            ),
+            "the resumed transfer must hold its corridor"
+        );
+    }
+
+    /// An Alpaca-outbound resume is refused by an Alpaca-outbound holder on
+    /// another corridor even while its own corridor is held too.
+    #[tokio::test]
+    async fn manual_resume_checks_the_alpaca_outbound_rule_even_on_a_held_corridor() {
+        let (trigger, pool, store) = make_resume_trigger().await;
+        let id = seed_converting_alpaca_to_base(&store).await;
+        trigger.usdc_guards.hold(
+            Chain::Base,
+            &UsdcRebalanceId(Uuid::new_v4()),
+            RebalanceDirection::BaseToAlpaca,
+        );
+        trigger.usdc_guards.hold(
+            Chain::Robinhood,
+            &UsdcRebalanceId(Uuid::new_v4()),
+            RebalanceDirection::AlpacaToBase,
+        );
+
+        let error = trigger
+            .resume_usdc_transfer(&pool, &id, RebalanceDirection::AlpacaToBase)
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(error, UsdcResumeError::GuardHeldElsewhere),
+            "got {error:?}"
+        );
+        assert!(market_making_job_rows(&trigger).await.is_empty());
+    }
 }
