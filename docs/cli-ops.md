@@ -310,10 +310,16 @@ corridor guard, so retrying it cannot start a second transfer alongside the
 first. `capital cctp-bridge` does not wait for Circle: it returns the burn tx,
 and `debug cctp complete-mint` fetches the attestation and mints once Circle has
 attested it (a `502` means not yet, retry). A request that times out on the
-client may still complete in the bot; check the bot logs for the transaction
-before retrying a vault or allowance verb. The tokenization and issuer verbs
-(`transfer-equity`, `wrap-equity`, `unwrap-equity`, `donate-equity`,
-`dividend-bump`) have no client subcommand and stay on `st0x-cli`.
+client may still complete in the bot; check the bot logs and the chain for the
+transaction before retrying a vault, allowance, or `cctp-bridge` verb. A retried
+`cctp-bridge` burns again: the bot keeps no record of the first burn, and an
+approve plus the burn's confirmations can outlast the 60-second proxy timeout.
+Find the first burn's tx in the logs (`CCTP burn submitted via API`) and finish
+it with `debug cctp complete-mint` instead of retrying. Every verb that sends a
+transaction answers `503` until the bot finishes starting. The tokenization and
+issuer verbs (`transfer-equity`, `wrap-equity`, `unwrap-equity`,
+`donate-equity`, `dividend-bump`) have no client subcommand and stay on
+`st0x-cli`.
 
 ### Orchestrator Rollout per Chain
 

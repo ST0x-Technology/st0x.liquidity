@@ -4145,7 +4145,9 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
 
-    use alloy::primitives::{Address, Bytes, IntoLogData, TxHash, address, fixed_bytes, uint};
+    use alloy::primitives::{
+        Address, B256, Bytes, IntoLogData, TxHash, address, fixed_bytes, uint,
+    };
     use alloy::providers::{ProviderBuilder, mock::Asserter};
     use alloy::rpc::types::Log;
     use alloy::sol_types::SolCall;
@@ -4164,8 +4166,8 @@ mod tests {
     use st0x_bridge::cctp::CctpError;
     use st0x_bridge::corridor::{HopKind, UsdcCorridor};
     use st0x_config::{
-        BrokerCtx, Ctx, ExecutionThreshold, FileLogging, HedgedChain, LogLevel, RestApiCtx,
-        create_test_ctx_with_order_owner,
+        BrokerCtx, ChainCashAsset, Ctx, ExecutionThreshold, FileLogging, HedgedChain, LogLevel,
+        OperationMode, RestApiCtx, create_test_ctx_with_order_owner,
     };
     use st0x_dto::{Trade, TradeOutcome, TradingVenue};
     use st0x_event_sorcery::{ReactorHarness, StoreBuilder};
@@ -4210,8 +4212,9 @@ mod tests {
     };
     use crate::rebalancing::{RebalancingSchedulers, RebalancingServiceConfig};
     use crate::test_utils::{
-        TEST_POLL_INTERVAL, get_test_order, reserving_counter_trade_preflight,
-        seed_get_test_order_token_symbols, setup_test_pools,
+        AnvilRaindexChain, TEST_POLL_INTERVAL, erc20_allowance, erc20_balance, get_test_order,
+        mined_receipt, reserving_counter_trade_preflight, seed_get_test_order_token_symbols,
+        setup_test_pools,
     };
     use crate::tokenized_equity_mint::TokenizedEquityMint;
     use crate::usdc_rebalance::{ConversionAmounts, RebalanceDirection, TransferRef};
@@ -7672,16 +7675,18 @@ mod tests {
         Json(serde_json::from_value(body).unwrap())
     }
 
-    /// A zero or negative amount is refused as input before the resume lock
-    /// is even tried: with the lock held, a 409 here would mean the amount
-    /// was not checked first.
+    /// A zero, negative, or off-grid amount is refused as input before the
+    /// resume lock is even tried: with the lock held, a 409 here would mean
+    /// the amount was not checked first. `1.0000001` is positive but
+    /// finer than USDC's six decimals, so the worker would refuse it only
+    /// after the enqueue had claimed the corridor.
     #[tokio::test]
-    async fn transfer_usdc_refuses_a_non_positive_amount_before_the_resume_lock() {
+    async fn transfer_usdc_refuses_an_invalid_amount_before_the_resume_lock() {
         let state = empty_app_state(create_test_ctx_with_order_owner(Address::ZERO)).await;
         let resume_lock = Arc::clone(&state.resume_lock);
         let _held = resume_lock.0.try_lock().unwrap();
 
-        for amount in ["0", "-5"] {
+        for amount in ["0", "-5", "1.0000001"] {
             let Err((status, Json(body))) = capital::transfer_usdc(
                 State(state.clone()),
                 capital_request(serde_json::json!({"direction": "to-raindex", "amount": amount})),
@@ -7922,6 +7927,7 @@ mod tests {
         let mut ctx = create_test_ctx_with_order_owner(Address::ZERO);
         ctx.wallet = Some(st0x_config::OnchainWalletCtx::stub());
         let (state, _gate) = recovery_state_for_ctx(ctx).await;
+        state.health.set_ready();
         let resume_lock = Arc::clone(&state.resume_lock);
         let _held = resume_lock.0.try_lock().unwrap();
 
@@ -7938,6 +7944,402 @@ mod tests {
         assert_eq!(
             body.error,
             "A resume or recheck operation is already in progress"
+        );
+    }
+
+    /// Every capital route that signs refuses with 503 until startup
+    /// completes, as process-tx does: the recovery handle and the wallets
+    /// exist before the chain id and `OPERATOR_ROLE` preflights have passed.
+    /// The request is otherwise valid for each route, so a 503 proves the
+    /// gate fires before any onchain call.
+    #[tokio::test]
+    async fn capital_signing_routes_return_503_until_startup_completes() {
+        let mut ctx = create_test_ctx_with_order_owner(Address::ZERO);
+        ctx.wallet = Some(st0x_config::OnchainWalletCtx::stub());
+        ctx.chains.primary_mut().assets.cash = Some(ChainCashAsset {
+            vault_ids: vec![B256::with_last_byte(7)],
+            rebalancing: OperationMode::Disabled,
+            operational_limit: None,
+        });
+        let (state, _gate) = recovery_state_for_ctx(ctx).await;
+        let vault = serde_json::json!({
+            "chain": "base",
+            "token": "0x0000000000000000000000000000000000000001",
+            "vaultId": "0x0000000000000000000000000000000000000000000000000000000000000002",
+            "amount": "1",
+        });
+
+        let deposit =
+            capital::vault_deposit(State(state.clone()), capital_request(vault.clone())).await;
+        let withdraw = capital::vault_withdraw(State(state.clone()), capital_request(vault)).await;
+        let withdraw_usdc = capital::vault_withdraw_usdc(
+            State(state.clone()),
+            capital_request(serde_json::json!({"chain": "base", "amount": "1"})),
+        )
+        .await;
+        let bridge = capital::cctp_bridge(
+            State(state.clone()),
+            capital_request(serde_json::json!({"from": "base", "amount": "1"})),
+        )
+        .await;
+        let reset = capital::reset_allowance(
+            State(state),
+            capital_request(serde_json::json!({"chain": "base"})),
+        )
+        .await;
+
+        for (route, result) in [
+            ("vault-deposit", deposit.err()),
+            ("vault-withdraw", withdraw.err()),
+            ("vault-withdraw-usdc", withdraw_usdc.err()),
+            ("cctp-bridge", bridge.err()),
+            ("reset-allowance", reset.err()),
+        ] {
+            let (status, Json(body)) = result.unwrap_or_else(|| panic!("{route} must refuse"));
+            assert_eq!(
+                status,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "{route}: {}",
+                body.error
+            );
+            assert_eq!(
+                body.error,
+                format!("{route} is unavailable until startup completes")
+            );
+        }
+    }
+
+    /// The 200 body of a capital route as JSON; a refusal panics with its
+    /// status and message, so a failing route reports why.
+    fn capital_success<Response: Serialize>(
+        route: &str,
+        result: Result<Json<Response>, (StatusCode, Json<ErrorResponse>)>,
+    ) -> serde_json::Value {
+        match result {
+            Ok(Json(body)) => serde_json::to_value(body).unwrap(),
+            Err((status, Json(error))) => {
+                panic!("{route} refused with {status}: {}", error.error)
+            }
+        }
+    }
+
+    fn vault_request(token: Address, vault_id: B256, amount: &str) -> serde_json::Value {
+        serde_json::json!({
+            "chain": "base",
+            "token": token,
+            "vaultId": vault_id,
+            "amount": amount,
+        })
+    }
+
+    /// A ctx whose Base trading table is `chain`'s orderbook in Legacy mode,
+    /// where the bot's own vaults live, with every signer the bot's wallet
+    /// on that node.
+    fn capital_ctx_on(chain: &AnvilRaindexChain) -> Ctx {
+        let mut ctx = create_test_ctx_with_order_owner(chain.bot);
+        let primary = ctx.chains.primary_mut();
+        primary.rpc_url = chain.endpoint.clone();
+        primary.orderbook = chain.orderbook;
+        ctx.wallet = Some(st0x_config::OnchainWalletCtx::from_wallets(
+            Arc::clone(&chain.bot_wallet),
+            Arc::clone(&chain.bot_wallet),
+            Arc::clone(&chain.bot_wallet),
+            Arc::clone(&chain.bot_wallet),
+        ));
+        ctx
+    }
+
+    /// End to end through the handler against a deployed orderbook: the
+    /// amount is scaled by the decimals read onchain, the response reports the
+    /// mined deposit, and exactly the reported raw amount moves from the bot's
+    /// wallet into its vault.
+    #[tokio::test]
+    async fn vault_deposit_moves_the_scaled_amount_into_the_bots_vault() {
+        let chain = AnvilRaindexChain::deploy().await;
+        let supply = U256::from(1_000_u64) * U256::from(10_u64).pow(U256::from(18_u64));
+        let token = chain.deploy_bot_token(18, supply).await;
+        let vault_id = B256::with_last_byte(3);
+        let state = empty_app_state(capital_ctx_on(&chain)).await;
+        state.health.set_ready();
+
+        let body = capital_success(
+            "vault-deposit",
+            capital::vault_deposit(
+                State(state),
+                capital_request(vault_request(token, vault_id, "1.5")),
+            )
+            .await,
+        );
+
+        let deposit_tx: TxHash = serde_json::from_value(body["depositTx"].clone()).unwrap();
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "chain": "base",
+                "token": token,
+                "vaultId": vault_id,
+                "amount": "1.5",
+                "amountRaw": "1500000000000000000",
+                "decimals": 18,
+                "depositTx": deposit_tx,
+            })
+        );
+        let receipt = mined_receipt(&chain.bot_wallet, deposit_tx).await;
+        assert_eq!(receipt.to, Some(chain.orderbook));
+
+        let deposited = U256::from(1_500_000_000_000_000_000_u64);
+        assert_eq!(chain.vault_balance(token, vault_id, 18).await, deposited);
+        assert_eq!(
+            erc20_balance(&chain.bot_wallet, token, chain.bot).await,
+            supply - deposited
+        );
+    }
+
+    /// After a deposit, a partial withdraw returns exactly the reported raw
+    /// amount from the vault to the bot's wallet.
+    #[tokio::test]
+    async fn vault_withdraw_moves_the_scaled_amount_back_to_the_bots_wallet() {
+        let chain = AnvilRaindexChain::deploy().await;
+        let supply = U256::from(1_000_u64) * U256::from(10_u64).pow(U256::from(18_u64));
+        let token = chain.deploy_bot_token(18, supply).await;
+        let vault_id = B256::with_last_byte(4);
+        let state = empty_app_state(capital_ctx_on(&chain)).await;
+        state.health.set_ready();
+        capital_success(
+            "vault-deposit",
+            capital::vault_deposit(
+                State(state.clone()),
+                capital_request(vault_request(token, vault_id, "1.5")),
+            )
+            .await,
+        );
+
+        let body = capital_success(
+            "vault-withdraw",
+            capital::vault_withdraw(
+                State(state),
+                capital_request(vault_request(token, vault_id, "0.25")),
+            )
+            .await,
+        );
+
+        let withdraw_tx: TxHash = serde_json::from_value(body["withdrawTx"].clone()).unwrap();
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "chain": "base",
+                "token": token,
+                "vaultId": vault_id,
+                "amount": "0.25",
+                "amountRaw": "250000000000000000",
+                "decimals": 18,
+                "withdrawTx": withdraw_tx,
+            })
+        );
+        let receipt = mined_receipt(&chain.bot_wallet, withdraw_tx).await;
+        assert_eq!(receipt.to, Some(chain.orderbook));
+
+        let deposited = U256::from(1_500_000_000_000_000_000_u64);
+        let withdrawn = U256::from(250_000_000_000_000_000_u64);
+        assert_eq!(
+            chain.vault_balance(token, vault_id, 18).await,
+            deposited - withdrawn
+        );
+        assert_eq!(
+            erc20_balance(&chain.bot_wallet, token, chain.bot).await,
+            supply - deposited + withdrawn
+        );
+    }
+
+    /// The USDC withdraw resolves the chain's settlement stable and the first
+    /// configured cash vault on its own: the response names both, the reported
+    /// raw amount (6 decimals) leaves that vault for the bot's wallet, and the
+    /// second configured cash vault is untouched.
+    #[tokio::test]
+    async fn vault_withdraw_usdc_withdraws_the_stable_from_the_first_cash_vault() {
+        let chain = AnvilRaindexChain::deploy().await;
+        let usdc = Chain::Base.settlement_stable().address;
+        chain
+            .etch_bot_stable(usdc, U256::from(100_000_000_u64))
+            .await;
+        let cash_vault = B256::with_last_byte(7);
+        let second_cash_vault = B256::with_last_byte(8);
+        let mut ctx = capital_ctx_on(&chain);
+        ctx.chains.primary_mut().assets.cash = Some(ChainCashAsset {
+            vault_ids: vec![cash_vault, second_cash_vault],
+            rebalancing: OperationMode::Disabled,
+            operational_limit: None,
+        });
+        let state = empty_app_state(ctx).await;
+        state.health.set_ready();
+        capital_success(
+            "vault-deposit",
+            capital::vault_deposit(
+                State(state.clone()),
+                capital_request(vault_request(usdc, cash_vault, "10")),
+            )
+            .await,
+        );
+
+        let body = capital_success(
+            "vault-withdraw-usdc",
+            capital::vault_withdraw_usdc(
+                State(state),
+                capital_request(serde_json::json!({"chain": "base", "amount": "2.5"})),
+            )
+            .await,
+        );
+
+        let withdraw_tx: TxHash = serde_json::from_value(body["withdrawTx"].clone()).unwrap();
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "chain": "base",
+                "token": usdc,
+                "vaultId": cash_vault,
+                "amount": "2.5",
+                "amountRaw": "2500000",
+                "decimals": 6,
+                "withdrawTx": withdraw_tx,
+            })
+        );
+        let receipt = mined_receipt(&chain.bot_wallet, withdraw_tx).await;
+        assert_eq!(receipt.to, Some(chain.orderbook));
+
+        assert_eq!(
+            chain.vault_balance(usdc, cash_vault, 6).await,
+            U256::from(7_500_000_u64)
+        );
+        assert_eq!(
+            chain.vault_balance(usdc, second_cash_vault, 6).await,
+            U256::ZERO
+        );
+        assert_eq!(
+            erc20_balance(&chain.bot_wallet, usdc, chain.bot).await,
+            U256::from(92_500_000_u64)
+        );
+    }
+
+    /// A standing settlement stable allowance to the orderbook is revoked by
+    /// a mined approve on the stable, reported with its tx; a second reset
+    /// finds it already zero and sends nothing.
+    #[tokio::test]
+    async fn reset_allowance_revokes_a_standing_allowance_then_reports_already_zero() {
+        let chain = AnvilRaindexChain::deploy().await;
+        let usdc = Chain::Base.settlement_stable().address;
+        chain.etch_bot_stable(usdc, U256::ZERO).await;
+        chain
+            .approve_from_bot(usdc, chain.orderbook, U256::from(5_000_000_u64))
+            .await;
+        let state = empty_app_state(capital_ctx_on(&chain)).await;
+        state.health.set_ready();
+
+        let revoked = capital_success(
+            "reset-allowance",
+            capital::reset_allowance(
+                State(state.clone()),
+                capital_request(serde_json::json!({"chain": "base"})),
+            )
+            .await,
+        );
+
+        let revoke_tx: TxHash = serde_json::from_value(revoked["tx"].clone()).unwrap();
+        assert_eq!(
+            revoked,
+            serde_json::json!({
+                "chain": "base",
+                "token": usdc,
+                "spender": chain.orderbook,
+                "outcome": "revoked",
+                "tx": revoke_tx,
+            })
+        );
+        let receipt = mined_receipt(&chain.bot_wallet, revoke_tx).await;
+        assert_eq!(receipt.to, Some(usdc));
+        assert_eq!(
+            erc20_allowance(&chain.bot_wallet, usdc, chain.bot, chain.orderbook).await,
+            U256::ZERO
+        );
+
+        let already_zero = capital_success(
+            "reset-allowance",
+            capital::reset_allowance(
+                State(state),
+                capital_request(serde_json::json!({"chain": "base"})),
+            )
+            .await,
+        );
+
+        assert_eq!(
+            already_zero,
+            serde_json::json!({
+                "chain": "base",
+                "token": usdc,
+                "spender": chain.orderbook,
+                "outcome": "already_zero",
+                "tx": null,
+            })
+        );
+    }
+
+    /// End to end against CCTP V2 deployed on two Anvil nodes, reached
+    /// through the ctx's test overrides: an exact burn from Base reports the
+    /// route, the raw amount and the mined burn, and exactly that amount
+    /// leaves the bot's Base wallet. Nothing is minted, so no attestation is
+    /// involved; the Circle API only serves the fast transfer fee.
+    #[cfg(feature = "test-support")]
+    #[tokio::test]
+    async fn cctp_bridge_burns_the_exact_amount_from_the_source_wallet() {
+        let starting_usdc = U256::from(5_000_000_u64);
+        let cctp = crate::test_utils::deploy_anvil_cctp_pair(starting_usdc).await;
+        let circle = httpmock::MockServer::start();
+        let _fees = circle.mock(|when, then| {
+            when.method(GET).path_includes("/v2/burn/USDC/fees/");
+            then.status(200).json_body(serde_json::json!([
+                {"finalityThreshold": 1000, "minimumFee": 1},
+                {"finalityThreshold": 2000, "minimumFee": 0}
+            ]));
+        });
+
+        let mut ctx = create_test_ctx_with_order_owner(cctp.bot);
+        ctx.wallet = Some(st0x_config::OnchainWalletCtx::from_wallets(
+            Arc::clone(&cctp.base_wallet),
+            Arc::clone(&cctp.ethereum_wallet),
+            Arc::clone(&cctp.base_wallet),
+            Arc::clone(&cctp.base_wallet),
+        ));
+        ctx.rebalancing.cctp_corridor =
+            st0x_bridge::cctp::CctpCorridor::with_tokens(cctp.usdc, cctp.usdc);
+        ctx.rebalancing.circle_api_base = circle.base_url();
+        ctx.rebalancing.token_messenger = cctp.token_messenger;
+        ctx.rebalancing.message_transmitter = cctp.message_transmitter;
+        let (state, _gate) = recovery_state_for_ctx(ctx).await;
+        state.health.set_ready();
+
+        let body = capital_success(
+            "cctp-bridge",
+            capital::cctp_bridge(
+                State(state),
+                capital_request(serde_json::json!({"from": "base", "amount": "1"})),
+            )
+            .await,
+        );
+
+        let burn_tx: TxHash = serde_json::from_value(body["burnTx"].clone()).unwrap();
+        assert_eq!(
+            body,
+            serde_json::json!({
+                "burnTx": burn_tx,
+                "sourceChain": "base",
+                "destinationChain": "ethereum",
+                "amountRaw": "1000000",
+            })
+        );
+        let receipt = mined_receipt(&cctp.base_wallet, burn_tx).await;
+        assert_eq!(receipt.to, Some(cctp.token_messenger));
+        assert_eq!(
+            erc20_balance(&cctp.base_wallet, cctp.usdc, cctp.bot).await,
+            starting_usdc - U256::from(1_000_000_u64)
         );
     }
 

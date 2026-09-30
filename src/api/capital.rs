@@ -5,9 +5,11 @@
 //! No route waits on CCTP attestation or on USDC settlement, since the ops
 //! load balancer times out first: `transfer-usdc` enqueues the transfer on
 //! the bot's own worker and returns its id, and `cctp-bridge` only burns. The
-//! routes that send transactions run them through `spawn_detached`,
-//! so a dropped request cannot cancel a transaction between broadcast and
-//! receipt, and graceful shutdown waits for it.
+//! routes that send transactions, and the `transfer-usdc` enqueue, run through
+//! `spawn_detached`, so a dropped request cannot cancel them midway (between
+//! broadcast and receipt, or between the enqueue and the corridor claim it
+//! keeps), and graceful shutdown waits for them. The routes that sign refuse
+//! until startup completes, like `process-tx`.
 
 use std::fmt::Debug;
 use std::sync::Arc;
@@ -172,46 +174,57 @@ pub(super) struct ResetAllowanceResponse {
 /// except that the bot drives the whole transfer.
 ///
 /// Ordered like `resume_usdc_transfer`: input validation, the resume lock,
-/// the recovery handle, the driver pause, then the enqueue gates.
+/// the recovery handle, the driver pause, then the enqueue gates. Everything
+/// after the input validation runs detached: the enqueue commits before the
+/// start keeps its corridor claim, so a request dropped between the two would
+/// release the claim and the driver pause with the job still queued, letting
+/// the trigger start a second transfer on the corridor.
 pub(super) async fn transfer_usdc(
     State(state): State<AppState>,
     Json(request): Json<TransferUsdcRequest>,
 ) -> Result<Json<TransferUsdcResponse>, (StatusCode, Json<ErrorResponse>)> {
     let wire_direction = request.direction;
     let direction = RebalanceDirection::from(wire_direction);
-    let amount = positive_amount(&request.amount, Usdc::new)?;
+    // The worker converts the amount to USDC base units before it records
+    // anything, so an amount off the six decimal grid is refused here.
+    let (amount, _) = positive_usdc(&request.amount)?;
 
-    let _guard = state.resume_lock.0.try_lock().map_err(|_| {
-        (
-            StatusCode::CONFLICT,
-            Json(ErrorResponse {
-                error: "A resume or recheck operation is already in progress".to_string(),
-            }),
-        )
-    })?;
-
-    let handle = state.recovery.get().ok_or_else(recovery_not_ready)?;
-
-    // Quiesce the workers so the start's preflight (job row dedupe and
-    // durable holder scan) and its enqueue cannot straddle an execution in
-    // flight.
-    let _driver_paused = quiesce_usdc_driver(
-        &handle.usdc_driver_pause,
-        UsdcDriverPauseRequest::ManualTransfer { direction },
-    )
-    .await?;
-
-    let transfer_id = handle
-        .rebalancing_service
-        .start_manual_usdc_transfer(&state.pool, direction, amount)
-        .await
-        .map_err(|error| {
-            error!(?error, ?direction, %amount, "Failed to start manual USDC transfer");
-            let (status, message) = usdc_resume_error_response(&error);
-            (status, Json(ErrorResponse { error: message }))
+    let detached_tasks = state.detached_tasks.clone();
+    let transfer_id = spawn_detached(&detached_tasks, "transfer-usdc", async move {
+        let _guard = state.resume_lock.0.try_lock().map_err(|_| {
+            (
+                StatusCode::CONFLICT,
+                Json(ErrorResponse {
+                    error: "A resume or recheck operation is already in progress".to_string(),
+                }),
+            )
         })?;
 
-    info!(%transfer_id, ?direction, %amount, "Manual USDC transfer enqueued via API");
+        let handle = state.recovery.get().ok_or_else(recovery_not_ready)?;
+
+        // Quiesce the workers so the start's preflight (job row dedupe and
+        // durable holder scan) and its enqueue cannot straddle an execution in
+        // flight.
+        let _driver_paused = quiesce_usdc_driver(
+            &handle.usdc_driver_pause,
+            UsdcDriverPauseRequest::ManualTransfer { direction },
+        )
+        .await?;
+
+        let transfer_id = handle
+            .rebalancing_service
+            .start_manual_usdc_transfer(&state.pool, direction, amount)
+            .await
+            .map_err(|error| {
+                error!(?error, ?direction, %amount, "Failed to start manual USDC transfer");
+                let (status, message) = usdc_resume_error_response(&error);
+                (status, Json(ErrorResponse { error: message }))
+            })?;
+
+        info!(%transfer_id, ?direction, %amount, "Manual USDC transfer enqueued via API");
+        Ok::<_, OpsError>(transfer_id)
+    })?
+    .await??;
 
     Ok(Json(TransferUsdcResponse {
         transfer_id: transfer_id.to_string(),
@@ -236,6 +249,7 @@ pub(super) async fn vault_deposit(
     } = request;
     let amount = positive_amount(&amount, std::convert::identity)?;
     let (trading, wallet) = hedged_chain_signer(&state, chain)?;
+    require_startup_complete(&state, VaultOperation::Deposit.route())?;
 
     let VaultOutcome {
         decimals,
@@ -280,6 +294,7 @@ pub(super) async fn vault_withdraw(
     } = request;
     let amount = positive_amount(&amount, std::convert::identity)?;
     let (trading, wallet) = hedged_chain_signer(&state, chain)?;
+    require_startup_complete(&state, VaultOperation::Withdraw.route())?;
 
     let VaultOutcome {
         decimals,
@@ -341,6 +356,7 @@ pub(super) async fn vault_withdraw_usdc(
             "Several cash vaults configured; withdrawing from the first one"
         );
     }
+    require_startup_complete(&state, VaultOperation::WithdrawUsdc.route())?;
 
     let VaultOutcome {
         decimals,
@@ -381,7 +397,8 @@ pub(super) async fn vault_withdraw_usdc(
 /// resume lock, and the lock and the driver pause are held only around the
 /// work that spends the rebalancing wallet's USDC. Both are taken inside the
 /// detached task, so they stay held until the burn finishes even when the
-/// request is dropped.
+/// request is dropped. Nothing records the burn, so the route is not
+/// idempotent: a retried request burns again (see the operator docs).
 pub(super) async fn cctp_bridge(
     State(state): State<AppState>,
     Json(request): Json<CctpBridgeRequest>,
@@ -391,6 +408,7 @@ pub(super) async fn cctp_bridge(
     let direction = from.bridge_direction();
     let (source_chain, destination_chain) = cctp_route(from);
 
+    require_startup_complete(&state, "cctp-bridge")?;
     let handle = state.recovery.get().ok_or_else(recovery_not_ready)?;
     let wallets = bot_wallets(&state)?;
     let corridor = state.ctx.rebalancing.cctp_corridor;
@@ -508,6 +526,7 @@ pub(super) async fn reset_allowance(
 ) -> Result<Json<ResetAllowanceResponse>, (StatusCode, Json<ErrorResponse>)> {
     let ResetAllowanceRequest { chain } = request;
     let (trading, wallet) = hedged_chain_signer(&state, chain)?;
+    require_startup_complete(&state, "reset-allowance")?;
     let token = chain.settlement_stable().address;
     let contracts = crate::onchain::raindex_contracts(trading);
     let spender = contracts.orderbook;
@@ -558,6 +577,17 @@ enum BurnAmount {
     All,
 }
 
+/// Parses a decimal USDC amount like [`positive_amount`] and converts it to
+/// USDC base units (6 decimals), refusing as a 400 an amount the token cannot
+/// hold: more than six decimals, or too large for a `U256`.
+fn positive_usdc(amount: &str) -> Result<(Positive<Usdc>, U256), OpsError> {
+    let amount = positive_amount(amount, Usdc::new)?;
+    let raw = amount.inner().to_u256_6_decimals().map_err(|error| {
+        ops_precondition_error(format!("invalid USDC amount {amount}: {error}"))
+    })?;
+    Ok((amount, raw))
+}
+
 /// Resolves the burn amount from exactly one of `amount` and `all`; both or
 /// neither is a 400, like the CLI's clap conflict.
 fn burn_amount(
@@ -566,10 +596,7 @@ fn burn_amount(
 ) -> Result<BurnAmount, (StatusCode, Json<ErrorResponse>)> {
     match (amount, all) {
         (Some(amount), false) => {
-            let amount = positive_amount(amount, Usdc::new)?;
-            let raw = amount.inner().to_u256_6_decimals().map_err(|error| {
-                ops_precondition_error(format!("invalid USDC amount {amount}: {error}"))
-            })?;
+            let (_, raw) = positive_usdc(amount)?;
             Ok(BurnAmount::Exact(raw))
         }
         (None, true) => Ok(BurnAmount::All),
@@ -596,6 +623,24 @@ fn recovery_not_ready() -> (StatusCode, Json<ErrorResponse>) {
             error: "Recovery not ready yet (conductor still starting)".to_string(),
         }),
     )
+}
+
+/// Refuses a route that signs transactions until startup completes, with the
+/// same 503 as `process-tx`. The recovery handle and the wallets exist before
+/// the startup preflights (each chain's id, the inventory `OPERATOR_ROLE`)
+/// have passed, and `health.is_ready()` gates on all of them.
+fn require_startup_complete(state: &AppState, route: &'static str) -> Result<(), OpsError> {
+    if state.health.is_ready() {
+        return Ok(());
+    }
+
+    warn!(route, "Capital route refused: startup has not completed");
+    Err((
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(ErrorResponse {
+            error: format!("{route} is unavailable until startup completes"),
+        }),
+    ))
 }
 
 /// The bot's signing wallets. A missing `[wallet]` is a server fault, so the
@@ -788,12 +833,17 @@ mod tests {
         );
 
         for direction in ["alpaca_to_base", "to_raindex", "ToRaindex"] {
+            let Err(error) = serde_json::from_value::<TransferUsdcRequest>(
+                serde_json::json!({"direction": direction, "amount": "1"}),
+            ) else {
+                panic!("{direction} must not parse");
+            };
+            assert_eq!(error.classify(), serde_json::error::Category::Data);
             assert!(
-                serde_json::from_value::<TransferUsdcRequest>(
-                    serde_json::json!({"direction": direction, "amount": "1"})
-                )
-                .is_err(),
-                "{direction} must not parse"
+                error
+                    .to_string()
+                    .starts_with(&format!("unknown variant `{direction}`")),
+                "{direction}: {error}"
             );
         }
     }
@@ -831,16 +881,16 @@ mod tests {
         assert_eq!(request.vault_id, B256::with_last_byte(2));
         assert_eq!(request.amount, "1.5");
 
-        assert!(
-            serde_json::from_value::<VaultRequest>(serde_json::json!({
-                "chain": "base",
-                "token": "0x0000000000000000000000000000000000000001",
-                "vault_id": "0x0000000000000000000000000000000000000000000000000000000000000002",
-                "amount": "1.5",
-            }))
-            .is_err(),
-            "a snake_case vault id must not parse"
-        );
+        let Err(error) = serde_json::from_value::<VaultRequest>(serde_json::json!({
+            "chain": "base",
+            "token": "0x0000000000000000000000000000000000000001",
+            "vault_id": "0x0000000000000000000000000000000000000000000000000000000000000002",
+            "amount": "1.5",
+        })) else {
+            panic!("a snake_case vault id must not parse");
+        };
+        assert_eq!(error.classify(), serde_json::error::Category::Data);
+        assert_eq!(error.to_string(), "missing field `vaultId`");
     }
 
     #[test]
@@ -854,6 +904,28 @@ mod tests {
 
         let amount = positive_amount("250.5", Usdc::new).unwrap();
         assert_eq!(amount.inner().to_string(), "250.5");
+    }
+
+    /// Six decimals is USDC's whole grid: the smallest unit converts exactly
+    /// and one digit finer is input the token cannot hold.
+    #[test]
+    fn positive_usdc_refuses_an_amount_finer_than_six_decimals() {
+        let (amount, raw) = positive_usdc("250.000001").unwrap();
+        assert_eq!(amount.inner().to_string(), "250.000001");
+        assert_eq!(raw, U256::from(250_000_001_u64));
+
+        for amount in ["0.0000001", "250.0000001"] {
+            let Err((status, Json(body))) = positive_usdc(amount) else {
+                panic!("{amount} must be refused");
+            };
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{amount}: {}", body.error);
+            assert!(
+                body.error
+                    .starts_with(&format!("invalid USDC amount {amount}")),
+                "{amount}: {}",
+                body.error
+            );
+        }
     }
 
     #[test]

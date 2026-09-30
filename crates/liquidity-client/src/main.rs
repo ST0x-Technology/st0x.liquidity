@@ -941,7 +941,7 @@ mod tests {
         ] {
             let request = request_for(Command::Capital(Capital::TransferUsdc {
                 direction,
-                amount: "250.5".to_owned(),
+                amount: "250.5".parse()?,
             }))
             .await?;
             assert_eq!(
@@ -960,15 +960,17 @@ mod tests {
     #[tokio::test]
     async fn vault_verbs_post_the_chain_token_vault_and_amount()
     -> Result<(), Box<dyn std::error::Error>> {
-        let args = || VaultArgs {
-            amount: "1.5".to_owned(),
-            token: "0xtoken".to_owned(),
-            vault_id: "0xvault".to_owned(),
+        let token = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913";
+        let vault_id = "0x00000000000000000000000000000000000000000000000000000000000000a1";
+        let args = VaultArgs {
+            amount: "1.5".parse()?,
+            token: token.parse()?,
+            vault_id: vault_id.parse()?,
             network: HedgedChain::Ethereum,
         };
         for (command, route) in [
-            (Capital::VaultDeposit(args()), "vault-deposit"),
-            (Capital::VaultWithdraw(args()), "vault-withdraw"),
+            (Capital::VaultDeposit(args.clone()), "vault-deposit"),
+            (Capital::VaultWithdraw(args), "vault-withdraw"),
         ] {
             let request = request_for(Command::Capital(command)).await?;
             assert_eq!(
@@ -979,8 +981,8 @@ mod tests {
                 request_body(&request),
                 serde_json::json!({
                     "chain": "ethereum",
-                    "token": "0xtoken",
-                    "vaultId": "0xvault",
+                    "token": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+                    "vaultId": "0x00000000000000000000000000000000000000000000000000000000000000a1",
                     "amount": "1.5",
                 })
             );
@@ -992,7 +994,7 @@ mod tests {
     async fn vault_withdraw_usdc_posts_the_chain_and_amount()
     -> Result<(), Box<dyn std::error::Error>> {
         let request = request_for(Command::Capital(Capital::VaultWithdrawUsdc {
-            amount: "100".to_owned(),
+            amount: "100".parse()?,
             network: HedgedChain::Base,
         }))
         .await?;
@@ -1012,7 +1014,7 @@ mod tests {
     #[tokio::test]
     async fn cctp_bridge_posts_either_an_amount_or_all() -> Result<(), Box<dyn std::error::Error>> {
         let amount = request_for(Command::Capital(Capital::CctpBridge {
-            amount: Some("100".to_owned()),
+            amount: Some("100".parse()?),
             all: false,
             from: CctpSourceChain::Ethereum,
         }))

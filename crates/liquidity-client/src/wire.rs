@@ -3,7 +3,78 @@
 //! compile time, so a contract change on the bot must be reflected here by
 //! hand. The request-body tests in `main.rs` pin the JSON each body produces.
 
+use std::str::FromStr;
+
 use serde::Serialize;
+
+/// A positive decimal amount as the user typed it: ASCII digits with at most
+/// one `.` that has digits on both sides, and at least one nonzero digit.
+/// The bot re-validates precision; this only refuses input that can never be
+/// valid, before authenticating or calling the bot.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(transparent)]
+pub(crate) struct DecimalAmount(String);
+
+impl FromStr for DecimalAmount {
+    type Err = String;
+
+    fn from_str(raw: &str) -> Result<Self, Self::Err> {
+        let (whole, fraction) = raw.split_once('.').unwrap_or((raw, "0"));
+        let all_digits =
+            |part: &str| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit());
+        if !all_digits(whole) || !all_digits(fraction) {
+            return Err(format!(
+                "`{raw}` is not a decimal amount (digits with an optional `.` \
+                 between digits, for example 100 or 1.5)"
+            ));
+        }
+        if raw.bytes().all(|byte| byte == b'0' || byte == b'.') {
+            return Err(format!("`{raw}` is zero; the amount must be positive"));
+        }
+        Ok(Self(raw.to_owned()))
+    }
+}
+
+/// Parses `raw` as `0x` followed by exactly `digits` hex digits, keeping the
+/// spelling as typed. Only the lowercase prefix, which the bot's hex decoding
+/// accepts.
+fn parse_prefixed_hex(raw: &str, digits: usize, what: &str) -> Result<String, String> {
+    let hex = raw
+        .strip_prefix("0x")
+        .ok_or_else(|| format!("`{raw}` is not {what}: missing the 0x prefix"))?;
+    if hex.len() != digits || !hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(format!(
+            "`{raw}` is not {what}: expected 0x followed by exactly {digits} hex digits"
+        ));
+    }
+    Ok(raw.to_owned())
+}
+
+/// An EVM address as the user typed it: `0x` plus exactly 40 hex digits.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(transparent)]
+pub(crate) struct EvmAddress(String);
+
+impl FromStr for EvmAddress {
+    type Err = String;
+
+    fn from_str(raw: &str) -> Result<Self, Self::Err> {
+        parse_prefixed_hex(raw, 40, "an EVM address").map(Self)
+    }
+}
+
+/// A Raindex vault id as the user typed it: `0x` plus exactly 64 hex digits.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(transparent)]
+pub(crate) struct VaultId(String);
+
+impl FromStr for VaultId {
+    type Err = String;
+
+    fn from_str(raw: &str) -> Result<Self, Self::Err> {
+        parse_prefixed_hex(raw, 64, "a vault id").map(Self)
+    }
+}
 
 /// Body of `POST /transfers/usdc/{id}/reconcile`.
 #[derive(Serialize)]
@@ -99,7 +170,7 @@ pub(crate) struct SetEquityMarkRequest {
 #[serde(rename_all = "camelCase")]
 pub(crate) struct TransferUsdcRequest {
     pub(crate) direction: TransferUsdcDirection,
-    pub(crate) amount: String,
+    pub(crate) amount: DecimalAmount,
 }
 
 /// The venue a USDC transfer moves funds to, kebab cased on the wire exactly
@@ -119,9 +190,9 @@ pub(crate) enum TransferUsdcDirection {
 #[serde(rename_all = "camelCase")]
 pub(crate) struct VaultTransferRequest {
     pub(crate) chain: &'static str,
-    pub(crate) token: String,
-    pub(crate) vault_id: String,
-    pub(crate) amount: String,
+    pub(crate) token: EvmAddress,
+    pub(crate) vault_id: VaultId,
+    pub(crate) amount: DecimalAmount,
 }
 
 /// Body of `POST /capital/vault-withdraw-usdc`.
@@ -129,7 +200,7 @@ pub(crate) struct VaultTransferRequest {
 #[serde(rename_all = "camelCase")]
 pub(crate) struct VaultWithdrawUsdcRequest {
     pub(crate) chain: &'static str,
-    pub(crate) amount: String,
+    pub(crate) amount: DecimalAmount,
 }
 
 /// Body of `POST /capital/cctp-bridge`: exactly one of `amount` or `all`.
@@ -138,7 +209,7 @@ pub(crate) struct VaultWithdrawUsdcRequest {
 pub(crate) struct CctpBridgeRequest {
     pub(crate) from: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub(crate) amount: Option<String>,
+    pub(crate) amount: Option<DecimalAmount>,
     /// Omitted when false, unlike `RebuildViewRequest::all`: the bot's body
     /// carries either `amount` or `all: true`, never both keys.
     #[serde(skip_serializing_if = "std::ops::Not::not")]

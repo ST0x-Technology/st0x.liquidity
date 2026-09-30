@@ -4,7 +4,7 @@
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
 use crate::target::Env;
-use crate::wire::{ReconcileUsdcReason, TransferUsdcDirection};
+use crate::wire::{DecimalAmount, EvmAddress, ReconcileUsdcReason, TransferUsdcDirection, VaultId};
 
 /// Rejects an empty or whitespace-only audit `--reason` at parse time, before
 /// the value can reach auth or the network. The server rejects blank reasons
@@ -379,7 +379,7 @@ pub(crate) enum Capital {
         direction: TransferUsdcDirection,
         /// Amount of USDC to transfer, as a decimal.
         #[arg(short = 'a', long)]
-        amount: String,
+        amount: DecimalAmount,
     },
     /// Deposit tokens from the bot's wallet into a Raindex vault: approves,
     /// then deposits, resolving token decimals from onchain metadata.
@@ -391,7 +391,7 @@ pub(crate) enum Capital {
     VaultWithdrawUsdc {
         /// Amount of USDC to withdraw, as a decimal.
         #[arg(short = 'a', long)]
-        amount: String,
+        amount: DecimalAmount,
         /// Chain of the cash vault: its canonical USDC and its
         /// `[chains.<name>.trading.assets.cash]` vault; a chain with no pinned
         /// USDC is refused.
@@ -400,7 +400,9 @@ pub(crate) enum Capital {
     },
     /// Burn USDC on Ethereum or Base for a CCTP transfer to the other chain.
     /// Returns the burn tx without waiting for Circle's attestation; finish
-    /// with `debug cctp complete-mint` once it is attested.
+    /// with `debug cctp complete-mint` once it is attested. Not idempotent:
+    /// after a timeout, find the burn in the bot logs instead of retrying,
+    /// since a retry burns again.
     CctpBridge {
         /// Amount of USDC to bridge, as a decimal (omit to use --all).
         #[arg(
@@ -409,7 +411,7 @@ pub(crate) enum Capital {
             conflicts_with = "all",
             required_unless_present = "all"
         )]
-        amount: Option<String>,
+        amount: Option<DecimalAmount>,
         /// Bridge the entire USDC balance of the source wallet.
         #[arg(long, conflicts_with = "amount", required_unless_present = "amount")]
         all: bool,
@@ -428,17 +430,17 @@ pub(crate) enum Capital {
 
 /// Shared by `vault-deposit` and `vault-withdraw`, whose requests carry the
 /// same body.
-#[derive(Args)]
+#[derive(Args, Clone)]
 pub(crate) struct VaultArgs {
     /// Amount of tokens as a decimal (for example 100 for 100 tokens).
     #[arg(short = 'a', long)]
-    pub(crate) amount: String,
+    pub(crate) amount: DecimalAmount,
     /// Token contract address.
     #[arg(short = 't', long)]
-    pub(crate) token: String,
+    pub(crate) token: EvmAddress,
     /// Vault ID.
     #[arg(short = 'v', long)]
-    pub(crate) vault_id: String,
+    pub(crate) vault_id: VaultId,
     /// Chain of the vault: selects the wallet and the
     /// `[chains.<name>.trading]` orderbook; a chain without that table is
     /// refused.
@@ -500,7 +502,16 @@ mod tests {
         Position, UsdcDirection, parse_key_value,
     };
     use crate::target::Env;
-    use crate::wire::{ReconcileUsdcReason, TransferUsdcDirection};
+    use crate::wire::{
+        DecimalAmount, EvmAddress, ReconcileUsdcReason, TransferUsdcDirection, VaultId,
+    };
+
+    const TOKEN: &str = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913";
+    const VAULT: &str = "0x00000000000000000000000000000000000000000000000000000000000000a1";
+
+    fn amount(raw: &str) -> DecimalAmount {
+        raw.parse().unwrap()
+    }
 
     #[test]
     fn parses_key_and_value() {
@@ -875,14 +886,14 @@ mod tests {
             Capital::TransferUsdc {
                 direction: TransferUsdcDirection::ToRaindex,
                 amount,
-            } if amount == "250.5"
+            } if amount == self::amount("250.5")
         ));
         assert!(matches!(
             capital(&["transfer-usdc", "-d", "to-alpaca", "-a", "10"]).unwrap(),
             Capital::TransferUsdc {
                 direction: TransferUsdcDirection::ToAlpaca,
                 amount,
-            } if amount == "10"
+            } if amount == self::amount("10")
         ));
 
         let Capital::VaultDeposit(deposit) = capital(&[
@@ -890,18 +901,18 @@ mod tests {
             "-a",
             "1.5",
             "-t",
-            "0xtoken",
+            TOKEN,
             "-v",
-            "0xvault",
+            VAULT,
             "--network",
             "ethereum",
         ])
         .unwrap() else {
             panic!("expected vault-deposit");
         };
-        assert_eq!(deposit.amount, "1.5");
-        assert_eq!(deposit.token, "0xtoken");
-        assert_eq!(deposit.vault_id, "0xvault");
+        assert_eq!(deposit.amount, amount("1.5"));
+        assert_eq!(deposit.token, TOKEN.parse::<EvmAddress>().unwrap());
+        assert_eq!(deposit.vault_id, VAULT.parse::<VaultId>().unwrap());
         assert_eq!(deposit.network.wire_name(), "ethereum");
 
         let Capital::VaultWithdraw(withdraw) = capital(&[
@@ -909,25 +920,27 @@ mod tests {
             "--amount",
             "2",
             "--token",
-            "0xtoken",
+            TOKEN,
             "--vault-id",
-            "0xvault",
+            VAULT,
             "--network",
             "robinhood",
         ])
         .unwrap() else {
             panic!("expected vault-withdraw");
         };
-        assert_eq!(withdraw.amount, "2");
-        assert_eq!(withdraw.vault_id, "0xvault");
+        assert_eq!(withdraw.amount, amount("2"));
+        assert_eq!(withdraw.vault_id, VAULT.parse::<VaultId>().unwrap());
         assert_eq!(withdraw.network.wire_name(), "robinhood");
 
-        let Capital::VaultWithdrawUsdc { amount, network } =
-            capital(&["vault-withdraw-usdc", "-a", "100", "--network", "hyperevm"]).unwrap()
+        let Capital::VaultWithdrawUsdc {
+            amount: withdrawn,
+            network,
+        } = capital(&["vault-withdraw-usdc", "-a", "100", "--network", "hyperevm"]).unwrap()
         else {
             panic!("expected vault-withdraw-usdc");
         };
-        assert_eq!(amount, "100");
+        assert_eq!(withdrawn, amount("100"));
         assert_eq!(network.wire_name(), "hyperevm");
 
         let Capital::ResetAllowance { network } =
@@ -939,8 +952,8 @@ mod tests {
 
         for argv in [
             &["transfer-usdc", "--direction", "to-raindex"][..],
-            &["vault-deposit", "-a", "1", "-t", "0xtoken"][..],
-            &["vault-withdraw", "-a", "1", "-v", "0xvault"][..],
+            &["vault-deposit", "-a", "1", "-t", TOKEN][..],
+            &["vault-withdraw", "-a", "1", "-v", VAULT][..],
             &["vault-withdraw-usdc", "--network", "base"][..],
             &["cctp-bridge", "--amount", "1"][..],
         ] {
@@ -959,16 +972,8 @@ mod tests {
     #[test]
     fn capital_network_defaults_to_base() {
         for argv in [
-            &["vault-deposit", "-a", "1", "-t", "0xtoken", "-v", "0xvault"][..],
-            &[
-                "vault-withdraw",
-                "-a",
-                "1",
-                "-t",
-                "0xtoken",
-                "-v",
-                "0xvault",
-            ][..],
+            &["vault-deposit", "-a", "1", "-t", TOKEN, "-v", VAULT][..],
+            &["vault-withdraw", "-a", "1", "-t", TOKEN, "-v", VAULT][..],
             &["vault-withdraw-usdc", "-a", "1"][..],
             &["reset-allowance"][..],
         ] {
@@ -994,7 +999,7 @@ mod tests {
                 amount: Some(amount),
                 all: false,
                 from: CctpSourceChain::Ethereum,
-            } if amount == "100"
+            } if amount == self::amount("100")
         ));
         assert!(matches!(
             capital(&["cctp-bridge", "--from", "base", "--all"]).unwrap(),
@@ -1031,9 +1036,9 @@ mod tests {
                 "-a",
                 "1",
                 "-t",
-                "0xtoken",
+                TOKEN,
                 "-v",
-                "0xvault",
+                VAULT,
                 "--network",
                 "solana",
             ][..],
@@ -1055,5 +1060,154 @@ mod tests {
             panic!("--chain must be refused");
         };
         assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument);
+    }
+
+    /// Malformed amounts, token addresses and vault ids are refused by clap
+    /// before any authentication or bot round trip.
+    #[test]
+    fn capital_refuses_malformed_amount_token_and_vault_id() {
+        let mut argvs: Vec<Vec<&str>> = Vec::new();
+        for bad_amount in ["0", "-1", "abc", "1e3", "0.00", "1.", ".5"] {
+            argvs.push(vec!["transfer-usdc", "-d", "to-alpaca", "-a", bad_amount]);
+            argvs.push(vec![
+                "vault-deposit",
+                "-a",
+                bad_amount,
+                "-t",
+                TOKEN,
+                "-v",
+                VAULT,
+            ]);
+            argvs.push(vec!["vault-withdraw-usdc", "-a", bad_amount]);
+            argvs.push(vec![
+                "cctp-bridge",
+                "--from",
+                "base",
+                "--amount",
+                bad_amount,
+            ]);
+        }
+        for bad_token in [
+            "0xtoken",
+            "833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+            "0x1234",
+        ] {
+            argvs.push(vec![
+                "vault-deposit",
+                "-a",
+                "1",
+                "-t",
+                bad_token,
+                "-v",
+                VAULT,
+            ]);
+        }
+        for bad_vault in ["0xvault", TOKEN, "1"] {
+            argvs.push(vec![
+                "vault-withdraw",
+                "-a",
+                "1",
+                "-t",
+                TOKEN,
+                "--vault-id",
+                bad_vault,
+            ]);
+        }
+        for argv in argvs {
+            let Err(error) = capital(&argv) else {
+                panic!("{argv:?} must be refused");
+            };
+            assert_eq!(
+                error.kind(),
+                clap::error::ErrorKind::ValueValidation,
+                "{argv:?} must be refused"
+            );
+        }
+    }
+
+    /// Valid values parse and serialize to exactly the spelling typed.
+    #[test]
+    fn capital_values_serialize_as_typed() {
+        let Capital::VaultDeposit(deposit) =
+            capital(&["vault-deposit", "-a", "0.000001", "-t", TOKEN, "-v", VAULT]).unwrap()
+        else {
+            panic!("expected vault-deposit");
+        };
+        assert_eq!(
+            serde_json::to_value(&deposit.amount).unwrap(),
+            serde_json::json!("0.000001")
+        );
+        assert_eq!(
+            serde_json::to_value(&deposit.token).unwrap(),
+            serde_json::json!(TOKEN)
+        );
+        assert_eq!(
+            serde_json::to_value(&deposit.vault_id).unwrap(),
+            serde_json::json!(VAULT)
+        );
+    }
+
+    #[test]
+    fn decimal_amount_boundaries() {
+        for good in ["100", "1.5", "0.000001", "0010", "10.0"] {
+            assert_eq!(
+                serde_json::to_value(amount(good)).unwrap(),
+                serde_json::json!(good)
+            );
+        }
+        for bad in [
+            "", "0", "0.00", "00", "-1", "+1", "1e3", " 1", "1 ", "1.", ".5", "1.2.3", "abc", "1,5",
+        ] {
+            let Err(message) = bad.parse::<DecimalAmount>() else {
+                panic!("{bad:?} must be refused");
+            };
+            assert!(message.contains(&format!("`{bad}`")), "{message}");
+        }
+    }
+
+    #[test]
+    fn evm_address_boundaries() {
+        let hex40 = "a".repeat(40);
+        for good in [format!("0x{hex40}"), TOKEN.to_owned()] {
+            assert_eq!(
+                serde_json::to_value(good.parse::<EvmAddress>().unwrap()).unwrap(),
+                serde_json::json!(good)
+            );
+        }
+        for bad in [
+            format!("0x{}", "a".repeat(39)),
+            format!("0x{}", "a".repeat(41)),
+            hex40.clone(),
+            format!("0X{hex40}"),
+            format!("0x{}g", "a".repeat(39)),
+            format!("0x{hex40} "),
+        ] {
+            let Err(message) = bad.parse::<EvmAddress>() else {
+                panic!("{bad:?} must be refused");
+            };
+            assert!(message.contains("EVM address"), "{message}");
+        }
+    }
+
+    #[test]
+    fn vault_id_boundaries() {
+        let hex64 = "F".repeat(64);
+        for good in [format!("0x{hex64}"), VAULT.to_owned()] {
+            assert_eq!(
+                serde_json::to_value(good.parse::<VaultId>().unwrap()).unwrap(),
+                serde_json::json!(good)
+            );
+        }
+        for bad in [
+            format!("0x{}", "f".repeat(63)),
+            format!("0x{}", "f".repeat(65)),
+            format!("0x{}z", "f".repeat(63)),
+            hex64,
+        ] {
+            let Err(message) = bad.parse::<VaultId>() else {
+                panic!("{bad:?} must be refused");
+            };
+            assert!(message.contains("vault id"), "{message}");
+        }
     }
 }
