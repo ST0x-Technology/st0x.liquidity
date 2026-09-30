@@ -1971,6 +1971,17 @@ fn validate_usdc_corridor_chains(
         }
     }
 
+    // With no corridor table the served corridor is Base via CCTP.
+    if usdc.corridors.is_empty()
+        && let Some(primary) = primary
+        && primary != Chain::Base
+    {
+        return Err(CtxError::CorridorChainNotPrimary {
+            chain: Chain::Base,
+            primary,
+        });
+    }
+
     if usdc.mode == OperationMode::Disabled {
         return Ok(());
     }
@@ -3051,9 +3062,11 @@ pub enum CtxError {
          but [rebalancing.usdc.corridors.{chain}] is not set"
     )]
     CashRebalancingWithoutCorridor { chain: Chain },
+    /// `chain` is the corridor table's chain, or Base via CCTP when there is
+    /// no corridor table.
     #[error(
-        "[rebalancing.usdc.corridors.{chain}]: cash transfers still run on the primary \
-         chain, {primary}"
+        "the USDC corridor on {chain} ([rebalancing.usdc.corridors.{chain}], or Base via \
+         CCTP with no corridor table) must be on the primary chain, {primary}"
     )]
     CorridorChainNotPrimary { chain: Chain, primary: Chain },
     #[error(

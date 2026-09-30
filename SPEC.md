@@ -1987,7 +1987,9 @@ rule fails startup with a named error:
 7. USDC mode enabled and a chain that is not disabled, whose cash table enables
    rebalancing, has no corridor table: there is no implicit corridor.
 8. A corridor chain other than the primary chain, until the trigger checks every
-   corridor and the executors' Ethereum-tx checks use Ethereum's own depth.
+   corridor and the executors' Ethereum-tx checks use Ethereum's own depth. With
+   no corridor table the served corridor is Base via CCTP, so the primary must
+   then be Base.
 9. Transitional: `target` or `deviation` still set directly under
    `[rebalancing.usdc]` and different from the corridor's value. The released
    image reads those two keys and ignores the corridor tables, so both stay in
