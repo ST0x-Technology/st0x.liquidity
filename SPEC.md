@@ -3099,15 +3099,18 @@ enum TriggerReason {
   broker shares, so it cannot take what the sell hedge needs. The pending order,
   failed-order anchor, and existing reservation checks still apply, and a short
   position (buy hedge) is still rejected. The equity trigger first reserves with
-  the standard admission; only when Position refuses a planned redemption for a
-  needed hedge does it ask the sell check for the position's net and retry with
-  the refusal as proof. It asks the regular session check, which refuses no more
-  sells than the extended hours one, so it never admits a redemption over a
-  hedge that could run. A sell check that cannot be asked schedules one delayed
-  equity check of the symbol five minutes later, because nothing else checks it
-  again until its balances change; a terminal transfer event cancels only checks
-  already due, not delayed ones. A reservation taken with the proof is dropped
-  before confirmation if the post-reservation plan is no longer a redemption.
+  the standard admission; only when Position refuses a planned redemption
+  because the position needs a hedge, or because its dollar threshold cannot be
+  valued yet, does it ask the sell check for the position's net and retry with
+  the refusal as proof. Both refusals take this same path; a pending order,
+  failed-order anchor, or existing reservation never asks the check. It asks the
+  regular session check, which refuses no more sells than the extended hours
+  one, so it never admits a redemption over a hedge that could run. A sell check
+  that cannot be asked schedules one delayed equity check of the symbol five
+  minutes later, because nothing else checks it again until its balances change;
+  a terminal transfer event cancels only checks already due, not delayed ones. A
+  reservation taken with the proof is dropped before confirmation if the
+  post-reservation plan is no longer a redemption.
   `transfer-equity --direction to-alpaca` asks the same check through the broker
   client. Startup restoration always uses the standard admission. The sell check
   is asked about the whole net, which covers the hedge request because config
@@ -3131,10 +3134,13 @@ enum TriggerReason {
   reservation only under the same pending-order, hedge-readiness, and price
   eligibility checks as fresh transfer admission. A redemption admitted over a
   sell hedge the broker refused for lack of shares keeps its reservation
-  instead, recorded by the `admission` its job carries: recreating it uses the
-  standard admission, which would refuse it and leave the job rescheduling
-  forever. No hedge order is placed for the symbol until the wallet has gas
-  again.
+  instead, recorded by the `admission` its job carries. The retry restores by
+  reservation ID alone: a matching confirmed reservation is left unchanged and a
+  matching reserved one is confirmed. Only when no reservation exists is one
+  recreated, always under the standard admission, which refuses a redemption
+  whose position still needs a hedge; a released reservation would therefore
+  leave the job rescheduling forever. No hedge order is placed for the symbol
+  until the wallet has gas again.
 - `ManuallyAdjustPosition` and `UpdateThreshold` are rejected while a confirmed
   transfer reservation owns the symbol. Transfer ownership must be released
   before either operator mutation can proceed.
