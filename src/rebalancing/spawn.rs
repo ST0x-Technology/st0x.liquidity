@@ -494,7 +494,7 @@ mod tests {
             .usdc
             .active()
             .next()
-            .expect("USDC threshold should be Some");
+            .expect("one active corridor");
         assert!(usdc_threshold.threshold.target.eq(float!(0.6)).unwrap());
         assert!(usdc_threshold.threshold.deviation.eq(float!(0.15)).unwrap());
     }

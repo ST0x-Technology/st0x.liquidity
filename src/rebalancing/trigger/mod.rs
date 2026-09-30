@@ -28918,8 +28918,8 @@ mod tests {
 
     #[tokio::test]
     async fn usdc_rebalancing_disabled_when_cash_ratio_absent() {
-        // Regression: when usdc is None, startup must not require assets.cash.vault_id.
-        // The trigger returns no USDC rebalancing params, so no USDC vault lookup occurs.
+        // No cash table on the corridor's chain returns no params, so startup needs no
+        // cash vault_id.
         let (pool, apalis_pool) = crate::test_utils::setup_test_pools().await;
         let wrapper = Arc::new(MockWrapper::new());
 
