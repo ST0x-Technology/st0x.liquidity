@@ -387,6 +387,62 @@ impl RebalancingServiceConfig {
     }
 }
 
+/// Whether a non-terminal recovery job of `job_type` already covers
+/// `symbol` on `chain`. A failed lookup counts as pending, skipping the
+/// enqueue rather than risking a duplicate.
+///
+/// Status-scoped rather than an apalis idempotency key: apalis's
+/// `ON CONFLICT(job_type, idempotency_key) DO NOTHING` never surfaces a
+/// unique-violation, and its index spans all statuses, so a key would
+/// silently wedge a symbol behind its own `Done` row until the hourly
+/// cleanup -- starving the next-poll re-dispatch the guard-contention skip
+/// relies on. The serialized `symbol` is matched exactly (json_extract, not
+/// a LIKE substring) so a queued job for a ticker containing this symbol
+/// (GOOGL vs GOOG) cannot suppress a distinct recovery. A row queued before
+/// jobs named their chain runs on Base, so it blocks only Base.
+async fn recovery_job_pending(
+    pool: &apalis_sqlite::SqlitePool,
+    job_type: &str,
+    chain: Chain,
+    symbol: &Symbol,
+) -> bool {
+    let existing: Result<(i64,), _> = sqlx_apalis::query_as(
+        "SELECT COUNT(*) FROM Jobs \
+         WHERE job_type = ? \
+         AND status IN ('Pending', 'Queued', 'Running') \
+         AND json_extract(job, '$.symbol') = ? \
+         AND COALESCE(json_extract(job, '$.chain'), ?) = ?",
+    )
+    .bind(job_type)
+    .bind(symbol.to_string())
+    .bind(crate::onchain::legacy_chain().as_str())
+    .bind(chain.as_str())
+    .fetch_one(pool)
+    .await;
+
+    match existing {
+        Ok((0,)) => false,
+        Ok((count,)) => {
+            debug!(
+                target: "rebalance",
+                %chain, %symbol, %count, job_type,
+                "Skipped recovery job enqueue: a non-terminal row for this symbol and chain \
+                 already exists",
+            );
+            true
+        }
+        Err(error) => {
+            warn!(
+                target: "rebalance",
+                %chain, %symbol, %error, job_type,
+                "Failed to query existing recovery job rows; skipping enqueue to avoid \
+                 duplicates",
+            );
+            true
+        }
+    }
+}
+
 /// What the registry lookup and gas probe found for a chain the planner
 /// picked, kept for one equity check so neither runs twice.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3165,7 +3221,11 @@ impl RebalancingService {
             | EthereumUsdc { .. }
             | BaseWalletUsdc { .. }
             | BaseWalletUnwrappedEquity { .. }
-            | BaseWalletWrappedEquity { .. } => inventory.clone().apply_snapshot_event(&event, now),
+            | BaseWalletWrappedEquity { .. }
+            | ChainWalletUnwrappedEquity { .. }
+            | ChainWalletWrappedEquity { .. } => {
+                inventory.clone().apply_snapshot_event(&event, now)
+            }
 
             InflightEquity { .. } => {
                 if let Some((mints, redemptions)) = &filtered_inflight {
@@ -3344,7 +3404,9 @@ impl RebalancingService {
             | EthereumUsdc { .. }
             | BaseWalletUsdc { .. }
             | BaseWalletUnwrappedEquity { .. }
-            | BaseWalletWrappedEquity { .. } => {
+            | BaseWalletWrappedEquity { .. }
+            | ChainWalletUnwrappedEquity { .. }
+            | ChainWalletWrappedEquity { .. } => {
                 inventory
                     .clone()
                     .force_apply_snapshot_event(&event, now, recovery_reason)
@@ -3428,164 +3490,29 @@ impl RebalancingService {
             | OffchainCashWithdrawable { .. } => {
                 self.usdc_scheduler.enqueue_check().await;
             }
-            // Wrapped equity in the bot wallet (outside Raindex) triggers
-            // a recovery dispatch job per symbol with a positive balance.
-            // Gated on the per-symbol `wrapped_equity_recovery` config so
-            // tests that pre-stage wallet wtSTOCK (e.g. for orderbook
-            // mechanics) can opt out.
+            // Wrapped equity in a chain's bot wallet (outside Raindex)
+            // triggers a recovery dispatch job per symbol with a positive
+            // balance on that chain.
             BaseWalletWrappedEquity { balances, .. } => {
-                let primary_chain = self.inventory.read().await.primary_chain();
-                for (symbol, amount) in balances {
-                    if *amount == FractionalShares::ZERO {
-                        continue;
-                    }
-                    if !self
-                        .config
-                        .wrapped_equity_recovery_enabled(primary_chain, symbol)
-                    {
-                        continue;
-                    }
-
-                    let mut queue = self.wrapped_equity_recovery_queue.clone();
-                    let job_type = std::any::type_name::<WrappedEquityRecoveryJob>();
-
-                    // Match the serialized `symbol` field exactly (json_extract, not
-                    // a LIKE substring) so a queued job for a ticker that contains
-                    // this symbol as a substring (e.g. GOOGL vs GOOG) can't suppress
-                    // a distinct recovery.
-                    let existing: Result<(i64,), _> = sqlx_apalis::query_as(
-                        "SELECT COUNT(*) FROM Jobs \
-                         WHERE job_type = ? \
-                         AND status IN ('Pending', 'Queued', 'Running') \
-                         AND json_extract(job, '$.symbol') = ?",
-                    )
-                    .bind(job_type)
-                    .bind(symbol.to_string())
-                    .fetch_one(queue.pool())
+                self.enqueue_wrapped_equity_recovery(Chain::Base, balances)
                     .await;
-
-                    match existing {
-                        Ok((count,)) if count > 0 => {
-                            debug!(
-                                target: "rebalance",
-                                %symbol, %count,
-                                "Skipped WrappedEquityRecoveryJob enqueue: a non-terminal \
-                                 row for this symbol already exists",
-                            );
-                            continue;
-                        }
-                        Ok(_) => {}
-                        Err(error) => {
-                            warn!(
-                                target: "rebalance",
-                                %symbol, %error,
-                                "Failed to query existing WrappedEquityRecoveryJob rows; \
-                                 skipping enqueue to avoid duplicates",
-                            );
-                            continue;
-                        }
-                    }
-
-                    let recovery_id = WrappedEquityRecoveryId(Uuid::new_v4());
-                    if let Err(error) = queue
-                        .push(WrappedEquityRecoveryJob {
-                            chain: primary_chain,
-                            symbol: symbol.clone(),
-                            recovery_id: recovery_id.clone(),
-                            backpressure_streak: BackpressureStreak::default(),
-                        })
-                        .await
-                    {
-                        warn!(
-                            target: "rebalance",
-                            %symbol, %recovery_id, ?error,
-                            "Failed to enqueue WrappedEquityRecoveryJob",
-                        );
-                    }
-                }
             }
-            // Unwrapped equity (tSTOCK) in the bot wallet triggers a
-            // recovery dispatch per symbol with a positive balance.
-            // Gated per-symbol on `wrapped_equity_recovery` -- the same
-            // config flag covers both detection paths since they share
-            // the same "auto-recover misplaced equity" intent.
+            ChainWalletWrappedEquity {
+                chain, balances, ..
+            } => {
+                self.enqueue_wrapped_equity_recovery(*chain, balances).await;
+            }
+            // Unwrapped equity (tSTOCK) in a chain's bot wallet triggers a
+            // recovery dispatch per symbol with a positive balance there.
             BaseWalletUnwrappedEquity { balances, .. } => {
-                let primary_chain = self.inventory.read().await.primary_chain();
-                for (symbol, amount) in balances {
-                    if *amount == FractionalShares::ZERO {
-                        continue;
-                    }
-                    if !self
-                        .config
-                        .wrapped_equity_recovery_enabled(primary_chain, symbol)
-                    {
-                        continue;
-                    }
-
-                    let mut queue = self.unwrapped_equity_recovery_queue.clone();
-                    let job_type = std::any::type_name::<UnwrappedEquityRecoveryJob>();
-
-                    // Status-scoped dedup, mirroring the wrapped path: only a
-                    // non-terminal row blocks a re-enqueue. apalis's
-                    // `ON CONFLICT(job_type, idempotency_key) DO NOTHING` never
-                    // surfaces a unique-violation, and its index spans all
-                    // statuses, so an idempotency key would silently wedge a
-                    // symbol behind its own `Done` row until the hourly cleanup
-                    // -- starving the next-poll re-dispatch the guard-contention
-                    // skip relies on. Match the serialized `symbol` field
-                    // exactly (json_extract, not a LIKE substring) so a queued
-                    // job for a ticker that contains this symbol as a substring
-                    // (e.g. GOOGL vs GOOG) can't suppress a distinct recovery.
-                    let existing: Result<(i64,), _> = sqlx_apalis::query_as(
-                        "SELECT COUNT(*) FROM Jobs \
-                         WHERE job_type = ? \
-                         AND status IN ('Pending', 'Queued', 'Running') \
-                         AND json_extract(job, '$.symbol') = ?",
-                    )
-                    .bind(job_type)
-                    .bind(symbol.to_string())
-                    .fetch_one(queue.pool())
+                self.enqueue_unwrapped_equity_recovery(Chain::Base, balances)
                     .await;
-
-                    match existing {
-                        Ok((count,)) if count > 0 => {
-                            debug!(
-                                target: "rebalance",
-                                %symbol, %count,
-                                "Skipped UnwrappedEquityRecoveryJob enqueue: a non-terminal \
-                                 row for this symbol already exists",
-                            );
-                            continue;
-                        }
-                        Ok(_) => {}
-                        Err(error) => {
-                            warn!(
-                                target: "rebalance",
-                                %symbol, %error,
-                                "Failed to query existing UnwrappedEquityRecoveryJob rows; \
-                                 skipping enqueue to avoid duplicates",
-                            );
-                            continue;
-                        }
-                    }
-
-                    let recovery_id = UnwrappedEquityRecoveryId(Uuid::new_v4());
-                    if let Err(error) = queue
-                        .push(UnwrappedEquityRecoveryJob {
-                            chain: primary_chain,
-                            symbol: symbol.clone(),
-                            recovery_id: recovery_id.clone(),
-                            backpressure_streak: BackpressureStreak::default(),
-                        })
-                        .await
-                    {
-                        warn!(
-                            target: "rebalance",
-                            %symbol, %recovery_id, ?error,
-                            "Failed to enqueue UnwrappedEquityRecoveryJob",
-                        );
-                    }
-                }
+            }
+            ChainWalletUnwrappedEquity {
+                chain, balances, ..
+            } => {
+                self.enqueue_unwrapped_equity_recovery(*chain, balances)
+                    .await;
             }
             // Wallet-read USDC events update `inflight_cash` for
             // visibility but don't drive triggers here.
@@ -3604,6 +3531,116 @@ impl RebalancingService {
         }
     }
 
+    /// Enqueues a `WrappedEquityRecoveryJob` on `chain` for each symbol with
+    /// a positive wrapped balance in that chain's wallet. Gated on the
+    /// chain's per-symbol `wrapped_equity_recovery` config so tests that
+    /// pre-stage wallet wtSTOCK (e.g. for orderbook mechanics) can opt out.
+    async fn enqueue_wrapped_equity_recovery(
+        &self,
+        chain: Chain,
+        balances: &BTreeMap<Symbol, FractionalShares>,
+    ) {
+        let primary_chain = self.inventory.read().await.primary_chain();
+        if !self.recovers_wallet_equity_on(chain, primary_chain) {
+            debug!(
+                target: "rebalance",
+                %chain,
+                "Skipping wallet equity recovery: the chain has no equity services, so its \
+                 wallet is not polled and cannot drive a recovery job"
+            );
+            return;
+        }
+        for (symbol, amount) in balances {
+            if *amount == FractionalShares::ZERO
+                || !self.config.wrapped_equity_recovery_enabled(chain, symbol)
+            {
+                continue;
+            }
+
+            let mut queue = self.wrapped_equity_recovery_queue.clone();
+            let job_type = std::any::type_name::<WrappedEquityRecoveryJob>();
+            if recovery_job_pending(queue.pool(), job_type, chain, symbol).await {
+                continue;
+            }
+
+            let recovery_id = WrappedEquityRecoveryId(Uuid::new_v4());
+            if let Err(error) = queue
+                .push(WrappedEquityRecoveryJob {
+                    chain,
+                    symbol: symbol.clone(),
+                    recovery_id: recovery_id.clone(),
+                    backpressure_streak: BackpressureStreak::default(),
+                })
+                .await
+            {
+                warn!(
+                    target: "rebalance",
+                    %chain, %symbol, %recovery_id, ?error,
+                    "Failed to enqueue WrappedEquityRecoveryJob",
+                );
+            }
+        }
+    }
+
+    /// Enqueues an `UnwrappedEquityRecoveryJob` on `chain` for each symbol
+    /// with a positive unwrapped balance in that chain's wallet. The same
+    /// `wrapped_equity_recovery` flag gates both detection paths since they
+    /// share the same "auto-recover misplaced equity" intent.
+    async fn enqueue_unwrapped_equity_recovery(
+        &self,
+        chain: Chain,
+        balances: &BTreeMap<Symbol, FractionalShares>,
+    ) {
+        let primary_chain = self.inventory.read().await.primary_chain();
+        if !self.recovers_wallet_equity_on(chain, primary_chain) {
+            debug!(
+                target: "rebalance",
+                %chain,
+                "Skipping wallet equity recovery: the chain has no equity services, so its \
+                 wallet is not polled and cannot drive a recovery job"
+            );
+            return;
+        }
+        for (symbol, amount) in balances {
+            if *amount == FractionalShares::ZERO
+                || !self.config.wrapped_equity_recovery_enabled(chain, symbol)
+            {
+                continue;
+            }
+
+            let mut queue = self.unwrapped_equity_recovery_queue.clone();
+            let job_type = std::any::type_name::<UnwrappedEquityRecoveryJob>();
+            if recovery_job_pending(queue.pool(), job_type, chain, symbol).await {
+                continue;
+            }
+
+            let recovery_id = UnwrappedEquityRecoveryId(Uuid::new_v4());
+            if let Err(error) = queue
+                .push(UnwrappedEquityRecoveryJob {
+                    chain,
+                    symbol: symbol.clone(),
+                    recovery_id: recovery_id.clone(),
+                    backpressure_streak: BackpressureStreak::default(),
+                })
+                .await
+            {
+                warn!(
+                    target: "rebalance",
+                    %chain, %symbol, %recovery_id, ?error,
+                    "Failed to enqueue UnwrappedEquityRecoveryJob",
+                );
+            }
+        }
+    }
+
+    /// Whether wallet balances on `chain` drive recovery jobs: the primary
+    /// chain, and every chain built with equity services. That is the set the
+    /// wallet poller reads, including a chain kept only to finish
+    /// unfinished equity work, so a balance it records is never dropped here.
+    fn recovers_wallet_equity_on(&self, chain: Chain, primary_chain: Chain) -> bool {
+        chain == primary_chain || self.registry_ids.contains_key(&chain)
+    }
+
     /// Re-drives recovery producers from the already-hydrated inventory view.
     ///
     /// Startup hydration updates the in-memory view directly instead of
@@ -3611,52 +3648,50 @@ impl RebalancingService {
     /// balances, so a positive tSTOCK/wtSTOCK balance that was persisted before
     /// restart would otherwise wait forever for a new event.
     pub(crate) async fn enqueue_recovery_for_current_wallet_balances(&self) {
-        let (wrapped, unwrapped) = {
+        let mut balances = Vec::new();
+        {
             let view = self.inventory.read().await;
-            let primary = view.primary_chain();
-            let mut wrapped = BTreeMap::new();
-            let mut unwrapped = BTreeMap::new();
-
-            let listed = self
-                .config
-                .chains
-                .get(&primary)
-                .into_iter()
-                .flat_map(|config| config.assets.equities.symbols.keys());
-            for symbol in listed {
-                if let Some(amount) =
-                    view.inflight_equity_at(symbol, InFlightEquityLocation::BaseWalletWrapped)
-                {
-                    wrapped.insert(symbol.clone(), amount);
+            for (chain, config) in &self.config.chains {
+                if !self.recovers_wallet_equity_on(*chain, view.primary_chain()) {
+                    continue;
                 }
-                if let Some(amount) =
-                    view.inflight_equity_at(symbol, InFlightEquityLocation::BaseWalletUnwrapped)
-                {
-                    unwrapped.insert(symbol.clone(), amount);
+                let mut wrapped = BTreeMap::new();
+                let mut unwrapped = BTreeMap::new();
+                for symbol in config.assets.equities.symbols.keys() {
+                    if let Some(amount) = view
+                        .inflight_equity_at(symbol, InFlightEquityLocation::WalletWrapped(*chain))
+                    {
+                        wrapped.insert(symbol.clone(), amount);
+                    }
+                    if let Some(amount) = view
+                        .inflight_equity_at(symbol, InFlightEquityLocation::WalletUnwrapped(*chain))
+                    {
+                        unwrapped.insert(symbol.clone(), amount);
+                    }
                 }
+                balances.push((*chain, wrapped, unwrapped));
             }
-
-            (wrapped, unwrapped)
-        };
+        }
 
         let fetched_at = Utc::now();
 
-        if !wrapped.is_empty() {
-            self.enqueue_checks_for_snapshot(&InventorySnapshotEvent::BaseWalletWrappedEquity {
-                balances: wrapped,
-                fetched_at,
-            })
-            .await;
-        }
+        for (chain, wrapped, unwrapped) in balances {
+            if !wrapped.is_empty() {
+                self.enqueue_checks_for_snapshot(&InventorySnapshotEvent::wallet_wrapped_equity(
+                    chain, wrapped, fetched_at,
+                ))
+                .await;
+            }
 
-        if !unwrapped.is_empty() {
-            self.enqueue_checks_for_snapshot(&InventorySnapshotEvent::BaseWalletUnwrappedEquity {
-                balances: unwrapped,
-                fetched_at,
-            })
-            .await;
+            if !unwrapped.is_empty() {
+                self.enqueue_checks_for_snapshot(&InventorySnapshotEvent::wallet_unwrapped_equity(
+                    chain, unwrapped, fetched_at,
+                ))
+                .await;
+            }
         }
     }
+
     async fn apply_onchain_fill_to_inventory(
         &self,
         symbol: Symbol,
@@ -9173,6 +9208,7 @@ mod tests {
     use chrono::{Duration as ChronoDuration, Utc};
     use futures_util::poll;
     use rain_math_float::Float;
+    use serde_json::json;
     use sqlx::SqlitePool;
     use st0x_bridge::corridor::HopKind;
     use st0x_config::{
@@ -9181,8 +9217,8 @@ mod tests {
     };
     use st0x_dto::Statement;
     use st0x_event_sorcery::{
-        EntityList, Never, Reactor, ReactorHarness, StoreBuilder, TestStore, deps, send_command,
-        test_store,
+        EntityList, Never, Reactor, ReactorHarness, StoreBuilder, TestStore, deps, replay,
+        send_command, test_store,
     };
     use st0x_evm::Chain;
     use st0x_execution::{
@@ -9380,7 +9416,7 @@ mod tests {
         balances.insert(symbol.clone(), FractionalShares::new(float!(5)));
         let now = Utc::now();
         let inventory_view = InventoryView::default().set_inflight_equity_at_location(
-            InFlightEquityLocation::BaseWalletUnwrapped,
+            InFlightEquityLocation::WalletUnwrapped(Chain::Base),
             &balances,
             now,
             now,
@@ -9451,7 +9487,7 @@ mod tests {
         balances.insert(symbol.clone(), FractionalShares::new(float!(5)));
         let now = Utc::now();
         let inventory_view = InventoryView::default().set_inflight_equity_at_location(
-            InFlightEquityLocation::BaseWalletUnwrapped,
+            InFlightEquityLocation::WalletUnwrapped(Chain::Base),
             &balances,
             now,
             now,
@@ -9522,7 +9558,7 @@ mod tests {
         balances.insert(symbol.clone(), FractionalShares::new(float!(5)));
         let now = Utc::now();
         let inventory_view = InventoryView::default().set_inflight_equity_at_location(
-            InFlightEquityLocation::BaseWalletWrapped,
+            InFlightEquityLocation::WalletWrapped(Chain::Base),
             &balances,
             now,
             now,
@@ -9584,6 +9620,389 @@ mod tests {
             jobs, 0,
             "recovery-disabled symbols must not enqueue wallet recovery jobs",
         );
+    }
+
+    fn recovery_listing(recovery: OperationMode) -> ChainEquityAsset {
+        ChainEquityAsset {
+            tokenized_equity: Address::random(),
+            tokenized_equity_derivative: Address::random(),
+            vault_ids: Vec::new(),
+            trading: OperationMode::Enabled,
+            rebalancing: RebalancingMode::Enabled,
+            wrapped_equity_recovery: recovery,
+            operational_limit: None,
+            target_share: None,
+        }
+    }
+
+    /// A service whose Base and Robinhood listings of AAPL each carry the
+    /// given recovery flag.
+    async fn base_and_robinhood_recovery_service(
+        inventory_view: InventoryView,
+        base_recovery: OperationMode,
+        robinhood_recovery: OperationMode,
+    ) -> RebalancingService {
+        let aapl = Symbol::new("AAPL").unwrap();
+        let mut config = test_config();
+        config
+            .chains
+            .get_mut(&Chain::Base)
+            .unwrap()
+            .assets
+            .equities
+            .symbols
+            .insert(aapl.clone(), recovery_listing(base_recovery));
+        config.chains.insert(
+            Chain::Robinhood,
+            ChainRebalancingConfig::for_test(ChainAssets {
+                equities: ChainEquities {
+                    symbols: HashMap::from([(aapl, recovery_listing(robinhood_recovery))]),
+                    operational_limit: None,
+                },
+                cash: None,
+            }),
+        );
+
+        let (pool, apalis_pool) = crate::test_utils::setup_test_pools().await;
+        let (event_sender, _) = broadcast::channel::<Statement>(16);
+        RebalancingService::new(
+            config,
+            Arc::new(test_store::<VaultRegistry>(pool, ())),
+            [Chain::Base, Chain::Robinhood]
+                .into_iter()
+                .map(|chain| {
+                    (
+                        chain,
+                        VaultRegistryId {
+                            chain,
+                            orderbook: TEST_ORDERBOOK,
+                            owner: TEST_ORDER_OWNER,
+                        },
+                    )
+                })
+                .collect(),
+            Arc::new(BroadcastingInventory::new(inventory_view, event_sender)),
+            BTreeMap::from([(
+                Chain::Base,
+                Arc::new(MockWrapper::new()) as Arc<dyn Wrapper>,
+            )]),
+            RebalancingSchedulers::new(&apalis_pool),
+            Arc::new(crate::alerts::LogNotifier),
+        )
+    }
+
+    async fn queued_job_payloads<T: serde::de::DeserializeOwned>(
+        pool: &apalis_sqlite::SqlitePool,
+    ) -> Vec<serde_json::Value> {
+        let rows: Vec<(Vec<u8>,)> =
+            sqlx_apalis::query_as("SELECT job FROM Jobs WHERE job_type = ? ORDER BY rowid")
+                .bind(std::any::type_name::<T>())
+                .fetch_all(pool)
+                .await
+                .unwrap();
+        rows.into_iter()
+            .map(|(job,)| serde_json::from_slice(&job).unwrap())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn hedge_only_secondary_does_not_recover_a_hydrated_wallet_balance() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let balances = BTreeMap::from([(symbol.clone(), FractionalShares::new(float!(5)))]);
+        let now = Utc::now();
+        let view = InventoryView::default()
+            .set_inflight_equity_at_location(
+                InFlightEquityLocation::WalletWrapped(Chain::Robinhood),
+                &balances,
+                now,
+                now,
+            )
+            .set_inflight_equity_at_location(
+                InFlightEquityLocation::WalletUnwrapped(Chain::Robinhood),
+                &balances,
+                now,
+                now,
+            );
+        let mut service = base_and_robinhood_recovery_service(
+            view,
+            OperationMode::Enabled,
+            OperationMode::Enabled,
+        )
+        .await;
+        service
+            .config
+            .chains
+            .get_mut(&Chain::Robinhood)
+            .unwrap()
+            .assets
+            .equities
+            .symbols
+            .get_mut(&symbol)
+            .unwrap()
+            .rebalancing = RebalancingMode::Disabled;
+        service.registry_ids.remove(&Chain::Robinhood);
+        service.enqueue_recovery_for_current_wallet_balances().await;
+        service
+            .enqueue_checks_for_snapshot(&InventorySnapshotEvent::wallet_wrapped_equity(
+                Chain::Robinhood,
+                balances.clone(),
+                now,
+            ))
+            .await;
+        service
+            .enqueue_checks_for_snapshot(&InventorySnapshotEvent::wallet_unwrapped_equity(
+                Chain::Robinhood,
+                balances,
+                now,
+            ))
+            .await;
+        assert_eq!(
+            queued_job_payloads::<WrappedEquityRecoveryJob>(
+                service.wrapped_equity_recovery_queue.pool()
+            )
+            .await,
+            Vec::<serde_json::Value>::new()
+        );
+        assert_eq!(
+            queued_job_payloads::<UnwrappedEquityRecoveryJob>(
+                service.unwrapped_equity_recovery_queue.pool()
+            )
+            .await,
+            Vec::<serde_json::Value>::new()
+        );
+    }
+
+    #[tokio::test]
+    async fn secondary_kept_for_unfinished_work_recovers_its_wallet_balance() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let balances = BTreeMap::from([(symbol.clone(), FractionalShares::new(float!(5)))]);
+        let now = Utc::now();
+        let view = InventoryView::default()
+            .set_inflight_equity_at_location(
+                InFlightEquityLocation::WalletWrapped(Chain::Robinhood),
+                &balances,
+                now,
+                now,
+            )
+            .set_inflight_equity_at_location(
+                InFlightEquityLocation::WalletUnwrapped(Chain::Robinhood),
+                &balances,
+                now,
+                now,
+            );
+        let mut service = base_and_robinhood_recovery_service(
+            view,
+            OperationMode::Enabled,
+            OperationMode::Enabled,
+        )
+        .await;
+        service
+            .config
+            .chains
+            .get_mut(&Chain::Robinhood)
+            .unwrap()
+            .assets
+            .equities
+            .symbols
+            .get_mut(&symbol)
+            .unwrap()
+            .rebalancing = RebalancingMode::Disabled;
+        service.enqueue_recovery_for_current_wallet_balances().await;
+        service
+            .enqueue_checks_for_snapshot(&InventorySnapshotEvent::wallet_wrapped_equity(
+                Chain::Robinhood,
+                balances.clone(),
+                now,
+            ))
+            .await;
+        service
+            .enqueue_checks_for_snapshot(&InventorySnapshotEvent::wallet_unwrapped_equity(
+                Chain::Robinhood,
+                balances,
+                now,
+            ))
+            .await;
+        // Its listing is disabled, but the chain keeps equity services for
+        // unfinished work, so its wallet is polled and its balance recovered.
+        assert_eq!(
+            queued_job_payloads::<WrappedEquityRecoveryJob>(
+                service.wrapped_equity_recovery_queue.pool()
+            )
+            .await
+            .len(),
+            1
+        );
+        assert_eq!(
+            queued_job_payloads::<UnwrappedEquityRecoveryJob>(
+                service.unwrapped_equity_recovery_queue.pool()
+            )
+            .await
+            .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn wallet_recovery_jobs_dedupe_per_symbol_and_chain() {
+        let service = base_and_robinhood_recovery_service(
+            InventoryView::default(),
+            OperationMode::Enabled,
+            OperationMode::Enabled,
+        )
+        .await;
+        let balances = BTreeMap::from([(
+            Symbol::new("AAPL").unwrap(),
+            FractionalShares::new(float!(5)),
+        )]);
+        let now = Utc::now();
+
+        for _ in 0..2 {
+            service
+                .enqueue_checks_for_snapshot(&InventorySnapshotEvent::ChainWalletWrappedEquity {
+                    chain: Chain::Robinhood,
+                    balances: balances.clone(),
+                    fetched_at: now,
+                })
+                .await;
+            service
+                .enqueue_checks_for_snapshot(&InventorySnapshotEvent::BaseWalletWrappedEquity {
+                    balances: balances.clone(),
+                    fetched_at: now,
+                })
+                .await;
+        }
+
+        let jobs = queued_job_payloads::<WrappedEquityRecoveryJob>(
+            service.wrapped_equity_recovery_queue.pool(),
+        )
+        .await;
+        let chains: Vec<_> = jobs.iter().map(|job| job["chain"].clone()).collect();
+        assert_eq!(
+            chains,
+            vec![json!("robinhood"), json!("base")],
+            "one job per chain for the same symbol, each stamped with its chain",
+        );
+    }
+
+    #[tokio::test]
+    async fn a_queued_recovery_job_without_a_chain_blocks_only_base() {
+        let service = base_and_robinhood_recovery_service(
+            InventoryView::default(),
+            OperationMode::Enabled,
+            OperationMode::Enabled,
+        )
+        .await;
+        let aapl = Symbol::new("AAPL").unwrap();
+        let mut queue = service.unwrapped_equity_recovery_queue.clone();
+        queue
+            .push(UnwrappedEquityRecoveryJob {
+                chain: Chain::Base,
+                symbol: aapl.clone(),
+                recovery_id: UnwrappedEquityRecoveryId(Uuid::new_v4()),
+                backpressure_streak: BackpressureStreak::default(),
+            })
+            .await
+            .unwrap();
+        let mut legacy = queued_job_payloads::<UnwrappedEquityRecoveryJob>(queue.pool())
+            .await
+            .remove(0);
+        legacy.as_object_mut().unwrap().remove("chain").unwrap();
+        sqlx_apalis::query("UPDATE Jobs SET job = ? WHERE job_type = ?")
+            .bind(serde_json::to_vec(&legacy).unwrap())
+            .bind(std::any::type_name::<UnwrappedEquityRecoveryJob>())
+            .execute(queue.pool())
+            .await
+            .unwrap();
+
+        let balances = BTreeMap::from([(aapl, FractionalShares::new(float!(5)))]);
+        let now = Utc::now();
+        service
+            .enqueue_checks_for_snapshot(&InventorySnapshotEvent::BaseWalletUnwrappedEquity {
+                balances: balances.clone(),
+                fetched_at: now,
+            })
+            .await;
+        service
+            .enqueue_checks_for_snapshot(&InventorySnapshotEvent::ChainWalletUnwrappedEquity {
+                chain: Chain::Robinhood,
+                balances,
+                fetched_at: now,
+            })
+            .await;
+
+        let chains: Vec<_> = queued_job_payloads::<UnwrappedEquityRecoveryJob>(queue.pool())
+            .await
+            .iter()
+            .map(|job| job.get("chain").cloned())
+            .collect();
+        assert_eq!(
+            chains,
+            vec![None, Some(json!("robinhood"))],
+            "the chainless row runs on Base, so it blocks Base but not Robinhood",
+        );
+    }
+
+    #[tokio::test]
+    async fn wallet_recovery_is_gated_on_the_wallets_own_chain() {
+        let service = base_and_robinhood_recovery_service(
+            InventoryView::default(),
+            OperationMode::Enabled,
+            OperationMode::Disabled,
+        )
+        .await;
+
+        service
+            .enqueue_checks_for_snapshot(&InventorySnapshotEvent::ChainWalletUnwrappedEquity {
+                chain: Chain::Robinhood,
+                balances: BTreeMap::from([(
+                    Symbol::new("AAPL").unwrap(),
+                    FractionalShares::new(float!(5)),
+                )]),
+                fetched_at: Utc::now(),
+            })
+            .await;
+
+        let jobs = queued_job_payloads::<UnwrappedEquityRecoveryJob>(
+            service.unwrapped_equity_recovery_queue.pool(),
+        )
+        .await;
+        assert!(
+            jobs.is_empty(),
+            "Robinhood's disabled recovery must not be overridden by Base's flag: {jobs:?}",
+        );
+    }
+
+    /// A persisted Robinhood wallet balance survives a restart: hydration
+    /// restores it to Robinhood's slot and the startup scan enqueues a
+    /// recovery on Robinhood for it.
+    #[tokio::test]
+    async fn startup_recovery_scan_enqueues_a_persisted_balance_on_its_own_chain() {
+        let aapl = Symbol::new("AAPL").unwrap();
+        let persisted =
+            replay::<InventorySnapshot>(vec![InventorySnapshotEvent::ChainWalletWrappedEquity {
+                chain: Chain::Robinhood,
+                balances: BTreeMap::from([(aapl.clone(), FractionalShares::new(float!(4)))]),
+                fetched_at: Utc::now(),
+            }])
+            .unwrap()
+            .unwrap();
+        let service = base_and_robinhood_recovery_service(
+            InventoryView::default(),
+            OperationMode::Enabled,
+            OperationMode::Enabled,
+        )
+        .await;
+        persisted.hydrate_inventory(&service.inventory).await;
+
+        service.enqueue_recovery_for_current_wallet_balances().await;
+
+        let jobs = queued_job_payloads::<WrappedEquityRecoveryJob>(
+            service.wrapped_equity_recovery_queue.pool(),
+        )
+        .await;
+        assert_eq!(jobs.len(), 1, "{jobs:?}");
+        assert_eq!(jobs[0]["chain"], json!("robinhood"));
+        assert_eq!(jobs[0]["symbol"], json!("AAPL"));
     }
 
     #[tokio::test]

@@ -182,10 +182,12 @@ mod tests {
             Self {
                 mm_available: view.equity_available(symbol, Venue::MarketMaking),
                 hedging_available: view.equity_available(symbol, Venue::Hedging),
-                unwrapped_inflight: view
-                    .inflight_equity_at(symbol, InFlightEquityLocation::BaseWalletUnwrapped),
+                unwrapped_inflight: view.inflight_equity_at(
+                    symbol,
+                    InFlightEquityLocation::WalletUnwrapped(Chain::Base),
+                ),
                 wrapped_inflight: view
-                    .inflight_equity_at(symbol, InFlightEquityLocation::BaseWalletWrapped),
+                    .inflight_equity_at(symbol, InFlightEquityLocation::WalletWrapped(Chain::Base)),
             }
         }
     }
