@@ -20803,6 +20803,65 @@ mod tests {
         );
     }
 
+    /// The redrive re-check refuses too: a mined tx that passes at a
+    /// configured depth fails without one instead of borrowing another depth.
+    #[tokio::test]
+    async fn redrive_withdrawal_tx_check_refuses_without_an_ethereum_depth() {
+        let market_maker_wallet = address!("0x2222222222222222222222222222222222222222");
+        let chain = deploy_ethereum_usdc_chain_with_balance(U256::ZERO, market_maker_wallet).await;
+        let server = MockServer::start();
+        let (mut manager, _cqrs) =
+            build_manager_with_ethereum_chain(&chain, &server, market_maker_wallet).await;
+        let id = UsdcRebalanceId(Uuid::new_v4());
+
+        manager.ethereum_required_confirmations = Some(1);
+        manager
+            .require_withdrawal_tx_confirmed(&id, chain.mint_tx, Utc::now())
+            .await
+            .unwrap();
+
+        manager.ethereum_required_confirmations = None;
+        let error = manager
+            .require_withdrawal_tx_confirmed(&id, chain.mint_tx, Utc::now())
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(error, UsdcTransferError::EthereumChainMissing(_)),
+            "got: {error:?}"
+        );
+    }
+
+    /// The credit ledger counts a confirmed withdrawal credit at a configured
+    /// depth, and none without one instead of borrowing another depth.
+    #[tokio::test]
+    async fn withdrawal_credit_is_unconfirmed_without_an_ethereum_depth() {
+        let market_maker_wallet = address!("0x2222222222222222222222222222222222222222");
+        let chain =
+            deploy_ethereum_usdc_chain_with_balance(U256::from(1_000_000u64), market_maker_wallet)
+                .await;
+        let server = MockServer::start();
+        let (mut manager, _cqrs) =
+            build_manager_with_ethereum_chain(&chain, &server, market_maker_wallet).await;
+        let credit_id = UsdcRebalanceId(Uuid::new_v4());
+
+        manager.ethereum_required_confirmations = Some(1);
+        assert_eq!(
+            manager
+                .confirmed_withdrawal_credit(&credit_id, chain.mint_tx)
+                .await,
+            Some(usdc("1"))
+        );
+
+        manager.ethereum_required_confirmations = None;
+        assert_eq!(
+            manager
+                .confirmed_withdrawal_credit(&credit_id, chain.mint_tx)
+                .await,
+            None
+        );
+    }
+
     /// Hypothesis: poll_and_confirm_withdrawal returns WithdrawalTxUnderconfirmed
     /// when the withdrawal tx hash is not yet mined (not in the chain). The
     /// unmined path reports actual=0 and a distinct log; the aggregate MUST advance
