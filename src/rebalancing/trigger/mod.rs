@@ -4245,6 +4245,11 @@ impl RebalancingService {
         }
 
         let Some(offchain) = self.inventory.read().await.equity_venues(symbol)?.offchain else {
+            debug!(
+                target: "rebalance",
+                %symbol,
+                "No broker balance to admit a redemption over a blocked sell hedge"
+            );
             return Ok(EquityTransferAdmission::Standard);
         };
         let floor = self.config.hedge_floor.for_symbol(symbol);

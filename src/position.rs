@@ -4083,6 +4083,74 @@ mod tests {
         );
     }
 
+    /// Reserves `admission` on a Position with net `net` under a dollar
+    /// threshold and no known price, so whether it needs a hedge is unknown.
+    async fn reserve_on_unvalued_position(
+        net: FractionalShares,
+        admission: EquityTransferAdmission,
+    ) -> (
+        EquityTransferReservationId,
+        st0x_event_sorcery::TestResult<Position>,
+    ) {
+        let symbol = Symbol::new("COIN").unwrap();
+        let threshold = ExecutionThreshold::dollar_value(Usdc::new(float!(1000))).unwrap();
+        let reservation_id = EquityTransferReservationId::generate();
+        let result = TestHarness::<Position>::with(())
+            .given(vec![
+                PositionEvent::Initialized {
+                    symbol: symbol.clone(),
+                    threshold,
+                    initialized_at: Utc::now(),
+                },
+                PositionEvent::ManualPositionAdjusted {
+                    previous_net: FractionalShares::ZERO,
+                    target_net: net,
+                    reason: "position recorded before any price".to_string(),
+                    price_usdc: None,
+                    adjusted_at: Utc::now(),
+                },
+            ])
+            .when(reserve(&symbol, threshold, reservation_id, admission))
+            .await;
+        (reservation_id, result)
+    }
+
+    /// A long position the Position cannot value may still need a sell
+    /// hedge. The inventory proof shows that hedge cannot run, so the
+    /// redemption is admitted as it would be over a known needed hedge.
+    #[tokio::test]
+    async fn inventory_proof_admits_a_redemption_while_a_long_position_cannot_be_valued() {
+        let (reservation_id, result) =
+            reserve_on_unvalued_position(FractionalShares::new(float!(61)), at_floor()).await;
+
+        let events = result.events();
+        assert!(
+            matches!(
+                events.as_slice(),
+                [PositionEvent::EquityTransferReserved { reservation_id: reserved, .. }]
+                    if *reserved == reservation_id
+            ),
+            "unexpected events: {events:?}"
+        );
+    }
+
+    /// An unvalued short position may need a buy hedge, which a redemption
+    /// cannot fund, so the valuation guard still refuses it.
+    #[tokio::test]
+    async fn inventory_proof_does_not_admit_a_transfer_while_a_short_position_cannot_be_valued() {
+        let (_, result) =
+            reserve_on_unvalued_position(FractionalShares::new(float!(-61)), at_floor()).await;
+
+        let error = result.then_expect_error();
+        assert!(
+            matches!(
+                error,
+                LifecycleError::Apply(PositionError::EquityTransferHedgeEligibilityUnknown { .. })
+            ),
+            "unexpected error: {error:?}"
+        );
+    }
+
     /// The proof only covers a hedge that cannot run. A hedge that the broker
     /// already accepted keeps priority.
     #[tokio::test]
