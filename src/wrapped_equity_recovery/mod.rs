@@ -1,4 +1,4 @@
-//! Recovery for wrapped equity tokens detected on the Base wallet
+//! Recovery for wrapped equity tokens detected on a chain's bot wallet
 //! outside the Raindex vault. See SPEC.md, "WrappedEquityRecovery
 //! Aggregate" section.
 //!
@@ -11,7 +11,10 @@
 pub(crate) mod aggregate;
 mod job;
 
-pub(crate) use aggregate::{WrappedEquityRecovery, WrappedEquityRecoveryServices};
+pub(crate) use aggregate::{
+    WrappedEquityRecovery, WrappedEquityRecoveryId, WrappedEquityRecoveryServices,
+    open_recovery_ids,
+};
 pub(crate) use job::{
     WrappedEquityRecoveryCtx, WrappedEquityRecoveryJob, WrappedEquityRecoveryJobQueue,
 };

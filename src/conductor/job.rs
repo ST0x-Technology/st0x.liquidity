@@ -454,6 +454,20 @@ impl<Task: Serialize + DeserializeOwned + Send + Sync + Unpin + 'static> JobQueu
         Ok(TaskSink::push_task(&mut self.0, scheduled).await?)
     }
 
+    /// Schedules one delayed successor for a stable domain identity.
+    pub(crate) async fn push_idempotent_with_delay(
+        &mut self,
+        idempotency_key: &str,
+        task: Task,
+        delay: Duration,
+    ) -> Result<(), QueuePushError> {
+        let scheduled = TaskBuilder::<Task, SqliteContext, _>::new(task)
+            .with_idempotency_key(idempotency_key)
+            .run_after(delay)
+            .build();
+        Ok(TaskSink::push_task(&mut self.0, scheduled).await?)
+    }
+
     pub(crate) fn into_storage(self) -> Storage<Task> {
         self.0
     }

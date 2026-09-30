@@ -292,6 +292,25 @@ where
 }
 
 impl TransferEquityToMarketMaking {
+    async fn release_position_reservation(
+        &self,
+        ctx: &TransferEquityToMarketMakingCtx,
+    ) -> Result<(), TransferEquityToMarketMakingJobError> {
+        if let Some((position_store, _)) = &ctx.position_authority {
+            position_store
+                .send(
+                    &self.symbol,
+                    PositionCommand::ReleaseEquityTransfer {
+                        reservation_id: EquityTransferReservationId::from_uuid(
+                            self.issuer_request_id.0,
+                        ),
+                    },
+                )
+                .await?;
+        }
+        Ok(())
+    }
+
     async fn abandon_if_stopped_and_fresh(
         &self,
         ctx: &TransferEquityToMarketMakingCtx,
@@ -438,18 +457,7 @@ impl Job<TransferEquityToMarketMakingCtx> for TransferEquityToMarketMaking {
         // here, after the transfer command and all of its reactors have
         // committed, before the worker can return and hedging can resume.
         let Err(transfer_error) = result else {
-            if let Some((position_store, _)) = &ctx.position_authority {
-                position_store
-                    .send(
-                        &self.symbol,
-                        PositionCommand::ReleaseEquityTransfer {
-                            reservation_id: EquityTransferReservationId::from_uuid(
-                                self.issuer_request_id.0,
-                            ),
-                        },
-                    )
-                    .await?;
-            }
+            self.release_position_reservation(ctx).await?;
             return Ok(());
         };
 
@@ -462,18 +470,7 @@ impl Job<TransferEquityToMarketMakingCtx> for TransferEquityToMarketMaking {
         }
 
         if let Some(delay) = transfer_error.gas_readiness_retry_interval() {
-            if let Some((position_store, _)) = &ctx.position_authority {
-                position_store
-                    .send(
-                        &self.symbol,
-                        PositionCommand::ReleaseEquityTransfer {
-                            reservation_id: EquityTransferReservationId::from_uuid(
-                                self.issuer_request_id.0,
-                            ),
-                        },
-                    )
-                    .await?;
-            }
+            self.release_position_reservation(ctx).await?;
             warn!(
                 target: "rebalance",
                 symbol = %self.symbol,
@@ -577,6 +574,7 @@ impl Job<TransferEquityToMarketMakingCtx> for TransferEquityToMarketMaking {
                         &ctx.equity_in_progress,
                         &self.symbol,
                         self.generation,
+                        self.chain,
                     ) {
                         MarkHeldResult::Transitioned | MarkHeldResult::AlreadyHeld => {
                             warn!(
@@ -598,6 +596,20 @@ impl Job<TransferEquityToMarketMakingCtx> for TransferEquityToMarketMaking {
                                 issuer_request_id = %self.issuer_request_id,
                                 "PostReceipt handler: guard entry absent (cleared by timeout \
                                  sweeper?); propagating Err so apalis retries"
+                            );
+                            Err(TransferEquityToMarketMakingJobError::Transfer(
+                                MintTransferError::PostReceipt(mint_error),
+                            ))
+                        }
+                        MarkHeldResult::HeldForOtherChain { held_chain } => {
+                            warn!(
+                                target: "rebalance",
+                                symbol = %self.symbol,
+                                issuer_request_id = %self.issuer_request_id,
+                                chain = %self.chain,
+                                %held_chain,
+                                "PostReceipt handler: slot held for another chain's recovery; \
+                                 propagating Err so apalis retries"
                             );
                             Err(TransferEquityToMarketMakingJobError::Transfer(
                                 MintTransferError::PostReceipt(mint_error),
@@ -710,8 +722,13 @@ impl Job<TransferEquityToMarketMakingCtx> for TransferEquityToMarketMaking {
 enum MarkHeldResult {
     /// Successfully transitioned `ActiveTransfer` -> `HeldForRecovery`.
     Transitioned,
-    /// Slot was already `HeldForRecovery` (idempotent double-call after retry).
+    /// Slot was already `HeldForRecovery` for the same chain (idempotent
+    /// double-call after retry).
     AlreadyHeld,
+    /// Slot is `HeldForRecovery` for another chain: that chain's recovery owns
+    /// the symbol, and this transfer's tokens have no hold of their own. The
+    /// caller should propagate `Err` so apalis retries.
+    HeldForOtherChain { held_chain: Chain },
     /// Guard entry is absent (cleared by timeout sweeper before `PostReceipt`
     /// handler ran). Caller should propagate `Err` so apalis retries; the
     /// tokens remain in the wallet and the next inventory poll re-triggers
@@ -728,13 +745,17 @@ enum MarkHeldResult {
 ///
 /// Returns [`MarkHeldResult`] describing the outcome:
 /// - `Transitioned`: slot updated; call site should return `Ok(())`.
-/// - `AlreadyHeld`: slot was already held (idempotent); return `Ok(())`.
+/// - `AlreadyHeld`: slot was already held for `chain` (idempotent); return
+///   `Ok(())`.
+/// - `HeldForOtherChain`: another chain's recovery holds the slot; return
+///   `Err` for apalis retry.
 /// - `EntryAbsent`: guard was cleared externally; return `Err` for apalis retry.
 /// - `GenerationMismatch`: a newer transfer owns the slot; return `Ok(())`.
 fn mark_held_for_recovery(
     map: &RwLock<HashMap<Symbol, GuardState>>,
     symbol: &Symbol,
     expected_generation: GuardGeneration,
+    chain: Chain,
 ) -> MarkHeldResult {
     let mut poisoned = false;
     let result = {
@@ -745,17 +766,26 @@ fn mark_held_for_recovery(
                 poison.into_inner()
             }
         };
-        match guard.get(symbol) {
+        let result = match guard.get(symbol) {
             Some(GuardState::ActiveTransfer { generation })
                 if *generation == expected_generation =>
             {
-                guard.insert(symbol.clone(), GuardState::HeldForRecovery);
+                guard.insert(symbol.clone(), GuardState::HeldForRecovery { chain });
                 MarkHeldResult::Transitioned
             }
             Some(GuardState::ActiveTransfer { .. }) => MarkHeldResult::GenerationMismatch,
-            Some(GuardState::HeldForRecovery) => MarkHeldResult::AlreadyHeld,
+            Some(GuardState::HeldForRecovery { chain: held_chain }) if *held_chain == chain => {
+                MarkHeldResult::AlreadyHeld
+            }
+            Some(GuardState::HeldForRecovery { chain: held_chain }) => {
+                MarkHeldResult::HeldForOtherChain {
+                    held_chain: *held_chain,
+                }
+            }
             None => MarkHeldResult::EntryAbsent,
-        }
+        };
+        drop(guard);
+        result
     };
 
     if poisoned {
@@ -785,7 +815,9 @@ fn mark_held_for_recovery(
                  double-call after idempotent retry"
             );
         }
-        MarkHeldResult::Transitioned | MarkHeldResult::EntryAbsent => {}
+        MarkHeldResult::Transitioned
+        | MarkHeldResult::EntryAbsent
+        | MarkHeldResult::HeldForOtherChain { .. } => {}
     }
     result
 }
@@ -2013,8 +2045,8 @@ mod tests {
                 Some(GuardState::ActiveTransfer { generation: newer }),
             ),
             (
-                GuardState::HeldForRecovery,
-                Some(GuardState::HeldForRecovery),
+                GuardState::HeldForRecovery { chain: Chain::Base },
+                Some(GuardState::HeldForRecovery { chain: Chain::Base }),
             ),
         ] {
             let id = issuer_request_id("paused-fresh-mint-worker");
@@ -2088,8 +2120,8 @@ mod tests {
                 Some(GuardState::ActiveTransfer { generation: newer }),
             ),
             (
-                GuardState::HeldForRecovery,
-                Some(GuardState::HeldForRecovery),
+                GuardState::HeldForRecovery { chain: Chain::Base },
+                Some(GuardState::HeldForRecovery { chain: Chain::Base }),
             ),
         ] {
             let id = redemption_aggregate_id("paused-fresh-redemption-worker");
@@ -2864,7 +2896,7 @@ mod tests {
 
         assert_eq!(
             ctx.equity_in_progress.read().unwrap().get(&symbol),
-            Some(&GuardState::HeldForRecovery),
+            Some(&GuardState::HeldForRecovery { chain: Chain::Base }),
             "guard must transition to HeldForRecovery for TokensReceived so \
              UnwrappedEquityRecovery can resume the wrap+deposit"
         );
@@ -3004,7 +3036,7 @@ mod tests {
 
         assert_eq!(
             ctx.equity_in_progress.read().unwrap().get(&symbol),
-            Some(&GuardState::HeldForRecovery),
+            Some(&GuardState::HeldForRecovery { chain: Chain::Base }),
             "guard must transition to HeldForRecovery for WrapSubmitted so \
              UnwrappedEquityRecovery can confirm/resume the wrap+deposit"
         );
@@ -3335,10 +3367,10 @@ mod tests {
 
         // Pre-seed the guard as HeldForRecovery (as if a prior attempt already
         // ran and set the guard before crashing).
-        ctx.equity_in_progress
-            .write()
-            .unwrap()
-            .insert(symbol.clone(), GuardState::HeldForRecovery);
+        ctx.equity_in_progress.write().unwrap().insert(
+            symbol.clone(),
+            GuardState::HeldForRecovery { chain: Chain::Base },
+        );
 
         // Drive to TokensReceived so the aggregate IS in a recoverable state.
         ctx.mint_store
@@ -3377,7 +3409,7 @@ mod tests {
 
         assert_eq!(
             ctx.equity_in_progress.read().unwrap().get(&symbol),
-            Some(&GuardState::HeldForRecovery),
+            Some(&GuardState::HeldForRecovery { chain: Chain::Base }),
             "idempotent re-entry must leave guard in HeldForRecovery"
         );
     }
@@ -3438,6 +3470,99 @@ mod tests {
             !ctx.equity_in_progress.read().unwrap().contains_key(&symbol),
             "absent guard must remain absent after failed handoff"
         );
+    }
+
+    /// A Base mint whose symbol is held for a Robinhood recovery gets no hold
+    /// of its own: the slot is not `AlreadyHeld` for it, so the job returns
+    /// `Err` and apalis retries instead of leaving its tokens unclaimed, and
+    /// Robinhood's hold stays in place.
+    #[tokio::test]
+    async fn perform_post_receipt_propagates_err_when_guard_held_for_another_chain() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let issuer_id = issuer_request_id("post-receipt-held-elsewhere");
+        let ctx = test_ctx(Arc::new(RecordingResume::post_receipt_failure())).await;
+        let robinhood_hold = GuardState::HeldForRecovery {
+            chain: Chain::Robinhood,
+        };
+        ctx.equity_in_progress
+            .write()
+            .unwrap()
+            .insert(symbol.clone(), robinhood_hold.clone());
+
+        ctx.mint_store
+            .send(
+                &issuer_id,
+                TokenizedEquityMintCommand::RequestMint {
+                    chain: Chain::Base,
+                    issuer_request_id: issuer_id.clone(),
+                    symbol: symbol.clone(),
+                    quantity: float!(5),
+                    wallet: Address::ZERO,
+                },
+            )
+            .await
+            .expect("RequestMint must persist");
+
+        submit_requested_mint(&ctx, &issuer_id).await;
+
+        ctx.mint_store
+            .send(&issuer_id, TokenizedEquityMintCommand::Poll)
+            .await
+            .expect("Poll must transition to TokensReceived");
+
+        let job = TransferEquityToMarketMaking {
+            chain: Chain::Base,
+            issuer_request_id: issuer_id.clone(),
+            symbol: symbol.clone(),
+            quantity: FractionalShares::new(float!(5)),
+            generation: GuardGeneration::default(),
+            backpressure_streak: BackpressureStreak::default(),
+            position_reservation_retry_attempts: 0,
+        };
+
+        let error = Job::perform(&job, &ctx).await.unwrap_err();
+        assert!(
+            matches!(
+                error,
+                TransferEquityToMarketMakingJobError::Transfer(MintTransferError::PostReceipt(_))
+            ),
+            "a hold for another chain must propagate PostReceipt for apalis retry, got {error:?}"
+        );
+        assert_eq!(
+            ctx.equity_in_progress.read().unwrap().get(&symbol),
+            Some(&robinhood_hold)
+        );
+    }
+
+    #[test]
+    fn mark_held_for_recovery_records_the_transfers_chain() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let generation = GuardGeneration::default();
+        let map = RwLock::new(HashMap::from([(
+            symbol.clone(),
+            GuardState::ActiveTransfer { generation },
+        )]));
+
+        assert!(matches!(
+            mark_held_for_recovery(&map, &symbol, generation, Chain::Robinhood),
+            MarkHeldResult::Transitioned
+        ));
+        assert_eq!(
+            map.read().unwrap().get(&symbol),
+            Some(&GuardState::HeldForRecovery {
+                chain: Chain::Robinhood
+            })
+        );
+        assert!(matches!(
+            mark_held_for_recovery(&map, &symbol, generation, Chain::Robinhood),
+            MarkHeldResult::AlreadyHeld
+        ));
+        assert!(matches!(
+            mark_held_for_recovery(&map, &symbol, generation, Chain::Base),
+            MarkHeldResult::HeldForOtherChain {
+                held_chain: Chain::Robinhood
+            }
+        ));
     }
 
     #[test]
@@ -4866,10 +4991,10 @@ mod tests {
             })
         );
 
-        ctx.equity_in_progress
-            .write()
-            .unwrap()
-            .insert(symbol.clone(), GuardState::HeldForRecovery);
+        ctx.equity_in_progress.write().unwrap().insert(
+            symbol.clone(),
+            GuardState::HeldForRecovery { chain: Chain::Base },
+        );
         let current_job = TransferEquityToMarketMaking {
             issuer_request_id: issuer_request_id("held-terminal-mint-cleanup"),
             symbol: symbol.clone(),
@@ -4886,7 +5011,7 @@ mod tests {
 
         assert_eq!(
             ctx.equity_in_progress.read().unwrap().get(&symbol),
-            Some(&GuardState::HeldForRecovery)
+            Some(&GuardState::HeldForRecovery { chain: Chain::Base })
         );
     }
 
@@ -4949,7 +5074,10 @@ mod tests {
                 current_owner,
                 GuardGeneration::from_parts(NonZeroU32::new(5).unwrap(), 2),
             ),
-            (GuardState::HeldForRecovery, current_generation),
+            (
+                GuardState::HeldForRecovery { chain: Chain::Base },
+                current_generation,
+            ),
         ] {
             ctx.equity_in_progress
                 .write()

@@ -1525,13 +1525,11 @@ migration files in `migrations/`.
   `UnwrappedEquityRecovery`. The wrapped/unwrapped equity-recovery aggregates'
   `DispatchToMint`/`DispatchToRedemption` handoff to a mint/redemption resume is
   the remaining swallowing site: a bot-gas enqueue failure there is folded into
-  the aggregate's normal `RecoveryFailed` event rather than redriven, because
-  `WrappedEquityRecoveryJob` (and, for consistency, its unwrapped twin) has no
-  resume arm for the `Detected` state a redrive would land back on -- redriving
-  would re-send `Detect`, which is rejected as `AlreadyInitialized`, stranding
-  the aggregate non-terminal and permanently blocking rebalancing for the symbol
-  (see "Known gaps" below). This differs from a downstream job's own execution
-  failures, which dead-letter without blocking the caller
+  the aggregate's normal `RecoveryFailed` event rather than redriven. Both
+  recovery jobs now resume from the `Detected` state a redrive would land back
+  on, so redriving would no longer strand the record; the redrive itself is not
+  wired yet (see "Known gaps" below). This differs from a downstream job's own
+  execution failures, which dead-letter without blocking the caller
 - Every cross-venue transfer constructor requires an explicit bot-gas enqueuer.
   Production wiring passes the durable queue-backed enqueuer, while CLI and
   test-only construction sites must explicitly pass `Disabled`; there is no
@@ -1561,17 +1559,17 @@ migration files in `migrations/`.
   loudly, not silently) rather than recorded, and the wrapped/unwrapped
   equity-recovery aggregates' `DispatchToMint`/ `DispatchToRedemption` handoff
   swallows a bot-gas enqueue failure into `RecoveryFailed` (permanently losing
-  that mint/redemption-resume gas fact) rather than redriving it, because
-  `WrappedEquityRecoveryJob` has no resume arm for the `Detected` state a
-  redrive would land back on -- redriving would re-send `Detect`, rejected as
-  `AlreadyInitialized`, stranding the aggregate non-terminal.
-  `UnwrappedEquityRecoveryJob` already resumes safely from `Detected`
-  (`resume_from_detected`), but its aggregate folds the failure the same way for
-  consistency with its wrapped twin pending the fix below. The proper fix is to
-  add a `Detected` resume arm to `WrappedEquityRecoveryJob` mirroring
-  `UnwrappedEquityRecoveryJob::resume_from_detected`, after which both
-  aggregates can safely redrive this handoff again -- so `/pnl`'s bot-gas line
-  is a lower bound on actual gas spend, not an exact figure
+  that mint/redemption-resume gas fact) rather than redriving it. Both jobs now
+  resume from `Detected` (the wrapped job skips `Detect` and fails a record
+  whose shares changed or whose active transfer no longer validates; changed
+  shares queue one replacement, while invalid dispatch alerts and retains any
+  existing hold without replacement). The unwrapped resume path does not match
+  that: a validation failure there sends `FailRecovery`, returns `Ok`, and
+  `perform` releases the hold, so a `HeldForRecovery` slot can drop while tokens
+  are still in the wallet. The remaining bot-gas fix is to propagate that
+  enqueue failure from both aggregates and let the shared redrive handle it.
+  Until then `/pnl`'s bot-gas line is a lower bound on actual gas spend, not an
+  exact figure
 
 #### Reporting and Analysis
 
@@ -2237,6 +2235,13 @@ corridor has run; once two corridors have run transfers at the same time, do not
 roll back below the first per-corridor release. It must therefore ship in a
 release before the first config that can run two corridors
 ([RAI-2488](https://linear.app/makeitrain/issue/RAI-2488)).
+
+Rollback floor for wrapped-equity recovery: `StaleDetectionFailed` and
+`InvalidDetectionFailed` are new persisted event variants. Once either is
+stored, a rollback to a previous binary cannot deserialize that event, and
+replay of that recovery fails (`SCHEMA_VERSION` only clears snapshots). Additive
+`chain` fields on the other events are ignored by older readers. Do not roll
+back below this release after a wrapped recovery has stored either event.
 
 #### CI/CD Credential Management
 
@@ -5213,6 +5218,12 @@ recovery job logs at debug and exits without writing an aggregate; the next
 polling tick re-evaluates. This keeps recovery dispatch from racing the
 mint/redemption tasks already driven by apalis.
 
+A transfer that hands its received tokens to recovery holds the symbol for the
+chain whose wallet holds them (`HeldForRecovery { chain }`). Only a recovery job
+on that chain claims the hold; a job on another chain reschedules, as it does
+for a live transfer. A failed recovery attempt restores the hold for the same
+chain.
+
 ##### Idempotency
 
 Each polled `BaseWalletWrappedEquity` snapshot triggers a fresh
@@ -5221,20 +5232,43 @@ the next job sees an empty balance and exits without writing an aggregate. If
 the previous recovery is still running the `equity_in_progress` guard ensures
 the new job exits.
 
+A job retried after `Detect` succeeded resumes the `Detected` record instead of
+sending `Detect` again: it dispatches from the current wallet snapshot. If the
+wallet balance differs from the detected shares, it closes the record with
+`StaleDetectionFailed` and queues one fresh recovery on the same chain and
+symbol. A queue idempotency key derived from the failed recovery ID prevents
+duplicate replacement rows after crash redelivery. Enqueue failure retries this
+typed restart decision without releasing a held slot. Invalid active mint or
+redemption validation closes the detection with `InvalidDetectionFailed`, raises
+an operational alert, and retains any existing recovery hold without queuing
+another invalid detection. Redelivery preserves that hold. A vanished wrapped
+balance without a recovery hold fails the record without replacement.
+
 ##### WrappedEquityRecovery Aggregate
 
 The audit trail AND the actor for recovery side effects. Persists one aggregate
 instance per detection-and-dispatch attempt -- multiple recoveries for the same
 symbol are independent aggregates, keyed by `WrappedEquityRecoveryId(Uuid)`.
 
-`Services = WrappedEquityRecoveryServices { raindex: Arc<dyn Raindex>,
-wrapper: Arc<dyn Wrapper>, transfer: Arc<CrossVenueEquityTransfer> }`
+`Services = WrappedEquityRecoveryServices { equity: EquityTransferServices,
+transfer: Arc<CrossVenueEquityTransfer>, bot_gas_enqueuer }`
 -- each command handler that needs an external side effect (orphan deposit
 submit/confirm, mint resume, redemption resume) calls the corresponding service
 inside the handler and emits the resulting event only on success. This mirrors
 `TokenizedEquityMint` and `EquityRedemption` (both use `EquityTransferServices`
 the same way) and keeps the audit trail tight: no event is recorded for a side
 effect that didn't actually happen.
+
+Every recovery records the chain whose wallet holds the shares (`chain` on
+`Detected`, and on every state). Each handler resolves that chain's entry of
+`equity` -- its wallet, orderbook, wrapper and vault lookup -- from the record,
+never from the primary chain, and charges bot gas to that chain. A `Detected`
+event persisted before the chain was recorded loads as Base. A chain with no
+entry (its rebalancing is `disabled`) is not a recovery failure: the command is
+refused with `ChainServicesMissing`, no event is recorded, and the recovery
+stays open. The job then reschedules itself and raises an operational alert
+naming the chain, symbol and recovery. At startup, an open recovery on such a
+chain, or a symbol held for recovery on one, refuses startup by name.
 
 The job's responsibility is purely orchestration -- read `InventoryView`, pick a
 dispatch path, and send the command sequence: `Detect`, then exactly one of
@@ -5270,9 +5304,10 @@ The dispatch-success states (`DispatchedToMint`, `DispatchedToRedemption`,
 succeeded and with which `mint_id` / `redemption_id` / `tx_hash`. No separate
 `Completed` state is needed.
 
-- `Detect` is the initialization command and records the trigger (symbol,
+- `Detect` is the initialization command and records the trigger (chain, symbol,
   wrapped share quantity, detected_at). The job sends it as soon as it observes
-  a non-zero balance for the symbol. No services are invoked.
+  a non-zero balance for the symbol. No services are invoked, but it is refused
+  when the chain has no services.
 - `DispatchToMint { mint_id }` / `DispatchToRedemption { redemption_id }`: the
   handler calls `services.transfer.resume_mint(mint_id)` (or
   `resume_redemption`) and emits the corresponding `DispatchedTo*` event only
@@ -5300,33 +5335,41 @@ succeeded and with which `mint_id` / `redemption_id` / `tx_hash`. No separate
 
 ###### States
 
+Every state also carries the `chain` recorded at `Detect`.
+
 ```rust
 enum WrappedEquityRecovery {
-    Detected { symbol, shares, detected_at },
-    DispatchedToMint { symbol, shares, detected_at, mint_id, dispatched_at },        // terminal
+    Detected { chain, symbol, shares, detected_at },
+    DispatchedToMint { chain, symbol, shares, detected_at, mint_id, dispatched_at },        // terminal
     DispatchedToRedemption {                                                          // terminal
-        symbol, shares, detected_at, redemption_id, dispatched_at,
+        chain, symbol, shares, detected_at, redemption_id, dispatched_at,
     },
     OrphanDepositSubmitted {
-        symbol, shares, detected_at, vault_deposit_tx_hash, submitted_at,
+        chain, symbol, shares, detected_at, vault_deposit_tx_hash, submitted_at,
     },
     OrphanDeposited {                                                                 // terminal
-        symbol, shares, detected_at, vault_deposit_tx_hash, submitted_at, deposited_at,
+        chain, symbol, shares, detected_at, vault_deposit_tx_hash, submitted_at, deposited_at,
     },
-    Failed { symbol, shares, reason, failed_at },                                     // terminal
+    Failed { chain, symbol, shares, reason, failed_at, detection_failure },                                     // terminal
 }
 ```
+
+`Failed.detection_failure` is `RestartDetection` for changed shares,
+`PreserveHold` for invalid dispatch, and absent for ordinary failures. The
+persisted event determines this disposition; job retries never parse reasons.
 
 ###### Commands
 
 ```rust
 enum WrappedEquityRecoveryCommand {
-    Detect { symbol, shares },
+    Detect { chain, symbol, shares },
     DispatchToMint { mint_id },                // services.transfer.resume_mint
     DispatchToRedemption { redemption_id },    // services.transfer.resume_redemption
-    SubmitOrphanDeposit,                       // services.{wrapper,raindex}.*
-    ConfirmOrphanDeposit,                      // services.raindex.confirm_tx
+    SubmitOrphanDeposit,                       // the chain's {wrapper,raindex}.*
+    ConfirmOrphanDeposit,                      // the chain's raindex.confirm_tx
     FailRecovery { reason },
+    FailStaleDetection { reason },
+    FailInvalidDetection { reason },
 }
 ```
 
@@ -5334,12 +5377,14 @@ enum WrappedEquityRecoveryCommand {
 
 ```rust
 enum WrappedEquityRecoveryEvent {
-    Detected { symbol, shares, detected_at },
+    Detected { chain, symbol, shares, detected_at }, // chain defaults to Base
     DispatchedToMint { mint_id, dispatched_at },
     DispatchedToRedemption { redemption_id, dispatched_at },
     OrphanDepositSubmitted { vault_deposit_tx_hash, submitted_at },
     OrphanDeposited { vault_deposit_tx_hash, deposited_at },
     RecoveryFailed { reason, failed_at },
+    StaleDetectionFailed { reason, failed_at },
+    InvalidDetectionFailed { reason, failed_at },
 }
 ```
 
@@ -5355,16 +5400,20 @@ enum WrappedEquityRecoveryEvent {
 - All dispatch handlers run their side effect inside the command handler so the
   success event is emitted iff the side effect actually completed. Service
   failures are recorded as `RecoveryFailed`.
+- A command on a chain without services is refused with no event; the recovery
+  stays open.
 - `DispatchedToMint`, `DispatchedToRedemption`, `OrphanDeposited`, and `Failed`
   are terminal states.
 
 ###### Job-level Idempotency
 
-The recovery job carries its `WrappedEquityRecoveryId` in the apalis payload
-(generated by the reactor when pushing). On retry, apalis re-runs `perform` with
-the same payload, so the job re-targets the same aggregate; the framework
-reloads its current state and the next command in the sequence picks up where
-the prior attempt stopped (e.g., if `SubmitOrphanDeposit` succeeded but
+The recovery job carries its `WrappedEquityRecoveryId` and its chain in the
+apalis payload (generated by the reactor when pushing; a payload queued before
+the chain was recorded runs as Base). A job whose loaded recovery names another
+chain fails that recovery, naming both chains. On retry, apalis re-runs
+`perform` with the same payload, so the job re-targets the same aggregate; the
+framework reloads its current state and the next command in the sequence picks
+up where the prior attempt stopped (e.g., if `SubmitOrphanDeposit` succeeded but
 `ConfirmOrphanDeposit` crashed before persisting, the retry skips submit and
 goes straight to confirm).
 
@@ -5458,12 +5507,12 @@ The audit trail AND the actor for recovery side effects, keyed by
 `UnwrappedEquityRecoveryId(Uuid)`. Each detection-and-dispatch attempt is its
 own aggregate instance.
 
-`Services = UnwrappedEquityRecoveryServices { raindex: Arc<dyn Raindex>,
-wrapper: Arc<dyn Wrapper>, transfer: Arc<CrossVenueEquityTransfer>,
-wallet: Address }`
--- differs from `WrappedEquityRecoveryServices` by the added `wallet: Address`,
-the bot wallet on Base that is both the wrap receiver and the address the orphan
-deposit pulls wrapped tokens from.
+`Services = UnwrappedEquityRecoveryServices { equity: EquityTransferServices,
+transfer: Arc<CrossVenueEquityTransfer>, bot_gas_enqueuer }`,
+the same shape as `WrappedEquityRecoveryServices`, with the same chain rules:
+the recovery records its chain, each handler resolves that chain's entry, and an
+unwired chain refuses the command without an event. The entry's `wallet` is both
+the wrap receiver and the address the orphan deposit pulls wrapped tokens from.
 
 The job's responsibility is purely orchestration -- read `InventoryView`, pick a
 dispatch path, and send the command sequence: `Detect`, then exactly one of
@@ -5494,22 +5543,24 @@ stateDiagram-v2
 
 ###### States
 
+Every state also carries the `chain` recorded at `Detect`.
+
 ```rust
 enum UnwrappedEquityRecovery {
-    Detected { symbol, shares, detected_at },
-    DispatchedToMint { symbol, shares, detected_at, mint_id, dispatched_at },          // terminal
+    Detected { chain, symbol, shares, detected_at },
+    DispatchedToMint { chain, symbol, shares, detected_at, mint_id, dispatched_at },          // terminal
     DispatchedToRedemption {                                                           // terminal
-        symbol, shares, detected_at, redemption_id, dispatched_at,
+        chain, symbol, shares, detected_at, redemption_id, dispatched_at,
     },
-    OrphanWrapSubmitted { symbol, shares, detected_at, wrap_tx_hash, submitted_at },
-    OrphanWrapped { symbol, shares, detected_at, wrap_tx_hash, wrapped_at },
+    OrphanWrapSubmitted { chain, symbol, shares, detected_at, wrap_tx_hash, submitted_at },
+    OrphanWrapped { chain, symbol, shares, detected_at, wrap_tx_hash, wrapped_at },
     OrphanDepositSubmitted {
-        symbol, shares, detected_at, wrap_tx_hash, vault_deposit_tx_hash, submitted_at,
+        chain, symbol, shares, detected_at, wrap_tx_hash, vault_deposit_tx_hash, submitted_at,
     },
     OrphanDeposited {                                                                  // terminal
-        symbol, shares, detected_at, vault_deposit_tx_hash, deposited_at,
+        chain, symbol, shares, detected_at, vault_deposit_tx_hash, deposited_at,
     },
-    Failed { symbol, shares, reason, failed_at },                                      // terminal
+    Failed { chain, symbol, shares, reason, failed_at },                                      // terminal
 }
 ```
 
@@ -5517,13 +5568,13 @@ enum UnwrappedEquityRecovery {
 
 ```rust
 enum UnwrappedEquityRecoveryCommand {
-    Detect { symbol, shares },
+    Detect { chain, symbol, shares },
     DispatchToMint { mint_id },                // services.transfer.resume_mint
     DispatchToRedemption { redemption_id },    // services.transfer.resume_redemption
-    SubmitOrphanWrap,                          // services.wrapper.submit_wrap
-    ConfirmOrphanWrap,                         // services.wrapper.confirm_wrap
-    SubmitOrphanDeposit,                       // services.raindex.submit_deposit
-    ConfirmOrphanDeposit,                      // services.raindex.confirm_tx
+    SubmitOrphanWrap,                          // the chain's wrapper.submit_wrap
+    ConfirmOrphanWrap,                         // the chain's wrapper.confirm_wrap
+    SubmitOrphanDeposit,                       // the chain's raindex.submit_deposit
+    ConfirmOrphanDeposit,                      // the chain's raindex.confirm_tx
     FailRecovery { reason },
 }
 ```
@@ -5532,7 +5583,7 @@ enum UnwrappedEquityRecoveryCommand {
 
 ```rust
 enum UnwrappedEquityRecoveryEvent {
-    Detected { symbol, shares, detected_at },
+    Detected { chain, symbol, shares, detected_at }, // chain defaults to Base
     DispatchedToMint { mint_id, dispatched_at },
     DispatchedToRedemption { redemption_id, dispatched_at },
     OrphanWrapSubmitted { wrap_tx_hash, submitted_at },
@@ -5563,17 +5614,18 @@ enum UnwrappedEquityRecoveryEvent {
 ###### Job-level Idempotency
 
 Same model as `WrappedEquityRecoveryJob`: the apalis payload carries the
-`UnwrappedEquityRecoveryId` so retries re-target the same aggregate and resume
-from the next non-terminal command. There is no `client_order_id` or nonce-based
-replay-protection at the wrapper layer -- `submit_wrap` takes only
-`(wrapped_token, underlying_amount, wallet)`, and wrapping is an on-chain
-ERC-4626 deposit, not a broker call. The crash-window guard is the aggregate
-state machine instead: a retry that finds `OrphanWrapSubmitted` already
-persisted resumes at `ConfirmOrphanWrap` rather than re-wrapping. The one
-un-guarded window is a wrap that lands on-chain but crashes before
-`OrphanWrapSubmitted` persists -- the aggregate is still `Detected`, so the
-retry re-submits. Funds are not lost: the surplus wtSTOCK is swept by the
-wrapped recovery path, though the original aggregate may terminate in `Failed`.
+`UnwrappedEquityRecoveryId` and the chain so retries re-target the same
+aggregate and resume from the next non-terminal command. There is no
+`client_order_id` or nonce-based replay-protection at the wrapper layer --
+`submit_wrap` takes only `(wrapped_token, underlying_amount, wallet)`, and
+wrapping is an on-chain ERC-4626 deposit, not a broker call. The crash-window
+guard is the aggregate state machine instead: a retry that finds
+`OrphanWrapSubmitted` already persisted resumes at `ConfirmOrphanWrap` rather
+than re-wrapping. The one un-guarded window is a wrap that lands on-chain but
+crashes before `OrphanWrapSubmitted` persists -- the aggregate is still
+`Detected`, so the retry re-submits. Funds are not lost: the surplus wtSTOCK is
+swept by the wrapped recovery path, though the original aggregate may terminate
+in `Failed`.
 
 #### Rebalancing Triggers
 
