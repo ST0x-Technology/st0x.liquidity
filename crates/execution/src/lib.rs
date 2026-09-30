@@ -1038,8 +1038,24 @@ pub(crate) fn resolve_sell_preflight(
     ))
 }
 
-/// `available - floor`, clamped at zero.
-fn sellable_above_floor(
+/// Whether [`resolve_sell_preflight`] skips a sell of `requested` shares.
+///
+/// `sellable` is the broker book above the hedge floor. The sell is skipped
+/// when the book covers less than the request, and too little for a partial
+/// hedge. Uses fractional figures, so a symbol that only trades whole shares
+/// can be skipped while this returns `false`; callers treat `false` as "not
+/// proven".
+pub fn sell_blocked_by_inventory(
+    sellable: FractionalShares,
+    requested: FractionalShares,
+) -> Result<bool, FloatError> {
+    Ok(sellable.inner().lt(requested.inner())?
+        && sellable.inner().lt(*MINIMUM_PARTIAL_HEDGE_SHARES)?)
+}
+
+/// `available - floor`, clamped at zero: the broker shares a sell hedge may
+/// use.
+pub fn sellable_above_floor(
     available: FractionalShares,
     floor: FractionalShares,
 ) -> Result<FractionalShares, FloatError> {
@@ -1727,5 +1743,45 @@ mod tests {
         };
         assert_eq!(required.inner(), frac_shares("5.27"));
         assert_eq!(available, frac_shares("5.27"));
+    }
+
+    /// The predicate must agree with the preflight it predicts, including a
+    /// request smaller than the partial hedge minimum that the book covers.
+    #[test]
+    fn sell_blocked_by_inventory_matches_the_sell_preflight() {
+        let cases = [
+            // (available, floor, requested, blocked)
+            ("0.01", "0.01", "61", true),
+            ("0", "0", "61", true),
+            ("0.005", "0", "61", true),
+            ("1.009", "1", "61", true),
+            ("0.5", "1", "61", true),
+            ("1.01", "1", "61", false),
+            ("5", "0", "61", false),
+            ("0.005", "0", "0.005", false),
+            ("0.005", "0", "0.004", false),
+            ("0.005", "0", "0.006", true),
+        ];
+
+        for (available, floor, requested, blocked) in cases {
+            let available = frac_shares(available);
+            let floor = frac_shares(floor);
+            let sellable = sellable_above_floor(available, floor).unwrap();
+
+            assert_eq!(
+                sell_blocked_by_inventory(sellable, frac_shares(requested)).unwrap(),
+                blocked,
+                "available {available}, floor {floor}, requested {requested}"
+            );
+
+            let preflight =
+                resolve_sell_preflight(sell_order("COIN", requested), available, floor).unwrap();
+            assert_eq!(
+                matches!(preflight, CounterTradePreflight::Skipped(_)),
+                blocked,
+                "preflight disagrees for available {available}, floor {floor}, \
+                 requested {requested}: {preflight:?}"
+            );
+        }
     }
 }

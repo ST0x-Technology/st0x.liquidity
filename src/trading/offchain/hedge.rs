@@ -5929,6 +5929,7 @@ mod tests {
                     symbol: symbol.clone(),
                     threshold: ExecutionThreshold::whole_share(),
                     reservation_id,
+                    admission: crate::position::EquityTransferAdmission::Standard,
                 },
             )
             .await

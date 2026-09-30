@@ -873,7 +873,8 @@ pub mod position {
     use crate::operator::{OperatorError, RejectionReason};
 
     pub use crate::position::{
-        AnchorDisposition, EquityTransferReservationId, Position, PositionCommand,
+        AnchorDisposition, EquityTransferAdmission, EquityTransferReservationId, Position,
+        PositionCommand,
     };
 
     #[cfg(feature = "test-support")]

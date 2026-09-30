@@ -68,7 +68,7 @@ pub(crate) fn setup() -> Result<PrometheusHandle, BuildError> {
         "Equity allocation plans that chose no operation, by reason (within_band, \
          floor_capped, below_minimum, no_gas, cooling_down, price_missing, inflight, \
          total_zero, offchain_unpolled, no_polled_chain, chain_unpolled, chain_stale, \
-         not_in_registry)"
+         not_in_registry, blocked_by_hedge)"
     );
     metrics::describe_counter!(
         "onchain_events_total",

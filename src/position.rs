@@ -120,6 +120,23 @@ pub struct EquityTransferReservation {
     pub status: EquityTransferReservationStatus,
 }
 
+/// How a Position decides a transfer reservation while the position still
+/// needs a hedge.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum EquityTransferAdmission {
+    /// Rejects the reservation while the position needs a hedge, so a transfer
+    /// never races a hedge that the broker can fill.
+    #[default]
+    Standard,
+    /// A redemption to the hedging venue, with the broker shares of the
+    /// symbol above the hedge floor that the caller observed. A redemption
+    /// only adds broker shares, so it cannot take what a sell hedge needs, and
+    /// it is the only way to refill them. The Position admits it while the
+    /// hedge is still needed only if the position is long (its hedge is a
+    /// sell) and the broker preflight would skip a sell of the whole net.
+    Redemption { broker_sellable: FractionalShares },
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Position {
     pub symbol: Symbol,
@@ -614,6 +631,7 @@ impl EventSourced for Position {
                 symbol,
                 threshold,
                 reservation_id,
+                admission: _,
             } => {
                 let now = Utc::now();
                 Ok(vec![
@@ -764,9 +782,11 @@ impl EventSourced for Position {
                 None,
             ),
 
-            ReserveEquityTransfer { reservation_id, .. } => {
-                self.reserve_equity_transfer_events(reservation_id, Utc::now())
-            }
+            ReserveEquityTransfer {
+                reservation_id,
+                admission,
+                ..
+            } => self.reserve_equity_transfer_events(reservation_id, admission, Utc::now()),
 
             ConfirmEquityTransfer { reservation_id } => {
                 self.confirm_equity_transfer_events(reservation_id, Utc::now())
@@ -1240,6 +1260,7 @@ impl Position {
     fn reserve_equity_transfer_events(
         &self,
         reservation_id: EquityTransferReservationId,
+        admission: EquityTransferAdmission,
         now: DateTime<Utc>,
     ) -> Result<Vec<PositionEvent>, PositionError> {
         if let Some(pending) = self.pending_offchain_order_id {
@@ -1259,17 +1280,25 @@ impl Position {
             });
         }
 
-        if self.create_trigger_reason(&self.threshold)?.is_some() {
+        let needs_hedge = self.create_trigger_reason(&self.threshold)?.is_some();
+        let eligibility_unknown = matches!(self.threshold, ExecutionThreshold::DollarValue(_))
+            && self.last_price.is_none()
+            && !self.net.is_zero()?;
+
+        if (needs_hedge || eligibility_unknown) && self.admits_inventory_blocked_sell(admission)? {
+            info!(
+                target: "rebalance",
+                symbol = %self.symbol,
+                net_position = %self.net,
+                %reservation_id,
+                "Admitting equity redemption while the sell hedge is blocked by broker inventory"
+            );
+        } else if needs_hedge {
             return Err(PositionError::EquityTransferBlockedByHedge {
                 net_position: self.net,
                 threshold: self.threshold,
             });
-        }
-
-        if matches!(self.threshold, ExecutionThreshold::DollarValue(_))
-            && self.last_price.is_none()
-            && !self.net.is_zero()?
-        {
+        } else if eligibility_unknown {
             return Err(PositionError::EquityTransferHedgeEligibilityUnknown {
                 net_position: self.net,
                 threshold: self.threshold,
@@ -1280,6 +1309,26 @@ impl Position {
             reservation_id,
             reserved_at: now,
         }])
+    }
+
+    /// A redemption is admitted over a needed hedge only while the position is
+    /// long, because only then is its hedge a sell, and only if the broker
+    /// preflight would skip a sell of the whole net.
+    fn admits_inventory_blocked_sell(
+        &self,
+        admission: EquityTransferAdmission,
+    ) -> Result<bool, PositionError> {
+        let EquityTransferAdmission::Redemption { broker_sellable } = admission else {
+            return Ok(false);
+        };
+        if self.net.is_zero()? || self.net.is_negative()? {
+            return Ok(false);
+        }
+
+        Ok(st0x_execution::sell_blocked_by_inventory(
+            broker_sellable,
+            self.net,
+        )?)
     }
 
     fn confirm_equity_transfer_events(
@@ -1357,7 +1406,11 @@ impl Position {
                 actual: reservation_id,
             }),
             None => {
-                let mut events = self.reserve_equity_transfer_events(reservation_id, now)?;
+                let mut events = self.reserve_equity_transfer_events(
+                    reservation_id,
+                    EquityTransferAdmission::Standard,
+                    now,
+                )?;
                 events.push(PositionEvent::EquityTransferReservationConfirmed {
                     reservation_id,
                     confirmed_at: now,
@@ -1892,11 +1945,14 @@ pub enum PositionCommand {
     /// Claims this symbol for equity transfer sizing only when no live or
     /// ambiguously failed broker order owns it. The command is also valid
     /// against an uninitialized aggregate: zero exposure is not hedge-ready,
-    /// and the supplied threshold seeds the Position.
+    /// and the supplied threshold seeds the Position. `admission` decides the
+    /// reservation while the position still needs a hedge.
     ReserveEquityTransfer {
         symbol: Symbol,
         threshold: ExecutionThreshold,
         reservation_id: EquityTransferReservationId,
+        #[serde(default)]
+        admission: EquityTransferAdmission,
     },
     /// Commits the exact reservation immediately before durable job enqueue.
     ConfirmEquityTransfer {
@@ -2556,11 +2612,13 @@ impl std::fmt::Debug for PositionCommand {
                 symbol,
                 threshold,
                 reservation_id,
+                admission,
             } => f
                 .debug_struct("ReserveEquityTransfer")
                 .field("symbol", symbol)
                 .field("threshold", threshold)
                 .field("reservation_id", reservation_id)
+                .field("admission", admission)
                 .finish(),
             Self::ConfirmEquityTransfer { reservation_id } => f
                 .debug_struct("ConfirmEquityTransfer")
@@ -3037,6 +3095,7 @@ mod tests {
                 symbol: Symbol::new("AAPL").unwrap(),
                 threshold: one_share_threshold(),
                 reservation_id,
+                admission: crate::position::EquityTransferAdmission::Standard,
             })
             .await
             .then_expect_error();
@@ -3846,6 +3905,7 @@ mod tests {
                 symbol: Symbol::new("AAPL").unwrap(),
                 threshold,
                 reservation_id,
+                admission: crate::position::EquityTransferAdmission::Standard,
             })
             .await
             .then_expect_error();
@@ -3854,6 +3914,215 @@ mod tests {
             error,
             LifecycleError::Apply(PositionError::EquityTransferBlockedByHedge { .. })
         ));
+    }
+
+    /// A Position that needs a hedge after one onchain fill in `direction`.
+    async fn hedge_ready_store(
+        direction: Direction,
+    ) -> (
+        std::sync::Arc<st0x_event_sorcery::Store<Position>>,
+        std::sync::Arc<Projection<Position>>,
+        Symbol,
+        ExecutionThreshold,
+    ) {
+        let pool = crate::test_utils::setup_test_db().await;
+        let (store, projection) = StoreBuilder::<Position>::new(pool).build(()).await.unwrap();
+        let symbol = Symbol::new("COIN").unwrap();
+        let threshold = one_share_threshold();
+        store
+            .send(
+                &symbol,
+                PositionCommand::AcknowledgeOnChainFill {
+                    symbol: symbol.clone(),
+                    threshold,
+                    trade_id: TradeId {
+                        chain: Chain::Base,
+                        tx_hash: TxHash::random(),
+                        log_index: 1,
+                    },
+                    amount: FractionalShares::new(float!(61)),
+                    direction,
+                    price_usdc: float!(192),
+                    block_timestamp: Utc::now(),
+                    block_number: None,
+                },
+            )
+            .await
+            .unwrap();
+        (store, projection, symbol, threshold)
+    }
+
+    /// A redemption whose broker book holds nothing above the hedge floor,
+    /// as in the 2026-09-30 COIN incident.
+    fn at_floor() -> EquityTransferAdmission {
+        EquityTransferAdmission::Redemption {
+            broker_sellable: FractionalShares::ZERO,
+        }
+    }
+
+    fn reserve(
+        symbol: &Symbol,
+        threshold: ExecutionThreshold,
+        reservation_id: EquityTransferReservationId,
+        admission: EquityTransferAdmission,
+    ) -> PositionCommand {
+        PositionCommand::ReserveEquityTransfer {
+            symbol: symbol.clone(),
+            threshold,
+            reservation_id,
+            admission,
+        }
+    }
+
+    /// The 2026-09-30 COIN deadlock: a long position needs a sell hedge that
+    /// the broker cannot fill, and only a redemption can refill the broker.
+    /// The proof admits the redemption, and the reservation still keeps the
+    /// hedge out until the transfer releases the symbol.
+    #[tokio::test]
+    async fn inventory_proof_admits_a_redemption_while_a_sell_hedge_is_needed() {
+        let (store, projection, symbol, threshold) = hedge_ready_store(Direction::Buy).await;
+        let reservation_id = EquityTransferReservationId::generate();
+
+        store
+            .send(
+                &symbol,
+                reserve(&symbol, threshold, reservation_id, at_floor()),
+            )
+            .await
+            .unwrap();
+
+        let position = projection.load(&symbol).await.unwrap().unwrap();
+        assert_eq!(
+            position.equity_transfer_reservation,
+            Some(EquityTransferReservation {
+                id: reservation_id,
+                status: EquityTransferReservationStatus::Reserved,
+            })
+        );
+
+        let hedge = store
+            .send(
+                &symbol,
+                PositionCommand::PlaceOffChainOrder {
+                    offchain_order_id: OffchainOrderId::new(),
+                    shares: Positive::new(FractionalShares::new(float!(61))).unwrap(),
+                    direction: Direction::Sell,
+                    executor: SupportedExecutor::DryRun,
+                    threshold,
+                },
+            )
+            .await;
+        assert!(
+            matches!(
+                hedge,
+                Err(AggregateError::UserError(LifecycleError::Apply(
+                    PositionError::EquityTransferPending { .. }
+                )))
+            ),
+            "the admitted redemption must still own the symbol: {hedge:?}"
+        );
+    }
+
+    /// A broker book with a partial hedge's worth above the floor can still
+    /// sell, so the hedge keeps priority over the redemption.
+    #[tokio::test]
+    async fn redemption_waits_while_the_broker_can_fill_part_of_the_sell_hedge() {
+        let (store, _, symbol, threshold) = hedge_ready_store(Direction::Buy).await;
+
+        let result = store
+            .send(
+                &symbol,
+                reserve(
+                    &symbol,
+                    threshold,
+                    EquityTransferReservationId::generate(),
+                    EquityTransferAdmission::Redemption {
+                        broker_sellable: FractionalShares::new(float!(0.01)),
+                    },
+                ),
+            )
+            .await;
+
+        assert!(
+            matches!(
+                result,
+                Err(AggregateError::UserError(LifecycleError::Apply(
+                    PositionError::EquityTransferBlockedByHedge { .. }
+                )))
+            ),
+            "unexpected result: {result:?}"
+        );
+    }
+
+    /// A short position needs a buy hedge. A redemption does not give the
+    /// broker cash, so the inventory proof must not admit it.
+    #[tokio::test]
+    async fn inventory_proof_does_not_admit_a_transfer_while_a_buy_hedge_is_needed() {
+        let (store, _, symbol, threshold) = hedge_ready_store(Direction::Sell).await;
+
+        let result = store
+            .send(
+                &symbol,
+                reserve(
+                    &symbol,
+                    threshold,
+                    EquityTransferReservationId::generate(),
+                    at_floor(),
+                ),
+            )
+            .await;
+
+        assert!(
+            matches!(
+                result,
+                Err(AggregateError::UserError(LifecycleError::Apply(
+                    PositionError::EquityTransferBlockedByHedge { .. }
+                )))
+            ),
+            "unexpected result: {result:?}"
+        );
+    }
+
+    /// The proof only covers a hedge that cannot run. A hedge that the broker
+    /// already accepted keeps priority.
+    #[tokio::test]
+    async fn inventory_proof_does_not_admit_a_transfer_over_a_pending_hedge() {
+        let (store, _, symbol, threshold) = hedge_ready_store(Direction::Buy).await;
+        store
+            .send(
+                &symbol,
+                PositionCommand::PlaceOffChainOrder {
+                    offchain_order_id: OffchainOrderId::new(),
+                    shares: Positive::new(FractionalShares::new(float!(1))).unwrap(),
+                    direction: Direction::Sell,
+                    executor: SupportedExecutor::DryRun,
+                    threshold,
+                },
+            )
+            .await
+            .unwrap();
+
+        let result = store
+            .send(
+                &symbol,
+                reserve(
+                    &symbol,
+                    threshold,
+                    EquityTransferReservationId::generate(),
+                    at_floor(),
+                ),
+            )
+            .await;
+
+        assert!(
+            matches!(
+                result,
+                Err(AggregateError::UserError(LifecycleError::Apply(
+                    PositionError::PendingExecution { .. }
+                )))
+            ),
+            "unexpected result: {result:?}"
+        );
     }
 
     #[tokio::test]
@@ -3933,6 +4202,7 @@ mod tests {
                     symbol: symbol.clone(),
                     threshold,
                     reservation_id,
+                    admission: EquityTransferAdmission::Standard,
                 },
             ),
             store.send(
@@ -3975,6 +4245,7 @@ mod tests {
                     symbol: symbol.clone(),
                     threshold,
                     reservation_id,
+                    admission: crate::position::EquityTransferAdmission::Standard,
                 },
             )
             .await
@@ -4038,6 +4309,7 @@ mod tests {
                     symbol: symbol.clone(),
                     threshold,
                     reservation_id,
+                    admission: crate::position::EquityTransferAdmission::Standard,
                 },
             )
             .await
@@ -4091,6 +4363,7 @@ mod tests {
                     symbol: symbol.clone(),
                     threshold,
                     reservation_id,
+                    admission: crate::position::EquityTransferAdmission::Standard,
                 },
             )
             .await
@@ -4140,6 +4413,7 @@ mod tests {
                     symbol: symbol.clone(),
                     threshold,
                     reservation_id,
+                    admission: crate::position::EquityTransferAdmission::Standard,
                 },
             )
             .await

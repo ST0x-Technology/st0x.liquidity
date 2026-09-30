@@ -50,8 +50,8 @@ use st0x_tokenization::{ClientRequestId, IssuerRequestId, TokenizationRequestId}
 use st0x_wrapper::{Wrapper, WrapperError};
 
 use self::allocation::{
-    ChainSlot, DeclineReason, EquityPlan, EquityPlanInput, PlannedDirection, PlannedOperation,
-    plan_equity_operation,
+    ChainSlot, DeclineReason, EquityPlan, EquityPlanError, EquityPlanInput, PlannedDirection,
+    PlannedOperation, plan_equity_operation,
 };
 use self::freeze::FreezeStatusReader;
 use self::usdc::UsdcRebalanceOperation;
@@ -77,8 +77,8 @@ use crate::inventory::{
 use crate::native_gas::{ConfiguredGasReadiness, GasReadiness, TransferGasRoute};
 use crate::offchain::order::OffchainOrderId;
 use crate::position::{
-    EquityTransferReservationId, EquityTransferReservationStatus, Position, PositionCommand,
-    PositionError, PositionEvent,
+    EquityTransferAdmission, EquityTransferReservationId, EquityTransferReservationStatus,
+    Position, PositionCommand, PositionError, PositionEvent,
 };
 #[cfg(test)]
 use crate::rebalancing::equity::EquityTransferServices;
@@ -844,6 +844,10 @@ pub(crate) struct RebalancingService {
     /// When each `(symbol, chain)` pair last dispatched an operation, so a
     /// transfer truncated by a limit is not re-planned every tick.
     equity_cooldowns: RwLock<HashMap<(Symbol, Chain), DateTime<Utc>>>,
+    /// When Position started rejecting each symbol's transfer reservation
+    /// because its hedge is still needed, and when that was last warned
+    /// about, so a block that outlives a normal hedge becomes visible.
+    blocked_by_hedge: RwLock<HashMap<Symbol, BlockedByHedge>>,
     /// Each symbol's last onchain fill price, attached through
     /// `set_last_price_reader`; without one no minimum can be valued and
     /// every plan declines.
@@ -983,6 +987,17 @@ type EquityInventoryUpdate = Box<
 const TIMEOUT_TOMBSTONE_RETENTION: Duration = Duration::from_secs(24 * 60 * 60);
 const TERMINAL_RESERVATION_RELEASE_RETRY_DELAY: Duration = Duration::from_millis(25);
 const TERMINAL_RESERVATION_RELEASE_ATTEMPTS: u32 = 5;
+/// How long Position may keep rejecting a symbol's transfer reservation for a
+/// needed hedge before the trigger warns, and how often it warns after that.
+const BLOCKED_BY_HEDGE_WARN_AFTER: Duration = Duration::from_secs(5 * 60);
+
+/// A symbol whose transfer reservations Position keeps rejecting because the
+/// hedge is still needed.
+#[derive(Debug, Clone, Copy)]
+struct BlockedByHedge {
+    since: DateTime<Utc>,
+    last_warned: Option<DateTime<Utc>>,
+}
 
 #[derive(Debug)]
 enum UsdcTimeoutCleanup {
@@ -1163,6 +1178,7 @@ impl RebalancingService {
             gas_readiness: RwLock::new(ConfiguredGasReadiness::default()),
             equity_gas_readiness: RwLock::new(BTreeMap::new()),
             equity_cooldowns: RwLock::new(HashMap::new()),
+            blocked_by_hedge: RwLock::new(HashMap::new()),
             last_prices: RwLock::new(None),
             equity_in_progress: Arc::new(std::sync::RwLock::new(HashMap::new())),
             divergence_gate: Arc::default(),
@@ -4128,6 +4144,7 @@ impl RebalancingService {
         &self,
         symbol: &Symbol,
         reservation_id: EquityTransferReservationId,
+        admission: EquityTransferAdmission,
     ) -> Result<bool, equity::EquityTriggerError> {
         let (store, threshold) = self.position_authority().await?;
         match store
@@ -4137,21 +4154,34 @@ impl RebalancingService {
                     symbol: symbol.clone(),
                     threshold,
                     reservation_id,
+                    admission,
                 },
             )
             .await
         {
-            Ok(()) => Ok(true),
+            Ok(()) => {
+                self.blocked_by_hedge.write().await.remove(symbol);
+                Ok(true)
+            }
+            Err(AggregateError::UserError(LifecycleError::Apply(
+                error @ PositionError::EquityTransferBlockedByHedge { .. },
+            ))) => {
+                self.record_blocked_by_hedge(symbol, reservation_id, &error, Utc::now())
+                    .await;
+                Ok(false)
+            }
             Err(AggregateError::UserError(LifecycleError::Apply(error)))
                 if matches!(
                     &error,
                     PositionError::PendingExecution { .. }
                         | PositionError::EquityTransferReservationExists { .. }
                         | PositionError::EquityTransferBlockedByFailedOrderAnchor { .. }
-                        | PositionError::EquityTransferBlockedByHedge { .. }
                         | PositionError::EquityTransferHedgeEligibilityUnknown { .. }
                 ) =>
             {
+                // A pending order or another owner means the hedge is not
+                // stuck behind this reservation, so the block is not continuous.
+                self.blocked_by_hedge.write().await.remove(symbol);
                 debug!(
                     target: "rebalance",
                     %symbol,
@@ -4162,6 +4192,105 @@ impl RebalancingService {
                 Ok(false)
             }
             Err(error) => Err(error.into()),
+        }
+    }
+
+    /// A hedge normally clears this rejection within seconds, so a short block
+    /// stays at debug. A block that lasts [`BLOCKED_BY_HEDGE_WARN_AFTER`] means
+    /// the hedge cannot execute, and nothing else would surface it.
+    async fn record_blocked_by_hedge(
+        &self,
+        symbol: &Symbol,
+        reservation_id: EquityTransferReservationId,
+        error: &PositionError,
+        now: DateTime<Utc>,
+    ) {
+        counter!("equity_plan_declined_total", "reason" => "blocked_by_hedge").increment(1);
+
+        let lasted = |start: DateTime<Utc>| {
+            now.signed_duration_since(start)
+                .to_std()
+                .is_ok_and(|age| age >= BLOCKED_BY_HEDGE_WARN_AFTER)
+        };
+        let (blocked_for, warn_due) = {
+            let mut blocked = self.blocked_by_hedge.write().await;
+            let entry = blocked.entry(symbol.clone()).or_insert(BlockedByHedge {
+                since: now,
+                last_warned: None,
+            });
+            let since = entry.since;
+            let warn_due = lasted(since) && entry.last_warned.is_none_or(lasted);
+            if warn_due {
+                entry.last_warned = Some(now);
+            }
+            drop(blocked);
+            (now.signed_duration_since(since), warn_due)
+        };
+
+        if warn_due {
+            warn!(
+                target: "rebalance",
+                %symbol,
+                %reservation_id,
+                blocked_secs = blocked_for.num_seconds(),
+                reason = %error,
+                "Equity transfer blocked by a hedge that is not clearing"
+            );
+        } else {
+            debug!(
+                target: "rebalance",
+                %symbol,
+                %reservation_id,
+                reason = %error,
+                "Skipped equity trigger: Position rejected transfer reservation"
+            );
+        }
+    }
+
+    /// The admission the Position reservation needs for `direction`. A
+    /// redemption reports the broker shares above the hedge floor, so Position
+    /// can admit it over a sell hedge the broker cannot fill. Anything the
+    /// trigger cannot observe falls back to the standard admission.
+    async fn equity_transfer_admission(
+        &self,
+        symbol: &Symbol,
+        direction: PlannedDirection,
+    ) -> Result<EquityTransferAdmission, equity::EquityTriggerError> {
+        if direction != PlannedDirection::Redemption {
+            return Ok(EquityTransferAdmission::Standard);
+        }
+
+        let Some(offchain) = self.inventory.read().await.equity_venues(symbol)?.offchain else {
+            return Ok(EquityTransferAdmission::Standard);
+        };
+        let floor = self.config.hedge_floor.for_symbol(symbol);
+        let broker_sellable = st0x_execution::sellable_above_floor(offchain.available(), floor)
+            .map_err(EquityPlanError::from)?;
+
+        Ok(EquityTransferAdmission::Redemption { broker_sellable })
+    }
+
+    /// Whether the admission for the post-reservation plan still supports
+    /// the one the reservation was taken with. A different direction, or
+    /// more broker shares above the floor, can let the sell hedge run, so the
+    /// hedge gets priority again.
+    fn admission_still_holds(
+        reserved: EquityTransferAdmission,
+        current: EquityTransferAdmission,
+    ) -> Result<bool, EquityPlanError> {
+        match (reserved, current) {
+            (EquityTransferAdmission::Standard, _) => Ok(true),
+            (
+                EquityTransferAdmission::Redemption {
+                    broker_sellable: reserved,
+                },
+                EquityTransferAdmission::Redemption {
+                    broker_sellable: current,
+                },
+            ) => Ok(current.inner().lte(reserved.inner())?),
+            (EquityTransferAdmission::Redemption { .. }, EquityTransferAdmission::Standard) => {
+                Ok(false)
+            }
         }
     }
 
@@ -4965,17 +5094,24 @@ impl RebalancingService {
         // remains authoritative; it reuses this plan's registry and gas
         // probes.
         let mut probes = BTreeMap::new();
-        if self
+        let Some(first_plan) = self
             .plan_equity_operation_or_skip(symbol, &mut probes)
             .await?
-            .is_none()
-        {
+        else {
+            // No reservation was attempted, so any hedge block is no longer
+            // continuous.
+            self.blocked_by_hedge.write().await.remove(symbol);
             return Ok(());
-        }
+        };
 
+        // A redemption reports the broker book so Position can admit it over
+        // a sell hedge the broker cannot fill; see `EquityTransferAdmission`.
+        let admission = self
+            .equity_transfer_admission(symbol, first_plan.direction)
+            .await?;
         let reservation_id = EquityTransferReservationId::generate();
         if !self
-            .try_reserve_equity_transfer(symbol, reservation_id)
+            .try_reserve_equity_transfer(symbol, reservation_id, admission)
             .await?
         {
             return Ok(());
@@ -4999,6 +5135,25 @@ impl RebalancingService {
                     %symbol,
                     "Skipped equity trigger before dispatch: snapshot divergence \
                      detected during operation sizing"
+                );
+                return Ok(false);
+            }
+
+            // Position judged the reservation against the first plan's broker
+            // book. If the re-plan changes direction or finds more broker
+            // shares, the sell hedge may now run, so it keeps priority.
+            let current = self
+                .equity_transfer_admission(symbol, operation.direction)
+                .await?;
+            if !Self::admission_still_holds(admission, current)? {
+                info!(
+                    target: "rebalance",
+                    %symbol,
+                    direction = ?operation.direction,
+                    reserved = ?admission,
+                    current = ?current,
+                    "Skipped equity trigger before dispatch: the broker book changed \
+                     after the reservation"
                 );
                 return Ok(false);
             }
@@ -13347,6 +13502,7 @@ mod tests {
                     symbol: symbol.clone(),
                     threshold: ExecutionThreshold::whole_share(),
                     reservation_id,
+                    admission: crate::position::EquityTransferAdmission::Standard,
                 },
             )
             .await
@@ -15295,6 +15451,7 @@ mod tests {
                     symbol: symbol.clone(),
                     threshold: ExecutionThreshold::whole_share(),
                     reservation_id,
+                    admission: crate::position::EquityTransferAdmission::Standard,
                 },
             )
             .await
@@ -22368,6 +22525,7 @@ mod tests {
                     symbol: symbol.clone(),
                     threshold: ExecutionThreshold::whole_share(),
                     reservation_id,
+                    admission: crate::position::EquityTransferAdmission::Standard,
                 },
             )
             .await
@@ -32914,6 +33072,180 @@ mod tests {
             panic!("Expected exactly one redemption job, got {dispatched:?}");
         };
         assert_eq!(job.symbol, symbol);
+    }
+
+    /// Moves the fixture's Position to a long `net` that needs a sell hedge.
+    async fn hold_long_position_needing_hedge(
+        trigger: &RebalancingService,
+        symbol: &Symbol,
+        net: FractionalShares,
+    ) {
+        let position_store = trigger
+            .position_store
+            .read()
+            .await
+            .as_ref()
+            .cloned()
+            .unwrap();
+        position_store
+            .send(
+                symbol,
+                PositionCommand::ManuallyAdjustPosition {
+                    symbol: symbol.clone(),
+                    target_net: net,
+                    reason: "long position that needs a sell hedge".to_string(),
+                    threshold: ExecutionThreshold::whole_share(),
+                    expected_net: Some(FractionalShares::ZERO),
+                    price_usdc: None,
+                },
+            )
+            .await
+            .unwrap();
+    }
+
+    /// The 2026-09-30 COIN deadlock: the position needs a sell hedge, the
+    /// broker has nothing above the hedge floor, and the only fix is a
+    /// redemption. The trigger must dispatch it.
+    #[tokio::test]
+    async fn equity_check_redeems_while_the_sell_hedge_is_blocked_by_broker_inventory() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let inventory = InventoryView::default()
+            .with_equity(symbol.clone(), shares(86), FractionalShares::ZERO)
+            .with_usdc(usdc(1_000_000), usdc(1_000_000));
+        let trigger = make_trigger_with_inventory_and_registry(inventory, &symbol).await;
+        hold_long_position_needing_hedge(&trigger, &symbol, shares(61)).await;
+
+        EquityRebalancingCheck {
+            symbol: symbol.clone(),
+        }
+        .perform(&trigger)
+        .await
+        .unwrap();
+
+        let dispatched = take_pending_equity_redemption_jobs(&trigger).await;
+        let [job] = dispatched.as_slice() else {
+            panic!("Expected exactly one redemption job, got {dispatched:?}");
+        };
+        assert_eq!(job.symbol, symbol);
+    }
+
+    /// When the broker can still fill part of the sell hedge, the hedge keeps
+    /// priority and the redemption waits, as before the fix.
+    #[tokio::test]
+    async fn equity_check_does_not_redeem_while_the_broker_can_fill_the_sell_hedge() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let inventory = InventoryView::default()
+            .with_equity(symbol.clone(), shares(80), shares(20))
+            .with_usdc(usdc(1_000_000), usdc(1_000_000));
+        let trigger = make_trigger_with_inventory_and_registry(inventory, &symbol).await;
+        hold_long_position_needing_hedge(&trigger, &symbol, shares(61)).await;
+
+        EquityRebalancingCheck {
+            symbol: symbol.clone(),
+        }
+        .perform(&trigger)
+        .await
+        .unwrap();
+
+        assert_eq!(count_pending_equity_redemption_jobs(&trigger).await, 0);
+        assert!(
+            trigger.blocked_by_hedge.read().await.contains_key(&symbol),
+            "Position must have refused the reservation for the needed hedge"
+        );
+    }
+
+    /// Position judged the reservation against the first plan's broker book.
+    /// The dispatch must stop if the re-plan leaves the redemption or finds
+    /// more broker shares, because the sell hedge may now run.
+    #[test]
+    fn admission_still_holds_only_while_the_broker_book_does_not_grow() {
+        let redemption = |sellable: Float| EquityTransferAdmission::Redemption {
+            broker_sellable: FractionalShares::new(sellable),
+        };
+        let cases = [
+            (redemption(float!(0)), redemption(float!(0)), true),
+            (redemption(float!(0.005)), redemption(float!(0)), true),
+            (redemption(float!(0)), redemption(float!(0.005)), false),
+            (redemption(float!(0)), redemption(float!(20)), false),
+            (
+                redemption(float!(0)),
+                EquityTransferAdmission::Standard,
+                false,
+            ),
+            (
+                EquityTransferAdmission::Standard,
+                redemption(float!(20)),
+                true,
+            ),
+            (
+                EquityTransferAdmission::Standard,
+                EquityTransferAdmission::Standard,
+                true,
+            ),
+        ];
+
+        for (reserved, current, holds) in cases {
+            assert_eq!(
+                RebalancingService::admission_still_holds(reserved, current).unwrap(),
+                holds,
+                "reserved {reserved:?}, current {current:?}"
+            );
+        }
+    }
+
+    /// A block warns once it lasts five minutes, then at most every five
+    /// minutes, and a reset starts a new interval.
+    #[tokio::test]
+    async fn blocked_by_hedge_warns_only_for_a_continuous_block() {
+        let symbol = Symbol::new("COIN").unwrap();
+        let trigger =
+            make_trigger_with_inventory_and_registry(InventoryView::default(), &symbol).await;
+        let error = PositionError::EquityTransferBlockedByHedge {
+            net_position: shares(61),
+            threshold: ExecutionThreshold::whole_share(),
+        };
+        let start = Utc::now();
+        let record = |minutes: i64| {
+            trigger.record_blocked_by_hedge(
+                &symbol,
+                EquityTransferReservationId::generate(),
+                &error,
+                start + chrono::Duration::minutes(minutes),
+            )
+        };
+        let last_warned = || async {
+            trigger
+                .blocked_by_hedge
+                .read()
+                .await
+                .get(&symbol)
+                .and_then(|blocked| blocked.last_warned)
+        };
+
+        record(0).await;
+        record(4).await;
+        assert_eq!(last_warned().await, None, "a short block stays quiet");
+
+        record(5).await;
+        assert_eq!(
+            last_warned().await,
+            Some(start + chrono::Duration::minutes(5))
+        );
+
+        record(9).await;
+        assert_eq!(
+            last_warned().await,
+            Some(start + chrono::Duration::minutes(5)),
+            "the warning repeats at most every five minutes"
+        );
+
+        trigger.blocked_by_hedge.write().await.remove(&symbol);
+        record(20).await;
+        assert_eq!(
+            last_warned().await,
+            None,
+            "a reset block starts a new interval"
+        );
     }
 
     #[tokio::test]

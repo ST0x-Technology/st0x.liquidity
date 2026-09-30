@@ -288,6 +288,24 @@ issuer. A resumed mint (`--issuer-request-id`) must be given the network it
 started on; a `--network` that disagrees with the record is refused, and the
 `transfer` recovery verbs carry no network at all.
 
+### Refilling Alpaca While a Sell Hedge Is Stuck
+
+`transfer-equity --direction to-alpaca` reserves the symbol on its `Position`
+before it redeems. Normally that reservation is refused while the position still
+needs a hedge. The exception is a sell hedge that Alpaca cannot fill: the CLI
+reads the Alpaca position and reports the shares above the hedge floor.
+`Position` admits the redemption when the position is long and a sell of its
+whole net would be skipped (less than 0.01 share, and less than the net, above
+the floor). The command prints what it saw before it sends anything:
+
+```
+Broker COIN: 0.01 shares, hedge floor 0.01, sellable above the floor 0
+```
+
+If Alpaca can still sell part of the hedge, `Position` refuses the redemption
+and the hedge keeps priority. The bot's own rebalancer applies the same rule, so
+this command is only needed when the rebalancer is not redeeming by itself.
+
 ### Orchestrator Rollout per Chain
 
 Issuance keys an asset's `vault_mode` by symbol, so cutting an asset over to

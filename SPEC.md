@@ -2916,6 +2916,8 @@ enum PositionCommand {
         symbol: Symbol,
         threshold: ExecutionThreshold,
         reservation_id: EquityTransferReservationId,
+        // Standard, or Redemption { broker_sellable }; see the rules below.
+        admission: EquityTransferAdmission,
     },
     ConfirmEquityTransfer {
         reservation_id: EquityTransferReservationId,
@@ -3084,6 +3086,22 @@ enum TriggerReason {
   reservation exists, and the current net position is below the hedge threshold.
   A nonzero position whose dollar threshold cannot be valued is rejected
   fail-closed.
+- One exception breaks the deadlock between a sell hedge and its refill. With
+  `admission = Redemption { broker_sellable }`, a long position that needs a
+  hedge (or cannot be valued) still accepts the reservation when the broker
+  preflight would skip a sell of the whole net: `broker_sellable`, the broker
+  shares above the hedge floor, is below both the 0.01-share partial hedge
+  minimum and the net. A redemption only adds broker shares, so it cannot take
+  what the sell hedge needs. The pending order, failed-order anchor, and
+  existing reservation checks still apply, and a short position (buy hedge) is
+  still rejected. The equity trigger reports `broker_sellable` from the
+  inventory view and the configured hedge floor. It drops the reservation before
+  confirmation if the post-reservation plan is not a redemption or reports more
+  broker shares. `transfer-equity --direction to-alpaca` reports it from the
+  broker inventory. Startup restoration always uses the standard admission.
+- A reservation that Position keeps rejecting for a needed hedge increments
+  `equity_plan_declined_total{reason="blocked_by_hedge"}` and logs a warning
+  after 5 minutes, then at most every 5 minutes per symbol.
 - `PlaceOffChainOrder` is rejected while any transfer reservation owns the
   symbol. A newly committed onchain fill invalidates an unconfirmed reservation;
   confirmation of that exact ID must succeed immediately before the transfer job
