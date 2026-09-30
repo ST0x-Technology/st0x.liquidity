@@ -18,9 +18,9 @@ use st0x_evm::{
     Chain, Evm, IERC20, OpenChainErrorRegistry, PreparedTransaction, ReadOnlyEvm, Wallet,
 };
 use st0x_execution::{
-    AlpacaBrokerApi, AlpacaBrokerApiCtx, AlpacaBrokerApiMode, AlpacaWalletService, Executor,
-    FractionalShares, HedgeFloor, InventoryResult, Positive, Symbol, TimeInForce, TryIntoExecutor,
-    sellable_above_floor,
+    AlpacaBrokerApi, AlpacaBrokerApiCtx, AlpacaBrokerApiMode, AlpacaWalletService, ClientOrderId,
+    CounterTradePreflight, Direction, Executor, FractionalShares, MarketOrder, Positive, Symbol,
+    TimeInForce, TryIntoExecutor,
 };
 use st0x_finance::Usdc;
 use st0x_hedge::operator::api::ResumeResponse;
@@ -151,89 +151,81 @@ async fn release_operator_equity_transfer(
         .context("failed to release operator equity-transfer reservation")
 }
 
-/// The broker book an operator redemption reports to Position.
-#[derive(Debug, Clone, Copy, PartialEq)]
-struct RedemptionAdmission {
-    /// Broker shares of the symbol, or `None` when the broker reports no
-    /// inventory.
-    available: Option<FractionalShares>,
-    floor: FractionalShares,
-    admission: EquityTransferAdmission,
-}
-
-/// Reads the broker book that the hedge preflight reads, so Position can
-/// admit the redemption over a sell hedge the broker cannot fill. A broker
-/// that reports no inventory keeps the standard admission.
-async fn redemption_admission<Broker>(
-    broker: &Broker,
-    hedge_floor: &HedgeFloor,
-    symbol: &Symbol,
-) -> anyhow::Result<RedemptionAdmission>
-where
-    Broker: Executor,
-    Broker::Error: std::error::Error + Send + Sync + 'static,
-{
-    let floor = hedge_floor.for_symbol(symbol);
-    let InventoryResult::Fetched(inventory) = broker
-        .get_inventory()
-        .await
-        .context("failed to read the broker inventory for the redemption admission")?
-    else {
-        return Ok(RedemptionAdmission {
-            available: None,
-            floor,
-            admission: EquityTransferAdmission::Standard,
-        });
-    };
-
-    let available = inventory
-        .positions
-        .into_iter()
-        .find(|position| position.symbol == *symbol)
-        .map_or(FractionalShares::ZERO, |position| position.quantity);
-    let broker_sellable = sellable_above_floor(available, floor)?;
-
-    Ok(RedemptionAdmission {
-        available: Some(available),
-        floor,
-        admission: EquityTransferAdmission::Redemption { broker_sellable },
-    })
-}
-
-/// [`redemption_admission`], or the standard admission when the broker cannot
-/// be built or read. A failed read proves nothing about the sell hedge, and the
-/// standard admission is the rule the redemption had before this exception, so
-/// a broker outage never blocks a redemption that does not need it. Position
-/// still refuses the redemption if the hedge is needed.
-async fn redemption_admission_or_standard<Writer, Broker>(
+/// Asks the broker's sell check, the one a hedge order passes, whether a sell
+/// of the symbol's whole position would be refused for lack of shares, and
+/// returns the redemption admission for that position when it would. Any
+/// other answer, or a broker that cannot be built or asked, keeps the standard
+/// admission, under which Position still refuses a redemption the hedge needs.
+async fn redemption_admission<Writer, Broker>(
     stdout: &mut Writer,
     broker: anyhow::Result<Broker>,
-    hedge_floor: &HedgeFloor,
+    position_store: &Store<Position>,
     symbol: &Symbol,
-) -> anyhow::Result<RedemptionAdmission>
+) -> anyhow::Result<EquityTransferAdmission>
 where
     Writer: Write,
     Broker: Executor,
     Broker::Error: std::error::Error + Send + Sync + 'static,
 {
-    let read = match broker {
-        Ok(broker) => redemption_admission(&broker, hedge_floor, symbol).await,
+    let net = position_store
+        .load(symbol)
+        .await
+        .context("failed to load the position for the redemption admission")?
+        .map_or(FractionalShares::ZERO, |position| position.net);
+    let Ok(shares) = Positive::new(net) else {
+        writeln!(
+            stdout,
+            "   {symbol} position is {net}, so there is no sell hedge to refill"
+        )?;
+        return Ok(EquityTransferAdmission::Standard);
+    };
+
+    let order = MarketOrder {
+        symbol: symbol.clone(),
+        shares,
+        direction: Direction::Sell,
+        client_order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
+    };
+    let checked = match broker {
+        Ok(broker) => broker
+            .preflight_counter_trade(order)
+            .await
+            .context("the broker sell check failed"),
         Err(error) => Err(error),
     };
 
-    match read {
-        Ok(admission) => Ok(admission),
+    match checked {
+        Ok(preflight) if preflight.is_blocked_by_inventory() => {
+            writeln!(
+                stdout,
+                "   Alpaca refuses a sell of the {net} {symbol} position for lack of shares, \
+                 so the redemption may start while that hedge is needed"
+            )?;
+            Ok(EquityTransferAdmission::Redemption { refused_sell: net })
+        }
+        Ok(CounterTradePreflight::Allowed { .. }) => {
+            writeln!(
+                stdout,
+                "   Alpaca can sell the {net} {symbol} position, so the redemption waits if \
+                 that hedge is needed"
+            )?;
+            Ok(EquityTransferAdmission::Standard)
+        }
+        Ok(CounterTradePreflight::Skipped(reason)) => {
+            writeln!(
+                stdout,
+                "   Alpaca skips a sell of the {net} {symbol} position ({reason}), which a \
+                 redemption does not fix, so the redemption waits if that hedge is needed"
+            )?;
+            Ok(EquityTransferAdmission::Standard)
+        }
         Err(error) => {
             writeln!(
                 stdout,
-                "   Warning: could not read the broker inventory ({error:#}); the redemption \
+                "   Warning: could not ask the broker sell check ({error:#}); the redemption \
                  is admitted only if the {symbol} position needs no hedge"
             )?;
-            Ok(RedemptionAdmission {
-                available: None,
-                floor: hedge_floor.for_symbol(symbol),
-                admission: EquityTransferAdmission::Standard,
-            })
+            Ok(EquityTransferAdmission::Standard)
         }
     }
 }
@@ -715,25 +707,8 @@ pub(super) async fn transfer_equity_command<Writer: Write>(
                 .try_into_executor()
                 .await
                 .context("failed to build the broker client for the redemption admission");
-            let RedemptionAdmission {
-                available,
-                floor,
-                admission: hedge_admission,
-            } = redemption_admission_or_standard(stdout, broker, &alpaca_auth.hedge_floor, &symbol)
-                .await?;
-            let available =
-                available.map_or_else(|| "unknown".to_string(), |shares| shares.to_string());
-            let sellable = match hedge_admission {
-                EquityTransferAdmission::Redemption { broker_sellable } => {
-                    broker_sellable.to_string()
-                }
-                EquityTransferAdmission::Standard => "unknown".to_string(),
-            };
-            writeln!(
-                stdout,
-                "   Broker {symbol}: {available} shares, hedge floor {floor}, \
-                 sellable above the floor {sellable}"
-            )?;
+            let hedge_admission =
+                redemption_admission(stdout, broker, &cli_services.position_store, &symbol).await?;
 
             writeln!(stdout, "   Sending tokens for redemption...")?;
 
@@ -2458,108 +2433,30 @@ mod tests {
         );
     }
 
+    /// A broker holding `shares` of `symbol`, of which it keeps 0.01 as the
+    /// hedge floor.
     fn broker_with_shares(symbol: &Symbol, shares: Float) -> st0x_execution::MockExecutor {
-        st0x_execution::MockExecutor::new().with_inventory(st0x_execution::Inventory {
-            positions: vec![st0x_execution::EquityPosition {
-                symbol: symbol.clone(),
-                quantity: FractionalShares::new(shares),
-                market_value: None,
-            }],
-            alpaca_usdc: None,
-            usd_balance_cents: 0,
-            cash_buying_power_cents: None,
-            cash_withdrawable_cents: None,
-        })
+        st0x_execution::MockExecutor::new()
+            .with_inventory(st0x_execution::Inventory {
+                positions: vec![st0x_execution::EquityPosition {
+                    symbol: symbol.clone(),
+                    quantity: FractionalShares::new(shares),
+                    market_value: None,
+                }],
+                alpaca_usdc: None,
+                usd_balance_cents: 0,
+                cash_buying_power_cents: None,
+                cash_withdrawable_cents: None,
+            })
+            .with_hedge_floor(st0x_execution::HedgeFloor::new(
+                FractionalShares::new(float!(0.01)),
+                std::collections::HashMap::new(),
+            ))
     }
 
-    #[tokio::test]
-    async fn redemption_admission_reports_the_shares_above_the_hedge_floor() {
-        let symbol = Symbol::new("COIN").unwrap();
-        let floor = HedgeFloor::new(
-            FractionalShares::new(float!(0.01)),
-            std::collections::HashMap::new(),
-        );
-
-        let at_floor =
-            redemption_admission(&broker_with_shares(&symbol, float!(0.01)), &floor, &symbol)
-                .await
-                .unwrap();
-        assert_eq!(
-            at_floor.admission,
-            EquityTransferAdmission::Redemption {
-                broker_sellable: FractionalShares::ZERO
-            }
-        );
-
-        let sellable =
-            redemption_admission(&broker_with_shares(&symbol, float!(5)), &floor, &symbol)
-                .await
-                .unwrap();
-        assert_eq!(
-            sellable.admission,
-            EquityTransferAdmission::Redemption {
-                broker_sellable: FractionalShares::new(float!(4.99))
-            }
-        );
-
-        let unreported =
-            redemption_admission(&st0x_execution::MockExecutor::new(), &floor, &symbol)
-                .await
-                .unwrap();
-        assert_eq!(unreported.available, None);
-        assert_eq!(unreported.admission, EquityTransferAdmission::Standard);
-    }
-
-    /// A broker that cannot be built or read falls back to the standard
-    /// admission with a warning, so an Alpaca outage does not block a
-    /// redemption that needs no exception.
-    #[tokio::test]
-    async fn redemption_admission_falls_back_to_standard_when_the_broker_fails() {
-        let symbol = Symbol::new("COIN").unwrap();
-        let floor = HedgeFloor::new(
-            FractionalShares::new(float!(0.01)),
-            std::collections::HashMap::new(),
-        );
-
-        let mut stdout = Vec::new();
-        let unreadable = redemption_admission_or_standard(
-            &mut stdout,
-            Ok(st0x_execution::MockExecutor::with_failure(
-                "positions endpoint down",
-            )),
-            &floor,
-            &symbol,
-        )
-        .await
-        .unwrap();
-        assert_eq!(unreadable.admission, EquityTransferAdmission::Standard);
-        assert_eq!(unreadable.available, None);
-        let printed = String::from_utf8(stdout).unwrap();
-        assert!(
-            printed.contains("could not read the broker inventory"),
-            "{printed}"
-        );
-
-        let mut stdout = Vec::new();
-        let unbuilt = redemption_admission_or_standard::<_, st0x_execution::MockExecutor>(
-            &mut stdout,
-            Err(anyhow::anyhow!("client construction failed")),
-            &floor,
-            &symbol,
-        )
-        .await
-        .unwrap();
-        assert_eq!(unbuilt.admission, EquityTransferAdmission::Standard);
-        assert_eq!(unbuilt.floor, FractionalShares::new(float!(0.01)));
-    }
-
-    /// The 2026-09-30 COIN incident: a long position needs a sell hedge and
-    /// the broker holds only the floor. The operator redemption is the only
-    /// way to refill the broker, so it must run and own the symbol.
-    #[tokio::test]
-    async fn operator_redemption_runs_while_the_sell_hedge_is_held_at_the_floor() {
-        let pool = setup_test_db().await;
-        let services = test_equity_transfer_cli_services(&pool).await;
+    /// Holds a long 61 share COIN position that needs a sell hedge, as in the
+    /// 2026-09-30 COIN incident.
+    async fn hold_long_coin(services: &EquityTransferCliServices) -> Symbol {
         let symbol = Symbol::new("COIN").unwrap();
         services
             .position_store
@@ -2582,6 +2479,89 @@ mod tests {
             )
             .await
             .unwrap();
+        symbol
+    }
+
+    /// Only a sell the broker refuses for lack of shares lets the redemption
+    /// start over the hedge; a broker that can sell keeps the hedge first.
+    #[tokio::test]
+    async fn redemption_admission_follows_the_broker_sell_check() {
+        let pool = setup_test_db().await;
+        let services = test_equity_transfer_cli_services(&pool).await;
+        let symbol = hold_long_coin(&services).await;
+
+        let at_floor = redemption_admission(
+            &mut Vec::new(),
+            Ok(broker_with_shares(&symbol, float!(0.01))),
+            &services.position_store,
+            &symbol,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            at_floor,
+            EquityTransferAdmission::Redemption {
+                refused_sell: FractionalShares::new(float!(61))
+            }
+        );
+
+        let sellable = redemption_admission(
+            &mut Vec::new(),
+            Ok(broker_with_shares(&symbol, float!(5))),
+            &services.position_store,
+            &symbol,
+        )
+        .await
+        .unwrap();
+        assert_eq!(sellable, EquityTransferAdmission::Standard);
+    }
+
+    /// A broker that cannot be built or asked falls back to the standard
+    /// admission with a warning, so an Alpaca outage does not block a
+    /// redemption that needs no exception.
+    #[tokio::test]
+    async fn redemption_admission_falls_back_to_standard_when_the_broker_fails() {
+        let pool = setup_test_db().await;
+        let services = test_equity_transfer_cli_services(&pool).await;
+        let symbol = hold_long_coin(&services).await;
+
+        let mut stdout = Vec::new();
+        let unreadable = redemption_admission(
+            &mut stdout,
+            Ok(st0x_execution::MockExecutor::with_failure(
+                "positions endpoint down",
+            )),
+            &services.position_store,
+            &symbol,
+        )
+        .await
+        .unwrap();
+        assert_eq!(unreadable, EquityTransferAdmission::Standard);
+        let printed = String::from_utf8(stdout).unwrap();
+        assert!(
+            printed.contains("could not ask the broker sell check"),
+            "{printed}"
+        );
+
+        let unbuilt = redemption_admission::<_, st0x_execution::MockExecutor>(
+            &mut Vec::new(),
+            Err(anyhow::anyhow!("client construction failed")),
+            &services.position_store,
+            &symbol,
+        )
+        .await
+        .unwrap();
+        assert_eq!(unbuilt, EquityTransferAdmission::Standard);
+    }
+
+    /// The 2026-09-30 COIN incident: a long position needs a sell hedge and
+    /// the broker holds only the floor. The operator redemption is the only
+    /// way to refill the broker, so it must run and own the symbol.
+    #[tokio::test]
+    async fn operator_redemption_runs_while_the_sell_hedge_is_held_at_the_floor() {
+        let pool = setup_test_db().await;
+        let services = test_equity_transfer_cli_services(&pool).await;
+        let symbol = hold_long_coin(&services).await;
 
         let aggregate_id = RedemptionAggregateId::generate();
         let rejected = run_operator_equity_transfer(
@@ -2603,6 +2583,14 @@ mod tests {
             "unexpected refusal: {rejected:#}"
         );
 
+        let admission = redemption_admission(
+            &mut Vec::new(),
+            Ok(broker_with_shares(&symbol, float!(0.01))),
+            &services.position_store,
+            &symbol,
+        )
+        .await
+        .unwrap();
         let invoked = Arc::new(AtomicBool::new(false));
         let invoked_by_transfer = Arc::clone(&invoked);
         run_operator_equity_transfer(
@@ -2610,9 +2598,7 @@ mod tests {
             &symbol,
             aggregate_id.as_uuid().into(),
             OperatorTransferAdmission::Fresh,
-            EquityTransferAdmission::Redemption {
-                broker_sellable: FractionalShares::ZERO,
-            },
+            admission,
             OperatorTransferLifecycle::Redemption {
                 store: &services.redemption_store,
                 id: &aggregate_id,

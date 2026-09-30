@@ -809,9 +809,10 @@ pub(crate) struct TransferEquityToHedging {
     #[serde(default)]
     pub(crate) position_reservation_retry_attempts: u32,
     /// The admission the Position reservation was taken with. A gas deferral
-    /// keeps a reservation admitted over a sell hedge the broker floor blocks,
-    /// because the retry could only restore it under the standard admission.
-    /// Rows queued before this field existed were all standard.
+    /// keeps a reservation admitted over a sell hedge the broker refused for
+    /// lack of shares, because the retry could only restore it under the
+    /// standard admission. Rows queued before this field existed were all
+    /// standard.
     #[serde(default)]
     pub(crate) admission: EquityTransferAdmission,
 }
@@ -983,11 +984,12 @@ impl Job<TransferEquityToHedgingCtx> for TransferEquityToHedging {
             // A standard reservation is released, like the mint job does, so
             // a low wallet cannot suppress hedging; the retry restores it once
             // hedging allows. A reservation admitted over a sell hedge the
-            // broker floor blocks is kept: `restore_position_reservation` only
-            // knows the standard admission, so the retry would be refused and
-            // reschedule forever, which is the deadlock that admission exists
-            // to break. Meanwhile no hedge order runs for the symbol, and the
-            // broker could not fill one when the redemption was admitted.
+            // broker refused for lack of shares is kept:
+            // `restore_position_reservation` only knows the standard
+            // admission, so the retry would be refused and reschedule forever,
+            // which is the deadlock that admission exists to break. Meanwhile
+            // no hedge order runs for the symbol, and the broker could not fill
+            // one when the redemption was admitted.
             if self.admission == EquityTransferAdmission::Standard
                 && let Some((position_store, _)) = &ctx.position_authority
             {
@@ -2923,7 +2925,7 @@ mod tests {
     async fn redemption_gas_readiness_failure_keeps_floor_admitted_reservation_for_delayed_redrive()
     {
         let admission = EquityTransferAdmission::Redemption {
-            broker_sellable: FractionalShares::ZERO,
+            refused_sell: FractionalShares::new(float!(10)),
         };
 
         let (reservation, redriven) = perform_low_gas_redemption(admission).await;
@@ -4138,7 +4140,7 @@ mod tests {
             backpressure_streak: BackpressureStreak::default(),
             position_reservation_retry_attempts: 0,
             admission: EquityTransferAdmission::Redemption {
-                broker_sellable: FractionalShares::new(float!(0.005)),
+                refused_sell: FractionalShares::new(float!(2.5)),
             },
         };
 
@@ -4150,7 +4152,7 @@ mod tests {
             "generation": 4_294_967_297_u64,
             "backpressure_streak": 0_u32,
             "position_reservation_retry_attempts": 0_u32,
-            "admission": { "Redemption": { "broker_sellable": "0.005" } },
+            "admission": { "Redemption": { "refused_sell": "2.5" } },
         });
         assert_eq!(serde_json::to_value(&job).unwrap(), expected);
         let deserialized: TransferEquityToHedging = serde_json::from_value(expected).unwrap();

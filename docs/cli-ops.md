@@ -292,19 +292,20 @@ started on; a `--network` that disagrees with the record is refused, and the
 
 `transfer-equity --direction to-alpaca` reserves the symbol on its `Position`
 before it redeems. Normally that reservation is refused while the position still
-needs a hedge. The exception is a sell hedge that Alpaca cannot fill: the CLI
-reads the Alpaca position and reports the shares above the hedge floor.
-`Position` admits the redemption when the position is long and a sell of its
-whole net would be skipped (less than 0.01 share, and less than the net, above
-the floor). The command prints what it saw before it sends anything:
+needs a hedge. The exception is a sell hedge that Alpaca refuses for lack of
+shares: the CLI asks Alpaca's own sell check, the one every hedge order passes,
+whether it would sell the whole position. `Position` admits the redemption when
+the position is long and Alpaca refused a sell of exactly that net for lack of
+shares above the hedge floor. The command prints the answer before it sends
+anything:
 
 ```
-Broker COIN: 0.01 shares, hedge floor 0.01, sellable above the floor 0
+Alpaca refuses a sell of the 61 COIN position for lack of shares, so the redemption may start while that hedge is needed
 ```
 
-If Alpaca can still sell part of the hedge, `Position` refuses the redemption
-and the hedge keeps priority. The bot's own rebalancer applies the same rule, so
-this command is only needed when the rebalancer is not redeeming by itself.
+If Alpaca can still sell, `Position` refuses the redemption and the hedge keeps
+priority. The bot's own rebalancer asks the same check, so this command is only
+needed when the rebalancer is not redeeming by itself.
 
 ### Orchestrator Rollout per Chain
 

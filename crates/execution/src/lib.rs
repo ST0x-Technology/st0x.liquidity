@@ -725,6 +725,22 @@ pub enum CounterTradePreflight {
     Skipped(CounterTradeSkipReason),
 }
 
+impl CounterTradePreflight {
+    /// Whether the check refused the order because the broker holds too few
+    /// shares above the hedge floor, the one refusal that more broker shares
+    /// fix.
+    #[must_use]
+    pub fn is_blocked_by_inventory(&self) -> bool {
+        matches!(
+            self,
+            Self::Skipped(
+                CounterTradeSkipReason::InsufficientEquity { .. }
+                    | CounterTradeSkipReason::HeldAtFloor { .. }
+            )
+        )
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum ExecutionError {
     #[error("Database error: {0}")]
@@ -1038,29 +1054,8 @@ pub(crate) fn resolve_sell_preflight(
     ))
 }
 
-/// Whether the sell preflight skips a sell of `requested` shares.
-///
-/// `sellable` is the broker book above the hedge floor. Like the Alpaca
-/// preflight, the request is first cut to `ALPACA_MAX_DECIMAL_PLACES`; a
-/// request that cuts to zero is skipped. The sell is then skipped when the
-/// book covers less than the request, and too little for a partial hedge.
-/// Uses fractional figures, so a symbol that only trades whole shares can be
-/// skipped while this returns `false`; callers treat `false` as "not proven".
-pub fn sell_blocked_by_inventory(
-    sellable: FractionalShares,
-    requested: FractionalShares,
-) -> Result<bool, FloatError> {
-    let Some(requested) = truncate_to_decimal_places(requested.inner(), ALPACA_MAX_DECIMAL_PLACES)?
-    else {
-        return Ok(true);
-    };
-
-    Ok(sellable.inner().lt(requested)? && sellable.inner().lt(*MINIMUM_PARTIAL_HEDGE_SHARES)?)
-}
-
-/// `available - floor`, clamped at zero: the broker shares a sell hedge may
-/// use.
-pub fn sellable_above_floor(
+/// `available - floor`, clamped at zero.
+fn sellable_above_floor(
     available: FractionalShares,
     floor: FractionalShares,
 ) -> Result<FractionalShares, FloatError> {
@@ -1750,58 +1745,40 @@ mod tests {
         assert_eq!(available, frac_shares("5.27"));
     }
 
-    /// The predicate must agree with the preflight it predicts, including a
-    /// request smaller than the partial hedge minimum that the book covers,
-    /// and a request past Alpaca's precision that the preflight cuts first.
+    /// A redemption can only unblock a sell refused for lack of shares: one the
+    /// book can partly fill, or one refused for another reason, is not.
     #[test]
-    fn sell_blocked_by_inventory_matches_the_sell_preflight() {
-        let cases = [
-            // (available, floor, requested, blocked)
-            ("0.01", "0.01", "61", true),
-            ("0", "0", "61", true),
-            ("0.005", "0", "61", true),
-            ("1.009", "1", "61", true),
-            ("0.5", "1", "61", true),
-            ("1.01", "1", "61", false),
-            ("5", "0", "61", false),
-            ("0.005", "0", "0.005", false),
-            ("0.005", "0", "0.004", false),
-            ("0.005", "0", "0.006", true),
-            ("0.005", "0", "0.0050000000001", false),
-            ("0.005", "0", "0.0000000001", true),
-        ];
+    fn only_a_sell_refused_for_lack_of_shares_is_blocked_by_inventory() {
+        let at_floor = resolve_sell_preflight(
+            sell_order("COIN", "61"),
+            frac_shares("0.01"),
+            frac_shares("0.01"),
+        )
+        .unwrap();
+        assert!(at_floor.is_blocked_by_inventory(), "{at_floor:?}");
 
-        for (available, floor, requested, blocked) in cases {
-            let available = frac_shares(available);
-            let floor = frac_shares(floor);
-            let sellable = sellable_above_floor(available, floor).unwrap();
+        let empty = resolve_sell_preflight(
+            sell_order("COIN", "61"),
+            FractionalShares::ZERO,
+            FractionalShares::ZERO,
+        )
+        .unwrap();
+        assert!(empty.is_blocked_by_inventory(), "{empty:?}");
 
-            assert_eq!(
-                sell_blocked_by_inventory(sellable, frac_shares(requested)).unwrap(),
-                blocked,
-                "available {available}, floor {floor}, requested {requested}"
-            );
+        let partial = resolve_sell_preflight(
+            sell_order("COIN", "61"),
+            frac_shares("0.02"),
+            frac_shares("0.01"),
+        )
+        .unwrap();
+        assert!(!partial.is_blocked_by_inventory(), "{partial:?}");
 
-            // Mirrors the Alpaca preflight for a fractionable symbol: the
-            // request is cut to Alpaca's precision, and one that cuts to zero
-            // is skipped, before `resolve_sell_preflight` runs.
-            let preflight = truncate_to_decimal_places(
-                frac_shares(requested).inner(),
-                ALPACA_MAX_DECIMAL_PLACES,
-            )
-            .unwrap()
-            .map(|cut| {
-                resolve_sell_preflight(sell_order("COIN", &cut.format().unwrap()), available, floor)
-                    .unwrap()
-            });
-            assert_eq!(
-                preflight
-                    .as_ref()
-                    .is_none_or(|preflight| matches!(preflight, CounterTradePreflight::Skipped(_))),
-                blocked,
-                "preflight disagrees for available {available}, floor {floor}, \
-                 requested {requested}: {preflight:?}"
-            );
-        }
+        let below_one_share = CounterTradePreflight::Skipped(
+            CounterTradeSkipReason::NonFractionableQuantityBelowOne {
+                symbol: Symbol::new("COIN").unwrap(),
+                requested: Positive::new(frac_shares("0.5")).unwrap(),
+            },
+        );
+        assert!(!below_one_share.is_blocked_by_inventory());
     }
 }

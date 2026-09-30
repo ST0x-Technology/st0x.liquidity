@@ -128,13 +128,14 @@ pub enum EquityTransferAdmission {
     /// never races a hedge that the broker can fill.
     #[default]
     Standard,
-    /// A redemption to the hedging venue, with the broker shares of the
-    /// symbol above the hedge floor that the caller observed. A redemption
-    /// only adds broker shares, so it cannot take what a sell hedge needs, and
-    /// it is the only way to refill them. The Position admits it while the
-    /// hedge is still needed only if the position is long (its hedge is a
-    /// sell) and the broker preflight would skip a sell of the whole net.
-    Redemption { broker_sellable: FractionalShares },
+    /// A redemption to the hedging venue after the broker's own sell check,
+    /// the one every hedge order passes, refused to sell `refused_sell` shares
+    /// for lack of shares above the hedge floor. A redemption only adds broker
+    /// shares, so it cannot take what a sell hedge needs, and it is the only
+    /// way to refill them. The Position admits it while the hedge is still
+    /// needed only if the position is long (its hedge is a sell) and its net is
+    /// exactly the refused sell.
+    Redemption { refused_sell: FractionalShares },
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -1313,22 +1314,20 @@ impl Position {
 
     /// A redemption is admitted over a needed hedge only while the position is
     /// long, because only then is its hedge a sell, and only if the broker
-    /// preflight would skip a sell of the whole net.
+    /// refused a sell of exactly this net: a different net is a different
+    /// order the check has not seen.
     fn admits_inventory_blocked_sell(
         &self,
         admission: EquityTransferAdmission,
     ) -> Result<bool, PositionError> {
-        let EquityTransferAdmission::Redemption { broker_sellable } = admission else {
+        let EquityTransferAdmission::Redemption { refused_sell } = admission else {
             return Ok(false);
         };
         if self.net.is_zero()? || self.net.is_negative()? {
             return Ok(false);
         }
 
-        Ok(st0x_execution::sell_blocked_by_inventory(
-            broker_sellable,
-            self.net,
-        )?)
+        Ok(self.net.inner().eq(refused_sell.inner())?)
     }
 
     fn confirm_equity_transfer_events(
@@ -3952,11 +3951,11 @@ mod tests {
         (store, projection, symbol, threshold)
     }
 
-    /// A redemption whose broker book holds nothing above the hedge floor,
-    /// as in the 2026-09-30 COIN incident.
-    fn at_floor() -> EquityTransferAdmission {
+    /// The broker refused a sell of the fixtures' whole 61 share net for lack
+    /// of shares, as in the 2026-09-30 COIN incident.
+    fn refused_whole_net() -> EquityTransferAdmission {
         EquityTransferAdmission::Redemption {
-            broker_sellable: FractionalShares::ZERO,
+            refused_sell: FractionalShares::new(float!(61)),
         }
     }
 
@@ -3986,7 +3985,7 @@ mod tests {
         store
             .send(
                 &symbol,
-                reserve(&symbol, threshold, reservation_id, at_floor()),
+                reserve(&symbol, threshold, reservation_id, refused_whole_net()),
             )
             .await
             .unwrap();
@@ -4023,10 +4022,11 @@ mod tests {
         );
     }
 
-    /// A broker book with a partial hedge's worth above the floor can still
-    /// sell, so the hedge keeps priority over the redemption.
+    /// The broker's refusal covers the net it was asked about. A net that
+    /// changed since is a different sell the check has not seen, so the hedge
+    /// keeps priority.
     #[tokio::test]
-    async fn redemption_waits_while_the_broker_can_fill_part_of_the_sell_hedge() {
+    async fn redemption_waits_when_the_refused_sell_is_not_the_current_net() {
         let (store, _, symbol, threshold) = hedge_ready_store(Direction::Buy).await;
 
         let result = store
@@ -4037,7 +4037,7 @@ mod tests {
                     threshold,
                     EquityTransferReservationId::generate(),
                     EquityTransferAdmission::Redemption {
-                        broker_sellable: FractionalShares::new(float!(0.01)),
+                        refused_sell: FractionalShares::new(float!(60)),
                     },
                 ),
             )
@@ -4067,7 +4067,7 @@ mod tests {
                     &symbol,
                     threshold,
                     EquityTransferReservationId::generate(),
-                    at_floor(),
+                    refused_whole_net(),
                 ),
             )
             .await;
@@ -4121,7 +4121,8 @@ mod tests {
     #[tokio::test]
     async fn inventory_proof_admits_a_redemption_while_a_long_position_cannot_be_valued() {
         let (reservation_id, result) =
-            reserve_on_unvalued_position(FractionalShares::new(float!(61)), at_floor()).await;
+            reserve_on_unvalued_position(FractionalShares::new(float!(61)), refused_whole_net())
+                .await;
 
         let events = result.events();
         assert!(
@@ -4139,7 +4140,8 @@ mod tests {
     #[tokio::test]
     async fn inventory_proof_does_not_admit_a_transfer_while_a_short_position_cannot_be_valued() {
         let (_, result) =
-            reserve_on_unvalued_position(FractionalShares::new(float!(-61)), at_floor()).await;
+            reserve_on_unvalued_position(FractionalShares::new(float!(-61)), refused_whole_net())
+                .await;
 
         let error = result.then_expect_error();
         assert!(
@@ -4177,7 +4179,7 @@ mod tests {
                     &symbol,
                     threshold,
                     EquityTransferReservationId::generate(),
-                    at_floor(),
+                    refused_whole_net(),
                 ),
             )
             .await;

@@ -1194,6 +1194,12 @@ impl Conductor {
             executor: executor.clone(),
             close_flatten_policy: Some(startup_policy.clone()),
         });
+        // The rebalancer asks the same executor's sell check the hedge passes,
+        // so a redemption is admitted over a needed hedge only when the broker
+        // itself would refuse that sell for lack of shares.
+        rebalancing_service
+            .set_hedge_sell_check(Arc::clone(&process_tx_order_placer))
+            .await;
         let (offchain_order, offchain_order_projection) = setup_offchain_order_store(
             &pool,
             &executor,

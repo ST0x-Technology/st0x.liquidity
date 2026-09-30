@@ -42,7 +42,10 @@ use st0x_event_sorcery::{
 #[cfg(test)]
 use st0x_event_sorcery::{StoreBuilder, test_store};
 use st0x_evm::Chain;
-use st0x_execution::{FractionalShares, HedgeFloor, Positive, SharesConversionError, Symbol};
+use st0x_execution::{
+    BuyingPowerReservationCents, ClientOrderId, Direction, FractionalShares, HedgeFloor,
+    MarketOrder, Positive, SharesConversionError, Symbol,
+};
 use st0x_finance::{HasZero, Usd, Usdc};
 #[cfg(test)]
 use st0x_float_macro::float;
@@ -50,8 +53,8 @@ use st0x_tokenization::{ClientRequestId, IssuerRequestId, TokenizationRequestId}
 use st0x_wrapper::{Wrapper, WrapperError};
 
 use self::allocation::{
-    ChainSlot, DeclineReason, EquityPlan, EquityPlanError, EquityPlanInput, PlannedDirection,
-    PlannedOperation, plan_equity_operation,
+    ChainSlot, DeclineReason, EquityPlan, EquityPlanInput, PlannedDirection, PlannedOperation,
+    plan_equity_operation,
 };
 use self::freeze::FreezeStatusReader;
 use self::usdc::UsdcRebalanceOperation;
@@ -75,7 +78,7 @@ use crate::inventory::{
     Venue,
 };
 use crate::native_gas::{ConfiguredGasReadiness, GasReadiness, TransferGasRoute};
-use crate::offchain::order::OffchainOrderId;
+use crate::offchain::order::{OffchainOrderId, OrderPlacer};
 use crate::position::{
     EquityTransferAdmission, EquityTransferReservationId, EquityTransferReservationStatus,
     Position, PositionCommand, PositionError, PositionEvent,
@@ -425,18 +428,20 @@ fn stale_snapshot_age(fetched_at: Option<DateTime<Utc>>, bound: Duration) -> Opt
     )
 }
 
-/// How long a redemption refused while the broker balance was missing or too
-/// old waits before its symbol is checked again.
-const MISSING_BROKER_BALANCE_RECHECK_DELAY: Duration = Duration::from_secs(5 * 60);
+/// How long a redemption waits to be checked again after the broker's sell
+/// check could not be asked.
+const SELL_CHECK_RETRY_DELAY: Duration = Duration::from_secs(5 * 60);
 
 /// The Position's answer to an equity transfer reservation.
 enum EquityReservation {
     Reserved,
-    /// The position needs a hedge, or cannot be valued, and the admission did
-    /// not show the broker unable to fill it.
-    HedgeFirst,
+    /// The position needs a hedge.
+    BlockedByHedge,
+    /// The position may need a hedge, but its dollar threshold cannot be
+    /// valued yet.
+    HedgeEligibilityUnknown,
     /// A pending order, a failed order anchor, or another transfer owns the
-    /// symbol, none of which a fresh broker balance changes.
+    /// symbol.
     Busy,
 }
 
@@ -863,6 +868,11 @@ pub(crate) struct RebalancingService {
     /// `set_last_price_reader`; without one no minimum can be valued and
     /// every plan declines.
     last_prices: RwLock<Option<Arc<dyn LastPriceReader>>>,
+    /// The broker's own sell check, the one a hedge order passes before it is
+    /// placed, attached through `set_hedge_sell_check`. A redemption asks it
+    /// whether a sell of the position's net would be refused for lack of
+    /// shares; without one no redemption is admitted over a needed hedge.
+    hedge_sell_check: RwLock<Option<Arc<dyn OrderPlacer>>>,
     pub(crate) equity_in_progress: Arc<std::sync::RwLock<HashMap<Symbol, equity::GuardState>>>,
     /// Symbols the inventory poller flagged with a pending snapshot
     /// divergence. Read here to suppress new equity transfers so a mint or
@@ -1179,6 +1189,7 @@ impl RebalancingService {
             equity_gas_readiness: RwLock::new(BTreeMap::new()),
             equity_cooldowns: RwLock::new(HashMap::new()),
             last_prices: RwLock::new(None),
+            hedge_sell_check: RwLock::new(None),
             equity_in_progress: Arc::new(std::sync::RwLock::new(HashMap::new())),
             divergence_gate: Arc::default(),
             usdc_guards: Arc::default(),
@@ -1281,6 +1292,12 @@ impl RebalancingService {
     /// projection exists.
     pub(crate) async fn set_last_price_reader(&self, reader: Arc<dyn LastPriceReader>) {
         *self.last_prices.write().await = Some(reader);
+    }
+
+    /// Attach the broker's sell check, the same one hedge orders pass. Called
+    /// by the conductor once the order placer exists.
+    pub(crate) async fn set_hedge_sell_check(&self, sell_check: Arc<dyn OrderPlacer>) {
+        *self.hedge_sell_check.write().await = Some(sell_check);
     }
 
     async fn equity_chain_gas_is_ready(&self, chain: Chain) -> bool {
@@ -4147,7 +4164,7 @@ impl RebalancingService {
         admission: EquityTransferAdmission,
     ) -> Result<EquityReservation, equity::EquityTriggerError> {
         let (store, threshold) = self.position_authority().await?;
-        match store
+        let refusal = match store
             .send(
                 symbol,
                 PositionCommand::ReserveEquityTransfer {
@@ -4159,126 +4176,164 @@ impl RebalancingService {
             )
             .await
         {
-            Ok(()) => Ok(EquityReservation::Reserved),
-            Err(AggregateError::UserError(LifecycleError::Apply(
-                error @ PositionError::EquityTransferBlockedByHedge { .. },
-            ))) => {
-                Self::log_reservation_refusal(symbol, reservation_id, &error);
-                // Counts how often a needed hedge holds rebalancing back, next
-                // to the planner's own decline reasons.
-                counter!("equity_plan_declined_total", "reason" => "blocked_by_hedge").increment(1);
-                Ok(EquityReservation::HedgeFirst)
-            }
-            Err(AggregateError::UserError(LifecycleError::Apply(
-                error @ PositionError::EquityTransferHedgeEligibilityUnknown { .. },
-            ))) => {
-                Self::log_reservation_refusal(symbol, reservation_id, &error);
-                Ok(EquityReservation::HedgeFirst)
-            }
-            Err(AggregateError::UserError(LifecycleError::Apply(
-                error @ (PositionError::PendingExecution { .. }
-                | PositionError::EquityTransferReservationExists { .. }
-                | PositionError::EquityTransferBlockedByFailedOrderAnchor { .. }),
-            ))) => {
-                Self::log_reservation_refusal(symbol, reservation_id, &error);
-                Ok(EquityReservation::Busy)
-            }
-            Err(error) => Err(error.into()),
-        }
-    }
+            Ok(()) => return Ok(EquityReservation::Reserved),
+            Err(AggregateError::UserError(LifecycleError::Apply(error))) => error,
+            Err(error) => return Err(error.into()),
+        };
 
-    fn log_reservation_refusal(
-        symbol: &Symbol,
-        reservation_id: EquityTransferReservationId,
-        error: &PositionError,
-    ) {
+        let reservation = match &refusal {
+            PositionError::EquityTransferBlockedByHedge { .. } => EquityReservation::BlockedByHedge,
+            PositionError::EquityTransferHedgeEligibilityUnknown { .. } => {
+                EquityReservation::HedgeEligibilityUnknown
+            }
+            PositionError::PendingExecution { .. }
+            | PositionError::EquityTransferReservationExists { .. }
+            | PositionError::EquityTransferBlockedByFailedOrderAnchor { .. } => {
+                EquityReservation::Busy
+            }
+            _ => return Err(AggregateError::UserError(LifecycleError::Apply(refusal)).into()),
+        };
         debug!(
             target: "rebalance",
             %symbol,
             %reservation_id,
-            reason = %error,
-            "Skipped equity trigger: Position rejected transfer reservation"
+            ?admission,
+            reason = %refusal,
+            "Position rejected transfer reservation"
         );
+        Ok(reservation)
     }
 
-    /// Schedules one more check of `symbol` after a redemption was refused
-    /// because the broker balance was missing or too old. An unchanged broker
-    /// poll emits no inventory event, so once the poll recovers nothing else
-    /// would check the symbol again until its balance changes.
-    async fn recheck_after_missing_broker_balance(&self, symbol: &Symbol) {
-        self.equity_scheduler
-            .enqueue_delayed_check(symbol.clone(), MISSING_BROKER_BALANCE_RECHECK_DELAY)
-            .await;
-    }
-
-    /// The admission the Position reservation needs for `direction`. A
-    /// redemption reports the broker shares above the hedge floor, so Position
-    /// can admit it over a sell hedge the broker cannot fill. Anything the
-    /// trigger cannot observe falls back to the standard admission, and so
-    /// does a broker balance older than `inventory_staleness_bound`, checked
-    /// like the onchain slots in `check_and_trigger_equity`: an old balance
-    /// cannot prove the broker still holds too little to fill the hedge.
-    async fn equity_transfer_admission(
+    /// Reserves the symbol for a transfer in `direction` and returns the
+    /// admission the reservation was taken with, or `None` when Position
+    /// refused it. A redemption that Position refuses for a needed hedge asks
+    /// the broker's sell check; if the check refuses a sell of the net for
+    /// lack of shares, the redemption is the only way to unblock the hedge, so
+    /// it retries with that refusal as proof.
+    async fn reserve_equity_transfer(
         &self,
         symbol: &Symbol,
+        reservation_id: EquityTransferReservationId,
         direction: PlannedDirection,
-    ) -> Result<EquityTransferAdmission, equity::EquityTriggerError> {
-        if direction != PlannedDirection::Redemption {
-            return Ok(EquityTransferAdmission::Standard);
-        }
+    ) -> Result<Option<EquityTransferAdmission>, equity::EquityTriggerError> {
+        let mut admission = EquityTransferAdmission::Standard;
+        let mut reservation = self
+            .try_reserve_equity_transfer(symbol, reservation_id, admission)
+            .await?;
 
-        let last_polled = self.config.poll_freshness.last_observed(
-            PortfolioLocation::Hedging,
-            &PortfolioAsset::Equity(symbol.clone()),
-        );
-        if let Some(staleness) =
-            stale_snapshot_age(last_polled, self.config.inventory_staleness_bound)
+        if matches!(
+            reservation,
+            EquityReservation::BlockedByHedge | EquityReservation::HedgeEligibilityUnknown
+        ) && direction == PlannedDirection::Redemption
+            && let Some(proof) = self.sell_refused_for_lack_of_shares(symbol).await?
         {
-            debug!(
-                target: "rebalance",
-                %symbol,
-                %staleness,
-                bound_secs = self.config.inventory_staleness_bound.as_secs(),
-                "Broker balance too old to admit a redemption over a blocked sell hedge"
-            );
-            return Ok(EquityTransferAdmission::Standard);
+            admission = proof;
+            reservation = self
+                .try_reserve_equity_transfer(symbol, reservation_id, admission)
+                .await?;
         }
 
-        let Some(offchain) = self.inventory.read().await.equity_venues(symbol)?.offchain else {
-            debug!(
-                target: "rebalance",
-                %symbol,
-                "No broker balance to admit a redemption over a blocked sell hedge"
-            );
-            return Ok(EquityTransferAdmission::Standard);
-        };
-        let floor = self.config.hedge_floor.for_symbol(symbol);
-        let broker_sellable = st0x_execution::sellable_above_floor(offchain.available(), floor)
-            .map_err(EquityPlanError::from)?;
-
-        Ok(EquityTransferAdmission::Redemption { broker_sellable })
+        match reservation {
+            EquityReservation::Reserved => Ok(Some(admission)),
+            EquityReservation::BlockedByHedge => {
+                // Counts how often a needed hedge holds rebalancing back, next
+                // to the planner's own decline reasons.
+                counter!("equity_plan_declined_total", "reason" => "blocked_by_hedge").increment(1);
+                Ok(None)
+            }
+            EquityReservation::HedgeEligibilityUnknown | EquityReservation::Busy => Ok(None),
+        }
     }
 
-    /// Whether the admission for the post-reservation plan still supports
-    /// the one the reservation was taken with. A different direction, or
-    /// more broker shares above the floor, can let the sell hedge run, so the
-    /// hedge gets priority again.
-    fn admission_still_holds(
-        reserved: EquityTransferAdmission,
-        current: EquityTransferAdmission,
-    ) -> Result<bool, EquityPlanError> {
-        match (reserved, current) {
-            (EquityTransferAdmission::Standard, _) => Ok(true),
-            (
-                EquityTransferAdmission::Redemption {
-                    broker_sellable: reserved,
-                },
-                EquityTransferAdmission::Redemption {
-                    broker_sellable: current,
-                },
-            ) => Ok(current.inner().lte(reserved.inner())?),
-            (EquityTransferAdmission::Redemption { .. }, EquityTransferAdmission::Standard) => {
-                Ok(false)
+    /// Asks the broker's sell check, the one a hedge order passes before it is
+    /// placed, whether a sell of the position's whole net would be refused for
+    /// lack of shares, and returns the redemption admission for that net when
+    /// it would. The rounding, precision and hedge floor are the check's own,
+    /// so this judges every symbol the way the hedge will.
+    ///
+    /// It asks the regular session check. Outside regular hours the broker may
+    /// sell only whole shares, which refuses more sells, never fewer, so this
+    /// never admits a redemption over a hedge that could run.
+    ///
+    /// A check that cannot be asked schedules one more equity check of the
+    /// symbol after `SELL_CHECK_RETRY_DELAY`, because nothing else checks it
+    /// again until its balances change.
+    async fn sell_refused_for_lack_of_shares(
+        &self,
+        symbol: &Symbol,
+    ) -> Result<Option<EquityTransferAdmission>, equity::EquityTriggerError> {
+        let Some(sell_check) = self.hedge_sell_check.read().await.clone() else {
+            debug!(
+                target: "rebalance",
+                %symbol,
+                "No broker sell check is attached, so the redemption waits for the hedge"
+            );
+            return Ok(None);
+        };
+
+        let (store, _) = self.position_authority().await?;
+        let net = store
+            .load(symbol)
+            .await?
+            .map_or(FractionalShares::ZERO, |position| position.net);
+        let Ok(shares) = Positive::new(net) else {
+            debug!(
+                target: "rebalance",
+                %symbol,
+                %net,
+                "Position is not long, so no sell hedge can be blocked for lack of shares"
+            );
+            return Ok(None);
+        };
+
+        let order = MarketOrder {
+            symbol: symbol.clone(),
+            shares,
+            direction: Direction::Sell,
+            client_order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
+        };
+        match sell_check
+            .preflight_counter_trade_with_reserved_buying_power(
+                order,
+                BuyingPowerReservationCents::ZERO,
+            )
+            .await
+        {
+            Ok(preflight) if preflight.is_blocked_by_inventory() => {
+                info!(
+                    target: "rebalance",
+                    %symbol,
+                    %net,
+                    ?preflight,
+                    "Broker refused the sell hedge for lack of shares; redeeming to refill it"
+                );
+                Ok(Some(EquityTransferAdmission::Redemption {
+                    refused_sell: net,
+                }))
+            }
+            Ok(preflight) => {
+                debug!(
+                    target: "rebalance",
+                    %symbol,
+                    %net,
+                    ?preflight,
+                    "Broker sell check did not refuse the hedge for lack of shares, so the \
+                     redemption waits for the hedge"
+                );
+                Ok(None)
+            }
+            Err(error) => {
+                warn!(
+                    target: "rebalance",
+                    %symbol,
+                    %error,
+                    retry_secs = SELL_CHECK_RETRY_DELAY.as_secs(),
+                    "Broker sell check failed, so the redemption waits and is checked again"
+                );
+                self.equity_scheduler
+                    .enqueue_delayed_check(symbol.clone(), SELL_CHECK_RETRY_DELAY)
+                    .await;
+                Ok(None)
             }
         }
     }
@@ -5090,27 +5145,13 @@ impl RebalancingService {
             return Ok(());
         };
 
-        // A redemption reports the broker book so Position can admit it over
-        // a sell hedge the broker cannot fill; see `EquityTransferAdmission`.
-        let admission = self
-            .equity_transfer_admission(symbol, first_plan.direction)
-            .await?;
         let reservation_id = EquityTransferReservationId::generate();
-        match self
-            .try_reserve_equity_transfer(symbol, reservation_id, admission)
+        let Some(admission) = self
+            .reserve_equity_transfer(symbol, reservation_id, first_plan.direction)
             .await?
-        {
-            EquityReservation::Reserved => {}
-            EquityReservation::HedgeFirst => {
-                if first_plan.direction == PlannedDirection::Redemption
-                    && admission == EquityTransferAdmission::Standard
-                {
-                    self.recheck_after_missing_broker_balance(symbol).await;
-                }
-                return Ok(());
-            }
-            EquityReservation::Busy => return Ok(()),
-        }
+        else {
+            return Ok(());
+        };
 
         let attempt = async {
             let Some(operation) = self
@@ -5134,27 +5175,18 @@ impl RebalancingService {
                 return Ok(false);
             }
 
-            // Position judged the reservation against the first plan's broker
-            // book. If the re-plan changes direction or finds more broker
-            // shares, the sell hedge may now run, so it keeps priority.
-            let current = self
-                .equity_transfer_admission(symbol, operation.direction)
-                .await?;
-            if !Self::admission_still_holds(admission, current)? {
+            // A reservation admitted over a sell hedge the broker refused for
+            // lack of shares covers only a redemption, which refills them.
+            if admission != EquityTransferAdmission::Standard
+                && operation.direction != PlannedDirection::Redemption
+            {
                 info!(
                     target: "rebalance",
                     %symbol,
                     direction = ?operation.direction,
-                    reserved = ?admission,
-                    current = ?current,
-                    "Skipped equity trigger before dispatch: the broker book changed \
-                     after the reservation"
+                    "Skipped equity trigger before dispatch: the reservation was admitted \
+                     for a redemption, but the plan is no longer one"
                 );
-                if operation.direction == PlannedDirection::Redemption
-                    && current == EquityTransferAdmission::Standard
-                {
-                    self.recheck_after_missing_broker_balance(symbol).await;
-                }
                 return Ok(false);
             }
 
@@ -33112,17 +33144,57 @@ mod tests {
             .unwrap();
     }
 
+    /// Attaches a broker sell check whose account holds `shares` of `symbol`
+    /// and keeps 0.01 of it as the hedge floor.
+    async fn attach_broker_holding(
+        trigger: &RebalancingService,
+        symbol: &Symbol,
+        shares: FractionalShares,
+    ) {
+        let executor = st0x_execution::MockExecutor::new()
+            .with_inventory(st0x_execution::Inventory {
+                positions: vec![st0x_execution::EquityPosition {
+                    symbol: symbol.clone(),
+                    quantity: shares,
+                    market_value: None,
+                }],
+                alpaca_usdc: None,
+                usd_balance_cents: 0,
+                cash_buying_power_cents: None,
+                cash_withdrawable_cents: None,
+            })
+            .with_hedge_floor(HedgeFloor::new(
+                FractionalShares::new(float!(0.01)),
+                HashMap::new(),
+            ));
+        attach_sell_check(trigger, executor).await;
+    }
+
+    async fn attach_sell_check(
+        trigger: &RebalancingService,
+        executor: st0x_execution::MockExecutor,
+    ) {
+        trigger
+            .set_hedge_sell_check(Arc::new(crate::offchain::order::ExecutorOrderPlacer {
+                executor,
+                close_flatten_policy: None,
+            }))
+            .await;
+    }
+
     /// The 2026-09-30 COIN deadlock: the position needs a sell hedge, the
-    /// broker has nothing above the hedge floor, and the only fix is a
-    /// redemption. The trigger must dispatch it.
+    /// broker holds only the hedge floor, and the only fix is a redemption.
+    /// The broker's own sell check refuses the hedge for lack of shares, so
+    /// the trigger dispatches the redemption with that refusal as proof.
     #[tokio::test]
-    async fn equity_check_redeems_while_the_sell_hedge_is_blocked_by_broker_inventory() {
+    async fn equity_check_redeems_while_the_broker_refuses_the_sell_hedge_for_lack_of_shares() {
         let symbol = Symbol::new("AAPL").unwrap();
         let inventory = InventoryView::default()
             .with_equity(symbol.clone(), shares(86), FractionalShares::ZERO)
             .with_usdc(usdc(1_000_000), usdc(1_000_000));
         let trigger = make_trigger_with_inventory_and_registry(inventory, &symbol).await;
         hold_long_position_needing_hedge(&trigger, &symbol, shares(61)).await;
+        attach_broker_holding(&trigger, &symbol, FractionalShares::new(float!(0.01))).await;
 
         EquityRebalancingCheck {
             symbol: symbol.clone(),
@@ -33136,52 +33208,63 @@ mod tests {
             panic!("Expected exactly one redemption job, got {dispatched:?}");
         };
         assert_eq!(job.symbol, symbol);
+        assert_eq!(
+            job.admission,
+            EquityTransferAdmission::Redemption {
+                refused_sell: shares(61)
+            },
+            "the job must carry the admission so a gas deferral keeps its reservation"
+        );
     }
 
-    /// The deadlock breaker needs a current broker balance: with a fresh
-    /// onchain slot but a broker balance older than the staleness bound, the
-    /// old balance cannot prove the hedge is still blocked, so Position gets
-    /// the standard admission and nothing is dispatched. An unchanged broker
-    /// poll emits no inventory event, so the refusal schedules one delayed
-    /// check of the symbol, which a fresh balance lets redeem.
+    /// When the broker can still fill part of the sell hedge, the hedge keeps
+    /// priority and the redemption waits, as before the fix.
     #[tokio::test]
-    async fn equity_check_does_not_redeem_over_the_hedge_on_a_stale_broker_balance() {
+    async fn equity_check_does_not_redeem_while_the_broker_can_fill_the_sell_hedge() {
         let symbol = Symbol::new("AAPL").unwrap();
         let inventory = InventoryView::default()
             .with_equity(symbol.clone(), shares(86), FractionalShares::ZERO)
             .with_usdc(usdc(1_000_000), usdc(1_000_000));
-        let freshness = PollFreshness::new();
-        freshness.set_observed(
-            PortfolioLocation::MarketMaking(Chain::Base),
-            PortfolioAsset::Equity(symbol.clone()),
-            Utc::now(),
-        );
-        freshness.set_observed(
-            PortfolioLocation::Hedging,
-            PortfolioAsset::Equity(symbol.clone()),
-            Utc::now() - chrono::Duration::seconds(301),
-        );
-        let trigger = make_trigger_with_inventory_and_registry_config(
-            inventory,
-            &symbol,
-            RebalancingServiceConfig {
-                poll_freshness: freshness.clone(),
-                ..test_config()
-            },
+        let trigger = make_trigger_with_inventory_and_registry(inventory, &symbol).await;
+        hold_long_position_needing_hedge(&trigger, &symbol, shares(61)).await;
+        attach_broker_holding(&trigger, &symbol, shares(20)).await;
+
+        EquityRebalancingCheck {
+            symbol: symbol.clone(),
+        }
+        .perform(&trigger)
+        .await
+        .unwrap();
+
+        assert_eq!(count_pending_equity_redemption_jobs(&trigger).await, 0);
+        assert_eq!(count_pending_equity_check_jobs(&trigger).await, 0);
+    }
+
+    /// A sell check that fails proves nothing, so the redemption waits. The
+    /// balances have not changed, so nothing else would check the symbol
+    /// again: the refusal schedules one delayed check, and repeated refusals
+    /// keep it to one.
+    #[tokio::test]
+    async fn equity_check_retries_later_when_the_broker_sell_check_fails() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let inventory = InventoryView::default()
+            .with_equity(symbol.clone(), shares(86), FractionalShares::ZERO)
+            .with_usdc(usdc(1_000_000), usdc(1_000_000));
+        let trigger = make_trigger_with_inventory_and_registry(inventory, &symbol).await;
+        hold_long_position_needing_hedge(&trigger, &symbol, shares(61)).await;
+        attach_sell_check(
+            &trigger,
+            st0x_execution::MockExecutor::with_failure("positions endpoint down"),
         )
         .await;
-        hold_long_position_needing_hedge(&trigger, &symbol, shares(61)).await;
         let check = EquityRebalancingCheck {
             symbol: symbol.clone(),
         };
 
         check.perform(&trigger).await.unwrap();
         check.perform(&trigger).await.unwrap();
-        assert_eq!(
-            count_pending_equity_redemption_jobs(&trigger).await,
-            0,
-            "a stale broker balance must not admit a redemption over the hedge"
-        );
+
+        assert_eq!(count_pending_equity_redemption_jobs(&trigger).await, 0);
         let delayed_checks: Vec<(Vec<u8>, i64)> = sqlx_apalis::query_as(
             "SELECT job, run_at FROM Jobs WHERE job_type = ? AND status = 'Pending' \
              AND run_at > CAST(strftime('%s', 'now') AS INTEGER)",
@@ -33192,107 +33275,18 @@ mod tests {
         .unwrap();
         let [(payload, run_at)] = delayed_checks.as_slice() else {
             panic!(
-                "two refused checks must leave exactly one delayed check, got {}",
+                "two failed checks must leave exactly one delayed check, got {}",
                 delayed_checks.len()
             );
         };
         let delayed: EquityRebalancingCheck = serde_json::from_slice(payload).unwrap();
         assert_eq!(delayed.symbol, symbol);
-        let expected_run_at = Utc::now().timestamp()
-            + i64::try_from(MISSING_BROKER_BALANCE_RECHECK_DELAY.as_secs()).unwrap();
+        let expected_run_at =
+            Utc::now().timestamp() + i64::try_from(SELL_CHECK_RETRY_DELAY.as_secs()).unwrap();
         assert!(
             (expected_run_at - 5..=expected_run_at).contains(run_at),
-            "the delayed check must run {MISSING_BROKER_BALANCE_RECHECK_DELAY:?} after the refusal"
+            "the delayed check must run {SELL_CHECK_RETRY_DELAY:?} after the failure"
         );
-
-        freshness.set_observed(
-            PortfolioLocation::Hedging,
-            PortfolioAsset::Equity(symbol.clone()),
-            Utc::now(),
-        );
-        check.perform(&trigger).await.unwrap();
-        assert_eq!(
-            count_pending_equity_redemption_jobs(&trigger).await,
-            1,
-            "a fresh broker poll must restore the redemption"
-        );
-    }
-
-    /// When the broker can still fill part of the sell hedge, the hedge keeps
-    /// priority and the redemption waits, as before the fix.
-    #[tokio::test]
-    async fn equity_check_does_not_redeem_while_the_broker_can_fill_the_sell_hedge() {
-        let symbol = Symbol::new("AAPL").unwrap();
-        let inventory = InventoryView::default()
-            .with_equity(symbol.clone(), shares(80), shares(20))
-            .with_usdc(usdc(1_000_000), usdc(1_000_000));
-        let trigger = make_trigger_with_inventory_and_registry(inventory, &symbol).await;
-        hold_long_position_needing_hedge(&trigger, &symbol, shares(61)).await;
-
-        EquityRebalancingCheck {
-            symbol: symbol.clone(),
-        }
-        .perform(&trigger)
-        .await
-        .unwrap();
-
-        assert_eq!(count_pending_equity_redemption_jobs(&trigger).await, 0);
-        let projection = trigger
-            .position_projection
-            .read()
-            .await
-            .as_ref()
-            .cloned()
-            .unwrap();
-        assert_eq!(
-            projection
-                .load(&symbol)
-                .await
-                .unwrap()
-                .unwrap()
-                .equity_transfer_reservation,
-            None,
-            "Position must have refused the reservation for the needed hedge"
-        );
-    }
-
-    /// Position judged the reservation against the first plan's broker book.
-    /// The dispatch must stop if the re-plan leaves the redemption or finds
-    /// more broker shares, because the sell hedge may now run.
-    #[test]
-    fn admission_still_holds_only_while_the_broker_book_does_not_grow() {
-        let redemption = |sellable: Float| EquityTransferAdmission::Redemption {
-            broker_sellable: FractionalShares::new(sellable),
-        };
-        let cases = [
-            (redemption(float!(0)), redemption(float!(0)), true),
-            (redemption(float!(0.005)), redemption(float!(0)), true),
-            (redemption(float!(0)), redemption(float!(0.005)), false),
-            (redemption(float!(0)), redemption(float!(20)), false),
-            (
-                redemption(float!(0)),
-                EquityTransferAdmission::Standard,
-                false,
-            ),
-            (
-                EquityTransferAdmission::Standard,
-                redemption(float!(20)),
-                true,
-            ),
-            (
-                EquityTransferAdmission::Standard,
-                EquityTransferAdmission::Standard,
-                true,
-            ),
-        ];
-
-        for (reserved, current, holds) in cases {
-            assert_eq!(
-                RebalancingService::admission_still_holds(reserved, current).unwrap(),
-                holds,
-                "reserved {reserved:?}, current {current:?}"
-            );
-        }
     }
 
     #[tokio::test]
