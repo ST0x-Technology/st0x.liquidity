@@ -80,7 +80,9 @@ use crate::equity_redemption::{
     EquityRedemption, RedemptionAggregateId, interrupted_redemption_ids,
     symbols_with_stuck_redemptions,
 };
-use crate::inventory::{BroadcastingInventory, Inventory, InventorySnapshot, PollFreshness, Venue};
+use crate::inventory::{
+    BroadcastingInventory, EquityWalletPolling, Inventory, InventorySnapshot, PollFreshness, Venue,
+};
 use crate::mint_authorization::{
     ConfiguredMintAuthorizer, MintAuthorizationService, VaultModeReader,
 };
@@ -1640,42 +1642,60 @@ fn build_record_bot_gas_receipt_cost_ctx(
     }))
 }
 
-fn base_wallet_equity_recovery_enabled(ctx: &Ctx, symbol: &Symbol) -> bool {
-    ctx.chains.primary().assets.is_trading_enabled(symbol)
-        || ctx
-            .chains
-            .primary()
-            .assets
-            .rebalancing_mode(symbol)
-            .keeps_services()
-        || ctx
-            .chains
-            .primary()
-            .assets
-            .is_wrapped_equity_recovery_enabled(symbol)
+/// Whether a chain's wallet is polled for `symbol`'s tokens: any equity the
+/// chain trades, rebalances or recovers can be left in its bot wallet.
+fn wallet_equity_polled(assets: &ChainAssets, symbol: &Symbol) -> bool {
+    assets.is_trading_enabled(symbol)
+        || assets.rebalancing_mode(symbol).keeps_services()
+        || assets.is_wrapped_equity_recovery_enabled(symbol)
 }
 
-fn base_wallet_unwrapped_equity_token_addresses(ctx: &Ctx) -> HashMap<Symbol, Address> {
-    ctx.chains
-        .primary()
-        .assets
+fn wallet_unwrapped_equity_token_addresses(assets: &ChainAssets) -> HashMap<Symbol, Address> {
+    assets
         .equities
         .symbols
         .iter()
-        .filter(|(symbol, _)| base_wallet_equity_recovery_enabled(ctx, symbol))
+        .filter(|(symbol, _)| wallet_equity_polled(assets, symbol))
         .map(|(symbol, config)| (symbol.clone(), config.tokenized_equity))
         .collect()
 }
 
-fn base_wallet_wrapped_equity_token_addresses(ctx: &Ctx) -> HashMap<Symbol, Address> {
-    ctx.chains
-        .primary()
-        .assets
+fn wallet_wrapped_equity_token_addresses(assets: &ChainAssets) -> HashMap<Symbol, Address> {
+    assets
         .equities
         .symbols
         .iter()
-        .filter(|(symbol, _)| base_wallet_equity_recovery_enabled(ctx, symbol))
+        .filter(|(symbol, _)| wallet_equity_polled(assets, symbol))
         .map(|(symbol, config)| (symbol.clone(), config.tokenized_equity_derivative))
+        .collect()
+}
+
+/// The equity wallet of every chain that rebalances equity, on the signer
+/// its tokenization uses. A hedge-only chain moves no equity through its
+/// wallet, so it is not polled.
+fn equity_wallet_polling(
+    ctx: &Ctx,
+    tokenizations: &HedgedChainTokenizations,
+) -> BTreeMap<Chain, EquityWalletPolling> {
+    ctx.chains
+        .hedged()
+        .filter_map(|hedged| {
+            let tokenization = tokenizations.get(&hedged.chain)?;
+            let EquityTokenization::Rebalancing(_) = tokenization.equity else {
+                return None;
+            };
+
+            Some((
+                hedged.chain,
+                EquityWalletPolling {
+                    wallet: tokenization.wallet.clone(),
+                    unwrapped_token_addresses: wallet_unwrapped_equity_token_addresses(
+                        &hedged.assets,
+                    ),
+                    wrapped_token_addresses: wallet_wrapped_equity_token_addresses(&hedged.assets),
+                },
+            ))
+        })
         .collect()
 }
 
@@ -2229,11 +2249,9 @@ impl PositionAndRebalancing {
         let wallets = ChainWallets::from_wallet_ctx(wallet_ctx);
         let tokenizations = build_chain_tokenizations(&deps.ctx, wallet_ctx)?;
 
-        // Computed before `deps` is moved into the spawn call, since
-        // `WalletPollingCtx` below also needs the config behind `deps.ctx`.
-        let unwrapped_equity_token_addresses =
-            base_wallet_unwrapped_equity_token_addresses(&deps.ctx);
-        let wrapped_equity_token_addresses = base_wallet_wrapped_equity_token_addresses(&deps.ctx);
+        // Computed before `deps` and the tokenizations are moved into the
+        // spawn call, since `WalletPollingCtx` below needs both.
+        let equity_wallets = equity_wallet_polling(&deps.ctx, &tokenizations);
 
         let infra =
             spawn_rebalancing_infrastructure(rebalancing_ctx, tokenizations, wallets.clone(), deps)
@@ -2249,8 +2267,7 @@ impl PositionAndRebalancing {
         let wallet_polling = crate::inventory::WalletPollingCtx {
             ethereum: Arc::new(ethereum_wallet),
             base: Arc::new(base_wallet),
-            unwrapped_equity_token_addresses,
-            wrapped_equity_token_addresses,
+            equity_wallets,
         };
 
         Ok(Self {
@@ -12011,7 +12028,7 @@ mod tests {
     }
 
     #[test]
-    fn base_wallet_unwrapped_equity_token_addresses_skips_disabled_assets() {
+    fn wallet_unwrapped_equity_token_addresses_skips_disabled_assets() {
         let aapl = Symbol::new("AAPL").unwrap();
         let tsla = Symbol::new("TSLA").unwrap();
         let spym = Symbol::new("SPYM").unwrap();
@@ -12086,7 +12103,7 @@ mod tests {
             cash: None,
         };
 
-        let actual = base_wallet_unwrapped_equity_token_addresses(&ctx);
+        let actual = wallet_unwrapped_equity_token_addresses(&ctx.chains.primary().assets);
 
         assert_eq!(
             actual.len(),
@@ -12103,7 +12120,7 @@ mod tests {
     }
 
     #[test]
-    fn base_wallet_wrapped_equity_token_addresses_skips_disabled_assets() {
+    fn wallet_wrapped_equity_token_addresses_skips_disabled_assets() {
         let aapl = Symbol::new("AAPL").unwrap();
         let tsla = Symbol::new("TSLA").unwrap();
         let spym = Symbol::new("SPYM").unwrap();
@@ -12178,7 +12195,7 @@ mod tests {
             cash: None,
         };
 
-        let actual = base_wallet_wrapped_equity_token_addresses(&ctx);
+        let actual = wallet_wrapped_equity_token_addresses(&ctx.chains.primary().assets);
 
         assert_eq!(
             actual.len(),
@@ -21114,6 +21131,82 @@ mod tests {
             tokenizations[&Chain::Base].equity,
             EquityTokenization::Rebalancing(_)
         ));
+    }
+
+    /// Every chain with equity services has its wallet polled on the signer
+    /// its tokenization uses, over that chain's own token addresses.
+    #[test]
+    fn equity_wallets_are_polled_on_every_rebalancing_chain_with_its_own_wallet() {
+        let mut ctx = create_test_ctx_with_order_owner(Address::ZERO);
+        ctx.broker = alpaca_broker_ctx();
+        ctx.chains.primary_mut().redemption_wallet = Some(Address::repeat_byte(0xb1));
+        ctx.chains.primary_mut().assets = ChainAssets {
+            equities: ChainEquities {
+                symbols: HashMap::from([(
+                    Symbol::new("AAPL").unwrap(),
+                    equity_asset(Address::repeat_byte(0xa5), Address::repeat_byte(0xa6)),
+                )]),
+                operational_limit: None,
+            },
+            cash: None,
+        };
+        ctx.chains.insert_secondary(ethereum_hedged_chain(
+            Some(Address::repeat_byte(0xe1)),
+            RebalancingMode::Paused,
+            ETHEREUM_INVENTORY,
+        ));
+        let tokenizations = build_chain_tokenizations(&ctx, &OnchainWalletCtx::stub()).unwrap();
+
+        let polled = equity_wallet_polling(&ctx, &tokenizations);
+
+        assert_eq!(
+            polled.keys().copied().collect::<Vec<_>>(),
+            vec![Chain::Base, Chain::Ethereum]
+        );
+        let base = &polled[&Chain::Base];
+        assert_eq!(
+            base.wallet.address(),
+            tokenizations[&Chain::Base].wallet.address()
+        );
+        assert_eq!(
+            base.unwrapped_token_addresses,
+            HashMap::from([(Symbol::new("AAPL").unwrap(), Address::repeat_byte(0xa5))])
+        );
+        let ethereum = &polled[&Chain::Ethereum];
+        assert_eq!(
+            ethereum.wallet.address(),
+            address!("0x0000000000000000000000000000000000000e78")
+        );
+        assert_eq!(
+            ethereum.unwrapped_token_addresses,
+            HashMap::from([(Symbol::new("TSLA").unwrap(), Address::repeat_byte(0xe5))])
+        );
+        assert_eq!(
+            ethereum.wrapped_token_addresses,
+            HashMap::from([(Symbol::new("TSLA").unwrap(), Address::repeat_byte(0xe6))])
+        );
+    }
+
+    /// A hedge-only chain moves no equity through its wallet, so its wallet
+    /// is not polled even for the equities it trades.
+    #[test]
+    fn a_hedge_only_chains_wallet_is_not_polled_for_equity() {
+        let mut ctx = create_test_ctx_with_order_owner(Address::ZERO);
+        ctx.broker = alpaca_broker_ctx();
+        ctx.chains.primary_mut().redemption_wallet = Some(Address::repeat_byte(0xb1));
+        ctx.chains.insert_secondary(ethereum_hedged_chain(
+            None,
+            RebalancingMode::Disabled,
+            ETHEREUM_INVENTORY,
+        ));
+        let tokenizations = build_chain_tokenizations(&ctx, &OnchainWalletCtx::stub()).unwrap();
+
+        let polled = equity_wallet_polling(&ctx, &tokenizations);
+
+        assert_eq!(
+            polled.keys().copied().collect::<Vec<_>>(),
+            vec![Chain::Base]
+        );
     }
 
     fn ctx_with_base_and_ethereum_trading() -> Ctx {

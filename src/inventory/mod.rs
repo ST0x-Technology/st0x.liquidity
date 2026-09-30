@@ -17,8 +17,9 @@ pub(crate) use freshness::PollFreshness;
 #[cfg(test)]
 pub(crate) use polling::PollerError;
 pub(crate) use polling::{
-    ChainVaultPolling, HedgeOrderGateReconciliationCtx, InventoryPollingService,
-    PendingRequestOwnership, PendingRequestOwnershipSnapshot, Poller, WalletPollingCtx,
+    ChainVaultPolling, EquityWalletPolling, HedgeOrderGateReconciliationCtx,
+    InventoryPollingService, PendingRequestOwnership, PendingRequestOwnershipSnapshot, Poller,
+    WalletPollingCtx,
 };
 pub(crate) use snapshot::{InventorySnapshot, InventorySnapshotId};
 pub(crate) use venue_balance::{InventoryError, VenueBalance};
