@@ -24404,6 +24404,19 @@ mod tests {
         apalis_sqlite::SqlitePool,
         MockServer,
     ) {
+        manager_on_corridor_with_bot_gas_queue(UsdcCorridor::BASE_CCTP, cqrs, wallet, bridge).await
+    }
+
+    async fn manager_on_corridor_with_bot_gas_queue<Signer: Wallet + Clone>(
+        corridor: UsdcCorridor,
+        cqrs: Arc<Store<UsdcRebalance>>,
+        wallet: Signer,
+        bridge: MockBridge,
+    ) -> (
+        CrossVenueCashTransfer<Signer, MockBridge>,
+        apalis_sqlite::SqlitePool,
+        MockServer,
+    ) {
         let (_apalis_only_pool, apalis_pool) = crate::test_utils::setup_test_pools().await;
         let queue = crate::bot_gas::RecordBotGasReceiptCostJobQueue::new(&apalis_pool);
 
@@ -24429,7 +24442,7 @@ mod tests {
             Arc::new(bridge),
             Arc::new(vault_service),
             cqrs,
-            MarketMakingUsdcEndpoints::new(UsdcCorridor::BASE_CCTP, recipient, TEST_VAULT_ID),
+            MarketMakingUsdcEndpoints::new(corridor, recipient, TEST_VAULT_ID),
             &test_settlement_params(),
             BotGasReceiptCostEnqueuer::Enabled(queue),
         );
@@ -24659,6 +24672,77 @@ mod tests {
         assert_eq!(jobs[0].chain, Chain::Base);
         assert_eq!(jobs[0].tx_hash, withdraw_tx);
         assert_eq!(jobs[0].symbol, None, "USDC paths carry no symbol");
+    }
+
+    /// A corridor off Base scans its own chain's stable for the withdrawal
+    /// it adopts and books that withdrawal's gas on its own chain.
+    #[tokio::test]
+    async fn vault_legs_use_the_corridor_chains_stable_and_gas_chain() {
+        let corridor = UsdcCorridor::HubRouted {
+            chain: Chain::Robinhood,
+            hop: HopKind::Cctp,
+        };
+        let pool = SqlitePool::connect(":memory:").await.unwrap();
+        sqlx::migrate!().run(&pool).await.unwrap();
+        let cqrs = Arc::new(test_store(pool, ()));
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let amount = usdc("1");
+        let amount_u256 = usdc_to_u256(amount).unwrap();
+        let from_block = 100;
+        cqrs.send(
+            &id,
+            UsdcRebalanceCommand::BeginWithdrawal {
+                corridor,
+                direction: RebalanceDirection::BaseToAlpaca,
+                amount,
+                from_block,
+            },
+        )
+        .await
+        .unwrap();
+
+        let withdraw_tx =
+            fixed_bytes!("0xdddd000000000000000000000000000000000000000000000000000000000003");
+        let withdrawal = crate::bindings::IRaindexInventory::OperatorWithdraw {
+            operator: address!("0x2222222222222222222222222222222222222222"),
+            token: Chain::Robinhood.settlement_stable().address,
+            vaultId: TEST_VAULT_ID.0,
+            amount: amount_u256,
+        };
+        let log = alloy::rpc::types::Log {
+            inner: alloy::primitives::Log {
+                address: ORDERBOOK_ADDRESS,
+                data: withdrawal.encode_log_data(),
+            },
+            block_hash: None,
+            block_number: Some(from_block + 1),
+            block_timestamp: None,
+            transaction_hash: Some(withdraw_tx),
+            transaction_index: None,
+            log_index: None,
+            removed: false,
+        };
+        let asserter = alloy::providers::mock::Asserter::new();
+        asserter.push_success(&json!([log]));
+        let wallet = RawPrivateKeyWallet::new(
+            &B256::repeat_byte(0x11),
+            ProviderBuilder::new().connect_mocked_client(asserter),
+            1,
+        )
+        .unwrap();
+        let (manager, apalis_pool, _server) =
+            manager_on_corridor_with_bot_gas_queue(corridor, cqrs, wallet, MockBridge::new()).await;
+
+        manager
+            .resume_withdrawal_submitting(&id, amount, amount_u256, from_block, Utc::now())
+            .await
+            .unwrap();
+
+        let jobs = pending_bot_gas_jobs(&apalis_pool).await;
+        assert_eq!(jobs.len(), 1, "expected exactly one bot-gas job");
+        assert_eq!(jobs[0].category, BotGasOperationCategory::VaultWithdraw);
+        assert_eq!(jobs[0].chain, Chain::Robinhood);
+        assert_eq!(jobs[0].tx_hash, withdraw_tx);
     }
 
     /// An enqueue failure for a confirmed vault withdrawal propagates as a
