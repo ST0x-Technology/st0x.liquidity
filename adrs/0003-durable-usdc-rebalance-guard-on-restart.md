@@ -166,6 +166,10 @@ The Jobs-table dedupe and the manual resume gates are scoped to the corridor in
 the same way. The operator pause stays global: it quiesces the shared transfer
 workers and never touches the guard.
 
+The inventory's busy marker follows the guard's shape: one entry per transfer,
+with its corridor chain and direction, and a release removes only its own entry.
+It stays in memory and is still not rebuilt at startup.
+
 Rollback: a single-guard build treats all corridors as one. It is safe on data
 written while only one corridor ran; after two corridors have run at the same
 time, do not roll back below the first per-corridor release.

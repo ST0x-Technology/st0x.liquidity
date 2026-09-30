@@ -167,19 +167,20 @@ Every chain the bot touches is declared under `[chains.<name>]` with a
 config carries a `[chains.<name>.trading]` table is a **hedged** chain: the bot
 runs a fill watcher against its order book, accounts its fills and hedges them
 with offsetting broker orders. Exactly one hedged chain must set
-`primary = true` on that table -- the **primary** chain anchors USDC rebalancing
-and the operator defaults (Base). The corridor table names the cash chain; until
-cash inventory is per corridor chain, the trigger, inventory and services of the
-cash path still run on the primary chain, so a corridor keyed by another chain
-is refused at load; equity rebalancing, hedging and vault balance polling happen
-on every hedged chain. Vault balance polling runs once per hedged chain, each on
+`primary = true` on that table -- the **primary** chain anchors the operator
+defaults (Base), and for now it is the only chain a cash corridor may be keyed
+by. The corridor table names the cash chain; the cash transfer executor runs on
+that chain's orderbook, vault, wallet and gas check. The cash inventory state is
+kept per corridor chain too: its trigger, inflight and busy marker address that
+chain's vault; equity rebalancing, hedging and vault balance polling happen on
+every hedged chain. Vault balance polling runs once per hedged chain, each on
 that chain's own Raindex service, its own chain-qualified vault registry and one
 pinned block, so every hedged chain's inventory slot is seeded and corrected. A
 secondary chain's fill updates that chain's own inventory slot: inventory is not
 fungible across chains. It schedules the symbol's equity check when that chain's
-listing rebalances the symbol, never the USDC check, which still runs on the
-primary chain; a hedge-only listing is prefunded and schedules neither. The
-distinction exists so that fill watching and inventory polling can go
+listing rebalances the symbol, and the USDC check only when that chain is the
+cash corridor's chain; a hedge-only listing is prefunded and schedules neither.
+The distinction exists so that fill watching and inventory polling can go
 multi-chain before rebalancing does: it names the chain the still-single-chain
 paths use. Equity rebalancing is already per chain (see Equity Allocation
 Planner); once the USDC corridors are too, `primary` shrinks to the operator's
@@ -1985,8 +1986,10 @@ rule fails startup with a named error:
 6. `hop = "relay"` on any chain: this build has no Relay hop.
 7. USDC mode enabled and a chain that is not disabled, whose cash table enables
    rebalancing, has no corridor table: there is no implicit corridor.
-8. A corridor chain other than the primary chain, until the inventory addresses
-   each corridor's chain.
+8. A corridor chain other than the primary chain, until the trigger checks every
+   corridor and the executors' Ethereum-tx checks use Ethereum's own depth. With
+   no corridor table the served corridor is Base via CCTP, so the primary must
+   then be Base.
 9. Transitional: `target` or `deviation` still set directly under
    `[rebalancing.usdc]` and different from the corridor's value. The released
    image reads those two keys and ignores the corridor tables, so both stay in
@@ -5898,16 +5901,19 @@ MarketMaking equity reading on one chain is ambiguous only for a transfer that
 moves that chain's slot: inflight in the slot, or an active mint or redemption
 on that chain. Hedging inflight does not record its destination, so it is
 attributed to the active mint's chain; with no active mint it is ambiguous on
-every chain. USDC rebalancing moves cash only between Hedging and the primary
-chain's vault, so Hedging USDC inflight, an active USDC rebalance, or a read
-fetched before the last completed rebalance makes only the primary chain's
-MarketMaking cash reading ambiguous, and inflight in one chain's slot makes only
-that chain's reading ambiguous. An open hedge order or a fill applied after a
-broker read makes only the Hedging reading ambiguous. The scopes are exactly
-Hedging and one MarketMaking scope per chain; wallet transit locations are not
-scopes. Suppression is read across every scope: any engaged venue or chain makes
-a transfer unsafe to size, and a matching poll at one scope cannot release
-another venue's or chain's membership.
+every chain. USDC rebalancing moves cash between Hedging and a corridor chain's
+vault, so an active USDC rebalance makes its corridor chain's MarketMaking cash
+reading ambiguous (one whose corridor cannot be read makes every chain's reading
+ambiguous), and so does a read on any chain fetched before the last completed
+rebalance, whose timestamp is one value for every chain. Hedging USDC inflight
+is attributed to the active Alpaca-outbound transfer's chain; with none known it
+is ambiguous on every chain. Inflight in one chain's slot makes only that
+chain's reading ambiguous. An open hedge order or a fill applied after a broker
+read makes only the Hedging reading ambiguous. The scopes are exactly Hedging
+and one MarketMaking scope per chain; wallet transit locations are not scopes.
+Suppression is read across every scope: any engaged venue or chain makes a
+transfer unsafe to size, and a matching poll at one scope cannot release another
+venue's or chain's membership.
 
 Guard-skip starvation is observable at both venues. The view logs a warning
 every five consecutive skipped equity snapshots for one Hedging symbol or one

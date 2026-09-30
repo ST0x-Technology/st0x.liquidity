@@ -323,9 +323,7 @@ impl Tokenizer for MockTokenizer {
             MockMintRequestOutcome::ApiError => {
                 Err(TokenizerError::Alpaca(AlpacaTokenizationError::ApiError {
                     status: StatusCode::INTERNAL_SERVER_ERROR,
-                    message: AlpacaApiErrorMessage::from_response(
-                        "mock mint request error".to_string(),
-                    ),
+                    message: AlpacaApiErrorMessage::for_test("mock mint request error".to_string()),
                     retry_after: None,
                 }))
             }
@@ -343,7 +341,7 @@ impl Tokenizer for MockTokenizer {
             MockMintLookupOutcome::ApiError => {
                 return Err(TokenizerError::Alpaca(AlpacaTokenizationError::ApiError {
                     status: StatusCode::INTERNAL_SERVER_ERROR,
-                    message: AlpacaApiErrorMessage::from_response(
+                    message: AlpacaApiErrorMessage::for_test(
                         "mock mint lookup failure".to_string(),
                     ),
                     retry_after: None,
@@ -459,7 +457,7 @@ impl Tokenizer for MockTokenizer {
             MockSendOutcome::ApiError => {
                 Err(TokenizerError::Alpaca(AlpacaTokenizationError::ApiError {
                     status: StatusCode::INTERNAL_SERVER_ERROR,
-                    message: AlpacaApiErrorMessage::from_response(
+                    message: AlpacaApiErrorMessage::for_test(
                         "mock send_for_redemption failure".to_string(),
                     ),
                     retry_after: None,
@@ -486,7 +484,7 @@ impl Tokenizer for MockTokenizer {
             Some(MockDetectionOutcome::ApiError) => {
                 Err(TokenizerError::Alpaca(AlpacaTokenizationError::ApiError {
                     status: StatusCode::INTERNAL_SERVER_ERROR,
-                    message: AlpacaApiErrorMessage::from_response(
+                    message: AlpacaApiErrorMessage::for_test(
                         "mock detection API error".to_string(),
                     ),
                     retry_after: None,
@@ -569,7 +567,7 @@ impl Tokenizer for MockTokenizer {
             MockListPendingOutcome::ApiError => {
                 return Err(TokenizerError::Alpaca(AlpacaTokenizationError::ApiError {
                     status: StatusCode::INTERNAL_SERVER_ERROR,
-                    message: AlpacaApiErrorMessage::from_response(
+                    message: AlpacaApiErrorMessage::for_test(
                         "mock list_pending_requests failure".to_string(),
                     ),
                     retry_after: None,

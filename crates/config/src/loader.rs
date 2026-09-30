@@ -1930,9 +1930,10 @@ fn validate_config(
 }
 
 /// Checks the cash corridors against the chain tables: each corridor's chain
-/// is configured, enabled, holds a cash vault and is the primary (the cash
-/// path still runs there), and with USDC mode enabled every chain whose cash
-/// rebalances has a corridor.
+/// is configured, enabled and holds a cash vault, and with USDC mode enabled
+/// every chain whose cash rebalances has a corridor. Each corridor runs on its
+/// own chain; the primary pin is only SPEC rule 8, until the trigger checks
+/// every corridor.
 fn validate_usdc_corridor_chains(
     usdc: &UsdcRebalancing,
     chains: &BTreeMap<Chain, ChainConfig>,
@@ -1969,6 +1970,17 @@ fn validate_usdc_corridor_chains(
         {
             return Err(CtxError::CorridorChainNotPrimary { chain, primary });
         }
+    }
+
+    // With no corridor table the served corridor is Base via CCTP.
+    if usdc.corridors.is_empty()
+        && let Some(primary) = primary
+        && primary != Chain::Base
+    {
+        return Err(CtxError::CorridorChainNotPrimary {
+            chain: Chain::Base,
+            primary,
+        });
     }
 
     if usdc.mode == OperationMode::Disabled {
@@ -3051,9 +3063,11 @@ pub enum CtxError {
          but [rebalancing.usdc.corridors.{chain}] is not set"
     )]
     CashRebalancingWithoutCorridor { chain: Chain },
+    /// `chain` is the corridor table's chain, or Base via CCTP when there is
+    /// no corridor table.
     #[error(
-        "[rebalancing.usdc.corridors.{chain}]: cash transfers still run on the primary \
-         chain, {primary}"
+        "the USDC corridor on {chain} ([rebalancing.usdc.corridors.{chain}], or Base via \
+         CCTP with no corridor table) must be on the primary chain, {primary}"
     )]
     CorridorChainNotPrimary { chain: Chain, primary: Chain },
     #[error(
@@ -9233,7 +9247,7 @@ mod tests {
     /// The shipped prod and staging configs run Robinhood Chain as a
     /// prefunded hedge-only secondary: fills on every listed equity are
     /// ingested and hedged, nothing is rebalanced, and Bebop is not mapped.
-    /// Both list the two launch equities; prod also lists PLBY and GRND.
+    /// Both list the two launch equities; prod also lists PLBY, GRND, and SNES.
     #[test]
     fn shipped_configs_hedge_robinhood_prefunded_without_rebalancing() {
         let orderbook = address!("0x37FC0EFec37D19f8A221aa4F8F7600C9ba2AcD20");
@@ -9267,6 +9281,13 @@ mod tests {
                 (
                     address!("0xdca06fddf5320870C8E9D0534aa102677C36bCc4"),
                     address!("0xB80Bd4D599EeBBF2851d4E7F5594918B82FF1823"),
+                ),
+            ),
+            (
+                Symbol::new("SNES").unwrap(),
+                (
+                    address!("0xF8bF43D61E4Cd2a5b5DfaD01BaC84693d7B95e51"),
+                    address!("0x06096908dBC38fc54509024674E4fd1891B5F7CA"),
                 ),
             ),
         ];
@@ -12290,8 +12311,8 @@ mod tests {
         );
     }
 
-    /// The cash path still runs on the primary chain, so a corridor elsewhere
-    /// would size and guard transfers off the wrong vault.
+    /// SPEC rule 8 pins the corridor to the primary until the trigger checks
+    /// every corridor.
     #[test]
     fn corridor_chain_other_than_primary_is_refused() {
         let mut config = prod_config();
@@ -12312,6 +12333,86 @@ mod tests {
                 CtxError::CorridorChainNotPrimary {
                     chain: Chain::Base,
                     primary: Chain::Robinhood,
+                }
+            ),
+            "got {error:?}"
+        );
+    }
+
+    /// The cash transfer executors run on the primary chain's orderbook and
+    /// vault, so the full config validation refuses an Ethereum primary with
+    /// a Base corridor.
+    #[test]
+    fn full_validation_refuses_a_corridor_off_the_primary_chain() {
+        let mut deployed: toml::Table =
+            toml::from_str(include_str!("../../../config/prod/st0x-hedge.toml")).unwrap();
+        let chains = deployed["chains"].as_table_mut().unwrap();
+        let mut ethereum_trading = chains["base"]["trading"].clone();
+        ethereum_trading
+            .as_table_mut()
+            .unwrap()
+            .insert("primary".to_string(), toml::Value::Boolean(true));
+        chains["base"]["trading"]
+            .as_table_mut()
+            .unwrap()
+            .insert("primary".to_string(), toml::Value::Boolean(false));
+        chains["ethereum"]
+            .as_table_mut()
+            .unwrap()
+            .insert("trading".to_string(), ethereum_trading);
+        let config = toml_file(&toml::to_string(&deployed).unwrap());
+
+        let error = Ctx::validate_config_file(config.path(), TokenFile::Skipped).unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                CtxError::CorridorChainNotPrimary {
+                    chain: Chain::Base,
+                    primary: Chain::Ethereum,
+                }
+            ),
+            "got {error:?}"
+        );
+    }
+
+    /// With no corridor table the served corridor is Base via CCTP, so a
+    /// primary other than Base is refused at load, not deep in startup.
+    #[test]
+    fn full_validation_refuses_a_non_base_primary_without_a_corridor_table() {
+        let mut deployed: toml::Table =
+            toml::from_str(include_str!("../../../config/prod/st0x-hedge.toml")).unwrap();
+        let chains = deployed["chains"].as_table_mut().unwrap();
+        let mut ethereum_trading = chains["base"]["trading"].clone();
+        ethereum_trading
+            .as_table_mut()
+            .unwrap()
+            .insert("primary".to_string(), toml::Value::Boolean(true));
+        chains["base"]["trading"]
+            .as_table_mut()
+            .unwrap()
+            .insert("primary".to_string(), toml::Value::Boolean(false));
+        chains["ethereum"]
+            .as_table_mut()
+            .unwrap()
+            .insert("trading".to_string(), ethereum_trading);
+        deployed["rebalancing"].as_table_mut().unwrap().insert(
+            "usdc".to_string(),
+            toml::Value::Table(toml::Table::from_iter([(
+                "mode".to_string(),
+                toml::Value::String("disabled".to_string()),
+            )])),
+        );
+        let config = toml_file(&toml::to_string(&deployed).unwrap());
+
+        let error = Ctx::validate_config_file(config.path(), TokenFile::Skipped).unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                CtxError::CorridorChainNotPrimary {
+                    chain: Chain::Base,
+                    primary: Chain::Ethereum,
                 }
             ),
             "got {error:?}"
