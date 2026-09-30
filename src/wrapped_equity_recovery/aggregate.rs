@@ -606,8 +606,6 @@ impl EventSourced for WrappedEquityRecovery {
             // terminal failure for a recovery that can still finish. The job
             // dispatches only to a transfer on the recovery's chain
             // (`validate_active_aggregate_quantity`), so the two match here.
-            // Its wallet snapshot and transfer lookup still read the primary
-            // chain's inventory until detection is per chain.
             (Self::Detected { chain, .. }, DispatchToMint { mint_id }) => {
                 services.equity.for_chain(*chain)?;
                 resume_mint_or_fail(&services.transfer, &mint_id, now).await

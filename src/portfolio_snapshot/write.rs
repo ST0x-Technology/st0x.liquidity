@@ -1939,13 +1939,13 @@ mod tests {
                 fetched_at,
             )
             .set_inflight_equity_at_location(
-                InFlightEquityLocation::BaseWalletUnwrapped,
+                InFlightEquityLocation::WalletUnwrapped(Chain::Base),
                 &zero_equity,
                 fetched_at,
                 fetched_at,
             )
             .set_inflight_equity_at_location(
-                InFlightEquityLocation::BaseWalletWrapped,
+                InFlightEquityLocation::WalletWrapped(Chain::Base),
                 &zero_equity,
                 fetched_at,
                 fetched_at,
@@ -3468,13 +3468,13 @@ mod tests {
             .record_equity_snapshot_watermarks(Venue::MarketMaking, Chain::Base, [&aapl()], now)
             .record_equity_snapshot_watermarks(Venue::Hedging, Chain::Base, [&aapl()], now)
             .set_inflight_equity_at_location(
-                InFlightEquityLocation::BaseWalletWrapped,
+                InFlightEquityLocation::WalletWrapped(Chain::Base),
                 &BTreeMap::from([(aapl(), wrapped_transit)]),
                 now,
                 now,
             )
             .set_inflight_equity_at_location(
-                InFlightEquityLocation::BaseWalletUnwrapped,
+                InFlightEquityLocation::WalletUnwrapped(Chain::Base),
                 &BTreeMap::from([(aapl(), unwrapped_transit)]),
                 now,
                 now,

@@ -281,6 +281,40 @@ impl TransferEquityToMarketMaking {
         Ok(())
     }
 
+    async fn restore_reservation_or_redrive(
+        &self,
+        ctx: &TransferEquityToMarketMakingCtx,
+    ) -> Result<bool, TransferEquityToMarketMakingJobError> {
+        if let Some((position_store, position_threshold)) = &ctx.position_authority
+            && !restore_position_reservation(
+                position_store,
+                &self.symbol,
+                *position_threshold,
+                EquityTransferReservationId::from_uuid(self.issuer_request_id.0),
+                None,
+            )
+            .await?
+        {
+            let retry_delay = equity_transfer_retry_delay(self.position_reservation_retry_attempts);
+            let mut retry = self.clone();
+            retry.position_reservation_retry_attempts =
+                self.position_reservation_retry_attempts.saturating_add(1);
+            warn!(
+                target: "rebalance",
+                symbol = %self.symbol,
+                issuer_request_id = %self.issuer_request_id,
+                position_reservation_retry_attempts = retry.position_reservation_retry_attempts,
+                retry_delay_secs = retry_delay.as_secs(),
+                "Hedge admission deferred equity mint reservation restoration; rescheduling"
+            );
+            let mut job_queue = ctx.job_queue.clone();
+            job_queue.push_with_delay(retry, retry_delay).await?;
+            return Ok(true);
+        }
+
+        Ok(false)
+    }
+
     async fn abandon_if_stopped_and_fresh(
         &self,
         ctx: &TransferEquityToMarketMakingCtx,
@@ -383,30 +417,7 @@ impl Job<TransferEquityToMarketMakingCtx> for TransferEquityToMarketMaking {
             return Ok(());
         }
 
-        if let Some((position_store, position_threshold)) = &ctx.position_authority
-            && !restore_position_reservation(
-                position_store,
-                &self.symbol,
-                *position_threshold,
-                EquityTransferReservationId::from_uuid(self.issuer_request_id.0),
-                None,
-            )
-            .await?
-        {
-            let retry_delay = equity_transfer_retry_delay(self.position_reservation_retry_attempts);
-            let mut retry = self.clone();
-            retry.position_reservation_retry_attempts =
-                self.position_reservation_retry_attempts.saturating_add(1);
-            warn!(
-                target: "rebalance",
-                symbol = %self.symbol,
-                issuer_request_id = %self.issuer_request_id,
-                position_reservation_retry_attempts = retry.position_reservation_retry_attempts,
-                retry_delay_secs = retry_delay.as_secs(),
-                "Hedge admission deferred equity mint reservation restoration; rescheduling"
-            );
-            let mut job_queue = ctx.job_queue.clone();
-            job_queue.push_with_delay(retry, retry_delay).await?;
+        if self.restore_reservation_or_redrive(ctx).await? {
             return Ok(());
         }
 
