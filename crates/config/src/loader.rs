@@ -31,11 +31,12 @@ use crate::InventoryAdapters;
 #[cfg(any(test, feature = "test-support"))]
 use crate::chain::HedgedChain;
 use crate::pricing::PricingSecrets;
+use crate::rebalancing::BaseCashVault;
 use crate::registry::{self, RegistryLive, RegistrySource, TokenFile};
 use crate::wallet::{SigningChain, SigningChains};
 use crate::{
-    AlertsConfig, AlertsCtx, AllocationConfigError, BaseCashVault, BotGasValuationConfig,
-    ChainConfig, ChainEquityAsset, ChainLifecycle, ChainRegistry, ChainSecrets, ExecutionThreshold,
+    AlertsConfig, AlertsCtx, AllocationConfigError, BotGasValuationConfig, ChainConfig,
+    ChainEquityAsset, ChainLifecycle, ChainRegistry, ChainSecrets, ExecutionThreshold,
     HedgingAssets, InvalidThresholdError, OperationMode, OrchestratorConfig, PricingConfig,
     PricingCtx, PricingCtxError, RebalancingConfig, RebalancingCtx, RebalancingCtxError,
     TelemetryConfig, TelemetryCtx, UsdcRebalancing,

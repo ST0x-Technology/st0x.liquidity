@@ -162,7 +162,7 @@ pub struct UsdcCorridorCtx {
 /// Whether Base is a hedged chain holding a cash vault. Base via CCTP is then
 /// served with no corridor table, so its in-flight transfers always recover.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BaseCashVault {
+pub(crate) enum BaseCashVault {
     Held,
     Absent,
 }
@@ -472,7 +472,7 @@ impl RebalancingCtx {
     /// trigger thresholds; wallet construction lives elsewhere.
     /// `base_cash_vault` says whether Base via CCTP is served with no
     /// corridor table.
-    pub fn new(
+    pub(crate) fn new(
         config: &RebalancingConfig,
         base_cash_vault: BaseCashVault,
     ) -> Result<Self, RebalancingCtxError> {
