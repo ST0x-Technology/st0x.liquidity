@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use st0x_evm::Chain;
 
 /// How USDC crosses between a corridor chain and the Ethereum hub.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HopKind {
     /// Circle CCTP burn and mint.
@@ -26,7 +26,7 @@ impl std::fmt::Display for HopKind {
 }
 
 /// The route a cash transfer takes between Alpaca and one chain's vault.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub enum UsdcCorridor {
     /// Chain vault <-> hop <-> Ethereum wallet <-> Alpaca.
     HubRouted { chain: Chain, hop: HopKind },

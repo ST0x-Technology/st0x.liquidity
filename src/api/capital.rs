@@ -26,6 +26,7 @@ use tracing::{error, info, warn};
 
 use st0x_bridge::Bridge;
 use st0x_bridge::cctp::{CctpBridge, CctpCtx};
+use st0x_bridge::corridor::UsdcCorridor;
 use st0x_config::{HedgedChain, OnchainWalletCtx};
 use st0x_evm::{Chain, Evm, IERC20, OpenChainErrorRegistry, Wallet};
 use st0x_finance::{HasZero, Positive, Usdc};
@@ -423,10 +424,12 @@ pub(super) async fn cctp_bridge(
     let handle = state.recovery.get().ok_or_else(recovery_not_ready)?;
     // Every other corridor move proves both wallets can pay gas first: the
     // burn spends the source wallet's gas, and the `complete-mint` it leads to
-    // spends the destination wallet's. Refused before anything is locked.
+    // spends the destination wallet's. The route only serves the Base and
+    // Ethereum CCTP corridor, whose check is keyed by Base. Refused before
+    // anything is locked.
     handle
         .rebalancing_service
-        .ensure_usdc_corridor_gas_ready()
+        .ensure_usdc_corridor_gas_ready(UsdcCorridor::BASE_CCTP.chain())
         .await
         .map_err(|failure| {
             warn!(

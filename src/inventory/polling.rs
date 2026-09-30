@@ -2063,11 +2063,13 @@ mod tests {
     use crate::equity_redemption::RedemptionAggregateId;
     use crate::inventory::projection::InventoryProjection;
     use crate::inventory::snapshot::InventorySnapshotEvent;
-    use crate::inventory::{BroadcastingInventory, InventoryDivergenceGate, InventoryView};
+    use crate::inventory::{
+        ActiveUsdcRebalance, BroadcastingInventory, InventoryDivergenceGate, InventoryView,
+    };
     use crate::offchain::order::OffchainOrderId;
     use crate::position::{PositionCommand, TradeId};
     use crate::test_utils::setup_test_db;
-    use crate::usdc_rebalance::UsdcRebalanceId;
+    use crate::usdc_rebalance::{RebalanceDirection, UsdcRebalanceId};
     use crate::vault_registry::{VaultRegistry, VaultRegistryCommand};
 
     fn test_order_id() -> OffchainOrderId {
@@ -7193,9 +7195,38 @@ mod tests {
 
     #[tokio::test]
     async fn cash_divergence_counter_frozen_while_usdc_rebalance_active() {
+        let id = UsdcRebalanceId(Uuid::new_v4());
         assert_cash_counter_frozen_while_busy(
-            |view| view.set_active_usdc_rebalance(UsdcRebalanceId(Uuid::new_v4())),
-            InventoryView::clear_active_usdc_rebalance,
+            |view| {
+                view.set_active_usdc_rebalance(
+                    id.clone(),
+                    ActiveUsdcRebalance::Known {
+                        chain: Chain::Base,
+                        direction: RebalanceDirection::AlpacaToBase,
+                    },
+                )
+            },
+            |view| view.clear_active_usdc_rebalance(&id),
+        )
+        .await;
+    }
+
+    /// A Robinhood-corridor conversion reserves no inflight yet; its marker
+    /// alone must freeze the broker cash counter.
+    #[tokio::test]
+    async fn cash_divergence_counter_frozen_during_a_non_primary_conversion() {
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        assert_cash_counter_frozen_while_busy(
+            |view| {
+                view.set_active_usdc_rebalance(
+                    id.clone(),
+                    ActiveUsdcRebalance::Known {
+                        chain: Chain::Robinhood,
+                        direction: RebalanceDirection::AlpacaToBase,
+                    },
+                )
+            },
+            |view| view.clear_active_usdc_rebalance(&id),
         )
         .await;
     }
@@ -7287,10 +7318,10 @@ mod tests {
         let threshold = 3u32;
         let now = Utc::now();
 
-        // Phantom cash at Hedging, guard armed by clear_usdc_inflight.
+        // Phantom cash at Hedging, guard armed by clear_usdc_inflight_at.
         let view = InventoryView::default()
             .with_usdc(Usdc::ZERO, phantom)
-            .clear_usdc_inflight(Venue::Hedging, now)
+            .clear_usdc_inflight_at(Chain::Base, Venue::Hedging, now)
             .unwrap();
         let inventory = broadcasting_inventory(view);
         let gate = Arc::new(InventoryDivergenceGate::default());
@@ -7348,7 +7379,7 @@ mod tests {
             let mut view = inventory.write().await;
             *view = view
                 .clone()
-                .clear_usdc_inflight(Venue::Hedging, Utc::now())
+                .clear_usdc_inflight_at(Chain::Base, Venue::Hedging, Utc::now())
                 .unwrap();
         }
 
@@ -7497,7 +7528,13 @@ mod tests {
         let mut view =
             InventoryView::default().with_usdc(Usdc::ZERO, Usdc::from_cents(50_000).unwrap());
         taint_from_restart(&mut view, &spym);
-        let view = view.set_active_usdc_rebalance(UsdcRebalanceId(Uuid::new_v4()));
+        let view = view.set_active_usdc_rebalance(
+            UsdcRebalanceId(Uuid::new_v4()),
+            ActiveUsdcRebalance::Known {
+                chain: Chain::Base,
+                direction: RebalanceDirection::AlpacaToBase,
+            },
+        );
         let inventory = broadcasting_inventory(view);
         let gate = Arc::new(InventoryDivergenceGate::default());
         let service = reconciling_service(
