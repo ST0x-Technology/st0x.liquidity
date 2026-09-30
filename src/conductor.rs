@@ -7011,9 +7011,9 @@ mod tests {
 
     use st0x_bridge::corridor::UsdcCorridor;
     use st0x_config::{
-        AllocationCtx, BotGasValuationConfig, ChainAssets, ChainEquities, ChainEquityAsset,
-        ExecutionThreshold, OperationMode, OrchestratorConfig, UsdcCorridorCtx,
-        create_test_ctx_with_order_owner, test_issuance_status_ctx,
+        AllocationCtx, BotGasValuationConfig, ChainAssets, ChainCashAsset, ChainEquities,
+        ChainEquityAsset, ChainRegistry, ExecutionThreshold, OperationMode, OrchestratorConfig,
+        UsdcCorridorCtx, create_test_ctx_with_order_owner, test_issuance_status_ctx,
     };
     use st0x_dto::Statement;
     use st0x_event_sorcery::{DomainEvent, Reconciler, StoreBuilder, test_store};
@@ -19657,6 +19657,67 @@ mod tests {
             cash: None,
         };
         trading
+    }
+
+    /// A corridor's transfers run on its own chain's orderbook, cash vault,
+    /// signer and confirmation depth, not the primary chain's.
+    #[test]
+    fn usdc_transfer_runs_on_the_corridor_chains_vault() {
+        let base_vault = B256::repeat_byte(0xba);
+        let mut ctx = create_test_ctx_with_order_owner(Address::ZERO);
+        ctx.chains = ChainRegistry::single_hedged_chain(ethereum_hedged_chain(
+            None,
+            OperationMode::Disabled,
+            ETHEREUM_INVENTORY,
+        ));
+        ctx.chains.insert_secondary(
+            HedgedChain::test()
+                .chain(Chain::Base)
+                .orderbook(Address::repeat_byte(0xb0))
+                .required_confirmations(3)
+                .assets(ChainAssets {
+                    equities: ChainEquities::default(),
+                    cash: Some(ChainCashAsset {
+                        vault_ids: vec![base_vault],
+                        rebalancing: OperationMode::Enabled,
+                        operational_limit: None,
+                    }),
+                })
+                .call(),
+        );
+        let wallet_ctx = OnchainWalletCtx::stub();
+        let tokenizations = [
+            (
+                Chain::Ethereum,
+                ChainRole::Primary,
+                wallet_ctx.ethereum_wallet(),
+            ),
+            (Chain::Base, ChainRole::Secondary, wallet_ctx.base_wallet()),
+        ]
+        .into_iter()
+        .map(|(chain, role, wallet)| {
+            let tokenization = ChainTokenization {
+                chain,
+                role,
+                wallet: wallet.clone(),
+                equity: EquityTokenization::HedgeOnly,
+            };
+            (chain, tokenization)
+        })
+        .collect::<BTreeMap<_, _>>();
+
+        let endpoints =
+            usdc_corridor_endpoints(&ctx, &tokenizations, UsdcCorridor::BASE_CCTP).unwrap();
+
+        let base = ctx.chains.hedged_chain(Chain::Base).unwrap();
+        assert_eq!(endpoints.corridor, UsdcCorridor::BASE_CCTP);
+        assert_eq!(endpoints.contracts, crate::onchain::raindex_contracts(base));
+        assert_eq!(endpoints.vault_id, RaindexVaultId(base_vault));
+        assert_eq!(
+            endpoints.chain_wallet.address(),
+            wallet_ctx.base_wallet().address()
+        );
+        assert_eq!(endpoints.required_confirmations, 3);
     }
 
     /// One set of tokenization services per hedged chain that rebalances
