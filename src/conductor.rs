@@ -2447,14 +2447,17 @@ fn build_rebalancing_raindex_service<Signer: Wallet + Clone>(
 }
 
 /// Resolves where `corridor`'s transfers run: the signer, orderbook
-/// contracts, first cash vault and confirmation depth of the primary chain.
+/// contracts, first cash vault and confirmation depth of the corridor's own
+/// chain, whatever the primary is.
 fn usdc_corridor_endpoints<Signer: Wallet + Clone>(
     ctx: &Ctx,
     tokenizations: &BTreeMap<Chain, ChainTokenization<Signer>>,
     corridor: UsdcCorridor,
 ) -> anyhow::Result<UsdcCorridorEndpoints<Signer>> {
-    let hedged = ctx.chains.primary();
-    let chain = hedged.chain;
+    let chain = corridor.chain();
+    let hedged = ctx.chains.hedged_chain(chain).with_context(|| {
+        format!("the {corridor} corridor needs a [chains.{chain}.trading] table")
+    })?;
     let tokenization = tokenizations
         .get(&chain)
         .with_context(|| format!("no tokenization services were built for {chain}"))?;
@@ -2776,11 +2779,13 @@ async fn confirm_chain_id<P: Provider>(provider: &P, chain: Chain) -> anyhow::Re
 /// stale artifact to revoke.
 async fn preflight_inventory_access<Signer: Wallet + Clone>(
     raindex_service: &RaindexService<Signer>,
-    ctx: &Ctx,
+    hedged: &HedgedChain,
 ) -> anyhow::Result<()> {
-    let InventoryMode::Managed { inventory } = ctx.chains.primary().inventory else {
+    let chain = hedged.chain;
+    let InventoryMode::Managed { inventory } = hedged.inventory else {
         debug!(
             target: "inventory",
+            %chain,
             "legacy inventory mode; skipping OPERATOR_ROLE preflight (no distinct inventory in play)",
         );
         return Ok(());
@@ -2795,6 +2800,7 @@ async fn preflight_inventory_access<Signer: Wallet + Clone>(
         )?;
     info!(
         target: "inventory",
+        %chain,
         %inventory,
         "OPERATOR_ROLE preflight passed",
     );
@@ -3456,7 +3462,7 @@ async fn build_primary_rebalancing_services<Signer: Wallet + Clone>(
         deps.ctx.issuance.api_key.header_value(),
     )?);
 
-    preflight_inventory_access(&raindex_service, &deps.ctx).await?;
+    preflight_inventory_access(&raindex_service, deps.ctx.chains.primary()).await?;
     preflight_tokenization(&deps.ctx, tokenizations, issuance_client.as_ref()).await?;
 
     let tokenizer = primary_equity.tokenizer.clone();
@@ -3589,16 +3595,27 @@ fn spawn_rebalancing_infrastructure<Signer: Wallet + Clone>(
             rebalancing_ctx.cctp_corridor.usdc_corridor(),
         )?;
 
-        let cash = deps.ctx.assets.cash.as_ref();
         let market_maker_wallet = usdc_endpoints.chain_wallet.address();
+        let usdc_raindex = Arc::new(RaindexService::new(
+            usdc_endpoints.chain_wallet.clone(),
+            usdc_endpoints.contracts,
+            market_maker_wallet,
+        ));
+        // The primary chain's inventory access is preflighted with its equity
+        // leg; a corridor on another chain gets its own check.
+        let corridor_chain = usdc_endpoints.corridor.chain();
+        if corridor_chain != primary_chain {
+            let hedged = deps.ctx.chains.hedged_chain(corridor_chain).with_context(|| {
+                format!("the USDC corridor chain {corridor_chain} has no [chains.{corridor_chain}.trading] table")
+            })?;
+            preflight_inventory_access(&usdc_raindex, hedged).await?;
+        }
+
+        let cash = deps.ctx.assets.cash.as_ref();
         let services = build_rebalancer_services(
             alpaca_auth,
             wallets,
-            Arc::new(RaindexService::new(
-                usdc_endpoints.chain_wallet.clone(),
-                usdc_endpoints.contracts,
-                market_maker_wallet,
-            )),
+            usdc_raindex,
             &rebalancing_ctx,
             usdc_endpoints.required_confirmations,
             deposit_send_required_confirmations(&deps.ctx.chains)
@@ -7781,7 +7798,7 @@ mod tests {
         let mut ctx = create_test_ctx_with_order_owner(Address::ZERO);
         ctx.chains.primary_mut().inventory = InventoryMode::Legacy;
 
-        preflight_inventory_access(&service, &ctx)
+        preflight_inventory_access(&service, ctx.chains.primary())
             .await
             .expect("legacy mode must skip the preflight and succeed");
     }
@@ -7799,7 +7816,7 @@ mod tests {
             inventory: Address::repeat_byte(0xAA),
         };
 
-        let error = preflight_inventory_access(&service, &ctx)
+        let error = preflight_inventory_access(&service, ctx.chains.primary())
             .await
             .expect_err("managed mode must attempt the role check and surface the failure");
 
