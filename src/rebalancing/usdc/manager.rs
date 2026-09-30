@@ -5079,8 +5079,13 @@ impl<
         let cqrs = Arc::clone(&self.cqrs);
         let prepare_lock = Arc::clone(&self.deposit_send_prepare);
         let task_id = id.clone();
+        // As in `submit_and_record_burn`: `PrepareDepositSend` can outlive a
+        // cancelled job, so the task continues the job's projection slot.
+        let projection_slot =
+            crate::conductor::projection_pause::projection_slot_for_detached_work().await;
 
         tokio::spawn(async move {
+            let _projection_slot = projection_slot;
             let _prepare_guard = prepare_lock.lock().await;
 
             if let Some(UsdcRebalance::Bridged { deposit_send, .. }) = cqrs.load(&task_id).await?

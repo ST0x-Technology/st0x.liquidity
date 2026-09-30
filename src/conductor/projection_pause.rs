@@ -6,8 +6,14 @@
 //! slot for their full write-capable operation, so a pause on the gate
 //! serializes a materialized-view rebuild against those projection writes.
 //!
-//! Operator HTTP write routes that call `Store::send` directly do not enter
-//! this gate.
+//! These writers do not enter this gate: operator HTTP write routes that call
+//! `Store::send` directly, the HTTP route detached tasks
+//! (`AppState::detached_tasks`, the in bot `process-tx`), and every write from
+//! another process, such as the operator CLI (`stox`), which opens the same
+//! SQLite database and folds projections through its own stores while the bot
+//! runs (`fail_usdc_transfer_command` and the repair commands, for example).
+//! The gate is process local, so a rebuild must exclude those writers
+//! separately.
 //!
 //! A job runs inside [`in_projection_slot`], so work it spawns and awaits takes
 //! a non parking continuation of the job's slot through
@@ -27,8 +33,9 @@ use std::time::Duration;
 use crate::quiesce::{self, InFlight, Quiesce, QuiesceGate};
 
 /// How long a pause waits for gated projection writers to drain before
-/// refusing. Coarse: a slot is held for the whole write-capable operation, so
-/// long-running work holds the gate for its duration.
+/// refusing. Coarse: a slot is held for the whole operation that can write. A
+/// job with no perform timeout claims an unbounded slot, so a pause refuses at
+/// once while one runs instead of parking every other writer for this long.
 const PROJECTION_QUIESCE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Process-global projection gate: the controller that pauses it and the gate
@@ -56,6 +63,15 @@ pub(crate) fn init_projection_gate() {
 pub(crate) async fn enter_projection_gate() -> Option<quiesce::InFlight> {
     match PROJECTION_GATE.get() {
         Some((_, gate)) => Some(gate.enter().await),
+        None => None,
+    }
+}
+
+/// [`enter_projection_gate`] for a job with no perform timeout, which can hold
+/// its slot for many minutes: while it does, a pause refuses at once.
+pub(crate) async fn enter_projection_gate_unbounded() -> Option<quiesce::InFlight> {
+    match PROJECTION_GATE.get() {
+        Some((_, gate)) => Some(gate.enter_unbounded().await),
         None => None,
     }
 }

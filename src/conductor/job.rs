@@ -1149,6 +1149,21 @@ where
     })
 }
 
+/// The projection slot a job runs in. A job with no perform timeout can run for
+/// many minutes, so it claims an unbounded slot: a rebuild refuses at once
+/// while one runs instead of parking every other job for the whole quiesce
+/// window.
+async fn enter_job_projection_slot<Ctx, J>() -> Option<crate::quiesce::InFlight>
+where
+    Ctx: Send + Sync + 'static,
+    J: Job<Ctx>,
+{
+    match J::PERFORM_TIMEOUT {
+        Some(_) => crate::conductor::projection_pause::enter_projection_gate().await,
+        None => crate::conductor::projection_pause::enter_projection_gate_unbounded().await,
+    }
+}
+
 /// Generic apalis handler -- test-support build.
 #[cfg(any(test, feature = "test-support"))]
 pub(crate) async fn work<Ctx, J>(
@@ -1166,7 +1181,7 @@ where
 {
     // Same projection gate and slot scope as the production handler, so tests
     // run jobs through the gate a view rebuild pauses.
-    let projection_slot = crate::conductor::projection_pause::enter_projection_gate().await;
+    let projection_slot = enter_job_projection_slot::<Ctx, J>().await;
     crate::conductor::projection_pause::in_projection_slot(
         projection_slot,
         injector.perform(
@@ -1202,7 +1217,7 @@ where
     // return, and scoped so work the job spawns and awaits continues this slot
     // instead of claiming a second one. Ungated until a conductor calls
     // `init_projection_gate`.
-    let projection_slot = crate::conductor::projection_pause::enter_projection_gate().await;
+    let projection_slot = enter_job_projection_slot::<Ctx, J>().await;
     crate::conductor::projection_pause::in_projection_slot(
         projection_slot,
         perform_bounded::<Ctx, J>(

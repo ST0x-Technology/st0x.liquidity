@@ -10,11 +10,17 @@
 //! [`QuiesceGuard`] lowers the flag on drop, so a caller cannot forget to resume
 //! on an error or panic path.
 //!
+//! An execution with no bound on its duration claims through
+//! [`QuiesceGate::enter_unbounded`]. A pause refuses at once while such a claim
+//! is held instead of raising the flag and parking every other worker for the
+//! whole timeout only to be refused anyway.
+//!
 //! This is the shared mechanism behind the USDC driver pause and the projection
 //! maintenance pause; each wraps a [`Quiesce`] with its own timeout and refusal
 //! type.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 use tokio::sync::{Mutex, OwnedMutexGuard, watch};
 
@@ -22,6 +28,8 @@ use tokio::sync::{Mutex, OwnedMutexGuard, watch};
 pub(crate) struct Quiesce {
     pause: watch::Sender<bool>,
     in_flight: watch::Receiver<usize>,
+    /// How many of the in flight claims have no bound on their duration.
+    unbounded: Arc<AtomicUsize>,
     /// Serializes pausers so one guard's resume cannot free the workers while
     /// another pauser is still mutating; held for the guard's lifetime.
     serialize: Arc<Mutex<()>>,
@@ -44,7 +52,8 @@ impl Quiesce {
     /// from under one another.
     ///
     /// Returns [`NotQuiesced`] when executions are still in flight after the
-    /// configured timeout, leaving the workers running. A caller that drops this
+    /// configured timeout, and at once when an unbounded claim is in flight
+    /// once the flag is raised, leaving the workers running. A caller that drops this
     /// future mid wait (a cancelled request) likewise leaves them running: the
     /// flag is lowered on the way out.
     pub(crate) async fn pause(&self) -> Result<QuiesceGuard, NotQuiesced> {
@@ -59,6 +68,14 @@ impl Quiesce {
             pause: self.pause.clone(),
             armed: true,
         };
+
+        // Read after raising the flag: an unbounded claim either counted
+        // before this read or sees the flag and backs off. Waiting for one
+        // would only park every other worker for the whole timeout.
+        if self.unbounded.load(Ordering::SeqCst) > 0 {
+            return Err(NotQuiesced);
+        }
+
         let mut in_flight = self.in_flight.clone();
         let drained = tokio::time::timeout(self.timeout, async {
             while *in_flight.borrow_and_update() > 0 {
@@ -124,6 +141,7 @@ impl Drop for QuiesceGuard {
 pub(crate) struct QuiesceGate {
     pause: watch::Receiver<bool>,
     in_flight: watch::Sender<usize>,
+    unbounded: Arc<AtomicUsize>,
 }
 
 impl QuiesceGate {
@@ -136,6 +154,16 @@ impl QuiesceGate {
     /// second read an execution could slip past a pause the controller had just
     /// confirmed.
     pub(crate) async fn enter(&self) -> InFlight {
+        self.enter_counted(None).await
+    }
+
+    /// [`Self::enter`] for an execution with no bound on its duration: while it
+    /// holds the claim, a pause refuses at once instead of waiting.
+    pub(crate) async fn enter_unbounded(&self) -> InFlight {
+        self.enter_counted(Some(Arc::clone(&self.unbounded))).await
+    }
+
+    async fn enter_counted(&self, unbounded: Option<Arc<AtomicUsize>>) -> InFlight {
         let mut pause = self.pause.clone();
         loop {
             while *pause.borrow_and_update() {
@@ -146,13 +174,11 @@ impl QuiesceGate {
                 }
             }
 
-            self.in_flight.send_modify(|count| *count += 1);
+            let claim = InFlight::claim(&self.in_flight, unbounded.clone());
             if !*pause.borrow() {
-                return InFlight {
-                    in_flight: self.in_flight.clone(),
-                };
+                return claim;
             }
-            self.in_flight.send_modify(|count| *count -= 1);
+            drop(claim);
         }
     }
 
@@ -167,15 +193,12 @@ impl QuiesceGate {
             return None;
         }
 
-        self.in_flight.send_modify(|count| *count += 1);
+        let claim = InFlight::claim(&self.in_flight, None);
         if *self.pause.borrow() {
-            self.in_flight.send_modify(|count| *count -= 1);
             return None;
         }
 
-        Some(InFlight {
-            in_flight: self.in_flight.clone(),
-        })
+        Some(claim)
     }
 
     /// Claims an in flight slot without checking the pause flag, for work an
@@ -185,10 +208,7 @@ impl QuiesceGate {
     /// detached work, and a pause waits for the work to finish exactly as it
     /// waits for an execution.
     pub(crate) fn hold(&self) -> InFlight {
-        self.in_flight.send_modify(|count| *count += 1);
-        InFlight {
-            in_flight: self.in_flight.clone(),
-        }
+        InFlight::claim(&self.in_flight, None)
     }
 
     /// Whether a pause is requested or held.
@@ -202,24 +222,38 @@ impl QuiesceGate {
 /// [`Quiesce::pause`] can wait for it to finish.
 pub(crate) struct InFlight {
     in_flight: watch::Sender<usize>,
+    /// Set when the claim has no bound on its duration.
+    unbounded: Option<Arc<AtomicUsize>>,
 }
 
 impl InFlight {
+    fn claim(in_flight: &watch::Sender<usize>, unbounded: Option<Arc<AtomicUsize>>) -> Self {
+        in_flight.send_modify(|count| *count += 1);
+        if let Some(unbounded) = &unbounded {
+            unbounded.fetch_add(1, Ordering::SeqCst);
+        }
+        Self {
+            in_flight: in_flight.clone(),
+            unbounded,
+        }
+    }
+
     /// Claims another slot for work that continues this admitted execution,
     /// such as a task it spawns and awaits, without checking the pause flag.
     /// Parking there would deadlock: a pause waits for this execution to drain,
     /// and this execution waits for the continuation. The continuation keeps a
-    /// pause waiting until it finishes, even if this token drops first.
+    /// pause waiting until it finishes, even if this token drops first. It is
+    /// unbounded when this claim is.
     pub(crate) fn continuation(&self) -> Self {
-        self.in_flight.send_modify(|count| *count += 1);
-        Self {
-            in_flight: self.in_flight.clone(),
-        }
+        Self::claim(&self.in_flight, self.unbounded.clone())
     }
 }
 
 impl Drop for InFlight {
     fn drop(&mut self) {
+        if let Some(unbounded) = &self.unbounded {
+            unbounded.fetch_sub(1, Ordering::SeqCst);
+        }
         self.in_flight.send_modify(|count| *count -= 1);
     }
 }
@@ -230,16 +264,19 @@ impl Drop for InFlight {
 pub(crate) fn quiesce(timeout: Duration) -> (Quiesce, QuiesceGate) {
     let (pause_tx, pause_rx) = watch::channel(false);
     let (in_flight_tx, in_flight_rx) = watch::channel(0);
+    let unbounded = Arc::new(AtomicUsize::new(0));
     (
         Quiesce {
             pause: pause_tx,
             in_flight: in_flight_rx,
+            unbounded: Arc::clone(&unbounded),
             serialize: Arc::new(Mutex::new(())),
             timeout,
         },
         QuiesceGate {
             pause: pause_rx,
             in_flight: in_flight_tx,
+            unbounded,
         },
     )
 }
@@ -318,9 +355,40 @@ mod tests {
         );
 
         drop(detached);
-        assert!(
-            control.pause().await.is_ok(),
-            "the pause proceeds once the detached work ends"
+        drop(
+            control
+                .pause()
+                .await
+                .expect("the pause proceeds once the detached work ends"),
+        );
+    }
+
+    /// An unbounded claim, or a continuation of one, refuses a pause at once
+    /// instead of parking every other worker for the whole timeout, and the
+    /// refusal leaves the workers running. Once every unbounded claim drops,
+    /// a pause is granted again.
+    #[tokio::test(start_paused = true)]
+    async fn an_unbounded_claim_refuses_the_pause_at_once() {
+        let (control, gate) = quiesce(TEST_TIMEOUT);
+        let unbounded = gate.enter_unbounded().await;
+        let continuation = unbounded.continuation();
+        drop(unbounded);
+
+        let started = tokio::time::Instant::now();
+        assert_eq!(control.pause().await.err(), Some(NotQuiesced));
+        assert_eq!(
+            started.elapsed(),
+            Duration::ZERO,
+            "the pause must refuse without waiting"
+        );
+        assert!(!gate.is_paused(), "a refused pause must lower the flag");
+
+        drop(continuation);
+        drop(
+            control
+                .pause()
+                .await
+                .expect("the pause is granted once every unbounded claim drops"),
         );
     }
 
@@ -393,12 +461,10 @@ mod tests {
 
         // The second pauser must wait for the first guard to drop.
         let mut second = std::pin::pin!(control.pause());
-        assert!(
-            tokio::time::timeout(Duration::from_millis(20), &mut second)
-                .await
-                .is_err(),
-            "a second pauser waits for the first guard"
-        );
+        match tokio::time::timeout(Duration::from_millis(20), &mut second).await {
+            Err(_) => {}
+            Ok(_) => panic!("a second pauser waits for the first guard"),
+        }
 
         drop(first);
         drop(second.await.unwrap());

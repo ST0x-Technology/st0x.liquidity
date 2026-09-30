@@ -6499,7 +6499,13 @@ impl RebalancingService {
         let id = id.clone();
         let symbol = symbol.clone();
         let reservation_id = EquityTransferReservationId::from_uuid(id.0);
+        // The release folds the Position projection after the caller's slot
+        // is gone, so the task holds its own: a continuation inside a job or
+        // the inventory poll, a fresh claim elsewhere.
+        let projection_slot =
+            crate::conductor::projection_pause::projection_slot_for_detached_work().await;
         drop(tokio::spawn(async move {
+            let _projection_slot = projection_slot;
             pending_restores.write().await.remove(&reservation_id);
             let Some(store) = store else {
                 warn!(
@@ -6535,7 +6541,13 @@ impl RebalancingService {
         let id = id.clone();
         let symbol = symbol.clone();
         let reservation_id = EquityTransferReservationId::from_uuid(id.0);
+        // The release folds the Position projection after the caller's slot
+        // is gone, so the task holds its own: a continuation inside a job or
+        // the inventory poll, a fresh claim elsewhere.
+        let projection_slot =
+            crate::conductor::projection_pause::projection_slot_for_detached_work().await;
         drop(tokio::spawn(async move {
+            let _projection_slot = projection_slot;
             pending_restores.write().await.remove(&reservation_id);
             let Some(store) = store else {
                 warn!(

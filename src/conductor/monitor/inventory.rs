@@ -15,7 +15,7 @@ use task_supervisor::{SupervisedTask, TaskResult};
 use tokio::time::MissedTickBehavior;
 use tracing::{info, warn};
 
-use crate::conductor::projection_pause::enter_projection_gate;
+use crate::conductor::projection_pause::{enter_projection_gate, in_projection_slot};
 use crate::inventory::Poller;
 use crate::quiesce;
 
@@ -26,9 +26,11 @@ pub(crate) struct InventoryMonitor {
 }
 
 impl InventoryMonitor {
+    /// Polls inside `projection_slot`'s scope, so detached work the poll's
+    /// reactors spawn continues this slot instead of parking behind a pause
+    /// that is waiting for the poll.
     async fn poll_once(&self, projection_slot: Option<quiesce::InFlight>) {
-        let result = self.poller.poll().await;
-        drop(projection_slot);
+        let result = in_projection_slot(projection_slot, self.poller.poll()).await;
 
         if let Err(error) = result {
             warn!(target: "inventory", ?error, "Inventory polling failed");
@@ -158,12 +160,10 @@ mod tests {
         };
         let handle = tokio::spawn(async move { monitor.run().await });
 
-        assert!(
-            timeout(Duration::from_millis(100), rx.recv())
-                .await
-                .is_err(),
-            "the monitor must not poll while a rebuild holds the projection gate"
-        );
+        match timeout(Duration::from_millis(100), rx.recv()).await {
+            Err(_) => {}
+            Ok(_) => panic!("the monitor must not poll while a rebuild holds the projection gate"),
+        }
 
         drop(rebuild);
         timeout(Duration::from_secs(5), rx.recv())
