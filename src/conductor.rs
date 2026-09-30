@@ -2487,6 +2487,27 @@ fn usdc_corridor_endpoints<Signer: Wallet + Clone>(
     })
 }
 
+/// The OPERATOR_ROLE preflight of a USDC corridor's chain, against that
+/// chain's own inventory with the corridor's signer. The primary chain is
+/// skipped: its equity leg's preflight already checked it.
+async fn preflight_usdc_corridor_inventory<Signer: Wallet + Clone>(
+    ctx: &Ctx,
+    endpoints: &UsdcCorridorEndpoints<Signer>,
+) -> anyhow::Result<()> {
+    let chain = endpoints.corridor.chain();
+    if chain == ctx.chains.primary().chain {
+        return Ok(());
+    }
+
+    let hedged = ctx.chains.hedged_chain(chain).with_context(|| {
+        format!("the USDC corridor chain {chain} has no [chains.{chain}.trading] table")
+    })?;
+    let wallet = &endpoints.chain_wallet;
+    let raindex = build_rebalancing_raindex_service(wallet, hedged, wallet.address());
+
+    preflight_inventory_access(&raindex, hedged).await
+}
+
 /// Startup preflight for the shared-inventory rebalancing path: the bot must
 /// hold `OPERATOR_ROLE` on the configured inventory or every rebalance
 /// deposit/withdraw reverts. Fails fast with a clear error rather than burning
@@ -3489,6 +3510,7 @@ fn spawn_rebalancing_infrastructure<Signer: Wallet + Clone>(
             &ethereum_wallet,
             rebalancing_ctx.cctp_corridor.usdc_corridor(),
         )?;
+        preflight_usdc_corridor_inventory(&deps.ctx, &usdc_endpoints).await?;
 
         let equity_transfer_services = EquityTransferServices {
             chains: chain_services,
@@ -3567,19 +3589,6 @@ fn spawn_rebalancing_infrastructure<Signer: Wallet + Clone>(
         rebalancing_service
             .recover_usdc_guard(&deps.pool, &built.usdc)
             .await?;
-
-        // The primary chain's inventory access is preflighted with its equity
-        // leg; a corridor on another chain gets its own check.
-        let corridor_chain = usdc_endpoints.corridor.chain();
-        if corridor_chain != primary_chain {
-            let hedged = deps.ctx.chains.hedged_chain(corridor_chain).with_context(|| {
-                format!("the USDC corridor chain {corridor_chain} has no [chains.{corridor_chain}.trading] table")
-            })?;
-            let chain_wallet = &usdc_endpoints.chain_wallet;
-            let raindex =
-                build_rebalancing_raindex_service(chain_wallet, hedged, chain_wallet.address());
-            preflight_inventory_access(&raindex, hedged).await?;
-        }
 
         let cash = deps.ctx.assets.cash.as_ref();
         let services = build_rebalancer_services(
@@ -20081,6 +20090,67 @@ mod tests {
             readiness.keys().copied().collect::<Vec<_>>(),
             vec![Chain::Base]
         );
+    }
+
+    fn mock_wallet_corridor_endpoints(
+        corridor: UsdcCorridor,
+    ) -> UsdcCorridorEndpoints<RawPrivateKeyWallet<impl alloy::providers::Provider + Clone>> {
+        let provider = ProviderBuilder::new().connect_mocked_client(Asserter::new());
+        let chain_wallet = RawPrivateKeyWallet::new(&B256::repeat_byte(0x11), provider, 1).unwrap();
+
+        UsdcCorridorEndpoints {
+            corridor,
+            chain_wallet,
+            contracts: RaindexContracts {
+                inventory: Address::repeat_byte(0xAA),
+                orderbook: Address::repeat_byte(0xBB),
+            },
+            vault_id: RaindexVaultId(B256::repeat_byte(0xba)),
+            gas_readiness: GasReadiness::always_ready_for_test(),
+        }
+    }
+
+    /// The primary chain's inventory access is checked with its equity leg,
+    /// so a corridor on the primary makes no call of its own. The wallet's
+    /// mock has no responses, so any call would fail.
+    #[tokio::test]
+    async fn usdc_corridor_preflight_skips_the_primary_chain() {
+        let mut ctx = create_test_ctx_with_order_owner(Address::ZERO);
+        ctx.chains.primary_mut().inventory = InventoryMode::Managed {
+            inventory: Address::repeat_byte(0xAA),
+        };
+
+        preflight_usdc_corridor_inventory(
+            &ctx,
+            &mock_wallet_corridor_endpoints(UsdcCorridor::BASE_CCTP),
+        )
+        .await
+        .unwrap();
+    }
+
+    /// A corridor off the primary is checked against its own chain's
+    /// inventory: a legacy-mode corridor chain skips the role read even
+    /// though the primary is managed, and a managed one reads it.
+    #[tokio::test]
+    async fn usdc_corridor_preflight_checks_a_non_primary_chains_own_inventory() {
+        let mut ctx = ethereum_primary_with_base_cash_ctx(B256::repeat_byte(0xba));
+        let endpoints = mock_wallet_corridor_endpoints(UsdcCorridor::BASE_CCTP);
+
+        let error = preflight_usdc_corridor_inventory(&ctx, &endpoints)
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("OPERATOR_ROLE"),
+            "a managed corridor chain must read the role, got: {error:#}"
+        );
+
+        let mut base = ctx.chains.hedged_chain(Chain::Base).unwrap().clone();
+        base.inventory = InventoryMode::Legacy;
+        ctx.chains.insert_secondary(base);
+
+        preflight_usdc_corridor_inventory(&ctx, &endpoints)
+            .await
+            .unwrap();
     }
 
     /// A corridor's USDC gas check reads its own chain's wallet and the
