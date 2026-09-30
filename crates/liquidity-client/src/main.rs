@@ -13,8 +13,8 @@ use std::process::ExitCode;
 
 use crate::auth::{AuthError, StaticToken, TokenSource};
 use crate::cli::{
-    Cli, Command, Debug, EquityTransferKind, PortfolioSnapshot, Position, Read,
-    RecheckTransferType, UsdcDirection,
+    Cctp, CctpSourceChain, Cli, Command, Debug, EquityTransferKind, PortfolioSnapshot, Position,
+    Read, RebuildableView, RecheckTransferType, UsdcDirection, View,
 };
 use crate::output::OutputError;
 use crate::target::Auth;
@@ -139,6 +139,15 @@ async fn execute(cli: Cli) -> Result<(), Failure> {
         .map_err(|error| Failure::Api { error, logging_url })
 }
 
+/// A single query parameter when `value` is given, none otherwise, so an
+/// omitted flag sends no query and the bot applies its default.
+fn optional_query(key: &str, value: Option<String>) -> Vec<(String, String)> {
+    value
+        .map(|value| (key.to_owned(), value))
+        .into_iter()
+        .collect()
+}
+
 async fn dispatch<A: TokenSource + Sync>(
     client: &Client<A>,
     command: Command,
@@ -175,10 +184,7 @@ async fn dispatch<A: TokenSource + Sync>(
                 RecheckTransferType::Usdc => "usdc_bridge",
             };
             let id = encode_segment(&id);
-            let params: Vec<(String, String)> = deposit_tx
-                .map(|tx| ("deposit_tx".to_owned(), tx))
-                .into_iter()
-                .collect();
+            let params = optional_query("deposit_tx", deposit_tx);
             client
                 .post(&format!("/transfers/recheck/{kind}/{id}"), &params)
                 .await?
@@ -295,12 +301,47 @@ async fn dispatch<A: TokenSource + Sync>(
         }
         Command::Debug(Debug::ProcessTx { tx_hash, chain }) => {
             let tx_hash = encode_segment(&tx_hash);
-            let params: Vec<(String, String)> = chain
-                .map(|chain| ("chain".to_owned(), chain.wire_name().to_owned()))
-                .into_iter()
-                .collect();
+            let params = optional_query("chain", chain.map(|chain| chain.wire_name().to_owned()));
             client
                 .post(&format!("/transactions/{tx_hash}/process"), &params)
+                .await?
+        }
+        Command::Debug(Debug::View(View::Rebuild(args))) => {
+            let view = match args.view {
+                RebuildableView::Position => "position",
+                RebuildableView::OffchainOrder => "offchain-order",
+                RebuildableView::VaultRegistry => "vault-registry",
+                RebuildableView::RebalanceTiming => "rebalance-timing",
+                RebuildableView::EquityTiming => "equity-timing",
+                RebuildableView::LifecycleFailure => "lifecycle-failure",
+                RebuildableView::PortfolioSnapshot => "portfolio-snapshot",
+            };
+            client
+                .post_json(
+                    &format!("/views/{view}/rebuild"),
+                    &wire::RebuildViewRequest {
+                        id: args.id,
+                        all: args.all,
+                    },
+                )
+                .await?
+        }
+        Command::Debug(Debug::Cctp(Cctp::CompleteMint {
+            burn_tx,
+            source_chain,
+        })) => {
+            let source_chain = match source_chain {
+                CctpSourceChain::Ethereum => "ethereum",
+                CctpSourceChain::Base => "base",
+            };
+            client
+                .post_json(
+                    "/cctp/complete-mint",
+                    &wire::CompleteCctpMintRequest {
+                        burn_tx,
+                        source_chain,
+                    },
+                )
                 .await?
         }
     };
@@ -318,9 +359,10 @@ mod tests {
     use super::{ApiError, dispatch};
     use crate::auth::{AuthError, StaticToken};
     use crate::cli::{
-        Command, Debug, EquityTransferKind, HedgedChain, PortfolioSnapshot, Position, Read,
-        ReadResource, RecheckTransferType, ReleaseHedgeArgs, ResourceArgs, SetMarkArgs,
-        SetPositionArgs, TradeEventsArgs, TransferEventsArgs, UsdcDirection,
+        Cctp, CctpSourceChain, Command, Debug, EquityTransferKind, HedgedChain, PortfolioSnapshot,
+        Position, Read, ReadResource, RebuildViewArgs, RebuildableView, RecheckTransferType,
+        ReleaseHedgeArgs, ResourceArgs, SetMarkArgs, SetPositionArgs, TradeEventsArgs,
+        TransferEventsArgs, UsdcDirection, View,
     };
     use crate::output::OutputError;
     use crate::transport::{Client, TransportError};
@@ -759,6 +801,65 @@ mod tests {
             request_line(&secondary),
             "POST /liquidity-write/transactions/0xabc/process?chain=ethereum HTTP/1.1"
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cctp_complete_mint_posts_the_burn_and_source_chain()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let request = request_for(Command::Debug(Debug::Cctp(Cctp::CompleteMint {
+            burn_tx: "0xabc".to_owned(),
+            source_chain: CctpSourceChain::Base,
+        })))
+        .await?;
+        assert_eq!(
+            request_line(&request),
+            "POST /liquidity-write/cctp/complete-mint HTTP/1.1"
+        );
+        assert_eq!(
+            request_body(&request),
+            serde_json::json!({ "burnTx": "0xabc", "sourceChain": "base" })
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn view_rebuild_posts_one_id() -> Result<(), Box<dyn std::error::Error>> {
+        let request = request_for(Command::Debug(Debug::View(View::Rebuild(
+            RebuildViewArgs {
+                view: RebuildableView::Position,
+                id: Some("AAPL".to_owned()),
+                all: false,
+            },
+        ))))
+        .await?;
+        assert_eq!(
+            request_line(&request),
+            "POST /liquidity-write/views/position/rebuild HTTP/1.1"
+        );
+        assert_eq!(
+            request_body(&request),
+            serde_json::json!({ "id": "AAPL", "all": false })
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn view_rebuild_posts_a_whole_model_without_an_id()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let request = request_for(Command::Debug(Debug::View(View::Rebuild(
+            RebuildViewArgs {
+                view: RebuildableView::RebalanceTiming,
+                id: None,
+                all: true,
+            },
+        ))))
+        .await?;
+        assert_eq!(
+            request_line(&request),
+            "POST /liquidity-write/views/rebalance-timing/rebuild HTTP/1.1"
+        );
+        assert_eq!(request_body(&request), serde_json::json!({ "all": true }));
         Ok(())
     }
 

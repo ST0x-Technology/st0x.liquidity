@@ -13688,6 +13688,68 @@ mod tests {
         );
     }
 
+    /// A terminal reservation release runs on a detached task that sleeps
+    /// before its `ReleaseEquityTransfer`, after the caller's projection slot
+    /// is gone. It carries a slot of its own, so a rebuild that asks for the
+    /// pause while the release is pending is granted only once the release
+    /// has folded the Position projection, never between the two.
+    #[tokio::test]
+    async fn rebuild_pause_waits_for_a_pending_terminal_reservation_release() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let trigger = make_trigger_with_inventory_and_registry(
+            InventoryView::default().with_equity(symbol.clone(), shares(50), shares(50)),
+            &symbol,
+        )
+        .await;
+        let projection = trigger
+            .position_projection
+            .read()
+            .await
+            .as_ref()
+            .cloned()
+            .unwrap();
+        let mint_id = issuer_request_id("rebuild-waits-for-release");
+        let reservation_id = EquityTransferReservationId::from_uuid(mint_id.0);
+        trigger
+            .recover_equity_transfer_reservations(&HashSet::from([(
+                symbol.clone(),
+                reservation_id,
+            )]))
+            .await
+            .unwrap();
+        assert!(
+            projection
+                .load(&symbol)
+                .await
+                .unwrap()
+                .unwrap()
+                .equity_transfer_reservation
+                .is_some(),
+            "the reservation must be held before the release is queued",
+        );
+
+        let maintenance = crate::conductor::projection_pause::init_projection_maintenance();
+        trigger
+            .queue_terminal_mint_reservation_release(&mint_id, &symbol)
+            .await;
+        let rebuild = tokio::time::timeout(Duration::from_secs(5), maintenance.pause())
+            .await
+            .expect("the rebuild must be granted once the release finishes")
+            .expect("an idle projection gate must quiesce");
+
+        assert_eq!(
+            projection
+                .load(&symbol)
+                .await
+                .unwrap()
+                .unwrap()
+                .equity_transfer_reservation,
+            None,
+            "the release must have folded before the rebuild is granted",
+        );
+        drop(rebuild);
+    }
+
     #[tokio::test]
     async fn terminal_reactor_cleanup_does_not_wait_for_deferred_restore_map() {
         let symbol = Symbol::new("AAPL").unwrap();

@@ -126,9 +126,9 @@ use crate::rebalancing::equity::{
 };
 use crate::rebalancing::trigger::{GUARD_GENERATION, GuardGeneration, GuardState};
 use crate::rebalancing::usdc::{
-    RecheckUsdcDeposit, RestoredDepositSends, TransferUsdcToHedging, TransferUsdcToHedgingCtx,
-    TransferUsdcToMarketMaking, TransferUsdcToMarketMakingCtx, UsdcDriverPause,
-    UsdcSettlementParams, deposit_send_required_confirmations,
+    RecheckUsdcDeposit, RecoverCctpMint, RestoredDepositSends, TransferUsdcToHedging,
+    TransferUsdcToHedgingCtx, TransferUsdcToMarketMaking, TransferUsdcToMarketMakingCtx,
+    UsdcDriverPause, UsdcSettlementParams, deposit_send_required_confirmations,
 };
 use crate::rebalancing::{
     BaseWallet, ChainRebalancingConfig, ChainWallets, EthereumWallet, RebalancerServices,
@@ -1012,6 +1012,7 @@ pub(crate) struct ServerHandles {
     pub(crate) recovery_cell: Arc<tokio::sync::OnceCell<crate::api::RecoveryHandle>>,
     pub(crate) process_tx_cell: Arc<tokio::sync::OnceCell<crate::api::ProcessTxHandle>>,
     pub(crate) pnl_ledger: Arc<PnlLedger>,
+    pub(crate) projection_maintenance: Arc<projection_pause::ProjectionMaintenance>,
 }
 
 async fn setup_trading_schedule(
@@ -1053,6 +1054,7 @@ impl Conductor {
             recovery_cell,
             process_tx_cell,
             pnl_ledger,
+            projection_maintenance,
         }: ServerHandles,
         shutdown_token: CancellationToken,
         startup_tokens: ConductorStartupTokens,
@@ -1132,6 +1134,7 @@ impl Conductor {
             service: rebalancing_service,
             recovery_transfer,
             usdc_recheck,
+            cctp_mint_recovery,
             usdc_driver_pause,
             usdc_store: recovery_usdc_store,
             wrapped_equity_recovery_store,
@@ -1284,6 +1287,7 @@ impl Conductor {
             wallet_polling,
             tokenizer,
             wrappers,
+            projection_maintenance,
             shutdown_token: shutdown_token.clone(),
             startup_token: startup_tokens.apalis_monitor,
             supervisor_startup: startup_tokens.supervisor,
@@ -1303,10 +1307,6 @@ impl Conductor {
             job_queue: resume_tokenization_queue.clone(),
             notifier: notifier.clone(),
         });
-
-        // Publish the process-global projection gate before spawning the apalis
-        // monitor so every worker execution is gated from its first poll.
-        crate::conductor::projection_pause::init_projection_gate();
 
         let conductor = builder::spawn()
             .context(conductor_ctx)
@@ -1363,6 +1363,7 @@ impl Conductor {
             redemption_store: recovery_redemption_store,
             rebalancing_service: recovery_service,
             usdc_recheck,
+            cctp_mint_recovery,
             usdc_driver_pause,
             usdc_store: recovery_usdc_store,
         });
@@ -1970,6 +1971,9 @@ struct RebalancingInfrastructure {
     /// Operator `transfer recheck` entry point for a failed USDC deposit,
     /// published on the recovery handle.
     usdc_recheck: Arc<dyn RecheckUsdcDeposit>,
+    /// Operator `cctp complete-mint` entry point, published on the recovery
+    /// handle.
+    cctp_mint_recovery: Arc<dyn RecoverCctpMint>,
     /// Operator pause control for the USDC driver, published on the recovery
     /// handle so a write route can quiesce the workers before it mutates.
     usdc_driver_pause: Arc<UsdcDriverPause>,
@@ -2025,6 +2029,7 @@ struct PositionAndRebalancing {
     service: Arc<RebalancingService>,
     recovery_transfer: Arc<CrossVenueEquityTransfer>,
     usdc_recheck: Arc<dyn RecheckUsdcDeposit>,
+    cctp_mint_recovery: Arc<dyn RecoverCctpMint>,
     usdc_driver_pause: Arc<UsdcDriverPause>,
     usdc_store: Arc<Store<UsdcRebalance>>,
     wrapped_equity_recovery_store: Arc<Store<WrappedEquityRecovery>>,
@@ -2243,6 +2248,7 @@ impl PositionAndRebalancing {
             service: infra.service,
             recovery_transfer: infra.recovery_transfer,
             usdc_recheck: infra.usdc_recheck,
+            cctp_mint_recovery: infra.cctp_mint_recovery,
             usdc_driver_pause: infra.usdc_driver_pause,
             usdc_store: infra.usdc_store,
             wrapped_equity_recovery_store: infra.wrapped_equity_recovery_store,
@@ -3667,6 +3673,7 @@ fn spawn_rebalancing_infrastructure<Signer: Wallet + Clone>(
             service: rebalancing_service,
             recovery_transfer,
             usdc_recheck: usdc_handles.recheck_deposit,
+            cctp_mint_recovery: usdc_handles.recover_cctp_mint,
             usdc_driver_pause,
             usdc_store: recovery_usdc_store,
             wrapped_equity_recovery_store,
