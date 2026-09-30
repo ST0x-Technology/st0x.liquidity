@@ -13,6 +13,7 @@ use chrono::{DateTime, Utc};
 use itertools::Itertools;
 use rain_math_float::Float;
 use sqlx::SqlitePool;
+use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::{debug, error, info, instrument, warn};
@@ -37,7 +38,9 @@ use st0x_float_macro::float;
 use st0x_raindex::{Raindex, RaindexError, RaindexService, RaindexVaultId};
 
 use super::driver_pause::UsdcDriverGate;
-use super::{DepositSendPending, UnresolvedDepositSend, UsdcTransferError};
+use super::{
+    DepositSendPending, UnresolvedDepositSend, UsdcTransferError, refuse_unserved_corridor,
+};
 use crate::bot_gas::{BotGasOperationCategory, BotGasReceiptCostEnqueuer, RecordBotGasReceiptCost};
 use crate::inventory::view::alpaca_to_base_usdc_capacity;
 use crate::native_gas::{ConfiguredGasReadiness, GasReadiness, TransferGasRoute};
@@ -92,7 +95,7 @@ const BURN_BROADCAST_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 ///
 /// Bundled together so constructors that require these values stay within
 /// the 8-argument clippy threshold.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct UsdcSettlementParams {
     pub attestation_retry_deadline: Duration,
     /// Upper bound on the retryable settlement wait after an Alpaca
@@ -742,35 +745,14 @@ impl<
     }
 
     /// Refuses, before any call, a transfer this service's corridor does not
-    /// carry: one recorded on another corridor, or a fresh one asking for
-    /// another. The transfer is left untouched. A recorded one that holds the
-    /// guard re-queues its job for a build that serves it and the rebalancing
-    /// service pages once (one that holds none ends its job); a fresh one
-    /// retries and dead-letters, which pages once.
+    /// carry (see [`refuse_unserved_corridor`]).
     fn require_served_corridor(
         &self,
         id: &UsdcRebalanceId,
         requested: UsdcCorridor,
         state: Option<&UsdcRebalance>,
     ) -> Result<(), UsdcTransferError> {
-        let served = self.corridor;
-        let error = match state {
-            Some(state) if state.corridor() != served => UsdcTransferError::CorridorMismatch {
-                id: id.clone(),
-                recorded: state.corridor(),
-                served,
-                holds_guard: state.holds_rebalance_guard(),
-            },
-            None if requested != served => UsdcTransferError::CorridorNotServed {
-                id: id.clone(),
-                requested,
-                served,
-            },
-            Some(_) | None => return Ok(()),
-        };
-
-        error!(target: "rebalance", %id, "{error}");
-        Err(error)
+        refuse_unserved_corridor(id, requested, &BTreeSet::from([self.corridor]), state)
     }
 
     /// Checks the Ethereum wallet against the credits of the open transfers in
@@ -6581,6 +6563,8 @@ pub enum DepositSendNotSuperseded {
     },
     #[error(transparent)]
     EthereumChainMissing(#[from] EthereumChainMissing),
+    #[error("no cash transfer service in this build serves the {corridor} corridor")]
+    CorridorNotServed { corridor: UsdcCorridor },
     /// Reading the event store for another transfer's claim on the
     /// superseding tx failed -- transient, retry later.
     #[error("could not check whether another transfer recorded superseding tx {superseding}")]
@@ -6754,9 +6738,12 @@ pub(crate) trait RecheckUsdcDeposit: Send + Sync + 'static {
         operator_deposit_tx: Option<TxHash>,
     ) -> Result<RecheckOutcome, UsdcRecheckError>;
 
+    /// `corridor` is the transfer's recorded corridor, which picks the
+    /// service that checks it.
     async fn verify_deposit_send_superseded(
         &self,
         id: &UsdcRebalanceId,
+        corridor: UsdcCorridor,
         prepared: &PreparedTransaction,
         superseding_tx: Option<TxHash>,
     ) -> Result<(), DepositSendNotSuperseded>;
@@ -6806,6 +6793,7 @@ where
     async fn verify_deposit_send_superseded(
         &self,
         id: &UsdcRebalanceId,
+        _corridor: UsdcCorridor,
         prepared: &PreparedTransaction,
         superseding_tx: Option<TxHash>,
     ) -> Result<(), DepositSendNotSuperseded> {
@@ -6886,6 +6874,9 @@ pub(crate) enum CctpMintRecoveryError {
         #[source]
         source: CctpError,
     },
+    /// No service in this build carries the corridor a CCTP burn runs on.
+    #[error("no cash transfer service in this build serves the {corridor} corridor")]
+    CorridorNotServed { corridor: UsdcCorridor },
 }
 
 impl CctpMintRecoveryError {
@@ -16863,6 +16854,7 @@ mod tests {
         let error = manager
             .verify_deposit_send_superseded(
                 &UsdcRebalanceId(Uuid::new_v4()),
+                UsdcCorridor::BASE_CCTP,
                 &prepared,
                 Some(cancel),
             )
@@ -16885,6 +16877,7 @@ mod tests {
         manager
             .verify_deposit_send_superseded(
                 &UsdcRebalanceId(Uuid::new_v4()),
+                UsdcCorridor::BASE_CCTP,
                 &prepared,
                 Some(cancel),
             )
@@ -16931,6 +16924,7 @@ mod tests {
         let error = manager
             .verify_deposit_send_superseded(
                 &UsdcRebalanceId(Uuid::new_v4()),
+                UsdcCorridor::BASE_CCTP,
                 &prepared,
                 Some(cancel),
             )
@@ -17002,6 +16996,7 @@ mod tests {
             let error = manager
                 .verify_deposit_send_superseded(
                     &UsdcRebalanceId(Uuid::new_v4()),
+                    UsdcCorridor::BASE_CCTP,
                     &prepared,
                     Some(superseding),
                 )
@@ -17101,6 +17096,7 @@ mod tests {
         let error = manager
             .verify_deposit_send_superseded(
                 &UsdcRebalanceId(Uuid::new_v4()),
+                UsdcCorridor::BASE_CCTP,
                 &prepared,
                 Some(fee_bumped),
             )
@@ -17178,6 +17174,7 @@ mod tests {
         manager
             .verify_deposit_send_superseded(
                 &UsdcRebalanceId(Uuid::new_v4()),
+                UsdcCorridor::BASE_CCTP,
                 &prepared,
                 Some(other_send),
             )
@@ -17213,6 +17210,7 @@ mod tests {
         let error = manager
             .verify_deposit_send_superseded(
                 &UsdcRebalanceId(Uuid::new_v4()),
+                UsdcCorridor::BASE_CCTP,
                 &prepared,
                 Some(cancel),
             )
@@ -27362,9 +27360,9 @@ mod tests {
                 error,
                 UsdcTransferError::CorridorMismatch {
                     recorded: ROBINHOOD_RELAY,
-                    served: UsdcCorridor::BASE_CCTP,
+                    ref served,
                     ..
-                }
+                } if *served == BTreeSet::from([UsdcCorridor::BASE_CCTP])
             ),
             "got {error:?}"
         );
@@ -27408,9 +27406,9 @@ mod tests {
                 error,
                 UsdcTransferError::CorridorMismatch {
                     recorded: ROBINHOOD_RELAY,
-                    served: UsdcCorridor::BASE_CCTP,
+                    ref served,
                     ..
-                }
+                } if *served == BTreeSet::from([UsdcCorridor::BASE_CCTP])
             ),
             "got {error:?}"
         );
@@ -27444,9 +27442,9 @@ mod tests {
                 error,
                 UsdcTransferError::CorridorNotServed {
                     requested: ROBINHOOD_RELAY,
-                    served: UsdcCorridor::BASE_CCTP,
+                    ref served,
                     ..
-                }
+                } if *served == BTreeSet::from([UsdcCorridor::BASE_CCTP])
             ),
             "got {error:?}"
         );
@@ -27482,9 +27480,9 @@ mod tests {
                 *error,
                 UsdcTransferError::CorridorMismatch {
                     recorded: ROBINHOOD_RELAY,
-                    served: UsdcCorridor::BASE_CCTP,
+                    ref served,
                     ..
-                }
+                } if *served == BTreeSet::from([UsdcCorridor::BASE_CCTP])
             ),
             "got {error:?}"
         );

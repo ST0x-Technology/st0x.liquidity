@@ -127,10 +127,9 @@ use crate::rebalancing::equity::{
 };
 use crate::rebalancing::trigger::{GUARD_GENERATION, GuardGeneration, GuardState};
 use crate::rebalancing::usdc::{
-    MarketMakingUsdcEndpoints, RecheckUsdcDeposit, RecoverCctpMint, RestoredDepositSends,
-    TransferUsdcToHedging, TransferUsdcToHedgingCtx, TransferUsdcToMarketMaking,
-    TransferUsdcToMarketMakingCtx, UsdcDriverPause, UsdcSettlementParams,
-    deposit_send_required_confirmations,
+    RecheckUsdcDeposit, RecoverCctpMint, RestoredDepositSends, TransferUsdcToHedging,
+    TransferUsdcToHedgingCtx, TransferUsdcToMarketMaking, TransferUsdcToMarketMakingCtx,
+    UsdcDriverPause, UsdcSettlementParams, deposit_send_required_confirmations,
 };
 use crate::rebalancing::{
     BaseWallet, ChainRebalancingConfig, ChainWallets, EthereumWallet, RebalancerServices,
@@ -3084,14 +3083,14 @@ async fn build_query_frameworks(
     manifest.build(pool.clone(), equity_transfer_services).await
 }
 
-/// Builds the Alpaca wallet client, instrumented broker, and CCTP/raindex
-/// services `RebalancerServices` needs. The telemetry wrap happens here (not
-/// at a lower layer) so rebalancer Alpaca calls emit broker dependency
-/// samples, mirroring the hedge executor's own wrapping.
+/// Builds the Alpaca wallet client and instrumented broker
+/// `RebalancerServices` needs, alongside the Ethereum hub wallet. The
+/// telemetry wrap happens here (not at a lower layer) so rebalancer Alpaca
+/// calls emit broker dependency samples, mirroring the hedge executor's own
+/// wrapping.
 async fn build_rebalancer_services<Signer: Wallet + Clone>(
     alpaca_auth: &AlpacaBrokerApiCtx,
-    wallets: ChainWallets<Signer>,
-    raindex_service: Arc<RaindexService<Signer>>,
+    ethereum_wallet: Signer,
     rebalancing_ctx: &RebalancingCtx,
     required_confirmations: u64,
     ethereum_required_confirmations: Option<u64>,
@@ -3109,12 +3108,11 @@ async fn build_rebalancer_services<Signer: Wallet + Clone>(
         telemetry,
     );
 
-    RebalancerServices::new(
+    Ok(RebalancerServices::new(
         broker,
         alpaca_wallet,
-        wallets,
+        ethereum_wallet,
         rebalancing_ctx.cctp_corridor,
-        raindex_service,
         UsdcSettlementParams {
             attestation_retry_deadline: rebalancing_ctx.attestation_retry_deadline,
             settlement_retry_deadline: rebalancing_ctx.settlement_retry_deadline,
@@ -3128,8 +3126,7 @@ async fn build_rebalancer_services<Signer: Wallet + Clone>(
             #[cfg(feature = "test-support")]
             message_transmitter: rebalancing_ctx.message_transmitter,
         },
-    )
-    .map_err(Into::into)
+    ))
 }
 
 /// The vault-registry lookup for one hedged chain. Every id is qualified by
@@ -3572,12 +3569,6 @@ fn spawn_rebalancing_infrastructure<Signer: Wallet + Clone>(
             .recover_usdc_guard(&deps.pool, &built.usdc)
             .await?;
 
-        let market_maker_wallet = usdc_endpoints.chain_wallet.address();
-        let usdc_raindex = Arc::new(RaindexService::new(
-            usdc_endpoints.chain_wallet.clone(),
-            usdc_endpoints.contracts,
-            market_maker_wallet,
-        ));
         // The primary chain's inventory access is preflighted with its equity
         // leg; a corridor on another chain gets its own check.
         let corridor_chain = usdc_endpoints.corridor.chain();
@@ -3585,14 +3576,16 @@ fn spawn_rebalancing_infrastructure<Signer: Wallet + Clone>(
             let hedged = deps.ctx.chains.hedged_chain(corridor_chain).with_context(|| {
                 format!("the USDC corridor chain {corridor_chain} has no [chains.{corridor_chain}.trading] table")
             })?;
-            preflight_inventory_access(&usdc_raindex, hedged).await?;
+            let chain_wallet = &usdc_endpoints.chain_wallet;
+            let raindex =
+                build_rebalancing_raindex_service(chain_wallet, hedged, chain_wallet.address());
+            preflight_inventory_access(&raindex, hedged).await?;
         }
 
         let cash = deps.ctx.assets.cash.as_ref();
         let services = build_rebalancer_services(
             alpaca_auth,
-            wallets,
-            usdc_raindex,
+            ethereum_wallet,
             &rebalancing_ctx,
             usdc_endpoints.required_confirmations,
             deposit_send_required_confirmations(&deps.ctx.chains)
@@ -3605,22 +3598,16 @@ fn spawn_rebalancing_infrastructure<Signer: Wallet + Clone>(
         )
         .await?;
 
-        // Cloned before `built.usdc` is consumed below: the transfer handles
-        // take one handle and the recovery handle needs another for the
-        // `fail-usdc-transfer` route.
-        let recovery_usdc_store = built.usdc.clone();
-        let usdc_handles = services.into_usdc_transfer_handles(
-            MarketMakingUsdcEndpoints::new(
-                usdc_endpoints.corridor,
-                market_maker_wallet,
-                usdc_endpoints.vault_id,
-            ),
-            built.usdc,
-            deps.pool.clone(),
-            bot_gas_enqueuer.clone(),
-            usdc_endpoints.gas_readiness.clone(),
-            usdc_driver_gate.clone(),
-        );
+        // `built.usdc` stays with the recovery handle for the
+        // `fail-usdc-transfer` route; the transfers take their own handles.
+        let recovery_usdc_store = built.usdc;
+        let usdc_handles = services.into_usdc_corridor_transfers(
+            vec![usdc_endpoints],
+            &recovery_usdc_store,
+            &deps.pool,
+            &bot_gas_enqueuer,
+            &usdc_driver_gate,
+        )?;
 
         // Before any job or the startup approvals can send from the Ethereum
         // wallet: a signed deposit send persisted before the restart keeps its

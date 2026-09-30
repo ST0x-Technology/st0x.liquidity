@@ -36607,7 +36607,7 @@ mod tests {
             Err(UsdcTransferError::CorridorMismatch {
                 id: id.clone(),
                 recorded: ROBINHOOD_RELAY,
-                served: UsdcCorridor::BASE_CCTP,
+                served: BTreeSet::from([UsdcCorridor::BASE_CCTP]),
                 holds_guard: true,
             })
         }

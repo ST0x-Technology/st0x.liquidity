@@ -2455,7 +2455,7 @@ async fn check_signed_deposit_send_superseded(
     };
 
     usdc_recheck
-        .verify_deposit_send_superseded(id, prepared, superseding_tx)
+        .verify_deposit_send_superseded(id, rebalance.corridor(), prepared, superseding_tx)
         .await
         .map_err(|error| {
             warn!(?error, %id, "Refused to reconcile a USDC transfer with a signed deposit send");
@@ -2481,7 +2481,8 @@ fn deposit_send_not_superseded_response(
         | DepositSendNotSuperseded::SupersedingTxPaidTheDepositAddress { .. }
         | DepositSendNotSuperseded::UnreadableDepositSend { .. }
         | DepositSendNotSuperseded::SendSignedByAnotherWallet { .. }
-        | DepositSendNotSuperseded::EthereumChainMissing(_) => (
+        | DepositSendNotSuperseded::EthereumChainMissing(_)
+        | DepositSendNotSuperseded::CorridorNotServed { .. } => (
             StatusCode::CONFLICT,
             format!("Transfer {id}: refusing to reconcile: {error}"),
         ),
@@ -4082,6 +4083,7 @@ pub(crate) fn routes(ops_api: Option<&OpsApiConfig>) -> Router<AppState> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
     use std::net::SocketAddr;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -7418,6 +7420,7 @@ mod tests {
         async fn verify_deposit_send_superseded(
             &self,
             _id: &UsdcRebalanceId,
+            _corridor: UsdcCorridor,
             _prepared: &st0x_evm::PreparedTransaction,
             _superseding_tx: Option<TxHash>,
         ) -> Result<(), DepositSendNotSuperseded> {
@@ -7734,7 +7737,7 @@ mod tests {
             UsdcTransferError::CorridorMismatch {
                 id: id.clone(),
                 recorded: relay,
-                served: UsdcCorridor::BASE_CCTP,
+                served: BTreeSet::from([UsdcCorridor::BASE_CCTP]),
                 holds_guard: true,
             },
         )));
@@ -7748,7 +7751,7 @@ mod tests {
             UsdcTransferError::CorridorNotServed {
                 id,
                 requested: relay,
-                served: UsdcCorridor::BASE_CCTP,
+                served: BTreeSet::from([UsdcCorridor::BASE_CCTP]),
             },
         )));
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
@@ -8331,6 +8334,7 @@ mod tests {
         async fn verify_deposit_send_superseded(
             &self,
             _id: &UsdcRebalanceId,
+            _corridor: UsdcCorridor,
             _prepared: &st0x_evm::PreparedTransaction,
             superseding_tx: Option<TxHash>,
         ) -> Result<(), DepositSendNotSuperseded> {

@@ -2,24 +2,24 @@
 
 use alloy::providers::RootProvider;
 use sqlx::SqlitePool;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::hash::BuildHasher;
 use std::sync::Arc;
 use tracing::info;
 
 use st0x_bridge::cctp::{CctpBridge, CctpCorridor, CctpCtx, CctpError};
-use st0x_bridge::corridor::UsdcCorridor;
+use st0x_bridge::corridor::{HopKind, UsdcCorridor};
 use st0x_config::{ChainEquityAsset, OnchainWalletCtx};
 use st0x_event_sorcery::Store;
-use st0x_evm::Wallet;
+use st0x_evm::{Chain, Wallet};
 use st0x_execution::{AlpacaWalletService, EmptySymbolError, Symbol};
 use st0x_raindex::{RaindexContracts, RaindexService, RaindexVaultId};
 use st0x_wrapper::WrappedEquity;
 
 use super::usdc::{
-    CrossVenueCashTransfer, MarketMakingUsdcEndpoints, RecheckUsdcDeposit, RecoverCctpMint,
-    RestorePreparedDepositSends, ResumeAlpacaToBase, ResumeBaseToAlpaca, UsdcDriverGate,
-    UsdcSettlementParams,
+    CorridorTransfer, CrossVenueCashTransfer, MarketMakingUsdcEndpoints, RecheckUsdcDeposit,
+    RecoverCctpMint, RestorePreparedDepositSends, ResumeAlpacaToBase, ResumeBaseToAlpaca,
+    UsdcCorridorTransfers, UsdcDriverGate, UsdcSettlementParams,
 };
 use crate::bot_gas::BotGasReceiptCostEnqueuer;
 use crate::native_gas::GasReadiness;
@@ -33,6 +33,8 @@ pub(crate) enum SpawnRebalancerError {
     Cctp(#[from] Box<CctpError>),
     #[error("failed to create wrapper service: {0}")]
     Wrapper(#[from] EmptySymbolError),
+    #[error("no cash transfer service can be built for the {corridor} corridor")]
+    UnwiredCorridor { corridor: UsdcCorridor },
 }
 
 /// Adapts the config-layer equity asset map to the narrow per-symbol token pairs
@@ -109,105 +111,137 @@ impl ChainWallets<Arc<dyn Wallet<Provider = RootProvider>>> {
     }
 }
 
-/// External service clients for rebalancing operations.
-///
-/// Holds connections to Alpaca APIs, CCTP bridge, and vault services.
-/// Providers for both chains are obtained from the wallets on `RebalancingCtx`.
+/// External service clients for rebalancing operations: the Alpaca broker
+/// and wallet every cash corridor shares, the Ethereum hub wallet and the
+/// CCTP pair a CCTP corridor bridges over.
 pub(crate) struct RebalancerServices<Signer: Wallet> {
     broker: InstrumentedAlpacaBroker,
     wallet: Arc<AlpacaWalletService>,
-    cctp: Arc<CctpBridge<Signer, Signer>>,
-    raindex: Arc<RaindexService<Signer>>,
+    ethereum_wallet: Signer,
+    cctp_corridor: CctpCorridor,
+    /// Settlement tuning shared by every corridor; each corridor's service
+    /// replaces `required_confirmations` with its own chain's depth.
     settlement: UsdcSettlementParams,
 }
 
-impl<Signer: Wallet + Clone> RebalancerServices<Signer> {
-    /// Creates the services needed for rebalancing.
-    ///
-    /// RaindexService is passed in rather than created here because it is
-    /// needed for CQRS framework initialization in the conductor, which
-    /// must happen before this constructor is called.
+impl<Signer: Wallet + Clone + 'static> RebalancerServices<Signer> {
     pub(crate) fn new(
         broker: InstrumentedAlpacaBroker,
         wallet: Arc<AlpacaWalletService>,
-        wallets: ChainWallets<Signer>,
-        corridor: CctpCorridor,
-        raindex: Arc<RaindexService<Signer>>,
+        ethereum_wallet: Signer,
+        cctp_corridor: CctpCorridor,
         settlement: UsdcSettlementParams,
-    ) -> Result<Self, SpawnRebalancerError> {
-        let ChainWallets {
-            ethereum: EthereumWallet(ethereum_wallet),
-            base: BaseWallet(base_wallet),
-        } = wallets;
-        let cctp = Arc::new(
-            CctpBridge::try_from_ctx(CctpCtx {
-                corridor,
-                ethereum_wallet,
-                base_wallet,
-                #[cfg(feature = "test-support")]
-                circle_api_base: settlement.circle_api_base.clone(),
-                #[cfg(feature = "test-support")]
-                token_messenger: settlement.token_messenger,
-                #[cfg(feature = "test-support")]
-                message_transmitter: settlement.message_transmitter,
-            })
-            .map_err(|error| SpawnRebalancerError::Cctp(Box::new(error)))?,
-        );
-
-        Ok(Self {
+    ) -> Self {
+        Self {
             broker,
             wallet,
-            cctp,
-            raindex,
+            ethereum_wallet,
+            cctp_corridor,
             settlement,
-        })
+        }
     }
 
-    /// Builds the cross-venue cash transfer and returns its trait-erased
-    /// resume entry points for the conductor's apalis job ctxs.
+    /// Builds one cross-venue cash transfer per served corridor, each on its
+    /// own chain's orderbook, vault, wallet, confirmations and gas check, and
+    /// returns the trait-erased entry points of the dispatcher that routes
+    /// every call to the transfer's corridor.
     ///
     /// The `UsdcRebalance` CQRS framework is created in the conductor and
     /// passed here to ensure single-instance initialization with all
     /// required query processors.
-    pub(crate) fn into_usdc_transfer_handles(
+    pub(crate) fn into_usdc_corridor_transfers(
         self,
-        market_making_endpoints: MarketMakingUsdcEndpoints,
-        usdc: Arc<Store<UsdcRebalance>>,
-        pool: SqlitePool,
-        bot_gas_enqueuer: BotGasReceiptCostEnqueuer,
-        gas_readiness: Arc<GasReadiness>,
-        driver_gate: UsdcDriverGate,
-    ) -> UsdcTransferResumeHandles {
-        let usdc = Arc::new(
-            CrossVenueCashTransfer::new(
-                self.broker,
-                self.wallet,
-                self.cctp,
-                self.raindex,
-                usdc,
-                market_making_endpoints,
-                &self.settlement,
-                bot_gas_enqueuer,
-            )
-            .with_gas_readiness(gas_readiness)
-            .with_credit_ledger(pool)
-            .with_driver_gate(driver_gate),
-        );
+        corridors: Vec<UsdcCorridorEndpoints<Signer>>,
+        usdc: &Arc<Store<UsdcRebalance>>,
+        pool: &SqlitePool,
+        bot_gas_enqueuer: &BotGasReceiptCostEnqueuer,
+        driver_gate: &UsdcDriverGate,
+    ) -> Result<UsdcTransferResumeHandles, SpawnRebalancerError> {
+        let mut by_corridor = BTreeMap::new();
+        for endpoints in corridors {
+            let corridor = endpoints.corridor;
+            let chain_wallet = endpoints.chain_wallet.clone();
+            let bridge = self.corridor_bridge(corridor, chain_wallet.clone())?;
+            let raindex = Arc::new(RaindexService::new(
+                chain_wallet.clone(),
+                endpoints.contracts,
+                chain_wallet.address(),
+            ));
+            let settlement = UsdcSettlementParams {
+                required_confirmations: endpoints.required_confirmations,
+                ..self.settlement.clone()
+            };
+            let transfer: Arc<dyn CorridorTransfer> = Arc::new(
+                CrossVenueCashTransfer::new(
+                    self.broker.clone(),
+                    self.wallet.clone(),
+                    bridge,
+                    raindex,
+                    usdc.clone(),
+                    MarketMakingUsdcEndpoints::new(
+                        corridor,
+                        chain_wallet.address(),
+                        endpoints.vault_id,
+                    ),
+                    &settlement,
+                    bot_gas_enqueuer.clone(),
+                )
+                .with_gas_readiness(endpoints.gas_readiness)
+                .with_credit_ledger(pool.clone())
+                .with_driver_gate(driver_gate.clone()),
+            );
 
-        let resume_base_to_alpaca: Arc<dyn ResumeBaseToAlpaca> = usdc.clone();
-        let recheck_deposit: Arc<dyn RecheckUsdcDeposit> = usdc.clone();
-        let restore_deposit_sends: Arc<dyn RestorePreparedDepositSends> = usdc.clone();
-        let recover_cctp_mint: Arc<dyn RecoverCctpMint> = usdc.clone();
-        let resume_alpaca_to_base: Arc<dyn ResumeAlpacaToBase> = usdc;
+            info!(target: "rebalance", %corridor, "Cash transfer service built");
+            by_corridor.insert(corridor, transfer);
+        }
 
-        info!(target: "rebalance", "Rebalancing infrastructure initialized");
+        let transfers = Arc::new(UsdcCorridorTransfers::new(by_corridor, usdc.clone()));
 
-        UsdcTransferResumeHandles {
-            resume_base_to_alpaca,
-            resume_alpaca_to_base,
-            recheck_deposit,
-            restore_deposit_sends,
-            recover_cctp_mint,
+        Ok(UsdcTransferResumeHandles {
+            resume_base_to_alpaca: transfers.clone(),
+            resume_alpaca_to_base: transfers.clone(),
+            recheck_deposit: transfers.clone(),
+            restore_deposit_sends: transfers.clone(),
+            recover_cctp_mint: transfers,
+        })
+    }
+
+    /// The bridge `corridor` hops over. Only Base via CCTP is wired: the
+    /// CCTP pair is Ethereum and Base, so any other corridor refuses startup
+    /// by name.
+    fn corridor_bridge(
+        &self,
+        corridor: UsdcCorridor,
+        chain_wallet: Signer,
+    ) -> Result<Arc<CctpBridge<Signer, Signer>>, SpawnRebalancerError> {
+        match corridor {
+            UsdcCorridor::HubRouted {
+                chain: Chain::Base,
+                hop: HopKind::Cctp,
+            } => {
+                let bridge = CctpBridge::try_from_ctx(CctpCtx {
+                    corridor: self.cctp_corridor,
+                    ethereum_wallet: self.ethereum_wallet.clone(),
+                    base_wallet: chain_wallet,
+                    #[cfg(feature = "test-support")]
+                    circle_api_base: self.settlement.circle_api_base.clone(),
+                    #[cfg(feature = "test-support")]
+                    token_messenger: self.settlement.token_messenger,
+                    #[cfg(feature = "test-support")]
+                    message_transmitter: self.settlement.message_transmitter,
+                })
+                .map_err(|error| SpawnRebalancerError::Cctp(Box::new(error)))?;
+
+                Ok(Arc::new(bridge))
+            }
+            UsdcCorridor::HubRouted {
+                chain: Chain::Base,
+                hop: HopKind::Relay,
+            }
+            | UsdcCorridor::HubRouted {
+                chain: Chain::Ethereum | Chain::HyperEvm | Chain::Robinhood,
+                hop: HopKind::Cctp | HopKind::Relay,
+            } => Err(SpawnRebalancerError::UnwiredCorridor { corridor }),
         }
     }
 }
@@ -429,7 +463,7 @@ mod tests {
         server: &httpmock::MockServer,
     ) -> (
         RebalancerServices<RawPrivateKeyWallet<BaseProvider>>,
-        RebalancingCtx,
+        RawPrivateKeyWallet<BaseProvider>,
     ) {
         let anvil = spawn_anvil(Anvil::new());
         let base_provider = ProviderBuilder::new().connect_http(anvil.endpoint_url());
@@ -447,44 +481,19 @@ mod tests {
 
         let (broker, wallet) = make_mock_alpaca_services(server, account_id).await;
 
-        let cctp = Arc::new(
-            CctpBridge::try_from_ctx(CctpCtx {
-                corridor: CctpCorridor::ethereum_base().unwrap(),
-                ethereum_wallet,
-                base_wallet: base_wallet.clone(),
-                #[cfg(feature = "test-support")]
-                circle_api_base: st0x_bridge::cctp::CIRCLE_API_BASE.to_string(),
-                #[cfg(feature = "test-support")]
-                token_messenger: st0x_bridge::cctp::TOKEN_MESSENGER_V2,
-                #[cfg(feature = "test-support")]
-                message_transmitter: st0x_bridge::cctp::MESSAGE_TRANSMITTER_V2,
-            })
-            .unwrap(),
-        );
-
-        let owner = base_wallet.address();
-        let raindex = Arc::new(RaindexService::new(
-            base_wallet,
-            RaindexContracts {
-                inventory: TEST_ORDERBOOK,
-                orderbook: TEST_ORDERBOOK,
-            },
-            owner,
-        ));
-
         let services = RebalancerServices {
             broker,
             wallet,
-            cctp,
-            raindex,
+            ethereum_wallet,
+            cctp_corridor: CctpCorridor::ethereum_base().unwrap(),
             settlement: make_test_settlement(&rebalancing_ctx),
         };
 
-        (services, rebalancing_ctx)
+        (services, base_wallet)
     }
 
     #[tokio::test]
-    async fn new_maps_ethereum_wallet_to_ethereum_cctp_endpoint() {
+    async fn base_cctp_bridge_maps_ethereum_wallet_to_ethereum_cctp_endpoint() {
         let server = MockServer::start();
         let ethereum_anvil = spawn_anvil(Anvil::new());
         let base_anvil = spawn_anvil(Anvil::new());
@@ -521,43 +530,45 @@ mod tests {
 
         let rebalancing_ctx = make_ctx();
         let (broker, wallet) = make_mock_alpaca_services(&server, account_id).await;
-        let wallets = ChainWallets {
-            ethereum: EthereumWallet(ethereum_wallet),
-            base: BaseWallet(base_wallet.clone()),
-        };
-        let raindex = Arc::new(RaindexService::new(
-            base_wallet,
-            RaindexContracts {
-                inventory: TEST_ORDERBOOK,
-                orderbook: TEST_ORDERBOOK,
-            },
-            Address::random(),
-        ));
-
         let services = RebalancerServices::new(
             broker,
             wallet,
-            wallets,
+            ethereum_wallet,
             rebalancing_ctx.cctp_corridor,
-            raindex,
             make_test_settlement(&rebalancing_ctx),
-        )
-        .unwrap();
+        );
+
+        let bridge = services
+            .corridor_bridge(UsdcCorridor::BASE_CCTP, base_wallet)
+            .unwrap();
 
         assert_eq!(
-            services
-                .cctp
-                .ethereum_usdc_balance(ethereum_holder)
-                .await
-                .unwrap(),
+            bridge.ethereum_usdc_balance(ethereum_holder).await.unwrap(),
             expected_balance
         );
     }
 
+    fn corridor_endpoints(
+        corridor: UsdcCorridor,
+        chain_wallet: RawPrivateKeyWallet<BaseProvider>,
+    ) -> UsdcCorridorEndpoints<RawPrivateKeyWallet<BaseProvider>> {
+        UsdcCorridorEndpoints {
+            corridor,
+            chain_wallet,
+            contracts: RaindexContracts {
+                inventory: TEST_ORDERBOOK,
+                orderbook: TEST_ORDERBOOK,
+            },
+            vault_id: RaindexVaultId(B256::ZERO),
+            required_confirmations: 0,
+            gas_readiness: crate::native_gas::GasReadiness::always_ready_for_test(),
+        }
+    }
+
     #[tokio::test]
-    async fn into_usdc_transfer_handles_produces_resume_handles() {
+    async fn into_usdc_corridor_transfers_produces_resume_handles() {
         let server = MockServer::start();
-        let (services, _ctx) = make_services_with_mock_wallet(&server).await;
+        let (services, base_wallet) = make_services_with_mock_wallet(&server).await;
 
         let pool = crate::test_utils::setup_test_db().await;
         let usdc_store = Arc::new(test_store(pool.clone(), ()));
@@ -568,17 +579,47 @@ mod tests {
             recheck_deposit: _,
             restore_deposit_sends: _,
             recover_cctp_mint: _,
-        } = services.into_usdc_transfer_handles(
-            MarketMakingUsdcEndpoints::new(
-                UsdcCorridor::BASE_CCTP,
-                Address::random(),
-                RaindexVaultId(B256::ZERO),
+        } = services
+            .into_usdc_corridor_transfers(
+                vec![corridor_endpoints(UsdcCorridor::BASE_CCTP, base_wallet)],
+                &usdc_store,
+                &pool,
+                &BotGasReceiptCostEnqueuer::Disabled,
+                &UsdcDriverGate::unpaused(),
+            )
+            .unwrap();
+    }
+
+    /// A corridor with no bridge wired refuses startup by name rather than
+    /// building a transfer that could never move cash.
+    #[tokio::test]
+    async fn corridor_without_a_bridge_refuses_startup_by_name() {
+        let server = MockServer::start();
+        let (services, chain_wallet) = make_services_with_mock_wallet(&server).await;
+        let corridor = UsdcCorridor::HubRouted {
+            chain: Chain::Robinhood,
+            hop: HopKind::Relay,
+        };
+
+        let pool = crate::test_utils::setup_test_db().await;
+        let usdc_store = Arc::new(test_store(pool.clone(), ()));
+
+        let Err(error) = services.into_usdc_corridor_transfers(
+            vec![corridor_endpoints(corridor, chain_wallet)],
+            &usdc_store,
+            &pool,
+            &BotGasReceiptCostEnqueuer::Disabled,
+            &UsdcDriverGate::unpaused(),
+        ) else {
+            panic!("a corridor without a bridge must be refused");
+        };
+
+        assert!(
+            matches!(
+                error,
+                SpawnRebalancerError::UnwiredCorridor { corridor: refused } if refused == corridor
             ),
-            usdc_store,
-            pool,
-            BotGasReceiptCostEnqueuer::Disabled,
-            crate::native_gas::GasReadiness::always_ready_for_test(),
-            UsdcDriverGate::unpaused(),
+            "got {error:?}"
         );
     }
 }
