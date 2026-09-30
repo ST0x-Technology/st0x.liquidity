@@ -37,7 +37,7 @@ inventory_divergence_threshold = 10
 # Durable-read deadline (seconds) for reconciling open hedge order gates by
 # order ID at startup (st0x.liquidity#1316). Required since that merge; its
 # absence crash-looped the staging bot from 10:24 UTC on 2026-09-01.
-hedge_order_gate_reconciliation_timeout_secs = 10
+hedge_order_gate_reconciliation_timeout_secs = 60
 
 [pricing]
 # The pricing plane on Cloud Run for THIS environment. Auth is the VM's

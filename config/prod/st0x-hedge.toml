@@ -36,10 +36,11 @@ apalis_finished_job_cleanup_interval_secs = 3600
 # Hedging balance for a symbol before the poller escalates a forced snapshot
 # reconciliation.
 inventory_divergence_threshold = 10
-# Master schema field, unknown to v1.10.0 (the 2026-09-04 crash loop was
-# this line landing in production ahead of the image; the release-time
-# validator now refuses that). Ships with the next version tag.
-hedge_order_gate_reconciliation_timeout_secs = 10
+# Durable-read deadline (seconds) for reconciling open hedge order gates.
+# Covers loading every Position before each offchain inventory poll; after a
+# Position SCHEMA_VERSION bump discards snapshots, idle symbols replay full
+# histories (~11s for the slowest on 2026-09-30), and 10 aborted every poll.
+hedge_order_gate_reconciliation_timeout_secs = 60
 
 [pricing]
 # The pricing plane on Cloud Run for THIS environment. Auth is the VM's
