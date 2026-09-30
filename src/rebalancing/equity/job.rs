@@ -1057,15 +1057,19 @@ impl Job<TransferEquityToHedgingCtx> for TransferEquityToHedging {
                      Raindex vault withdrawal is unresolved, and no live job remains to drive \
                      it. Check the withdrawal onchain. If it mined successfully, do not \
                      reconcile: run `stox transfer resume --kind equity` or restart the bot so \
-                     a new resume confirms it. If it mined and reverted, it moved nothing: \
-                     reconcile it (`stox transfer reconcile --kind redemption --id {}`). \
-                     Otherwise it will not confirm at its current fee but can still mine when \
-                     fees drop, so cancel it first: send a 0-value self-transfer from the bot \
-                     wallet at its nonce, with fees above the withdrawal's, and wait for that \
-                     to confirm. Only then settle the equity by hand and reconcile with \
-                     `--superseding-tx <cancel tx>`, which releases its reservation and the \
+                     a new resume confirms it. If it mined and reverted, it used its nonce and \
+                     moved nothing: once it has the required confirmations, settle the equity \
+                     by hand and reconcile without --superseding-tx \
+                     (`stox transfer reconcile --kind redemption --id {} --reason <reason>`). \
+                     If it has no receipt, it will not confirm at its current fee but can \
+                     still mine when fees drop, so cancel it first: send a 0-value \
+                     self-transfer from the bot wallet at its nonce, with fees above the \
+                     withdrawal's, and wait for the required confirmations. Only then settle \
+                     the equity by hand and reconcile \
+                     (`stox transfer reconcile --kind redemption --id {} --reason <reason> \
+                     --superseding-tx <cancel tx>`), which releases its reservation and the \
                      wallet's hold on its nonce.",
-                    self.aggregate_id, self.symbol, self.aggregate_id,
+                    self.aggregate_id, self.symbol, self.aggregate_id, self.aggregate_id,
                 );
                 if let Err(alert_error) = ctx.notifier.notify(&message).await {
                     warn!(

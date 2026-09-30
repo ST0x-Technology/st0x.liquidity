@@ -938,14 +938,16 @@ pub enum TransferCommand {
         /// `deposit-credited-offline`; for `mint`/`redemption` it is free text.
         #[arg(short = 'r', long = "reason")]
         reason: AuditReason,
-        /// usdc and redemption only, required for a USDC transfer with a signed
-        /// deposit send or a redemption with a signed vault withdrawal, and
-        /// refused for any other: the tx that took that signed tx's nonce (the
-        /// 0-value self-transfer cancel). The bot checks that it is from the
-        /// bot wallet on that chain, at the nonce, not the signed tx itself,
-        /// has the required confirmations, and did not do what the signed tx
-        /// does: pay the deposit address USDC (unless another transfer recorded
-        /// it as its own deposit send), or call the contract the withdrawal
+        /// usdc and redemption only. Required for a USDC transfer with a signed
+        /// deposit send, and for a redemption whose signed vault withdrawal has
+        /// no canonical receipt (a confirmed reverted withdrawal reconciles
+        /// without it); refused for a mint and for a USDC transfer or redemption
+        /// with no signed tx. It is the tx that took that signed tx's nonce (the
+        /// 0-value self-transfer cancel). The bot checks that it is from the bot
+        /// wallet on that chain, at the nonce, not the signed tx itself, has the
+        /// required confirmations, and did not do what the signed tx does: pay
+        /// the deposit address USDC (unless another transfer recorded it as its
+        /// own deposit send), or successfully call the contract the withdrawal
         /// calls.
         #[arg(long = "superseding-tx")]
         superseding_tx: Option<TxHash>,

@@ -477,8 +477,9 @@ transfer should be marked resolved rather than left in `Failed`.
 
 `transfer fail --kind redemption` refuses a redemption with a signed vault
 withdrawal (`VaultWithdrawSubmitting` or `VaultWithdrawSubmitted`), because the
-withdrawal can still mine. Cancel the withdrawal and reconcile the redemption
-instead (see the `--kind redemption` notes below).
+withdrawal can still mine. Check the withdrawal on chain and reconcile the
+redemption instead (see the `--kind redemption` notes below): a reverted
+withdrawal needs no cancel; one with no receipt must be cancelled first.
 
 ### Withdrawal poll inconclusive (Alpaca->Base stuck at `Withdrawing`)
 
@@ -773,15 +774,18 @@ stox transfer reconcile --kind redemption --id <redemption-aggregate-id> \
     bot so that a new resume confirms it.
   - Mined and reverted: it used the nonce and moved nothing. Once it has the
     chain's required confirmations (`[chains.<chain>] required_confirmations`),
-    reconcile directly with no `--superseding-tx`.
-  - Pending, or dropped: do **not** settle the equity or reconcile yet. Cancel
-    it: from the bot wallet on the redemption's chain, send a 0-value transfer
-    to the wallet itself at the withdrawal's nonce, with `maxFeePerGas` and
-    `maxPriorityFeePerGas` at least 10% above the withdrawal's. Never fee bump
-    the withdrawal itself (the same call at a higher fee): that withdraws the
-    vault, and reconcile refuses it. Wait until the cancel has the chain's
-    required confirmations. If the withdrawal mined instead, follow the cases
-    above. Then settle the equity by hand and run
+    settle the equity by hand and reconcile with no `--superseding-tx`:
+    `stox transfer reconcile --kind redemption --id <id> --reason <reason>`.
+  - No receipt (pending, or dropped): do **not** settle the equity or reconcile
+    yet. Cancel it: from the bot wallet on the redemption's chain, send a
+    0-value transfer to the wallet itself at the withdrawal's nonce, with
+    `maxFeePerGas` and `maxPriorityFeePerGas` at least 10% above the
+    withdrawal's. Never fee bump the withdrawal itself (the same call at a
+    higher fee): that withdraws the vault, and reconcile refuses it. Wait until
+    the cancel has the chain's required confirmations. If the withdrawal mined
+    instead, follow the cases above. Then settle the equity by hand (the same
+    settlement as for a reverted withdrawal: nothing moved in either case) and
+    run
     `stox transfer reconcile --kind redemption --id <id> --reason <reason> --superseding-tx <cancel>`
     (or, against the live bot,
     `st0x-liquidity-client --env <env> debug reconcile-equity redemption <id> --reason <reason> --superseding-tx <cancel>`;

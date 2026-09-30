@@ -3833,9 +3833,11 @@ state: a redemption stuck before tokens leave custody takes `FailTransfer`, a
 and a `Pending` redemption takes `RejectRedemption { reason }`. In every case
 the replayed `Failed` state materializes the operator's reason. The verb refuses
 a redemption with a signed vault withdrawal (`VaultWithdrawSubmitting` or
-`VaultWithdrawSubmitted`): the withdrawal can still mine, so the operator
-cancels it and reconciles the redemption instead, which requires the chain proof
-described under operator reconciliation.
+`VaultWithdrawSubmitted`), because the withdrawal can still mine. Instead the
+operator checks it on chain: one that mined successfully went through and is not
+reconciled; one that mined and reverted is reconciled with no cancel once
+confirmed; one with no receipt is cancelled first and then reconciled. Reconcile
+requires the chain proof described under operator reconciliation.
 
 Vault withdrawal submission is an irreversible uncertainty boundary. The
 orchestrator prepares and signs the transaction, then the pure aggregate
@@ -6138,30 +6140,33 @@ retried on later sweep ticks). The release is ownership-checked and idempotent.
 It does not cancel the signed withdrawal, so reconcile of a redemption holding
 one is refused unless the chain proves the withdrawal can never land. A signed
 withdrawal stuck below the market fee will not confirm at that fee but can still
-mine when fees drop, so the operator first cancels it: a higher fee 0-value
-self-transfer from the bot wallet at its nonce, mined. Only then does the
-operator settle the equity by hand and reconcile, naming the cancel
-(`--superseding-tx`, the API's `supersedingTx`). The bot reads the chain of the
-redemption, through that chain's raindex and bot wallet, and accepts only one of
-two proofs, each with that chain's required confirmations. Either the withdrawal
-itself mined and reverted, which used its nonce and moved nothing, so no
-replacement is named. Or the withdrawal has no receipt and the named tx is a
+mine when fees drop. If the withdrawal mined and reverted, the operator waits
+for its required confirmations, settles the equity by hand and reconciles with
+no `--superseding-tx`. If it has no receipt, the operator first cancels it: a
+higher fee 0-value self-transfer from the bot wallet at its nonce, mined. Only
+then does the operator settle the equity by hand and reconcile, naming the
+cancel (`--superseding-tx`, the API's `supersedingTx`). The bot reads the chain
+of the redemption, through that chain's raindex and bot wallet, and accepts only
+one of two proofs, each with that chain's required confirmations. Either the
+withdrawal itself mined and reverted, which used its nonce and moved nothing, so
+no replacement is named. Or the withdrawal has no receipt and the named tx is a
 different tx from the bot wallet at its nonce that is not a successful call to
 the contract the withdrawal calls (a fee bumped copy of the withdrawal, which
-withdrew the vault). A withdrawal that mined successfully went through and is
-refused: its withdraw4 settles atomically, so a success moved tokens even when
-its logs do not match what the bot expected. The withdrawal must be signed by
-the chain's configured bot wallet, since nonces are per sender. Only a tx the
-node shows mined in the canonical chain counts, so a lagging node refuses rather
-than proves. The check runs before the pure `Reconcile` command in both the CLI
-and the bot's reconcile route (`409` with the reason, `502` on a failed chain
-read, `503` before the bot is ready); a `supersedingTx` on a mint, or on a
-redemption with no signed withdrawal, is refused. In both cases a mined
-transaction already used the nonce, and that is what lets later sends proceed.
-The release is bookkeeping: it drops the bot's hold on the used nonce and does
-not rewind nonce allocation onto it. A prepared transaction discarded before
-broadcast (a persist-failure rollback) is different: its nonce is unused, so
-allocation is rewound to refill it.
+withdrew the vault). Either way nothing moved, so the manual equity settlement
+is the same. A withdrawal that mined successfully went through and is refused:
+its withdraw4 settles atomically, so a success moved tokens even when its logs
+do not match what the bot expected. The withdrawal must be signed by the chain's
+configured bot wallet, since nonces are per sender. Only a tx the node shows
+mined in the canonical chain counts, so a lagging node refuses rather than
+proves. The check runs before the pure `Reconcile` command in both the CLI and
+the bot's reconcile route (`409` with the reason, `502` on a failed chain read,
+`503` before the bot is ready); a `supersedingTx` on a mint, or on a redemption
+with no signed withdrawal, is refused. In both cases a mined transaction already
+used the nonce, and that is what lets later sends proceed. The release is
+bookkeeping: it drops the bot's hold on the used nonce and does not rewind nonce
+allocation onto it. A prepared transaction discarded before broadcast (a
+persist-failure rollback) is different: its nonce is unused, so allocation is
+rewound to refill it.
 
 The `Reconciled` state retains the identifying fields (symbol, quantity,
 original failure reason, request/redemption identifiers) so the dashboard

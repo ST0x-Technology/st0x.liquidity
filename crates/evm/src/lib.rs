@@ -1364,11 +1364,12 @@ pub struct MinedTx {
 
 /// Returns `tx_hash` as mined, or `None` while the node shows no receipt or
 /// no transaction for it, or the receipt's block is not the canonical block
-/// at its height. Does not wait.
+/// at its height. Does not wait. Every failure is a provider RPC read, so it
+/// returns the raw transport error for callers to wrap in their own variant.
 pub async fn mined_tx(
     provider: &impl Provider,
     tx_hash: TxHash,
-) -> Result<Option<MinedTx>, EvmError> {
+) -> alloy::transports::TransportResult<Option<MinedTx>> {
     let Some(receipt) = provider.get_transaction_receipt(tx_hash).await? else {
         return Ok(None);
     };
@@ -1670,12 +1671,13 @@ mod tests {
     use alloy::consensus::{SignableTransaction, TxEip1559};
     use alloy::eips::eip2718::Encodable2718;
     use alloy::eips::eip2930::AccessList;
-    use alloy::network::EthereumWallet;
+    use alloy::network::{EthereumWallet, TransactionBuilder};
     use alloy::node_bindings::{Anvil, AnvilInstance};
     #[cfg(any(feature = "turnkey", feature = "local-signer"))]
     use alloy::primitives::Bloom;
-    use alloy::primitives::{Address, TxKind, U256};
+    use alloy::primitives::{Address, TxKind, U256, hex};
     use alloy::providers::ProviderBuilder;
+    use alloy::providers::ext::AnvilApi as _;
     use alloy::providers::mock::Asserter;
     #[cfg(any(feature = "turnkey", feature = "local-signer"))]
     use alloy::rpc::types::TransactionReceipt;
@@ -2168,6 +2170,140 @@ mod tests {
 
         assert_eq!(receipt.transaction_hash, tx_hash);
         assert!(receipt.status());
+    }
+
+    /// PUSH0 PUSH0 REVERT runtime (always reverts); the init code copies the
+    /// 3-byte runtime from bytecode offset 10 into memory and returns it.
+    const ALWAYS_REVERTS_INIT_CODE: [u8; 13] = hex!("0x6003600a5f3960035ff35f5ffd");
+
+    #[tokio::test]
+    async fn mined_tx_returns_none_for_unknown_hash() {
+        let anvil = Anvil::new().spawn();
+        let provider = ProviderBuilder::new()
+            .disable_recommended_fillers()
+            .connect_http(anvil.endpoint_url());
+
+        let mined = mined_tx(&provider, TxHash::repeat_byte(0xAB))
+            .await
+            .unwrap();
+
+        assert_eq!(mined, None);
+    }
+
+    #[tokio::test]
+    async fn mined_tx_reports_successful_call_and_counts_later_blocks() {
+        let anvil = Anvil::new().spawn();
+        let provider = ProviderBuilder::new()
+            .wallet(anvil_signer(&anvil))
+            .connect_http(anvil.endpoint_url());
+        let recipient = Address::repeat_byte(0x42);
+
+        let receipt = provider
+            .send_transaction(
+                TransactionRequest::default()
+                    .to(recipient)
+                    .value(U256::from(1)),
+            )
+            .await
+            .unwrap()
+            .get_receipt()
+            .await
+            .unwrap();
+
+        let included = MinedTx {
+            from: anvil.addresses()[0],
+            to: Some(recipient),
+            nonce: 0,
+            succeeded: true,
+            confirmations: 1,
+        };
+        assert_eq!(
+            mined_tx(&provider, receipt.transaction_hash).await.unwrap(),
+            Some(included)
+        );
+
+        provider.anvil_mine(Some(2), None).await.unwrap();
+
+        assert_eq!(
+            mined_tx(&provider, receipt.transaction_hash).await.unwrap(),
+            Some(MinedTx {
+                confirmations: 3,
+                ..included
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn mined_tx_reports_contract_creation_without_target() {
+        let anvil = Anvil::new().spawn();
+        let provider = ProviderBuilder::new()
+            .wallet(anvil_signer(&anvil))
+            .connect_http(anvil.endpoint_url());
+
+        let receipt = provider
+            .send_transaction(
+                TransactionRequest::default().with_deploy_code(ALWAYS_REVERTS_INIT_CODE),
+            )
+            .await
+            .unwrap()
+            .get_receipt()
+            .await
+            .unwrap();
+
+        assert_eq!(
+            mined_tx(&provider, receipt.transaction_hash).await.unwrap(),
+            Some(MinedTx {
+                from: anvil.addresses()[0],
+                to: None,
+                nonce: 0,
+                succeeded: true,
+                confirmations: 1,
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn mined_tx_reports_reverted_call_as_not_succeeded() {
+        let anvil = Anvil::new().spawn();
+        let provider = ProviderBuilder::new()
+            .wallet(anvil_signer(&anvil))
+            .connect_http(anvil.endpoint_url());
+
+        let reverting = provider
+            .send_transaction(
+                TransactionRequest::default().with_deploy_code(ALWAYS_REVERTS_INIT_CODE),
+            )
+            .await
+            .unwrap()
+            .get_receipt()
+            .await
+            .unwrap()
+            .contract_address
+            .unwrap();
+
+        // Explicit gas skips estimation, which would reject a reverting call.
+        let receipt = provider
+            .send_transaction(
+                TransactionRequest::default()
+                    .to(reverting)
+                    .with_gas_limit(100_000),
+            )
+            .await
+            .unwrap()
+            .get_receipt()
+            .await
+            .unwrap();
+
+        assert_eq!(
+            mined_tx(&provider, receipt.transaction_hash).await.unwrap(),
+            Some(MinedTx {
+                from: anvil.addresses()[0],
+                to: Some(reverting),
+                nonce: 1,
+                succeeded: false,
+                confirmations: 1,
+            })
+        );
     }
 
     #[cfg(any(feature = "turnkey", feature = "local-signer"))]

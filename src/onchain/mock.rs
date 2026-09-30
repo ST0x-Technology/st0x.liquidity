@@ -7,7 +7,7 @@ use alloy::sol_types::SolEvent;
 #[cfg(test)]
 use alloy::transports::{RpcError, TransportErrorKind};
 use async_trait::async_trait;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -95,6 +95,7 @@ pub struct MockRaindex {
     released_superseded_withdrawals: Mutex<Vec<TxHash>>,
     withdrawals_mined: bool,
     mined_txs: HashMap<TxHash, MinedTx>,
+    mined_tx_read_errors: HashSet<TxHash>,
 }
 
 fn successful_receipt(tx_hash: TxHash, logs: Vec<Log>) -> TransactionReceipt {
@@ -168,6 +169,7 @@ impl MockRaindex {
             released_superseded_withdrawals: Mutex::new(Vec::new()),
             withdrawals_mined: false,
             mined_txs: HashMap::new(),
+            mined_tx_read_errors: HashSet::new(),
         }
     }
 
@@ -191,6 +193,14 @@ impl MockRaindex {
     #[cfg(test)]
     pub(crate) fn with_mined_tx(mut self, tx_hash: TxHash, mined: MinedTx) -> Self {
         self.mined_txs.insert(tx_hash, mined);
+        self
+    }
+
+    /// Makes `mined_tx` fail to read `tx_hash` with a transport error, as a
+    /// node that dropped the connection would; other hashes are unaffected.
+    #[cfg(test)]
+    pub(crate) fn with_mined_tx_read_error(mut self, tx_hash: TxHash) -> Self {
+        self.mined_tx_read_errors.insert(tx_hash);
         self
     }
 
@@ -489,6 +499,12 @@ impl Raindex for MockRaindex {
     }
 
     async fn mined_tx(&self, tx_hash: TxHash) -> Result<Option<MinedTx>, RaindexError> {
+        if self.mined_tx_read_errors.contains(&tx_hash) {
+            return Err(RaindexError::RpcTransport(
+                alloy::transports::TransportErrorKind::backend_gone(),
+            ));
+        }
+
         Ok(self.mined_txs.get(&tx_hash).copied())
     }
 
