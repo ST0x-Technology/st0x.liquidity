@@ -378,7 +378,7 @@ pub(crate) enum Capital {
         #[arg(short = 'd', long, value_enum)]
         direction: TransferUsdcDirection,
         /// Amount of USDC to transfer, as a decimal.
-        #[arg(short = 'a', long)]
+        #[arg(short = 'a', long, allow_negative_numbers = true)]
         amount: DecimalAmount,
     },
     /// Deposit tokens from the bot's wallet into a Raindex vault: approves,
@@ -390,7 +390,7 @@ pub(crate) enum Capital {
     /// Withdraw USDC from the chain's configured Raindex cash vault.
     VaultWithdrawUsdc {
         /// Amount of USDC to withdraw, as a decimal.
-        #[arg(short = 'a', long)]
+        #[arg(short = 'a', long, allow_negative_numbers = true)]
         amount: DecimalAmount,
         /// Chain of the cash vault: its canonical USDC and its
         /// `[chains.<name>.trading.assets.cash]` vault; a chain with no pinned
@@ -408,6 +408,7 @@ pub(crate) enum Capital {
         #[arg(
             short = 'a',
             long,
+            allow_negative_numbers = true,
             conflicts_with = "all",
             required_unless_present = "all"
         )]
@@ -433,7 +434,7 @@ pub(crate) enum Capital {
 #[derive(Args, Clone)]
 pub(crate) struct VaultArgs {
     /// Amount of tokens as a decimal (for example 100 for 100 tokens).
-    #[arg(short = 'a', long)]
+    #[arg(short = 'a', long, allow_negative_numbers = true)]
     pub(crate) amount: DecimalAmount,
     /// Token contract address.
     #[arg(short = 't', long)]
