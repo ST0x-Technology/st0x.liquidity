@@ -8585,6 +8585,8 @@ pub(crate) async fn wire_usdc_reactor_store(
     pool: &sqlx::SqlitePool,
     apalis_pool: &apalis_sqlite::SqlitePool,
 ) -> (Arc<RebalancingService>, Arc<Store<UsdcRebalance>>) {
+    use crate::inventory::InventoryView;
+
     let (event_sender, _) = broadcast::channel(16);
     let inventory = Arc::new(BroadcastingInventory::new(
         InventoryView::default(),
