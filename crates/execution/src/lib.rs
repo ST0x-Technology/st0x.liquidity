@@ -1038,19 +1038,24 @@ pub(crate) fn resolve_sell_preflight(
     ))
 }
 
-/// Whether `resolve_sell_preflight` skips a sell of `requested` shares.
+/// Whether the sell preflight skips a sell of `requested` shares.
 ///
-/// `sellable` is the broker book above the hedge floor. The sell is skipped
-/// when the book covers less than the request, and too little for a partial
-/// hedge. Uses fractional figures, so a symbol that only trades whole shares
-/// can be skipped while this returns `false`; callers treat `false` as "not
-/// proven".
+/// `sellable` is the broker book above the hedge floor. Like the Alpaca
+/// preflight, the request is first cut to `ALPACA_MAX_DECIMAL_PLACES`; a
+/// request that cuts to zero is skipped. The sell is then skipped when the
+/// book covers less than the request, and too little for a partial hedge.
+/// Uses fractional figures, so a symbol that only trades whole shares can be
+/// skipped while this returns `false`; callers treat `false` as "not proven".
 pub fn sell_blocked_by_inventory(
     sellable: FractionalShares,
     requested: FractionalShares,
 ) -> Result<bool, FloatError> {
-    Ok(sellable.inner().lt(requested.inner())?
-        && sellable.inner().lt(*MINIMUM_PARTIAL_HEDGE_SHARES)?)
+    let Some(requested) = truncate_to_decimal_places(requested.inner(), ALPACA_MAX_DECIMAL_PLACES)?
+    else {
+        return Ok(true);
+    };
+
+    Ok(sellable.inner().lt(requested)? && sellable.inner().lt(*MINIMUM_PARTIAL_HEDGE_SHARES)?)
 }
 
 /// `available - floor`, clamped at zero: the broker shares a sell hedge may
@@ -1746,7 +1751,8 @@ mod tests {
     }
 
     /// The predicate must agree with the preflight it predicts, including a
-    /// request smaller than the partial hedge minimum that the book covers.
+    /// request smaller than the partial hedge minimum that the book covers,
+    /// and a request past Alpaca's precision that the preflight cuts first.
     #[test]
     fn sell_blocked_by_inventory_matches_the_sell_preflight() {
         let cases = [
@@ -1761,6 +1767,8 @@ mod tests {
             ("0.005", "0", "0.005", false),
             ("0.005", "0", "0.004", false),
             ("0.005", "0", "0.006", true),
+            ("0.005", "0", "0.0050000000001", false),
+            ("0.005", "0", "0.0000000001", true),
         ];
 
         for (available, floor, requested, blocked) in cases {
@@ -1774,10 +1782,22 @@ mod tests {
                 "available {available}, floor {floor}, requested {requested}"
             );
 
-            let preflight =
-                resolve_sell_preflight(sell_order("COIN", requested), available, floor).unwrap();
+            // Mirrors the Alpaca preflight for a fractionable symbol: the
+            // request is cut to Alpaca's precision, and one that cuts to zero
+            // is skipped, before `resolve_sell_preflight` runs.
+            let preflight = truncate_to_decimal_places(
+                frac_shares(requested).inner(),
+                ALPACA_MAX_DECIMAL_PLACES,
+            )
+            .unwrap()
+            .map(|cut| {
+                resolve_sell_preflight(sell_order("COIN", &cut.format().unwrap()), available, floor)
+                    .unwrap()
+            });
             assert_eq!(
-                matches!(preflight, CounterTradePreflight::Skipped(_)),
+                preflight
+                    .as_ref()
+                    .is_none_or(|preflight| matches!(preflight, CounterTradePreflight::Skipped(_))),
                 blocked,
                 "preflight disagrees for available {available}, floor {floor}, \
                  requested {requested}: {preflight:?}"
