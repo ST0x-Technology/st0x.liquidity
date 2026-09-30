@@ -2334,6 +2334,11 @@ async fn reconcile_usdc_transfer(
     let id = parse_usdc_rebalance_id(&id)?;
     let reason = ReconcileReason::from(request.reason);
 
+    // Admit the projection write before taking the recovery lock, as
+    // `fail_usdc_transfer` does: a request parked behind a view rebuild must
+    // not hold the exclusive lock through the replay.
+    let _projection_write = state.projection_maintenance.enter().await;
+
     let _guard = state.resume_lock.0.try_lock().map_err(|_| {
         (
             StatusCode::CONFLICT,
@@ -2351,7 +2356,6 @@ async fn reconcile_usdc_transfer(
             }),
         )
     })?;
-    let _projection_write = state.projection_maintenance.enter().await;
 
     let _driver_paused = quiesce_usdc_driver(
         &handle.usdc_driver_pause,
@@ -10146,6 +10150,11 @@ mod tests {
             "fail-usdc" => fail_usdc_transfer(State(state), Path(id), fail_usdc_request())
                 .await
                 .map(|_| ()),
+            "reconcile-usdc" => {
+                reconcile_usdc_transfer(State(state), Path(id), reconcile_usdc_request())
+                    .await
+                    .map(|_| ())
+            }
             other => panic!("unknown recovery route {other}"),
         };
         outcome.map_err(|(status, _)| status)
@@ -10157,7 +10166,7 @@ mod tests {
     /// with 409 for the whole replay. Taking the lock first fails this test.
     #[tokio::test]
     async fn recovery_routes_wait_for_a_rebuild_without_holding_the_resume_lock() {
-        for route in ["resume", "fail", "recheck", "fail-usdc"] {
+        for route in ["resume", "fail", "recheck", "fail-usdc", "reconcile-usdc"] {
             let (state, _gate) = recovery_state_with_driver_pause().await;
             let rebuild = state.projection_maintenance.pause().await.unwrap();
 
