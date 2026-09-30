@@ -51,7 +51,8 @@ pub(crate) enum TransferGasRoute {
     /// Equity mint/redemption submits transactions on the equity chain: Base
     /// for the rebalancer, the selected network for an operator transfer.
     Equity,
-    /// USDC transfer directions submit transactions on Base and Ethereum.
+    /// USDC transfer directions submit transactions on the corridor chain
+    /// and Ethereum.
     Usdc,
 }
 
@@ -60,8 +61,8 @@ pub(crate) enum TransferGasRoute {
 pub struct GasReadiness {
     /// The chain an equity mint or redemption submits its transactions on.
     equity: ChainGasReadiness,
-    /// Both ends of the USDC corridor.
-    base: ChainGasReadiness,
+    /// Both ends of the USDC corridor: its chain and the Ethereum hub.
+    usdc_chain: ChainGasReadiness,
     ethereum: ChainGasReadiness,
     retry_interval: Duration,
 }
@@ -69,13 +70,13 @@ pub struct GasReadiness {
 impl GasReadiness {
     fn new(
         equity: ChainGasReadiness,
-        base: ChainGasReadiness,
+        usdc_chain: ChainGasReadiness,
         ethereum: ChainGasReadiness,
         retry_interval: Duration,
     ) -> Self {
         Self {
             equity,
-            base,
+            usdc_chain,
             ethereum,
             retry_interval,
         }
@@ -96,6 +97,28 @@ impl GasReadiness {
             base_wallet,
             ethereum_wallet,
         )
+    }
+
+    /// Build readiness for the USDC transfers of the corridor on
+    /// `corridor_chain`: its route checks `chain_wallet` there and
+    /// `ethereum_wallet` on the Ethereum hub. The equity slot reads the
+    /// corridor chain's wallet too; no equity transfer uses this readiness.
+    /// A chain with no `[alerts.low_balance_thresholds]` entry is refused by
+    /// name rather than checked against nothing.
+    pub fn for_usdc_corridor<Signer: Wallet + ?Sized>(
+        alerts: &AlertsCtx,
+        corridor_chain: Chain,
+        chain_wallet: &Signer,
+        ethereum_wallet: &Signer,
+    ) -> anyhow::Result<Arc<Self>> {
+        let usdc_chain = ChainGasReadiness::from_wallet(alerts, corridor_chain, chain_wallet)?;
+
+        Ok(Arc::new(Self::new(
+            usdc_chain.clone(),
+            usdc_chain,
+            ChainGasReadiness::from_wallet(alerts, Chain::Ethereum, ethereum_wallet)?,
+            alerts.poll_interval,
+        )))
     }
 
     /// Build readiness for an equity transfer submitted on `equity_chain`
@@ -124,7 +147,7 @@ impl GasReadiness {
         match route {
             TransferGasRoute::Equity => self.equity.ensure_ready().await,
             TransferGasRoute::Usdc => {
-                tokio::try_join!(self.base.ensure_ready(), self.ethereum.ensure_ready())?;
+                tokio::try_join!(self.usdc_chain.ensure_ready(), self.ethereum.ensure_ready())?;
                 Ok(())
             }
         }
@@ -211,7 +234,7 @@ impl GasReadiness {
         };
         let readiness = Self::new(
             equity,
-            static_readiness.base.clone(),
+            static_readiness.usdc_chain.clone(),
             static_readiness.ethereum.clone(),
             Duration::from_secs(1),
         );
@@ -487,8 +510,8 @@ mod tests {
         let readiness =
             GasReadiness::from_wallets(&alerts, &base_wallet, &ethereum_wallet).unwrap();
 
-        assert_eq!(readiness.base.wallet, base_wallet.address());
-        assert_eq!(readiness.base.threshold, U256::from(50_u64));
+        assert_eq!(readiness.usdc_chain.wallet, base_wallet.address());
+        assert_eq!(readiness.usdc_chain.threshold, U256::from(50_u64));
         assert_eq!(readiness.ethereum.wallet, ethereum_wallet.address());
         assert_eq!(readiness.ethereum.threshold, U256::from(100_u64));
         assert_eq!(readiness.equity.chain, Chain::Base);
@@ -524,8 +547,59 @@ mod tests {
         assert_eq!(readiness.equity.chain, Chain::Ethereum);
         assert_eq!(readiness.equity.wallet, ethereum_wallet.address());
         assert_eq!(readiness.equity.threshold, U256::from(100_u64));
-        assert_eq!(readiness.base.wallet, base_wallet.address());
+        assert_eq!(readiness.usdc_chain.wallet, base_wallet.address());
         assert_eq!(readiness.ethereum.wallet, ethereum_wallet.address());
+    }
+
+    /// Each corridor's USDC route checks its own chain's wallet and the
+    /// Ethereum hub: a low Robinhood balance fails the Robinhood corridor,
+    /// not Base's.
+    #[tokio::test]
+    async fn usdc_route_checks_the_corridor_chain_and_ethereum() {
+        let base_wallet = StubWallet::stub(Address::with_last_byte(1));
+        let ethereum_wallet = StubWallet::stub(Address::with_last_byte(2));
+        let robinhood_wallet = StubWallet::stub(Address::with_last_byte(3));
+        let alerts = AlertsCtx::for_test(
+            BTreeMap::from([
+                (Chain::Base, U256::from(50_u64)),
+                (Chain::Ethereum, U256::from(100_u64)),
+                (Chain::Robinhood, U256::from(10_u64)),
+            ]),
+            Duration::from_secs(30),
+            Duration::from_secs(300),
+        );
+        let corridor_readiness = |chain, wallet, balance: u64| {
+            let mut readiness = Arc::unwrap_or_clone(
+                GasReadiness::for_usdc_corridor(&alerts, chain, wallet, &ethereum_wallet).unwrap(),
+            );
+            readiness.usdc_chain.balance_reader =
+                Arc::new(StubBalanceReader::returning(U256::from(balance)));
+            readiness.ethereum.balance_reader =
+                Arc::new(StubBalanceReader::returning(U256::from(100_u64)));
+            readiness
+        };
+        let robinhood = corridor_readiness(Chain::Robinhood, &robinhood_wallet, 9);
+        let base = corridor_readiness(Chain::Base, &base_wallet, 50);
+
+        assert_eq!(robinhood.usdc_chain.wallet, robinhood_wallet.address());
+        assert_eq!(robinhood.usdc_chain.threshold, U256::from(10_u64));
+        assert_eq!(robinhood.ethereum.wallet, ethereum_wallet.address());
+
+        let error = robinhood
+            .ensure_ready(TransferGasRoute::Usdc)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                GasReadinessError::BelowThreshold {
+                    chain: Chain::Robinhood,
+                    ..
+                }
+            ),
+            "got: {error:?}"
+        );
+        base.ensure_ready(TransferGasRoute::Usdc).await.unwrap();
     }
 
     /// A chain with no `[alerts.low_balance_thresholds]` entry is refused by
