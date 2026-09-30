@@ -1674,8 +1674,9 @@ fn validate_asset_tables(
         }
     }
 
-    // Startup seeds one vault per rebalancing-enabled equity, so a row that
-    // rebalances with no vault id crash-loops the conductor. Judged here,
+    // Startup seeds one vault per equity that keeps rebalancing services
+    // (enabled or paused), so a row with no vault id crash-loops the
+    // conductor. Judged here,
     // where every config-only path (boot, validate-config, verify-approvals,
     // the token-file refresh check) runs it.
     for config in chains.values() {
@@ -1683,7 +1684,7 @@ fn validate_asset_tables(
             continue;
         };
         for (symbol, asset) in &trading.assets.equities.symbols {
-            if asset.rebalancing == OperationMode::Enabled && asset.vault_ids.is_empty() {
+            if asset.rebalancing.keeps_services() && asset.vault_ids.is_empty() {
                 return Err(CtxError::MissingEquityVaultId {
                     symbol: symbol.clone(),
                 });
@@ -3038,8 +3039,10 @@ pub enum CtxError {
     #[error(
         "the [rebalancing] config section is required; there is no global \
          rebalancing off-switch. To pause rebalancing work use the narrow \
-         controls: per-asset `rebalancing = \"disabled\"`, issuance freeze, \
-         or the `usdc` mode under [rebalancing]"
+         controls: per-asset `rebalancing = \"paused\"` keeps services until \
+         in-flight work finishes; use `rebalancing = \"disabled\"` only \
+         after draining. Issuance freeze and the `usdc` mode under \
+         [rebalancing] control their respective work"
     )]
     MissingRebalancing,
     #[error(
@@ -3104,7 +3107,7 @@ pub enum CtxError {
     MissingCashVaultId,
     #[error(
         "vault_ids in [chains.<name>.trading.assets.equities.{symbol}] is required when \
-         rebalancing is enabled but not configured"
+         rebalancing is enabled or paused but not configured"
     )]
     MissingEquityVaultId { symbol: Symbol },
     #[error(
@@ -3455,7 +3458,7 @@ mod tests {
 
     use super::*;
     use crate::chain::IngestionCutoffTag;
-    use crate::{ChainLifecycle, ChainRole, ExecutionThreshold, InventoryModeTag};
+    use crate::{ChainLifecycle, ChainRole, ExecutionThreshold, InventoryModeTag, RebalancingMode};
 
     fn toml_file(content: &str) -> NamedTempFile {
         let mut file = NamedTempFile::new().unwrap();
@@ -4885,7 +4888,9 @@ mod tests {
 
         let message = error.to_string();
         assert!(
-            message.contains("per-asset") && message.contains("issuance freeze"),
+            message.contains("per-asset")
+                && message.contains("rebalancing = \"paused\"")
+                && message.contains("Issuance freeze"),
             "the error must name the supported pause controls, got: {message}"
         );
     }
@@ -9226,7 +9231,7 @@ mod tests {
             "the pinned token file must give Base its equities, or the loop below checks nothing"
         );
         for (symbol, equity) in &base.assets.equities.symbols {
-            if equity.rebalancing == OperationMode::Enabled
+            if equity.rebalancing == RebalancingMode::Enabled
                 && let Some(limit) = &equity.operational_limit
                 && let Some(global) = global_limit
             {
@@ -9389,7 +9394,7 @@ mod tests {
                     assert_eq!(equity.trading, OperationMode::Enabled, "{name} {symbol}");
                     assert_eq!(
                         equity.rebalancing,
-                        OperationMode::Disabled,
+                        RebalancingMode::Disabled,
                         "{name} {symbol}"
                     );
                     (

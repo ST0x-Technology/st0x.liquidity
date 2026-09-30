@@ -13,6 +13,7 @@
 //! reserve, which sits at the broker rather than on any chain.
 
 use std::collections::HashMap;
+use std::fmt;
 
 use alloy::primitives::{Address, B256};
 use serde::{Deserialize, Serialize};
@@ -29,6 +30,52 @@ use crate::TargetShare;
 pub enum OperationMode {
     Enabled,
     Disabled,
+}
+
+/// Whether one equity listing rebalances on its chain.
+///
+/// `Paused` retains the chain's equity services and startup approvals, so
+/// existing transfers continue, while no new mint or redemption starts.
+/// Wallet polling and orphan recovery remain active where already wired
+/// (currently the primary chain); this mode does not extend their coverage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RebalancingMode {
+    Enabled,
+    Paused,
+    Disabled,
+}
+
+impl fmt::Display for RebalancingMode {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let label = match self {
+            Self::Enabled => "enabled",
+            Self::Paused => "paused",
+            Self::Disabled => "disabled",
+        };
+        formatter.write_str(label)
+    }
+}
+
+impl RebalancingMode {
+    /// Whether the listing needs the chain's equity-rebalancing services:
+    /// an enabled listing starts operations and a paused one still finishes
+    /// and recovers them.
+    pub fn keeps_services(self) -> bool {
+        match self {
+            Self::Enabled | Self::Paused => true,
+            Self::Disabled => false,
+        }
+    }
+
+    /// Whether the planner may start a new mint or redemption for the
+    /// listing.
+    pub fn starts_operations(self) -> bool {
+        match self {
+            Self::Enabled => true,
+            Self::Paused | Self::Disabled => false,
+        }
+    }
 }
 
 /// Why a vault-id hex string does not parse into a `B256`.
@@ -106,7 +153,7 @@ pub struct ChainEquityAsset {
     )]
     pub vault_ids: Vec<B256>,
     pub trading: OperationMode,
-    pub rebalancing: OperationMode,
+    pub rebalancing: RebalancingMode,
     pub wrapped_equity_recovery: OperationMode,
     /// Cap on how much of this equity the bot will hold or move on this chain.
     /// Per chain because tokens are deliverable only where they sit: a symbol
@@ -175,24 +222,24 @@ impl ChainAssets {
             .or(self.equities.operational_limit)
     }
 
-    /// Returns whether rebalancing is enabled for the given equity on this
-    /// chain. Assets not present in the config are treated as
-    /// rebalancing-disabled.
-    pub fn is_rebalancing_enabled(&self, symbol: &Symbol) -> bool {
+    /// The rebalancing mode of the given equity on this chain. Assets not
+    /// present in the config are treated as rebalancing-disabled.
+    pub fn rebalancing_mode(&self, symbol: &Symbol) -> RebalancingMode {
         self.equities
             .symbols
             .get(symbol)
-            .is_some_and(|config| config.rebalancing == OperationMode::Enabled)
+            .map_or(RebalancingMode::Disabled, |config| config.rebalancing)
     }
 
-    /// Whether any equity on this chain opts into rebalancing: the flag that
-    /// makes the chain need the equity-rebalancing wiring (wrapper, issuer
-    /// client, redemption wallet). A chain with none is hedge-only.
+    /// Whether any equity on this chain opts into rebalancing, enabled or
+    /// paused: the flag that makes the chain need the equity-rebalancing
+    /// wiring (wrapper, issuer client, redemption wallet). A chain with none
+    /// is hedge-only.
     pub fn rebalances_equity(&self) -> bool {
         self.equities
             .symbols
             .values()
-            .any(|equity| equity.rebalancing == OperationMode::Enabled)
+            .any(|equity| equity.rebalancing.keeps_services())
     }
 
     /// Returns whether wrapped/unwrapped wallet equity recovery is enabled
@@ -341,7 +388,7 @@ mod tests {
                 .unwrap()
         );
         assert_eq!(rklb.trading, OperationMode::Disabled);
-        assert_eq!(rklb.rebalancing, OperationMode::Enabled);
+        assert_eq!(rklb.rebalancing, RebalancingMode::Enabled);
         assert_eq!(rklb.vault_ids.len(), 1);
         assert!(rklb.operational_limit.is_some());
 
@@ -350,7 +397,8 @@ mod tests {
         assert_eq!(cash.vault_ids.len(), 1);
     }
 
-    /// A chain rebalances equity when at least one listed equity opts in;
+    /// A chain rebalances equity when at least one listed equity opts in,
+    /// enabled or paused;
     /// trading flags and cash do not count, and an empty table does not.
     #[test]
     fn rebalances_equity_only_when_some_equity_opts_in() {
@@ -377,10 +425,20 @@ mod tests {
             equity("enabled"),
         ))
         .unwrap();
+        let paused: ChainAssets = toml::from_str(&format!(
+            "[equities.AAPL]\n{}\n[equities.TSLA]\n{}",
+            equity("disabled"),
+            equity("paused"),
+        ))
+        .unwrap();
 
         assert!(!ChainAssets::default().rebalances_equity());
         assert!(!hedge_only.rebalances_equity());
         assert!(rebalancing.rebalances_equity());
+        assert!(
+            paused.rebalances_equity(),
+            "a paused listing keeps the chain's equity services"
+        );
     }
 
     #[test]
@@ -575,7 +633,7 @@ mod tests {
                 tokenized_equity_derivative: Address::ZERO,
                 vault_ids: Vec::new(),
                 trading: OperationMode::Disabled,
-                rebalancing: OperationMode::Enabled,
+                rebalancing: RebalancingMode::Enabled,
                 wrapped_equity_recovery: OperationMode::Disabled,
                 operational_limit: None,
                 target_share: None,
@@ -640,7 +698,7 @@ mod tests {
     }
 
     #[test]
-    fn is_rebalancing_enabled_returns_configured_value() {
+    fn rebalancing_mode_returns_configured_value() {
         let mut symbols = HashMap::new();
         symbols.insert(
             Symbol::new("RKLB").unwrap(),
@@ -649,7 +707,7 @@ mod tests {
                 tokenized_equity_derivative: Address::ZERO,
                 vault_ids: Vec::new(),
                 trading: OperationMode::Disabled,
-                rebalancing: OperationMode::Enabled,
+                rebalancing: RebalancingMode::Enabled,
                 wrapped_equity_recovery: OperationMode::Disabled,
                 operational_limit: None,
                 target_share: None,
@@ -664,19 +722,32 @@ mod tests {
             cash: None,
         };
 
-        assert!(
-            assets.is_rebalancing_enabled(&Symbol::new("RKLB").unwrap()),
-            "RKLB rebalancing should be enabled"
+        assert_eq!(
+            assets.rebalancing_mode(&Symbol::new("RKLB").unwrap()),
+            RebalancingMode::Enabled
         );
     }
     #[test]
-    fn is_rebalancing_enabled_defaults_to_false_for_unknown() {
+    fn rebalancing_mode_defaults_to_disabled_for_unknown() {
         let assets = ChainAssets::default();
 
-        assert!(
-            !assets.is_rebalancing_enabled(&Symbol::new("UNKNOWN").unwrap()),
+        assert_eq!(
+            assets.rebalancing_mode(&Symbol::new("UNKNOWN").unwrap()),
+            RebalancingMode::Disabled,
             "Unknown assets should default to rebalancing disabled"
         );
+    }
+
+    /// A paused listing keeps the chain's services, so work under way
+    /// finishes and recovers, but starts nothing new.
+    #[test]
+    fn paused_rebalancing_keeps_services_without_starting_operations() {
+        assert!(RebalancingMode::Enabled.keeps_services());
+        assert!(RebalancingMode::Enabled.starts_operations());
+        assert!(RebalancingMode::Paused.keeps_services());
+        assert!(!RebalancingMode::Paused.starts_operations());
+        assert!(!RebalancingMode::Disabled.keeps_services());
+        assert!(!RebalancingMode::Disabled.starts_operations());
     }
     #[test]
     fn is_wrapped_equity_recovery_enabled_is_independent_of_rebalancing() {
@@ -688,7 +759,7 @@ mod tests {
                 tokenized_equity_derivative: Address::ZERO,
                 vault_ids: Vec::new(),
                 trading: OperationMode::Disabled,
-                rebalancing: OperationMode::Disabled,
+                rebalancing: RebalancingMode::Disabled,
                 wrapped_equity_recovery: OperationMode::Enabled,
                 operational_limit: None,
                 target_share: None,
@@ -708,8 +779,9 @@ mod tests {
             assets.is_wrapped_equity_recovery_enabled(&aapl),
             "Recovery should follow wrapped_equity_recovery config"
         );
-        assert!(
-            !assets.is_rebalancing_enabled(&aapl),
+        assert_eq!(
+            assets.rebalancing_mode(&aapl),
+            RebalancingMode::Disabled,
             "Recovery-enabled symbol must not imply rebalancing is enabled"
         );
         assert!(
@@ -730,7 +802,7 @@ mod tests {
                 tokenized_equity_derivative: Address::ZERO,
                 vault_ids: Vec::new(),
                 trading: OperationMode::Disabled,
-                rebalancing: OperationMode::Disabled,
+                rebalancing: RebalancingMode::Disabled,
                 wrapped_equity_recovery: OperationMode::Disabled,
                 operational_limit: None,
                 target_share: None,
@@ -845,10 +917,14 @@ mod tests {
             share_byte in any::<u8>(),
             derivative_byte in any::<u8>(),
             trading_enabled in any::<bool>(),
-            rebalancing_enabled in any::<bool>(),
+            expected_rebalancing in prop_oneof![
+                Just(RebalancingMode::Enabled),
+                Just(RebalancingMode::Paused),
+                Just(RebalancingMode::Disabled),
+            ],
         ) {
             let trading = if trading_enabled { "enabled" } else { "disabled" };
-            let rebalancing = if rebalancing_enabled { "enabled" } else { "disabled" };
+            let rebalancing = expected_rebalancing.to_string();
             let toml_str = format!(
                 r#"
                 tokenized_equity = "0x{share_byte:02x}{:0>38}"
@@ -868,11 +944,6 @@ mod tests {
 
             let config = result.unwrap();
             let expected_trading = if trading_enabled {
-                OperationMode::Enabled
-            } else {
-                OperationMode::Disabled
-            };
-            let expected_rebalancing = if rebalancing_enabled {
                 OperationMode::Enabled
             } else {
                 OperationMode::Disabled

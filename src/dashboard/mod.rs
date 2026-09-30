@@ -416,7 +416,7 @@ pub(crate) fn settings_from_ctx(ctx: &st0x_config::Ctx) -> st0x_dto::Settings {
             st0x_dto::AssetSettings {
                 symbol: symbol.clone(),
                 counter_trading,
-                rebalancing: config.rebalancing == OperationMode::Enabled,
+                rebalancing: config.rebalancing.starts_operations(),
                 operational_limit: limit,
             }
         })
@@ -514,8 +514,8 @@ mod tests {
 
     use st0x_bridge::corridor::{HopKind, UsdcCorridor};
     use st0x_config::{
-        ChainAssets, ChainEquityAsset, ImbalanceThreshold, UsdcCorridorCtx, UsdcCorridors,
-        create_test_ctx_with_order_owner,
+        ChainAssets, ChainEquityAsset, ImbalanceThreshold, RebalancingMode, UsdcCorridorCtx,
+        UsdcCorridors, create_test_ctx_with_order_owner,
     };
     use st0x_dto::{Direction, Trade, TradingVenue};
     use st0x_event_sorcery::StoreBuilder;
@@ -733,7 +733,7 @@ mod tests {
                 tokenized_equity_derivative: address!("0x2222222222222222222222222222222222222222"),
                 vault_ids: Vec::new(),
                 trading: OperationMode::Enabled,
-                rebalancing: OperationMode::Disabled,
+                rebalancing: RebalancingMode::Disabled,
                 wrapped_equity_recovery: OperationMode::Disabled,
                 operational_limit: None,
                 target_share: None,
@@ -779,7 +779,7 @@ mod tests {
                 tokenized_equity_derivative: address!("0x2222222222222222222222222222222222222222"),
                 vault_ids: Vec::new(),
                 trading: OperationMode::Disabled,
-                rebalancing: OperationMode::Enabled,
+                rebalancing: RebalancingMode::Enabled,
                 wrapped_equity_recovery: OperationMode::Disabled,
                 operational_limit: None,
                 target_share: None,
@@ -798,6 +798,38 @@ mod tests {
             st0x_dto::CounterTrading::Disabled
         ));
         assert!(asset.rebalancing);
+    }
+
+    /// The dashboard flag means "starts new operations", so a paused listing
+    /// reads `false` even though its chain still finishes and recovers work.
+    #[test]
+    fn settings_from_ctx_shows_a_paused_asset_as_not_rebalancing() {
+        let mut ctx = create_test_ctx_with_order_owner(address!(
+            "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        ));
+        let symbol = st0x_finance::Symbol::new("RKLB").unwrap();
+        ctx.chains.primary_mut().assets.equities.symbols.insert(
+            symbol.clone(),
+            ChainEquityAsset {
+                tokenized_equity: address!("0x1111111111111111111111111111111111111111"),
+                tokenized_equity_derivative: address!("0x2222222222222222222222222222222222222222"),
+                vault_ids: Vec::new(),
+                trading: OperationMode::Enabled,
+                rebalancing: RebalancingMode::Paused,
+                wrapped_equity_recovery: OperationMode::Enabled,
+                operational_limit: None,
+                target_share: None,
+            },
+        );
+
+        let settings = settings_from_ctx(&ctx);
+        let asset = settings
+            .assets
+            .iter()
+            .find(|asset| asset.symbol == symbol)
+            .expect("RKLB settings should be present");
+
+        assert!(!asset.rebalancing);
     }
 
     async fn create_test_state() -> AppState {

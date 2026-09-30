@@ -129,7 +129,7 @@ pub use st0x_config::{
 };
 #[cfg(any(test, feature = "test-support"))]
 pub use st0x_config::{
-    ChainAssets, ChainCashAsset, ChainEquities, ChainEquityAsset, OperationMode,
+    ChainAssets, ChainCashAsset, ChainEquities, ChainEquityAsset, OperationMode, RebalancingMode,
 };
 #[cfg(feature = "test-support")]
 pub use trading::onchain::trade_accountant::AccountForDexTrade;

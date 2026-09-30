@@ -100,7 +100,7 @@
     },
     {
       name: 'Rebal',
-      def: 'Automatic equity rebalancing status for this asset. Green means enabled; red means disabled; grey means not configured.'
+      def: 'Automatic equity rebalancing status for this asset. Green means enabled; red means disabled or paused (a paused asset starts nothing new but finishes work under way); grey means not configured.'
     },
     {
       name: 'Ext',

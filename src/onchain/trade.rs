@@ -1088,7 +1088,7 @@ mod tests {
 
     use st0x_config::{
         ChainEquities, ChainEquityAsset, HedgedChain, InventoryAdapter, InventoryAdapterVenue,
-        InventoryAdapters, InventoryMode, OperationMode,
+        InventoryAdapters, InventoryMode, OperationMode, RebalancingMode,
     };
     use st0x_evm::IERC20::decimalsCall;
     use st0x_evm::ReadOnlyEvm;
@@ -2168,7 +2168,7 @@ mod tests {
                 tokenized_equity_derivative,
                 vault_ids: Vec::new(),
                 trading: OperationMode::Enabled,
-                rebalancing: OperationMode::Disabled,
+                rebalancing: RebalancingMode::Disabled,
                 wrapped_equity_recovery: OperationMode::Disabled,
                 operational_limit: None,
                 target_share: None,

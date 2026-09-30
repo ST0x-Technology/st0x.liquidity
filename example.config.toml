@@ -177,7 +177,7 @@ primary = true
 # sending them to another chain's issuer address would burn them.
 #
 # Required when [rebalancing] is configured on the primary chain and on every
-# secondary with an equity that has rebalancing = "enabled": startup builds
+# secondary with an equity that has rebalancing = "enabled" or "paused": startup builds
 # those chains' tokenization services and refuses, naming the chain, without
 # its wallet. A hedge-only secondary (every equity rebalancing = "disabled")
 # needs none, and no wrapper vault either. Also used by the alpaca-redeem and
@@ -298,8 +298,10 @@ chainlink_feed = "0x71041dddad3595F9CEd3DcCFBe3D1F4b0a16Bb70"
 # base = "0xcccccccccccccccccccccccccccccccccccccccc"
 
 # Required: the bot does not start without this section. To pause rebalancing
-# work, use the narrow controls instead: per-asset `rebalancing = "disabled"`,
-# the issuance freeze, or `[rebalancing.usdc] mode = "disabled"`.
+# work, use the narrow controls instead: per-asset `rebalancing = "paused"`
+# (starts nothing new, still finishes and recovers work under way; set
+# `"disabled"` only once nothing is in flight), the issuance freeze, or
+# `[rebalancing.usdc] mode = "disabled"`.
 [rebalancing]
 # Transfer timeout in seconds before stuck inflight state is tombstoned and cleared.
 # 1800 = 30 minutes.

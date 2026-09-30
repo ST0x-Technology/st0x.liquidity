@@ -205,7 +205,9 @@ fn chain_equity_symbols(assets: &st0x_config::ChainAssets) -> HashSet<Symbol> {
         .equities
         .symbols
         .keys()
-        .filter(|symbol| assets.is_trading_enabled(symbol) || assets.is_rebalancing_enabled(symbol))
+        .filter(|symbol| {
+            assets.is_trading_enabled(symbol) || assets.rebalancing_mode(symbol).keeps_services()
+        })
         .cloned()
         .collect()
 }
@@ -1660,7 +1662,7 @@ mod tests {
     use st0x_bridge::corridor::UsdcCorridor;
     use st0x_config::{
         ChainAssets, ChainCashAsset, ChainEquities, ChainEquityAsset, OperationMode,
-        create_test_ctx_with_order_owner,
+        RebalancingMode, create_test_ctx_with_order_owner,
     };
     use st0x_event_sorcery::test_store;
     use st0x_execution::{FractionalShares, Symbol};
@@ -1693,7 +1695,7 @@ mod tests {
     use crate::usdc_rebalance::UsdcRebalanceId;
     use crate::vault_lookup::MockVaultLookup;
 
-    fn equity_asset(trading: OperationMode, rebalancing: OperationMode) -> ChainEquityAsset {
+    fn equity_asset(trading: OperationMode, rebalancing: RebalancingMode) -> ChainEquityAsset {
         ChainEquityAsset {
             tokenized_equity: Address::ZERO,
             tokenized_equity_derivative: Address::ZERO,
@@ -1718,15 +1720,15 @@ mod tests {
                 symbols: HashMap::from([
                     (
                         Symbol::new("TRADE").unwrap(),
-                        equity_asset(OperationMode::Enabled, OperationMode::Disabled),
+                        equity_asset(OperationMode::Enabled, RebalancingMode::Disabled),
                     ),
                     (
                         Symbol::new("REBAL").unwrap(),
-                        equity_asset(OperationMode::Disabled, OperationMode::Enabled),
+                        equity_asset(OperationMode::Disabled, RebalancingMode::Enabled),
                     ),
                     (
                         Symbol::new("OFF").unwrap(),
-                        equity_asset(OperationMode::Disabled, OperationMode::Disabled),
+                        equity_asset(OperationMode::Disabled, RebalancingMode::Disabled),
                     ),
                 ]),
             },
@@ -1757,7 +1759,7 @@ mod tests {
                 operational_limit: None,
                 symbols: HashMap::from([(
                     Symbol::new("AAPL").unwrap(),
-                    equity_asset(OperationMode::Enabled, OperationMode::Disabled),
+                    equity_asset(OperationMode::Enabled, RebalancingMode::Disabled),
                 )]),
             },
             cash: None,
@@ -1770,7 +1772,7 @@ mod tests {
                         operational_limit: None,
                         symbols: HashMap::from([(
                             secondary_symbol.clone(),
-                            equity_asset(OperationMode::Enabled, OperationMode::Disabled),
+                            equity_asset(OperationMode::Enabled, RebalancingMode::Disabled),
                         )]),
                     },
                     cash: None,
@@ -1907,7 +1909,7 @@ mod tests {
                 operational_limit: None,
                 symbols: HashMap::from([(
                     Symbol::new("AAPL").unwrap(),
-                    equity_asset(OperationMode::Enabled, OperationMode::Disabled),
+                    equity_asset(OperationMode::Enabled, RebalancingMode::Disabled),
                 )]),
             },
             cash: Some(ChainCashAsset {
@@ -1924,7 +1926,7 @@ mod tests {
                         operational_limit: None,
                         symbols: HashMap::from([(
                             secondary_symbol.clone(),
-                            equity_asset(OperationMode::Enabled, OperationMode::Disabled),
+                            equity_asset(OperationMode::Enabled, RebalancingMode::Disabled),
                         )]),
                     },
                     cash: None,
@@ -2441,7 +2443,13 @@ mod tests {
                     wrapper,
                     mint_authorizer: ConfiguredMintAuthorizer::Disabled,
                     gas_readiness: ConfiguredGasReadiness::Unwired,
-                    equities: ChainEquities::default(),
+                    equities: ChainEquities {
+                        operational_limit: None,
+                        symbols: HashMap::from([(
+                            Symbol::new("AAPL").unwrap(),
+                            equity_asset(OperationMode::Disabled, RebalancingMode::Enabled),
+                        )]),
+                    },
                 },
             )]),
             bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
@@ -2450,9 +2458,9 @@ mod tests {
         Arc::new(TransferEquityToMarketMakingCtx {
             transfer,
             equity_in_progress: Arc::new(RwLock::new(HashMap::new())),
-            mint_store: Arc::new(test_store(cqrs_pool, services)),
+            mint_store: Arc::new(test_store(cqrs_pool, services.clone())),
             position_authority: None,
-            transfer_services: EquityTransferServices::panicking(),
+            transfer_services: services,
             primary_chain: Chain::Base,
             job_queue,
         })
@@ -2481,12 +2489,18 @@ mod tests {
                     wrapper: Arc::new(MockWrapper::new()),
                     mint_authorizer: ConfiguredMintAuthorizer::Disabled,
                     gas_readiness: ConfiguredGasReadiness::Unwired,
-                    equities: ChainEquities::default(),
+                    equities: ChainEquities {
+                        operational_limit: None,
+                        symbols: HashMap::from([(
+                            symbol.clone(),
+                            equity_asset(OperationMode::Disabled, RebalancingMode::Enabled),
+                        )]),
+                    },
                 },
             )]),
             bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
         };
-        let redemption_store = Arc::new(test_store(cqrs_pool, services));
+        let redemption_store = Arc::new(test_store(cqrs_pool, services.clone()));
 
         queue
             .push(TransferEquityToHedging {
@@ -2510,6 +2524,7 @@ mod tests {
             }),
             equity_in_progress: equity_in_progress.clone(),
             redemption_store,
+            transfer_services: services,
             position_authority: None,
             hedge_capacity: None,
             job_queue: queue.clone(),

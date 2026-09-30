@@ -558,6 +558,24 @@ pub(super) async fn transfer_equity_command<Writer: Write>(
         }
     }
 
+    if !existing_mint {
+        let listing = ctx
+            .chains
+            .hedged_chain(chain)
+            .with_context(|| format!("{chain} has no trading services"))?
+            .assets
+            .equities
+            .symbols
+            .get(&symbol)
+            .with_context(|| format!("no equity listing for {symbol} on {chain}"))?;
+        if !listing.rebalancing.starts_operations() {
+            anyhow::bail!(
+                "equity rebalancing is {} for {symbol} on {chain}; new operations require enabled",
+                listing.rebalancing
+            );
+        }
+    }
+
     let direction_str = match direction {
         TransferDirection::ToRaindex => "Alpaca → Raindex (mint)",
         TransferDirection::ToAlpaca => "Raindex → Alpaca (redeem)",
@@ -2307,7 +2325,7 @@ mod tests {
     use st0x_config::create_test_issuance_ctx;
     use st0x_config::{
         ChainAssets, ChainCashAsset, ChainEquities, ChainEquityAsset, LogFormat, LogLevel,
-        OperationMode,
+        OperationMode, RebalancingMode,
     };
     use st0x_config::{HedgedChain, InventoryMode};
     use st0x_event_sorcery::{AggregateError, LifecycleError};
@@ -3066,6 +3084,54 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn fresh_cli_equity_transfers_refuse_stopped_listings_before_wallet_access() {
+        for mode in [
+            st0x_config::RebalancingMode::Paused,
+            st0x_config::RebalancingMode::Disabled,
+        ] {
+            let mut ctx = create_base_test_ctx();
+            let symbol = Symbol::new("AAPL").unwrap();
+            ctx.chains.primary_mut().assets.equities.symbols.insert(
+                symbol.clone(),
+                st0x_config::ChainEquityAsset {
+                    tokenized_equity: Address::ZERO,
+                    tokenized_equity_derivative: Address::ZERO,
+                    vault_ids: vec![],
+                    trading: st0x_config::OperationMode::Disabled,
+                    rebalancing: mode,
+                    wrapped_equity_recovery: st0x_config::OperationMode::Disabled,
+                    operational_limit: None,
+                    target_share: None,
+                },
+            );
+            let pool = setup_test_db().await;
+            for direction in [TransferDirection::ToRaindex, TransferDirection::ToAlpaca] {
+                let error = transfer_equity_command(
+                    &mut Vec::new(),
+                    TransferEquity {
+                        direction,
+                        symbol: symbol.clone(),
+                        quantity: FractionalShares::new(float!(1)),
+                        issuer_request_id: None,
+                        redemption_wallet: None,
+                        network: TokenizationNetwork::Base,
+                    },
+                    &ctx,
+                    &pool,
+                )
+                .await
+                .unwrap_err();
+                assert_eq!(
+                    error.to_string(),
+                    format!(
+                        "equity rebalancing is {mode} for AAPL on base; new operations require enabled"
+                    )
+                );
+            }
+        }
+    }
+
     fn create_base_test_ctx() -> Ctx {
         Ctx {
             database_url: ":memory:".to_string(),
@@ -3242,12 +3308,20 @@ mod tests {
     #[tokio::test]
     async fn test_transfer_equity_requires_tokenization_config() {
         let mut ctx = create_alpaca_test_ctx();
-        // The trading table is now resolved first, and resolving it needs a
-        // wallet, so the missing redemption wallet is what refuses only once
-        // a wallet exists.
+        // A listing that starts operations is required before the command
+        // looks up the chain's redemption wallet. Without it, this would
+        // fail on "no equity listing" and never reach the wallet check.
         ctx.wallet = Some(OnchainWalletCtx::stub());
         let pool = setup_test_db().await;
         let symbol = Symbol::new("AAPL").unwrap();
+        let mut listing = equity_asset(Address::ZERO);
+        listing.rebalancing = RebalancingMode::Enabled;
+        ctx.chains
+            .primary_mut()
+            .assets
+            .equities
+            .symbols
+            .insert(symbol.clone(), listing);
         let quantity = FractionalShares::new(Float::parse("10.5".to_string()).unwrap());
 
         let mut stdout = Vec::new();
@@ -5599,7 +5673,7 @@ mod tests {
                 tokenized_equity_derivative: Address::ZERO,
                 vault_ids: Vec::new(),
                 trading: OperationMode::Enabled,
-                rebalancing: OperationMode::Disabled,
+                rebalancing: RebalancingMode::Disabled,
                 wrapped_equity_recovery: OperationMode::Disabled,
                 operational_limit: None,
                 target_share: None,
@@ -5852,7 +5926,7 @@ mod tests {
             tokenized_equity_derivative: Address::ZERO,
             vault_ids: Vec::new(),
             trading: OperationMode::Enabled,
-            rebalancing: OperationMode::Disabled,
+            rebalancing: RebalancingMode::Disabled,
             wrapped_equity_recovery: OperationMode::Disabled,
             operational_limit: None,
             target_share: None,

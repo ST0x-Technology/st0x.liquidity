@@ -22,7 +22,7 @@ use uuid::Uuid;
 use rain_math_float::Float;
 use st0x_config::{
     AllocationCtx, ChainAssets, ChainCashAsset, ChainEquities, ChainEquityAsset, DeviationBand,
-    ExecutionThreshold, OperationMode, TargetShare, UsdcCorridors,
+    ExecutionThreshold, OperationMode, RebalancingMode, TargetShare, UsdcCorridors,
 };
 use st0x_dto::Statement;
 use st0x_event_sorcery::{Projection, Store, StoreBuilder, test_store};
@@ -239,7 +239,7 @@ fn aapl_equities(operational_limit: Option<&str>) -> ChainEquities {
                 tokenized_equity_derivative: Address::ZERO,
                 vault_ids: Vec::new(),
                 trading: OperationMode::Disabled,
-                rebalancing: OperationMode::Enabled,
+                rebalancing: RebalancingMode::Enabled,
                 wrapped_equity_recovery: OperationMode::Disabled,
                 operational_limit: operational_limit
                     .map(|limit| Positive::new(FractionalShares::new(float!(limit))).unwrap()),
@@ -547,6 +547,25 @@ async fn build_imbalanced_inventory(imbalance: Imbalance<'_>) {
     }
 }
 
+fn enabled_equity_job_services() -> EquityTransferServices {
+    EquityTransferServices {
+        chains: BTreeMap::from([(
+            Chain::Base,
+            ChainEquityServices {
+                wallet: Address::ZERO,
+                raindex: Arc::new(MockRaindex::new()),
+                vault_lookup: Arc::new(MockVaultLookup::new()),
+                tokenizer: Arc::new(MockTokenizer::new()),
+                wrapper: Arc::new(MockWrapper::new()),
+                mint_authorizer: ConfiguredMintAuthorizer::Disabled,
+                gas_readiness: ConfiguredGasReadiness::Unwired,
+                equities: aapl_equities(None),
+            },
+        )]),
+        bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
+    }
+}
+
 fn build_equity_transfer_with_wrapper(
     pool: &SqlitePool,
     raindex: &Arc<dyn Raindex>,
@@ -568,7 +587,7 @@ fn build_equity_transfer_with_wrapper(
                 wrapper: Arc::clone(&wrapper),
                 mint_authorizer: ConfiguredMintAuthorizer::Disabled,
                 gas_readiness: ConfiguredGasReadiness::Unwired,
-                equities: ChainEquities::default(),
+                equities: aapl_equities(None),
             },
         )]),
         bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
@@ -614,7 +633,7 @@ async fn build_equity_transfer_with_service(
                 wrapper: Arc::clone(&wrapper),
                 mint_authorizer: ConfiguredMintAuthorizer::Disabled,
                 gas_readiness: ConfiguredGasReadiness::Unwired,
-                equities: ChainEquities::default(),
+                equities: aapl_equities(None),
             },
         )]),
         bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
@@ -816,7 +835,7 @@ async fn equity_offchain_imbalance_triggers_mint() {
             Arc::clone(&position_cqrs),
             ExecutionThreshold::whole_share(),
         )),
-        transfer_services: EquityTransferServices::panicking(),
+        transfer_services: enabled_equity_job_services(),
         primary_chain: Chain::Base,
         job_queue: TransferEquityToMarketMakingJobQueue::new(&apalis_pool),
     };
@@ -1059,7 +1078,7 @@ async fn equity_onchain_imbalance_triggers_redemption() {
                 wrapper: Arc::new(MockWrapper::new()),
                 mint_authorizer: ConfiguredMintAuthorizer::Disabled,
                 gas_readiness: ConfiguredGasReadiness::Unwired,
-                equities: ChainEquities::default(),
+                equities: aapl_equities(None),
             },
         )]),
         bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
@@ -1067,7 +1086,8 @@ async fn equity_onchain_imbalance_triggers_redemption() {
     let ctx = TransferEquityToHedgingCtx {
         transfer: equity_transfer,
         equity_in_progress: service.equity_in_progress.clone(),
-        redemption_store: Arc::new(test_store(pool.clone(), cleanup_services)),
+        redemption_store: Arc::new(test_store(pool.clone(), cleanup_services.clone())),
+        transfer_services: cleanup_services,
         position_authority: Some((
             Arc::clone(&position_cqrs),
             ExecutionThreshold::whole_share(),
@@ -2324,7 +2344,7 @@ async fn mint_api_failure_preserves_requested_intent() {
             Arc::clone(&position_cqrs),
             ExecutionThreshold::whole_share(),
         )),
-        transfer_services: EquityTransferServices::panicking(),
+        transfer_services: enabled_equity_job_services(),
         primary_chain: Chain::Base,
         job_queue: TransferEquityToMarketMakingJobQueue::new(&apalis_pool),
     };
@@ -2961,7 +2981,7 @@ async fn mint_accepted_sets_offchain_inflight() {
                     Arc::clone(&position_cqrs),
                     ExecutionThreshold::whole_share(),
                 )),
-                transfer_services: EquityTransferServices::panicking(),
+                transfer_services: enabled_equity_job_services(),
                 primary_chain: Chain::Base,
                 job_queue: TransferEquityToMarketMakingJobQueue::new(&apalis_pool),
             };
@@ -3194,7 +3214,7 @@ async fn completed_mint_clears_inflight_and_updates_inventory() {
             Arc::clone(&position_cqrs),
             ExecutionThreshold::whole_share(),
         )),
-        transfer_services: EquityTransferServices::panicking(),
+        transfer_services: enabled_equity_job_services(),
         primary_chain: Chain::Base,
         job_queue: TransferEquityToMarketMakingJobQueue::new(&apalis_pool),
     };
