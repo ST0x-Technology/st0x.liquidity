@@ -1521,6 +1521,19 @@ impl EquityRedemption {
         }
     }
 
+    /// The withdrawal hash of a `VaultWithdrawSubmitted` that holds no signed
+    /// bytes: an adopted replacement, or a legacy hash only submission.
+    pub fn hash_only_withdrawal(&self) -> Option<TxHash> {
+        match self {
+            Self::VaultWithdrawSubmitted {
+                tx_hash,
+                prepared: None,
+                ..
+            } => Some(*tx_hash),
+            _ => None,
+        }
+    }
+
     pub(crate) fn to_dto(&self, id: &RedemptionAggregateId) -> TransferOperation {
         let RedemptionAggregateId(id) = id;
 

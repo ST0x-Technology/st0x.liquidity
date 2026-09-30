@@ -271,7 +271,11 @@ pub mod equity_transfer {
              reverted, it moved nothing: once it has the required confirmations, settle the \
              equity by hand and reconcile without --superseding-tx \
              (`stox transfer reconcile --kind redemption --id {0} --reason <reason>`). If it \
-             has no receipt, cancel it with a 0-value self-transfer with no calldata (not \
+             has no receipt but another tx from the bot wallet already mined at its nonce and \
+             did the withdrawal (for example a wallet speed up of the same withdraw4), do not \
+             settle by hand: adopt that tx (`st0x-liquidity-client --env <env> debug \
+             adopt-withdrawal {0} --replacement-tx <tx> --reason <reason>`). If nothing mined \
+             at its nonce, cancel it with a 0-value self-transfer with no calldata (not \
              EIP-7702) from the bot wallet at its nonce with fees above the withdrawal's, \
              wait for the required \
              confirmations, then settle the equity by hand and reconcile \
@@ -8510,8 +8514,8 @@ pub mod rebalancing {
     pub mod equity {
         pub use crate::rebalancing::equity::{
             ChainEquityServices, CrossVenueEquityTransfer, EquityTransferServices,
-            WithdrawalNotSuperseded, verify_withdrawal_superseded,
-            withdrawal_required_confirmations,
+            WithdrawalNotSuperseded, verify_hash_only_withdrawal_not_through,
+            verify_withdrawal_superseded, withdrawal_required_confirmations,
         };
     }
 

@@ -3873,7 +3873,9 @@ a redemption with a signed vault withdrawal (`VaultWithdrawSubmitting` or
 `VaultWithdrawSubmitted`), because the withdrawal can still mine. Instead the
 operator checks it on chain: one that mined successfully went through and is not
 reconciled; one that mined and reverted is reconciled with no cancel once
-confirmed; one with no receipt is cancelled first and then reconciled. Reconcile
+confirmed; one with no receipt, whose nonce another tx from the bot wallet
+already used to do the withdrawal itself, is adopted; one with no receipt and
+nothing at its nonce is cancelled first and then reconciled. Reconcile
 requires the chain proof described under operator reconciliation.
 
 Vault withdrawal submission is an irreversible uncertainty boundary. The
@@ -6254,7 +6256,9 @@ not the withdrawal itself, has the chain's required confirmations, succeeded,
 and is a `withdraw4` to the contract the withdrawal calls, from the same token
 and vault, in any amount, since `withdraw4` pays its caller, the bot wallet
 (`409` naming the failed check, `502` on a failed chain read, `503` before the
-bot is ready, `400` for a redemption with no signed withdrawal). The
+bot is ready, `400` for a redemption with no signed withdrawal). The route
+holds the recovery lock and sends the command through the conductor owned
+store, so the live transfer reactor sees the adoption. The
 redemption's redrive then resumes from `VaultWithdrawSubmitted` as for any hash
 only submission: it restores the adopted hash at its nonce, `ConfirmWithdraw`
 confirms it and records the vault transfer its receipt shows (refusing a receipt
@@ -6263,6 +6267,19 @@ releases the whole nonce entry, including the signed withdrawal's reservation.
 Nothing is rebroadcast, since the nonce is used. A restart restores the same
 hash only reservation, so the release does not depend on the process that
 adopted it.
+
+A redemption holding only a withdrawal hash (an adopted replacement, or a
+legacy submission from before the signed bytes were kept) has no nonce to prove
+unused, so it reconciles on the operator's word, except once that hash mined and
+succeeded: then the equity left the vault, and reconcile refuses it as it does a
+signed withdrawal that went through (both the CLI and the bot's route read the
+hash first, the route `503` before the bot is ready).
+
+Rollback floor for withdrawal adoption: a build before it cannot replay
+`VaultWithdrawReplacementAdopted`, and its active redemption queries skip a
+redemption whose latest event it is, so after rolling back that redemption is
+neither resumed nor holding its symbol guard. Do not roll back below the first
+release with adoption while an adopted redemption is still unfinished.
 
 The `Reconciled` state retains the identifying fields (symbol, quantity,
 original failure reason, request/redemption identifiers) so the dashboard

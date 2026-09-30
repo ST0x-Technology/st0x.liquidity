@@ -3301,27 +3301,30 @@ async fn reconcile_equity_transfer(
 /// hash (`None` when there is none), which the command checks is still the
 /// redemption's, so a withdrawal signed during the check is never reconciled
 /// unproven. A `supersedingTx` on a redemption with no signed withdrawal is a
-/// `400`.
+/// `400`. A redemption holding only a withdrawal hash (an adopted replacement,
+/// or a legacy submission) is refused once that hash mined and succeeded.
 async fn check_signed_withdrawal_superseded(
     state: &AppState,
     id: &RedemptionAggregateId,
     redemption: &EquityRedemption,
     superseding_tx: Option<TxHash>,
 ) -> Result<Option<TxHash>, (StatusCode, Json<ErrorResponse>)> {
-    let Some(prepared) = redemption.prepared_withdrawal() else {
-        return match superseding_tx {
-            Some(_) => Err((
-                StatusCode::BAD_REQUEST,
-                Json(ErrorResponse {
-                    error: format!(
-                        "Redemption {id} has no signed vault withdrawal; supersedingTx applies \
-                         only to one that has"
-                    ),
-                }),
-            )),
-            None => Ok(None),
-        };
-    };
+    let prepared = redemption.prepared_withdrawal();
+    if prepared.is_none() && superseding_tx.is_some() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: format!(
+                    "Redemption {id} has no signed vault withdrawal; supersedingTx applies only \
+                     to one that has"
+                ),
+            }),
+        ));
+    }
+    let hash_only = redemption.hash_only_withdrawal();
+    if prepared.is_none() && hash_only.is_none() {
+        return Ok(None);
+    }
 
     let handle = state.recovery.get().ok_or_else(|| {
         (
@@ -3333,9 +3336,9 @@ async fn check_signed_withdrawal_superseded(
     })?;
 
     let chain = redemption.chain();
-    let verified = match withdrawal_required_confirmations(&state.ctx.chains, chain) {
-        Ok(required_confirmations) => {
-            handle
+    let verified = match (prepared, hash_only) {
+        (Some(prepared), _) => match withdrawal_required_confirmations(&state.ctx.chains, chain) {
+            Ok(required_confirmations) => handle
                 .transfer
                 .verify_withdrawal_superseded(
                     chain,
@@ -3344,19 +3347,24 @@ async fn check_signed_withdrawal_superseded(
                     required_confirmations,
                 )
                 .await
-        }
-        Err(error) => Err(error),
+                .map(|()| Some(prepared.tx_hash())),
+            Err(error) => Err(error),
+        },
+        (None, Some(tx)) => handle
+            .transfer
+            .verify_hash_only_withdrawal_not_through(chain, tx)
+            .await
+            .map(|()| None),
+        (None, None) => Ok(None),
     };
 
-    verified
-        .map(|()| Some(prepared.tx_hash()))
-        .map_err(|error| {
-            // `Display`, not `Debug`: a read error's `Debug` names the RPC URL,
-            // whose path carries the key.
-            warn!(%error, %id, "Refused to reconcile a redemption with a signed vault withdrawal");
-            let (status, message) = withdrawal_not_superseded_response(id, &error);
-            (status, Json(ErrorResponse { error: message }))
-        })
+    verified.map_err(|error| {
+        // `Display`, not `Debug`: a read error's `Debug` names the RPC URL,
+        // whose path carries the key.
+        warn!(%error, %id, "Refused to reconcile a redemption with an unresolved vault withdrawal");
+        let (status, message) = withdrawal_not_superseded_response(id, &error);
+        (status, Json(ErrorResponse { error: message }))
+    })
 }
 
 /// Maps a refused vault withdrawal chain check to an HTTP status: an unproven
@@ -3412,9 +3420,12 @@ struct AdoptWithdrawalReplacementRequest {
 /// [`verify_withdrawal_replacement`](crate::rebalancing::equity::verify_withdrawal_replacement)):
 /// `409` naming the failed check, `502` on a failed chain read, `503` before
 /// the bot is ready, `400` for a redemption holding no signed withdrawal. The
-/// command is pure, and the redemption's redrive then confirms the adopted tx,
-/// records the vault transfer from its receipt and continues with the unwrap
-/// and send. Confirming it releases the withdrawal's nonce hold.
+/// command goes through the conductor owned store, as `fail_transfer` does, so
+/// the live transfer reactor sees the adoption and the write queues behind any
+/// command the redemption's job is sending. The redemption's redrive then
+/// confirms the adopted tx, records the vault transfer from its receipt and
+/// continues with the unwrap and send. Confirming it releases the withdrawal's
+/// nonce hold.
 async fn adopt_withdrawal_replacement(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -3438,8 +3449,29 @@ async fn adopt_withdrawal_replacement(
         )
     })?;
 
+    // Admit the projection write before taking the recovery lock, as
+    // `fail_transfer` does.
     let _projection_write = state.projection_maintenance.enter().await;
-    let entity = load_entity::<EquityRedemption>(&state.pool, &redemption_id)
+    let _guard = state.resume_lock.0.try_lock().map_err(|_| {
+        (
+            StatusCode::CONFLICT,
+            Json(ErrorResponse {
+                error: "A transfer recovery operation is already in progress".to_string(),
+            }),
+        )
+    })?;
+    let handle = state.recovery.get().ok_or_else(|| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ErrorResponse {
+                error: "Recovery not ready yet (conductor still starting)".to_string(),
+            }),
+        )
+    })?;
+
+    let entity = handle
+        .redemption_store
+        .load(&redemption_id)
         .await
         .map_err(ops_store_error)?
         .ok_or_else(|| {
@@ -3463,15 +3495,6 @@ async fn adopt_withdrawal_replacement(
         ));
     };
 
-    let handle = state.recovery.get().ok_or_else(|| {
-        (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(ErrorResponse {
-                error: "Recovery not ready yet (conductor still starting)".to_string(),
-            }),
-        )
-    })?;
-
     let chain = entity.chain();
     let verified = match state.ctx.chains.required_confirmations(chain) {
         Some(required_confirmations) => {
@@ -3488,23 +3511,25 @@ async fn adopt_withdrawal_replacement(
         None => Err(ReplacementNotAdoptable::NoConfirmationDepth { chain }),
     };
     verified.map_err(|error| {
-        warn!(?error, %id, "Refused to adopt a vault withdrawal replacement");
+        // `Display`, not `Debug`: a read error's `Debug` names the RPC URL, whose
+        // path carries the key.
+        warn!(%error, %id, "Refused to adopt a vault withdrawal replacement");
         let (status, message) = replacement_not_adoptable_response(&redemption_id, &error);
         (status, Json(ErrorResponse { error: message }))
     })?;
 
-    send_command::<EquityRedemption>(
-        &state.pool,
-        &redemption_id,
-        EquityRedemptionCommand::AdoptWithdrawalReplacement {
-            replacement_tx: request.replacement_tx,
-            replaced_withdrawal: prepared.tx_hash(),
-            reason,
-        },
-        EquityTransferServices::panicking(),
-    )
-    .await
-    .map_err(ops_command_error)?;
+    handle
+        .redemption_store
+        .send(
+            &redemption_id,
+            EquityRedemptionCommand::AdoptWithdrawalReplacement {
+                replacement_tx: request.replacement_tx,
+                replaced_withdrawal: prepared.tx_hash(),
+                reason,
+            },
+        )
+        .await
+        .map_err(ops_command_error)?;
 
     info!(
         %id, replacement_tx = %request.replacement_tx,
@@ -10458,6 +10483,60 @@ mod tests {
         );
     }
 
+    /// An adopted replacement holds no signed bytes, but it already withdrew
+    /// the equity, so reconcile on the operator's word is refused: the redrive
+    /// confirms it.
+    #[tokio::test]
+    async fn reconcile_refuses_an_adopted_replacement_that_went_through() {
+        let signer = PrivateKeySigner::random();
+        let bot_wallet = signer.address();
+        let speed_up = TxHash::repeat_byte(0x5E);
+        let raindex = MockRaindex::new().with_mined_tx(
+            speed_up,
+            mined_at_withdrawal_nonce(
+                bot_wallet,
+                SIGNED_WITHDRAWAL_TARGET,
+                B256::repeat_byte(0x02),
+            ),
+        );
+        let id = redemption_aggregate_id("api-redemption-adopt-then-reconcile");
+        let state = signed_withdrawal_reconcile_state(
+            bot_wallet,
+            raindex,
+            &id,
+            sign_vault_withdrawal(&signer),
+        )
+        .await;
+        let Ok(_) = adopt(&state, &id, speed_up).await else {
+            panic!("a confirmed call to the withdrawal target must be adopted");
+        };
+
+        let Err((status, Json(body))) = reconcile_equity_transfer(
+            State(state.clone()),
+            Path(("equity_redemption".to_string(), id.to_string())),
+            Json(ReconcileEquityRequest {
+                reason: "settled by hand".to_string(),
+                superseding_tx: None,
+            }),
+        )
+        .await
+        else {
+            panic!("an adopted replacement that went through must not be reconciled");
+        };
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert!(
+            body.error.contains("the withdrawal went through"),
+            "{}",
+            body.error
+        );
+        assert!(matches!(
+            load_entity::<EquityRedemption>(&state.pool, &id)
+                .await
+                .unwrap(),
+            Some(EquityRedemption::VaultWithdrawSubmitted { .. })
+        ));
+    }
+
     /// Each chain check refuses with its reason and leaves the signed
     /// withdrawal in place.
     #[tokio::test]
@@ -10542,7 +10621,7 @@ mod tests {
                     ),
                     ..valid
                 }),
-                "not token",
+                "from vault 0x0e0e0e0e",
             ),
             ("not mined", None, "is not mined"),
         ];
@@ -10626,9 +10705,11 @@ mod tests {
         };
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
 
+        let (ready, _gate) =
+            recovery_state_with_driver_pause(EquityTransferServices::panicking()).await;
         let failed = redemption_aggregate_id("api-redemption-adopt-failed");
-        seed_redemption_failed(&state.pool, &failed).await;
-        let Err((status, Json(body))) = adopt(&state, &failed, TxHash::repeat_byte(0x5E)).await
+        seed_redemption_failed(&ready.pool, &failed).await;
+        let Err((status, Json(body))) = adopt(&ready, &failed, TxHash::repeat_byte(0x5E)).await
         else {
             panic!("a redemption with no signed withdrawal has nothing to replace");
         };

@@ -1139,8 +1139,9 @@ impl Job<TransferEquityToHedgingCtx> for TransferEquityToHedging {
                      If it has no receipt but another tx from the bot wallet already mined at \
                      its nonce and did the withdrawal (for example a wallet speed up of the \
                      same withdraw4), do not settle by hand: adopt that tx \
-                     (`st0x-liquidity-client debug adopt-withdrawal {} --replacement-tx <tx> \
-                     --reason <reason>`), then run `stox transfer resume --kind equity` or \
+                     (`st0x-liquidity-client --env <env> debug adopt-withdrawal {} \
+                     --replacement-tx <tx> --reason <reason>`), then run \
+                     `stox transfer resume --kind equity` or \
                      restart the bot so a new resume confirms it. If nothing mined at its \
                      nonce, it will not confirm at its current fee but can still mine when \
                      fees drop, so cancel it first: send a 0-value self-transfer with no \
