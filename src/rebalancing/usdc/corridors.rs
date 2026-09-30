@@ -13,7 +13,6 @@ use async_trait::async_trait;
 use sqlx::SqlitePool;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
-use tracing::error;
 
 use st0x_bridge::BridgeDirection;
 use st0x_bridge::cctp::AttestationResponse;
@@ -55,17 +54,28 @@ impl<Transfer> CorridorTransfer for Transfer where
 }
 
 /// The cash transfer services of every served corridor, keyed by corridor.
+/// At least one corridor is served, so the startup restore always has a
+/// service to run on.
 pub(crate) struct UsdcCorridorTransfers {
     by_corridor: BTreeMap<UsdcCorridor, Arc<dyn CorridorTransfer>>,
+    /// Runs the work that touches only the shared Ethereum wallet.
+    hub: Arc<dyn CorridorTransfer>,
     store: Arc<Store<UsdcRebalance>>,
 }
 
 impl UsdcCorridorTransfers {
+    /// `None` when no corridor is served.
     pub(crate) fn new(
         by_corridor: BTreeMap<UsdcCorridor, Arc<dyn CorridorTransfer>>,
         store: Arc<Store<UsdcRebalance>>,
-    ) -> Self {
-        Self { by_corridor, store }
+    ) -> Option<Self> {
+        let hub = Arc::clone(by_corridor.values().next()?);
+
+        Some(Self {
+            by_corridor,
+            hub,
+            store,
+        })
     }
 
     /// The service of `id`'s recorded corridor, or of `requested` for a
@@ -177,15 +187,7 @@ impl RecheckUsdcDeposit for UsdcCorridorTransfers {
 #[async_trait]
 impl RestorePreparedDepositSends for UsdcCorridorTransfers {
     async fn restore_prepared_deposit_sends(&self, pool: &SqlitePool) -> RestoredDepositSends {
-        let Some(service) = self.by_corridor.values().next() else {
-            error!(
-                target: "rebalance",
-                "No cash transfer service is built, so no signed Alpaca deposit send is restored"
-            );
-            return RestoredDepositSends::default();
-        };
-
-        service.restore_prepared_deposit_sends(pool).await
+        self.hub.restore_prepared_deposit_sends(pool).await
     }
 }
 
@@ -355,7 +357,7 @@ mod tests {
         ]);
 
         TwoCorridors {
-            transfers: UsdcCorridorTransfers::new(by_corridor, Arc::clone(&store)),
+            transfers: UsdcCorridorTransfers::new(by_corridor, Arc::clone(&store)).unwrap(),
             base,
             robinhood,
             store,
@@ -554,7 +556,8 @@ mod tests {
         let robinhood_only = UsdcCorridorTransfers::new(
             BTreeMap::from([(ROBINHOOD_CCTP, robinhood as Arc<dyn CorridorTransfer>)]),
             store,
-        );
+        )
+        .unwrap();
         let error = robinhood_only
             .fetch_recovery_attestation(BridgeDirection::BaseToEthereum, burn_tx)
             .await
@@ -568,5 +571,14 @@ mod tests {
             ),
             "got {error:?}"
         );
+    }
+
+    /// No dispatcher exists without a served corridor, so the startup
+    /// restore can never silently skip the signed deposit sends.
+    #[tokio::test]
+    async fn no_dispatcher_without_a_served_corridor() {
+        let store = Arc::new(test_store(setup_test_db().await, ()));
+
+        assert!(UsdcCorridorTransfers::new(BTreeMap::new(), store).is_none());
     }
 }

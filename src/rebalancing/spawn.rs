@@ -35,6 +35,8 @@ pub(crate) enum SpawnRebalancerError {
     Wrapper(#[from] EmptySymbolError),
     #[error("no cash transfer service can be built for the {corridor} corridor")]
     UnwiredCorridor { corridor: UsdcCorridor },
+    #[error("no USDC corridor is served, so no cash transfer service can be built")]
+    NoCorridor,
 }
 
 /// Adapts the config-layer equity asset map to the narrow per-symbol token pairs
@@ -189,7 +191,10 @@ impl<Signer: Wallet + Clone + 'static> RebalancerServices<Signer> {
             by_corridor.insert(corridor, transfer);
         }
 
-        let transfers = Arc::new(UsdcCorridorTransfers::new(by_corridor, usdc.clone()));
+        let transfers = Arc::new(
+            UsdcCorridorTransfers::new(by_corridor, usdc.clone())
+                .ok_or(SpawnRebalancerError::NoCorridor)?,
+        );
 
         Ok(UsdcTransferResumeHandles {
             resume_base_to_alpaca: transfers.clone(),
@@ -612,6 +617,31 @@ mod tests {
                 error,
                 SpawnRebalancerError::UnwiredCorridor { corridor: refused } if refused == corridor
             ),
+            "got {error:?}"
+        );
+    }
+
+    /// With no corridor served there is no service to restore the signed
+    /// deposit sends on, so startup refuses rather than skipping the restore.
+    #[tokio::test]
+    async fn empty_corridor_list_refuses_startup() {
+        let server = MockServer::start();
+        let (services, _chain_wallet) = make_services_with_mock_wallet(&server).await;
+        let pool = crate::test_utils::setup_test_db().await;
+        let usdc_store = Arc::new(test_store(pool.clone(), ()));
+
+        let Err(error) = services.into_usdc_corridor_transfers(
+            Vec::new(),
+            &usdc_store,
+            &pool,
+            &BotGasReceiptCostEnqueuer::Disabled,
+            &UsdcDriverGate::unpaused(),
+        ) else {
+            panic!("an empty corridor list must be refused");
+        };
+
+        assert!(
+            matches!(error, SpawnRebalancerError::NoCorridor),
             "got {error:?}"
         );
     }
