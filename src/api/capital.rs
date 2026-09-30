@@ -833,7 +833,24 @@ async fn run_vault_operation(
     } = target;
     let route = operation.route();
 
+    let deposit_lock = Arc::clone(&state.vault_deposit_lock);
     spawn_detached(&state.detached_tasks, route, token, async move {
+        // Held for the whole approve then deposit sequence, inside the task so
+        // a dropped request cannot release it early; see
+        // `AppState::vault_deposit_lock`. Withdrawals approve nothing.
+        let _deposit_guard = match operation {
+            VaultOperation::Deposit => Some(deposit_lock.try_lock().map_err(|_| {
+                warn!(route, %chain, %token, "Vault deposit refused: another deposit is in progress");
+                (
+                    StatusCode::CONFLICT,
+                    Json(ErrorResponse {
+                        error: "Another vault deposit is in progress; retry once it finishes"
+                            .to_string(),
+                    }),
+                )
+            })?),
+            VaultOperation::Withdraw | VaultOperation::WithdrawUsdc => None,
+        };
         let decimals = wallet
             .call::<OpenChainErrorRegistry, _>(token, IERC20::decimalsCall {})
             .await

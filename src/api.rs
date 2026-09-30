@@ -2050,9 +2050,9 @@ async fn resume_usdc_transfer(
 /// stay generic (the full error is logged at the call site).
 fn usdc_resume_error_response(error: &UsdcResumeError) -> (StatusCode, String) {
     use UsdcResumeError::{
-        Aggregate, AlreadyInFlight, AlreadyTerminal, ApalisDatabase, CorridorNotServed, Database,
-        DirectionMismatch, EveryCorridorLatched, GasNotReady, GuardHeldElsewhere, NotFound,
-        NotReady, Queue,
+        Aggregate, AlreadyInFlight, AlreadyTerminal, ApalisDatabase, CashDivergenceEngaged,
+        CashRestartTainted, CorridorNotServed, Database, DirectionMismatch, EveryCorridorLatched,
+        GasNotReady, GuardHeldElsewhere, NotFound, NotReady, Queue,
     };
 
     match error {
@@ -2060,9 +2060,11 @@ fn usdc_resume_error_response(error: &UsdcResumeError) -> (StatusCode, String) {
         DirectionMismatch { .. } | AlreadyTerminal { .. } | CorridorNotServed { .. } => {
             (StatusCode::UNPROCESSABLE_ENTITY, error.to_string())
         }
-        AlreadyInFlight { .. } | GuardHeldElsewhere | EveryCorridorLatched => {
-            (StatusCode::CONFLICT, error.to_string())
-        }
+        AlreadyInFlight { .. }
+        | GuardHeldElsewhere
+        | EveryCorridorLatched
+        | CashDivergenceEngaged
+        | CashRestartTainted => (StatusCode::CONFLICT, error.to_string()),
         NotReady | GasNotReady(_) => (StatusCode::SERVICE_UNAVAILABLE, error.to_string()),
         Aggregate(_) | Database(_) | ApalisDatabase(_) | Queue(_) => (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -4254,6 +4256,7 @@ mod tests {
             recovery: Arc::new(tokio::sync::OnceCell::new()),
             process_tx: Arc::new(tokio::sync::OnceCell::new()),
             resume_lock: Arc::new(ResumeLock(Mutex::new(()))),
+            vault_deposit_lock: Arc::new(Mutex::new(())),
             projection_maintenance: Arc::new(
                 crate::conductor::projection_pause::ProjectionMaintenance::for_test(),
             ),
@@ -8007,6 +8010,39 @@ mod tests {
         );
     }
 
+    /// Two concurrent deposits of a token without the startup MAX grant can
+    /// overwrite each other's approval, so a deposit refuses with 409 while
+    /// another one holds the deposit lock, before any chain call.
+    #[tokio::test]
+    async fn vault_deposit_returns_409_while_another_deposit_holds_the_lock() {
+        let mut ctx = create_test_ctx_with_order_owner(Address::ZERO);
+        ctx.wallet = Some(st0x_config::OnchainWalletCtx::stub());
+        let (state, _gate) = recovery_state_for_ctx(ctx).await;
+        state.health.set_ready();
+        let deposit_lock = Arc::clone(&state.vault_deposit_lock);
+        let _held = deposit_lock.try_lock().unwrap();
+
+        let Err((status, Json(body))) = capital::vault_deposit(
+            State(state),
+            capital_request(serde_json::json!({
+                "chain": "base",
+                "token": "0x0000000000000000000000000000000000000001",
+                "vaultId": "0x0000000000000000000000000000000000000000000000000000000000000002",
+                "amount": "1",
+            })),
+        )
+        .await
+        else {
+            panic!("a held deposit lock must refuse the deposit");
+        };
+
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(
+            body.error,
+            "Another vault deposit is in progress; retry once it finishes"
+        );
+    }
+
     /// Every capital route refuses with 503 until startup completes, as
     /// process-tx does: the recovery handle and the wallets exist before the
     /// chain id and `OPERATOR_ROLE` preflights have passed, and the job
@@ -8483,6 +8519,12 @@ mod tests {
         assert_eq!(status, StatusCode::CONFLICT);
 
         let (status, _) = usdc_resume_error_response(&UsdcResumeError::EveryCorridorLatched);
+        assert_eq!(status, StatusCode::CONFLICT);
+
+        let (status, _) = usdc_resume_error_response(&UsdcResumeError::CashDivergenceEngaged);
+        assert_eq!(status, StatusCode::CONFLICT);
+
+        let (status, _) = usdc_resume_error_response(&UsdcResumeError::CashRestartTainted);
         assert_eq!(status, StatusCode::CONFLICT);
 
         let (status, _) = usdc_resume_error_response(&UsdcResumeError::NotReady);

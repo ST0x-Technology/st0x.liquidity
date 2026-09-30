@@ -238,6 +238,16 @@ pub(crate) enum UsdcResumeError {
     )]
     GasNotReady(#[source] GasReadinessFailure),
     #[error(
+        "an unresolved cash snapshot divergence blocks fresh USDC transfers; retry once \
+         the inventory poller has reconciled it"
+    )]
+    CashDivergenceEngaged,
+    #[error(
+        "the cash balance is restart tainted, which blocks fresh USDC transfers; retry \
+         once the inventory poller has re-based it on the broker"
+    )]
+    CashRestartTainted,
+    #[error(
         "USDC transfer corridor mismatch: transfer {id} runs on the {recorded} corridor, \
          this build serves {served}; nothing was enqueued"
     )]
@@ -5938,8 +5948,9 @@ impl RebalancingService {
     /// exactly as it does for a trigger enqueue. Shares the single flight
     /// gates of [`Self::resume_usdc_transfer`] in the same order, so a manual
     /// start cannot race the trigger, a resume, or a transfer in flight, and
-    /// applies the trigger's gas readiness gate before the corridor claim,
-    /// since unlike a resume it starts a fresh transfer.
+    /// then applies the trigger's fresh dispatch gates (no engaged cash
+    /// divergence, no restart tainted cash balance, gas readiness) before the
+    /// corridor claim, since unlike a resume it starts a fresh transfer.
     pub(crate) async fn start_manual_usdc_transfer(
         &self,
         pool: &SqlitePool,
@@ -5987,6 +5998,27 @@ impl RebalancingService {
             return Err(UsdcResumeError::GuardHeldElsewhere);
         }
 
+        // The trigger's other fresh dispatch gates. An active transfer marks the
+        // cash venue busy, which freezes the counter that resolves a divergence
+        // and aborts the forced reconcile, so a manual start in either state
+        // would keep the trigger blocked for the whole transfer.
+        if self.divergence_gate.is_cash_engaged() {
+            warn!(
+                target: "rebalance",
+                %id,
+                "Manual USDC transfer refused: unresolved cash snapshot divergence"
+            );
+            return Err(UsdcResumeError::CashDivergenceEngaged);
+        }
+        if self.is_restart_cash_tainted().await {
+            warn!(
+                target: "rebalance",
+                %id,
+                "Manual USDC transfer refused: cash balance is restart tainted"
+            );
+            return Err(UsdcResumeError::CashRestartTainted);
+        }
+
         // The worker gates gas itself before any withdrawal, but only after the
         // enqueue: without this check the route would answer with an id whose
         // job parks on the gas retry interval while its claim holds the
@@ -6019,6 +6051,20 @@ impl RebalancingService {
                     | ClaimRefusal::CorridorUnread => UsdcResumeError::GuardHeldElsewhere,
                 }
             })?;
+
+        // Re-check right before the enqueue, like the trigger's dispatch: the
+        // poller may have engaged the cash gate during the awaits above.
+        // Returning drops `claim`, which releases the corridor. The restart
+        // taint is only seeded at boot, so it cannot appear here.
+        if self.divergence_gate.is_cash_engaged() {
+            warn!(
+                target: "rebalance",
+                %id,
+                "Manual USDC transfer refused: cash snapshot divergence engaged \
+                 during the preflight"
+            );
+            return Err(UsdcResumeError::CashDivergenceEngaged);
+        }
 
         let idempotency_key = manual_transfer_idempotency_key(&id);
         let push = match direction {
@@ -18525,6 +18571,55 @@ mod tests {
                 .is_held(trigger.config.served_usdc_corridor.chain()),
             "a gas refusal must leave no corridor guard claimed"
         );
+    }
+
+    /// Like the trigger's fresh dispatch, a manual start refuses while a cash
+    /// snapshot divergence is engaged: the transfer would mark the venue busy
+    /// and freeze the counter that resolves the divergence.
+    #[tokio::test]
+    async fn manual_start_is_refused_while_a_cash_divergence_is_engaged() {
+        let (trigger, pool, _store) = make_resume_trigger().await;
+        trigger
+            .divergence_gate()
+            .engage_cash(InventoryScope::Hedging);
+
+        let error = trigger
+            .start_manual_usdc_transfer(&pool, RebalanceDirection::AlpacaToBase, positive_usdc(250))
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(error, UsdcResumeError::CashDivergenceEngaged),
+            "got {error:?}"
+        );
+        assert!(market_making_job_rows(&trigger).await.is_empty());
+    }
+
+    /// Like the trigger's fresh dispatch, a manual start refuses while the
+    /// cash balance is restart tainted, as it is when a hedge order was open
+    /// at boot.
+    #[tokio::test]
+    async fn manual_start_is_refused_while_the_cash_balance_is_restart_tainted() {
+        let (trigger, pool, _store) = make_resume_trigger().await;
+        trigger
+            .inventory
+            .write_without_broadcast()
+            .await
+            .set_pending_offchain_orders(HashMap::from([(
+                Symbol::new("AAPL").unwrap(),
+                OffchainOrderId::new(),
+            )]));
+
+        let error = trigger
+            .start_manual_usdc_transfer(&pool, RebalanceDirection::AlpacaToBase, positive_usdc(250))
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(error, UsdcResumeError::CashRestartTainted),
+            "got {error:?}"
+        );
+        assert!(market_making_job_rows(&trigger).await.is_empty());
     }
 
     #[tokio::test]

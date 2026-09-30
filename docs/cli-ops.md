@@ -309,28 +309,40 @@ st0x-liquidity-client --env <env> debug cctp complete-mint --burn-tx <burn-tx> -
 `--network` defaults to `base`, as in `st0x-cli`. `capital transfer-usdc` is
 refused with `409` while another USDC transfer is in flight or holds the
 corridor guard, so retrying it cannot start a second transfer alongside the
-first. `capital transfer-usdc` and `capital cctp-bridge` both answer `503` while
-the Base or Ethereum signing wallet cannot be shown to pay gas: fund a wallet
-that is below its gas threshold, or retry if the message says its balance could
-not be read. `capital cctp-bridge` waits for neither Circle nor the burn's
-receipt: it returns the burn tx as soon as the burn is broadcast, and
+first. Like the automatic rebalancer, it is also refused with `409` while a cash
+snapshot divergence is unresolved or the cash balance is restart tainted; retry
+once the inventory poller has cleared it. `capital vault-deposit` is refused
+with `409` while another deposit runs. `capital transfer-usdc` and
+`capital cctp-bridge` both answer `503` while the Base or Ethereum signing
+wallet cannot be shown to pay gas: fund a wallet that is below its gas
+threshold, or retry if the message says its balance could not be read.
+`capital cctp-bridge` waits for neither Circle nor the burn's receipt: it
+returns the burn tx as soon as the burn is broadcast, and
 `debug cctp complete-mint` fetches the attestation and mints once Circle has
 attested it.
 
 After answering, the bot keeps the recovery lock and the driver pause until the
 burn has the source chain's required confirmations (12 blocks on Ethereum in
 production, about two and a half minutes; 3 on Base) or the confirmation wait
-gives up, and logs the outcome. Until then `complete-mint` answers `502` while
-Circle has not attested the burn, and `409`
-(`A resume or recheck operation is already in progress`) once it has; both mean
-retry. After the task finishes, confirmed or not, `complete-mint` no longer
-waits on it. The outcome is `CCTP burn confirmed via API`, or
-`CCTP burn broadcast via API did not confirm`, whose `error` field says why: a
-revert, a dropped tx, a missing CCTP `MessageSent` event, or a receipt wait that
-timed out or kept failing on RPC errors. A timed out receipt wait, or one that
-kept failing on RPC errors, does not prove the burn failed, so check the burn tx
-onchain before completing the mint or retrying; a burn that never confirmed
-never attests, and `complete-mint` keeps answering `502` for it.
+gives up, which takes up to 5 minutes for inclusion plus 30 minutes for the
+confirmations. Until then every verb that takes the recovery lock answers `409`:
+`debug resume`, `debug recheck`, `debug resume-usdc`, `debug reconcile-usdc`,
+`debug fail-usdc-transfer`, `debug fail-equity-transfer`,
+`capital transfer-usdc`, a second `capital cctp-bridge`, and
+`debug cctp complete-mint`. Most say
+`A resume or recheck operation is already in progress`; `debug resume` says
+`A resume operation is already in progress` and `debug fail-equity-transfer`
+says `A transfer recovery operation is already in progress`. `complete-mint`
+answers `502` instead while Circle has not attested the burn, since it fetches
+the attestation before it tries the lock; both mean retry. After the task
+finishes, confirmed or not, the lock is free again. The outcome is
+`CCTP burn confirmed via API`, or `CCTP burn broadcast via API did not confirm`,
+whose `error` field says why: a revert, a dropped tx, a missing CCTP
+`MessageSent` event, or a receipt wait that timed out or kept failing on RPC
+errors. A timed out receipt wait, or one that kept failing on RPC errors, does
+not prove the burn failed, so check the burn tx onchain before completing the
+mint or retrying; a burn that never confirmed never attests, and `complete-mint`
+keeps answering `502` for it.
 
 A request that times out on the client may still complete in the bot; check the
 bot logs and the chain for the transaction before retrying a vault or allowance
