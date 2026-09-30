@@ -280,20 +280,21 @@ pub enum WithdrawalNotSuperseded {
     #[error(transparent)]
     ChainServicesMissing(#[from] ChainServicesMissing),
     /// Only a plain-looking successful cancel reaches this read. Historical
-    /// state needs a node that still holds it, so it can keep failing.
+    /// state needs a node that still holds it, so it can keep failing. The
+    /// read error is in the message, scrubbed of RPC keys, and deliberately
+    /// not the error's source: an error chain printer would show it unscrubbed.
     #[error(
         "could not read the bot wallet {bot_wallet}'s code where superseding tx {superseding} ran \
          in block {block}, to rule out an EIP-7702 delegation ({}): retry. If the error says \
          the state is missing, the RPC no longer holds the state before that block (a full node \
          keeps about 128 blocks), so reconcile against an archive RPC",
-        crate::telemetry::scrub_secrets(&source.to_string())
+        crate::telemetry::scrub_secrets(&read_error.to_string())
     )]
     WalletCodeUnreadable {
         superseding: TxHash,
         bot_wallet: Address,
         block: u64,
-        #[source]
-        source: Box<RaindexError>,
+        read_error: Box<RaindexError>,
     },
     /// Reading the chain failed: transient, retry later.
     #[error("could not read tx {tx} on chain; retry")]
@@ -419,11 +420,11 @@ pub async fn verify_withdrawal_superseded(
     let wallet_had_code = raindex
         .had_code_at_tx(bot_wallet, block_number, superseding)
         .await
-        .map_err(|source| WithdrawalNotSuperseded::WalletCodeUnreadable {
+        .map_err(|read_error| WithdrawalNotSuperseded::WalletCodeUnreadable {
             superseding,
             bot_wallet,
             block: block_number,
-            source: Box::new(source),
+            read_error: Box::new(read_error),
         })?;
     if wallet_had_code {
         return Err(not_a_plain_cancel);
@@ -7425,9 +7426,24 @@ mod withdrawal_superseded_tests {
             .with_mined_tx(fixture.cancel, plain_cancel(fixture.bot))
             .with_code_at(fixture.bot);
 
-        let error = verify(raindex, &fixture, Some(fixture.cancel))
-            .await
-            .unwrap_err();
+        let error = verify_withdrawal_superseded(
+            &raindex,
+            &fixture.prepared,
+            Some(fixture.cancel),
+            fixture.bot,
+            REQUIRED,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            raindex.code_reads(),
+            vec![(
+                fixture.bot,
+                plain_cancel(fixture.bot).block_number,
+                fixture.cancel
+            )],
+            "the code check reads the bot wallet at the cancel's block and position"
+        );
 
         let WithdrawalNotSuperseded::SupersedingTxNotAPlainCancel {
             superseding,
@@ -7450,12 +7466,16 @@ mod withdrawal_superseded_tests {
         let error = verify(raindex, &fixture, Some(fixture.cancel))
             .await
             .unwrap_err();
+        assert!(
+            std::error::Error::source(&error).is_none(),
+            "the unscrubbed read error must not be chained"
+        );
 
         let WithdrawalNotSuperseded::WalletCodeUnreadable {
             superseding,
             bot_wallet,
             block,
-            source,
+            read_error,
         } = error
         else {
             panic!("an unread wallet may hold a delegation: {error:?}");
@@ -7464,8 +7484,8 @@ mod withdrawal_superseded_tests {
         assert_eq!(bot_wallet, fixture.bot);
         assert_eq!(block, plain_cancel(fixture.bot).block_number);
         assert!(
-            matches!(*source, RaindexError::RpcTransport(_)),
-            "got: {source:?}"
+            matches!(*read_error, RaindexError::RpcTransport(_)),
+            "got: {read_error:?}"
         );
     }
 
