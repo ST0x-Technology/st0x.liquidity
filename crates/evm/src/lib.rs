@@ -1423,8 +1423,9 @@ pub async fn mined_tx(
 /// A delegation runs code even on a plain call to the account, and any tx can
 /// set or clear it, so neither the head nor the end of `block` shows the code
 /// at `tx_hash`. This reads the code as `block` started (as of its parent), and
-/// counts as code any EIP-7702 authorization for `address` in a tx before
-/// `tx_hash` in `block`, even one the chain may have skipped as invalid.
+/// counts as code any EIP-7702 authorization for `address` in `tx_hash` or a
+/// tx before it in `block`, even one the chain may have skipped as invalid: a
+/// tx applies its own authorizations before it runs.
 /// Reading the parent's state needs a node that still holds it (a full node
 /// prunes it after about 128 blocks); one that does not fails the read rather
 /// than guessing. A block that no longer holds `tx_hash` fails too.
@@ -1463,7 +1464,7 @@ pub async fn had_code_at_tx(
         )));
     };
 
-    Ok(txs[..position]
+    Ok(txs[..=position]
         .iter()
         .filter_map(|tx| tx.authorization_list.as_deref())
         .flatten()
@@ -2554,10 +2555,16 @@ mod tests {
                 .unwrap()
         );
         assert!(
-            !had_code_at_tx(&provider, authority.address(), block, set)
+            had_code_at_tx(&provider, authority.address(), block, set)
                 .await
                 .unwrap(),
-            "a delegation counts only from the tx after the one carrying it"
+            "a tx applies its own delegation before it runs"
+        );
+        assert!(
+            !had_code_at_tx(&provider, caller_address, block, call)
+                .await
+                .unwrap(),
+            "only the wallet that signed the delegation has code"
         );
     }
 
@@ -2617,6 +2624,43 @@ mod tests {
                 .await
                 .unwrap(),
             "a delegation signed by the wallet before the cancel counts as code"
+        );
+    }
+
+    /// A block the node no longer serves, or one that no longer holds the tx
+    /// (a reorg moved it), leaves the tx's position unchecked, so the read
+    /// fails rather than reporting no code.
+    #[tokio::test]
+    async fn had_code_at_tx_fails_when_the_block_or_the_tx_is_missing() {
+        let cancel_hash = B256::repeat_byte(0xCA);
+        let asserter = Asserter::new();
+        asserter.push_success(&"0x");
+        asserter.push_success(&serde_json::Value::Null);
+        asserter.push_success(&"0x");
+        asserter.push_success(&serde_json::json!({
+            "number": "0x64",
+            "transactions": [{ "type": "0x2", "hash": B256::repeat_byte(0xAA) }],
+        }));
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+        let wallet = Address::repeat_byte(0xB0);
+
+        let missing_block = had_code_at_tx(&provider, wallet, 100, cancel_hash)
+            .await
+            .unwrap_err();
+        assert!(
+            missing_block
+                .to_string()
+                .contains("block 100 is not available"),
+            "{missing_block}"
+        );
+        let missing_tx = had_code_at_tx(&provider, wallet, 100, cancel_hash)
+            .await
+            .unwrap_err();
+        assert!(
+            missing_tx
+                .to_string()
+                .contains(&format!("block 100 does not hold tx {cancel_hash}")),
+            "{missing_tx}"
         );
     }
 

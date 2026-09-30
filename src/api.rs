@@ -10256,6 +10256,24 @@ mod tests {
                 format!("Redemption {id}: refusing to reconcile: {unreadable_code}")
             )
         );
+
+        // A transport failure names the RPC URL, whose path carries the key.
+        let keyed_url = WithdrawalNotSuperseded::WalletCodeUnreadable {
+            superseding: tx,
+            bot_wallet: Address::repeat_byte(0xB0),
+            block: 42,
+            source: Box::new(st0x_raindex::RaindexError::RpcTransport(
+                alloy::transports::TransportErrorKind::custom_str(
+                    "error sending request for url (https://base-mainnet.g.alchemy.com/v2/SECRETKEY)",
+                ),
+            )),
+        };
+        let (_, body) = withdrawal_not_superseded_response(&id, &keyed_url);
+        assert!(!body.contains("SECRETKEY"), "the RPC key leaked: {body}");
+        assert!(
+            body.contains("https://base-mainnet.g.alchemy.com"),
+            "{body}"
+        );
     }
 
     #[tokio::test]
