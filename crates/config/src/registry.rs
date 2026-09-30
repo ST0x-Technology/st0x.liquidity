@@ -20,10 +20,14 @@
 //! one file.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use base64::prelude::*;
+use md5::{Digest, Md5};
 use serde::Deserialize;
+use sha2::Sha256;
 use thiserror::Error;
 use toml::{Table, Value};
 use url::Url;
@@ -122,6 +126,16 @@ pub enum RegistryError {
     },
     #[error("reading {url}: larger than {MAX_BODY} bytes")]
     TooLarge { url: String },
+    #[error("reading {url}: the metadata is not an object resource")]
+    Metadata {
+        url: String,
+        #[source]
+        source: serde_json::Error,
+    },
+    #[error("reading {url}: the metadata's {field} is not a number")]
+    MetadataField { url: String, field: &'static str },
+    #[error("reading {url}#{generation}: the content does not match its size and MD5")]
+    Integrity { url: String, generation: u64 },
     #[error("reading {url}: boot read exceeded {}s", BOOT_READ_BUDGET.as_secs())]
     BootTimeout {
         url: String,
@@ -159,6 +173,9 @@ impl RegistryError {
             | Self::Client(_)
             | Self::MetadataToken(_)
             | Self::Http { .. }
+            | Self::Metadata { .. }
+            | Self::MetadataField { .. }
+            | Self::Integrity { .. }
             | Self::BootTimeout { .. } => false,
         }
     }
@@ -523,6 +540,35 @@ pub fn merge(config: &mut Table, projection: &Projection) -> Result<(), Registry
     Ok(())
 }
 
+/// One version of the token file object, as its `objects.get` metadata
+/// names it. Reading the metadata downloads nothing, so a poll that finds
+/// the generation it already has costs one small request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObjectVersion {
+    pub generation: u64,
+    pub size: u64,
+    /// The base64 MD5 digest of the content, as Cloud Storage reports it.
+    pub md5_hash: String,
+}
+
+/// The bytes of one generation of the token file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TokenCopy {
+    pub generation: u64,
+    pub bytes: Vec<u8>,
+}
+
+/// The lowercase hex SHA-256 of `bytes`: how the bot names the exact
+/// content it runs, whatever generation carried it.
+pub fn sha256_hex(bytes: &[u8]) -> String {
+    Sha256::digest(bytes)
+        .iter()
+        .fold(String::with_capacity(64), |mut hex, byte| {
+            let _ = write!(hex, "{byte:02x}");
+            hex
+        })
+}
+
 /// Where the metadata server and Cloud Storage answer.
 #[derive(Debug, Clone, Copy)]
 struct Endpoints<'a> {
@@ -535,15 +581,19 @@ const GOOGLE: Endpoints<'static> = Endpoints {
     storage: "https://storage.googleapis.com",
 };
 
-/// The JSON API URL of one object: `/b/<bucket>/o/<object>?alt=media`, the
-/// object name as one path segment (`/` in it becomes `%2F`), plus
-/// `generation` when pinned.
-fn object_url(
-    storage: &str,
-    bucket: &str,
-    object: &str,
-    generation: Option<u64>,
-) -> Result<Url, RegistryError> {
+/// Which `objects.get` answer a read asks for.
+#[derive(Debug, Clone, Copy)]
+enum Read {
+    /// The object's metadata as JSON.
+    Metadata,
+    /// The content (`alt=media`): of one generation, or of the latest.
+    Media(Option<u64>),
+}
+
+/// The JSON API URL of one object: `/b/<bucket>/o/<object>`, the object
+/// name as one path segment (`/` in it becomes `%2F`), with `alt=media` for
+/// the content and `generation` when pinned.
+fn object_url(storage: &str, bucket: &str, object: &str, read: Read) -> Result<Url, RegistryError> {
     let mut url =
         Url::parse(&format!("{storage}/storage/v1/")).map_err(|_| RegistryError::Url {
             url: format!("gs://{bucket}/{object}"),
@@ -554,11 +604,14 @@ fn object_url(
         })?
         .pop_if_empty()
         .extend(["b", bucket, "o", object]);
-    {
-        let mut query = url.query_pairs_mut();
-        query.append_pair("alt", "media");
-        if let Some(generation) = generation {
-            query.append_pair("generation", &generation.to_string());
+    match read {
+        Read::Metadata => {}
+        Read::Media(generation) => {
+            let mut query = url.query_pairs_mut();
+            query.append_pair("alt", "media");
+            if let Some(generation) = generation {
+                query.append_pair("generation", &generation.to_string());
+            }
         }
     }
     Ok(url)
@@ -608,20 +661,103 @@ pub async fn fetch(
     fetch_from(http, GOOGLE, gs_url, generation).await
 }
 
+/// The latest version's metadata: its generation, size and MD5, without
+/// the content.
+pub async fn fetch_metadata(
+    http: &reqwest::Client,
+    gs_url: &str,
+) -> Result<ObjectVersion, RegistryError> {
+    fetch_metadata_from(http, GOOGLE, gs_url).await
+}
+
+/// The content of exactly `version`, checked against the size and MD5 its
+/// metadata reported, so what is judged is what was published.
+pub async fn fetch_version(
+    http: &reqwest::Client,
+    gs_url: &str,
+    version: &ObjectVersion,
+) -> Result<TokenCopy, RegistryError> {
+    fetch_version_from(http, GOOGLE, gs_url, version).await
+}
+
 async fn fetch_from(
     http: &reqwest::Client,
     endpoints: Endpoints<'_>,
     gs_url: &str,
     generation: Option<u64>,
 ) -> Result<Vec<u8>, RegistryError> {
+    get(http, endpoints, gs_url, Read::Media(generation)).await
+}
+
+async fn fetch_metadata_from(
+    http: &reqwest::Client,
+    endpoints: Endpoints<'_>,
+    gs_url: &str,
+) -> Result<ObjectVersion, RegistryError> {
+    /// The fields of the JSON object resource the bot reads. Cloud Storage
+    /// sends the 64-bit numbers as strings.
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct ObjectResource {
+        generation: String,
+        size: String,
+        md5_hash: String,
+    }
+
+    let body = get(http, endpoints, gs_url, Read::Metadata).await?;
+    let resource: ObjectResource =
+        serde_json::from_slice(&body).map_err(|source| RegistryError::Metadata {
+            url: gs_url.to_string(),
+            source,
+        })?;
+    let number = |value: &str, field: &'static str| {
+        value
+            .parse::<u64>()
+            .map_err(|_| RegistryError::MetadataField {
+                url: gs_url.to_string(),
+                field,
+            })
+    };
+    Ok(ObjectVersion {
+        generation: number(&resource.generation, "generation")?,
+        size: number(&resource.size, "size")?,
+        md5_hash: resource.md5_hash,
+    })
+}
+
+async fn fetch_version_from(
+    http: &reqwest::Client,
+    endpoints: Endpoints<'_>,
+    gs_url: &str,
+    version: &ObjectVersion,
+) -> Result<TokenCopy, RegistryError> {
+    let bytes = fetch_from(http, endpoints, gs_url, Some(version.generation)).await?;
+    let md5_hash = BASE64_STANDARD.encode(Md5::digest(&bytes));
+    if bytes.len() as u64 != version.size || md5_hash != version.md5_hash {
+        return Err(RegistryError::Integrity {
+            url: gs_url.to_string(),
+            generation: version.generation,
+        });
+    }
+    Ok(TokenCopy {
+        generation: version.generation,
+        bytes,
+    })
+}
+
+/// One authenticated `objects.get`, its body bounded by [`MAX_BODY`].
+async fn get(
+    http: &reqwest::Client,
+    endpoints: Endpoints<'_>,
+    gs_url: &str,
+    read: Read,
+) -> Result<Vec<u8>, RegistryError> {
     let (bucket, object) = parse_gs_url(gs_url)?;
-    let url = object_url(endpoints.storage, bucket, object, generation)?;
+    let url = object_url(endpoints.storage, bucket, object, read)?;
     let token = access_token(http, endpoints.metadata).await?;
-    let named = || {
-        generation.map_or_else(
-            || gs_url.to_string(),
-            |generation| format!("{gs_url}#{generation}"),
-        )
+    let named = || match read {
+        Read::Media(Some(generation)) => format!("{gs_url}#{generation}"),
+        Read::Media(None) | Read::Metadata => gs_url.to_string(),
     };
     let http_error = |source| RegistryError::Http {
         url: named(),
@@ -1086,12 +1222,23 @@ mod tests {
             GOOGLE.storage,
             "t0-artifacts-tokens",
             "production/tokens.toml",
-            Some(7),
+            Read::Media(Some(7)),
         )
         .unwrap();
         assert_eq!(
             url.as_str(),
             "https://storage.googleapis.com/storage/v1/b/t0-artifacts-tokens/o/production%2Ftokens.toml?alt=media&generation=7"
+        );
+        let url = object_url(
+            GOOGLE.storage,
+            "t0-artifacts-tokens",
+            "production/tokens.toml",
+            Read::Metadata,
+        )
+        .unwrap();
+        assert_eq!(
+            url.as_str(),
+            "https://storage.googleapis.com/storage/v1/b/t0-artifacts-tokens/o/production%2Ftokens.toml"
         );
     }
 
@@ -1311,6 +1458,179 @@ mod tests {
 
         assert_eq!(read(&server).await.unwrap(), b"schema_version = 1");
         object.assert_async().await;
+    }
+
+    fn serve_metadata<'server>(
+        server: &'server httpmock::MockServer,
+        status: u16,
+        body: &str,
+    ) -> httpmock::Mock<'server> {
+        server.mock(|when, then| {
+            when.method(httpmock::Method::GET)
+                .path("/storage/v1/b/t0-artifacts-tokens/o/staging%2Ftokens.toml")
+                .query_param_missing("alt")
+                .header("authorization", "Bearer vm-token");
+            then.status(status)
+                .header("content-type", "application/json")
+                .body(body);
+        })
+    }
+
+    async fn read_metadata(server: &httpmock::MockServer) -> Result<ObjectVersion, RegistryError> {
+        let (metadata, storage) = endpoints(server);
+        fetch_metadata_from(
+            &http_client().unwrap(),
+            Endpoints {
+                metadata: &metadata,
+                storage: &storage,
+            },
+            OBJECT,
+        )
+        .await
+    }
+
+    async fn read_version(
+        server: &httpmock::MockServer,
+        version: &ObjectVersion,
+    ) -> Result<TokenCopy, RegistryError> {
+        let (metadata, storage) = endpoints(server);
+        fetch_version_from(
+            &http_client().unwrap(),
+            Endpoints {
+                metadata: &metadata,
+                storage: &storage,
+            },
+            OBJECT,
+            version,
+        )
+        .await
+    }
+
+    /// The MD5 Cloud Storage reports for `schema_version = 1`, as
+    /// `gcloud storage objects describe` prints it.
+    const BODY_MD5: &str = "omc/TsRplPfcUe8sQDyy/A==";
+
+    #[tokio::test]
+    async fn the_metadata_names_the_latest_version_without_its_content() {
+        let server = httpmock::MockServer::start_async().await;
+        serve_token(&server);
+        let metadata = serve_metadata(
+            &server,
+            200,
+            r#"{"kind":"storage#object","name":"staging/tokens.toml",
+               "generation":"1790782803062872","size":"18","md5Hash":"omc/TsRplPfcUe8sQDyy/A=="}"#,
+        );
+
+        assert_eq!(
+            read_metadata(&server).await.unwrap(),
+            ObjectVersion {
+                generation: 1_790_782_803_062_872,
+                size: 18,
+                md5_hash: BODY_MD5.to_string(),
+            }
+        );
+        metadata.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn metadata_that_is_gone_is_unusable_and_malformed_metadata_is_refused() {
+        let server = httpmock::MockServer::start_async().await;
+        serve_token(&server);
+        serve_metadata(&server, 404, "{}");
+        let error = read_metadata(&server).await.unwrap_err();
+        assert!(error.copy_is_unusable(), "{error:?}");
+
+        let server = httpmock::MockServer::start_async().await;
+        serve_token(&server);
+        serve_metadata(
+            &server,
+            200,
+            r#"{"generation":"one","size":"18","md5Hash":"x"}"#,
+        );
+        let error = read_metadata(&server).await.unwrap_err();
+        assert!(
+            matches!(
+                error,
+                RegistryError::MetadataField {
+                    field: "generation",
+                    ..
+                }
+            ),
+            "{error:?}"
+        );
+
+        let server = httpmock::MockServer::start_async().await;
+        serve_token(&server);
+        serve_metadata(&server, 200, r#"{"generation":"1"}"#);
+        let error = read_metadata(&server).await.unwrap_err();
+        assert!(matches!(error, RegistryError::Metadata { .. }), "{error:?}");
+    }
+
+    #[tokio::test]
+    async fn a_version_read_returns_the_content_its_metadata_describes() {
+        let server = httpmock::MockServer::start_async().await;
+        serve_token(&server);
+        let object = server.mock(|when, then| {
+            when.method(httpmock::Method::GET)
+                .path_includes("/storage/v1/b/t0-artifacts-tokens/o/")
+                .query_param("alt", "media")
+                .query_param("generation", "42");
+            then.status(200).body("schema_version = 1");
+        });
+        let version = ObjectVersion {
+            generation: 42,
+            size: 18,
+            md5_hash: BODY_MD5.to_string(),
+        };
+
+        assert_eq!(
+            read_version(&server, &version).await.unwrap(),
+            TokenCopy {
+                generation: 42,
+                bytes: b"schema_version = 1".to_vec(),
+            }
+        );
+        object.assert_async().await;
+    }
+
+    /// Content that does not match its metadata is not what was published:
+    /// it is never judged, whatever it holds.
+    #[tokio::test]
+    async fn content_that_does_not_match_its_metadata_is_refused() {
+        for version in [
+            ObjectVersion {
+                generation: 42,
+                size: 18,
+                md5_hash: "1B2M2Y8AsgTpgAmY7PhCfg==".to_string(),
+            },
+            ObjectVersion {
+                generation: 42,
+                size: 19,
+                md5_hash: BODY_MD5.to_string(),
+            },
+        ] {
+            let server = httpmock::MockServer::start_async().await;
+            serve_token(&server);
+            serve_object(&server, 200, b"schema_version = 1".to_vec());
+
+            let error = read_version(&server, &version).await.unwrap_err();
+            assert!(
+                matches!(error, RegistryError::Integrity { generation: 42, .. }),
+                "{version:?}: {error:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn sha256_names_the_content() {
+        assert_eq!(
+            sha256_hex(b"schema_version = 1"),
+            "b7bd3a4ef3d4f76daaba11c506459e2671b423580f507b3796cd06575a81ddd6"
+        );
+        assert_eq!(
+            sha256_hex(b""),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
     }
 
     #[tokio::test]
