@@ -163,20 +163,17 @@ impl RecheckUsdcDeposit for UsdcCorridorTransfers {
             .await
     }
 
+    /// Runs on the hub service whatever the transfer's corridor: the check
+    /// reads only the shared Ethereum wallet, so a transfer on a corridor this
+    /// build no longer serves can still be reconciled.
     async fn verify_deposit_send_superseded(
         &self,
         id: &UsdcRebalanceId,
-        corridor: UsdcCorridor,
         prepared: &PreparedTransaction,
         superseding_tx: Option<TxHash>,
     ) -> Result<(), DepositSendNotSuperseded> {
-        let service = self
-            .by_corridor
-            .get(&corridor)
-            .ok_or(DepositSendNotSuperseded::CorridorNotServed { corridor })?;
-
-        service
-            .verify_deposit_send_superseded(id, corridor, prepared, superseding_tx)
+        self.hub
+            .verify_deposit_send_superseded(id, prepared, superseding_tx)
             .await
     }
 }
@@ -290,7 +287,6 @@ mod tests {
         async fn verify_deposit_send_superseded(
             &self,
             id: &UsdcRebalanceId,
-            _corridor: UsdcCorridor,
             _prepared: &PreparedTransaction,
             _superseding_tx: Option<TxHash>,
         ) -> Result<(), DepositSendNotSuperseded> {
@@ -496,40 +492,34 @@ mod tests {
         );
     }
 
-    /// The superseded-send check runs on the service of the corridor the
-    /// transfer records; an unserved corridor is refused by name.
+    /// The superseded-send check reads only the shared Ethereum wallet, so it
+    /// reaches one service however the transfer's corridor is recorded,
+    /// served or not.
     #[tokio::test]
-    async fn superseded_send_check_routes_to_the_recorded_corridors_service() {
+    async fn superseded_send_check_reaches_a_service_whatever_the_corridor() {
         let TwoCorridors {
             transfers,
             base,
             robinhood,
+            store,
             ..
         } = two_corridors().await;
-        let id = UsdcRebalanceId(Uuid::new_v4());
+        let unserved = record_on(&store, ROBINHOOD_RELAY).await;
         let prepared = PreparedTransaction::for_test(TxHash::repeat_byte(0x66), 7);
 
         transfers
-            .verify_deposit_send_superseded(&id, ROBINHOOD_CCTP, &prepared, None)
+            .verify_deposit_send_superseded(&unserved, &prepared, None)
             .await
             .unwrap();
 
-        assert!(base.resumed.lock().unwrap().is_empty());
-        assert_eq!(*robinhood.resumed.lock().unwrap(), vec![id.clone()]);
-
-        let error = transfers
-            .verify_deposit_send_superseded(&id, ROBINHOOD_RELAY, &prepared, None)
-            .await
-            .unwrap_err();
-        assert!(
-            matches!(
-                error,
-                DepositSendNotSuperseded::CorridorNotServed {
-                    corridor: ROBINHOOD_RELAY
-                }
-            ),
-            "got {error:?}"
-        );
+        let checked = [
+            base.resumed.lock().unwrap(),
+            robinhood.resumed.lock().unwrap(),
+        ]
+        .iter()
+        .map(|resumed| resumed.len())
+        .sum::<usize>();
+        assert_eq!(checked, 1);
     }
 
     /// CCTP mint recovery runs on the Base via CCTP service, and is refused

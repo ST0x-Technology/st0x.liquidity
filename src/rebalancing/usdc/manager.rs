@@ -6563,8 +6563,6 @@ pub enum DepositSendNotSuperseded {
     },
     #[error(transparent)]
     EthereumChainMissing(#[from] EthereumChainMissing),
-    #[error("no cash transfer service in this build serves the {corridor} corridor")]
-    CorridorNotServed { corridor: UsdcCorridor },
     /// Reading the event store for another transfer's claim on the
     /// superseding tx failed -- transient, retry later.
     #[error("could not check whether another transfer recorded superseding tx {superseding}")]
@@ -6738,12 +6736,9 @@ pub(crate) trait RecheckUsdcDeposit: Send + Sync + 'static {
         operator_deposit_tx: Option<TxHash>,
     ) -> Result<RecheckOutcome, UsdcRecheckError>;
 
-    /// `corridor` is the transfer's recorded corridor, which picks the
-    /// service that checks it.
     async fn verify_deposit_send_superseded(
         &self,
         id: &UsdcRebalanceId,
-        corridor: UsdcCorridor,
         prepared: &PreparedTransaction,
         superseding_tx: Option<TxHash>,
     ) -> Result<(), DepositSendNotSuperseded>;
@@ -6793,7 +6788,6 @@ where
     async fn verify_deposit_send_superseded(
         &self,
         id: &UsdcRebalanceId,
-        _corridor: UsdcCorridor,
         prepared: &PreparedTransaction,
         superseding_tx: Option<TxHash>,
     ) -> Result<(), DepositSendNotSuperseded> {
@@ -16872,7 +16866,6 @@ mod tests {
         let error = manager
             .verify_deposit_send_superseded(
                 &UsdcRebalanceId(Uuid::new_v4()),
-                UsdcCorridor::BASE_CCTP,
                 &prepared,
                 Some(cancel),
             )
@@ -16895,7 +16888,6 @@ mod tests {
         manager
             .verify_deposit_send_superseded(
                 &UsdcRebalanceId(Uuid::new_v4()),
-                UsdcCorridor::BASE_CCTP,
                 &prepared,
                 Some(cancel),
             )
@@ -16942,7 +16934,6 @@ mod tests {
         let error = manager
             .verify_deposit_send_superseded(
                 &UsdcRebalanceId(Uuid::new_v4()),
-                UsdcCorridor::BASE_CCTP,
                 &prepared,
                 Some(cancel),
             )
@@ -17014,7 +17005,6 @@ mod tests {
             let error = manager
                 .verify_deposit_send_superseded(
                     &UsdcRebalanceId(Uuid::new_v4()),
-                    UsdcCorridor::BASE_CCTP,
                     &prepared,
                     Some(superseding),
                 )
@@ -17114,7 +17104,6 @@ mod tests {
         let error = manager
             .verify_deposit_send_superseded(
                 &UsdcRebalanceId(Uuid::new_v4()),
-                UsdcCorridor::BASE_CCTP,
                 &prepared,
                 Some(fee_bumped),
             )
@@ -17192,7 +17181,6 @@ mod tests {
         manager
             .verify_deposit_send_superseded(
                 &UsdcRebalanceId(Uuid::new_v4()),
-                UsdcCorridor::BASE_CCTP,
                 &prepared,
                 Some(other_send),
             )
@@ -17228,7 +17216,6 @@ mod tests {
         let error = manager
             .verify_deposit_send_superseded(
                 &UsdcRebalanceId(Uuid::new_v4()),
-                UsdcCorridor::BASE_CCTP,
                 &prepared,
                 Some(cancel),
             )

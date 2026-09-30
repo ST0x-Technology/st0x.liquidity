@@ -2455,7 +2455,7 @@ async fn check_signed_deposit_send_superseded(
     };
 
     usdc_recheck
-        .verify_deposit_send_superseded(id, rebalance.corridor(), prepared, superseding_tx)
+        .verify_deposit_send_superseded(id, prepared, superseding_tx)
         .await
         .map_err(|error| {
             warn!(?error, %id, "Refused to reconcile a USDC transfer with a signed deposit send");
@@ -2481,8 +2481,7 @@ fn deposit_send_not_superseded_response(
         | DepositSendNotSuperseded::SupersedingTxPaidTheDepositAddress { .. }
         | DepositSendNotSuperseded::UnreadableDepositSend { .. }
         | DepositSendNotSuperseded::SendSignedByAnotherWallet { .. }
-        | DepositSendNotSuperseded::EthereumChainMissing(_)
-        | DepositSendNotSuperseded::CorridorNotServed { .. } => (
+        | DepositSendNotSuperseded::EthereumChainMissing(_) => (
             StatusCode::CONFLICT,
             format!("Transfer {id}: refusing to reconcile: {error}"),
         ),
@@ -7420,7 +7419,6 @@ mod tests {
         async fn verify_deposit_send_superseded(
             &self,
             _id: &UsdcRebalanceId,
-            _corridor: UsdcCorridor,
             _prepared: &st0x_evm::PreparedTransaction,
             _superseding_tx: Option<TxHash>,
         ) -> Result<(), DepositSendNotSuperseded> {
@@ -8334,7 +8332,6 @@ mod tests {
         async fn verify_deposit_send_superseded(
             &self,
             _id: &UsdcRebalanceId,
-            _corridor: UsdcCorridor,
             _prepared: &st0x_evm::PreparedTransaction,
             superseding_tx: Option<TxHash>,
         ) -> Result<(), DepositSendNotSuperseded> {
