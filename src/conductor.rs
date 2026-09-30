@@ -3221,8 +3221,7 @@ fn build_rebalancing_service(
         RebalancingServiceConfig {
             poll_freshness: deps.poll_freshness.clone(),
             inventory_staleness_bound: rebalancing_ctx.inventory_staleness_bound,
-            usdc: rebalancing_ctx.usdc,
-            served_usdc_corridor: rebalancing_ctx.cctp_corridor.usdc_corridor(),
+            usdc: rebalancing_ctx.usdc.clone(),
             transfer_timeout: rebalancing_ctx.transfer_timeout,
             chains,
             allocation,
@@ -3491,13 +3490,17 @@ fn spawn_rebalancing_infrastructure<Signer: Wallet + Clone>(
         } = build_hedged_equity_services(&deps, &tokenizations, &wallets)?;
 
         let (EthereumWallet(ethereum_wallet), _) = wallets.clone().into_parts();
-        let usdc_endpoints = usdc_corridor_endpoints(
-            &deps.ctx,
-            &tokenizations,
-            &ethereum_wallet,
-            rebalancing_ctx.cctp_corridor.usdc_corridor(),
-        )?;
-        preflight_usdc_corridor_inventory(&deps.ctx, &usdc_endpoints).await?;
+        let usdc_endpoints = rebalancing_ctx
+            .usdc
+            .served()
+            .iter()
+            .map(|corridor| {
+                usdc_corridor_endpoints(&deps.ctx, &tokenizations, &ethereum_wallet, *corridor)
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        for endpoints in &usdc_endpoints {
+            preflight_usdc_corridor_inventory(&deps.ctx, endpoints).await?;
+        }
 
         let equity_transfer_services = EquityTransferServices {
             chains: chain_services,
@@ -3518,10 +3521,15 @@ fn spawn_rebalancing_infrastructure<Signer: Wallet + Clone>(
 
         wire_transfer_admission_guards(
             &rebalancing_service,
-            BTreeMap::from([(
-                usdc_endpoints.corridor.chain(),
-                ConfiguredGasReadiness::Wired(usdc_endpoints.gas_readiness.clone()),
-            )]),
+            usdc_endpoints
+                .iter()
+                .map(|endpoints| {
+                    (
+                        endpoints.corridor.chain(),
+                        ConfiguredGasReadiness::Wired(endpoints.gas_readiness.clone()),
+                    )
+                })
+                .collect(),
             equity_gas_readiness,
             rebalancing_ctx.freeze_check,
             &deps.ctx.issuance,
@@ -3592,7 +3600,7 @@ fn spawn_rebalancing_infrastructure<Signer: Wallet + Clone>(
         // `fail-usdc-transfer` route; the transfers take their own handles.
         let recovery_usdc_store = built.usdc;
         let usdc_handles = services.into_usdc_corridor_transfers(
-            vec![usdc_endpoints],
+            usdc_endpoints,
             &recovery_usdc_store,
             &deps.pool,
             &bot_gas_enqueuer,
@@ -6984,7 +6992,7 @@ mod tests {
     use st0x_config::{
         AllocationCtx, BotGasValuationConfig, ChainAssets, ChainCashAsset, ChainEquities,
         ChainEquityAsset, ChainRegistry, ExecutionThreshold, OperationMode, OrchestratorConfig,
-        UsdcCorridorCtx, create_test_ctx_with_order_owner, test_issuance_status_ctx,
+        UsdcCorridors, create_test_ctx_with_order_owner, test_issuance_status_ctx,
     };
     use st0x_dto::Statement;
     use st0x_event_sorcery::{DomainEvent, Reconciler, StoreBuilder, test_store};
@@ -7791,13 +7799,12 @@ mod tests {
 
         Arc::new(RebalancingService::new(
             RebalancingServiceConfig {
-                served_usdc_corridor: UsdcCorridor::BASE_CCTP,
                 poll_freshness: PollFreshness::always_fresh(),
                 inventory_staleness_bound: Duration::from_secs(300),
                 cash_reserved: None,
                 hedge_floor: HedgeFloor::default(),
                 allocation: AllocationCtx::base_test(),
-                usdc: None,
+                usdc: UsdcCorridors::base_cctp_disabled(),
                 transfer_timeout: Duration::from_secs(60),
                 chains: BTreeMap::from([(
                     Chain::Base,
@@ -8653,13 +8660,12 @@ mod tests {
         let notifier = Arc::new(crate::alerts::CapturingNotifier::default());
         let rebalancing_service = RebalancingService::new(
             RebalancingServiceConfig {
-                served_usdc_corridor: UsdcCorridor::BASE_CCTP,
                 poll_freshness: PollFreshness::always_fresh(),
                 inventory_staleness_bound: Duration::from_secs(300),
                 cash_reserved: None,
                 hedge_floor: HedgeFloor::default(),
                 allocation: AllocationCtx::base_test(),
-                usdc: None,
+                usdc: UsdcCorridors::base_cctp_disabled(),
                 transfer_timeout: Duration::from_secs(60),
                 chains: BTreeMap::from([(
                     Chain::Base,
@@ -10277,13 +10283,12 @@ mod tests {
         let vault_registry: Arc<Store<VaultRegistry>> = Arc::new(test_store(pool.clone(), ()));
         let rebalancing_service = RebalancingService::new(
             RebalancingServiceConfig {
-                served_usdc_corridor: UsdcCorridor::BASE_CCTP,
                 poll_freshness: PollFreshness::always_fresh(),
                 inventory_staleness_bound: Duration::from_secs(300),
                 cash_reserved: None,
                 hedge_floor: HedgeFloor::default(),
                 allocation: AllocationCtx::base_test(),
-                usdc: None,
+                usdc: UsdcCorridors::base_cctp_disabled(),
                 transfer_timeout: Duration::from_secs(60),
                 chains: BTreeMap::from([(
                     Chain::Base,
@@ -10390,13 +10395,12 @@ mod tests {
         let vault_registry2: Arc<Store<VaultRegistry>> = Arc::new(test_store(pool2.clone(), ()));
         let rebalancing_service2 = RebalancingService::new(
             RebalancingServiceConfig {
-                served_usdc_corridor: UsdcCorridor::BASE_CCTP,
                 poll_freshness: PollFreshness::always_fresh(),
                 inventory_staleness_bound: Duration::from_secs(300),
                 cash_reserved: None,
                 hedge_floor: HedgeFloor::default(),
                 allocation: AllocationCtx::base_test(),
-                usdc: None,
+                usdc: UsdcCorridors::base_cctp_disabled(),
                 transfer_timeout: Duration::from_secs(60),
                 chains: BTreeMap::from([(
                     Chain::Base,
@@ -15074,18 +15078,14 @@ mod tests {
 
         let trigger = Arc::new(RebalancingService::new(
             RebalancingServiceConfig {
-                served_usdc_corridor: UsdcCorridor::BASE_CCTP,
                 poll_freshness: PollFreshness::always_fresh(),
                 inventory_staleness_bound: Duration::from_secs(300),
                 cash_reserved: None,
                 hedge_floor: HedgeFloor::default(),
                 allocation: AllocationCtx::base_test(),
-                usdc: Some(UsdcCorridorCtx {
-                    corridor: UsdcCorridor::BASE_CCTP,
-                    threshold: ImbalanceThreshold {
-                        target: float!(0.5),
-                        deviation: float!(0.2),
-                    },
+                usdc: UsdcCorridors::base_cctp(ImbalanceThreshold {
+                    target: float!(0.5),
+                    deviation: float!(0.2),
                 }),
                 transfer_timeout: Duration::from_secs(30 * 60),
                 chains: BTreeMap::from([(
@@ -15218,16 +15218,12 @@ mod tests {
 
         let trigger = Arc::new(RebalancingService::new(
             RebalancingServiceConfig {
-                served_usdc_corridor: UsdcCorridor::BASE_CCTP,
                 poll_freshness: PollFreshness::always_fresh(),
                 inventory_staleness_bound: Duration::from_secs(300),
                 cash_reserved: None,
                 hedge_floor: HedgeFloor::default(),
                 allocation: AllocationCtx::base_test(),
-                usdc: Some(UsdcCorridorCtx {
-                    corridor: UsdcCorridor::BASE_CCTP,
-                    threshold,
-                }),
+                usdc: UsdcCorridors::base_cctp(threshold),
                 transfer_timeout: Duration::from_secs(30 * 60),
                 chains: BTreeMap::from([(
                     Chain::Base,
@@ -15384,18 +15380,14 @@ mod tests {
 
         let trigger = Arc::new(RebalancingService::new(
             RebalancingServiceConfig {
-                served_usdc_corridor: UsdcCorridor::BASE_CCTP,
                 poll_freshness: PollFreshness::always_fresh(),
                 inventory_staleness_bound: Duration::from_secs(300),
                 cash_reserved: None,
                 hedge_floor: HedgeFloor::default(),
                 allocation: AllocationCtx::base_test(),
-                usdc: Some(UsdcCorridorCtx {
-                    corridor: UsdcCorridor::BASE_CCTP,
-                    threshold: ImbalanceThreshold {
-                        target: float!(0.5),
-                        deviation: float!(0.2),
-                    },
+                usdc: UsdcCorridors::base_cctp(ImbalanceThreshold {
+                    target: float!(0.5),
+                    deviation: float!(0.2),
                 }),
                 transfer_timeout: Duration::from_secs(30 * 60),
                 chains: BTreeMap::from([(
@@ -15551,18 +15543,14 @@ mod tests {
 
         let trigger = Arc::new(RebalancingService::new(
             RebalancingServiceConfig {
-                served_usdc_corridor: UsdcCorridor::BASE_CCTP,
                 poll_freshness: PollFreshness::always_fresh(),
                 inventory_staleness_bound: Duration::from_secs(300),
                 cash_reserved: None,
                 hedge_floor: HedgeFloor::default(),
                 allocation: AllocationCtx::base_test(),
-                usdc: Some(UsdcCorridorCtx {
-                    corridor: UsdcCorridor::BASE_CCTP,
-                    threshold: ImbalanceThreshold {
-                        target: float!(0.5),
-                        deviation: float!(0.2),
-                    },
+                usdc: UsdcCorridors::base_cctp(ImbalanceThreshold {
+                    target: float!(0.5),
+                    deviation: float!(0.2),
                 }),
                 transfer_timeout: Duration::from_secs(30 * 60),
                 chains: BTreeMap::from([(

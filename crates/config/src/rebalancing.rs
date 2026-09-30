@@ -5,7 +5,7 @@ use alloy::primitives::Address;
 use rain_math_float::{Float, FloatError};
 use serde::Deserialize;
 use serde::de::IgnoredAny;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::LazyLock;
 use std::time::Duration;
 
@@ -159,24 +159,113 @@ pub struct UsdcCorridorCtx {
     pub threshold: ImbalanceThreshold,
 }
 
+/// Whether Base is a hedged chain holding a cash vault. Base via CCTP is then
+/// served with no corridor table, so its in-flight transfers always recover.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BaseCashVault {
+    Held,
+    Absent,
+}
+
+/// The validated cash corridors, active and served.
+///
+/// New transfers run on the active ones (every table while USDC mode is
+/// enabled); a cash transfer service carries the served ones (every table
+/// whatever the mode, plus Base via CCTP while Base holds a cash vault).
+#[derive(Debug, Clone)]
+pub struct UsdcCorridors {
+    mode: OperationMode,
+    by_chain: BTreeMap<Chain, UsdcCorridorCtx>,
+    served: BTreeSet<UsdcCorridor>,
+}
+
+impl UsdcCorridors {
+    /// The corridors new transfers run on, in chain order; none while USDC
+    /// mode is disabled.
+    pub fn active(&self) -> impl Iterator<Item = &UsdcCorridorCtx> {
+        let enabled = self.mode == OperationMode::Enabled;
+
+        self.by_chain.values().filter(move |_| enabled)
+    }
+
+    /// The corridors this build runs a cash transfer service for.
+    pub const fn served(&self) -> &BTreeSet<UsdcCorridor> {
+        &self.served
+    }
+
+    pub fn serves(&self, corridor: UsdcCorridor) -> bool {
+        self.served.contains(&corridor)
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl UsdcCorridors {
+    /// Base via CCTP, active on `threshold`.
+    pub fn base_cctp(threshold: ImbalanceThreshold) -> Self {
+        Self::for_test(OperationMode::Enabled, [base_cctp_corridor(threshold)])
+    }
+
+    /// USDC mode disabled, Base via CCTP still served.
+    pub fn base_cctp_disabled() -> Self {
+        Self {
+            mode: OperationMode::Disabled,
+            by_chain: BTreeMap::new(),
+            served: BTreeSet::from([UsdcCorridor::BASE_CCTP]),
+        }
+    }
+
+    /// `corridors` under `mode`, each one served.
+    pub fn for_test(
+        mode: OperationMode,
+        corridors: impl IntoIterator<Item = UsdcCorridorCtx>,
+    ) -> Self {
+        let by_chain: BTreeMap<Chain, UsdcCorridorCtx> = corridors
+            .into_iter()
+            .map(|usdc| (usdc.corridor.chain(), usdc))
+            .collect();
+        let served = by_chain.values().map(|usdc| usdc.corridor).collect();
+
+        Self {
+            mode,
+            by_chain,
+            served,
+        }
+    }
+}
+
 impl UsdcRebalancing {
-    /// Validates every corridor table, whatever the mode, and returns the
-    /// corridor new transfers run on: `None` while the mode is disabled.
-    fn corridor_ctx(&self) -> Result<Option<UsdcCorridorCtx>, RebalancingCtxError> {
-        let mut validated = self
+    /// Validates every corridor table, whatever the mode. Every table is
+    /// served, and Base via CCTP too while Base holds a cash vault; with USDC
+    /// mode enabled at least one table is required.
+    fn corridors(
+        &self,
+        base_cash_vault: BaseCashVault,
+    ) -> Result<UsdcCorridors, RebalancingCtxError> {
+        let by_chain = self
             .corridors
             .iter()
-            .map(|(chain, config)| self.validate_corridor(*chain, config))
-            .collect::<Result<Vec<_>, _>>()?
-            .into_iter();
+            .map(|(chain, config)| Ok((*chain, self.validate_corridor(*chain, config)?)))
+            .collect::<Result<BTreeMap<_, _>, RebalancingCtxError>>()?;
 
-        match self.mode {
-            OperationMode::Enabled => validated
-                .next()
-                .map(Some)
-                .ok_or(RebalancingCtxError::UsdcEnabledWithoutCorridor),
-            OperationMode::Disabled => Ok(None),
+        if self.mode == OperationMode::Enabled && by_chain.is_empty() {
+            return Err(RebalancingCtxError::UsdcEnabledWithoutCorridor);
         }
+
+        let implicit_base = match base_cash_vault {
+            BaseCashVault::Held => Some(UsdcCorridor::BASE_CCTP),
+            BaseCashVault::Absent => None,
+        };
+        let served = by_chain
+            .values()
+            .map(|usdc| usdc.corridor)
+            .chain(implicit_base)
+            .collect();
+
+        Ok(UsdcCorridors {
+            mode: self.mode,
+            by_chain,
+            served,
+        })
     }
 
     fn validate_corridor(
@@ -342,9 +431,9 @@ fn default_settlement_retry_deadline_secs() -> u64 {
 pub struct RebalancingCtx {
     /// The validated `[rebalancing.allocation]` section.
     pub allocation: AllocationCtx,
-    /// The corridor new cash transfers run on; `None` while USDC mode is
-    /// disabled.
-    pub usdc: Option<UsdcCorridorCtx>,
+    /// The corridors new cash transfers run on and the ones this build
+    /// serves.
+    pub usdc: UsdcCorridors,
     pub transfer_timeout: Duration,
     /// Staleness bound for per-chain inventory snapshots. See
     /// [`RebalancingConfig::inventory_staleness_bound_secs`].
@@ -381,7 +470,12 @@ pub struct RebalancingCtx {
 impl RebalancingCtx {
     /// Construct from config. Validates only rebalancing-specific
     /// trigger thresholds; wallet construction lives elsewhere.
-    pub fn new(config: &RebalancingConfig) -> Result<Self, RebalancingCtxError> {
+    /// `base_cash_vault` says whether Base via CCTP is served with no
+    /// corridor table.
+    pub fn new(
+        config: &RebalancingConfig,
+        base_cash_vault: BaseCashVault,
+    ) -> Result<Self, RebalancingCtxError> {
         let allocation = config.allocation()?;
         if config.transfer_timeout_secs == 0 {
             return Err(RebalancingCtxError::ZeroTransferTimeout);
@@ -400,9 +494,9 @@ impl RebalancingCtx {
             return Err(RebalancingCtxError::ZeroTransferAttemptTimeout);
         }
 
-        let usdc = config.usdc.corridor_ctx()?;
+        let usdc = config.usdc.corridors(base_cash_vault)?;
 
-        if usdc.is_some() && config.max_burn_revert_redrives == 0 {
+        if usdc.active().next().is_some() && config.max_burn_revert_redrives == 0 {
             return Err(RebalancingCtxError::ZeroMaxBurnRevertRedrives);
         }
 
@@ -449,7 +543,7 @@ impl RebalancingCtx {
     ) -> Self {
         Self {
             allocation,
-            usdc: usdc.map(base_cctp_corridor),
+            usdc: usdc.map_or_else(UsdcCorridors::base_cctp_disabled, UsdcCorridors::base_cctp),
             transfer_timeout,
             inventory_staleness_bound,
             transfer_attempt_timeout,
@@ -488,7 +582,7 @@ impl RebalancingCtx {
     ) -> Self {
         Self {
             allocation,
-            usdc: usdc.map(base_cctp_corridor),
+            usdc: usdc.map_or_else(UsdcCorridors::base_cctp_disabled, UsdcCorridors::base_cctp),
             transfer_timeout,
             inventory_staleness_bound,
             transfer_attempt_timeout,
@@ -587,7 +681,7 @@ mod tests {
     fn rebalancing_ctx_resolves_the_ethereum_base_corridor() {
         let config: RebalancingConfig = toml::from_str(valid_rebalancing_config_toml()).unwrap();
 
-        let ctx = RebalancingCtx::new(&config).unwrap();
+        let ctx = RebalancingCtx::new(&config, BaseCashVault::Held).unwrap();
 
         assert_eq!(ctx.cctp_corridor.usdc_ethereum(), USDC_ETHEREUM);
         assert_eq!(ctx.cctp_corridor.usdc_base(), USDC_BASE);
@@ -656,7 +750,9 @@ mod tests {
 
         assert_eq!(config.freeze_check, OperationMode::Disabled);
         assert_eq!(
-            RebalancingCtx::new(&config).unwrap().freeze_check,
+            RebalancingCtx::new(&config, BaseCashVault::Held)
+                .unwrap()
+                .freeze_check,
             OperationMode::Disabled,
             "RebalancingCtx must carry the configured freeze_check through"
         );
@@ -823,7 +919,7 @@ mod tests {
         "#;
 
         let config = toml::from_str::<RebalancingConfig>(toml_str).unwrap();
-        let error = RebalancingCtx::new(&config).unwrap_err();
+        let error = RebalancingCtx::new(&config, BaseCashVault::Held).unwrap_err();
         assert!(matches!(
             error,
             RebalancingCtxError::ZeroInventoryStalenessBound
@@ -892,7 +988,7 @@ mod tests {
         )
         .unwrap();
 
-        let error = RebalancingCtx::new(&config).unwrap_err();
+        let error = RebalancingCtx::new(&config, BaseCashVault::Held).unwrap_err();
         assert!(matches!(
             error,
             RebalancingCtxError::ZeroAttestationRetryDeadline
@@ -958,7 +1054,7 @@ mod tests {
         )
         .unwrap();
 
-        let error = RebalancingCtx::new(&config).unwrap_err();
+        let error = RebalancingCtx::new(&config, BaseCashVault::Held).unwrap_err();
         assert!(matches!(
             error,
             RebalancingCtxError::ZeroSettlementRetryDeadline
@@ -995,7 +1091,7 @@ mod tests {
         )
         .unwrap();
 
-        let ctx = RebalancingCtx::new(&config).unwrap();
+        let ctx = RebalancingCtx::new(&config, BaseCashVault::Held).unwrap();
         assert_eq!(ctx.settlement_retry_deadline, Duration::from_secs(7200));
     }
 
@@ -1088,7 +1184,7 @@ mod tests {
         )
         .unwrap();
 
-        let error = RebalancingCtx::new(&config).unwrap_err();
+        let error = RebalancingCtx::new(&config, BaseCashVault::Held).unwrap_err();
         assert!(matches!(
             error,
             RebalancingCtxError::ZeroTransferAttemptTimeout
@@ -1125,7 +1221,7 @@ mod tests {
         )
         .unwrap();
 
-        let error = RebalancingCtx::new(&config).unwrap_err();
+        let error = RebalancingCtx::new(&config, BaseCashVault::Held).unwrap_err();
         assert!(matches!(
             error,
             RebalancingCtxError::ZeroMaxBurnRevertRedrives
@@ -1158,7 +1254,7 @@ mod tests {
         .unwrap();
 
         // USDC is disabled so the zero-check is skipped.
-        RebalancingCtx::new(&config).unwrap();
+        RebalancingCtx::new(&config, BaseCashVault::Held).unwrap();
     }
 
     #[test]
@@ -1242,7 +1338,7 @@ mod tests {
         );
         assert_eq!(allocation.cooldown_secs, 600);
 
-        let ctx = RebalancingCtx::new(&config).unwrap();
+        let ctx = RebalancingCtx::new(&config, BaseCashVault::Held).unwrap();
         let allocation = ctx.allocation;
         assert_eq!(allocation.cooldown, Duration::from_secs(600));
         assert!(
@@ -1352,7 +1448,7 @@ mod tests {
         ))
         .unwrap();
 
-        let error = RebalancingCtx::new(&config).unwrap_err();
+        let error = RebalancingCtx::new(&config, BaseCashVault::Held).unwrap_err();
         assert!(matches!(
             error,
             RebalancingCtxError::Allocation(AllocationConfigError::ZeroCooldown)
@@ -1390,7 +1486,7 @@ mod tests {
         )
         .unwrap();
 
-        let error = RebalancingCtx::new(&config).unwrap_err();
+        let error = RebalancingCtx::new(&config, BaseCashVault::Held).unwrap_err();
 
         assert!(
             matches!(error, RebalancingCtxError::RetiredEquityThreshold),
@@ -1422,7 +1518,7 @@ mod tests {
         )
         .unwrap();
 
-        let error = RebalancingCtx::new(&config).unwrap_err();
+        let error = RebalancingCtx::new(&config, BaseCashVault::Held).unwrap_err();
 
         assert!(
             matches!(error, RebalancingCtxError::RetiredEquityThreshold),
@@ -1448,7 +1544,7 @@ mod tests {
         )
         .unwrap();
 
-        let error = RebalancingCtx::new(&config).unwrap_err();
+        let error = RebalancingCtx::new(&config, BaseCashVault::Held).unwrap_err();
 
         assert!(
             matches!(error, RebalancingCtxError::MissingAllocation),
@@ -1467,13 +1563,14 @@ mod tests {
     }
 
     fn corridor_error(usdc: &str) -> RebalancingCtxError {
-        RebalancingCtx::new(&with_usdc(usdc)).unwrap_err()
+        RebalancingCtx::new(&with_usdc(usdc), BaseCashVault::Held).unwrap_err()
     }
 
     #[test]
     fn corridor_table_resolves_the_base_cctp_corridor() {
-        let ctx = RebalancingCtx::new(&with_usdc(
-            r#"
+        let ctx = RebalancingCtx::new(
+            &with_usdc(
+                r#"
             [usdc]
             mode = "enabled"
 
@@ -1482,10 +1579,12 @@ mod tests {
             target = 0.6
             deviation = 0.05
             "#,
-        ))
+            ),
+            BaseCashVault::Held,
+        )
         .unwrap();
 
-        let usdc = ctx.usdc.unwrap();
+        let usdc = ctx.usdc.active().next().unwrap();
         assert_eq!(usdc.corridor, UsdcCorridor::BASE_CCTP);
         assert!(usdc.threshold.target.eq(float!(0.6)).unwrap());
         assert!(usdc.threshold.deviation.eq(float!(0.05)).unwrap());
@@ -1735,8 +1834,9 @@ mod tests {
 
     #[test]
     fn legacy_threshold_equal_to_the_corridor_is_accepted() {
-        let ctx = RebalancingCtx::new(&with_usdc(
-            r#"
+        let ctx = RebalancingCtx::new(
+            &with_usdc(
+                r#"
             [usdc]
             mode = "enabled"
             target = 0.6
@@ -1747,10 +1847,15 @@ mod tests {
             target = "0.6"
             deviation = 0.05
             "#,
-        ))
+            ),
+            BaseCashVault::Held,
+        )
         .unwrap();
 
-        assert_eq!(ctx.usdc.unwrap().corridor, UsdcCorridor::BASE_CCTP);
+        assert_eq!(
+            ctx.usdc.active().next().unwrap().corridor,
+            UsdcCorridor::BASE_CCTP
+        );
     }
 
     /// A typo in a corridor table fails the day it is written, not the day
@@ -1780,10 +1885,13 @@ mod tests {
         );
     }
 
+    /// A disabled mode starts no transfers, but every table stays served so
+    /// its in-flight transfers recover.
     #[test]
-    fn disabled_mode_with_a_valid_corridor_starts_no_transfers() {
-        let ctx = RebalancingCtx::new(&with_usdc(
-            r#"
+    fn disabled_mode_still_serves_every_table() {
+        let ctx = RebalancingCtx::new(
+            &with_usdc(
+                r#"
             [usdc]
             mode = "disabled"
 
@@ -1792,14 +1900,36 @@ mod tests {
             target = 0.6
             deviation = 0.05
             "#,
-        ))
+            ),
+            BaseCashVault::Absent,
+        )
         .unwrap();
 
-        let None = ctx.usdc else {
-            panic!(
-                "a disabled mode must start no transfers, got {:?}",
-                ctx.usdc
-            );
-        };
+        assert_eq!(ctx.usdc.active().count(), 0, "got {:?}", ctx.usdc);
+        assert_eq!(
+            ctx.usdc.served(),
+            &BTreeSet::from([UsdcCorridor::BASE_CCTP])
+        );
+    }
+
+    /// With no corridor table Base via CCTP is served only while Base holds a
+    /// cash vault.
+    #[test]
+    fn base_cash_vault_serves_base_cctp_without_a_table() {
+        let config = with_usdc(
+            r#"
+            [usdc]
+            mode = "disabled"
+            "#,
+        );
+
+        let held = RebalancingCtx::new(&config, BaseCashVault::Held).unwrap();
+        let absent = RebalancingCtx::new(&config, BaseCashVault::Absent).unwrap();
+
+        assert_eq!(
+            held.usdc.served(),
+            &BTreeSet::from([UsdcCorridor::BASE_CCTP])
+        );
+        assert!(absent.usdc.served().is_empty(), "got {:?}", absent.usdc);
     }
 }

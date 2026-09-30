@@ -4109,7 +4109,7 @@ mod tests {
     use st0x_bridge::corridor::{HopKind, UsdcCorridor};
     use st0x_config::{
         BrokerCtx, Ctx, ExecutionThreshold, FileLogging, HedgedChain, LogLevel, RestApiCtx,
-        create_test_ctx_with_order_owner,
+        UsdcCorridors, create_test_ctx_with_order_owner,
     };
     use st0x_dto::{Trade, TradeOutcome, TradingVenue};
     use st0x_event_sorcery::{ReactorHarness, StoreBuilder};
@@ -7467,7 +7467,7 @@ mod tests {
                 poll_freshness: crate::inventory::PollFreshness::always_fresh(),
                 inventory_staleness_bound: std::time::Duration::from_secs(300),
                 allocation: st0x_config::AllocationCtx::base_test(),
-                usdc: None,
+                usdc: UsdcCorridors::base_cctp_disabled(),
                 transfer_timeout: std::time::Duration::from_secs(60),
                 chains: std::collections::BTreeMap::from([(
                     Chain::Base,
@@ -7480,7 +7480,6 @@ mod tests {
                 )]),
                 cash_reserved: None,
                 hedge_floor: st0x_execution::HedgeFloor::default(),
-                served_usdc_corridor: UsdcCorridor::BASE_CCTP,
             },
             vault_registry,
             std::collections::BTreeMap::from([(
@@ -7624,7 +7623,7 @@ mod tests {
                 chain: Chain::Robinhood,
                 hop: HopKind::Relay,
             },
-            served: UsdcCorridor::BASE_CCTP,
+            served: BTreeSet::from([UsdcCorridor::BASE_CCTP]),
         });
         assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
         assert!(

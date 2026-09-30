@@ -174,9 +174,8 @@ mod tests {
     use std::time::Duration;
     use tokio::sync::broadcast;
 
-    use st0x_bridge::corridor::UsdcCorridor;
     use st0x_config::ChainEquities;
-    use st0x_config::{AllocationCtx, ChainAssets, ExecutionThreshold, UsdcCorridorCtx};
+    use st0x_config::{AllocationCtx, ChainAssets, ExecutionThreshold, UsdcCorridors};
     use st0x_dto::Statement;
     use st0x_event_sorcery::test_store;
     use st0x_evm::Chain;
@@ -209,18 +208,14 @@ mod tests {
 
     fn test_trigger_config() -> RebalancingServiceConfig {
         RebalancingServiceConfig {
-            served_usdc_corridor: UsdcCorridor::BASE_CCTP,
             poll_freshness: PollFreshness::always_fresh(),
             inventory_staleness_bound: Duration::from_secs(300),
             cash_reserved: None,
             hedge_floor: st0x_execution::HedgeFloor::default(),
             allocation: AllocationCtx::base_test(),
-            usdc: Some(UsdcCorridorCtx {
-                corridor: UsdcCorridor::BASE_CCTP,
-                threshold: ImbalanceThreshold {
-                    target: float!(0.6),
-                    deviation: float!(0.15),
-                },
+            usdc: UsdcCorridors::base_cctp(ImbalanceThreshold {
+                target: float!(0.6),
+                deviation: float!(0.15),
             }),
             transfer_timeout: Duration::from_secs(30 * 60),
             chains: BTreeMap::from([(

@@ -20,10 +20,9 @@ use tokio::sync::broadcast;
 use uuid::Uuid;
 
 use rain_math_float::Float;
-use st0x_bridge::corridor::UsdcCorridor;
 use st0x_config::{
     AllocationCtx, ChainAssets, ChainCashAsset, ChainEquities, ChainEquityAsset, DeviationBand,
-    ExecutionThreshold, OperationMode, TargetShare, UsdcCorridorCtx,
+    ExecutionThreshold, OperationMode, TargetShare, UsdcCorridors,
 };
 use st0x_dto::Statement;
 use st0x_event_sorcery::{Projection, Store, StoreBuilder, test_store};
@@ -267,18 +266,14 @@ fn rebalancing_enabled_cash() -> ChainCashAsset {
 
 fn test_trigger_config() -> RebalancingServiceConfig {
     RebalancingServiceConfig {
-        served_usdc_corridor: UsdcCorridor::BASE_CCTP,
         poll_freshness: PollFreshness::always_fresh(),
         inventory_staleness_bound: Duration::from_secs(300),
         cash_reserved: None,
         hedge_floor: st0x_execution::HedgeFloor::default(),
         allocation: allocation(&[(Chain::Base, "0.5")], "0", "0.2"),
-        usdc: Some(UsdcCorridorCtx {
-            corridor: UsdcCorridor::BASE_CCTP,
-            threshold: ImbalanceThreshold {
-                target: float!(0.5),
-                deviation: float!(0.2),
-            },
+        usdc: UsdcCorridors::base_cctp(ImbalanceThreshold {
+            target: float!(0.5),
+            deviation: float!(0.2),
         }),
         transfer_timeout: Duration::from_secs(30 * 60),
         chains: BTreeMap::from([(
@@ -2200,7 +2195,7 @@ async fn usdc_none_disables_usdc_rebalancing() {
             poll_freshness: PollFreshness::always_fresh(),
             inventory_staleness_bound: Duration::from_secs(300),
             cash_reserved: None,
-            usdc: None,
+            usdc: UsdcCorridors::base_cctp_disabled(),
             ..test_trigger_config()
         },
         vault_registry,
@@ -2439,18 +2434,14 @@ async fn usdc_operational_limits_cap_across_trigger_cycles() {
     };
 
     let config = RebalancingServiceConfig {
-        served_usdc_corridor: UsdcCorridor::BASE_CCTP,
         poll_freshness: PollFreshness::always_fresh(),
         inventory_staleness_bound: Duration::from_secs(300),
         cash_reserved: None,
         hedge_floor: st0x_execution::HedgeFloor::default(),
         allocation: test_trigger_config().allocation,
-        usdc: Some(UsdcCorridorCtx {
-            corridor: UsdcCorridor::BASE_CCTP,
-            threshold: ImbalanceThreshold {
-                target: float!(0.5),
-                deviation: float!(0.2),
-            },
+        usdc: UsdcCorridors::base_cctp(ImbalanceThreshold {
+            target: float!(0.5),
+            deviation: float!(0.2),
         }),
         transfer_timeout: Duration::from_secs(30 * 60),
         chains: BTreeMap::from([(Chain::Base, ChainRebalancingConfig::for_test(assets))]),
@@ -2577,18 +2568,14 @@ async fn usdc_guard_blocks_concurrent_triggers() {
         }),
     };
     let config = RebalancingServiceConfig {
-        served_usdc_corridor: UsdcCorridor::BASE_CCTP,
         poll_freshness: PollFreshness::always_fresh(),
         inventory_staleness_bound: Duration::from_secs(300),
         cash_reserved: None,
         hedge_floor: st0x_execution::HedgeFloor::default(),
         allocation: test_trigger_config().allocation,
-        usdc: Some(UsdcCorridorCtx {
-            corridor: UsdcCorridor::BASE_CCTP,
-            threshold: ImbalanceThreshold {
-                target: float!(0.5),
-                deviation: float!(0.2),
-            },
+        usdc: UsdcCorridors::base_cctp(ImbalanceThreshold {
+            target: float!(0.5),
+            deviation: float!(0.2),
         }),
         transfer_timeout: Duration::from_secs(30 * 60),
         chains: BTreeMap::from([(Chain::Base, ChainRebalancingConfig::for_test(assets))]),
@@ -2679,18 +2666,14 @@ async fn threshold_config_controls_trigger_sensitivity() {
         .await;
 
         let wide_config = RebalancingServiceConfig {
-            served_usdc_corridor: UsdcCorridor::BASE_CCTP,
             poll_freshness: PollFreshness::always_fresh(),
             inventory_staleness_bound: Duration::from_secs(300),
             cash_reserved: None,
             hedge_floor: st0x_execution::HedgeFloor::default(),
             allocation: test_trigger_config().allocation,
-            usdc: Some(UsdcCorridorCtx {
-                corridor: UsdcCorridor::BASE_CCTP,
-                threshold: ImbalanceThreshold {
-                    target: float!(0.5),
-                    deviation: float!(0.4),
-                },
+            usdc: UsdcCorridors::base_cctp(ImbalanceThreshold {
+                target: float!(0.5),
+                deviation: float!(0.4),
             }),
             transfer_timeout: Duration::from_secs(30 * 60),
             chains: BTreeMap::from([(
@@ -2751,18 +2734,14 @@ async fn threshold_config_controls_trigger_sensitivity() {
         .await;
 
         let tight_config = RebalancingServiceConfig {
-            served_usdc_corridor: UsdcCorridor::BASE_CCTP,
             poll_freshness: PollFreshness::always_fresh(),
             inventory_staleness_bound: Duration::from_secs(300),
             cash_reserved: None,
             hedge_floor: st0x_execution::HedgeFloor::default(),
             allocation: test_trigger_config().allocation,
-            usdc: Some(UsdcCorridorCtx {
-                corridor: UsdcCorridor::BASE_CCTP,
-                threshold: ImbalanceThreshold {
-                    target: float!(0.5),
-                    deviation: float!(0.1),
-                },
+            usdc: UsdcCorridors::base_cctp(ImbalanceThreshold {
+                target: float!(0.5),
+                deviation: float!(0.1),
             }),
             transfer_timeout: Duration::from_secs(30 * 60),
             chains: BTreeMap::from([(

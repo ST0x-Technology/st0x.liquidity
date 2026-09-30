@@ -1989,10 +1989,12 @@ rule fails startup with a named error:
 6. `hop = "relay"` on any chain: this build has no Relay hop.
 7. USDC mode enabled and a chain that is not disabled, whose cash table enables
    rebalancing, has no corridor table: there is no implicit corridor.
-8. No served corridor. The build serves every corridor table, whatever the mode,
-   and Base via CCTP whenever Base is a hedged chain with a cash vault, so
-   in-flight Base transfers always recover. A config that serves neither has no
-   cash transfer service to start.
+8. No served corridor while a hedged chain has a cash table. The build serves
+   every corridor table, whatever the mode, and Base via CCTP whenever Base is a
+   hedged chain with a cash vault, so in-flight Base transfers always recover. A
+   config that holds cash but serves neither has no service to move it; one with
+   no cash table at all (the s01 CLI config) loads, and the bot refuses it at
+   startup.
 9. Transitional: `target` or `deviation` still set directly under
    `[rebalancing.usdc]` and different from the corridor's value. The released
    image reads those two keys and ignores the corridor tables, so both stay in

@@ -327,8 +327,14 @@ pub(crate) fn routes() -> Router<AppState> {
 pub(crate) fn settings_from_ctx(ctx: &st0x_config::Ctx) -> st0x_dto::Settings {
     let (equity_target, equity_deviation, usdc_target, usdc_deviation) = {
         let rebalancing = &ctx.rebalancing;
-        let (usdc_target, usdc_deviation) =
-            rebalancing.usdc.as_ref().map_or((None, None), |usdc| {
+        // The primary chain's corridor band, until the dashboard shows one
+        // cash band per chain.
+        let primary = ctx.chains.primary().chain;
+        let (usdc_target, usdc_deviation) = rebalancing
+            .usdc
+            .active()
+            .find(|usdc| usdc.corridor.chain() == primary)
+            .map_or((None, None), |usdc| {
                 (
                     Some(float_to_f64(usdc.threshold.target, 0.5)),
                     Some(float_to_f64(usdc.threshold.deviation, 0.3)),
@@ -339,7 +345,7 @@ pub(crate) fn settings_from_ctx(ctx: &st0x_config::Ctx) -> st0x_dto::Settings {
         let primary_target = rebalancing
             .allocation
             .targets
-            .get(&ctx.chains.primary().chain)
+            .get(&primary)
             .map(|target| float_to_f64(target.inner(), 0.5));
 
         (

@@ -3233,7 +3233,7 @@ pub mod process_tx {
 
         use st0x_config::{
             ChainAssets, Ctx, ExecutionThreshold, HedgedChain, HedgingAssets, PricingCtx,
-            TradingScheduleConfig, TradingScheduleMode,
+            TradingScheduleConfig, TradingScheduleMode, UsdcCorridors,
         };
         use st0x_event_sorcery::{AggregateError, SendError, StoreBuilder};
         use st0x_evm::{Chain, ReadOnlyEvm};
@@ -8352,7 +8352,7 @@ pub mod process_tx {
                     cash_reserved: None,
                     hedge_floor: st0x_execution::HedgeFloor::default(),
                     allocation: st0x_config::AllocationCtx::base_test(),
-                    usdc: None,
+                    usdc: UsdcCorridors::base_cctp_disabled(),
                     transfer_timeout: std::time::Duration::from_secs(60),
                     chains: std::collections::BTreeMap::from([(
                         Chain::Base,
@@ -8361,7 +8361,6 @@ pub mod process_tx {
                             cash: None,
                         }),
                     )]),
-                    served_usdc_corridor: st0x_bridge::corridor::UsdcCorridor::BASE_CCTP,
                 },
                 vault_registry,
                 std::collections::BTreeMap::from([(

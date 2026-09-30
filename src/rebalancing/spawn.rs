@@ -418,7 +418,6 @@ mod tests {
         let ctx = make_ctx();
 
         let trigger_config = RebalancingServiceConfig {
-            served_usdc_corridor: UsdcCorridor::BASE_CCTP,
             poll_freshness: PollFreshness::always_fresh(),
             inventory_staleness_bound: std::time::Duration::from_secs(300),
             cash_reserved: None,
@@ -450,7 +449,6 @@ mod tests {
         let ctx = make_ctx();
 
         let trigger_config = RebalancingServiceConfig {
-            served_usdc_corridor: UsdcCorridor::BASE_CCTP,
             poll_freshness: PollFreshness::always_fresh(),
             inventory_staleness_bound: std::time::Duration::from_secs(300),
             cash_reserved: None,
@@ -461,7 +459,11 @@ mod tests {
             chains: BTreeMap::new(),
         };
 
-        let usdc_threshold = trigger_config.usdc.expect("USDC threshold should be Some");
+        let usdc_threshold = trigger_config
+            .usdc
+            .active()
+            .next()
+            .expect("USDC threshold should be Some");
         assert!(usdc_threshold.threshold.target.eq(float!(0.6)).unwrap());
         assert!(usdc_threshold.threshold.deviation.eq(float!(0.15)).unwrap());
     }

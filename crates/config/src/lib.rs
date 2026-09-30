@@ -46,8 +46,9 @@ pub use orchestrator::{OrchestratorAddresses, OrchestratorConfig, OrchestratorEr
 pub use order_poller::OrderPollerCtx;
 pub use pricing::{PricingApiKey, PricingAuth, PricingConfig, PricingCtx, PricingCtxError};
 pub use rebalancing::{
-    ALPACA_MINIMUM_WITHDRAWAL, ALPACA_TO_BASE_MINIMUM_TRANSFER, RebalancingConfig, RebalancingCtx,
-    RebalancingCtxError, UsdcCorridorConfig, UsdcCorridorCtx, UsdcRebalancing,
+    ALPACA_MINIMUM_WITHDRAWAL, ALPACA_TO_BASE_MINIMUM_TRANSFER, BaseCashVault, RebalancingConfig,
+    RebalancingCtx, RebalancingCtxError, UsdcCorridorConfig, UsdcCorridorCtx, UsdcCorridors,
+    UsdcRebalancing,
 };
 pub use registry::{RegistryLive, RegistrySource, TokenFile};
 pub use telemetry::{

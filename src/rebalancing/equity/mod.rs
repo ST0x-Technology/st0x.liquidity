@@ -2715,8 +2715,9 @@ mod tests {
     use std::time::Duration;
     use tokio::sync::{Notify, broadcast};
 
-    use st0x_bridge::corridor::UsdcCorridor;
-    use st0x_config::{AllocationCtx, ChainAssets, ChainEquities, ChainEquityAsset, OperationMode};
+    use st0x_config::{
+        AllocationCtx, ChainAssets, ChainEquities, ChainEquityAsset, OperationMode, UsdcCorridors,
+    };
     use st0x_dto::Statement;
     use st0x_event_sorcery::{
         AggregateError, EntityList, LifecycleError, Never, Reactor, StoreBuilder, deps, test_store,
@@ -3378,13 +3379,12 @@ mod tests {
 
         let service = Arc::new(RebalancingService::new(
             RebalancingServiceConfig {
-                served_usdc_corridor: UsdcCorridor::BASE_CCTP,
                 poll_freshness: PollFreshness::always_fresh(),
                 inventory_staleness_bound: Duration::from_secs(300),
                 cash_reserved: None,
                 hedge_floor: st0x_execution::HedgeFloor::default(),
                 allocation: AllocationCtx::base_test(),
-                usdc: None,
+                usdc: UsdcCorridors::base_cctp_disabled(),
                 transfer_timeout: Duration::from_secs(1800),
                 chains: BTreeMap::from([(
                     Chain::Base,
@@ -3536,13 +3536,12 @@ mod tests {
 
         let service = Arc::new(RebalancingService::new(
             RebalancingServiceConfig {
-                served_usdc_corridor: UsdcCorridor::BASE_CCTP,
                 poll_freshness: PollFreshness::always_fresh(),
                 inventory_staleness_bound: Duration::from_secs(300),
                 cash_reserved: None,
                 hedge_floor: st0x_execution::HedgeFloor::default(),
                 allocation: AllocationCtx::base_test(),
-                usdc: None,
+                usdc: UsdcCorridors::base_cctp_disabled(),
                 transfer_timeout: Duration::from_secs(1800),
                 chains: BTreeMap::from([(
                     Chain::Base,
@@ -3945,13 +3944,12 @@ mod tests {
         ));
         let service = Arc::new(RebalancingService::new(
             RebalancingServiceConfig {
-                served_usdc_corridor: UsdcCorridor::BASE_CCTP,
                 poll_freshness: PollFreshness::always_fresh(),
                 inventory_staleness_bound: Duration::from_secs(300),
                 cash_reserved: None,
                 hedge_floor: st0x_execution::HedgeFloor::default(),
                 allocation: AllocationCtx::base_test(),
-                usdc: None,
+                usdc: UsdcCorridors::base_cctp_disabled(),
                 transfer_timeout: Duration::from_secs(1800),
                 chains: BTreeMap::from([(
                     Chain::Base,
@@ -4097,13 +4095,12 @@ mod tests {
 
         let service = Arc::new(RebalancingService::new(
             RebalancingServiceConfig {
-                served_usdc_corridor: UsdcCorridor::BASE_CCTP,
                 poll_freshness: PollFreshness::always_fresh(),
                 inventory_staleness_bound: Duration::from_secs(300),
                 cash_reserved: None,
                 hedge_floor: st0x_execution::HedgeFloor::default(),
                 allocation: AllocationCtx::base_test(),
-                usdc: None,
+                usdc: UsdcCorridors::base_cctp_disabled(),
                 transfer_timeout: Duration::from_secs(1800),
                 chains: BTreeMap::from([(
                     Chain::Base,
