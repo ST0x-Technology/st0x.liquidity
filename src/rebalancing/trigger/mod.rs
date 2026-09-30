@@ -37537,6 +37537,78 @@ mod tests {
         assert!(!trigger.usdc_guards.is_latched());
     }
 
+    /// The sweep that reads an unread untracked transfer also resolves its
+    /// unknown-corridor marker: a held guard names the corridor, a released
+    /// one drops the marker, which nothing else would ever clear.
+    #[tokio::test]
+    async fn sweep_read_resolves_the_unknown_marker_of_an_unread_transfer() {
+        let pool = crate::test_utils::setup_test_db().await;
+        let store = Arc::new(test_store::<UsdcRebalance>(pool.clone(), ()));
+        let held = UsdcRebalanceId(Uuid::new_v4());
+        seed_withdrawing_alpaca_to_base_on(&store, &held, usdc(400), ROBINHOOD_RELAY).await;
+        let reconciled = UsdcRebalanceId(Uuid::new_v4());
+        let burn_tx = B256::repeat_byte(0x0d);
+        for command in [
+            UsdcRebalanceCommand::Initiate {
+                corridor: ROBINHOOD_RELAY,
+                direction: RebalanceDirection::BaseToAlpaca,
+                amount: usdc(300),
+                withdrawal: TransferRef::OnchainTx(burn_tx),
+            },
+            UsdcRebalanceCommand::ConfirmWithdrawal {
+                withdrawal_tx: None,
+            },
+            UsdcRebalanceCommand::InitiateBridging { burn_tx },
+            UsdcRebalanceCommand::FailBridging {
+                reason: "stuck".to_string(),
+            },
+            UsdcRebalanceCommand::ReconcileStuckRebalance {
+                reason: crate::usdc_rebalance::ReconcileReason::FundsMovedManually,
+            },
+        ] {
+            store.send(&reconciled, command).await.unwrap();
+        }
+        let notifier = Arc::new(CapturingNotifier::default());
+        let trigger = make_unserved_corridor_trigger(&pool, store.clone(), notifier).await;
+        let harness = ReactorHarness::new(Arc::clone(&trigger));
+        let mut originals = Vec::new();
+        for id in [&held, &reconciled] {
+            let original = break_latest_usdc_event(&pool, id).await;
+            harness
+                .receive::<UsdcRebalance>(id.clone(), make_usdc_deposit_failed())
+                .await
+                .unwrap();
+            assert_eq!(
+                trigger
+                    .inventory
+                    .read()
+                    .await
+                    .active_usdc_rebalance_entry(id),
+                Some(&ActiveUsdcRebalance::Unknown)
+            );
+            originals.push((id, original));
+        }
+
+        for (id, original) in originals {
+            set_latest_usdc_event_payload(&pool, id, &original).await;
+        }
+        trigger
+            .expire_stuck_usdc_rebalances(Utc::now())
+            .await
+            .unwrap();
+
+        let inventory = trigger.inventory.read().await;
+        assert_eq!(
+            inventory.active_usdc_rebalance_entry(&held),
+            Some(&ActiveUsdcRebalance::Known {
+                chain: Chain::Robinhood,
+                direction: RebalanceDirection::AlpacaToBase,
+            })
+        );
+        assert_eq!(inventory.active_usdc_rebalance_entry(&reconciled), None);
+        drop(inventory);
+    }
+
     /// A live Alpaca-outbound job on another corridor blocks an
     /// Alpaca-outbound enqueue, so the rule survives a restart, while an
     /// inbound enqueue proceeds.
