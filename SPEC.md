@@ -3599,6 +3599,8 @@ Arc<dyn Tokenizer>, wrapper: Arc<dyn Wrapper> }`
 stateDiagram-v2
     [*] --> VaultWithdrawSubmitting: Redeem (persists signed transaction)
     VaultWithdrawSubmitting --> VaultWithdrawSubmitted: RecordWithdrawSubmission
+    VaultWithdrawSubmitting --> VaultWithdrawSubmitted: AdoptWithdrawalReplacement
+    VaultWithdrawSubmitted --> VaultWithdrawSubmitted: AdoptWithdrawalReplacement
     VaultWithdrawSubmitted --> WithdrawnFromRaindex: ConfirmWithdraw
     WithdrawnFromRaindex --> TokensUnwrapped: Unwrap
     WithdrawnFromRaindex --> Failed
@@ -3752,6 +3754,14 @@ enum EquityRedemptionCommand {
     RejectRedemption { reason: String },
     // Operator or timeout-driven failure before the tokens leave custody
     FailTransfer { reason: String },
+    // Operator adoption of a mined tx that took the signed withdrawal's nonce
+    // and did the withdrawal itself; the bot checks it on chain first.
+    AdoptWithdrawalReplacement {
+        replacement_tx: TxHash,
+        // The signed withdrawal the caller checked the replacement against.
+        replaced_withdrawal: TxHash,
+        reason: String,
+    },
 }
 ```
 
@@ -3817,6 +3827,14 @@ enum EquityRedemptionEvent {
     TransferFailed {
         tx_hash: Option<TxHash>,
         failed_at: DateTime<Utc>,
+    },
+    // Leaves the redemption in VaultWithdrawSubmitted with tx_hash =
+    // replacement_tx, no signed bytes, and the original submitted_at.
+    VaultWithdrawReplacementAdopted {
+        replacement_tx: TxHash,
+        replaced_tx: TxHash,
+        reason: String,
+        adopted_at: DateTime<Utc>,
     },
 
     Detected {
@@ -3905,6 +3923,14 @@ redemption polling, and `Wrapper` methods for ERC-4626 wrapping/unwrapping.
   `VaultWithdrawSubmitting` transaction and never broadcasts it
 - `RecordWithdrawSubmission` only from `VaultWithdrawSubmitting`
 - `ConfirmWithdraw` only from `VaultWithdrawSubmitted`
+- `AdoptWithdrawalReplacement` only from `VaultWithdrawSubmitting`, or from a
+  `VaultWithdrawSubmitted` that retains its signed bytes, and only while those
+  signed bytes are the `replaced_withdrawal` the caller checked; refused for the
+  withdrawal's own hash and for a blank reason. It emits
+  `VaultWithdrawReplacementAdopted`, leaving `VaultWithdrawSubmitted` with the
+  adopted hash, no signed bytes and the original submitted time, so resume
+  restores and confirms the adopted hash and never rebroadcasts the replaced
+  withdrawal
 - a resume from `VaultWithdrawSubmitting` always rebroadcasts the exact
   persisted bytes; retries never sign or submit a different withdrawal
 - if a later transfer step fails after withdrawal, the aggregate retains the
@@ -6225,16 +6251,18 @@ running. The command is pure: the bot's route
 redemption's chain, through that chain's raindex and bot wallet, that the tx is
 mined in the canonical chain from the bot wallet, at the withdrawal's nonce, is
 not the withdrawal itself, has the chain's required confirmations, succeeded,
-and calls the contract the withdrawal calls (`409` naming the failed check,
-`502` on a failed chain read, `503` before the bot is ready, `400` for a
-redemption with no signed withdrawal). The redemption's redrive then resumes
-from `VaultWithdrawSubmitted` as for any hash only submission: it restores the
-adopted hash at its nonce, `ConfirmWithdraw` confirms it and records the vault
-transfer its receipt shows (refusing a receipt that paid the withdrawal's token
-nowhere the bot expects), and confirming it releases the whole nonce entry,
-including the signed withdrawal's reservation. Nothing is rebroadcast, since the
-nonce is used. A restart restores the same hash only reservation, so the release
-does not depend on the process that adopted it.
+and is a `withdraw4` to the contract the withdrawal calls, from the same token
+and vault, in any amount, since `withdraw4` pays its caller, the bot wallet
+(`409` naming the failed check, `502` on a failed chain read, `503` before the
+bot is ready, `400` for a redemption with no signed withdrawal). The
+redemption's redrive then resumes from `VaultWithdrawSubmitted` as for any hash
+only submission: it restores the adopted hash at its nonce, `ConfirmWithdraw`
+confirms it and records the vault transfer its receipt shows (refusing a receipt
+that paid the withdrawal's token nowhere the bot expects), and confirming it
+releases the whole nonce entry, including the signed withdrawal's reservation.
+Nothing is rebroadcast, since the nonce is used. A restart restores the same
+hash only reservation, so the release does not depend on the process that
+adopted it.
 
 The `Reconciled` state retains the identifying fields (symbol, quantity,
 original failure reason, request/redemption identifiers) so the dashboard

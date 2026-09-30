@@ -3532,6 +3532,8 @@ fn replacement_not_adoptable_response(
         | ReplacementNotAdoptable::ReplacementUnconfirmed { .. }
         | ReplacementNotAdoptable::ReplacementReverted { .. }
         | ReplacementNotAdoptable::ReplacementCallsAnotherContract { .. }
+        | ReplacementNotAdoptable::ReplacementNotAWithdrawal { .. }
+        | ReplacementNotAdoptable::ReplacementWithdrawsAnotherVault { .. }
         | ReplacementNotAdoptable::NoConfirmationDepth { .. }
         | ReplacementNotAdoptable::ChainServicesMissing(_) => (
             StatusCode::CONFLICT,
@@ -4380,7 +4382,7 @@ mod tests {
     use alloy::eips::eip2718::{EIP1559_TX_TYPE_ID, Encodable2718 as _};
     use alloy::eips::eip2930::AccessList;
     use alloy::primitives::{
-        Address, Bytes, IntoLogData, TxHash, TxKind, address, fixed_bytes, uint,
+        Address, B256, Bytes, IntoLogData, TxHash, TxKind, address, fixed_bytes, uint,
     };
     use alloy::providers::{ProviderBuilder, mock::Asserter};
     use alloy::rpc::types::Log;
@@ -8489,6 +8491,24 @@ mod tests {
     const SIGNED_WITHDRAWAL_NONCE: u64 = 12;
     /// The contract the ready-path reconcile tests' vault withdrawal calls.
     const SIGNED_WITHDRAWAL_TARGET: Address = Address::repeat_byte(0x1A);
+    /// The token and vault the ready path reconcile tests' vault withdrawal
+    /// withdraws.
+    const SIGNED_WITHDRAWAL_TOKEN: Address = Address::repeat_byte(0x70);
+    const SIGNED_WITHDRAWAL_VAULT: B256 = B256::repeat_byte(0x7A);
+
+    /// `withdraw4` calldata withdrawing `target_amount` of `token` from
+    /// `vault_id`, as the bot signs it.
+    fn withdraw4_calldata(token: Address, vault_id: B256, target_amount: B256) -> Bytes {
+        Bytes::from(
+            crate::bindings::IRaindexInventory::withdraw4Call {
+                token,
+                vaultId: vault_id,
+                targetAmount: target_amount,
+                tasks: Vec::new(),
+            }
+            .abi_encode(),
+        )
+    }
 
     /// A vault withdrawal on Base genuinely signed by `signer`, so the chain
     /// check can recover its signer and target.
@@ -8502,7 +8522,11 @@ mod tests {
             to: TxKind::Call(SIGNED_WITHDRAWAL_TARGET),
             value: U256::ZERO,
             access_list: AccessList::default(),
-            input: Bytes::from_static(&[0xde, 0xad, 0xbe, 0xef]),
+            input: withdraw4_calldata(
+                SIGNED_WITHDRAWAL_TOKEN,
+                SIGNED_WITHDRAWAL_VAULT,
+                B256::repeat_byte(0x01),
+            ),
         };
         let signature = signer.sign_hash_sync(&unsigned.signature_hash()).unwrap();
         let envelope = TxEnvelope::from(unsigned.into_signed(signature));
@@ -10173,7 +10197,7 @@ mod tests {
                 to: Some(bot_wallet),
                 nonce: SIGNED_WITHDRAWAL_NONCE,
                 value: U256::ZERO,
-                has_calldata: false,
+                input: Bytes::new(),
                 tx_type: EIP1559_TX_TYPE_ID,
                 succeeded: true,
                 emitted_logs: false,
@@ -10224,7 +10248,11 @@ mod tests {
                 to: Some(SIGNED_WITHDRAWAL_TARGET),
                 nonce: SIGNED_WITHDRAWAL_NONCE,
                 value: U256::ZERO,
-                has_calldata: true,
+                input: withdraw4_calldata(
+                    SIGNED_WITHDRAWAL_TOKEN,
+                    SIGNED_WITHDRAWAL_VAULT,
+                    B256::repeat_byte(0x01),
+                ),
                 tx_type: EIP1559_TX_TYPE_ID,
                 succeeded: false,
                 emitted_logs: false,
@@ -10346,17 +10374,22 @@ mod tests {
         );
     }
 
-    /// A tx at the signed withdrawal's nonce, as the chain reports it.
-    fn mined_at_withdrawal_nonce(from: Address, to: Address) -> MinedTx {
+    /// A `withdraw4` of the signed withdrawal's token and vault at its nonce,
+    /// for `target_amount`, as the chain reports it.
+    fn mined_at_withdrawal_nonce(from: Address, to: Address, target_amount: B256) -> MinedTx {
         MinedTx {
             from,
             to: Some(to),
             nonce: SIGNED_WITHDRAWAL_NONCE,
             value: U256::ZERO,
-            has_calldata: true,
+            input: withdraw4_calldata(
+                SIGNED_WITHDRAWAL_TOKEN,
+                SIGNED_WITHDRAWAL_VAULT,
+                target_amount,
+            ),
             tx_type: EIP1559_TX_TYPE_ID,
-            block_number: 1,
             succeeded: true,
+            emitted_logs: true,
             confirmations: 1,
         }
     }
@@ -10377,9 +10410,10 @@ mod tests {
         .await
     }
 
-    /// A successful call at the withdrawal's nonce to the contract it calls,
-    /// e.g. a wallet "speed up" of the same `withdraw4`, becomes the
-    /// redemption's withdrawal, with no signed bytes left.
+    /// A successful `withdraw4` at the withdrawal's nonce to the contract it
+    /// calls, from the same token and vault, e.g. a wallet "speed up" of the
+    /// withdrawal, becomes the redemption's withdrawal, with no signed bytes
+    /// left. A different amount is adopted too: the receipt records what moved.
     #[tokio::test]
     async fn adopt_withdrawal_replacement_adopts_a_confirmed_call_to_the_withdrawal_target() {
         let signer = PrivateKeySigner::random();
@@ -10388,7 +10422,11 @@ mod tests {
         let speed_up = TxHash::repeat_byte(0x5E);
         let raindex = MockRaindex::new().with_mined_tx(
             speed_up,
-            mined_at_withdrawal_nonce(bot_wallet, SIGNED_WITHDRAWAL_TARGET),
+            mined_at_withdrawal_nonce(
+                bot_wallet,
+                SIGNED_WITHDRAWAL_TARGET,
+                B256::repeat_byte(0x02),
+            ),
         );
         let id = redemption_aggregate_id("api-redemption-adopt");
         let state = signed_withdrawal_reconcile_state(bot_wallet, raindex, &id, prepared).await;
@@ -10428,13 +10466,17 @@ mod tests {
         let bot_wallet = signer.address();
         let other = Address::repeat_byte(0x0E);
         let candidate = TxHash::repeat_byte(0x5E);
-        let valid = mined_at_withdrawal_nonce(bot_wallet, SIGNED_WITHDRAWAL_TARGET);
-        let cases: [(&str, Option<MinedTx>, &str); 6] = [
+        let valid = mined_at_withdrawal_nonce(
+            bot_wallet,
+            SIGNED_WITHDRAWAL_TARGET,
+            B256::repeat_byte(0x01),
+        );
+        let cases: [(&str, Option<MinedTx>, &str); 9] = [
             (
                 "another sender",
                 Some(MinedTx {
                     from: other,
-                    ..valid
+                    ..valid.clone()
                 }),
                 "was sent by",
             ),
@@ -10442,7 +10484,7 @@ mod tests {
                 "another nonce",
                 Some(MinedTx {
                     nonce: SIGNED_WITHDRAWAL_NONCE + 1,
-                    ..valid
+                    ..valid.clone()
                 }),
                 "is at nonce",
             ),
@@ -10450,7 +10492,7 @@ mod tests {
                 "unconfirmed",
                 Some(MinedTx {
                     confirmations: 0,
-                    ..valid
+                    ..valid.clone()
                 }),
                 "required confirmations",
             ),
@@ -10458,7 +10500,7 @@ mod tests {
                 "reverted",
                 Some(MinedTx {
                     succeeded: false,
-                    ..valid
+                    ..valid.clone()
                 }),
                 "reverted, so it withdrew nothing",
             ),
@@ -10466,9 +10508,41 @@ mod tests {
                 "another target",
                 Some(MinedTx {
                     to: Some(other),
-                    ..valid
+                    ..valid.clone()
                 }),
                 "so it did not do the withdrawal",
+            ),
+            (
+                "not a withdraw4",
+                Some(MinedTx {
+                    input: Bytes::from_static(&[0xde, 0xad, 0xbe, 0xef]),
+                    ..valid.clone()
+                }),
+                "is not a withdraw4 call",
+            ),
+            (
+                "another token",
+                Some(MinedTx {
+                    input: withdraw4_calldata(
+                        other,
+                        SIGNED_WITHDRAWAL_VAULT,
+                        B256::repeat_byte(0x01),
+                    ),
+                    ..valid.clone()
+                }),
+                "not token",
+            ),
+            (
+                "another vault",
+                Some(MinedTx {
+                    input: withdraw4_calldata(
+                        SIGNED_WITHDRAWAL_TOKEN,
+                        B256::repeat_byte(0x0E),
+                        B256::repeat_byte(0x01),
+                    ),
+                    ..valid
+                }),
+                "not token",
             ),
             ("not mined", None, "is not mined"),
         ];

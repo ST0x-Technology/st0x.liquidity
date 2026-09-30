@@ -505,7 +505,7 @@ impl Raindex for MockRaindex {
             ));
         }
 
-        Ok(self.mined_txs.get(&tx_hash).copied())
+        Ok(self.mined_txs.get(&tx_hash).cloned())
     }
 
     async fn confirm_tx_receipt(
