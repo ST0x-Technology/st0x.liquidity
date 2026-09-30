@@ -842,6 +842,63 @@ mod tests {
         assert_eq!(rebroadcast_hash, prepared.tx_hash());
     }
 
+    /// A different tx mined at a prepared transaction's nonce (a wallet "speed
+    /// up" of a stuck withdrawal), restored by hash and confirmed, releases the
+    /// prepared reservation: what adopting such a replacement relies on, since
+    /// the prepared bytes themselves can never confirm.
+    #[tokio::test]
+    async fn confirming_a_restored_replacement_releases_the_prepared_reservation() {
+        let (anvil, wallet, _token_address, signer_address) = setup_anvil_with_token().await;
+        let prepared = wallet
+            .prepare_pending(
+                signer_address,
+                Bytes::new(),
+                "withdrawal that never broadcasts",
+            )
+            .await
+            .unwrap();
+        let private_key = B256::from_slice(&anvil.keys()[0].to_bytes());
+        let speed_up_sender = ProviderBuilder::new()
+            .wallet(EthereumWallet::from(
+                PrivateKeySigner::from_bytes(&private_key).unwrap(),
+            ))
+            .connect_http(anvil.endpoint().parse().unwrap());
+        let replacement = speed_up_sender
+            .send_transaction(
+                TransactionRequest::default()
+                    .to(signer_address)
+                    .nonce(prepared.nonce()),
+            )
+            .await
+            .unwrap()
+            .get_receipt()
+            .await
+            .unwrap()
+            .transaction_hash;
+        assert_eq!(
+            wallet.in_flight.ownership(signer_address, prepared.nonce()),
+            NonceOwnership::Ours
+        );
+
+        wallet.restore_transaction(replacement).await.unwrap();
+        wallet
+            .confirm::<NoOpErrorRegistry>(replacement)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            wallet.in_flight.ownership(signer_address, prepared.nonce()),
+            NonceOwnership::Unknown,
+            "the confirmed replacement must release the whole nonce entry"
+        );
+        assert!(
+            !wallet
+                .nonce_manager
+                .release_occupied_nonce(signer_address, prepared.nonce()),
+            "confirming the replacement must already have released the reservation"
+        );
+    }
+
     #[tokio::test]
     async fn failed_preparation_does_not_consume_an_unbroadcast_nonce() {
         let (_anvil, wallet, token_address, signer_address) = setup_anvil_with_token().await;

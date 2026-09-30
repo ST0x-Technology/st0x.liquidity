@@ -6206,6 +6206,36 @@ used nonce and does not rewind nonce allocation onto it. A prepared transaction
 discarded before broadcast (a persist-failure rollback) is different: its nonce
 is unused, so allocation is rewound to refill it.
 
+A tx that took the signed withdrawal's nonce but is not a plain cancel may have
+moved the equity, so reconcile refuses it; when it did the withdrawal itself (a
+wallet "speed up" that sent the same `withdraw4` again at a higher fee), the
+redemption adopts it instead. The
+`AdoptWithdrawalReplacement { replacement_tx,
+replaced_withdrawal, reason }`
+command is valid only while the redemption still holds the signed withdrawal the
+caller checked (`VaultWithdrawSubmitting`, or a `VaultWithdrawSubmitted` that
+retains its signed bytes), refuses the withdrawal itself as its own replacement,
+and requires a reason. It emits `VaultWithdrawReplacementAdopted`, which leaves
+the redemption in `VaultWithdrawSubmitted` with the adopted hash, no signed
+bytes and the original submitted time, so the reconciliation deadline keeps
+running. The command is pure: the bot's route
+`POST
+/liquidity-write/transfers/equity_redemption/{id}/adopt-withdrawal`
+(client: `debug adopt-withdrawal`; `stox` has no adopt verb) first checks on the
+redemption's chain, through that chain's raindex and bot wallet, that the tx is
+mined in the canonical chain from the bot wallet, at the withdrawal's nonce, is
+not the withdrawal itself, has the chain's required confirmations, succeeded,
+and calls the contract the withdrawal calls (`409` naming the failed check,
+`502` on a failed chain read, `503` before the bot is ready, `400` for a
+redemption with no signed withdrawal). The redemption's redrive then resumes
+from `VaultWithdrawSubmitted` as for any hash only submission: it restores the
+adopted hash at its nonce, `ConfirmWithdraw` confirms it and records the vault
+transfer its receipt shows (refusing a receipt that paid the withdrawal's token
+nowhere the bot expects), and confirming it releases the whole nonce entry,
+including the signed withdrawal's reservation. Nothing is rebroadcast, since the
+nonce is used. A restart restores the same hash only reservation, so the release
+does not depend on the process that adopted it.
+
 The `Reconciled` state retains the identifying fields (symbol, quantity,
 original failure reason, request/redemption identifiers) so the dashboard
 projection still reports the real transfer, and maps to a distinct terminal

@@ -741,6 +741,12 @@ impl PreparedTransaction {
             .recover_signer()
             .ok()
     }
+
+    /// The address these bytes call, or `None` when they are not a signed
+    /// envelope or create a contract.
+    pub fn to(&self) -> Option<Address> {
+        TxEnvelope::decode_2718_exact(self.raw.as_ref()).ok()?.to()
+    }
 }
 
 impl<'de> Deserialize<'de> for PreparedTransaction {

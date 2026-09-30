@@ -776,6 +776,26 @@ stox transfer reconcile --kind redemption --id <redemption-aggregate-id> \
     chain's required confirmations (`[chains.<chain>] required_confirmations`),
     settle the equity by hand and reconcile with no `--superseding-tx`:
     `stox transfer reconcile --kind redemption --id <id> --reason <reason>`.
+  - No receipt, but another tx from the bot wallet already mined at the
+    withdrawal's nonce and did the withdrawal itself (for example a wallet
+    "speed up" that sent the same `withdraw4` again at a higher fee): do **not**
+    settle the equity by hand or reconcile. The equity moved, and reconcile
+    refuses it as not a plain cancel. Adopt that tx as the redemption's
+    withdrawal instead, against the live bot:
+    `st0x-liquidity-client --env <env> debug adopt-withdrawal <id> --replacement-tx <tx> --reason <reason>`
+    (the API is
+    `POST /liquidity-write/transfers/equity_redemption/{id}/adopt-withdrawal`
+    with `replacementTx` and `reason` in the body; `stox` has no adopt verb).
+    The bot refuses (the API with `409`, naming the failed check) unless `<tx>`
+    is mined from the bot wallet, at the withdrawal's nonce, is not the
+    withdrawal itself, has the chain's required confirmations, succeeded, and
+    calls the contract the withdrawal calls. A reverted tx withdrew nothing:
+    reconcile with it as the `--superseding-tx` instead. After adoption the
+    redemption's redrive confirms `<tx>`, records the vault transfer its receipt
+    shows, releases the withdrawal's nonce and continues with the unwrap and
+    send. After the reconciliation deadline the redrive runs every 30 minutes,
+    so to continue at once, or when the job budget page fired and no job
+    remains, run `stox transfer resume --kind equity` or restart the bot.
   - No receipt (pending, or dropped): do **not** settle the equity or reconcile
     yet. Cancel it: from the bot wallet on the redemption's chain, send a
     0-value transfer with no calldata to the wallet itself (any tx type except

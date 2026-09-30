@@ -159,10 +159,15 @@ pub(crate) async fn withdrawal_reconciliation_redrive_delay(
                  reverted, it used its nonce and moved nothing: once it has the chain's \
                  required confirmations, settle the equity by hand and run \
                  `stox transfer reconcile --kind redemption --id {aggregate_id} --reason \
-                 <reason>` with no --superseding-tx. (3) If it has no receipt (pending or \
-                 dropped), cancel it: send a 0-value self-transfer with no calldata (not \
-                 EIP-7702) from the bot wallet at its nonce, with fees above the withdrawal's, \
-                 and wait for the chain's required \
+                 <reason>` with no --superseding-tx. (3) If it has no receipt but another tx \
+                 from the bot wallet already mined at its nonce and did the withdrawal (for \
+                 example a wallet speed up of the same withdraw4), do not settle by hand: \
+                 adopt that tx with `st0x-liquidity-client debug adopt-withdrawal \
+                 {aggregate_id} --replacement-tx <tx> --reason <reason>`, and the redrive \
+                 confirms it and continues the redemption. (4) If it has no receipt and \
+                 nothing mined at its nonce (pending or dropped), cancel it: send a 0-value \
+                 self-transfer with no calldata (not EIP-7702) from the bot wallet at its \
+                 nonce, with fees above the withdrawal's, and wait for the chain's required \
                  confirmations. Then settle the equity by hand and run \
                  `stox transfer reconcile --kind redemption --id {aggregate_id} --reason \
                  <reason> --superseding-tx <cancel tx>`. A reverted and a cancelled withdrawal \
@@ -269,8 +274,11 @@ pub enum WithdrawalNotSuperseded {
     #[error(
         "superseding tx {superseding} succeeded but is not a plain cancel (a 0-value transfer \
          with no calldata from the bot wallet {bot_wallet} to itself, not EIP-7702, that \
-         emitted no logs), so it may have withdrawn the vault: do not reconcile or settle by \
-         hand until you have checked what it did onchain"
+         emitted no logs), so it may have withdrawn the vault: do not reconcile or settle \
+         by hand. If it did the withdrawal (for example a wallet speed up of the same \
+         withdraw4), adopt it so the redemption finishes: `st0x-liquidity-client debug \
+         adopt-withdrawal <id> --replacement-tx {superseding} --reason <reason>`. Otherwise \
+         check what it did onchain"
     )]
     SupersedingTxNotAPlainCancel {
         superseding: TxHash,
@@ -430,6 +438,186 @@ pub fn withdrawal_required_confirmations(
     chains
         .required_confirmations(chain)
         .ok_or(WithdrawalNotSuperseded::NoConfirmationDepth { chain })
+}
+
+/// Why a tx the operator named is not adoptable as a redemption's vault
+/// withdrawal in place of its signed one.
+#[derive(Debug, Error)]
+pub enum ReplacementNotAdoptable {
+    /// The persisted bytes are not a signed transaction, so its signer and the
+    /// contract it calls cannot be read.
+    #[error(
+        "vault withdrawal {tx} is not a readable signed transaction; its signer and target are \
+         unknown"
+    )]
+    UnreadableWithdrawal { tx: TxHash },
+    /// Nonces are per sender, so only a tx from the withdrawal's signer can
+    /// take its nonce, and the check reads the configured wallet's txs only.
+    #[error(
+        "vault withdrawal {tx} was signed by {signer}, not the bot wallet {bot_wallet} (was the \
+         key rotated?): only a tx from {signer} at its nonce can replace it"
+    )]
+    WithdrawalSignedByAnotherWallet {
+        tx: TxHash,
+        signer: Address,
+        bot_wallet: Address,
+    },
+    #[error(
+        "replacement {tx} is the vault withdrawal itself: if it mined, the redrive confirms it \
+         with nothing to adopt"
+    )]
+    ReplacementIsTheWithdrawal { tx: TxHash },
+    #[error(
+        "replacement {replacement} is not mined (unknown hash, or still pending); retry once it \
+         is mined"
+    )]
+    ReplacementNotMined { replacement: TxHash },
+    #[error("replacement {replacement} was sent by {from}, not the bot wallet {bot_wallet}")]
+    ReplacementFromAnotherSender {
+        replacement: TxHash,
+        from: Address,
+        bot_wallet: Address,
+    },
+    #[error(
+        "replacement {replacement} is at nonce {replacement_nonce}, not the vault withdrawal's \
+         nonce {nonce}"
+    )]
+    ReplacementAtAnotherNonce {
+        replacement: TxHash,
+        replacement_nonce: u64,
+        nonce: u64,
+    },
+    #[error(
+        "replacement {replacement} has {confirmations} of the {required} required \
+         confirmations; retry once it has them"
+    )]
+    ReplacementUnconfirmed {
+        replacement: TxHash,
+        confirmations: u64,
+        required: u64,
+    },
+    /// A reverted tx used the nonce and moved nothing, so it withdrew nothing
+    /// to adopt; it proves the withdrawal can never land instead.
+    #[error(
+        "replacement {replacement} reverted, so it withdrew nothing: reconcile the redemption \
+         with --superseding-tx {replacement} instead"
+    )]
+    ReplacementReverted { replacement: TxHash },
+    #[error(
+        "replacement {replacement} calls {called:?}, not {target}, the contract the vault \
+         withdrawal calls, so it did not do the withdrawal"
+    )]
+    ReplacementCallsAnotherContract {
+        replacement: TxHash,
+        called: Option<Address>,
+        target: Address,
+    },
+    #[error("no [chains.{chain}] required_confirmations: it gates the replacement check")]
+    NoConfirmationDepth { chain: Chain },
+    #[error(transparent)]
+    ChainServicesMissing(#[from] ChainServicesMissing),
+    /// Reading the chain failed: transient, retry later.
+    #[error("could not read tx {tx} on chain; retry")]
+    Read {
+        tx: TxHash,
+        #[source]
+        source: Box<RaindexError>,
+    },
+}
+
+/// Checks, reading its chain through `raindex`, that `replacement` did what
+/// `prepared`, a redemption's signed vault withdrawal, would have done, so the
+/// redemption can adopt it as its withdrawal.
+///
+/// `prepared` must be signed by `bot_wallet`, since nonces are per sender.
+/// `replacement` must be a different tx from `bot_wallet` at the withdrawal's
+/// nonce with `required_confirmations`, and a successful call to the contract
+/// the withdrawal calls. Taking the nonce means the signed withdrawal can
+/// never land, and a successful call to that contract is what moved the
+/// equity, so the redemption continues from it: `ConfirmWithdraw` records
+/// what its receipt actually transferred, and refuses a receipt that
+/// transferred the withdrawal's token nowhere it expects. Only a tx the node
+/// shows mined in the canonical chain counts, so a node that lags refuses
+/// rather than adopts.
+pub async fn verify_withdrawal_replacement(
+    raindex: &dyn Raindex,
+    prepared: &PreparedTransaction,
+    replacement: TxHash,
+    bot_wallet: Address,
+    required_confirmations: u64,
+) -> Result<(), ReplacementNotAdoptable> {
+    let tx = prepared.tx_hash();
+    let nonce = prepared.nonce();
+
+    let signer = prepared
+        .signer()
+        .ok_or(ReplacementNotAdoptable::UnreadableWithdrawal { tx })?;
+    if signer != bot_wallet {
+        return Err(ReplacementNotAdoptable::WithdrawalSignedByAnotherWallet {
+            tx,
+            signer,
+            bot_wallet,
+        });
+    }
+    let target = prepared
+        .to()
+        .ok_or(ReplacementNotAdoptable::UnreadableWithdrawal { tx })?;
+
+    if replacement == tx {
+        return Err(ReplacementNotAdoptable::ReplacementIsTheWithdrawal { tx });
+    }
+
+    let Some(MinedTx {
+        from,
+        to,
+        nonce: replacement_nonce,
+        succeeded,
+        confirmations,
+        ..
+    }) = raindex
+        .mined_tx(replacement)
+        .await
+        .map_err(|source| ReplacementNotAdoptable::Read {
+            tx: replacement,
+            source: Box::new(source),
+        })?
+    else {
+        return Err(ReplacementNotAdoptable::ReplacementNotMined { replacement });
+    };
+
+    if from != bot_wallet {
+        return Err(ReplacementNotAdoptable::ReplacementFromAnotherSender {
+            replacement,
+            from,
+            bot_wallet,
+        });
+    }
+    if replacement_nonce != nonce {
+        return Err(ReplacementNotAdoptable::ReplacementAtAnotherNonce {
+            replacement,
+            replacement_nonce,
+            nonce,
+        });
+    }
+    if confirmations < required_confirmations {
+        return Err(ReplacementNotAdoptable::ReplacementUnconfirmed {
+            replacement,
+            confirmations,
+            required: required_confirmations,
+        });
+    }
+    if !succeeded {
+        return Err(ReplacementNotAdoptable::ReplacementReverted { replacement });
+    }
+    if to != Some(target) {
+        return Err(ReplacementNotAdoptable::ReplacementCallsAnotherContract {
+            replacement,
+            called: to,
+            target,
+        });
+    }
+
+    Ok(())
 }
 
 /// Data extracted from the TokensReceived aggregate state for
@@ -1333,6 +1521,28 @@ impl CrossVenueEquityTransfer {
             services.raindex.as_ref(),
             prepared,
             superseding_tx,
+            services.wallet,
+            required_confirmations,
+        )
+        .await
+    }
+
+    /// Checks through `chain`'s own raindex and bot wallet that `replacement`
+    /// can be adopted in place of `prepared`, the signed vault withdrawal of a
+    /// redemption on that chain; see [`verify_withdrawal_replacement`].
+    pub(crate) async fn verify_withdrawal_replacement(
+        &self,
+        chain: Chain,
+        prepared: &PreparedTransaction,
+        replacement: TxHash,
+        required_confirmations: u64,
+    ) -> Result<(), ReplacementNotAdoptable> {
+        let services = self.services.for_chain(chain)?;
+
+        verify_withdrawal_replacement(
+            services.raindex.as_ref(),
+            prepared,
+            replacement,
             services.wallet,
             required_confirmations,
         )
@@ -4591,6 +4801,63 @@ mod tests {
             0,
             "the submitting-state path records ownership while broadcasting \
              and must not redundantly restore before its first confirmation"
+        );
+    }
+
+    /// A redemption whose signed withdrawal was replaced by a mined copy (a
+    /// wallet "speed up") finishes once the copy is adopted. Resume restores
+    /// the adopted hash with no signed bytes, which records it at the
+    /// withdrawal's nonce so confirming it releases that nonce; it never
+    /// rebroadcasts the dead withdrawal, and it runs the redemption to the end.
+    #[tokio::test]
+    async fn an_adopted_withdrawal_replacement_is_confirmed_and_the_redemption_completes() {
+        let raindex =
+            Arc::new(MockRaindex::new().with_withdraw_transfer(Address::ZERO, withdrawal_amount()));
+        let tokenizer: Arc<dyn Tokenizer> = Arc::new(
+            MockTokenizer::new()
+                .with_detection_outcome(MockDetectionOutcome::Detected)
+                .with_completion_outcome(MockCompletionOutcome::Completed),
+        );
+        let (transfer, _pool) = create_equity_transfer_with_pool(
+            tokenizer,
+            raindex.clone(),
+            Arc::new(MockWrapper::new()),
+        )
+        .await;
+        let id = redemption_aggregate_id("withdraw-replaced-by-a-mined-copy");
+        seed_withdrawal_intent(&transfer, &id, 0).await;
+        let speed_up = TxHash::repeat_byte(0x5E);
+        transfer
+            .redemption_store
+            .send(
+                &id,
+                EquityRedemptionCommand::AdoptWithdrawalReplacement {
+                    replacement_tx: speed_up,
+                    replaced_withdrawal: crate::equity_redemption::prepared_withdrawal_for_test()
+                        .tx_hash(),
+                    reason: "wallet sped up the withdrawal".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+
+        transfer.resume_redemption(&id).await.unwrap();
+
+        let entity = transfer.redemption_store.load(&id).await.unwrap().unwrap();
+        assert!(
+            matches!(entity, EquityRedemption::Completed { .. }),
+            "an adopted replacement must let the redemption complete, got {entity:?}"
+        );
+        assert_eq!(
+            raindex.restore_submitted_withdrawal_calls(),
+            vec![(speed_up, false)],
+            "resume must restore the adopted hash, not the signed withdrawal, so \
+             confirming it releases the withdrawal's nonce"
+        );
+        assert_eq!(
+            raindex.withdraw_submissions(),
+            0,
+            "the replaced withdrawal must never be rebroadcast"
         );
     }
 

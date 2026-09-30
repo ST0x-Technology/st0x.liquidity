@@ -140,6 +140,20 @@ pub(crate) enum Debug {
         #[arg(long)]
         superseding_tx: Option<String>,
     },
+    /// Adopt a mined tx that took a stuck redemption's signed vault withdrawal
+    /// nonce and did the withdrawal itself (e.g. a wallet "speed up" of the
+    /// same withdraw4), so the redemption finishes. The bot verifies it on
+    /// chain before adopting it.
+    AdoptWithdrawal {
+        /// Redemption aggregate id.
+        id: String,
+        /// The mined tx at the withdrawal's nonce to adopt.
+        #[arg(long)]
+        replacement_tx: String,
+        /// Free text audit reason, persisted on the event.
+        #[arg(long, value_parser = nonblank_reason)]
+        reason: String,
+    },
     /// Clear a dropped CCTP burn hash from a USDC rebalance so the guard can
     /// be released.
     ClearPendingBurn {
@@ -492,6 +506,13 @@ mod tests {
         let blanks = ["", "   ", "\t", "\n"];
         let verbs: &[&[&str]] = &[
             &["reconcile-equity", "mint", "abc", "--reason"],
+            &[
+                "adopt-withdrawal",
+                "abc",
+                "--replacement-tx",
+                "0xa",
+                "--reason",
+            ],
             &["clear-pending-burn", "abc", "--reason"],
             &["fail-usdc-transfer", "abc", "--reason"],
             &["fail-equity-transfer", "redemption", "abc", "--reason"],
