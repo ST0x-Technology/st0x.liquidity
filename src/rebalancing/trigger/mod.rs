@@ -73,7 +73,7 @@ use crate::inventory::{
     InventoryViewError, Operator, PendingRequestOwnership, PendingRequestOwnershipSnapshot,
     PollFreshness, PortfolioAsset, PortfolioLocation, TransferOp, Venue,
 };
-use crate::native_gas::{ConfiguredGasReadiness, GasReadiness, TransferGasRoute};
+use crate::native_gas::{ConfiguredGasReadiness, TransferGasRoute};
 use crate::offchain::order::OffchainOrderId;
 use crate::position::{
     EquityTransferReservationId, EquityTransferReservationStatus, Position, PositionCommand,
@@ -833,10 +833,11 @@ pub(crate) struct RebalancingService {
     /// config, mirroring `set_stores`); `None` only in tests that do not
     /// exercise the gate.
     freeze_status: RwLock<Option<Arc<dyn FreezeStatusReader>>>,
-    /// Fresh USDC-transfer gas admission, attached by the conductor through
-    /// `set_gas_readiness`. `Unwired` is fail-closed in production so a missed
-    /// startup wiring step cannot move funds without checking native gas.
-    gas_readiness: RwLock<ConfiguredGasReadiness>,
+    /// Fresh USDC-transfer gas admission per corridor chain, attached by the
+    /// conductor through `set_usdc_gas_readiness`. A chain without an entry
+    /// is `Unwired`, fail-closed in production so a missed startup wiring
+    /// step cannot move funds without checking native gas.
+    usdc_gas_readiness: RwLock<BTreeMap<Chain, ConfiguredGasReadiness>>,
     /// Per-chain gas admission for equity candidates, attached through
     /// `set_equity_gas_readiness`; a chain without an entry is `Unwired`.
     equity_gas_readiness: RwLock<BTreeMap<Chain, ConfiguredGasReadiness>>,
@@ -1159,7 +1160,7 @@ impl RebalancingService {
             registry_ids,
             inventory,
             freeze_status: RwLock::new(None),
-            gas_readiness: RwLock::new(ConfiguredGasReadiness::default()),
+            usdc_gas_readiness: RwLock::new(BTreeMap::new()),
             equity_gas_readiness: RwLock::new(BTreeMap::new()),
             equity_cooldowns: RwLock::new(HashMap::new()),
             last_prices: RwLock::new(None),
@@ -1247,8 +1248,13 @@ impl RebalancingService {
         *self.freeze_status.write().await = Some(reader);
     }
 
-    pub(crate) async fn set_gas_readiness(&self, readiness: Arc<GasReadiness>) {
-        *self.gas_readiness.write().await = ConfiguredGasReadiness::Wired(readiness);
+    /// Attach one gas check per USDC corridor chain; a fresh transfer on a
+    /// chain without one is refused.
+    pub(crate) async fn set_usdc_gas_readiness(
+        &self,
+        readiness: BTreeMap<Chain, ConfiguredGasReadiness>,
+    ) {
+        *self.usdc_gas_readiness.write().await = readiness;
     }
 
     /// Attach one gas check per chain an equity transfer can run on; the
@@ -1291,8 +1297,15 @@ impl RebalancingService {
         }
     }
 
-    async fn transfer_gas_is_ready(&self, route: TransferGasRoute) -> bool {
-        let readiness = self.gas_readiness.read().await.clone();
+    async fn usdc_transfer_gas_is_ready(&self, chain: Chain) -> bool {
+        let readiness = self
+            .usdc_gas_readiness
+            .read()
+            .await
+            .get(&chain)
+            .cloned()
+            .unwrap_or(ConfiguredGasReadiness::Unwired);
+        let route = TransferGasRoute::Usdc;
 
         match readiness.ensure_ready(route).await {
             Ok(()) => true,
@@ -1300,6 +1313,7 @@ impl RebalancingService {
                 warn!(
                     target: "rebalance",
                     ?route,
+                    %chain,
                     %error,
                     "Skipped fresh transfer because its signing wallet is not gas-ready"
                 );
@@ -5259,7 +5273,7 @@ impl RebalancingService {
             return;
         }
 
-        if !self.transfer_gas_is_ready(TransferGasRoute::Usdc).await {
+        if !self.usdc_transfer_gas_is_ready(usdc.corridor.chain()).await {
             return;
         }
 
@@ -8705,6 +8719,7 @@ mod tests {
     use crate::inventory::view::{EquityReconcileBusy, InFlightEquityLocation, Operator};
     use crate::inventory::{ActiveUsdcRebalance, InventoryError, InventoryView, TransferOp, Venue};
     use crate::mint_authorization::ConfiguredMintAuthorizer;
+    use crate::native_gas::GasReadiness;
     use crate::offchain::order::OffchainOrderId;
     use crate::onchain::mock::MockRaindex;
     use crate::position::{
@@ -32684,12 +32699,15 @@ mod tests {
         let inventory = InventoryView::default().with_usdc(usdc(900), usdc(100));
         let trigger = make_trigger_with_inventory(inventory).await;
         trigger
-            .set_gas_readiness(crate::native_gas::GasReadiness::for_test(
-                U256::MAX,
-                U256::from(1_u64),
-                U256::ZERO,
-                U256::from(1_u64),
-            ))
+            .set_usdc_gas_readiness(BTreeMap::from([(
+                Chain::Base,
+                ConfiguredGasReadiness::Wired(crate::native_gas::GasReadiness::for_test(
+                    U256::MAX,
+                    U256::from(1_u64),
+                    U256::ZERO,
+                    U256::from(1_u64),
+                )),
+            )]))
             .await;
 
         trigger.check_and_trigger_usdc().await;
@@ -32704,7 +32722,12 @@ mod tests {
         );
 
         trigger
-            .set_gas_readiness(crate::native_gas::GasReadiness::always_ready_for_test())
+            .set_usdc_gas_readiness(BTreeMap::from([(
+                Chain::Base,
+                ConfiguredGasReadiness::Wired(
+                    crate::native_gas::GasReadiness::always_ready_for_test(),
+                ),
+            )]))
             .await;
         trigger.check_and_trigger_usdc().await;
 

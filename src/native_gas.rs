@@ -157,10 +157,13 @@ impl GasReadiness {
         self.retry_interval
     }
 
-    /// The chain and wallet the equity route checks.
+    /// The chains and wallets the USDC route checks.
     #[cfg(test)]
-    pub(crate) fn equity_route(&self) -> (Chain, Address) {
-        (self.equity.chain, self.equity.wallet)
+    pub(crate) fn usdc_route(&self) -> [(Chain, Address); 2] {
+        [
+            (self.usdc_chain.chain, self.usdc_chain.wallet),
+            (self.ethereum.chain, self.ethereum.wallet),
+        ]
     }
 
     #[cfg(test)]

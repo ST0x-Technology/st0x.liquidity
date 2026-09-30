@@ -78,6 +78,8 @@ pub(crate) struct UsdcCorridorEndpoints<Signer> {
     pub(crate) contracts: RaindexContracts,
     pub(crate) vault_id: RaindexVaultId,
     pub(crate) required_confirmations: u64,
+    /// The USDC route's gas check: this chain's wallet and the Ethereum hub.
+    pub(crate) gas_readiness: Arc<GasReadiness>,
 }
 
 #[derive(Clone)]
