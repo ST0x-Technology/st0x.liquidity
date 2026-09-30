@@ -43,7 +43,7 @@ match CI's feature selection so the build reuses CI's artifacts instead of
 compiling another copy of every dependency:
 
 ```bash
-cargo nextest run --workspace --all-features -E 'package(st0x-cli) & test(name)'
+cargo nextest run --workspace --all-features -E 'package(st0x-cli) & test(<test_name>)'
 ```
 
 ### Common pitfall: dead code warnings
