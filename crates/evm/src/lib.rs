@@ -19,10 +19,11 @@
 use alloy::consensus::transaction::SignerRecoverable as _;
 use alloy::consensus::{Transaction, TxEnvelope};
 use alloy::eips::BlockId;
+use alloy::eips::Typed2718 as _;
 #[cfg(any(feature = "turnkey", feature = "local-signer"))]
 use alloy::eips::eip2718::Encodable2718;
 use alloy::eips::eip2718::{Decodable2718, Eip2718Error};
-use alloy::primitives::{Address, B256, Bytes, Signature, TxHash};
+use alloy::primitives::{Address, B256, Bytes, Signature, TxHash, U256};
 use alloy::providers::Provider;
 use alloy::rpc::types::{TransactionReceipt, TransactionRequest};
 use alloy::sol_types::SolCall;
@@ -740,12 +741,6 @@ impl PreparedTransaction {
             .recover_signer()
             .ok()
     }
-
-    /// The address these bytes call, or `None` when they are not a signed
-    /// envelope or create a contract.
-    pub fn to(&self) -> Option<Address> {
-        TxEnvelope::decode_2718_exact(self.raw.as_ref()).ok()?.to()
-    }
 }
 
 impl<'de> Deserialize<'de> for PreparedTransaction {
@@ -1349,14 +1344,23 @@ impl ReceiptWaitConfig {
 }
 
 /// A mined transaction as the node reports it: who sent it, what it called,
-/// at which nonce, whether it succeeded, and how deep it is (the inclusion
-/// block counts as confirmation 1).
+/// with what value and calldata, at which nonce, whether it succeeded, and how
+/// deep it is (the inclusion block counts as confirmation 1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MinedTx {
     pub from: Address,
     /// `None` for a contract creation.
     pub to: Option<Address>,
     pub nonce: u64,
+    pub value: U256,
+    /// Whether it carried calldata (initcode, for a contract creation).
+    pub has_calldata: bool,
+    /// Whether it is an EIP-7702 transaction, which sets code on accounts.
+    pub is_eip7702: bool,
+    /// Whether `to` held code as the inclusion block started or as it ended: a
+    /// contract, or an account with an EIP-7702 delegation. `false` for a
+    /// contract creation.
+    pub to_has_code: bool,
     /// `false` when it reverted. A reverted tx still used its nonce.
     pub succeeded: bool,
     pub confirmations: u64,
@@ -1394,10 +1398,32 @@ pub async fn mined_tx(
 
     let head = provider.get_block_number().await?;
 
+    let to = tx.to();
+    let to_has_code = match to {
+        // An EIP-7702 delegation runs code even on a plain call to the
+        // account, and any tx can set or clear it, so the head proves nothing
+        // about this tx: read the code before (as of the parent block) and at
+        // the end of the inclusion block. A node without that block's state
+        // fails the read rather than guessing.
+        Some(address) => {
+            let before = provider
+                .get_code_at(address)
+                .number(tx_block.saturating_sub(1))
+                .await?;
+            let after = provider.get_code_at(address).number(tx_block).await?;
+            !before.is_empty() || !after.is_empty()
+        }
+        None => false,
+    };
+
     Ok(Some(MinedTx {
         from: receipt.from,
-        to: tx.to(),
+        to,
         nonce: tx.nonce(),
+        value: tx.value(),
+        has_calldata: !tx.input().is_empty(),
+        is_eip7702: tx.is_eip7702(),
+        to_has_code,
         succeeded: receipt.status(),
         confirmations: head.saturating_sub(tx_block).saturating_add(1),
     }))
@@ -2214,6 +2240,10 @@ mod tests {
             from: anvil.addresses()[0],
             to: Some(recipient),
             nonce: 0,
+            value: U256::from(1),
+            has_calldata: false,
+            is_eip7702: false,
+            to_has_code: false,
             succeeded: true,
             confirmations: 1,
         };
@@ -2256,6 +2286,10 @@ mod tests {
                 from: anvil.addresses()[0],
                 to: None,
                 nonce: 0,
+                value: U256::ZERO,
+                has_calldata: true,
+                is_eip7702: false,
+                to_has_code: false,
                 succeeded: true,
                 confirmations: 1,
             })
@@ -2300,6 +2334,10 @@ mod tests {
                 from: anvil.addresses()[0],
                 to: Some(reverting),
                 nonce: 1,
+                value: U256::ZERO,
+                has_calldata: false,
+                is_eip7702: false,
+                to_has_code: true,
                 succeeded: false,
                 confirmations: 1,
             })

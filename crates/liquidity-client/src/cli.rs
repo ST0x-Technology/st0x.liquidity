@@ -134,8 +134,9 @@ pub(crate) enum Debug {
         #[arg(long, value_parser = nonblank_reason)]
         reason: String,
         /// The tx mined at a signed vault withdrawal's nonce, for a
-        /// redemption whose withdrawal was cancelled; the bot verifies it on
-        /// chain before reconciling.
+        /// redemption whose withdrawal was cancelled: a reverted tx, or a
+        /// 0-value self-transfer with no calldata (not EIP-7702) from the bot
+        /// wallet. The bot verifies it on chain before reconciling.
         #[arg(long)]
         superseding_tx: Option<String>,
     },

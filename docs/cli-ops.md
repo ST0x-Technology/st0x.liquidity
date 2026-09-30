@@ -778,14 +778,15 @@ stox transfer reconcile --kind redemption --id <redemption-aggregate-id> \
     `stox transfer reconcile --kind redemption --id <id> --reason <reason>`.
   - No receipt (pending, or dropped): do **not** settle the equity or reconcile
     yet. Cancel it: from the bot wallet on the redemption's chain, send a
-    0-value transfer to the wallet itself at the withdrawal's nonce, with
-    `maxFeePerGas` and `maxPriorityFeePerGas` at least 10% above the
-    withdrawal's. Never fee bump the withdrawal itself (the same call at a
-    higher fee): that withdraws the vault, and reconcile refuses it. Wait until
-    the cancel has the chain's required confirmations. If the withdrawal mined
-    instead, follow the cases above. Then settle the equity by hand (the same
-    settlement as for a reverted withdrawal: nothing moved in either case) and
-    run
+    0-value transfer with no calldata to the wallet itself (any tx type except
+    EIP-7702) at the withdrawal's nonce, with `maxFeePerGas` and
+    `maxPriorityFeePerGas` at least 10% above the withdrawal's. Never fee bump
+    the withdrawal itself (the same call at a higher fee), or cancel through a
+    contract: that can withdraw the vault, and reconcile refuses any successful
+    cancel that is not this plain self-transfer. Wait until the cancel has the
+    chain's required confirmations. If the withdrawal mined instead, follow the
+    cases above. Then settle the equity by hand (the same settlement as for a
+    reverted withdrawal: nothing moved in either case) and run
     `stox transfer reconcile --kind redemption --id <id> --reason <reason> --superseding-tx <cancel>`
     (or, against the live bot,
     `st0x-liquidity-client --env <env> debug reconcile-equity redemption <id> --reason <reason> --superseding-tx <cancel>`;
@@ -793,8 +794,10 @@ stox transfer reconcile --kind redemption --id <redemption-aggregate-id> \
 
   Reconcile reads the redemption's chain and refuses (the API with `409`) unless
   `<cancel>` is mined from the bot wallet, at the withdrawal's nonce, is not the
-  withdrawal itself, has the chain's required confirmations, and is not a
-  successful call to the contract the withdrawal calls; each refusal names the
+  withdrawal itself, has the chain's required confirmations, and either reverted
+  or is a plain cancel: a 0-value transfer with no calldata to the bot wallet
+  itself, not EIP-7702, while the wallet holds no code (no EIP-7702 delegation).
+  Any other successful tx may have withdrawn the vault. Each refusal names the
   failed check. No receipt for the withdrawal is not proof: a lagging node shows
   none for one that did mine. "could not read tx" (the API: `502`) is transient;
   retry. The withdrawal must be signed by the chain's configured bot wallet,

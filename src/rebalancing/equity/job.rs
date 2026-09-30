@@ -1063,7 +1063,8 @@ impl Job<TransferEquityToHedgingCtx> for TransferEquityToHedging {
                      (`stox transfer reconcile --kind redemption --id {} --reason <reason>`). \
                      If it has no receipt, it will not confirm at its current fee but can \
                      still mine when fees drop, so cancel it first: send a 0-value \
-                     self-transfer from the bot wallet at its nonce, with fees above the \
+                     self-transfer with no calldata (not EIP-7702) from the bot wallet at its \
+                     nonce, with fees above the \
                      withdrawal's, and wait for the required confirmations. Only then settle \
                      the equity by hand and reconcile \
                      (`stox transfer reconcile --kind redemption --id {} --reason <reason> \

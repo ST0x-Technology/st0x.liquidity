@@ -3363,7 +3363,7 @@ fn withdrawal_not_superseded_response(
         | WithdrawalNotSuperseded::SupersedingTxFromAnotherSender { .. }
         | WithdrawalNotSuperseded::SupersedingTxAtAnotherNonce { .. }
         | WithdrawalNotSuperseded::SupersedingTxUnconfirmed { .. }
-        | WithdrawalNotSuperseded::SupersedingTxCallsTheWithdrawalTarget { .. }
+        | WithdrawalNotSuperseded::SupersedingTxNotAPlainCancel { .. }
         | WithdrawalNotSuperseded::NoConfirmationDepth { .. }
         | WithdrawalNotSuperseded::ChainServicesMissing(_) => (
             StatusCode::CONFLICT,
@@ -9982,6 +9982,10 @@ mod tests {
                 from: bot_wallet,
                 to: Some(bot_wallet),
                 nonce: SIGNED_WITHDRAWAL_NONCE,
+                value: U256::ZERO,
+                has_calldata: false,
+                is_eip7702: false,
+                to_has_code: false,
                 succeeded: true,
                 confirmations: 1,
             },
@@ -10029,6 +10033,10 @@ mod tests {
                 from: bot_wallet,
                 to: Some(SIGNED_WITHDRAWAL_TARGET),
                 nonce: SIGNED_WITHDRAWAL_NONCE,
+                value: U256::ZERO,
+                has_calldata: true,
+                is_eip7702: false,
+                to_has_code: true,
                 succeeded: false,
                 confirmations: 1,
             },

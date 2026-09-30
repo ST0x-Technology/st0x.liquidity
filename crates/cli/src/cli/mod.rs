@@ -945,10 +945,11 @@ pub enum TransferCommand {
         /// with no signed tx. It is the tx that took that signed tx's nonce (the
         /// 0-value self-transfer cancel). The bot checks that it is from the bot
         /// wallet on that chain, at the nonce, not the signed tx itself, has the
-        /// required confirmations, and did not do what the signed tx does: pay
-        /// the deposit address USDC (unless another transfer recorded it as its
-        /// own deposit send), or successfully call the contract the withdrawal
-        /// calls.
+        /// required confirmations, and did not do what the signed tx does: for
+        /// usdc, pay the deposit address USDC (unless another transfer recorded
+        /// it as its own deposit send); for a redemption, it must have reverted
+        /// or be a plain cancel (0 value, no calldata, to the bot wallet itself,
+        /// not EIP-7702, with no code at the wallet).
         #[arg(long = "superseding-tx")]
         superseding_tx: Option<TxHash>,
     },
