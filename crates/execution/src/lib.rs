@@ -1038,7 +1038,7 @@ pub(crate) fn resolve_sell_preflight(
     ))
 }
 
-/// Whether [`resolve_sell_preflight`] skips a sell of `requested` shares.
+/// Whether `resolve_sell_preflight` skips a sell of `requested` shares.
 ///
 /// `sellable` is the broker book above the hedge floor. The sell is skipped
 /// when the book covers less than the request, and too little for a partial
