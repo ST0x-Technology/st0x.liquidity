@@ -12,6 +12,7 @@ use std::sync::Arc;
 use uuid::Uuid;
 
 use st0x_bridge::cctp::{CctpBridge, CctpCtx};
+use st0x_bridge::corridor::{HopKind, UsdcCorridor};
 use st0x_config::{BrokerCtx, Ctx, ExecutionThreshold, HedgedChain, OnchainWalletCtx};
 use st0x_event_sorcery::{Store, StoreBuilder};
 use st0x_evm::{
@@ -331,21 +332,20 @@ where
     result
 }
 
-/// Gas readiness for the USDC corridor (Base and Ethereum).
+/// Gas readiness for a USDC corridor: its chain's wallet and the Ethereum
+/// hub wallet.
 fn usdc_gas_readiness(
     ctx: &Ctx,
-    wallet_ctx: &OnchainWalletCtx,
+    corridor_chain: Chain,
+    chain_wallet: &Arc<dyn Wallet<Provider = RootProvider>>,
+    ethereum_wallet: &Arc<dyn Wallet<Provider = RootProvider>>,
 ) -> anyhow::Result<Arc<GasReadiness>> {
     let alerts = ctx
         .alerts
         .as_ref()
         .context("rebalancing transfer requires [alerts] gas thresholds")?;
 
-    GasReadiness::from_wallets(
-        alerts,
-        wallet_ctx.base_wallet(),
-        wallet_ctx.ethereum_wallet(),
-    )
+    GasReadiness::for_usdc_corridor(alerts, corridor_chain, chain_wallet, ethereum_wallet)
 }
 
 /// Gas readiness for an equity transfer on the selected chain: its wallet is
@@ -1006,7 +1006,30 @@ async fn run_usdc_transfer<Writer: Write>(
 
     let wallet_ctx = ctx.wallet()?;
 
-    let cash = ctx.chains.primary().assets.cash.as_ref().ok_or_else(|| {
+    // The corridor the CCTP bridge below carries: the transfer runs on that
+    // chain's vault and signer.
+    let rebalancing_ctx = &ctx.rebalancing;
+    let corridor = rebalancing_ctx.cctp_corridor.usdc_corridor();
+    let corridor_chain = corridor.chain();
+    let hedged = ctx.chains.hedged_chain(corridor_chain).with_context(|| {
+        format!("the {corridor} corridor needs a [chains.{corridor_chain}.trading] table")
+    })?;
+    let chain_wallet = match corridor {
+        UsdcCorridor::HubRouted {
+            chain: Chain::Base,
+            hop: HopKind::Cctp,
+        } => wallet_ctx.base_wallet(),
+        UsdcCorridor::HubRouted {
+            chain: Chain::Base,
+            hop: HopKind::Relay,
+        }
+        | UsdcCorridor::HubRouted {
+            chain: Chain::Ethereum | Chain::HyperEvm | Chain::Robinhood,
+            hop: HopKind::Cctp | HopKind::Relay,
+        } => anyhow::bail!("transfer-usdc has no bridge for the {corridor} corridor"),
+    };
+
+    let cash = hedged.assets.cash.as_ref().ok_or_else(|| {
         anyhow::anyhow!(
             "vault_ids in [chains.<name>.trading.assets.cash] is required but not configured"
         )
@@ -1027,7 +1050,7 @@ async fn run_usdc_transfer<Writer: Write>(
             cash.vault_ids.len()
         )?;
     }
-    let owner = wallet_ctx.base_wallet().address();
+    let owner = chain_wallet.address();
 
     let broker_mode = if alpaca_auth.is_sandbox() {
         AlpacaBrokerApiMode::Sandbox
@@ -1060,9 +1083,9 @@ async fn run_usdc_transfer<Writer: Write>(
     )?);
 
     let bridge = Arc::new(CctpBridge::try_from_ctx(CctpCtx {
-        corridor: ctx.rebalancing.cctp_corridor,
+        corridor: rebalancing_ctx.cctp_corridor,
         ethereum_wallet: wallet_ctx.ethereum_wallet().clone(),
-        base_wallet: wallet_ctx.base_wallet().clone(),
+        base_wallet: chain_wallet.clone(),
         #[cfg(any(test, feature = "test-support"))]
         circle_api_base: st0x_bridge::cctp::CIRCLE_API_BASE.to_string(),
         #[cfg(any(test, feature = "test-support"))]
@@ -1072,15 +1095,17 @@ async fn run_usdc_transfer<Writer: Write>(
     })?);
 
     let vault_service = Arc::new(RaindexService::new(
-        wallet_ctx.base_wallet().clone(),
-        st0x_hedge::operator::onchain::raindex_contracts(ctx.chains.primary()),
+        chain_wallet.clone(),
+        st0x_hedge::operator::onchain::raindex_contracts(hedged),
         owner,
     ));
 
-    let rebalancing_ctx = &ctx.rebalancing;
-    let gas_readiness = usdc_gas_readiness(ctx, wallet_ctx)?;
-    // The corridor the CCTP bridge built above carries.
-    let corridor = rebalancing_ctx.cctp_corridor.usdc_corridor();
+    let gas_readiness = usdc_gas_readiness(
+        ctx,
+        corridor_chain,
+        chain_wallet,
+        wallet_ctx.ethereum_wallet(),
+    )?;
 
     let rebalance_manager = CrossVenueCashTransfer::new(
         alpaca_broker,

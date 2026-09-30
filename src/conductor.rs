@@ -37,6 +37,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 use url::Url;
 
+use st0x_bridge::corridor::UsdcCorridor;
 use st0x_config::{
     AlertsCtx, BrokerCtx, ChainAssets, ChainRole, Ctx, CtxError, ExecutionThreshold, HedgedChain,
     HedgingAssets, InventoryMode, IssuanceStatusCtx, OnchainWalletCtx, OperationMode,
@@ -132,7 +133,8 @@ use crate::rebalancing::usdc::{
 };
 use crate::rebalancing::{
     BaseWallet, ChainRebalancingConfig, ChainWallets, EthereumWallet, RebalancerServices,
-    RebalancingSchedulers, RebalancingService, RebalancingServiceConfig, to_wrapped_equities,
+    RebalancingSchedulers, RebalancingService, RebalancingServiceConfig, UsdcCorridorEndpoints,
+    to_wrapped_equities,
 };
 use crate::startup::StartupToken;
 use crate::telemetry::broker::InstrumentedAlpacaBroker;
@@ -2119,9 +2121,9 @@ type HedgedChainTokenizations =
     BTreeMap<Chain, ChainTokenization<Arc<dyn Wallet<Provider = RootProvider>>>>;
 
 /// One [`ChainTokenization`] per hedged chain. The primary always carries
-/// the equity leg: the rebalancer, the cash corridor and the recovery jobs
-/// run on its services until chain selection moves into the global
-/// rebalancer. A secondary carries it only when one of its equities opts
+/// the equity leg: the rebalancer and the recovery jobs run on its services
+/// until chain selection moves into the global rebalancer. Each cash
+/// corridor runs on its own chain's services. A secondary carries it only when one of its equities opts
 /// into rebalancing; otherwise it is hedge-only, keeps just its signer, and
 /// is logged as such. A chain carrying the leg without its own redemption
 /// wallet refuses startup naming the chain, rather than borrowing the
@@ -2419,16 +2421,18 @@ async fn attach_manifest_handles(
 }
 
 /// Wires the pre-dispatch safety checks used by fresh rebalancing transfers:
-/// the USDC corridor's gas check, one gas check per equity chain, and the
+/// one gas check per USDC corridor chain, one per equity chain, and the
 /// dividend freeze guard.
 async fn wire_transfer_admission_guards(
     rebalancing_service: &RebalancingService,
-    gas_readiness: Arc<GasReadiness>,
+    usdc_gas_readiness: BTreeMap<Chain, ConfiguredGasReadiness>,
     equity_gas_readiness: BTreeMap<Chain, ConfiguredGasReadiness>,
     freeze_check: OperationMode,
     issuance: &IssuanceStatusCtx,
 ) -> anyhow::Result<()> {
-    rebalancing_service.set_gas_readiness(gas_readiness).await;
+    rebalancing_service
+        .set_usdc_gas_readiness(usdc_gas_readiness)
+        .await;
     rebalancing_service
         .set_equity_gas_readiness(equity_gas_readiness)
         .await;
@@ -2447,6 +2451,67 @@ fn build_rebalancing_raindex_service<Signer: Wallet + Clone>(
         crate::onchain::raindex_contracts(trading),
         market_maker_wallet,
     ))
+}
+
+/// Resolves where `corridor`'s transfers run: the signer, orderbook
+/// contracts and first cash vault of the corridor's own chain, whatever the
+/// primary is, and the gas check of that chain's wallet
+/// and `ethereum_wallet`. A corridor chain without a gas threshold refuses
+/// startup by name.
+fn usdc_corridor_endpoints<Signer: Wallet + Clone>(
+    ctx: &Ctx,
+    tokenizations: &BTreeMap<Chain, ChainTokenization<Signer>>,
+    ethereum_wallet: &Signer,
+    corridor: UsdcCorridor,
+) -> anyhow::Result<UsdcCorridorEndpoints<Signer>> {
+    let chain = corridor.chain();
+    let hedged = ctx.chains.hedged_chain(chain).with_context(|| {
+        format!("the {corridor} corridor needs a [chains.{chain}.trading] table")
+    })?;
+    let tokenization = tokenizations
+        .get(&chain)
+        .with_context(|| format!("no tokenization services were built for {chain}"))?;
+    let vault_id = hedged
+        .assets
+        .cash
+        .as_ref()
+        .and_then(|cash| cash.vault_ids.first().copied())
+        .ok_or(CtxError::MissingCashVaultId)?;
+    let alerts = ctx
+        .alerts
+        .as_ref()
+        .context("rebalancing requires [alerts] gas thresholds")?;
+    let gas_readiness =
+        GasReadiness::for_usdc_corridor(alerts, chain, &tokenization.wallet, ethereum_wallet)?;
+
+    Ok(UsdcCorridorEndpoints {
+        corridor,
+        chain_wallet: tokenization.wallet.clone(),
+        contracts: crate::onchain::raindex_contracts(hedged),
+        vault_id: RaindexVaultId(vault_id),
+        gas_readiness,
+    })
+}
+
+/// The OPERATOR_ROLE preflight of a USDC corridor's chain, against that
+/// chain's own inventory with the corridor's signer. The primary chain is
+/// skipped: its equity leg's preflight already checked it.
+async fn preflight_usdc_corridor_inventory<Signer: Wallet + Clone>(
+    ctx: &Ctx,
+    endpoints: &UsdcCorridorEndpoints<Signer>,
+) -> anyhow::Result<()> {
+    let chain = endpoints.corridor.chain();
+    if chain == ctx.chains.primary().chain {
+        return Ok(());
+    }
+
+    let hedged = ctx.chains.hedged_chain(chain).with_context(|| {
+        format!("the USDC corridor chain {chain} has no [chains.{chain}.trading] table")
+    })?;
+    let wallet = &endpoints.chain_wallet;
+    let raindex = build_rebalancing_raindex_service(wallet, hedged, wallet.address());
+
+    preflight_inventory_access(&raindex, hedged).await
 }
 
 /// Startup preflight for the shared-inventory rebalancing path: the bot must
@@ -2751,11 +2816,13 @@ async fn confirm_chain_id<P: Provider>(provider: &P, chain: Chain) -> anyhow::Re
 /// stale artifact to revoke.
 async fn preflight_inventory_access<Signer: Wallet + Clone>(
     raindex_service: &RaindexService<Signer>,
-    ctx: &Ctx,
+    hedged: &HedgedChain,
 ) -> anyhow::Result<()> {
-    let InventoryMode::Managed { inventory } = ctx.chains.primary().inventory else {
+    let chain = hedged.chain;
+    let InventoryMode::Managed { inventory } = hedged.inventory else {
         debug!(
             target: "inventory",
+            %chain,
             "legacy inventory mode; skipping OPERATOR_ROLE preflight (no distinct inventory in play)",
         );
         return Ok(());
@@ -2770,6 +2837,7 @@ async fn preflight_inventory_access<Signer: Wallet + Clone>(
         )?;
     info!(
         target: "inventory",
+        %chain,
         %inventory,
         "OPERATOR_ROLE preflight passed",
     );
@@ -3041,14 +3109,14 @@ async fn build_query_frameworks(
     manifest.build(pool.clone(), equity_transfer_services).await
 }
 
-/// Builds the Alpaca wallet client, instrumented broker, and CCTP/raindex
-/// services `RebalancerServices` needs. The telemetry wrap happens here (not
-/// at a lower layer) so rebalancer Alpaca calls emit broker dependency
-/// samples, mirroring the hedge executor's own wrapping.
+/// Builds the Alpaca wallet client and instrumented broker
+/// `RebalancerServices` needs, alongside the Ethereum hub wallet. The
+/// telemetry wrap happens here (not at a lower layer) so rebalancer Alpaca
+/// calls emit broker dependency samples, mirroring the hedge executor's own
+/// wrapping.
 async fn build_rebalancer_services<Signer: Wallet + Clone>(
     alpaca_auth: &AlpacaBrokerApiCtx,
-    wallets: ChainWallets<Signer>,
-    raindex_service: Arc<RaindexService<Signer>>,
+    ethereum_wallet: Signer,
     rebalancing_ctx: &RebalancingCtx,
     required_confirmations: u64,
     ethereum_required_confirmations: Option<u64>,
@@ -3066,12 +3134,11 @@ async fn build_rebalancer_services<Signer: Wallet + Clone>(
         telemetry,
     );
 
-    RebalancerServices::new(
+    Ok(RebalancerServices::new(
         broker,
         alpaca_wallet,
-        wallets,
+        ethereum_wallet,
         rebalancing_ctx.cctp_corridor,
-        raindex_service,
         UsdcSettlementParams {
             attestation_retry_deadline: rebalancing_ctx.attestation_retry_deadline,
             settlement_retry_deadline: rebalancing_ctx.settlement_retry_deadline,
@@ -3085,8 +3152,7 @@ async fn build_rebalancer_services<Signer: Wallet + Clone>(
             #[cfg(feature = "test-support")]
             message_transmitter: rebalancing_ctx.message_transmitter,
         },
-    )
-    .map_err(Into::into)
+    ))
 }
 
 /// The vault-registry lookup for one hedged chain. Every id is qualified by
@@ -3139,41 +3205,6 @@ fn build_equity_gas_readiness<Signer: Wallet>(
             Ok((entry.chain, ConfiguredGasReadiness::Wired(readiness)))
         })
         .collect()
-}
-
-/// The pre-dispatch admission check for the USDC corridor, which spans Base
-/// and Ethereum; its equity leg is the primary chain's own wallet, kept so
-/// the check stays complete. Equity candidates are gated per chain from
-/// [`build_equity_gas_readiness`] instead, and each transfer's own chain is
-/// checked again from its [`ChainEquityServices`] entry. Only the corridor's
-/// two wallets are wired here, so a primary outside the corridor refuses
-/// startup by name.
-fn build_transfer_gas_readiness<Signer: Wallet + Clone>(
-    wallets: &ChainWallets<Signer>,
-    ctx: &Ctx,
-) -> anyhow::Result<Arc<GasReadiness>> {
-    let alerts = ctx
-        .alerts
-        .as_ref()
-        .context("rebalancing requires [alerts] gas thresholds")?;
-    let (EthereumWallet(ethereum_wallet), BaseWallet(base_wallet)) = wallets.clone().into_parts();
-    let primary_chain = ctx.chains.primary().chain;
-    let primary_wallet = match primary_chain {
-        Chain::Base => &base_wallet,
-        Chain::Ethereum => &ethereum_wallet,
-        Chain::HyperEvm | Chain::Robinhood => anyhow::bail!(
-            "the transfer gas readiness has no {primary_chain} wallet: \
-             only the Base and Ethereum signers are wired"
-        ),
-    };
-
-    GasReadiness::for_equity_chain(
-        alerts,
-        primary_chain,
-        primary_wallet,
-        &base_wallet,
-        &ethereum_wallet,
-    )
 }
 
 /// Builds the trigger service from the validated rebalancing config plus the
@@ -3373,12 +3404,9 @@ fn build_hedged_equity_services<Signer: Wallet + Clone + 'static>(
 /// The primary chain's rebalancing services, and the shared handles the rest
 /// of the rebalancing wiring hangs off, once the startup preflights have
 /// passed.
-struct PrimaryRebalancingServices<Signer: Wallet> {
+struct PrimaryRebalancingServices {
     primary_chain: Chain,
-    market_maker_wallet: Address,
-    gas_readiness: Arc<GasReadiness>,
     bot_gas_enqueuer: BotGasReceiptCostEnqueuer,
-    raindex_service: Arc<RaindexService<Signer>>,
     tokenizer: Arc<dyn Tokenizer>,
     mint_authorization: MintAuthorizationInfra,
 }
@@ -3391,8 +3419,7 @@ struct PrimaryRebalancingServices<Signer: Wallet> {
 async fn build_primary_rebalancing_services<Signer: Wallet + Clone>(
     deps: &RebalancingDeps,
     tokenizations: &BTreeMap<Chain, ChainTokenization<Signer>>,
-    wallets: &ChainWallets<Signer>,
-) -> anyhow::Result<PrimaryRebalancingServices<Signer>> {
+) -> anyhow::Result<PrimaryRebalancingServices> {
     let primary_chain = deps.ctx.chains.primary().chain;
     let primary = tokenizations.get(&primary_chain).with_context(|| {
         format!("no tokenization services were built for the primary chain {primary_chain}")
@@ -3409,7 +3436,6 @@ async fn build_primary_rebalancing_services<Signer: Wallet + Clone>(
         "Initializing rebalancing infrastructure on the primary chain's tokenization services"
     );
     let market_maker_wallet = primary.wallet.address();
-    let gas_readiness = build_transfer_gas_readiness(wallets, &deps.ctx)?;
 
     // The worker consuming this queue is always registered
     // (`build_record_bot_gas_receipt_cost_ctx` fails startup when its
@@ -3433,7 +3459,7 @@ async fn build_primary_rebalancing_services<Signer: Wallet + Clone>(
         deps.ctx.issuance.api_key.header_value(),
     )?);
 
-    preflight_inventory_access(&raindex_service, &deps.ctx).await?;
+    preflight_inventory_access(&raindex_service, deps.ctx.chains.primary()).await?;
     preflight_tokenization(&deps.ctx, tokenizations, issuance_client.as_ref()).await?;
 
     let tokenizer = primary_equity.tokenizer.clone();
@@ -3443,10 +3469,7 @@ async fn build_primary_rebalancing_services<Signer: Wallet + Clone>(
 
     Ok(PrimaryRebalancingServices {
         primary_chain,
-        market_maker_wallet,
-        gas_readiness,
         bot_gas_enqueuer,
-        raindex_service,
         tokenizer,
         mint_authorization,
     })
@@ -3474,13 +3497,10 @@ fn spawn_rebalancing_infrastructure<Signer: Wallet + Clone>(
 
         let PrimaryRebalancingServices {
             primary_chain,
-            market_maker_wallet,
-            gas_readiness,
             bot_gas_enqueuer,
-            raindex_service,
             tokenizer,
             mint_authorization,
-        } = build_primary_rebalancing_services(&deps, &tokenizations, &wallets).await?;
+        } = build_primary_rebalancing_services(&deps, &tokenizations).await?;
 
         let HedgedEquityServices {
             chains: chain_services,
@@ -3488,6 +3508,15 @@ fn spawn_rebalancing_infrastructure<Signer: Wallet + Clone>(
             gas_readiness: equity_gas_readiness,
             wrappers,
         } = build_hedged_equity_services(&deps, &tokenizations, &wallets)?;
+
+        let (EthereumWallet(ethereum_wallet), _) = wallets.clone().into_parts();
+        let usdc_endpoints = usdc_corridor_endpoints(
+            &deps.ctx,
+            &tokenizations,
+            &ethereum_wallet,
+            rebalancing_ctx.cctp_corridor.usdc_corridor(),
+        )?;
+        preflight_usdc_corridor_inventory(&deps.ctx, &usdc_endpoints).await?;
 
         let equity_transfer_services = EquityTransferServices {
             chains: chain_services,
@@ -3508,7 +3537,10 @@ fn spawn_rebalancing_infrastructure<Signer: Wallet + Clone>(
 
         wire_transfer_admission_guards(
             &rebalancing_service,
-            gas_readiness.clone(),
+            BTreeMap::from([(
+                usdc_endpoints.corridor.chain(),
+                ConfiguredGasReadiness::Wired(usdc_endpoints.gas_readiness.clone()),
+            )]),
             equity_gas_readiness,
             rebalancing_ctx.freeze_check,
             &deps.ctx.issuance,
@@ -3567,8 +3599,7 @@ fn spawn_rebalancing_infrastructure<Signer: Wallet + Clone>(
         let cash = deps.ctx.assets.cash.as_ref();
         let services = build_rebalancer_services(
             alpaca_auth,
-            wallets,
-            raindex_service,
+            ethereum_wallet,
             &rebalancing_ctx,
             deps.ctx.chains.primary().required_confirmations,
             deposit_send_required_confirmations(&deps.ctx.chains)
@@ -3581,29 +3612,16 @@ fn spawn_rebalancing_infrastructure<Signer: Wallet + Clone>(
         )
         .await?;
 
-        let usdc_vault_id = deps
-            .ctx
-            .chains
-            .primary()
-            .assets
-            .cash
-            .as_ref()
-            .and_then(|cash| cash.vault_ids.first().copied())
-            .ok_or(CtxError::MissingCashVaultId)?;
-
-        // Cloned before `built.usdc` is consumed below: the transfer handles
-        // take one handle and the recovery handle needs another for the
-        // `fail-usdc-transfer` route.
-        let recovery_usdc_store = built.usdc.clone();
-        let usdc_handles = services.into_usdc_transfer_handles(
-            market_maker_wallet,
-            RaindexVaultId(usdc_vault_id),
-            built.usdc,
-            deps.pool.clone(),
-            bot_gas_enqueuer.clone(),
-            gas_readiness,
-            usdc_driver_gate.clone(),
-        );
+        // `built.usdc` stays with the recovery handle for the
+        // `fail-usdc-transfer` route; the transfers take their own handles.
+        let recovery_usdc_store = built.usdc;
+        let usdc_handles = services.into_usdc_corridor_transfers(
+            vec![usdc_endpoints],
+            &recovery_usdc_store,
+            &deps.pool,
+            &bot_gas_enqueuer,
+            &usdc_driver_gate,
+        )?;
 
         // Before any job or the startup approvals can send from the Ethereum
         // wallet: a signed deposit send persisted before the restart keeps its
@@ -6988,9 +7006,9 @@ mod tests {
 
     use st0x_bridge::corridor::UsdcCorridor;
     use st0x_config::{
-        AllocationCtx, BotGasValuationConfig, ChainAssets, ChainEquities, ChainEquityAsset,
-        ExecutionThreshold, OperationMode, OrchestratorConfig, UsdcCorridorCtx,
-        create_test_ctx_with_order_owner, test_issuance_status_ctx,
+        AllocationCtx, BotGasValuationConfig, ChainAssets, ChainCashAsset, ChainEquities,
+        ChainEquityAsset, ChainRegistry, ExecutionThreshold, OperationMode, OrchestratorConfig,
+        UsdcCorridorCtx, create_test_ctx_with_order_owner, test_issuance_status_ctx,
     };
     use st0x_dto::Statement;
     use st0x_event_sorcery::{DomainEvent, Reconciler, StoreBuilder, test_store};
@@ -7758,7 +7776,7 @@ mod tests {
         let mut ctx = create_test_ctx_with_order_owner(Address::ZERO);
         ctx.chains.primary_mut().inventory = InventoryMode::Legacy;
 
-        preflight_inventory_access(&service, &ctx)
+        preflight_inventory_access(&service, ctx.chains.primary())
             .await
             .expect("legacy mode must skip the preflight and succeed");
     }
@@ -7776,7 +7794,7 @@ mod tests {
             inventory: Address::repeat_byte(0xAA),
         };
 
-        let error = preflight_inventory_access(&service, &ctx)
+        let error = preflight_inventory_access(&service, ctx.chains.primary())
             .await
             .expect_err("managed mode must attempt the role check and surface the failure");
 
@@ -19639,6 +19657,85 @@ mod tests {
         trading
     }
 
+    /// An Ethereum primary with no cash vault, and Base hedged with
+    /// `base_vault` as its cash vault.
+    fn ethereum_primary_with_base_cash_ctx(base_vault: B256) -> Ctx {
+        let mut ctx = create_test_ctx_with_order_owner(Address::ZERO);
+        ctx.chains = ChainRegistry::single_hedged_chain(ethereum_hedged_chain(
+            None,
+            OperationMode::Disabled,
+            ETHEREUM_INVENTORY,
+        ));
+        ctx.chains.insert_secondary(
+            HedgedChain::test()
+                .chain(Chain::Base)
+                .orderbook(Address::repeat_byte(0xb0))
+                .assets(ChainAssets {
+                    equities: ChainEquities::default(),
+                    cash: Some(ChainCashAsset {
+                        vault_ids: vec![base_vault],
+                        rebalancing: OperationMode::Enabled,
+                        operational_limit: None,
+                    }),
+                })
+                .call(),
+        );
+        ctx
+    }
+
+    /// Hedge-only Ethereum (primary) and Base tokenizations on the stub
+    /// wallets.
+    fn hedge_only_tokenizations(
+        wallet_ctx: &OnchainWalletCtx,
+    ) -> BTreeMap<Chain, ChainTokenization<Arc<dyn Wallet<Provider = RootProvider>>>> {
+        [
+            (
+                Chain::Ethereum,
+                ChainRole::Primary,
+                wallet_ctx.ethereum_wallet(),
+            ),
+            (Chain::Base, ChainRole::Secondary, wallet_ctx.base_wallet()),
+        ]
+        .into_iter()
+        .map(|(chain, role, wallet)| {
+            let tokenization = ChainTokenization {
+                chain,
+                role,
+                wallet: wallet.clone(),
+                equity: EquityTokenization::HedgeOnly,
+            };
+            (chain, tokenization)
+        })
+        .collect()
+    }
+
+    /// A corridor's transfers run on its own chain's orderbook, cash vault
+    /// and signer, not the primary chain's.
+    #[test]
+    fn usdc_transfer_runs_on_the_corridor_chains_vault() {
+        let base_vault = B256::repeat_byte(0xba);
+        let mut ctx = ethereum_primary_with_base_cash_ctx(base_vault);
+        ctx.alerts = Some(gas_threshold_alerts());
+        let wallet_ctx = OnchainWalletCtx::stub();
+
+        let endpoints = usdc_corridor_endpoints(
+            &ctx,
+            &hedge_only_tokenizations(&wallet_ctx),
+            wallet_ctx.ethereum_wallet(),
+            UsdcCorridor::BASE_CCTP,
+        )
+        .unwrap();
+
+        let base = ctx.chains.hedged_chain(Chain::Base).unwrap();
+        assert_eq!(endpoints.corridor, UsdcCorridor::BASE_CCTP);
+        assert_eq!(endpoints.contracts, crate::onchain::raindex_contracts(base));
+        assert_eq!(endpoints.vault_id, RaindexVaultId(base_vault));
+        assert_eq!(
+            endpoints.chain_wallet.address(),
+            wallet_ctx.base_wallet().address()
+        );
+    }
+
     /// One set of tokenization services per hedged chain that rebalances
     /// equity, each bound to that chain's own signer and asset table --
     /// never the Base wallet or the primary's tokens -- and none for a chain
@@ -20004,43 +20101,118 @@ mod tests {
         );
     }
 
-    /// The shared pre-dispatch admission check gates the equity leg on the
-    /// primary chain's own wallet, not Base's: with Ethereum as the primary
-    /// it checks the Ethereum signer.
-    #[test]
-    fn transfer_gas_readiness_checks_the_primary_chains_wallet() {
-        let mut ctx = create_test_ctx_with_order_owner(Address::ZERO);
-        ctx.alerts = Some(gas_threshold_alerts());
-        ctx.chains.primary_mut().chain = Chain::Ethereum;
-        let wallet_ctx = OnchainWalletCtx::stub();
-        let wallets = ChainWallets::from_wallet_ctx(&wallet_ctx);
+    fn mock_wallet_corridor_endpoints(
+        corridor: UsdcCorridor,
+    ) -> UsdcCorridorEndpoints<RawPrivateKeyWallet<impl alloy::providers::Provider + Clone>> {
+        let provider = ProviderBuilder::new().connect_mocked_client(Asserter::new());
+        let chain_wallet = RawPrivateKeyWallet::new(&B256::repeat_byte(0x11), provider, 1).unwrap();
 
-        let readiness = build_transfer_gas_readiness(&wallets, &ctx).unwrap();
+        UsdcCorridorEndpoints {
+            corridor,
+            chain_wallet,
+            contracts: RaindexContracts {
+                inventory: Address::repeat_byte(0xAA),
+                orderbook: Address::repeat_byte(0xBB),
+            },
+            vault_id: RaindexVaultId(B256::repeat_byte(0xba)),
+            gas_readiness: GasReadiness::always_ready_for_test(),
+        }
+    }
+
+    /// The primary chain's inventory access is checked with its equity leg,
+    /// so a corridor on the primary makes no call of its own. The wallet's
+    /// mock has no responses, so any call would fail.
+    #[tokio::test]
+    async fn usdc_corridor_preflight_skips_the_primary_chain() {
+        let mut ctx = create_test_ctx_with_order_owner(Address::ZERO);
+        ctx.chains.primary_mut().inventory = InventoryMode::Managed {
+            inventory: Address::repeat_byte(0xAA),
+        };
+
+        preflight_usdc_corridor_inventory(
+            &ctx,
+            &mock_wallet_corridor_endpoints(UsdcCorridor::BASE_CCTP),
+        )
+        .await
+        .unwrap();
+    }
+
+    /// A corridor off the primary is checked against its own chain's
+    /// inventory: a legacy-mode corridor chain skips the role read even
+    /// though the primary is managed, and a managed one reads it.
+    #[tokio::test]
+    async fn usdc_corridor_preflight_checks_a_non_primary_chains_own_inventory() {
+        let mut ctx = ethereum_primary_with_base_cash_ctx(B256::repeat_byte(0xba));
+        let endpoints = mock_wallet_corridor_endpoints(UsdcCorridor::BASE_CCTP);
+
+        let error = preflight_usdc_corridor_inventory(&ctx, &endpoints)
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("OPERATOR_ROLE"),
+            "a managed corridor chain must read the role, got: {error:#}"
+        );
+
+        let mut base = ctx.chains.hedged_chain(Chain::Base).unwrap().clone();
+        base.inventory = InventoryMode::Legacy;
+        ctx.chains.insert_secondary(base);
+
+        preflight_usdc_corridor_inventory(&ctx, &endpoints)
+            .await
+            .unwrap();
+    }
+
+    /// A corridor's USDC gas check reads its own chain's wallet and the
+    /// Ethereum hub wallet, not the primary's: with Ethereum as the primary
+    /// and a Base corridor it checks the Base signer.
+    #[test]
+    fn usdc_corridor_gas_readiness_checks_the_corridor_chains_wallet() {
+        let mut ctx = ethereum_primary_with_base_cash_ctx(B256::repeat_byte(0xba));
+        ctx.alerts = Some(gas_threshold_alerts());
+        let wallet_ctx = OnchainWalletCtx::stub();
+
+        let endpoints = usdc_corridor_endpoints(
+            &ctx,
+            &hedge_only_tokenizations(&wallet_ctx),
+            wallet_ctx.ethereum_wallet(),
+            UsdcCorridor::BASE_CCTP,
+        )
+        .unwrap();
 
         assert_eq!(
-            readiness.equity_route(),
-            (Chain::Ethereum, wallet_ctx.ethereum_wallet().address())
+            endpoints.gas_readiness.usdc_route(),
+            [
+                (Chain::Base, wallet_ctx.base_wallet().address()),
+                (Chain::Ethereum, wallet_ctx.ethereum_wallet().address()),
+            ]
         );
     }
 
-    /// A primary chain outside the Base/Ethereum corridor has no wallet in
-    /// the shared check, so startup refuses it by name rather than gating
-    /// its transfers on Base's balance.
+    /// A corridor chain without a gas threshold is refused by name rather
+    /// than admitting transfers against a balance nothing checks.
     #[test]
-    fn transfer_gas_readiness_refuses_a_hyperevm_primary_by_name() {
-        let mut ctx = create_test_ctx_with_order_owner(Address::ZERO);
-        ctx.alerts = Some(gas_threshold_alerts());
-        ctx.chains.primary_mut().chain = Chain::HyperEvm;
-        let wallets = ChainWallets::from_wallet_ctx(&OnchainWalletCtx::stub());
+    fn usdc_corridor_gas_readiness_refuses_a_chain_without_a_threshold() {
+        let mut ctx = ethereum_primary_with_base_cash_ctx(B256::repeat_byte(0xba));
+        ctx.alerts = Some(st0x_config::AlertsCtx::for_test(
+            BTreeMap::from([(Chain::Ethereum, U256::from(100_u64))]),
+            Duration::from_secs(30),
+            Duration::from_secs(300),
+        ));
+        let wallet_ctx = OnchainWalletCtx::stub();
 
-        let Err(error) = build_transfer_gas_readiness(&wallets, &ctx) else {
-            panic!("a primary chain without a wired wallet must be refused");
+        let Err(error) = usdc_corridor_endpoints(
+            &ctx,
+            &hedge_only_tokenizations(&wallet_ctx),
+            wallet_ctx.ethereum_wallet(),
+            UsdcCorridor::BASE_CCTP,
+        ) else {
+            panic!("a corridor chain without a gas threshold must be refused");
         };
         let error = error.to_string();
 
         assert!(
-            error.contains("hyperevm") && error.contains("wallet"),
-            "expected the unwired chain named, got: {error}"
+            error.contains("base") && error.contains("low_balance_thresholds"),
+            "expected the missing threshold named by chain, got: {error}"
         );
     }
 

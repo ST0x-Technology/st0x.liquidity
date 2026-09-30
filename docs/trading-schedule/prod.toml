@@ -23,6 +23,7 @@ extended_hours = true
 assets = [
   "SGOV",
   "SPYM",
+  "SPY",
   "TSLA",
   "AMZN",
   "NVDA",
@@ -64,6 +65,7 @@ assets = [
   "GRND",
   "DNUT",
   "FGI",
+  "SNES",
   "PLBY",
   "TR",
   "WEN",
