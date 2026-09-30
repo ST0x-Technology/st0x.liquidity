@@ -220,6 +220,7 @@ mod tests {
     use std::sync::Mutex;
     use uuid::Uuid;
 
+    use st0x_bridge::cctp::CctpError;
     use st0x_bridge::corridor::HopKind;
     use st0x_event_sorcery::test_store;
     use st0x_evm::Chain;
@@ -238,11 +239,13 @@ mod tests {
         hop: HopKind::Relay,
     };
 
-    /// Records which transfers reached it and how many restores ran.
+    /// Records which transfers reached it and how many restores and CCTP
+    /// recoveries ran.
     #[derive(Default)]
     struct StubTransfer {
         resumed: Mutex<Vec<UsdcRebalanceId>>,
         restores: Mutex<usize>,
+        cctp_recoveries: Mutex<usize>,
     }
 
     #[async_trait]
@@ -275,20 +278,22 @@ mod tests {
     impl RecheckUsdcDeposit for StubTransfer {
         async fn recheck_deposit(
             &self,
-            _id: &UsdcRebalanceId,
+            id: &UsdcRebalanceId,
             _operator_deposit_tx: Option<TxHash>,
         ) -> Result<RecheckOutcome, UsdcRecheckError> {
-            unimplemented!("StubTransfer: recheck not used")
+            self.resumed.lock().unwrap().push(id.clone());
+            Ok(RecheckOutcome::LeftUnchanged)
         }
 
         async fn verify_deposit_send_superseded(
             &self,
-            _id: &UsdcRebalanceId,
+            id: &UsdcRebalanceId,
             _corridor: UsdcCorridor,
             _prepared: &PreparedTransaction,
             _superseding_tx: Option<TxHash>,
         ) -> Result<(), DepositSendNotSuperseded> {
-            unimplemented!("StubTransfer: reconcile not used")
+            self.resumed.lock().unwrap().push(id.clone());
+            Ok(())
         }
     }
 
@@ -305,9 +310,13 @@ mod tests {
         async fn fetch_recovery_attestation(
             &self,
             _direction: BridgeDirection,
-            _burn_tx: TxHash,
+            burn_tx: TxHash,
         ) -> Result<AttestationResponse, CctpMintRecoveryError> {
-            unimplemented!("StubTransfer: CCTP recovery not used")
+            *self.cctp_recoveries.lock().unwrap() += 1;
+            Err(CctpMintRecoveryError::Attestation {
+                burn_tx,
+                source: CctpError::TxNotMined { tx_hash: burn_tx },
+            })
         }
 
         async fn submit_recovered_cctp_mint(
@@ -457,5 +466,107 @@ mod tests {
 
         let restores = *base.restores.lock().unwrap() + *robinhood.restores.lock().unwrap();
         assert_eq!(restores, 1);
+    }
+
+    /// An operator recheck reaches the service of the transfer's recorded
+    /// corridor; an unknown transfer is not found.
+    #[tokio::test]
+    async fn recheck_routes_to_the_recorded_corridors_service() {
+        let TwoCorridors {
+            transfers,
+            base,
+            robinhood,
+            store,
+            ..
+        } = two_corridors().await;
+        let id = record_on(&store, ROBINHOOD_CCTP).await;
+
+        transfers.recheck_deposit(&id, None).await.unwrap();
+
+        assert!(base.resumed.lock().unwrap().is_empty());
+        assert_eq!(*robinhood.resumed.lock().unwrap(), vec![id]);
+
+        let unknown = UsdcRebalanceId(Uuid::new_v4());
+        let error = transfers.recheck_deposit(&unknown, None).await.unwrap_err();
+        assert!(
+            matches!(error, UsdcRecheckError::NotFound(ref missing) if *missing == unknown),
+            "got {error:?}"
+        );
+    }
+
+    /// The superseded-send check runs on the service of the corridor the
+    /// transfer records; an unserved corridor is refused by name.
+    #[tokio::test]
+    async fn superseded_send_check_routes_to_the_recorded_corridors_service() {
+        let TwoCorridors {
+            transfers,
+            base,
+            robinhood,
+            ..
+        } = two_corridors().await;
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let prepared = PreparedTransaction::for_test(TxHash::repeat_byte(0x66), 7);
+
+        transfers
+            .verify_deposit_send_superseded(&id, ROBINHOOD_CCTP, &prepared, None)
+            .await
+            .unwrap();
+
+        assert!(base.resumed.lock().unwrap().is_empty());
+        assert_eq!(*robinhood.resumed.lock().unwrap(), vec![id.clone()]);
+
+        let error = transfers
+            .verify_deposit_send_superseded(&id, ROBINHOOD_RELAY, &prepared, None)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                DepositSendNotSuperseded::CorridorNotServed {
+                    corridor: ROBINHOOD_RELAY
+                }
+            ),
+            "got {error:?}"
+        );
+    }
+
+    /// CCTP mint recovery runs on the Base via CCTP service, and is refused
+    /// by name when no service carries that corridor.
+    #[tokio::test]
+    async fn cctp_mint_recovery_routes_to_the_base_cctp_service() {
+        let TwoCorridors {
+            transfers,
+            base,
+            robinhood,
+            store,
+            ..
+        } = two_corridors().await;
+        let burn_tx = TxHash::repeat_byte(0x77);
+
+        transfers
+            .fetch_recovery_attestation(BridgeDirection::BaseToEthereum, burn_tx)
+            .await
+            .unwrap_err();
+
+        assert_eq!(*base.cctp_recoveries.lock().unwrap(), 1);
+        assert_eq!(*robinhood.cctp_recoveries.lock().unwrap(), 0);
+
+        let robinhood_only = UsdcCorridorTransfers::new(
+            BTreeMap::from([(ROBINHOOD_CCTP, robinhood as Arc<dyn CorridorTransfer>)]),
+            store,
+        );
+        let error = robinhood_only
+            .fetch_recovery_attestation(BridgeDirection::BaseToEthereum, burn_tx)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                CctpMintRecoveryError::CorridorNotServed {
+                    corridor: UsdcCorridor::BASE_CCTP
+                }
+            ),
+            "got {error:?}"
+        );
     }
 }

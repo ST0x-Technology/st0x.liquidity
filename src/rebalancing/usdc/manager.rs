@@ -8512,6 +8512,15 @@ mod tests {
         id: &UsdcRebalanceId,
         amount: Usdc,
     ) {
+        advance_to_attested_alpaca_to_base_on(cqrs, id, amount, UsdcCorridor::BASE_CCTP).await;
+    }
+
+    async fn advance_to_attested_alpaca_to_base_on(
+        cqrs: &Store<UsdcRebalance>,
+        id: &UsdcRebalanceId,
+        amount: Usdc,
+        corridor: UsdcCorridor,
+    ) {
         use UsdcRebalanceCommand::*;
 
         let burn_tx =
@@ -8520,7 +8529,7 @@ mod tests {
         cqrs.send(
             id,
             InitiateConversion {
-                corridor: UsdcCorridor::BASE_CCTP,
+                corridor,
                 direction: RebalanceDirection::AlpacaToBase,
                 amount,
                 order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
@@ -8539,7 +8548,7 @@ mod tests {
         cqrs.send(
             id,
             Initiate {
-                corridor: UsdcCorridor::BASE_CCTP,
+                corridor,
                 direction: RebalanceDirection::AlpacaToBase,
                 amount,
                 withdrawal: TransferRef::AlpacaId(AlpacaTransferId::from(Uuid::new_v4())),
@@ -8579,7 +8588,16 @@ mod tests {
         id: &UsdcRebalanceId,
         amount: Usdc,
     ) {
-        advance_to_attested_alpaca_to_base(cqrs, id, amount).await;
+        advance_to_bridged_alpaca_to_base_on(cqrs, id, amount, UsdcCorridor::BASE_CCTP).await;
+    }
+
+    async fn advance_to_bridged_alpaca_to_base_on(
+        cqrs: &Store<UsdcRebalance>,
+        id: &UsdcRebalanceId,
+        amount: Usdc,
+        corridor: UsdcCorridor,
+    ) {
+        advance_to_attested_alpaca_to_base_on(cqrs, id, amount, corridor).await;
 
         let mint_tx =
             fixed_bytes!("0xaaaa111111111111111111111111111111111111111111111111111111111111");
@@ -24756,6 +24774,84 @@ mod tests {
         assert_eq!(jobs[0].category, BotGasOperationCategory::VaultWithdraw);
         assert_eq!(jobs[0].chain, Chain::Robinhood);
         assert_eq!(jobs[0].tx_hash, withdraw_tx);
+    }
+
+    /// A fresh deposit, its resume from `DepositInitiated`, and a fresh
+    /// withdrawal on a corridor off Base move their own chain's stable and
+    /// book their gas on their own chain. Only USDG has token code here, so
+    /// a deposit of any other token fails its allowance read.
+    #[tokio::test]
+    async fn fresh_vault_legs_use_the_corridor_chains_stable_and_gas_chain() {
+        let corridor = UsdcCorridor::HubRouted {
+            chain: Chain::Robinhood,
+            hop: HopKind::Cctp,
+        };
+        let usdg = Chain::Robinhood.settlement_stable().address;
+        let pool = SqlitePool::connect(":memory:").await.unwrap();
+        sqlx::migrate!().run(&pool).await.unwrap();
+        let cqrs = Arc::new(test_store(pool, ()));
+        let deposit_id = UsdcRebalanceId(Uuid::new_v4());
+        let withdrawal_id = UsdcRebalanceId(Uuid::new_v4());
+        let amount = usdc("1");
+        let amount_u256 = usdc_to_u256(amount).unwrap();
+        advance_to_bridged_alpaca_to_base_on(&cqrs, &deposit_id, amount, corridor).await;
+
+        let (_anvil, endpoint, private_key) = setup_anvil();
+        let wallet = create_test_wallet(&endpoint, &private_key);
+        wallet
+            .provider()
+            .anvil_set_code(
+                usdg,
+                crate::bindings::DeployableERC20::DEPLOYED_BYTECODE.clone(),
+            )
+            .await
+            .unwrap();
+        let (manager, apalis_pool, _server) = manager_on_corridor_with_bot_gas_queue(
+            corridor,
+            cqrs,
+            wallet.clone(),
+            MockBridge::new(),
+        )
+        .await;
+
+        manager
+            .deposit_to_vault(&deposit_id, amount_u256)
+            .await
+            .unwrap();
+        manager
+            .resume_alpaca_to_base(&deposit_id, amount, corridor)
+            .await
+            .unwrap();
+        manager
+            .withdraw_from_vault(&withdrawal_id, amount, amount_u256)
+            .await
+            .unwrap();
+
+        let jobs = pending_bot_gas_jobs(&apalis_pool).await;
+        let booked = jobs
+            .iter()
+            .map(|job| (job.category, job.chain))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            booked,
+            vec![
+                (BotGasOperationCategory::VaultDeposit, Chain::Robinhood),
+                (BotGasOperationCategory::VaultDeposit, Chain::Robinhood),
+                (BotGasOperationCategory::VaultWithdraw, Chain::Robinhood),
+            ]
+        );
+
+        let withdraw_tx = wallet
+            .provider()
+            .get_transaction_by_hash(jobs[2].tx_hash)
+            .await
+            .unwrap()
+            .unwrap();
+        let withdraw = crate::bindings::IRaindexInventory::withdraw4Call::abi_decode(
+            withdraw_tx.inner.input(),
+        )
+        .unwrap();
+        assert_eq!(withdraw.token, usdg);
     }
 
     /// An enqueue failure for a confirmed vault withdrawal propagates as a
