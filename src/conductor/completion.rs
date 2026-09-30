@@ -26,18 +26,11 @@ pub(super) async fn unfinished_listings(pool: &SqlitePool) -> anyhow::Result<Unf
     for id in redemptions {
         listings.insert(first_listing(pool, "EquityRedemption", &id.to_string()).await?);
     }
-    for kind in ["WrappedEquityRecovery", "UnwrappedEquityRecovery"] {
-        let ids: Vec<String> = sqlx::query_scalar(
-            "SELECT aggregate_id FROM events e WHERE aggregate_type = ? \
-             AND sequence = (SELECT MAX(sequence) FROM events WHERE aggregate_type = e.aggregate_type AND aggregate_id = e.aggregate_id) \
-             AND event_type NOT LIKE '%::OrphanDeposited' \
-             AND event_type NOT LIKE '%::RecoveryFailed' \
-             AND event_type NOT LIKE '%::DispatchedToMint' \
-             AND event_type NOT LIKE '%::DispatchedToRedemption'",
-        ).bind(kind).fetch_all(pool).await?;
-        for id in ids {
-            listings.insert(first_listing(pool, kind, &id).await?);
-        }
+    for id in crate::wrapped_equity_recovery::aggregate::open_recovery_ids(pool).await? {
+        listings.insert(first_listing(pool, "WrappedEquityRecovery", &id.to_string()).await?);
+    }
+    for id in crate::unwrapped_equity_recovery::aggregate::open_recovery_ids(pool).await? {
+        listings.insert(first_listing(pool, "UnwrappedEquityRecovery", &id.to_string()).await?);
     }
     for row in load_transfer_jobs::<TransferEquityToMarketMaking>(pool).await? {
         if !row.is_terminal() {
@@ -51,12 +44,12 @@ pub(super) async fn unfinished_listings(pool: &SqlitePool) -> anyhow::Result<Unf
     }
     for row in load_transfer_jobs::<WrappedEquityRecoveryJob>(pool).await? {
         if !row.is_terminal() {
-            listings.insert((Chain::Base, row.task.symbol));
+            listings.insert((row.task.chain, row.task.symbol));
         }
     }
     for row in load_transfer_jobs::<UnwrappedEquityRecoveryJob>(pool).await? {
         if !row.is_terminal() {
-            listings.insert((Chain::Base, row.task.symbol));
+            listings.insert((row.task.chain, row.task.symbol));
         }
     }
     Ok(listings)
@@ -198,6 +191,7 @@ mod tests {
             &id,
             1,
             &WrappedEquityRecoveryEvent::Detected {
+                chain: Chain::Base,
                 symbol: Symbol::new("AAPL").unwrap(),
                 shares: st0x_execution::FractionalShares::ZERO,
                 detected_at: chrono::Utc::now(),
@@ -212,6 +206,33 @@ mod tests {
             2,
             &WrappedEquityRecoveryEvent::RecoveryFailed {
                 reason: "terminal".into(),
+                failed_at: chrono::Utc::now(),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(unfinished_listings(&pool).await.unwrap().is_empty());
+
+        let stale = uuid::Uuid::new_v4().to_string();
+        crate::test_utils::try_persist_event::<WrappedEquityRecovery>(
+            &pool,
+            &stale,
+            1,
+            &WrappedEquityRecoveryEvent::Detected {
+                chain: Chain::Base,
+                symbol: Symbol::new("AAPL").unwrap(),
+                shares: st0x_execution::FractionalShares::ZERO,
+                detected_at: chrono::Utc::now(),
+            },
+        )
+        .await
+        .unwrap();
+        crate::test_utils::try_persist_event::<WrappedEquityRecovery>(
+            &pool,
+            &stale,
+            2,
+            &WrappedEquityRecoveryEvent::StaleDetectionFailed {
+                reason: "balance changed".into(),
                 failed_at: chrono::Utc::now(),
             },
         )

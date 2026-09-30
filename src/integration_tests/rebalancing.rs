@@ -3418,7 +3418,7 @@ async fn wrapped_recovery_reschedules_when_held_for_recovery_but_no_balance() {
     // Guard is HeldForRecovery: set by the transfer job when PostReceipt fired.
     let equity_in_progress = Arc::new(RwLock::new(HashMap::from([(
         symbol.clone(),
-        GuardState::HeldForRecovery,
+        GuardState::HeldForRecovery { chain: Chain::Base },
     )])));
 
     let (pool, apalis_pool) = setup_test_pools().await;
@@ -3458,8 +3458,10 @@ async fn wrapped_recovery_reschedules_when_held_for_recovery_but_no_balance() {
     let store = Arc::new(test_store(
         pool.clone(),
         WrappedEquityRecoveryServices {
-            chain: Chain::Base,
-            chain_services,
+            equity: EquityTransferServices {
+                chains: BTreeMap::from([(Chain::Base, chain_services)]),
+                bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
+            },
             transfer,
             bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
         },
@@ -3480,6 +3482,7 @@ async fn wrapped_recovery_reschedules_when_held_for_recovery_but_no_balance() {
 
     let recovery_id = WrappedEquityRecoveryId(Uuid::new_v4());
     let job = WrappedEquityRecoveryJob {
+        chain: Chain::Base,
         symbol: symbol.clone(),
         recovery_id: recovery_id.clone(),
         backpressure_streak: BackpressureStreak::default(),
@@ -3494,7 +3497,7 @@ async fn wrapped_recovery_reschedules_when_held_for_recovery_but_no_balance() {
     // The guard must be restored to HeldForRecovery after the no-balance drop.
     assert_eq!(
         equity_in_progress.read().unwrap().get(&symbol),
-        Some(&GuardState::HeldForRecovery),
+        Some(&GuardState::HeldForRecovery { chain: Chain::Base }),
         "equity_in_progress must be restored to HeldForRecovery after a no-balance reschedule; \
          the slot must not be cleared so recovery retries can still claim it",
     );
@@ -3537,7 +3540,7 @@ async fn recovery_job_breaks_deadlock_when_wrap_landed_wrapped_equity_recovery()
     // error in WrapSubmitted. The wrap tx landed, so tokens are WRAPPED.
     let equity_in_progress = Arc::new(RwLock::new(HashMap::from([(
         symbol.clone(),
-        GuardState::HeldForRecovery,
+        GuardState::HeldForRecovery { chain: Chain::Base },
     )])));
 
     let (pool, apalis_pool) = setup_test_pools().await;
@@ -3581,8 +3584,10 @@ async fn recovery_job_breaks_deadlock_when_wrap_landed_wrapped_equity_recovery()
     let store = Arc::new(test_store(
         pool.clone(),
         WrappedEquityRecoveryServices {
-            chain: Chain::Base,
-            chain_services,
+            equity: EquityTransferServices {
+                chains: BTreeMap::from([(Chain::Base, chain_services)]),
+                bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
+            },
             transfer,
             bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
         },
@@ -3616,6 +3621,7 @@ async fn recovery_job_breaks_deadlock_when_wrap_landed_wrapped_equity_recovery()
 
     let recovery_id = WrappedEquityRecoveryId(Uuid::new_v4());
     let job = WrappedEquityRecoveryJob {
+        chain: Chain::Base,
         symbol: symbol.clone(),
         recovery_id: recovery_id.clone(),
         backpressure_streak: BackpressureStreak::default(),
@@ -3679,7 +3685,7 @@ async fn recovery_job_breaks_deadlock_when_wrap_failed_unwrapped_equity_recovery
     // PostReceipt error with the aggregate in TokensReceived/WrapSubmitted.
     let equity_in_progress = Arc::new(RwLock::new(HashMap::from([(
         symbol.clone(),
-        GuardState::HeldForRecovery,
+        GuardState::HeldForRecovery { chain: Chain::Base },
     )])));
 
     let (pool, apalis_pool) = setup_test_pools().await;
@@ -3723,8 +3729,10 @@ async fn recovery_job_breaks_deadlock_when_wrap_failed_unwrapped_equity_recovery
     let store = Arc::new(test_store(
         pool.clone(),
         UnwrappedEquityRecoveryServices {
-            chain: Chain::Base,
-            chain_services,
+            equity: EquityTransferServices {
+                chains: BTreeMap::from([(Chain::Base, chain_services)]),
+                bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
+            },
             transfer,
             bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
         },
@@ -3758,6 +3766,7 @@ async fn recovery_job_breaks_deadlock_when_wrap_failed_unwrapped_equity_recovery
 
     let recovery_id = UnwrappedEquityRecoveryId(Uuid::new_v4());
     let job = UnwrappedEquityRecoveryJob {
+        chain: Chain::Base,
         symbol: symbol.clone(),
         recovery_id: recovery_id.clone(),
         backpressure_streak: BackpressureStreak::default(),
@@ -3812,7 +3821,7 @@ async fn recovery_job_breaks_deadlock_when_wrap_failed_dispatches_active_mint() 
     // Guard is HeldForRecovery: handed off by the transfer job after PostReceipt.
     let equity_in_progress = Arc::new(RwLock::new(HashMap::from([(
         symbol.clone(),
-        GuardState::HeldForRecovery,
+        GuardState::HeldForRecovery { chain: Chain::Base },
     )])));
 
     let (pool, apalis_pool) = setup_test_pools().await;
@@ -3856,8 +3865,10 @@ async fn recovery_job_breaks_deadlock_when_wrap_failed_dispatches_active_mint() 
     let store = Arc::new(test_store(
         pool.clone(),
         UnwrappedEquityRecoveryServices {
-            chain: Chain::Base,
-            chain_services,
+            equity: EquityTransferServices {
+                chains: BTreeMap::from([(Chain::Base, chain_services)]),
+                bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
+            },
             transfer,
             bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
         },
@@ -3923,6 +3934,7 @@ async fn recovery_job_breaks_deadlock_when_wrap_failed_dispatches_active_mint() 
 
     let recovery_id = UnwrappedEquityRecoveryId(Uuid::new_v4());
     let job = UnwrappedEquityRecoveryJob {
+        chain: Chain::Base,
         symbol: symbol.clone(),
         recovery_id: recovery_id.clone(),
         backpressure_streak: BackpressureStreak::default(),
