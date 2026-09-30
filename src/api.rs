@@ -7966,7 +7966,9 @@ mod tests {
 
     /// Like every other corridor move, the burn refuses while the corridor's
     /// signing wallets are below their gas thresholds, before it takes the
-    /// resume lock or touches the chain.
+    /// resume lock or touches the chain. The lock is held here, so a gate
+    /// placed behind it would answer the 409 of
+    /// `cctp_bridge_returns_409_while_the_resume_lock_is_held` instead.
     #[tokio::test]
     async fn cctp_bridge_returns_503_while_the_corridor_wallets_are_not_gas_ready() {
         let mut ctx = create_test_ctx_with_order_owner(Address::ZERO);
@@ -7985,6 +7987,8 @@ mod tests {
                 U256::from(1_u64),
             ))
             .await;
+        let resume_lock = Arc::clone(&state.resume_lock);
+        let _held = resume_lock.0.try_lock().unwrap();
 
         let Err((status, Json(body))) = capital::cctp_bridge(
             State(state),
@@ -8493,7 +8497,7 @@ mod tests {
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         assert!(
             message.contains("signing wallets are not gas ready"),
-            "the 503 must tell the operator to fund the wallets; got: {message}"
+            "the 503 must say the corridor wallets are not gas ready; got: {message}"
         );
 
         let (status, message) =

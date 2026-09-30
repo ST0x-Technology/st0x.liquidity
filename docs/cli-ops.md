@@ -278,13 +278,15 @@ stox wrap-equity -s COIN -q 10 --network ethereum
 stox vault-deposit --amount 10 --token <wrapped-token> --vault-id <vault-id> --network ethereum
 ```
 
-For USDC, deposit the chain's canonical USDC into the cash vault the same way
+For cash, deposit the chain's settlement stable (USDC, or USDG on Robinhood)
+into the cash vault the same way
 (`vault-deposit --amount <amount> --network ethereum --token <usdc> --vault-id <cash-vault-id>`);
 `vault-withdraw-usdc --amount <amount> --network <chain>` reverses it and
-`reset-allowance --network <chain>` zeroes the orderbook's USDC allowance on
-that chain. `transfer-equity --network <chain>` records the chain it ran on, and
-the server resumes an interrupted transfer with that chain's wallet, vault and
-issuer. A resumed mint (`--issuer-request-id`) must be given the network it
+`reset-allowance --network <chain>` zeroes the orderbook's allowance of that
+settlement stable on that chain; both act on USDG on Robinhood despite the
+command names. `transfer-equity --network <chain>` records the chain it ran on,
+and the server resumes an interrupted transfer with that chain's wallet, vault
+and issuer. A resumed mint (`--issuer-request-id`) must be given the network it
 started on; a `--network` that disagrees with the record is refused, and the
 `transfer` recovery verbs carry no network at all.
 
@@ -325,10 +327,10 @@ retry. After the task finishes, confirmed or not, `complete-mint` no longer
 waits on it. The outcome is `CCTP burn confirmed via API`, or
 `CCTP burn broadcast via API did not confirm`, whose `error` field says why: a
 revert, a dropped tx, a missing CCTP `MessageSent` event, or a receipt wait that
-timed out or kept failing on RPC errors. The last two do not prove the burn
-failed, so check the burn tx onchain before completing the mint or retrying; a
-burn that never confirmed never attests, and `complete-mint` keeps answering
-`502` for it.
+timed out or kept failing on RPC errors. A timed out receipt wait, or one that
+kept failing on RPC errors, does not prove the burn failed, so check the burn tx
+onchain before completing the mint or retrying; a burn that never confirmed
+never attests, and `complete-mint` keeps answering `502` for it.
 
 A request that times out on the client may still complete in the bot; check the
 bot logs and the chain for the transaction before retrying a vault or allowance
@@ -336,14 +338,16 @@ verb. A retried `cctp-bridge` burns again, since the bot keeps no record of the
 burn. After a timeout, find `CCTP burn broadcast via API` in the bot logs and
 finish that burn with `complete-mint` instead of retrying. If instead the logs
 show `Capital route failed onchain` for `cctp-bridge` with no broadcast line,
-the burn was not broadcast cleanly and its `error` field says why: a balance
-read, the allowance approve, the Circle fee lookup, or a preflight revert
-broadcast no burn, but a transport error on the burn send itself may still have
-landed, so check the source wallet's recent transactions onchain before
-retrying. Every capital verb answers `503` until the bot finishes starting. The
-tokenization and issuer verbs (`transfer-equity`, `wrap-equity`,
-`unwrap-equity`, `donate-equity`, `dividend-bump`) have no client subcommand and
-stay on `st0x-cli`.
+the burn was not broadcast cleanly. A revert broadcast no burn, but a transport
+error reads the same whichever step raised it (the balance read, the allowance
+approve, the Circle fee lookup, or the burn send itself), and only the burn send
+may still have landed. The bridge logs
+`Submitting depositForBurn (pending) for fast transfer` just before that send:
+if that line is present, treat the burn as possibly broadcast and check the
+source wallet's recent transactions onchain before retrying. Every capital verb
+answers `503` until the bot finishes starting. The tokenization and issuer verbs
+(`transfer-equity`, `wrap-equity`, `unwrap-equity`, `donate-equity`,
+`dividend-bump`) have no client subcommand and stay on `st0x-cli`.
 
 ### Orchestrator Rollout per Chain
 

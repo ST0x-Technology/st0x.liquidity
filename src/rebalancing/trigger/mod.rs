@@ -5938,8 +5938,8 @@ impl RebalancingService {
     /// exactly as it does for a trigger enqueue. Shares the single flight
     /// gates of [`Self::resume_usdc_transfer`] in the same order, so a manual
     /// start cannot race the trigger, a resume, or a transfer in flight, and
-    /// then applies the trigger's gas readiness gate, since unlike a resume it
-    /// starts a fresh transfer.
+    /// applies the trigger's gas readiness gate before the corridor claim,
+    /// since unlike a resume it starts a fresh transfer.
     pub(crate) async fn start_manual_usdc_transfer(
         &self,
         pool: &SqlitePool,

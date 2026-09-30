@@ -387,14 +387,15 @@ pub(crate) enum Capital {
     /// Withdraw tokens from a Raindex vault to the bot's wallet, resolving
     /// token decimals from onchain metadata.
     VaultWithdraw(VaultArgs),
-    /// Withdraw USDC from the chain's configured Raindex cash vault.
+    /// Withdraw the chain's settlement stable (USDC, or USDG on Robinhood)
+    /// from its configured Raindex cash vault.
     VaultWithdrawUsdc {
-        /// Amount of USDC to withdraw, as a decimal.
+        /// Amount of the settlement stable to withdraw, as a decimal.
         #[arg(short = 'a', long, allow_negative_numbers = true)]
         amount: DecimalAmount,
-        /// Chain of the cash vault: its canonical USDC and its
-        /// `[chains.<name>.trading.assets.cash]` vault; a chain with no pinned
-        /// USDC is refused.
+        /// Chain of the cash vault: its settlement stable and its first
+        /// `[chains.<name>.trading.assets.cash]` vault; a chain with no cash
+        /// vault configured is refused.
         #[arg(long, value_enum, default_value_t = HedgedChain::Base)]
         network: HedgedChain,
     },
@@ -420,10 +421,11 @@ pub(crate) enum Capital {
         #[arg(long, value_enum)]
         from: CctpSourceChain,
     },
-    /// Reset the bot wallet's USDC allowance for the orderbook to zero.
+    /// Reset the bot wallet's settlement stable allowance (USDC, or USDG on
+    /// Robinhood) for the orderbook to zero.
     ResetAllowance {
-        /// Chain whose USDC allowance to reset: its wallet, canonical USDC
-        /// and `[chains.<name>.trading]` orderbook.
+        /// Chain whose allowance to reset: its wallet, its settlement stable
+        /// and its `[chains.<name>.trading]` orderbook.
         #[arg(long, value_enum, default_value_t = HedgedChain::Base)]
         network: HedgedChain,
     },
