@@ -39,8 +39,8 @@ use url::Url;
 
 use st0x_bridge::corridor::UsdcCorridor;
 use st0x_config::{
-    AlertsCtx, BrokerCtx, ChainAssets, ChainRole, Ctx, CtxError, ExecutionThreshold, HedgedChain,
-    HedgingAssets, InventoryMode, IssuanceStatusCtx, OnchainWalletCtx, OperationMode,
+    AlertsCtx, BrokerCtx, ChainAssets, ChainRegistry, ChainRole, Ctx, CtxError, ExecutionThreshold,
+    HedgedChain, HedgingAssets, InventoryMode, IssuanceStatusCtx, OnchainWalletCtx, OperationMode,
     OrchestratorAddresses, RebalancingCtx,
 };
 use st0x_dto::Statement;
@@ -129,7 +129,7 @@ use crate::rebalancing::trigger::{GUARD_GENERATION, GuardGeneration, GuardState}
 use crate::rebalancing::usdc::{
     RecheckUsdcDeposit, RecoverCctpMint, RestoredDepositSends, TransferUsdcToHedging,
     TransferUsdcToHedgingCtx, TransferUsdcToMarketMaking, TransferUsdcToMarketMakingCtx,
-    UsdcDriverPause, UsdcSettlementParams, deposit_send_required_confirmations,
+    UsdcDriverPause, UsdcSettlementParams,
 };
 use crate::rebalancing::{
     BaseWallet, ChainRebalancingConfig, ChainWallets, EthereumWallet, RebalancerServices,
@@ -3112,8 +3112,7 @@ async fn build_rebalancer_services<Signer: Wallet + Clone>(
     alpaca_auth: &AlpacaBrokerApiCtx,
     ethereum_wallet: Signer,
     rebalancing_ctx: &RebalancingCtx,
-    required_confirmations: u64,
-    ethereum_required_confirmations: Option<u64>,
+    chains: &ChainRegistry,
     reserved_cash: Option<Usd>,
     telemetry: TelemetrySender,
 ) -> anyhow::Result<RebalancerServices<Signer>> {
@@ -3133,19 +3132,7 @@ async fn build_rebalancer_services<Signer: Wallet + Clone>(
         alpaca_wallet,
         ethereum_wallet,
         rebalancing_ctx.cctp_corridor,
-        UsdcSettlementParams {
-            attestation_retry_deadline: rebalancing_ctx.attestation_retry_deadline,
-            settlement_retry_deadline: rebalancing_ctx.settlement_retry_deadline,
-            required_confirmations,
-            ethereum_required_confirmations,
-            reserved_cash,
-            #[cfg(feature = "test-support")]
-            circle_api_base: rebalancing_ctx.circle_api_base.clone(),
-            #[cfg(feature = "test-support")]
-            token_messenger: rebalancing_ctx.token_messenger,
-            #[cfg(feature = "test-support")]
-            message_transmitter: rebalancing_ctx.message_transmitter,
-        },
+        UsdcSettlementParams::for_chains(rebalancing_ctx, chains, reserved_cash),
     ))
 }
 
@@ -3595,12 +3582,7 @@ fn spawn_rebalancing_infrastructure<Signer: Wallet + Clone>(
             alpaca_auth,
             ethereum_wallet,
             &rebalancing_ctx,
-            deps.ctx.chains.primary().required_confirmations,
-            deposit_send_required_confirmations(&deps.ctx.chains)
-                .inspect_err(|error| {
-                    warn!(target: "rebalance", %error, "Reconcile of a signed Alpaca deposit send is refused until [chains.ethereum] is configured");
-                })
-                .ok(),
+            &deps.ctx.chains,
             cash.map(|cash| cash.reserved).map(Positive::inner),
             deps.telemetry.clone(),
         )

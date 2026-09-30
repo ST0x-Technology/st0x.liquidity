@@ -24,7 +24,9 @@ use st0x_bridge::cctp::{
 };
 use st0x_bridge::corridor::UsdcCorridor;
 use st0x_bridge::{Attestation, Bridge, BridgeDirection, BurnReceipt, BurnTxStatus, MintReceipt};
-use st0x_config::{ALPACA_MINIMUM_WITHDRAWAL, ALPACA_TO_BASE_MINIMUM_TRANSFER, ChainRegistry};
+use st0x_config::{
+    ALPACA_MINIMUM_WITHDRAWAL, ALPACA_TO_BASE_MINIMUM_TRANSFER, ChainRegistry, RebalancingCtx,
+};
 use st0x_event_sorcery::Store;
 use st0x_evm::{Chain, IERC20, PreparedTransaction, Wallet};
 use st0x_execution::alpaca_broker_api::CryptoOrderResponse;
@@ -103,10 +105,10 @@ pub struct UsdcSettlementParams {
     /// `confirmed_at`. Past it the redrive terminalizes via `FailBridging`
     /// instead of re-enqueueing forever.
     pub settlement_retry_deadline: Duration,
-    pub required_confirmations: u64,
-    /// Depth a tx on Ethereum needs before it proves a signed deposit send
-    /// can never mine: Ethereum's own `required_confirmations`. `None` with
-    /// no `[chains.ethereum]` entry, which refuses that proof.
+    /// Ethereum's own `required_confirmations`: the depth the Alpaca
+    /// withdrawal tx needs before its USDC is used, and the depth a tx needs
+    /// before it proves a signed deposit send can never mine. `None` with no
+    /// `[chains.ethereum]` entry, which refuses both checks.
     pub ethereum_required_confirmations: Option<u64>,
     pub reserved_cash: Option<Usd>,
     /// Circle attestation/fee API base URL (test-only override; production
@@ -119,6 +121,30 @@ pub struct UsdcSettlementParams {
     /// `MessageTransmitterV2` contract address (test-only override).
     #[cfg(feature = "test-support")]
     pub message_transmitter: Address,
+}
+
+impl UsdcSettlementParams {
+    /// A cash transfer's settlement tuning. Its depth is Ethereum's: the txs
+    /// it checks against a depth land on Ethereum, whichever chain the
+    /// corridor or the primary is.
+    pub fn for_chains(
+        rebalancing: &RebalancingCtx,
+        chains: &ChainRegistry,
+        reserved_cash: Option<Usd>,
+    ) -> Self {
+        Self {
+            attestation_retry_deadline: rebalancing.attestation_retry_deadline,
+            settlement_retry_deadline: rebalancing.settlement_retry_deadline,
+            ethereum_required_confirmations: chains.required_confirmations(Chain::Ethereum),
+            reserved_cash,
+            #[cfg(feature = "test-support")]
+            circle_api_base: rebalancing.circle_api_base.clone(),
+            #[cfg(feature = "test-support")]
+            token_messenger: rebalancing.token_messenger,
+            #[cfg(feature = "test-support")]
+            message_transmitter: rebalancing.message_transmitter,
+        }
+    }
 }
 
 /// Identifies the market-making endpoints for bridged USDC.
@@ -407,7 +433,6 @@ pub struct CrossVenueCashTransfer<Signer: Wallet, B = CctpBridge<Signer, Signer>
     vault_id: RaindexVaultId,
     attestation_retry_deadline: Duration,
     settlement_retry_deadline: Duration,
-    required_confirmations: u64,
     ethereum_required_confirmations: Option<u64>,
     reserved_cash: Option<Usd>,
     gas_readiness: ConfiguredGasReadiness,
@@ -734,7 +759,6 @@ impl<
             vault_id: market_making_endpoints.vault_id,
             attestation_retry_deadline: settlement.attestation_retry_deadline,
             settlement_retry_deadline: settlement.settlement_retry_deadline,
-            required_confirmations: settlement.required_confirmations,
             ethereum_required_confirmations: settlement.ethereum_required_confirmations,
             reserved_cash: settlement.reserved_cash,
             gas_readiness: ConfiguredGasReadiness::default(),
@@ -898,12 +922,17 @@ impl<
         credit_id: &UsdcRebalanceId,
         withdrawal_tx: TxHash,
     ) -> Option<Usdc> {
+        let Some(required) = self.ethereum_required_confirmations else {
+            warn!(target: "rebalance", %credit_id, %withdrawal_tx, error = %EthereumChainMissing, "Cannot confirm the withdrawal tx for the credit ledger");
+            return None;
+        };
+
         match self
             .cctp_bridge
             .ethereum_tx_confirmations(withdrawal_tx)
             .await
         {
-            Ok(Some(confirmations)) if confirmations >= self.required_confirmations => {}
+            Ok(Some(confirmations)) if confirmations >= required => {}
             Ok(_) => return None,
             Err(error) => {
                 warn!(target: "rebalance", %credit_id, %withdrawal_tx, %error, "Could not read the withdrawal tx confirmations for the credit ledger");
@@ -2613,6 +2642,9 @@ impl<
         tx: TxHash,
         confirmed_at: DateTime<Utc>,
     ) -> Result<(), UsdcTransferError> {
+        let required = self
+            .ethereum_required_confirmations
+            .ok_or(EthereumChainMissing)?;
         let confirmations = match self.cctp_bridge.ethereum_tx_confirmations(tx).await {
             Ok(confirmations) => confirmations,
             Err(error) => {
@@ -2642,11 +2674,11 @@ impl<
                 Err(UsdcTransferError::WithdrawalTxUnderconfirmed {
                     id: id.clone(),
                     tx,
-                    required: self.required_confirmations,
+                    required,
                     actual: 0,
                 })
             }
-            Some(confirmations) if confirmations < self.required_confirmations => {
+            Some(confirmations) if confirmations < required => {
                 self.check_settlement_deadline(id, confirmed_at, SettlementStall::TxUnderconfirmed)
                     .await?;
                 warn!(
@@ -2654,13 +2686,13 @@ impl<
                     %id,
                     %tx,
                     confirmations,
-                    required = self.required_confirmations,
+                    required,
                     "Withdrawal tx under-confirmed on redrive; retrying"
                 );
                 Err(UsdcTransferError::WithdrawalTxUnderconfirmed {
                     id: id.clone(),
                     tx,
-                    required: self.required_confirmations,
+                    required,
                     actual: confirmations,
                 })
             }
@@ -3119,6 +3151,9 @@ impl<
         // apalis redrive the resume path enters
         // continue_alpaca_to_base_from_withdrawal_complete and re-runs this same
         // confirmation check durably before any burn.
+        let required = self
+            .ethereum_required_confirmations
+            .ok_or(EthereumChainMissing)?;
         match self
             .cctp_bridge
             .ethereum_tx_confirmations(withdrawal_tx)
@@ -3137,23 +3172,23 @@ impl<
                 return Err(UsdcTransferError::WithdrawalTxUnderconfirmed {
                     id: id.clone(),
                     tx: withdrawal_tx,
-                    required: self.required_confirmations,
+                    required,
                     actual: 0,
                 });
             }
-            Some(confirmations) if confirmations < self.required_confirmations => {
+            Some(confirmations) if confirmations < required => {
                 warn!(
                     target: "rebalance",
                     %id,
                     tx = %withdrawal_tx,
                     confirmations,
-                    required = self.required_confirmations,
+                    required,
                     "Alpaca withdrawal tx under-confirmed; retrying"
                 );
                 return Err(UsdcTransferError::WithdrawalTxUnderconfirmed {
                     id: id.clone(),
                     tx: withdrawal_tx,
-                    required: self.required_confirmations,
+                    required,
                     actual: confirmations,
                 });
             }
@@ -6714,9 +6749,9 @@ fn deposit_send_recipient(prepared: &PreparedTransaction) -> Option<Address> {
 }
 
 /// The configured chains have no Ethereum entry, so there is no depth for
-/// the tx that supersedes a signed deposit send.
+/// the Ethereum txs a cash transfer checks.
 #[derive(Debug, Clone, Copy, thiserror::Error)]
-#[error("no [chains.ethereum] entry: its required_confirmations gates the deposit send check")]
+#[error("no [chains.ethereum] entry: its required_confirmations gates the Ethereum tx checks")]
 pub struct EthereumChainMissing;
 
 /// The depth a tx needs before it proves a signed Alpaca deposit send can
@@ -8301,7 +8336,6 @@ mod tests {
         UsdcSettlementParams {
             attestation_retry_deadline: TEST_ATTESTATION_RETRY_DEADLINE,
             settlement_retry_deadline: TEST_SETTLEMENT_RETRY_DEADLINE,
-            required_confirmations: 3,
             ethereum_required_confirmations: Some(3),
             reserved_cash: None,
             #[cfg(feature = "test-support")]
@@ -16901,6 +16935,29 @@ mod tests {
             .unwrap();
     }
 
+    /// The withdrawal tx, the deposit send and its cancel all land on
+    /// Ethereum, so a Base primary three deep still checks them five deep.
+    #[test]
+    fn settlement_params_check_ethereum_txs_at_ethereums_depth() {
+        let mut chains = ChainRegistry::single_hedged_chain(
+            HedgedChain::test().required_confirmations(3).call(),
+        );
+        let rebalancing = RebalancingCtx::stub().call();
+
+        let without_ethereum = UsdcSettlementParams::for_chains(&rebalancing, &chains, None);
+        assert_eq!(without_ethereum.ethereum_required_confirmations, None);
+
+        chains.insert_secondary(
+            HedgedChain::test()
+                .chain(Chain::Ethereum)
+                .required_confirmations(5)
+                .call(),
+        );
+        let settlement = UsdcSettlementParams::for_chains(&rebalancing, &chains, None);
+
+        assert_eq!(settlement.ethereum_required_confirmations, Some(5));
+    }
+
     /// The cancel lands on Ethereum, so it needs Ethereum's depth, not the
     /// primary chain's: one between the two is not yet proof.
     #[tokio::test]
@@ -20696,6 +20753,53 @@ mod tests {
                 }
             ),
             "Aggregate must advance to WithdrawalComplete when tx is under-confirmed; got: {state:?}"
+        );
+    }
+
+    /// With no `[chains.ethereum]` entry the withdrawal tx has no depth to
+    /// reach, so the check refuses rather than borrowing another chain's.
+    #[tokio::test]
+    async fn withdrawal_tx_check_refuses_without_an_ethereum_depth() {
+        let market_maker_wallet = address!("0x2222222222222222222222222222222222222222");
+        let chain = deploy_ethereum_usdc_chain_with_balance(U256::ZERO, market_maker_wallet).await;
+        let server = MockServer::start();
+        let (mut manager, cqrs) =
+            build_manager_with_ethereum_chain(&chain, &server, market_maker_wallet).await;
+        manager.ethereum_required_confirmations = None;
+        let transfer_uuid = Uuid::new_v4();
+        let _transfer_mock =
+            mock_complete_withdrawal_with_tx(&server, transfer_uuid, Some(chain.mint_tx));
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let amount = usdc("1");
+        let withdrawal_id = AlpacaTransferId::from(transfer_uuid);
+        for command in [
+            UsdcRebalanceCommand::InitiateConversion {
+                corridor: UsdcCorridor::BASE_CCTP,
+                direction: RebalanceDirection::AlpacaToBase,
+                amount,
+                order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
+            },
+            UsdcRebalanceCommand::ConfirmConversion {
+                conversion: par_conversion(amount),
+            },
+            UsdcRebalanceCommand::Initiate {
+                corridor: UsdcCorridor::BASE_CCTP,
+                direction: RebalanceDirection::AlpacaToBase,
+                amount,
+                withdrawal: TransferRef::AlpacaId(withdrawal_id),
+            },
+        ] {
+            cqrs.send(&id, command).await.unwrap();
+        }
+
+        let error = manager
+            .poll_and_confirm_withdrawal(&id, &withdrawal_id, Utc::now())
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(error, UsdcTransferError::EthereumChainMissing(_)),
+            "got: {error:?}"
         );
     }
 

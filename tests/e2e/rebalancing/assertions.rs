@@ -18,7 +18,7 @@ use sqlx::SqlitePool;
 use tokio::task::JoinHandle;
 
 use st0x_bridge::cctp::CctpAttestationMock;
-use st0x_config::{BrokerCtx, Ctx};
+use st0x_config::{BrokerCtx, ChainCtx, Ctx};
 use st0x_config::{CashHedgePolicy, EquityHedgePolicy, HedgedEquities, HedgingAssets};
 use st0x_evm::Chain;
 use st0x_evm::local::RawPrivateKeyWallet;
@@ -300,7 +300,7 @@ where
         ethereum_wallet,
     );
 
-    Ctx::for_test()
+    let mut ctx = Ctx::for_test()
         .database_url(db_path.display().to_string())
         .rpc_url(base_chain.endpoint().parse()?)
         .orderbook(base_chain.orderbook)
@@ -327,8 +327,15 @@ where
             chainlink_feed: base_chain.mock_chainlink_feed,
         })
         .alerts(test_alerts())
-        .call()
-        .map_err(Into::into)
+        .call()?;
+    // The USDC withdrawal tx lands on Ethereum and is checked at its depth.
+    ctx.chains.insert_transport(ChainCtx {
+        chain: Chain::Ethereum,
+        rpc_url: ethereum_endpoint.parse()?,
+        required_confirmations: 0,
+    });
+
+    Ok(ctx)
 }
 
 pub(crate) enum EquityRebalanceType<'a> {

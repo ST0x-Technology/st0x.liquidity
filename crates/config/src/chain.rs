@@ -914,6 +914,13 @@ impl ChainRegistry {
         self.secondary.insert(chain.chain, chain);
     }
 
+    /// Adds a transport chain (RPC and depth only), so a fixture can give
+    /// Ethereum its own confirmation depth.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn insert_transport(&mut self, chain: ChainCtx) {
+        self.transport.insert(chain.chain, chain);
+    }
+
     /// A registry holding one primary chain and nothing else.
     ///
     /// Test and fixture construction only: production registries come from

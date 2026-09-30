@@ -402,7 +402,6 @@ mod tests {
         UsdcSettlementParams {
             attestation_retry_deadline: rebalancing_ctx.attestation_retry_deadline,
             settlement_retry_deadline: rebalancing_ctx.settlement_retry_deadline,
-            required_confirmations: 0,
             ethereum_required_confirmations: Some(0),
             reserved_cash: None,
             #[cfg(feature = "test-support")]

@@ -723,7 +723,8 @@ fn is_bot_resumable_wait(error: &UsdcTransferError) -> bool {
         | UsdcTransferError::BurnTxDropped { .. }
         | UsdcTransferError::DepositSendUnresolved { .. }
         | UsdcTransferError::DepositSendTaskPanicked { .. }
-        | UsdcTransferError::DepositSendLookup { .. } => false,
+        | UsdcTransferError::DepositSendLookup { .. }
+        | UsdcTransferError::EthereumChainMissing(_) => false,
     }
 }
 
@@ -1017,26 +1018,15 @@ async fn run_usdc_transfer<Writer: Write>(
         vault_service,
         usdc_store,
         MarketMakingUsdcEndpoints::new(corridor, owner, RaindexVaultId(usdc_vault_id)),
-        &UsdcSettlementParams {
-            attestation_retry_deadline: rebalancing_ctx.attestation_retry_deadline,
-            settlement_retry_deadline: rebalancing_ctx.settlement_retry_deadline,
-            required_confirmations: ctx.chains.primary().required_confirmations,
-            ethereum_required_confirmations: Some(deposit_send_required_confirmations(
-                &ctx.chains,
-            )?),
-            reserved_cash: ctx
-                .assets
+        &UsdcSettlementParams::for_chains(
+            rebalancing_ctx,
+            &ctx.chains,
+            ctx.assets
                 .cash
                 .as_ref()
                 .map(|cash| cash.reserved)
                 .map(Positive::inner),
-            #[cfg(any(test, feature = "test-support"))]
-            circle_api_base: rebalancing_ctx.circle_api_base.clone(),
-            #[cfg(any(test, feature = "test-support"))]
-            token_messenger: rebalancing_ctx.token_messenger,
-            #[cfg(any(test, feature = "test-support"))]
-            message_transmitter: rebalancing_ctx.message_transmitter,
-        },
+        ),
         BotGasReceiptCostEnqueuer::Disabled,
     )
     .with_gas_readiness(gas_readiness)
