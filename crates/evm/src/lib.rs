@@ -1388,9 +1388,12 @@ pub async fn mined_tx(
         return Ok(None);
     };
 
-    // Reads are not pinned to one node, so a lagging node can serve a
-    // receipt from a reorged-out block while the head comes from another:
-    // count confirmations only for a receipt in the canonical block.
+    // Reads are not pinned to one node (a load-balanced RPC offers no way to),
+    // so a lagging node can serve a receipt from a reorged-out block while the
+    // head comes from another. Read the head first, then count confirmations
+    // only if the receipt's block is still canonical after it.
+    let head = provider.get_block_number().await?;
+
     let canonical = provider.get_block_by_number(tx_block.into()).await?;
     if canonical.is_none_or(|block| block.header.hash != receipt_block_hash) {
         warn!(target: "wallet", %tx_hash, tx_block, %receipt_block_hash, "Receipt block is not the canonical block at its height; treating the tx as not mined");
@@ -1400,8 +1403,6 @@ pub async fn mined_tx(
     let Some(tx) = provider.get_transaction_by_hash(tx_hash).await? else {
         return Ok(None);
     };
-
-    let head = provider.get_block_number().await?;
 
     let to = tx.to();
     let to_has_code = match to {
