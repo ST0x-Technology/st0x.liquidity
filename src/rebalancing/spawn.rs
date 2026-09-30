@@ -37,6 +37,8 @@ pub(crate) enum SpawnRebalancerError {
     UnwiredCorridor { corridor: UsdcCorridor },
     #[error("no USDC corridor is served, so no cash transfer service can be built")]
     NoCorridor,
+    #[error("the {corridor} corridor is listed twice")]
+    DuplicateCorridor { corridor: UsdcCorridor },
 }
 
 /// Adapts the config-layer equity asset map to the narrow per-symbol token pairs
@@ -187,8 +189,10 @@ impl<Signer: Wallet + Clone + 'static> RebalancerServices<Signer> {
                 .with_driver_gate(driver_gate.clone()),
             );
 
+            if by_corridor.insert(corridor, transfer).is_some() {
+                return Err(SpawnRebalancerError::DuplicateCorridor { corridor });
+            }
             info!(target: "rebalance", %corridor, "Cash transfer service built");
-            by_corridor.insert(corridor, transfer);
         }
 
         let transfers = Arc::new(
@@ -616,6 +620,39 @@ mod tests {
             matches!(
                 error,
                 SpawnRebalancerError::UnwiredCorridor { corridor: refused } if refused == corridor
+            ),
+            "got {error:?}"
+        );
+    }
+
+    /// A corridor listed twice would silently replace its first service, so
+    /// startup refuses it by name.
+    #[tokio::test]
+    async fn duplicate_corridor_refuses_startup_by_name() {
+        let server = MockServer::start();
+        let (services, chain_wallet) = make_services_with_mock_wallet(&server).await;
+        let pool = crate::test_utils::setup_test_db().await;
+        let usdc_store = Arc::new(test_store(pool.clone(), ()));
+
+        let Err(error) = services.into_usdc_corridor_transfers(
+            vec![
+                corridor_endpoints(UsdcCorridor::BASE_CCTP, chain_wallet.clone()),
+                corridor_endpoints(UsdcCorridor::BASE_CCTP, chain_wallet),
+            ],
+            &usdc_store,
+            &pool,
+            &BotGasReceiptCostEnqueuer::Disabled,
+            &UsdcDriverGate::unpaused(),
+        ) else {
+            panic!("a corridor listed twice must be refused");
+        };
+
+        assert!(
+            matches!(
+                error,
+                SpawnRebalancerError::DuplicateCorridor {
+                    corridor: UsdcCorridor::BASE_CCTP
+                }
             ),
             "got {error:?}"
         );
