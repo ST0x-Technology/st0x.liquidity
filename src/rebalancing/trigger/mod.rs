@@ -271,13 +271,6 @@ fn resume_idempotency_key(id: &UsdcRebalanceId, existing_rows: i64) -> String {
     format!("usdc-resume:{id}:{existing_rows}")
 }
 
-/// Builds the idempotency key of a manual transfer start. Its prefix differs
-/// from `resume_idempotency_key`'s, so a start and a resume can never share a
-/// key even for the same id.
-fn manual_transfer_idempotency_key(id: &UsdcRebalanceId) -> String {
-    format!("usdc-manual-transfer:{id}")
-}
-
 /// Why loading a token address from the vault registry failed.
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum TokenAddressError {
@@ -6093,36 +6086,32 @@ impl RebalancingService {
             return Err(UsdcResumeError::CashDivergenceEngaged);
         }
 
-        let idempotency_key = manual_transfer_idempotency_key(&id);
+        // A plain push, as in the trigger's fresh dispatch: the id is fresh, so
+        // an idempotency key could never collide. Single flight comes from the
+        // job row gate and the corridor claim above.
         let push = match direction {
             RebalanceDirection::AlpacaToBase => {
                 self.transfer_usdc_to_market_making_queue
                     .clone()
-                    .push_idempotent(
-                        &idempotency_key,
-                        TransferUsdcToMarketMaking {
-                            id: id.clone(),
-                            amount,
-                            corridor,
-                            revert_redrive_attempts: 0,
-                            backpressure_streak: BackpressureStreak::default(),
-                        },
-                    )
+                    .push(TransferUsdcToMarketMaking {
+                        id: id.clone(),
+                        amount,
+                        corridor,
+                        revert_redrive_attempts: 0,
+                        backpressure_streak: BackpressureStreak::default(),
+                    })
                     .await
             }
             RebalanceDirection::BaseToAlpaca => {
                 self.transfer_usdc_to_hedging_queue
                     .clone()
-                    .push_idempotent(
-                        &idempotency_key,
-                        TransferUsdcToHedging {
-                            id: id.clone(),
-                            amount,
-                            corridor,
-                            revert_redrive_attempts: 0,
-                            backpressure_streak: BackpressureStreak::default(),
-                        },
-                    )
+                    .push(TransferUsdcToHedging {
+                        id: id.clone(),
+                        amount,
+                        corridor,
+                        revert_redrive_attempts: 0,
+                        backpressure_streak: BackpressureStreak::default(),
+                    })
                     .await
             }
         };

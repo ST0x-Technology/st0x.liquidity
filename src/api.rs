@@ -8018,9 +8018,10 @@ mod tests {
         );
     }
 
-    /// Two concurrent deposits of a token without the startup MAX grant can
-    /// overwrite each other's approval, so a deposit refuses with 409 while
-    /// another one holds the deposit lock, before any chain call.
+    /// Two concurrent `capital vault-deposit` requests for a token without the
+    /// startup MAX grant could overwrite each other's approval, so a request
+    /// refuses with 409 while another one holds the deposit lock, before any
+    /// chain call.
     #[tokio::test]
     async fn vault_deposit_returns_409_while_another_deposit_holds_the_lock() {
         let mut ctx = create_test_ctx_with_order_owner(Address::ZERO);

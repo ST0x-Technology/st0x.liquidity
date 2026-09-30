@@ -177,10 +177,14 @@ pub(crate) struct AppState {
     pub(crate) recovery: Arc<tokio::sync::OnceCell<api::RecoveryHandle>>,
     pub(crate) process_tx: Arc<tokio::sync::OnceCell<api::ProcessTxHandle>>,
     pub(crate) resume_lock: Arc<api::ResumeLock>,
-    /// Serializes `capital vault-deposit` requests. `RaindexService::deposit`
-    /// reads the allowance, approves exactly the amount when it is short, then
-    /// deposits, so two concurrent deposits of a token without the startup MAX
-    /// grant can overwrite each other's approval and one of them reverts.
+    /// Serializes `capital vault-deposit` requests against each other, and
+    /// nothing else. `RaindexService::deposit` reads the allowance, approves
+    /// exactly the amount when it is short, then deposits, so two concurrent
+    /// requests for a token without the startup MAX grant could overwrite each
+    /// other's approval. The bot's own deposits (the USDC transfer workers) do
+    /// not take this lock, so a request can still use up a worker's exact
+    /// approval when the MAX grant is missing; the worker's deposit then
+    /// reverts and its transfer needs a redrive.
     pub(crate) vault_deposit_lock: Arc<tokio::sync::Mutex<()>>,
     pub(crate) projection_maintenance: Arc<conductor::projection_pause::ProjectionMaintenance>,
     pub(crate) pnl_report_admission: dashboard::pnl::PnlReportAdmission,

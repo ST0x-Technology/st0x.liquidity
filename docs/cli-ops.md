@@ -312,7 +312,8 @@ corridor guard, so retrying it cannot start a second transfer alongside the
 first. Like the automatic rebalancer, it is also refused with `409` while a cash
 snapshot divergence is unresolved or the cash balance is restart tainted; retry
 once the inventory poller has cleared it. `capital vault-deposit` is refused
-with `409` while another deposit runs. `capital transfer-usdc` and
+with `409` while another `capital vault-deposit` runs; the lock does not cover
+the bot's own transfer deposits. `capital transfer-usdc` and
 `capital cctp-bridge` both answer `503` while the Base or Ethereum signing
 wallet cannot be shown to pay gas: fund a wallet that is below its gas
 threshold, or retry if the message says its balance could not be read.

@@ -6405,18 +6405,21 @@ effect rather than a generic intent:
   The vault verbs and `reset-allowance` take neither the lock nor the pause,
   like the `st0x-cli` verbs: pausing the driver would refuse every vault
   operation for the length of each USDC transfer. `vault-deposit` does take its
-  own lock (`409` while another deposit runs): the deposit reads the allowance
-  and approves exactly the amount when it is short, so two concurrent deposits
-  of a token without the startup MAX grant could overwrite each other's
-  approval. Every capital route refuses with `503` until startup completes, like
-  `process-tx`, since the startup preflights (each chain's id, the inventory
-  `OPERATOR_ROLE`) have not passed before then. Each route that sends a
-  transaction runs it on a tracked detached task, like `process-tx`, so a client
-  or load balancer timeout cannot drop a transaction between its broadcast and
-  its receipt, graceful shutdown waits for it, and the task logs its own
-  outcome. The tokenization and issuer verbs (`transfer-equity`, `wrap-equity`,
-  `unwrap-equity`, `donate-equity`, `dividend-bump`) have no route: they touch
-  tokenization and the issuer wallet, not liquidity capital.
+  own lock (`409` while another `vault-deposit` request runs): the deposit reads
+  the allowance and approves exactly the amount when it is short, so two
+  concurrent requests for a token without the startup MAX grant could overwrite
+  each other's approval. The lock covers these requests only: without the MAX
+  grant, a request can still use up the exact approval of a USDC transfer
+  worker's deposit, which then reverts and needs a redrive. Every capital route
+  refuses with `503` until startup completes, like `process-tx`, since the
+  startup preflights (each chain's id, the inventory `OPERATOR_ROLE`) have not
+  passed before then. Each route that sends a transaction runs it on a tracked
+  detached task, like `process-tx`, so a client or load balancer timeout cannot
+  drop a transaction between its broadcast and its receipt, graceful shutdown
+  waits for it, and the task logs its own outcome. The tokenization and issuer
+  verbs (`transfer-equity`, `wrap-equity`, `unwrap-equity`, `donate-equity`,
+  `dividend-bump`) have no route: they touch tokenization and the issuer wallet,
+  not liquidity capital.
 - **`transfer resume --kind usdc` routes through the running bot.** The CLI
   posts to `POST /transfers/usdc/resume/{direction}/{id}`. The endpoint
   validates server-side (unknown id refuses -- a mistyped id must never start a
