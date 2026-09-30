@@ -4,7 +4,7 @@ use alloy::primitives::{Address, TxHash, U256};
 use alloy::providers::RootProvider;
 use anyhow::Context;
 use sqlx::SqlitePool;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::io::{self, Write};
 use std::path::PathBuf;
@@ -736,6 +736,7 @@ pub(super) async fn transfer_usdc_command<Writer: Write>(
     stdout: &mut Writer,
     direction: TransferDirection,
     amount: Usdc,
+    chain: Option<Chain>,
     ctx: &Ctx,
     pool: &SqlitePool,
 ) -> anyhow::Result<()> {
@@ -750,7 +751,40 @@ pub(super) async fn transfer_usdc_command<Writer: Write>(
     // story depends on the operator still having this id if the process is killed
     // after burning, and buffered/redirected stdout could otherwise lose it.
     stdout.flush()?;
-    run_usdc_transfer(stdout, direction, id, amount, ctx, pool).await
+    run_usdc_transfer(stdout, direction, id, amount, chain, ctx, pool).await
+}
+
+/// The served corridor a manual transfer runs on: the one on `chain`, or
+/// the only one when `chain` is left out. Several served corridors with no
+/// `chain`, or none on it, are refused with the choices named.
+fn transfer_usdc_corridor(
+    served: &BTreeSet<UsdcCorridor>,
+    chain: Option<Chain>,
+) -> anyhow::Result<UsdcCorridor> {
+    let candidates: Vec<UsdcCorridor> = served
+        .iter()
+        .copied()
+        .filter(|corridor| chain.is_none_or(|chain| corridor.chain() == chain))
+        .collect();
+    let served_list = served
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    match (candidates.as_slice(), chain) {
+        ([corridor], _) => Ok(*corridor),
+        ([], Some(chain)) => {
+            anyhow::bail!("no served USDC corridor runs on {chain}; served: {served_list}")
+        }
+        ([], None) => anyhow::bail!("this build serves no USDC corridor"),
+        (_, Some(chain)) => {
+            anyhow::bail!("several served USDC corridors run on {chain}: {served_list}")
+        }
+        (_, None) => anyhow::bail!(
+            "several USDC corridors are served ({served_list}); pass --chain to pick one"
+        ),
+    }
 }
 
 /// Resumes an interrupted manual USDC transfer by enqueueing it on the
@@ -892,6 +926,7 @@ async fn run_usdc_transfer<Writer: Write>(
     direction: TransferDirection,
     id: UsdcRebalanceId,
     amount: Usdc,
+    chain: Option<Chain>,
     ctx: &Ctx,
     pool: &SqlitePool,
 ) -> anyhow::Result<()> {
@@ -910,10 +945,9 @@ async fn run_usdc_transfer<Writer: Write>(
 
     let wallet_ctx = ctx.wallet()?;
 
-    // The corridor the CCTP bridge below carries: the transfer runs on that
-    // chain's vault and signer.
+    // The transfer runs on the served corridor's chain vault and signer.
     let rebalancing_ctx = &ctx.rebalancing;
-    let corridor = rebalancing_ctx.cctp_corridor.usdc_corridor();
+    let corridor = transfer_usdc_corridor(rebalancing_ctx.usdc.served(), chain)?;
     let corridor_chain = corridor.chain();
     let hedged = ctx.chains.hedged_chain(corridor_chain).with_context(|| {
         format!("the {corridor} corridor needs a [chains.{corridor_chain}.trading] table")
@@ -2151,13 +2185,13 @@ mod tests {
     use alloy::primitives::{Address, B256, address, b256};
     use chrono::Utc;
     use rain_math_float::Float;
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
     use uuid::uuid;
 
     use st0x_bridge::cctp::CctpError;
-    use st0x_bridge::corridor::UsdcCorridor;
+    use st0x_bridge::corridor::{HopKind, UsdcCorridor};
     use st0x_config::AlertsCtx;
     use st0x_config::ChainRegistry;
     use st0x_config::CtxError;
@@ -3470,6 +3504,37 @@ mod tests {
         );
     }
 
+    /// `--chain` picks the served corridor on that chain; it may be left out
+    /// only while one corridor is served, and an unserved chain is refused.
+    #[test]
+    fn transfer_usdc_runs_on_the_served_corridor_its_chain_names() {
+        let robinhood_relay = UsdcCorridor::HubRouted {
+            chain: Chain::Robinhood,
+            hop: HopKind::Relay,
+        };
+        let one = BTreeSet::from([UsdcCorridor::BASE_CCTP]);
+        let two = BTreeSet::from([UsdcCorridor::BASE_CCTP, robinhood_relay]);
+
+        assert_eq!(
+            transfer_usdc_corridor(&one, None).unwrap(),
+            UsdcCorridor::BASE_CCTP
+        );
+        assert_eq!(
+            transfer_usdc_corridor(&two, Some(Chain::Robinhood)).unwrap(),
+            robinhood_relay
+        );
+
+        let unpicked = transfer_usdc_corridor(&two, None).unwrap_err().to_string();
+        assert!(unpicked.contains("pass --chain"), "{unpicked}");
+        let unserved = transfer_usdc_corridor(&one, Some(Chain::HyperEvm))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            unserved.starts_with("no served USDC corridor runs on"),
+            "{unserved}"
+        );
+    }
+
     #[tokio::test]
     async fn test_transfer_usdc_requires_wallet_config() {
         let mut ctx = create_alpaca_test_ctx();
@@ -3488,6 +3553,7 @@ mod tests {
             &mut stdout,
             TransferDirection::ToRaindex,
             amount,
+            None,
             &ctx,
             &pool,
         )
@@ -3511,6 +3577,7 @@ mod tests {
             &mut stdout,
             TransferDirection::ToRaindex,
             amount,
+            None,
             &ctx,
             &pool,
         )
@@ -3591,6 +3658,7 @@ mod tests {
             &mut stdout,
             TransferDirection::ToRaindex,
             amount,
+            None,
             &ctx,
             &pool,
         )
@@ -3618,6 +3686,7 @@ mod tests {
             &mut stdout,
             TransferDirection::ToRaindex,
             amount,
+            None,
             &ctx,
             &pool,
         )
@@ -3648,6 +3717,7 @@ mod tests {
             &mut stdout,
             TransferDirection::ToRaindex,
             amount,
+            None,
             &ctx,
             &pool,
         )
