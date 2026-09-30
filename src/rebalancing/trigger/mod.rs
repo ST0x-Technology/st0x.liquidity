@@ -1709,7 +1709,10 @@ impl RebalancingService {
                     Ok(guard) => guard,
                     Err(poison) => poison.into_inner(),
                 };
-                guard.get(&symbol) == Some(&equity::GuardState::HeldForRecovery)
+                match guard.get(&symbol) {
+                    Some(equity::GuardState::HeldForRecovery { .. }) => true,
+                    Some(equity::GuardState::ActiveTransfer { .. }) | None => false,
+                }
             };
             if held_for_recovery {
                 continue;
@@ -3432,6 +3435,7 @@ impl RebalancingService {
                     let recovery_id = WrappedEquityRecoveryId(Uuid::new_v4());
                     if let Err(error) = queue
                         .push(WrappedEquityRecoveryJob {
+                            chain: primary_chain,
                             symbol: symbol.clone(),
                             recovery_id: recovery_id.clone(),
                             backpressure_streak: BackpressureStreak::default(),
@@ -3514,6 +3518,7 @@ impl RebalancingService {
                     let recovery_id = UnwrappedEquityRecoveryId(Uuid::new_v4());
                     if let Err(error) = queue
                         .push(UnwrappedEquityRecoveryJob {
+                            chain: primary_chain,
                             symbol: symbol.clone(),
                             recovery_id: recovery_id.clone(),
                             backpressure_streak: BackpressureStreak::default(),
@@ -6881,7 +6886,7 @@ impl RebalancingService {
             Err(poison) => poison.into_inner(),
         };
         match guard.get(symbol) {
-            Some(equity::GuardState::HeldForRecovery) => false,
+            Some(equity::GuardState::HeldForRecovery { .. }) => false,
             Some(equity::GuardState::ActiveTransfer { .. }) | None => {
                 guard.remove(symbol);
                 true
@@ -6890,10 +6895,13 @@ impl RebalancingService {
     }
 
     /// Marks the slot as `ActiveTransfer` (startup recovery and tracking-rebuild
-    /// paths that re-establish a live transfer's guard on restart).
+    /// paths that re-establish a live transfer's guard on restart). With the
+    /// generation counter exhausted, the slot is instead held for `chain`'s
+    /// recovery, the chain the transfer runs on.
     fn mark_equity_active_transfer(
         &self,
         symbol: &Symbol,
+        chain: Chain,
         next_generation: impl FnOnce() -> Option<equity::GuardGeneration>,
     ) {
         let mut guard = match self.equity_in_progress.write() {
@@ -6904,10 +6912,14 @@ impl RebalancingService {
             error!(
                 target: "rebalance",
                 %symbol,
+                %chain,
                 "Equity guard generation counter exhausted during startup recovery; \
                  holding the symbol for operator recovery"
             );
-            guard.insert(symbol.clone(), equity::GuardState::HeldForRecovery);
+            guard.insert(
+                symbol.clone(),
+                equity::GuardState::HeldForRecovery { chain },
+            );
             return;
         };
         guard.insert(
@@ -6921,13 +6933,16 @@ impl RebalancingService {
     /// Used during startup reconstruction for post-receipt mint states when
     /// recovery is enabled: instead of `ActiveTransfer` (which would block
     /// the recovery job), we set `HeldForRecovery` so `claim_guard_for_recovery_or_orphan`
-    /// can claim the slot and resume.
-    fn mark_equity_held_for_recovery(&self, symbol: &Symbol) {
+    /// can claim the slot and resume on `chain`, the chain holding the tokens.
+    fn mark_equity_held_for_recovery(&self, symbol: &Symbol, chain: Chain) {
         let mut guard = match self.equity_in_progress.write() {
             Ok(guard) => guard,
             Err(poison) => poison.into_inner(),
         };
-        guard.insert(symbol.clone(), equity::GuardState::HeldForRecovery);
+        guard.insert(
+            symbol.clone(),
+            equity::GuardState::HeldForRecovery { chain },
+        );
     }
 
     /// Releases the in-progress guard and tracking for a mint whose recovery
@@ -7626,9 +7641,11 @@ impl RebalancingService {
                         .config
                         .wrapped_equity_recovery_enabled(primary_chain, symbol)
                 {
-                    self.mark_equity_held_for_recovery(symbol);
+                    self.mark_equity_held_for_recovery(symbol, entity.chain());
                 } else {
-                    self.mark_equity_active_transfer(symbol, || equity::GUARD_GENERATION.next());
+                    self.mark_equity_active_transfer(symbol, entity.chain(), || {
+                        equity::GUARD_GENERATION.next()
+                    });
                 }
 
                 let mut inventory = self.inventory.write().await;
@@ -7784,9 +7801,11 @@ impl RebalancingService {
             let recovery_guard = if reuses_self_owned_guard {
                 None
             } else {
-                let Some(guard) =
-                    claim_guard_for_recovery_or_orphan(&self.equity_in_progress, symbol)
-                else {
+                let Some(guard) = claim_guard_for_recovery_or_orphan(
+                    &self.equity_in_progress,
+                    symbol,
+                    entity.chain(),
+                ) else {
                     warn!(
                         target: "rebalance",
                         id = %id,
@@ -7973,9 +7992,11 @@ impl RebalancingService {
             recovery_guard = if reuses_self_owned_guard {
                 None
             } else {
-                let Some(guard) =
-                    claim_guard_for_recovery_or_orphan(&self.equity_in_progress, symbol)
-                else {
+                let Some(guard) = claim_guard_for_recovery_or_orphan(
+                    &self.equity_in_progress,
+                    symbol,
+                    entity.chain(),
+                ) else {
                     warn!(
                         target: "rebalance",
                         id = %id,
@@ -8226,7 +8247,9 @@ impl RebalancingService {
                         last_progress_at,
                     },
                 );
-                self.mark_equity_active_transfer(symbol, || equity::GUARD_GENERATION.next());
+                self.mark_equity_active_transfer(symbol, entity.chain(), || {
+                    equity::GUARD_GENERATION.next()
+                });
 
                 let mut inventory = self.inventory.write().await;
                 let updated = inventory.clone().update_equity_at(
@@ -8868,12 +8891,15 @@ mod tests {
         let trigger = make_trigger().await;
         let symbol = Symbol::new("AAPL").unwrap();
 
-        trigger.mark_equity_active_transfer(&symbol, || None);
+        trigger.mark_equity_active_transfer(&symbol, Chain::Robinhood, || None);
 
-        assert!(matches!(
+        assert_eq!(
             trigger.equity_in_progress.read().unwrap().get(&symbol),
-            Some(equity::GuardState::HeldForRecovery)
-        ));
+            Some(&equity::GuardState::HeldForRecovery {
+                chain: Chain::Robinhood
+            }),
+            "the operator hold must name the transfer's chain so its recovery can claim it"
+        );
         assert!(!trigger.clear_equity_in_progress_unless_held_for_recovery(&symbol));
     }
 
@@ -9390,7 +9416,7 @@ mod tests {
                 accepted_at: now,
                 received_at: now,
             },
-            equity::GuardState::HeldForRecovery,
+            equity::GuardState::HeldForRecovery { chain: Chain::Base },
             "TokensReceived + recovery enabled must reconstruct as HeldForRecovery",
         )
         .await;
@@ -9414,7 +9440,7 @@ mod tests {
                 received_at: now,
                 wrap_tx_hash: TxHash::ZERO,
             },
-            equity::GuardState::HeldForRecovery,
+            equity::GuardState::HeldForRecovery { chain: Chain::Base },
             "WrapSubmitted + recovery enabled must reconstruct as HeldForRecovery",
         )
         .await;
@@ -9815,7 +9841,8 @@ mod tests {
             )
             .unwrap()
             .set_active_redemption(symbol.clone(), Chain::Base, id.clone());
-        trigger.mark_equity_active_transfer(&symbol, || equity::GUARD_GENERATION.next());
+        trigger
+            .mark_equity_active_transfer(&symbol, Chain::Base, || equity::GUARD_GENERATION.next());
         trigger.redemption_tracking.write().await.insert(
             id.clone(),
             RedemptionTracking {
@@ -9906,7 +9933,8 @@ mod tests {
             )
             .unwrap()
             .set_active_mint(symbol.clone(), Chain::Base, mint_id.clone());
-        trigger.mark_equity_active_transfer(&symbol, || equity::GUARD_GENERATION.next());
+        trigger
+            .mark_equity_active_transfer(&symbol, Chain::Base, || equity::GUARD_GENERATION.next());
         trigger.mint_tracking.write().await.insert(
             mint_id.clone(),
             MintTracking {
@@ -10346,7 +10374,8 @@ mod tests {
         *trigger.inventory.write().await = InventoryView::default()
             .with_equity(symbol.clone(), shares(0), shares(100))
             .set_active_mint(symbol.clone(), Chain::Base, recovering.clone());
-        trigger.mark_equity_active_transfer(&symbol, || equity::GUARD_GENERATION.next());
+        trigger
+            .mark_equity_active_transfer(&symbol, Chain::Base, || equity::GUARD_GENERATION.next());
         let guard_before = trigger
             .equity_in_progress
             .read()
@@ -10758,7 +10787,8 @@ mod tests {
                 timed_out_at: tombstone_at,
             },
         );
-        trigger.mark_equity_active_transfer(&symbol, || equity::GUARD_GENERATION.next());
+        trigger
+            .mark_equity_active_transfer(&symbol, Chain::Base, || equity::GUARD_GENERATION.next());
         let guard_before = trigger
             .equity_in_progress
             .read()
@@ -12931,11 +12961,10 @@ mod tests {
         );
 
         // Verify clear works on HeldForRecovery.
-        trigger
-            .equity_in_progress
-            .write()
-            .unwrap()
-            .insert(symbol.clone(), equity::GuardState::HeldForRecovery);
+        trigger.equity_in_progress.write().unwrap().insert(
+            symbol.clone(),
+            equity::GuardState::HeldForRecovery { chain: Chain::Base },
+        );
         trigger.clear_equity_in_progress(&symbol);
         assert!(
             !trigger
@@ -36136,85 +36165,87 @@ mod tests {
     /// `HeldForRecovery`. The recovery job owns those mints and is responsible for
     /// driving them to a terminal state; timing them out would clear the guard and
     /// allow a double-mint while the original tokens are still in the wallet.
+    /// A hold for any chain counts: the symbol has one owner across chains.
     #[tokio::test]
     async fn expire_stuck_mints_skips_held_for_recovery_mints() {
-        let symbol = Symbol::new("AAPL").unwrap();
-        let now = Utc::now();
+        for held_chain in [Chain::Base, Chain::Robinhood] {
+            let symbol = Symbol::new("AAPL").unwrap();
+            let now = Utc::now();
 
-        // Use a very short timeout so the mint would normally be cleaned up.
-        let config = test_config_with_timeout(Duration::from_secs(60));
-        let (event_sender, _) = broadcast::channel::<Statement>(16);
-        let inventory = Arc::new(BroadcastingInventory::new(
-            InventoryView::default(),
-            event_sender,
-        ));
-        let (pool, apalis_pool) = crate::test_utils::setup_test_pools().await;
-        let wrapper = Arc::new(MockWrapper::new());
-        let trigger = Arc::new(RebalancingService::new(
-            config,
-            Arc::new(test_store::<VaultRegistry>(pool, ())),
-            BTreeMap::from([(
-                Chain::Base,
-                VaultRegistryId {
-                    chain: st0x_evm::Chain::Base,
-                    orderbook: TEST_ORDERBOOK,
-                    owner: TEST_ORDER_OWNER,
+            // Use a very short timeout so the mint would normally be cleaned up.
+            let config = test_config_with_timeout(Duration::from_secs(60));
+            let (event_sender, _) = broadcast::channel::<Statement>(16);
+            let inventory = Arc::new(BroadcastingInventory::new(
+                InventoryView::default(),
+                event_sender,
+            ));
+            let (pool, apalis_pool) = crate::test_utils::setup_test_pools().await;
+            let wrapper = Arc::new(MockWrapper::new());
+            let trigger = Arc::new(RebalancingService::new(
+                config,
+                Arc::new(test_store::<VaultRegistry>(pool, ())),
+                BTreeMap::from([(
+                    Chain::Base,
+                    VaultRegistryId {
+                        chain: st0x_evm::Chain::Base,
+                        orderbook: TEST_ORDERBOOK,
+                        owner: TEST_ORDER_OWNER,
+                    },
+                )]),
+                inventory,
+                BTreeMap::from([(Chain::Base, wrapper as Arc<dyn Wrapper>)]),
+                RebalancingSchedulers::new(&apalis_pool),
+                Arc::new(crate::alerts::LogNotifier),
+            ));
+
+            let id = issuer_request_id("held-for-recovery-timeout");
+
+            // Seed a mint tracking entry at a post-receipt stage with a stale
+            // last_progress_at so the timeout sweep would normally pick it up.
+            trigger.mint_tracking.write().await.insert(
+                id.clone(),
+                MintTracking {
+                    chain: Chain::Base,
+                    symbol: symbol.clone(),
+                    quantity: shares(10),
+                    tokenization_request_id: None,
+                    stage: MintTrackingStage::TokensReceived,
+                    last_progress_at: now - ChronoDuration::hours(2),
                 },
-            )]),
-            inventory,
-            BTreeMap::from([(Chain::Base, wrapper as Arc<dyn Wrapper>)]),
-            RebalancingSchedulers::new(&apalis_pool),
-            Arc::new(crate::alerts::LogNotifier),
-        ));
+            );
 
-        let id = issuer_request_id("held-for-recovery-timeout");
+            // Set the guard to HeldForRecovery for this symbol (simulating the
+            // PostReceipt handoff from the transfer job).
+            trigger.equity_in_progress.write().unwrap().insert(
+                symbol.clone(),
+                equity::GuardState::HeldForRecovery { chain: held_chain },
+            );
 
-        // Seed a mint tracking entry at a post-receipt stage with a stale
-        // last_progress_at so the timeout sweep would normally pick it up.
-        trigger.mint_tracking.write().await.insert(
-            id.clone(),
-            MintTracking {
-                chain: Chain::Base,
-                symbol: symbol.clone(),
-                quantity: shares(10),
-                tokenization_request_id: None,
-                stage: MintTrackingStage::TokensReceived,
-                last_progress_at: now - ChronoDuration::hours(2),
-            },
-        );
-
-        // Set the guard to HeldForRecovery for this symbol (simulating the
-        // PostReceipt handoff from the transfer job).
-        trigger
-            .equity_in_progress
-            .write()
-            .unwrap()
-            .insert(symbol.clone(), equity::GuardState::HeldForRecovery);
-
-        // Run expire_stuck_mints with a far-future now so the mint is well past
-        // the timeout threshold.
-        trigger
-            .expire_stuck_mints(now + ChronoDuration::hours(24))
-            .await
-            .unwrap();
-
-        // The mint tracking entry must NOT have been removed.
-        assert!(
-            trigger.mint_tracking.read().await.contains_key(&id),
-            "expire_stuck_mints must not clean up a HeldForRecovery mint"
-        );
-
-        // The guard must still be HeldForRecovery.
-        assert_eq!(
+            // Run expire_stuck_mints with a far-future now so the mint is well past
+            // the timeout threshold.
             trigger
-                .equity_in_progress
-                .read()
-                .unwrap()
-                .get(&symbol)
-                .cloned(),
-            Some(equity::GuardState::HeldForRecovery),
-            "expire_stuck_mints must not clear a HeldForRecovery guard"
-        );
+                .expire_stuck_mints(now + ChronoDuration::hours(24))
+                .await
+                .unwrap();
+
+            // The mint tracking entry must NOT have been removed.
+            assert!(
+                trigger.mint_tracking.read().await.contains_key(&id),
+                "expire_stuck_mints must not clean up a HeldForRecovery mint"
+            );
+
+            // The guard must still be HeldForRecovery.
+            assert_eq!(
+                trigger
+                    .equity_in_progress
+                    .read()
+                    .unwrap()
+                    .get(&symbol)
+                    .cloned(),
+                Some(equity::GuardState::HeldForRecovery { chain: held_chain }),
+                "expire_stuck_mints must not clear a HeldForRecovery guard"
+            );
+        }
     }
 
     #[tokio::test]
@@ -36411,18 +36442,17 @@ mod tests {
 
         // HeldForRecovery: recovery owns the slot -- must be left untouched and
         // signal the caller (returns false) to skip the failure event.
-        trigger
-            .equity_in_progress
-            .write()
-            .unwrap()
-            .insert(symbol.clone(), equity::GuardState::HeldForRecovery);
+        trigger.equity_in_progress.write().unwrap().insert(
+            symbol.clone(),
+            equity::GuardState::HeldForRecovery { chain: Chain::Base },
+        );
         assert!(
             !trigger.clear_equity_in_progress_unless_held_for_recovery(&symbol),
             "a HeldForRecovery slot must not be cleared by the timeout path",
         );
         assert_eq!(
             trigger.equity_in_progress.read().unwrap().get(&symbol),
-            Some(&equity::GuardState::HeldForRecovery),
+            Some(&equity::GuardState::HeldForRecovery { chain: Chain::Base }),
             "the HeldForRecovery guard must remain after a refused clear",
         );
 

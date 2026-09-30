@@ -157,14 +157,18 @@ use crate::trading::onchain::skipped_fill::{
 use crate::trading::onchain::trade_accountant::{
     DexTradeAccountingJobQueue, NormalizedFillEconomicsError, TradeAccountingError,
 };
-use crate::unwrapped_equity_recovery::{UnwrappedEquityRecovery, UnwrappedEquityRecoveryServices};
+use crate::unwrapped_equity_recovery::{
+    UnwrappedEquityRecovery, UnwrappedEquityRecoveryId, UnwrappedEquityRecoveryServices,
+};
 use crate::usdc_rebalance::UsdcRebalance;
 use crate::vault_lookup::{VaultLookup, VaultRegistryLookup};
 use crate::vault_registry::{
     SeedVaultRegistry, SeedVaultRegistryCtx, SeedVaultRegistryJobQueue, VaultRegistry,
     VaultRegistryCommand, VaultRegistryId,
 };
-use crate::wrapped_equity_recovery::{WrappedEquityRecovery, WrappedEquityRecoveryServices};
+use crate::wrapped_equity_recovery::{
+    WrappedEquityRecovery, WrappedEquityRecoveryId, WrappedEquityRecoveryServices,
+};
 
 pub(crate) use builder::CqrsFrameworks;
 use manifest::{BuiltFrameworks, QueryManifest};
@@ -3527,13 +3531,6 @@ fn spawn_rebalancing_infrastructure<Signer: Wallet + Clone>(
             bot_gas_enqueuer: bot_gas_enqueuer.clone(),
         };
 
-        // The equity recovery aggregates run where the orphaned balance sits:
-        // the primary chain, until chain selection moves into the global
-        // rebalancer. They take that chain's entry rather than loose handles,
-        // so their registry, orderbook, wrapper and wallet are the same ones
-        // the saga uses there.
-        let primary_equity_services = equity_transfer_services.for_chain(primary_chain)?.clone();
-
         let rebalancing_service =
             build_rebalancing_service(&rebalancing_ctx, &deps, registry_ids, wrappers.clone());
         let usdc_driver_gate = rebalancing_service.usdc_driver_gate();
@@ -3585,8 +3582,7 @@ fn spawn_rebalancing_infrastructure<Signer: Wallet + Clone>(
         let (wrapped_equity_recovery_store, unwrapped_equity_recovery_store) =
             build_equity_recovery_stores(
                 &deps.pool,
-                primary_chain,
-                primary_equity_services,
+                equity_transfer_services.clone(),
                 recovery_transfer.clone(),
                 bot_gas_enqueuer.clone(),
             )
@@ -3602,6 +3598,22 @@ fn spawn_rebalancing_infrastructure<Signer: Wallet + Clone>(
             built.redemption.clone(),
             &equity_transfer_services,
             &mut resume_tokenization_queue,
+        )
+        .await?;
+
+        refuse_chainless_recoveries_on_non_base_primary(
+            &deps.pool,
+            &deps.apalis_pool,
+            deps.ctx.chains.primary().chain,
+        )
+        .await?;
+
+        refuse_recoveries_stranded_by_chain_services(
+            &deps.pool,
+            &wrapped_equity_recovery_store,
+            &unwrapped_equity_recovery_store,
+            &equity_transfer_services,
+            &rebalancing_service.equity_in_progress,
         )
         .await?;
 
@@ -3766,13 +3778,13 @@ async fn catch_up_stage_timing_projections(
 
 /// Builds the wrapped and unwrapped equity-recovery aggregate stores.
 ///
-/// Both drive the same chain entry -- its registry, orderbook, wrapper and
-/// wallet -- and the same recovery `transfer`. Kept together because they are
-/// the recovery counterpart built from the same `recovery_transfer`.
+/// Both carry every chain's entry -- its registry, orderbook, wrapper and
+/// wallet -- and each recovery drives the entry of the chain it records.
+/// Kept together because they are the recovery counterpart built from the
+/// same `recovery_transfer`.
 async fn build_equity_recovery_stores(
     pool: &SqlitePool,
-    chain: Chain,
-    chain_services: ChainEquityServices,
+    equity: EquityTransferServices,
     transfer: Arc<CrossVenueEquityTransfer>,
     bot_gas_enqueuer: BotGasReceiptCostEnqueuer,
 ) -> anyhow::Result<(
@@ -3781,8 +3793,7 @@ async fn build_equity_recovery_stores(
 )> {
     let wrapped_store = StoreBuilder::<WrappedEquityRecovery>::new(pool.clone())
         .build(WrappedEquityRecoveryServices {
-            chain,
-            chain_services: chain_services.clone(),
+            equity: equity.clone(),
             transfer: transfer.clone(),
             bot_gas_enqueuer: bot_gas_enqueuer.clone(),
         })
@@ -3790,8 +3801,7 @@ async fn build_equity_recovery_stores(
 
     let unwrapped_store = StoreBuilder::<UnwrappedEquityRecovery>::new(pool.clone())
         .build(UnwrappedEquityRecoveryServices {
-            chain,
-            chain_services,
+            equity,
             transfer,
             bot_gas_enqueuer,
         })
@@ -3848,6 +3858,239 @@ struct TransferStrandedByChainServices {
     chain: Chain,
     transfer: ResumeTokenizationTarget,
     symbol: Symbol,
+}
+
+/// An open equity-wallet recovery, or a symbol held for one, on a chain this
+/// configuration builds no equity services for. The recovery would wait
+/// forever for services that never come, holding the symbol, while the
+/// tokens sit in that chain's wallet.
+#[derive(Debug, thiserror::Error)]
+enum RecoveryStrandedByChainServices {
+    #[error(
+        "the open {recovery} ({symbol}) is recorded on {chain}, which rebalances no equity \
+         under this configuration and so gets no equity services: its tokens could never be \
+         recovered. Set rebalancing for one of {chain}'s equities to \"paused\" (or \
+         \"enabled\") until the recovery completes"
+    )]
+    Recovery {
+        chain: Chain,
+        recovery: StrandedRecovery,
+        symbol: Symbol,
+    },
+    #[error(
+        "{symbol} is held for a recovery on {chain}, which rebalances no equity under this \
+         configuration and so gets no equity services: the recovery could never run. Set \
+         rebalancing for one of {chain}'s equities to \"paused\" (or \"enabled\") until the \
+         recovery completes"
+    )]
+    Hold { chain: Chain, symbol: Symbol },
+}
+
+#[derive(Debug)]
+enum StrandedRecovery {
+    Wrapped(WrappedEquityRecoveryId),
+    Unwrapped(UnwrappedEquityRecoveryId),
+}
+
+impl std::fmt::Display for StrandedRecovery {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Wrapped(id) => write!(formatter, "wrapped equity recovery {id}"),
+            Self::Unwrapped(id) => write!(formatter, "unwrapped equity recovery {id}"),
+        }
+    }
+}
+
+/// Refuses startup while an open equity-wallet recovery, or a symbol the
+/// startup restore held for recovery, names a chain with no equity services.
+/// The recovery jobs would otherwise reschedule forever against a chain that
+/// is not wired, and the operator would learn of it only from alerts.
+async fn refuse_recoveries_stranded_by_chain_services(
+    pool: &SqlitePool,
+    wrapped_store: &Store<WrappedEquityRecovery>,
+    unwrapped_store: &Store<UnwrappedEquityRecovery>,
+    equity_services: &EquityTransferServices,
+    equity_in_progress: &RwLock<HashMap<Symbol, GuardState>>,
+) -> anyhow::Result<()> {
+    for id in crate::wrapped_equity_recovery::open_recovery_ids(pool).await? {
+        let Some(recovery) = wrapped_store.load(&id).await? else {
+            return Err(anyhow::anyhow!(
+                "Open wrapped equity recovery {id} missing from store"
+            ));
+        };
+
+        if !equity_services.chains.contains_key(&recovery.chain()) {
+            return Err(RecoveryStrandedByChainServices::Recovery {
+                chain: recovery.chain(),
+                recovery: StrandedRecovery::Wrapped(id),
+                symbol: recovery.symbol().clone(),
+            }
+            .into());
+        }
+    }
+
+    for id in crate::unwrapped_equity_recovery::open_recovery_ids(pool).await? {
+        let Some(recovery) = unwrapped_store.load(&id).await? else {
+            return Err(anyhow::anyhow!(
+                "Open unwrapped equity recovery {id} missing from store"
+            ));
+        };
+
+        if !equity_services.chains.contains_key(&recovery.chain()) {
+            return Err(RecoveryStrandedByChainServices::Recovery {
+                chain: recovery.chain(),
+                recovery: StrandedRecovery::Unwrapped(id),
+                symbol: recovery.symbol().clone(),
+            }
+            .into());
+        }
+    }
+
+    let held = equity_in_progress
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter()
+        .find_map(|(symbol, state)| match state {
+            GuardState::HeldForRecovery { chain }
+                if !equity_services.chains.contains_key(chain) =>
+            {
+                Some((*chain, symbol.clone()))
+            }
+            GuardState::HeldForRecovery { .. } | GuardState::ActiveTransfer { .. } => None,
+        });
+
+    if let Some((chain, symbol)) = held {
+        return Err(RecoveryStrandedByChainServices::Hold { chain, symbol }.into());
+    }
+
+    Ok(())
+}
+
+/// An open equity-wallet recovery, or a queued recovery job, persisted before
+/// recoveries named their chain, on a deployment whose primary chain is not
+/// Base. Chainless recovery data replays as Base (`legacy_chain`), but those
+/// recoveries ran on the configured primary, so replaying it here would act
+/// on the wrong chain's wallet.
+#[derive(Debug, thiserror::Error)]
+enum ChainlessRecoveryOnNonBasePrimary {
+    #[error(
+        "the open {recovery} was recorded before recoveries named their chain and replays \
+         as base, but the primary chain is {primary}: finish or fail it with a binary that \
+         predates per-chain recovery, or switch the primary back to base, before upgrading"
+    )]
+    Recovery {
+        primary: Chain,
+        recovery: StrandedRecovery,
+    },
+    #[error(
+        "the {status} {job_type} job {job_id} was queued before recovery jobs named their \
+         chain and runs as base, but the primary chain is {primary}: let it finish with a \
+         binary that predates per-chain recovery, or switch the primary back to base, before \
+         upgrading"
+    )]
+    Job {
+        primary: Chain,
+        job_type: &'static str,
+        job_id: String,
+        status: String,
+    },
+}
+
+/// Refuses startup when the primary chain is not Base and a recovery or
+/// recovery job persisted without a chain is still open. Terminal history is
+/// not checked: it never acts again, so it cannot block a later primary switch.
+async fn refuse_chainless_recoveries_on_non_base_primary(
+    pool: &SqlitePool,
+    apalis_pool: &apalis_sqlite::SqlitePool,
+    primary: Chain,
+) -> anyhow::Result<()> {
+    if primary == Chain::Base {
+        return Ok(());
+    }
+
+    let open_wrapped = crate::wrapped_equity_recovery::open_recovery_ids(pool).await?;
+    let open_unwrapped = crate::unwrapped_equity_recovery::open_recovery_ids(pool).await?;
+    let chainless = chainless_detected_recovery_ids(pool).await?;
+
+    if let Some(id) = open_wrapped
+        .into_iter()
+        .find(|id| chainless.contains(&("WrappedEquityRecovery", id.to_string())))
+    {
+        return Err(ChainlessRecoveryOnNonBasePrimary::Recovery {
+            primary,
+            recovery: StrandedRecovery::Wrapped(id),
+        }
+        .into());
+    }
+
+    if let Some(id) = open_unwrapped
+        .into_iter()
+        .find(|id| chainless.contains(&("UnwrappedEquityRecovery", id.to_string())))
+    {
+        return Err(ChainlessRecoveryOnNonBasePrimary::Recovery {
+            primary,
+            recovery: StrandedRecovery::Unwrapped(id),
+        }
+        .into());
+    }
+
+    for job_type in [
+        std::any::type_name::<crate::wrapped_equity_recovery::WrappedEquityRecoveryJob>(),
+        std::any::type_name::<crate::unwrapped_equity_recovery::UnwrappedEquityRecoveryJob>(),
+    ] {
+        let row: Option<(String, String)> = sqlx_apalis::query_as(
+            "SELECT id, status FROM Jobs \
+             WHERE job_type = ? \
+             AND (status IN ('Pending', 'Queued', 'Running') \
+             OR (status = 'Failed' AND attempts < max_attempts)) \
+             AND json_extract(CAST(job AS TEXT), '$.chain') IS NULL \
+             ORDER BY id LIMIT 1",
+        )
+        .bind(job_type)
+        .fetch_optional(apalis_pool)
+        .await?;
+
+        if let Some((job_id, status)) = row {
+            return Err(ChainlessRecoveryOnNonBasePrimary::Job {
+                primary,
+                job_type,
+                job_id,
+                status,
+            }
+            .into());
+        }
+    }
+
+    Ok(())
+}
+
+/// `(aggregate_type, aggregate_id)` of every recovery whose `Detected` event
+/// has no `chain` key.
+async fn chainless_detected_recovery_ids(
+    pool: &SqlitePool,
+) -> Result<HashSet<(&'static str, String)>, sqlx::Error> {
+    let rows: Vec<(String, String)> = sqlx::query_as(
+        "SELECT aggregate_type, aggregate_id FROM events \
+         WHERE event_type IN ( \
+             'WrappedEquityRecoveryEvent::Detected', \
+             'UnwrappedEquityRecoveryEvent::Detected' \
+         ) \
+         AND json_extract(payload, '$.Detected.chain') IS NULL",
+    )
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows
+        .into_iter()
+        .filter_map(|(aggregate_type, aggregate_id)| {
+            let aggregate_type = match aggregate_type.as_str() {
+                "WrappedEquityRecovery" => "WrappedEquityRecovery",
+                "UnwrappedEquityRecovery" => "UnwrappedEquityRecovery",
+                _ => return None,
+            };
+            Some((aggregate_type, aggregate_id))
+        })
+        .collect())
 }
 
 /// Restores a submitted withdrawal's nonce ownership, retrying a transient
@@ -4626,9 +4869,11 @@ fn unique_transfer_reservations(
 
 /// Returns `true` when `mint` is a pre-wrap post-receipt state
 /// (`TokensReceived` or `WrapSubmitted`) AND its symbol's guard is
-/// `HeldForRecovery`. These mints are excluded from direct `resume_mints`
-/// because `UnwrappedEquityRecovery` owns the slot and will re-wrap and
-/// deposit the tokens; calling `resume_mint` concurrently would race.
+/// `HeldForRecovery` for the mint's chain. These mints are excluded from
+/// direct `resume_mints` because `UnwrappedEquityRecovery` owns the slot and
+/// will re-wrap and deposit the tokens; calling `resume_mint` concurrently
+/// would race. A hold for another chain belongs to that chain's recovery,
+/// which cannot reach this mint's tokens.
 fn is_pre_wrap_held_for_recovery(
     mint: &TokenizedEquityMint,
     equity_in_progress: &RwLock<HashMap<Symbol, GuardState>>,
@@ -4641,7 +4886,7 @@ fn is_pre_wrap_held_for_recovery(
             Err(poison) => poison.into_inner(),
         };
         match guard.get(symbol) {
-            Some(GuardState::HeldForRecovery) => true,
+            Some(GuardState::HeldForRecovery { chain }) => *chain == mint.chain(),
             Some(GuardState::ActiveTransfer { .. }) | None => false,
         }
     } else {
@@ -8632,6 +8877,222 @@ mod tests {
         ));
     }
 
+    async fn insert_recovery_event(
+        pool: &SqlitePool,
+        aggregate_type: &str,
+        aggregate_id: &str,
+        sequence: i64,
+        event_type: &str,
+        payload: &str,
+    ) {
+        sqlx::query(
+            "INSERT INTO events (aggregate_type, aggregate_id, sequence, event_type, \
+             event_version, payload, metadata) VALUES (?1, ?2, ?3, ?4, '1.0', ?5, '{}')",
+        )
+        .bind(aggregate_type)
+        .bind(aggregate_id)
+        .bind(sequence)
+        .bind(event_type)
+        .bind(payload)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    async fn insert_recovery_job(
+        apalis_pool: &apalis_sqlite::SqlitePool,
+        id: &str,
+        job_type: &str,
+        status: Status,
+        job: &str,
+    ) {
+        sqlx_apalis::query(
+            "INSERT INTO Jobs \
+             (job, id, job_type, status, attempts, max_attempts, run_at, priority) \
+             VALUES (?, ?, ?, ?, 0, 25, 0, 0)",
+        )
+        .bind(job.as_bytes().to_vec())
+        .bind(id)
+        .bind(job_type)
+        .bind(status.to_string())
+        .execute(apalis_pool)
+        .await
+        .unwrap();
+    }
+
+    const LEGACY_DETECTED: &str =
+        r#"{"Detected":{"symbol":"AAPL","shares":"1","detected_at":"2026-01-01T00:00:00Z"}}"#;
+
+    #[tokio::test]
+    async fn chainless_open_recovery_refuses_startup_only_on_a_non_base_primary() {
+        let (pool, apalis_pool) = crate::test_utils::setup_test_pools().await;
+        let open_legacy = UnwrappedEquityRecoveryId(uuid::Uuid::new_v4());
+        insert_recovery_event(
+            &pool,
+            "UnwrappedEquityRecovery",
+            &open_legacy.to_string(),
+            1,
+            "UnwrappedEquityRecoveryEvent::Detected",
+            LEGACY_DETECTED,
+        )
+        .await;
+
+        refuse_chainless_recoveries_on_non_base_primary(&pool, &apalis_pool, Chain::Base)
+            .await
+            .unwrap();
+
+        let error =
+            refuse_chainless_recoveries_on_non_base_primary(&pool, &apalis_pool, Chain::Ethereum)
+                .await
+                .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "the open unwrapped equity recovery {open_legacy} was recorded before \
+                 recoveries named their chain and replays as base, but the primary chain is \
+                 ethereum: finish or fail it with a binary that predates per-chain recovery, \
+                 or switch the primary back to base, before upgrading"
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn chainless_terminal_or_chained_recoveries_do_not_refuse_a_non_base_primary() {
+        let (pool, apalis_pool) = crate::test_utils::setup_test_pools().await;
+        let terminal_legacy = WrappedEquityRecoveryId(uuid::Uuid::new_v4());
+        insert_recovery_event(
+            &pool,
+            "WrappedEquityRecovery",
+            &terminal_legacy.to_string(),
+            1,
+            "WrappedEquityRecoveryEvent::Detected",
+            LEGACY_DETECTED,
+        )
+        .await;
+        insert_recovery_event(
+            &pool,
+            "WrappedEquityRecovery",
+            &terminal_legacy.to_string(),
+            2,
+            "WrappedEquityRecoveryEvent::RecoveryFailed",
+            r#"{"RecoveryFailed":{"reason":"resolved","failed_at":"2026-01-01T00:00:01Z"}}"#,
+        )
+        .await;
+        insert_recovery_event(
+            &pool,
+            "WrappedEquityRecovery",
+            &WrappedEquityRecoveryId(uuid::Uuid::new_v4()).to_string(),
+            1,
+            "WrappedEquityRecoveryEvent::Detected",
+            r#"{"Detected":{"chain":"ethereum","symbol":"AAPL","shares":"1","detected_at":"2026-01-01T00:00:00Z"}}"#,
+        )
+        .await;
+
+        let wrapped_job_type =
+            std::any::type_name::<crate::wrapped_equity_recovery::WrappedEquityRecoveryJob>();
+        let legacy_job = format!(
+            r#"{{"symbol":"AAPL","recovery_id":"{}"}}"#,
+            uuid::Uuid::new_v4()
+        );
+        insert_recovery_job(
+            &apalis_pool,
+            "done-legacy",
+            wrapped_job_type,
+            Status::Done,
+            &legacy_job,
+        )
+        .await;
+        insert_recovery_job(
+            &apalis_pool,
+            "pending-chained",
+            wrapped_job_type,
+            Status::Pending,
+            &format!(
+                r#"{{"chain":"ethereum","symbol":"AAPL","recovery_id":"{}"}}"#,
+                uuid::Uuid::new_v4()
+            ),
+        )
+        .await;
+
+        refuse_chainless_recoveries_on_non_base_primary(&pool, &apalis_pool, Chain::Ethereum)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn chainless_pending_recovery_job_refuses_a_non_base_primary() {
+        let (pool, apalis_pool) = crate::test_utils::setup_test_pools().await;
+        let job_type =
+            std::any::type_name::<crate::unwrapped_equity_recovery::UnwrappedEquityRecoveryJob>();
+        insert_recovery_job(
+            &apalis_pool,
+            "pending-legacy",
+            job_type,
+            Status::Pending,
+            &format!(
+                r#"{{"symbol":"AAPL","recovery_id":"{}"}}"#,
+                uuid::Uuid::new_v4()
+            ),
+        )
+        .await;
+
+        refuse_chainless_recoveries_on_non_base_primary(&pool, &apalis_pool, Chain::Base)
+            .await
+            .unwrap();
+
+        let error =
+            refuse_chainless_recoveries_on_non_base_primary(&pool, &apalis_pool, Chain::Ethereum)
+                .await
+                .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "the Pending {job_type} job pending-legacy was queued before recovery jobs \
+                 named their chain and runs as base, but the primary chain is ethereum: let it \
+                 finish with a binary that predates per-chain recovery, or switch the primary \
+                 back to base, before upgrading"
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn chainless_failed_recovery_job_refuses_until_retries_are_exhausted() {
+        let (pool, apalis_pool) = crate::test_utils::setup_test_pools().await;
+        let job_type =
+            std::any::type_name::<crate::wrapped_equity_recovery::WrappedEquityRecoveryJob>();
+        insert_recovery_job(
+            &apalis_pool,
+            "failed-legacy",
+            job_type,
+            Status::Failed,
+            &format!(
+                r#"{{"symbol":"AAPL","recovery_id":"{}"}}"#,
+                uuid::Uuid::new_v4()
+            ),
+        )
+        .await;
+        sqlx_apalis::query(
+            "UPDATE Jobs SET attempts = max_attempts - 1 WHERE id = 'failed-legacy'",
+        )
+        .execute(&apalis_pool)
+        .await
+        .unwrap();
+        let error =
+            refuse_chainless_recoveries_on_non_base_primary(&pool, &apalis_pool, Chain::Ethereum)
+                .await
+                .unwrap_err();
+        assert!(error.to_string().contains("the Failed"));
+        assert!(error.to_string().contains("failed-legacy"));
+
+        sqlx_apalis::query("UPDATE Jobs SET attempts = max_attempts WHERE id = 'failed-legacy'")
+            .execute(&apalis_pool)
+            .await
+            .unwrap();
+        refuse_chainless_recoveries_on_non_base_primary(&pool, &apalis_pool, Chain::Ethereum)
+            .await
+            .unwrap();
+    }
+
     async fn insert_finished_job(apalis_pool: &apalis_sqlite::SqlitePool, id: &str) {
         sqlx_apalis::query(
             "INSERT INTO Jobs \
@@ -8678,6 +9139,7 @@ mod tests {
 
         queue
             .push(UnwrappedEquityRecoveryJob {
+                chain: Chain::Base,
                 symbol: Symbol::new("AAPL").unwrap(),
                 recovery_id: UnwrappedEquityRecoveryId(uuid::Uuid::new_v4()),
                 backpressure_streak: BackpressureStreak::default(),
@@ -8714,6 +9176,7 @@ mod tests {
 
         queue
             .push(WrappedEquityRecoveryJob {
+                chain: Chain::Base,
                 symbol: Symbol::new("AAPL").unwrap(),
                 recovery_id: WrappedEquityRecoveryId(uuid::Uuid::new_v4()),
                 backpressure_streak: BackpressureStreak::default(),
@@ -10149,7 +10612,7 @@ mod tests {
         }];
         let guards = RwLock::new(HashMap::from([(
             symbol.clone(),
-            GuardState::HeldForRecovery,
+            GuardState::HeldForRecovery { chain: Chain::Base },
         )]));
 
         restore_live_transfer_job_guards(
@@ -10176,10 +10639,10 @@ mod tests {
             )
             .await
             .unwrap();
-        guards
-            .write()
-            .unwrap()
-            .insert(symbol.clone(), GuardState::HeldForRecovery);
+        guards.write().unwrap().insert(
+            symbol.clone(),
+            GuardState::HeldForRecovery { chain: Chain::Base },
+        );
 
         restore_live_transfer_job_guards(
             &guards,
@@ -10239,7 +10702,7 @@ mod tests {
         }];
         let guards = RwLock::new(HashMap::from([(
             symbol.clone(),
-            GuardState::HeldForRecovery,
+            GuardState::HeldForRecovery { chain: Chain::Base },
         )]));
 
         let reservations = restore_live_transfer_job_guards(
@@ -10257,7 +10720,10 @@ mod tests {
             Ok(guard) => guard.get(&symbol).cloned(),
             Err(poison) => poison.into_inner().get(&symbol).cloned(),
         };
-        assert_eq!(restored, Some(GuardState::HeldForRecovery));
+        assert_eq!(
+            restored,
+            Some(GuardState::HeldForRecovery { chain: Chain::Base })
+        );
         assert_eq!(
             reservations,
             HashSet::from([(symbol, EquityTransferReservationId::from_uuid(mint_id.0))])
@@ -10830,6 +11296,127 @@ mod tests {
                     == ResumeTokenizationTarget::Redemption(paused_id.clone())
             }),
             "the paused chain's transfer must be queued for resume"
+        );
+    }
+
+    /// An open wallet recovery on a chain that this configuration builds no
+    /// equity services for, or a symbol held for such a recovery, refuses
+    /// startup by name: the recovery could never run, and its tokens would
+    /// sit in that chain's wallet with the symbol held.
+    #[tokio::test]
+    async fn open_recovery_on_a_chain_without_services_refuses_startup() {
+        let fixture = seed_interrupted_aggregates_and_build_service(
+            8,
+            "stranded-recovery-mint",
+            "stranded-recovery-redemption",
+        )
+        .await;
+        let transfer = Arc::new(CrossVenueEquityTransfer::new(
+            fixture.services.clone(),
+            Arc::new(test_store::<TokenizedEquityMint>(
+                fixture.pool.clone(),
+                fixture.services.clone(),
+            )),
+            Arc::new(test_store::<EquityRedemption>(
+                fixture.pool.clone(),
+                fixture.services.clone(),
+            )),
+        ));
+        let mut with_ethereum = fixture.services.clone();
+        let base = with_ethereum.chains[&Chain::Base].clone();
+        with_ethereum.chains.insert(Chain::Ethereum, base);
+        let (wrapped_store, unwrapped_store) = build_equity_recovery_stores(
+            &fixture.pool,
+            fixture.services.clone(),
+            transfer.clone(),
+            BotGasReceiptCostEnqueuer::Disabled,
+        )
+        .await
+        .unwrap();
+        let equity_in_progress = RwLock::new(HashMap::new());
+
+        refuse_recoveries_stranded_by_chain_services(
+            &fixture.pool,
+            &wrapped_store,
+            &unwrapped_store,
+            &fixture.services,
+            &equity_in_progress,
+        )
+        .await
+        .unwrap();
+
+        // Opened while Ethereum was still wired, then left open.
+        let stranded_id = UnwrappedEquityRecoveryId(uuid::Uuid::new_v4());
+        test_store::<UnwrappedEquityRecovery>(
+            fixture.pool.clone(),
+            UnwrappedEquityRecoveryServices {
+                equity: with_ethereum,
+                transfer,
+                bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
+            },
+        )
+        .send(
+            &stranded_id,
+            crate::unwrapped_equity_recovery::aggregate::UnwrappedEquityRecoveryCommand::Detect {
+                chain: Chain::Ethereum,
+                symbol: Symbol::new("AAPL").unwrap(),
+                shares: FractionalShares::new(float!(2)),
+            },
+        )
+        .await
+        .unwrap();
+
+        let error = refuse_recoveries_stranded_by_chain_services(
+            &fixture.pool,
+            &wrapped_store,
+            &unwrapped_store,
+            &fixture.services,
+            &equity_in_progress,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "the open unwrapped equity recovery {stranded_id} (AAPL) is recorded on \
+                 ethereum, which rebalances no equity under this configuration and so gets no \
+                 equity services: its tokens could never be recovered. Set rebalancing for one \
+                 of ethereum's equities to \"paused\" (or \"enabled\") until the recovery \
+                 completes"
+            )
+        );
+
+        unwrapped_store
+            .send(
+                &stranded_id,
+                crate::unwrapped_equity_recovery::aggregate::UnwrappedEquityRecoveryCommand::FailRecovery {
+                    reason: "resolved by the operator".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+        equity_in_progress.write().unwrap().insert(
+            Symbol::new("TSLA").unwrap(),
+            GuardState::HeldForRecovery {
+                chain: Chain::Ethereum,
+            },
+        );
+
+        let error = refuse_recoveries_stranded_by_chain_services(
+            &fixture.pool,
+            &wrapped_store,
+            &unwrapped_store,
+            &fixture.services,
+            &equity_in_progress,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "TSLA is held for a recovery on ethereum, which rebalances no equity under this \
+             configuration and so gets no equity services: the recovery could never run. Set \
+             rebalancing for one of ethereum's equities to \"paused\" (or \"enabled\") until \
+             the recovery completes"
         );
     }
 
@@ -20030,11 +20617,24 @@ mod tests {
             "WrapSubmitted + ActiveTransfer must NOT be excluded"
         );
 
+        // A hold for another chain belongs to that chain's recovery, which
+        // cannot reach this mint's tokens -- the mint resumes itself.
+        equity_in_progress.write().unwrap().insert(
+            symbol.clone(),
+            GuardState::HeldForRecovery {
+                chain: Chain::Robinhood,
+            },
+        );
+        assert!(
+            !is_pre_wrap_held_for_recovery(&tokens_received, &equity_in_progress),
+            "TokensReceived held for another chain's recovery must NOT be excluded"
+        );
+
         // With HeldForRecovery -- only pre-wrap states are excluded.
         equity_in_progress
             .write()
             .unwrap()
-            .insert(symbol, GuardState::HeldForRecovery);
+            .insert(symbol, GuardState::HeldForRecovery { chain: Chain::Base });
         assert!(
             is_pre_wrap_held_for_recovery(&tokens_received, &equity_in_progress),
             "TokensReceived + HeldForRecovery must be excluded from resume_mints"
