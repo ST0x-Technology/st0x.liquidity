@@ -24,8 +24,7 @@ use rain_math_float::Float;
 use tracing::{debug, info, warn};
 
 use st0x_evm::{
-    Evm, EvmError, IntoErrorRegistry, OpenChainErrorRegistry, PreparedTransaction,
-    SettlementStable, Wallet,
+    Evm, EvmError, IntoErrorRegistry, OpenChainErrorRegistry, PreparedTransaction, Wallet,
 };
 use st0x_execution::FractionalShares;
 use st0x_finance::Usdc;
@@ -87,8 +86,9 @@ const SCAN_RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_millis
 ///
 /// // Submit a USDC deposit to the vault, then confirm it (needs Wallet)
 /// let amount = U256::from(1000) * U256::from(10).pow(U256::from(6)); // 1000 USDC
+/// let stable = Chain::Base.settlement_stable();
 /// let deposit_tx = service
-///     .submit_deposit_usdc(Chain::Base.settlement_stable(), vault_id, amount)
+///     .submit_deposit(stable.address, vault_id, amount, stable.decimals)
 ///     .await?;
 /// service.confirm_tx(deposit_tx).await?;
 /// ```
@@ -284,43 +284,6 @@ impl<W: Wallet> RaindexService<W> {
 
         info!(target: "inventory", %tx_hash, %token, %amount, "deposit4 submitted");
         Ok(tx_hash)
-    }
-
-    /// Submits a deposit of the chain's settlement `stable` to a Rain OrderBook
-    /// vault WITHOUT waiting for confirmation, returning the broadcast tx hash.
-    ///
-    /// Used by the crash-safe deposit path: the hash is persisted as
-    /// `InitiateDeposit` before confirmation, so a crash during the confirmation
-    /// wait resumes from `DepositInitiated` (re-verifying the recorded tx via
-    /// `confirm_tx`) instead of re-submitting a second deposit.
-    pub async fn submit_deposit_usdc(
-        &self,
-        stable: SettlementStable,
-        vault_id: RaindexVaultId,
-        amount: U256,
-    ) -> Result<TxHash, RaindexError> {
-        // `submit_deposit` handles the ERC20 approval before submitting deposit4
-        // (unlike the bare `submit_deposit4_to_vault`), then returns without
-        // confirming.
-        self.submit_deposit(stable.address, vault_id, amount, stable.decimals)
-            .await
-    }
-
-    /// Withdraws the chain's settlement `stable` from a Rain OrderBook vault.
-    ///
-    /// # Parameters
-    ///
-    /// * `stable` - The vault chain's settlement stable (`Chain::settlement_stable`)
-    /// * `vault_id` - Source vault identifier
-    /// * `target_amount` - Target amount to withdraw, in the stable's base units
-    pub async fn withdraw_usdc(
-        &self,
-        stable: SettlementStable,
-        vault_id: RaindexVaultId,
-        target_amount: U256,
-    ) -> Result<TxHash, RaindexError> {
-        self.withdraw(stable.address, vault_id, target_amount, stable.decimals)
-            .await
     }
 }
 

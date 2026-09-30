@@ -300,7 +300,7 @@ impl<EthWallet: Wallet, BaseWallet: Wallet> UsdcBridgeHelper for CctpBridge<EthW
     }
 }
 
-/// Classifies a failed vault `withdraw_usdc`. An atomic
+/// Classifies a failed vault `withdraw`. An atomic
 /// [`RaindexError::InsufficientVaultLiquidity`] revert means the vault could not
 /// cover the request; it withdrew nothing (atomic revert), so retrying only
 /// reverts again until the vault is refunded. It is surfaced as a distinct,
@@ -3637,13 +3637,10 @@ impl<
         // Persisting the hash first lands a crash in `DepositInitiated`, whose
         // resume arm re-verifies the recorded tx via `confirm_tx` instead of
         // re-depositing.
+        let stable = self.corridor.chain().settlement_stable();
         let deposit_tx = match self
             .raindex
-            .submit_deposit_usdc(
-                self.corridor.chain().settlement_stable(),
-                self.vault_id,
-                amount,
-            )
+            .submit_deposit(stable.address, self.vault_id, amount, stable.decimals)
             .await
         {
             Ok(tx) => tx,
@@ -5240,7 +5237,7 @@ impl<
         let stable = self.corridor.chain().settlement_stable();
         let withdraw_tx = match self
             .raindex
-            .withdraw_usdc(stable, self.vault_id, amount_u256)
+            .withdraw(stable.address, self.vault_id, amount_u256, stable.decimals)
             .await
         {
             Ok(tx) => tx,
