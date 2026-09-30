@@ -30,6 +30,7 @@ pub(crate) use resume_job::{
     ResumeTokenizationTarget,
 };
 
+use alloy::eips::eip2718::EIP7702_TX_TYPE_ID;
 use alloy::hex::FromHexError;
 use alloy::primitives::{Address, TxHash, U256};
 use alloy::rpc::types::TransactionReceipt;
@@ -352,7 +353,7 @@ pub async fn verify_withdrawal_superseded(
         nonce: superseding_nonce,
         value,
         has_calldata,
-        is_eip7702,
+        tx_type,
         to_has_code,
         succeeded,
         confirmations,
@@ -383,8 +384,11 @@ pub async fn verify_withdrawal_superseded(
         });
     }
 
-    let plain_cancel =
-        to == Some(bot_wallet) && value.is_zero() && !has_calldata && !is_eip7702 && !to_has_code;
+    let plain_cancel = to == Some(bot_wallet)
+        && value.is_zero()
+        && !has_calldata
+        && tx_type != EIP7702_TX_TYPE_ID
+        && !to_has_code;
     if succeeded && !plain_cancel {
         return Err(WithdrawalNotSuperseded::SupersedingTxNotAPlainCancel {
             superseding,
@@ -6959,7 +6963,7 @@ mod tests {
 #[cfg(test)]
 mod withdrawal_superseded_tests {
     use alloy::consensus::{SignableTransaction as _, TxEip1559, TxEnvelope};
-    use alloy::eips::eip2718::Encodable2718 as _;
+    use alloy::eips::eip2718::{EIP1559_TX_TYPE_ID, EIP7702_TX_TYPE_ID, Encodable2718 as _};
     use alloy::eips::eip2930::AccessList;
     use alloy::primitives::{Address, Bytes, TxHash, TxKind, U256};
     use alloy::signers::SignerSync as _;
@@ -7002,7 +7006,7 @@ mod withdrawal_superseded_tests {
             nonce: NONCE,
             value: U256::ZERO,
             has_calldata: false,
-            is_eip7702: false,
+            tx_type: EIP1559_TX_TYPE_ID,
             to_has_code: false,
             succeeded: true,
             confirmations: REQUIRED,
@@ -7336,7 +7340,7 @@ mod withdrawal_superseded_tests {
             (
                 "EIP-7702 self-transfer",
                 MinedTx {
-                    is_eip7702: true,
+                    tx_type: EIP7702_TX_TYPE_ID,
                     ..cancel
                 },
             ),

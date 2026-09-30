@@ -4204,7 +4204,7 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
 
     use alloy::consensus::{SignableTransaction as _, TxEip1559, TxEnvelope};
-    use alloy::eips::eip2718::Encodable2718 as _;
+    use alloy::eips::eip2718::{EIP1559_TX_TYPE_ID, Encodable2718 as _};
     use alloy::eips::eip2930::AccessList;
     use alloy::primitives::{
         Address, Bytes, IntoLogData, TxHash, TxKind, address, fixed_bytes, uint,
@@ -9984,7 +9984,7 @@ mod tests {
                 nonce: SIGNED_WITHDRAWAL_NONCE,
                 value: U256::ZERO,
                 has_calldata: false,
-                is_eip7702: false,
+                tx_type: EIP1559_TX_TYPE_ID,
                 to_has_code: false,
                 succeeded: true,
                 confirmations: 1,
@@ -10035,7 +10035,7 @@ mod tests {
                 nonce: SIGNED_WITHDRAWAL_NONCE,
                 value: U256::ZERO,
                 has_calldata: true,
-                is_eip7702: false,
+                tx_type: EIP1559_TX_TYPE_ID,
                 to_has_code: true,
                 succeeded: false,
                 confirmations: 1,

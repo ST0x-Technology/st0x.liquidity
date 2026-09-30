@@ -1343,9 +1343,11 @@ impl ReceiptWaitConfig {
     }
 }
 
-/// A mined transaction as the node reports it: who sent it, what it called,
-/// with what value and calldata, at which nonce, whether it succeeded, and how
-/// deep it is (the inclusion block counts as confirmation 1).
+/// A mined transaction as the node reports it.
+///
+/// Who sent it, what it called, with what value and calldata, at which nonce,
+/// whether it succeeded, and how deep it is (the inclusion block counts as
+/// confirmation 1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MinedTx {
     pub from: Address,
@@ -1355,8 +1357,8 @@ pub struct MinedTx {
     pub value: U256,
     /// Whether it carried calldata (initcode, for a contract creation).
     pub has_calldata: bool,
-    /// Whether it is an EIP-7702 transaction, which sets code on accounts.
-    pub is_eip7702: bool,
+    /// The EIP-2718 type byte. `EIP7702_TX_TYPE_ID` sets code on accounts.
+    pub tx_type: u8,
     /// Whether `to` held code as the inclusion block started or as it ended: a
     /// contract, or an account with an EIP-7702 delegation. `false` for a
     /// contract creation.
@@ -1366,10 +1368,13 @@ pub struct MinedTx {
     pub confirmations: u64,
 }
 
-/// Returns `tx_hash` as mined, or `None` while the node shows no receipt or
-/// no transaction for it, or the receipt's block is not the canonical block
-/// at its height. Does not wait. Every failure is a provider RPC read, so it
-/// returns the raw transport error for callers to wrap in their own variant.
+/// Returns `tx_hash` as mined, or `None` while the node shows no canonical
+/// receipt for it.
+///
+/// `None` also covers no transaction for the hash, or a receipt whose block is
+/// not the canonical block at its height. Does not wait. Every failure is a
+/// provider RPC read, so it returns the raw transport error for callers to wrap
+/// in their own variant.
 pub async fn mined_tx(
     provider: &impl Provider,
     tx_hash: TxHash,
@@ -1422,7 +1427,7 @@ pub async fn mined_tx(
         nonce: tx.nonce(),
         value: tx.value(),
         has_calldata: !tx.input().is_empty(),
-        is_eip7702: tx.is_eip7702(),
+        tx_type: tx.ty(),
         to_has_code,
         succeeded: receipt.status(),
         confirmations: head.saturating_sub(tx_block).saturating_add(1),
@@ -1695,7 +1700,7 @@ mod tests {
     #[cfg(any(feature = "turnkey", feature = "local-signer"))]
     use alloy::consensus::{Receipt, ReceiptEnvelope, ReceiptWithBloom};
     use alloy::consensus::{SignableTransaction, TxEip1559};
-    use alloy::eips::eip2718::Encodable2718;
+    use alloy::eips::eip2718::{EIP1559_TX_TYPE_ID, Encodable2718};
     use alloy::eips::eip2930::AccessList;
     use alloy::network::{EthereumWallet, TransactionBuilder};
     use alloy::node_bindings::{Anvil, AnvilInstance};
@@ -2242,7 +2247,7 @@ mod tests {
             nonce: 0,
             value: U256::from(1),
             has_calldata: false,
-            is_eip7702: false,
+            tx_type: EIP1559_TX_TYPE_ID,
             to_has_code: false,
             succeeded: true,
             confirmations: 1,
@@ -2288,7 +2293,7 @@ mod tests {
                 nonce: 0,
                 value: U256::ZERO,
                 has_calldata: true,
-                is_eip7702: false,
+                tx_type: EIP1559_TX_TYPE_ID,
                 to_has_code: false,
                 succeeded: true,
                 confirmations: 1,
@@ -2336,7 +2341,7 @@ mod tests {
                 nonce: 1,
                 value: U256::ZERO,
                 has_calldata: false,
-                is_eip7702: false,
+                tx_type: EIP1559_TX_TYPE_ID,
                 to_has_code: true,
                 succeeded: false,
                 confirmations: 1,
