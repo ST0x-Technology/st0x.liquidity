@@ -18,7 +18,9 @@ use tracing_subscriber::util::SubscriberInitExt;
 
 use st0x_bridge::cctp::CctpAttestationMock;
 use st0x_config::mk_env_filter;
-use st0x_config::{ChainAssets, ChainCashAsset, ChainEquities, ChainEquityAsset, OperationMode};
+use st0x_config::{
+    ChainAssets, ChainCashAsset, ChainEquities, ChainEquityAsset, OperationMode, RebalancingMode,
+};
 use st0x_execution::Symbol;
 use st0x_execution::alpaca_broker_api::{AlpacaBrokerMock, MockPosition};
 use st0x_hedge::mock_api::{AlpacaTokenizationMock, REDEMPTION_WALLET};
@@ -123,7 +125,7 @@ impl<P> TestInfra<P> {
                     tokenized_equity_derivative: *vault_addr,
                     vault_ids: Vec::new(),
                     trading: OperationMode::Enabled,
-                    rebalancing: OperationMode::Disabled,
+                    rebalancing: RebalancingMode::Disabled,
                     wrapped_equity_recovery: OperationMode::Disabled,
                     operational_limit: None,
                     target_share: None,

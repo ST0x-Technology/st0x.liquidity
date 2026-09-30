@@ -46,6 +46,7 @@ use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
 use tracing::{info, warn};
 
+use st0x_config::RebalancingMode;
 use st0x_dto::{EquityMintOperation, EquityMintStatus, TransferOperation};
 use st0x_event_sorcery::{DomainEvent, EventSourced, Table};
 use st0x_evm::Chain;
@@ -105,6 +106,25 @@ pub enum TokenizedEquityMintError {
     /// by DomainError).
     #[error("Mint request failed: {error_message}")]
     RequestFailed { error_message: String },
+    /// The provider lookup found no mint for a `MintRequested` intent, and the
+    /// listing cannot start operations, so the request is not replayed. The
+    /// lookup is inconclusive (the original submit may still land), so the
+    /// mint stays `MintRequested` with its reservation. The operator confirms
+    /// with the issuer that it never received the request, then runs
+    /// `transfer fail --kind mint`, or sets the listing back to enabled to
+    /// replay it.
+    #[error(
+        "No provider mint found for {issuer_request_id} and equity rebalancing is \
+         {mode} for {symbol} on {chain}; not replaying the request. Confirm with \
+         the issuer, then run `transfer fail --kind mint`, or set the listing back \
+         to enabled to replay it"
+    )]
+    ReplayRefused {
+        issuer_request_id: IssuerRequestId,
+        chain: Chain,
+        symbol: Symbol,
+        mode: RebalancingMode,
+    },
     #[error("Provider request type mismatch: expected mint, returned {actual_request_type:?}")]
     ProviderRequestTypeMismatch {
         actual_request_type: Option<TokenizationRequestType>,
@@ -206,6 +226,20 @@ impl PartialEq for TokenizedEquityMintError {
             )
             | (Self::Float(a), Self::Float(b)) => a == b,
             (Self::ChainServicesMissing(a), Self::ChainServicesMissing(b)) => a == b,
+            (
+                Self::ReplayRefused {
+                    issuer_request_id: id_a,
+                    chain: chain_a,
+                    symbol: symbol_a,
+                    mode: mode_a,
+                },
+                Self::ReplayRefused {
+                    issuer_request_id: id_b,
+                    chain: chain_b,
+                    symbol: symbol_b,
+                    mode: mode_b,
+                },
+            ) => id_a == id_b && chain_a == chain_b && symbol_a == symbol_b && mode_a == mode_b,
             (
                 Self::ProviderRequestTypeMismatch {
                     actual_request_type: a,
@@ -2685,6 +2719,26 @@ impl TokenizedEquityMint {
             {
                 Ok(Some(request)) => (Ok(request), false),
                 Ok(None) => {
+                    let chain = self.chain();
+                    let mode = services.rebalancing_mode(chain, symbol);
+                    if !mode.starts_operations() {
+                        warn!(
+                            target: "tokenization",
+                            %issuer_request_id,
+                            %symbol,
+                            %chain,
+                            %mode,
+                            "Provider lookup found no mint and the listing cannot start \
+                             operations; keeping the mint requested without replaying it"
+                        );
+                        return Err(TokenizedEquityMintError::ReplayRefused {
+                            issuer_request_id,
+                            chain,
+                            symbol: symbol.clone(),
+                            mode,
+                        });
+                    }
+
                     warn!(
                         target: "tokenization",
                         %issuer_request_id,
@@ -3159,7 +3213,7 @@ mod tests {
     use std::collections::BTreeMap;
     use std::sync::Arc;
 
-    use st0x_config::ChainEquities;
+    use st0x_config::{ChainEquities, ChainEquityAsset, OperationMode};
     use st0x_event_sorcery::{AggregateError, LifecycleError, TestHarness, TestStore, replay};
     use st0x_float_macro::float;
     use st0x_raindex::RaindexVaultId;
@@ -3228,6 +3282,34 @@ mod tests {
                 ConfiguredMintAuthorizer::Enabled(Arc::new(MockMintAuthorizer));
         }
 
+        services
+    }
+
+    /// Lists AAPL on Base with the given rebalancing mode; the provider
+    /// replay of a requested mint reads it.
+    fn with_aapl_rebalancing(
+        mut services: EquityTransferServices,
+        rebalancing: RebalancingMode,
+    ) -> EquityTransferServices {
+        services
+            .chains
+            .get_mut(&Chain::Base)
+            .unwrap()
+            .equities
+            .symbols
+            .insert(
+                Symbol::new("AAPL").unwrap(),
+                ChainEquityAsset {
+                    tokenized_equity: Address::ZERO,
+                    tokenized_equity_derivative: Address::ZERO,
+                    vault_ids: vec![],
+                    trading: OperationMode::Disabled,
+                    rebalancing,
+                    wrapped_equity_recovery: OperationMode::Disabled,
+                    operational_limit: None,
+                    target_share: None,
+                },
+            );
         services
     }
 
@@ -3695,7 +3777,8 @@ mod tests {
     #[tokio::test]
     async fn legacy_intent_without_identity_remains_recoverable() {
         let tokenizer = Arc::new(MockTokenizer::new());
-        let services = mint_services_sharing(&tokenizer);
+        let services =
+            with_aapl_rebalancing(mint_services_sharing(&tokenizer), RebalancingMode::Enabled);
         let event = serde_json::from_str(&mint_requested_payload("AAPL")).unwrap();
         let state = TokenizedEquityMint::originate(&event).unwrap();
         assert!(matches!(
@@ -3724,6 +3807,50 @@ mod tests {
             issuer_request_id, ..
         } if issuer_request_id == &id)
         );
+    }
+
+    #[tokio::test]
+    async fn requested_intent_is_not_replayed_when_the_listing_cannot_start_operations() {
+        for mode in [RebalancingMode::Paused, RebalancingMode::Disabled] {
+            let tokenizer = Arc::new(MockTokenizer::new());
+            let services = with_aapl_rebalancing(mint_services_sharing(&tokenizer), mode);
+            let id = issuer_request_id("ISS-PAUSED");
+            let state = TestHarness::<TokenizedEquityMint>::with(services.clone())
+                .given_no_previous_events()
+                .when(TokenizedEquityMintCommand::RequestMint {
+                    chain: Chain::Base,
+                    issuer_request_id: id.clone(),
+                    symbol: Symbol::new("AAPL").unwrap(),
+                    quantity: float!(10),
+                    wallet: Address::ZERO,
+                })
+                .await
+                .events();
+            let state = TokenizedEquityMint::originate(&state[0]).unwrap();
+
+            let error = state
+                .transition(
+                    TokenizedEquityMintCommand::ReconcileMintRequest {
+                        issuer_request_id: id.clone(),
+                    },
+                    &services,
+                )
+                .await
+                .unwrap_err();
+
+            assert_eq!(
+                error,
+                TokenizedEquityMintError::ReplayRefused {
+                    issuer_request_id: id.clone(),
+                    chain: Chain::Base,
+                    symbol: Symbol::new("AAPL").unwrap(),
+                    mode,
+                },
+                "an inconclusive lookup on a stopped listing must keep the mint requested"
+            );
+            assert_eq!(tokenizer.mint_lookup_call_count(), 1);
+            assert_eq!(tokenizer.mint_request_call_count(), 0);
+        }
     }
 
     #[tokio::test]
@@ -3868,7 +3995,8 @@ mod tests {
         )
         .unwrap();
         let tokenizer = Arc::new(MockTokenizer::new().with_pending_requests(vec![request]));
-        let services = mint_services_sharing(&tokenizer);
+        let services =
+            with_aapl_rebalancing(mint_services_sharing(&tokenizer), RebalancingMode::Enabled);
         let store = TestStore::<TokenizedEquityMint>::new(services);
 
         store.send(&id, mint_command()).await.unwrap();
@@ -3944,7 +4072,8 @@ mod tests {
     #[tokio::test]
     async fn reconciliation_without_match_replays_idempotent_submission() {
         let tokenizer = Arc::new(MockTokenizer::new());
-        let services = mint_services_sharing(&tokenizer);
+        let services =
+            with_aapl_rebalancing(mint_services_sharing(&tokenizer), RebalancingMode::Enabled);
         let store = TestStore::<TokenizedEquityMint>::new(services);
         let id = issuer_request_id("ISS001");
 

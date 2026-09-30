@@ -300,7 +300,7 @@ mod tests {
     use std::collections::{BTreeMap, HashMap};
     use uuid::Uuid;
 
-    use st0x_config::{AllocationCtx, OperationMode, RebalancingCtx};
+    use st0x_config::{AllocationCtx, OperationMode, RebalancingCtx, RebalancingMode};
     use st0x_event_sorcery::test_store;
     use st0x_evm::local::RawPrivateKeyWallet;
     use st0x_evm::test_chain::evm_mapping_slot;
@@ -337,7 +337,7 @@ mod tests {
                 tokenized_equity_derivative: derivative,
                 vault_ids: Vec::new(),
                 trading: OperationMode::Enabled,
-                rebalancing: OperationMode::Disabled,
+                rebalancing: RebalancingMode::Disabled,
                 wrapped_equity_recovery: OperationMode::Disabled,
                 operational_limit: None,
                 target_share: None,

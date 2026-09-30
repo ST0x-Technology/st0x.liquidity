@@ -151,8 +151,43 @@ transfer stores and workers, and interrupted-transfer recovery — always starts
 
 Operators pause rebalancing with narrow, explicit controls:
 
+- **Per-asset `rebalancing = "paused"`**: the chain keeps everything the listing
+  needs to finish transfers already under way -- its equity services and startup
+  approvals -- and its inventory still counts in the planner's total, but the
+  planner starts no new mint or redemption on it (`paused`). In-flight
+  transfers, their resume jobs and recovery run to completion, and startup with
+  an unfinished transfer on a paused chain succeeds. A mint persisted but never
+  received by the issuer is the exception: the bot does not replay its request
+  on a paused chain, because that would start a new mint. A lookup that finds no
+  mint does not prove the issuer never got it, so the mint stays `MintRequested`
+  with its reservation, the resume job errors until its retries run out and
+  pages, and the operator confirms with the issuer before
+  `transfer fail --kind mint`. Wallet polling and orphan recovery continue where
+  already wired (currently the primary chain); pause does not add secondary
+  recovery coverage. Switching between `enabled` and `paused` needs only a
+  restart. This is the switch to stop a chain's equity operations without
+  stranding anything. Because a paused chain's inventory still counts, the chain
+  must stay polled and readable: a stale or unpolled paused slot declines the
+  whole symbol (`chain_stale`/`chain_unpolled`), and a failed ratio read on it
+  fails that symbol's check. To take a chain with a degraded RPC or indexer out
+  of the total, pause it, wait until its in-flight transfers finish, and then
+  set it to `disabled`. Pausing does not move the chain's equity: the planner
+  skips paused chains and `transfer-equity` refuses a new transfer on them. To
+  move that equity elsewhere first, use the manual vault, unwrap, and redeem
+  commands (`vault-withdraw`, `unwrap-equity`, then `alpaca-redeem` with the
+  unwrapped quantity, see docs/cli-ops.md). The Raindex vault holds the wrapped
+  derivative; redeeming without unwrap sends the wrong token. Publish
+  `rebalancing = "paused"` only after this order: deploy the bot that reads
+  `paused`, merge the `t0/check.jq` validator change, then publish `paused`. On
+  rollback, restore the token value before downgrading the binary. The dashboard
+  currently shows paused and disabled listings with the same red rebalancing
+  indicator; verify the registry mode before you set `disabled`. It displays
+  settings for the primary chain only.
 - **Per-asset `rebalancing = "disabled"`**: removes the asset from the trigger
-  whitelist. New equity rebalancing flows do not start for that asset.
+  whitelist. New equity rebalancing flows do not start for that asset. On a
+  secondary chain where no equity is `enabled` or `paused`, the chain's equity
+  services are not built, so startup refuses an unfinished transfer there; pause
+  first and let the work finish.
 - **Issuance freeze (`Frozen`)**: stops new mints for the asset during
   maintenance or corporate actions. When `freeze_check = "enabled"`, the freeze
   also stops new liquidity-initiated rebalancing flows for the asset. When
@@ -165,8 +200,10 @@ Operators pause rebalancing with narrow, explicit controls:
 - **Circuit breakers**: stop a transfer after repeated failures and alert the
   operator.
 
-None of these controls disable hedging, inventory visibility, or the recovery of
-in-flight transfers. A pause stops new rebalancing work only.
+None of these controls disable hedging or inventory visibility. They also keep
+the recovery of in-flight transfers, except on a secondary chain where every
+equity is `disabled`: there the equity services are not built, as described
+above. A pause stops new rebalancing work only.
 
 ##### Chain Roles: Hedged (Primary or Secondary) and Transport
 
@@ -250,39 +287,39 @@ parent-chain finality.
 
 The tokenization services are built per hedged chain, never once for Base, on
 the chain's own signing wallet. The primary, and every secondary with at least
-one rebalancing-enabled equity (the same per-asset flags that make the chain
-require the equity-rebalancing capability), get the full set: an issuer client,
-wrapper and mint authorizer bound to that chain's wallet, orderbook, asset table
-and issuer redemption wallet, plus that chain's `[orchestrator.addresses]` entry
-when the section carries one; without the entry the chain's mint authorizer is
-disabled with a startup warning and only an orchestrator-mode mint fails (see
-Mint Recipient Authorization). Such a chain must have its own redemption wallet,
-or startup fails naming the chain. A **hedge-only** secondary -- a trading table
-whose equities all have `rebalancing = "disabled"` -- needs no issuer client,
-redemption wallet or mint authorizer: only its signer is kept, for the startup
-allowance work, and startup logs the chain as hedge-only. It still gets the
-read-only ERC-4626 ratio reader over its own asset table, because vault polling
-reads its market-making vaults like any hedged chain's and those hold wrapped
-vault shares the daily portfolio capture values in underlying units. The
-rebalancing trigger plans across every hedged chain's entry and dispatches each
-operation with its chain (see Equity Allocation Planner); the portfolio snapshot
-and the wrapped- and unwrapped-equity orphan-recovery aggregates still consume
-the primary chain's entry. A secondary listing that sets
-`wrapped_equity_recovery = "enabled"` is refused at load, naming the chain and
-symbol, since no recovery would claim its stranded tokens. A mint or redemption
-transfer resolves the entry of the chain its record names (see below). The
-tokenization preflight (below) runs once per hedged chain with that chain's
-wallet, orderbook and settlement stable, as does the stale-allowance revoke on
-each chain in managed inventory mode. The startup MAX approvals run on every
-hedged chain in either mode, but only the settlement-stable grant is
-unconditional: the equity grants (underlying to wrapper vault, wrapped token to
-the deposit spender) are made only on chains that rebalance equity, since a
-hedge-only secondary has no wrapper to approve. Both deposit grants name the
-spender that chain settles deposits through -- its orderbook in legacy inventory
-mode, its `RaindexInventory` in managed mode -- so the same two token identities
-are approved, and proved by the deploy gate, in either inventory mode. A hedged
-chain for which this build has no pinned settlement stable fails startup rather
-than borrowing another chain's address.
+one equity whose rebalancing is `enabled` or `paused` (the same per-asset flags
+that make the chain require the equity-rebalancing capability), get the full
+set: an issuer client, wrapper and mint authorizer bound to that chain's wallet,
+orderbook, asset table and issuer redemption wallet, plus that chain's
+`[orchestrator.addresses]` entry when the section carries one; without the entry
+the chain's mint authorizer is disabled with a startup warning and only an
+orchestrator-mode mint fails (see Mint Recipient Authorization). Such a chain
+must have its own redemption wallet, or startup fails naming the chain. A
+**hedge-only** secondary -- a trading table whose equities all have
+`rebalancing = "disabled"` -- needs no issuer client, redemption wallet or mint
+authorizer: only its signer is kept, for the startup allowance work, and startup
+logs the chain as hedge-only. It still gets the read-only ERC-4626 ratio reader
+over its own asset table, because vault polling reads its market-making vaults
+like any hedged chain's and those hold wrapped vault shares the daily portfolio
+capture values in underlying units. The rebalancing trigger plans across every
+hedged chain's entry and dispatches each operation with its chain (see Equity
+Allocation Planner); the portfolio snapshot and the wrapped- and
+unwrapped-equity orphan-recovery aggregates still consume the primary chain's
+entry. A secondary listing that sets `wrapped_equity_recovery = "enabled"` is
+refused at load, naming the chain and symbol, since no recovery would claim its
+stranded tokens. A mint or redemption transfer resolves the entry of the chain
+its record names (see below). The tokenization preflight (below) runs once per
+hedged chain with that chain's wallet, orderbook and settlement stable, as does
+the stale-allowance revoke on each chain in managed inventory mode. The startup
+MAX approvals run on every hedged chain in either mode, but only the
+settlement-stable grant is unconditional: the equity grants (underlying to
+wrapper vault, wrapped token to the deposit spender) are made only on chains
+that rebalance equity, since a hedge-only secondary has no wrapper to approve.
+Both deposit grants name the spender that chain settles deposits through -- its
+orderbook in legacy inventory mode, its `RaindexInventory` in managed mode -- so
+the same two token identities are approved, and proved by the deploy gate, in
+either inventory mode. A hedged chain for which this build has no pinned
+settlement stable fails startup rather than borrowing another chain's address.
 
 The operator CLI selects its chain the same way. Every command that itself
 submits an onchain operation takes `--network` (default `base`) and runs on that
@@ -701,37 +738,37 @@ grants the one-time MAX approvals on every hedged chain with that chain's
 wallet: that chain's settlement stable to its deposit spender on every hedged
 chain, and each wrapped equity's underlying to its wrapper vault and wrapped to
 that same deposit spender -- the chain's orderbook in legacy inventory mode, its
-`RaindexInventory` in managed mode: on the primary every equity with trading or
-rebalancing enabled, on a secondary only the equities with rebalancing enabled,
-the same selection its tokenization preflight attests (a hedge-only secondary
-has no wrapper to approve, so its allowance work is the settlement-stable grant
-alone). Only when rebalancing is configured does it also revoke any stale
-orderbook allowance, per chain in managed inventory mode, the same way (also
-after those nonce restores), and a tokenization preflight runs per hedged chain,
-read-only: the chain's issuer redemption wallet must be configured, and every
-preflighted equity's configured vault must report the configured underlying as
-its `asset()` (the same attestation a redemption's unwrap step performs). The
-preflighted equities are, on the primary, every trading- or rebalancing-enabled
-equity (the bot may wrap or redeem any of them there), and on a secondary only
-its rebalancing-enabled equities; a hedge-only secondary is skipped with a log
-line and has no redemption-wallet requirement. Each failure is fatal and names
-the chain and, where one applies, the symbol. Then, on every preflighted chain
-with no `[orchestrator.addresses]` entry, the preflight asks issuance's
-per-asset status endpoint (the freeze gate's endpoint, through the same client)
-for each preflighted equity's `vault_mode` and refuses startup naming the chain
-and symbol when one is orchestrator-mode: its first mint would stall at the
-signing step. Chains with an entry are not queried: the entry is the only
-prerequisite this bot can see, and the Turnkey `MintAuth` policy for that chain
-stays invisible at startup, so a missing policy fails the first
-orchestrator-mode mint at signing rather than at preflight. An indeterminate
-mode (issuance unreachable, asset unknown to issuance) is warned about per chain
-and symbol rather than refused: rebalancing mode never requires issuance to be
-reachable at startup (the freeze gate fails closed per cycle and has its own
-`freeze_check` escape hatch for an issuance outage), and the per-mint mode read
-fails closed on its own: a mint whose mode cannot be read stops at mode
-discovery, before any signing. The signing-step failure is the last line only
-for a known orchestrator-mode mint without its chain's entry or `MintAuth`
-policy.
+`RaindexInventory` in managed mode: on the primary every equity with trading
+enabled or rebalancing enabled or paused, on a secondary only the equities with
+rebalancing enabled or paused, the same selection its tokenization preflight
+attests (a hedge-only secondary has no wrapper to approve, so its allowance work
+is the settlement-stable grant alone). Only when rebalancing is configured does
+it also revoke any stale orderbook allowance, per chain in managed inventory
+mode, the same way (also after those nonce restores), and a tokenization
+preflight runs per hedged chain, read-only: the chain's issuer redemption wallet
+must be configured, and every preflighted equity's configured vault must report
+the configured underlying as its `asset()` (the same attestation a redemption's
+unwrap step performs). The preflighted equities are, on the primary, every
+equity with trading enabled or rebalancing enabled or paused (the bot may wrap
+or redeem any of them there), and on a secondary only its equities with
+rebalancing enabled or paused; a hedge-only secondary is skipped with a log line
+and has no redemption-wallet requirement. Each failure is fatal and names the
+chain and, where one applies, the symbol. Then, on every preflighted chain with
+no `[orchestrator.addresses]` entry, the preflight asks issuance's per-asset
+status endpoint (the freeze gate's endpoint, through the same client) for each
+preflighted equity's `vault_mode` and refuses startup naming the chain and
+symbol when one is orchestrator-mode: its first mint would stall at the signing
+step. Chains with an entry are not queried: the entry is the only prerequisite
+this bot can see, and the Turnkey `MintAuth` policy for that chain stays
+invisible at startup, so a missing policy fails the first orchestrator-mode mint
+at signing rather than at preflight. An indeterminate mode (issuance
+unreachable, asset unknown to issuance) is warned about per chain and symbol
+rather than refused: rebalancing mode never requires issuance to be reachable at
+startup (the freeze gate fails closed per cycle and has its own `freeze_check`
+escape hatch for an issuance outage), and the per-mint mode read fails closed on
+its own: a mint whose mode cannot be read stops at mode discovery, before any
+signing. The signing-step failure is the last line only for a known
+orchestrator-mode mint without its chain's entry or `MintAuth` policy.
 
 Right after it restores each of those signed sends, startup rebroadcasts its
 exact bytes ("already known" is success; it does not wait for a confirmation),
@@ -2115,31 +2152,31 @@ systemd unit:
   chain's settlement stable to its deposit spender -- its orderbook in legacy
   inventory mode, its `RaindexInventory` in managed mode -- plus equity token to
   wrapper and wrapper to that same deposit spender for every equity the chain
-  wraps in its role: trading or rebalancing enabled on the primary, rebalancing
-  enabled on a secondary) is covered by an allow policy whose consensus the
-  authenticated API user can satisfy alone and whose target condition provably
-  applies on that chain's id. Applicable deny policies take precedence; unknown
-  allow or deny applicability, unsupported consensus, a hedged chain with no
-  pinned settlement stable, and missing coverage fail closed, naming the chain,
-  symbol, token contract, and spender. Only after both gates pass may activation
-  stop the old process and install the candidate files, so a policy or config
-  failure leaves the running bot untouched; a failed stop aborts before
-  candidate files are installed. It then verifies migrations, chowns data files,
-  writes the git-rev marker, touches the activation marker, and restarts the
-  unit. The server writes its PID to a systemd-managed runtime-directory file
-  only after Conductor has completed startup initialization and every essential
-  supervised runtime task has reached a pending run state. Activation waits for
-  that PID to match the unit's live main process with a bounded startup timeout.
-  If the process exits, readiness reporting fails, or the timeout expires first,
-  activation prints the unit status and recent journal, exits non-zero, and
-  deploy-rs rolls the profile back. The unit remains `Type=simple` so automatic
-  rollback stays compatible with service generations from before the readiness
-  handshake was introduced. The first rollout requires deploying the system
-  profile before the service profile; a service-only deploy verifies the
-  installed unit exposes the expected ready file before stopping the running bot
-  and otherwise fails immediately with the required rollout order. Outside
-  systemd, the server uses a no-op readiness notifier so local runs remain
-  available.
+  wraps in its role: trading enabled or rebalancing enabled or paused on the
+  primary, rebalancing enabled or paused on a secondary) is covered by an allow
+  policy whose consensus the authenticated API user can satisfy alone and whose
+  target condition provably applies on that chain's id. Applicable deny policies
+  take precedence; unknown allow or deny applicability, unsupported consensus, a
+  hedged chain with no pinned settlement stable, and missing coverage fail
+  closed, naming the chain, symbol, token contract, and spender. Only after both
+  gates pass may activation stop the old process and install the candidate
+  files, so a policy or config failure leaves the running bot untouched; a
+  failed stop aborts before candidate files are installed. It then verifies
+  migrations, chowns data files, writes the git-rev marker, touches the
+  activation marker, and restarts the unit. The server writes its PID to a
+  systemd-managed runtime-directory file only after Conductor has completed
+  startup initialization and every essential supervised runtime task has reached
+  a pending run state. Activation waits for that PID to match the unit's live
+  main process with a bounded startup timeout. If the process exits, readiness
+  reporting fails, or the timeout expires first, activation prints the unit
+  status and recent journal, exits non-zero, and deploy-rs rolls the profile
+  back. The unit remains `Type=simple` so automatic rollback stays compatible
+  with service generations from before the readiness handshake was introduced.
+  The first rollout requires deploying the system profile before the service
+  profile; a service-only deploy verifies the installed unit exposes the
+  expected ready file before stopping the running bot and otherwise fails
+  immediately with the required rollout order. Outside systemd, the server uses
+  a no-op readiness notifier so local runs remain available.
 - `dashboard` (kind = `static`) - frontend assets served by nginx; the deploy
   step is `systemctl reload nginx` and there is no managed systemd unit.
 - `datasette` (kind = `plain`) - read-only SQLite explorer over the hedge DB.
@@ -5598,7 +5635,9 @@ minimum operation size, whether its vault registry knows the token and whether
 its wallet is gas-ready), the floors, the cooling chains and the symbol's price.
 A hedge-only listing (`rebalancing = "disabled"`) is neither slotted nor
 counted: its prefunded inventory is outside the planner's total, so it never
-moves the other chains' targets.
+moves the other chains' targets. A paused listing (`rebalancing = "paused"`) is
+slotted and counted like an enabled one, but is never chosen: a candidate on it
+is skipped and recorded as `paused`.
 
 - Guards, in order: the broker venue unpolled, no chain slot at all, a
   rebalancing chain without a slot, or any transfer in flight for the symbol

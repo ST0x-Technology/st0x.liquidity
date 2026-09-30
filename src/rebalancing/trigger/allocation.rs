@@ -65,10 +65,15 @@ pub(crate) struct ChainSlot {
     /// Whether the chain's vault registry knows the token: a mint has no
     /// vault to land in and a redemption nothing to withdraw without it.
     pub(crate) registry_known: bool,
-    /// Whether the trigger resolved a target for this listing. A slot without
-    /// one still counts in the total, so the total stays whole, but is never
-    /// chosen. A hedge-only listing never reaches the planner at all.
-    pub(crate) enabled: bool,
+    pub(crate) participation: Participation,
+}
+
+/// Whether this slot can supply a new operation while contributing to the total.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Participation {
+    Plans,
+    Paused,
+    NoTarget,
 }
 
 /// What the planner decided for one symbol.
@@ -131,6 +136,11 @@ pub(crate) enum DeclineReason {
     RedemptionUnrecoverable {
         chain: Chain,
     },
+    /// The chain's listing is paused: work under way finishes, nothing new
+    /// starts.
+    Paused {
+        chain: Chain,
+    },
 }
 
 impl DeclineReason {
@@ -151,6 +161,7 @@ impl DeclineReason {
             Self::PriceMissing => "price_missing",
             Self::NotInRegistry { .. } => "not_in_registry",
             Self::RedemptionUnrecoverable { .. } => "redemption_unrecoverable",
+            Self::Paused { .. } => "paused",
         }
     }
 }
@@ -204,7 +215,8 @@ impl Candidate {
 /// Picks at most one operation for the symbol.
 ///
 /// The guards run first, then the best-ranked candidate that survives the
-/// recovery, registry, gas, cooldown, floor and minimum size checks wins. A missing price
+/// pause, recovery, registry, gas, cooldown, floor and minimum size checks
+/// wins. A missing price
 /// declines the symbol before any
 /// candidate is tried; a per-chain drop on a higher-ranked candidate only
 /// outranks a later `FloorCapped`.
@@ -255,6 +267,12 @@ pub(crate) fn plan_equity_operation(
         let slot = &input.onchain[&candidate.chain];
         let direction = candidate.direction()?;
 
+        if slot.participation == Participation::Paused {
+            first_drop.get_or_insert(DeclineReason::Paused {
+                chain: candidate.chain,
+            });
+            continue;
+        }
         if direction == PlannedDirection::Redemption && candidate.chain != input.primary_chain {
             first_drop.get_or_insert(DeclineReason::RedemptionUnrecoverable {
                 chain: candidate.chain,
@@ -364,7 +382,7 @@ fn ranked_candidates(
         let target = (total * slot.target.inner())?;
         let deviation = (underlying[chain] - target)?;
         deviations.insert(*chain, deviation);
-        if !slot.enabled {
+        if slot.participation == Participation::NoTarget {
             continue;
         }
 
@@ -516,7 +534,7 @@ mod tests {
             min_operation_usd: usdc("1"),
             gas_ready: true,
             registry_known: true,
-            enabled: true,
+            participation: Participation::Plans,
         }
     }
 
@@ -976,6 +994,65 @@ mod tests {
         assert_eq!(with_alternative, mint(Chain::HyperEvm, "25"));
     }
 
+    fn paused(slot: &ChainSlot) -> ChainSlot {
+        ChainSlot {
+            participation: Participation::Paused,
+            ..slot.clone()
+        }
+    }
+
+    /// A paused listing over its target never redeems, and under it never
+    /// mints; another chain's operation still runs.
+    #[test]
+    fn paused_chain_starts_nothing_and_is_recorded() {
+        let over = plan_equity_operation(&input(
+            Some(balance("15")),
+            BTreeMap::from([(Chain::Base, paused(&slot("85", "0.5")))]),
+        ))
+        .unwrap();
+        assert_eq!(
+            over,
+            EquityPlan::Decline(DeclineReason::Paused { chain: Chain::Base })
+        );
+
+        let under = plan_equity_operation(&input(
+            Some(balance("85")),
+            BTreeMap::from([(Chain::Base, paused(&slot("15", "0.5")))]),
+        ))
+        .unwrap();
+        assert_eq!(
+            under,
+            EquityPlan::Decline(DeclineReason::Paused { chain: Chain::Base })
+        );
+
+        let with_alternative = plan_equity_operation(&input(
+            Some(balance("60")),
+            BTreeMap::from([
+                (Chain::Base, paused(&slot("20", "0.5"))),
+                (Chain::HyperEvm, slot("20", "0.45")),
+            ]),
+        ))
+        .unwrap();
+        assert_eq!(with_alternative, mint(Chain::HyperEvm, "25"));
+    }
+
+    /// A paused listing's inventory still counts in the total, so the other
+    /// chain's target is sized against the whole book: 100 in total puts
+    /// HyperEVM's 0.5 target at 50, and it mints 30 rather than the 20 a
+    /// total without Base's 40 would give.
+    #[test]
+    fn paused_chain_inventory_counts_in_the_total() {
+        let plan = plan_equity_operation(&input(
+            Some(balance("40")),
+            BTreeMap::from([
+                (Chain::Base, paused(&slot("40", "0.0"))),
+                (Chain::HyperEvm, slot("20", "0.5")),
+            ]),
+        ))
+        .unwrap();
+        assert_eq!(plan, mint(Chain::HyperEvm, "30"));
+    }
+
     /// HyperEVM sits 36 over its target. Wallet recovery runs on Base only,
     /// so HyperEVM's redemption is declined, and Base's mint is the fallback
     /// once Base is short.
@@ -1183,7 +1260,7 @@ mod tests {
                 (
                     Chain::HyperEvm,
                     ChainSlot {
-                        enabled: false,
+                        participation: Participation::NoTarget,
                         ..slot("50", "0")
                     },
                 ),
@@ -1390,7 +1467,11 @@ mod tests {
             proptest::option::of(arb_shares()),
             any::<bool>(),
             any::<bool>(),
-            any::<bool>(),
+            prop_oneof![
+                Just(Participation::Plans),
+                Just(Participation::Paused),
+                Just(Participation::NoTarget)
+            ],
         )
             .prop_map(
                 |(
@@ -1400,7 +1481,7 @@ mod tests {
                     limit,
                     gas_ready,
                     registry_known,
-                    enabled,
+                    participation,
                 )| ChainSlot {
                     balance: VenueBalance::new(available, FractionalShares::ZERO),
                     ratio: one_to_one(),
@@ -1410,7 +1491,7 @@ mod tests {
                     min_operation_usd: usdc("0.000000001"),
                     gas_ready,
                     registry_known,
-                    enabled,
+                    participation,
                 },
             )
     }
@@ -1519,6 +1600,11 @@ mod tests {
                 return Ok(());
             };
 
+            prop_assert!(
+                input.onchain[&operation.chain].participation == Participation::Plans,
+                "an operation started on a paused listing"
+            );
+
             let (total, deviations) = deviations(&input);
             let deviation = deviations[&operation.chain];
             let quantity = operation.quantity.inner();
@@ -1558,7 +1644,7 @@ mod tests {
 
             let (total, deviations) = deviations(&input);
             for (chain, slot) in &input.onchain {
-                let admissible = slot.enabled
+                let admissible = slot.participation == Participation::Plans
                     && *chain == input.primary_chain
                     && slot.registry_known
                     && slot.gas_ready

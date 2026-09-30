@@ -1724,7 +1724,7 @@ mod tests {
 
     use st0x_config::{
         ChainEquityAsset, EquityHedgePolicy, ExecutionThreshold, HedgedEquities, HedgingAssets,
-        OperationMode, create_test_ctx_with_order_owner,
+        OperationMode, RebalancingMode, create_test_ctx_with_order_owner,
     };
     use st0x_event_sorcery::StoreBuilder;
     use st0x_evm::Chain;
@@ -2099,7 +2099,7 @@ mod tests {
                     tokenized_equity_derivative: Address::ZERO,
                     vault_ids: Vec::new(),
                     trading: OperationMode::Enabled,
-                    rebalancing: OperationMode::Disabled,
+                    rebalancing: RebalancingMode::Disabled,
                     wrapped_equity_recovery: OperationMode::Disabled,
                     operational_limit: None,
                     target_share: None,

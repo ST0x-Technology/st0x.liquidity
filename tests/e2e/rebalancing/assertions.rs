@@ -38,6 +38,7 @@ use st0x_hedge::mock_api::{AlpacaTokenizationMock, TokenizationStatus};
 pub(crate) use st0x_hedge::mock_api::{RedemptionOutcome, TokenizationRequestType};
 use st0x_hedge::{
     AllocationCtx, ChainAssets, ChainCashAsset, ChainEquities, ChainEquityAsset, OperationMode,
+    RebalancingMode,
 };
 
 pub(crate) use crate::assert::{ExpectedPosition, assert_event_subsequence};
@@ -156,7 +157,7 @@ pub(crate) fn build_rebalancing_ctx<P: Provider + Clone>(
                     tokenized_equity_derivative: wrapped,
                     vault_ids: equity_vault_ids.get(symbol).copied().into_iter().collect(),
                     trading: OperationMode::Enabled,
-                    rebalancing: OperationMode::Enabled,
+                    rebalancing: RebalancingMode::Enabled,
                     wrapped_equity_recovery,
                     operational_limit: None,
                     target_share: None,
@@ -260,7 +261,7 @@ where
                     tokenized_equity_derivative: *wrapped,
                     vault_ids: Vec::new(),
                     trading: OperationMode::Enabled,
-                    rebalancing: OperationMode::Disabled,
+                    rebalancing: RebalancingMode::Disabled,
                     wrapped_equity_recovery,
                     operational_limit: None,
                     target_share: None,

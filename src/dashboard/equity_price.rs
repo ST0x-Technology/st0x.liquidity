@@ -855,7 +855,7 @@ mod tests {
     };
     use url::Url;
 
-    use st0x_config::{ChainEquities, ChainEquityAsset, OperationMode};
+    use st0x_config::{ChainEquities, ChainEquityAsset, OperationMode, RebalancingMode};
 
     use super::*;
 
@@ -922,7 +922,7 @@ mod tests {
                         tokenized_equity_derivative: TEST_DERIVATIVE,
                         vault_ids: Vec::new(),
                         trading: OperationMode::Enabled,
-                        rebalancing: OperationMode::Disabled,
+                        rebalancing: RebalancingMode::Disabled,
                         wrapped_equity_recovery: OperationMode::Disabled,
                         operational_limit: None,
                         target_share: None,

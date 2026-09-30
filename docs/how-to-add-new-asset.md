@@ -145,14 +145,25 @@ which is independent of any chain -- there is one broker account and one
 position per symbol. Other services own other keys on the same tables (the
 file's header lists them). The bot takes its own keys and ignores the others;
 which keys may appear, and their spelling, is checked by `st0x.registry`'s CI
-(`t0/check.jq`) before the file is published, not by the bot.
+(`t0/check.jq`) before the file is published, not by the bot. Publishing
+`rebalancing = "paused"` needs this order so an older binary never reads a token
+file it cannot load:
+
+1. Deploy the bot that reads `paused`.
+2. Merge the `t0/check.jq` validator change that accepts `paused`.
+3. Publish `paused` in the token file.
+
+On rollback, restore the token value before downgrading the binary. If the
+validator lands first and someone publishes `paused`, a restart of an older
+binary (staging loads the latest token file on every restart) refuses the
+registry and stops hedging.
 
 ```toml
 [chains.base.assets.equities.SGOV]
 trading = "disabled"                          # "enabled" or "disabled"
-rebalancing = "disabled"                      # "enabled" or "disabled"
+rebalancing = "disabled"                      # "enabled", "paused" or "disabled"
 wrapped_equity_recovery = "disabled"          # "enabled" or "disabled"
-vault_ids = ["0xfab"]                         # Raindex vault IDs (required when rebalancing = "enabled")
+vault_ids = ["0xfab"]                         # Raindex vault IDs (required when rebalancing = "enabled" or "paused")
 tokenized_equity = "0xc941C1506B7555Ba8C506Fb6c9b9CC259902d612"
 tokenized_equity_derivative = "0x78c31580c97101694c70022c83d570150c11e935"
 
@@ -173,20 +184,21 @@ chain's signing wallet, orderbook, `redemption_wallet` and
 (Base included), check before enabling the asset:
 
 - On a redemption-capable chain -- the primary, and a secondary where at least
-  one equity sets `rebalancing = "enabled"` -- `[chains.<name>.trading]` carries
-  a `redemption_wallet` (the issuer's wallet on that chain). Startup builds that
-  chain's tokenization services and refuses, naming the chain, without it. A
-  hedge-only secondary, where every equity has `rebalancing = "disabled"`, needs
-  no redemption wallet, issuer client or mint authorizer, and gets no wrap or
-  deposit approvals.
+  one equity sets `rebalancing = "enabled"` or `"paused"` --
+  `[chains.<name>.trading]` carries a `redemption_wallet` (the issuer's wallet
+  on that chain). Startup builds that chain's tokenization services and refuses,
+  naming the chain, without it. A hedge-only secondary, where every equity has
+  `rebalancing = "disabled"`, needs no redemption wallet, issuer client or mint
+  authorizer, and gets no wrap or deposit approvals.
 - Every chain that lists the asset, hedge-only secondaries included, needs its
   own `tokenized_equity_derivative`: that address is the token its vaults hold
   and the one its fills are checked against, and the daily portfolio capture
   reads that chain's vault ratio to value those balances in underlying shares.
 - The vault at `tokenized_equity_derivative` reports `tokenized_equity` as its
   `asset()`. Startup attests this on each redemption-capable chain -- every
-  trading- or rebalancing-enabled equity on the primary, the rebalancing-enabled
-  ones on a secondary -- and fails naming the chain and symbol otherwise.
+  equity with trading enabled or rebalancing enabled or paused on the primary,
+  those with rebalancing enabled or paused on a secondary -- and fails naming
+  the chain and symbol otherwise.
 - The Turnkey policies allow the startup approvals on that chain's id: the
   approvals (underlying to vault, vault to that chain's deposit spender, that
   chain's USDC to the same deposit spender) are granted per hedged chain, and
@@ -224,7 +236,19 @@ chain's signing wallet, orderbook, `redemption_wallet` and
   it is disabled on purpose and hedged by hand, silence the alert for that chain
   and symbol.
 - `rebalancing`: Whether the bot auto-rebalances this asset between venues.
-  Usually `"disabled"` at first.
+  Usually `"disabled"` at first. `"paused"` starts no new mint or redemption but
+  keeps the chain's equity transfer services, so work already under way
+  finishes. Before you disable a listing that may have a transfer in flight,
+  pause it and wait until its in-flight transfers finish. Pausing does not move
+  the chain's equity: the planner skips a paused chain and `transfer-equity`
+  refuses a new transfer on it. To move that equity first, use the manual vault,
+  unwrap, and redeem commands (`vault-withdraw`, `unwrap-equity`, then
+  `alpaca-redeem` with the unwrapped quantity, see [cli-ops.md](cli-ops.md)). A
+  paused chain still counts in the planner's total, so it must stay polled and
+  readable: a stale paused chain stops equity rebalancing for the symbol on
+  every chain until it is fresh again or set to `"disabled"`. Wallet polling and
+  wallet recovery run where the chain already has them (the primary chain
+  today); pausing does not add them to a secondary.
 - `wrapped_equity_recovery`: Explicit opt-in for recovery of wrapped-equity
   positions. Set to `"enabled"` to allow the bot to recover wrapped equity;
   `"disabled"` skips recovery for this asset. Must be specified for every equity
@@ -234,10 +258,10 @@ chain's signing wallet, orderbook, `redemption_wallet` and
   bot to place offsetting broker trades outside regular market hours;
   `"disabled"` restricts counter-trading to regular session only. Must be
   specified for every equity entry.
-- `vault_ids`: The Raindex vault IDs. Required when `rebalancing = "enabled"`:
-  the bot refuses a token file with a rebalancing row that has none. With
-  rebalancing disabled they can be omitted, and the bot discovers the vaults
-  from its trade events.
+- `vault_ids`: The Raindex vault IDs. Required when `rebalancing` is `"enabled"`
+  or `"paused"`: the bot refuses a token file with a rebalancing row that has
+  none. With rebalancing disabled they can be omitted, and the bot discovers the
+  vaults from its trade events.
 - `tokenized_equity`: The base token contract address.
 - `tokenized_equity_derivative`: The wrapped token contract address.
 
@@ -309,11 +333,11 @@ For adding asset **XYZ**:
       `tokenized_equity_derivative`, and Turnkey approval policies for that
       chain's id
 - [ ] On each redemption-capable chain that lists it -- the primary, and a
-      secondary where at least one equity sets `rebalancing = "enabled"` --
-      `redemption_wallet` and, before the asset is cut over to orchestrator
-      mode, the orchestrator entry for that chain (see step 4a) and the Turnkey
-      `MintAuth` policy for that chain's id and orchestrator; the first
-      orchestrator-mode mint fails at signing without it
+      secondary where at least one equity sets `rebalancing = "enabled"` or
+      `"paused"` -- `redemption_wallet` and, before the asset is cut over to
+      orchestrator mode, the orchestrator entry for that chain (see step 4a) and
+      the Turnkey `MintAuth` policy for that chain's id and orchestrator; the
+      first orchestrator-mode mint fails at signing without it
 - [ ] Restart staging, verify bot sees the asset
 - [ ] Enable trading in the token file, restart again
 - [ ] Repeat for production when staging looks good, bumping `generation` in

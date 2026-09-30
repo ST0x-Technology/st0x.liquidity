@@ -30,7 +30,8 @@ use st0x_dto::{
     TradingVenue,
 };
 use st0x_event_sorcery::{
-    AggregateError, EventSourced, SendError, Store, StoreBuilder, load_entity, send_command,
+    AggregateError, EventSourced, LifecycleError, SendError, Store, StoreBuilder, load_entity,
+    send_command,
 };
 use st0x_evm::Chain;
 use st0x_execution::alpaca_broker_api::AccountActivitiesQuery;
@@ -73,7 +74,7 @@ use crate::performance::reliability::{
 };
 use crate::performance::{ReportRange, hedge_latency_report, load_hedge_performance};
 use crate::rebalancing::equity::{
-    CrossVenueEquityTransfer, EquityTransferServices, RecheckError, RecheckOutcome,
+    CrossVenueEquityTransfer, EquityTransferServices, MintError, RecheckError, RecheckOutcome,
     ReplacementNotAdoptable, WithdrawalNotSuperseded, withdrawal_required_confirmations,
 };
 use crate::rebalancing::usdc::{
@@ -83,7 +84,8 @@ use crate::rebalancing::usdc::{
 };
 use crate::rebalancing::{RebalancingService, UsdcResumeError};
 use crate::tokenized_equity_mint::{
-    TokenizedEquityMint, TokenizedEquityMintCommand, TokenizedEquityMintEvent,
+    TokenizedEquityMint, TokenizedEquityMintCommand, TokenizedEquityMintError,
+    TokenizedEquityMintEvent,
 };
 use crate::usdc_rebalance::{
     PreBurnFailEligibility, RebalanceDirection, ReconcileReason, UsdcRebalance,
@@ -1876,10 +1878,35 @@ fn recheck_error_response(error: &RecheckError) -> (StatusCode, String) {
             StatusCode::BAD_GATEWAY,
             "Tokenization provider unavailable; retry later".to_string(),
         ),
-        ChainServicesMissing(_) | Mint(_) | Redemption(_) | Rebalancing(_) | Database(_) => (
+        Mint(mint_error) => replay_refusal(mint_error).map_or_else(
+            || {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "Failed to recheck transfer".to_string(),
+                )
+            },
+            |refusal| (StatusCode::UNPROCESSABLE_ENTITY, refusal.to_string()),
+        ),
+        ChainServicesMissing(_) | Redemption(_) | Rebalancing(_) | Database(_) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             "Failed to recheck transfer".to_string(),
         ),
+    }
+}
+
+/// The provider still has no record of a `MintRequested` mint on a listing
+/// that cannot start operations. This is the operator's state to act on, not
+/// a bot fault, so `recheck_error_response` answers 422 with its message.
+fn replay_refusal(error: &MintError) -> Option<&TokenizedEquityMintError> {
+    let MintError::Aggregate(send_error) = error else {
+        return None;
+    };
+
+    match send_error.as_ref() {
+        AggregateError::UserError(LifecycleError::Apply(
+            refusal @ TokenizedEquityMintError::ReplayRefused { .. },
+        )) => Some(refusal),
+        _ => None,
     }
 }
 
@@ -4453,8 +4480,8 @@ mod tests {
     use st0x_bridge::cctp::CctpError;
     use st0x_bridge::corridor::{HopKind, UsdcCorridor};
     use st0x_config::{
-        BrokerCtx, Ctx, ExecutionThreshold, FileLogging, HedgedChain, LogLevel, RestApiCtx,
-        UsdcCorridors, create_test_ctx_with_order_owner,
+        BrokerCtx, Ctx, ExecutionThreshold, FileLogging, HedgedChain, LogLevel, RebalancingMode,
+        RestApiCtx, UsdcCorridors, create_test_ctx_with_order_owner,
     };
     use st0x_dto::{Trade, TradeOutcome, TradingVenue};
     use st0x_event_sorcery::{ReactorHarness, StoreBuilder};
@@ -7652,6 +7679,21 @@ mod tests {
             }));
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(message, "Failed to recheck transfer");
+
+        // The provider still has no record of a mint on a stopped listing:
+        // the operator's state to act on -> 422 carrying the refusal.
+        let refusal = TokenizedEquityMintError::ReplayRefused {
+            issuer_request_id: issuer_request_id("mint-2"),
+            chain: Chain::Base,
+            symbol: Symbol::new("AAPL").unwrap(),
+            mode: RebalancingMode::Paused,
+        };
+        let (status, message) =
+            recheck_error_response(&RecheckError::Mint(MintError::Aggregate(Box::new(
+                AggregateError::UserError(LifecycleError::Apply(refusal.clone())),
+            ))));
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(message, refusal.to_string());
     }
 
     #[test]
