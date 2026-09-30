@@ -12318,6 +12318,43 @@ mod tests {
         );
     }
 
+    /// The cash transfer executors run on the primary chain's orderbook and
+    /// vault, so the full config validation refuses an Ethereum primary with
+    /// a Base corridor.
+    #[test]
+    fn full_validation_refuses_a_corridor_off_the_primary_chain() {
+        let mut deployed: toml::Table =
+            toml::from_str(include_str!("../../../config/prod/st0x-hedge.toml")).unwrap();
+        let chains = deployed["chains"].as_table_mut().unwrap();
+        let mut ethereum_trading = chains["base"]["trading"].clone();
+        ethereum_trading
+            .as_table_mut()
+            .unwrap()
+            .insert("primary".to_string(), toml::Value::Boolean(true));
+        chains["base"]["trading"]
+            .as_table_mut()
+            .unwrap()
+            .insert("primary".to_string(), toml::Value::Boolean(false));
+        chains["ethereum"]
+            .as_table_mut()
+            .unwrap()
+            .insert("trading".to_string(), ethereum_trading);
+        let config = toml_file(&toml::to_string(&deployed).unwrap());
+
+        let error = Ctx::validate_config_file(config.path(), TokenFile::Skipped).unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                CtxError::CorridorChainNotPrimary {
+                    chain: Chain::Base,
+                    primary: Chain::Ethereum,
+                }
+            ),
+            "got {error:?}"
+        );
+    }
+
     #[test]
     fn disabled_chain_with_stale_cash_rebalancing_needs_no_corridor() {
         let mut config = prod_config();
