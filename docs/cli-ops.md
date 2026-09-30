@@ -431,8 +431,11 @@ Not covered by `transfer recheck` yet:
 - Provider rejections. These remain failed unless an operator performs a
   separate manual reconciliation.
 - USDC rebalancing failures. Those use the USDC/CCTP state machine and have
-  their own recovery commands. A manual `transfer-usdc` prints its transfer id
-  and, if interrupted mid-flight, is resumed with
+  their own recovery commands. A manual `transfer-usdc` runs on the served
+  corridor that `--chain <chain>` names; the flag may be left out only while the
+  build serves one corridor, and with several the command refuses and lists
+  them. It prints its transfer id and, if interrupted mid-flight, is resumed
+  with
   `stox transfer resume --kind usdc --id <id> --direction <to-raindex|to-alpaca>`.
   This covers post-burn interruptions and the resumable pre-burn states (a
   BaseToAlpaca `WithdrawalSubmitting`, an AlpacaToBase `Withdrawing` with a

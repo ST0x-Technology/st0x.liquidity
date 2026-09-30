@@ -119,6 +119,9 @@ and the system proves market fit.
     `[rebalancing.usdc.corridors.<chain>]` with its `hop`, `target` and
     `deviation`; the chain's cash vault, per-transfer limit and confirmations
     come from the chain's own tables. Today the only corridor is Base via CCTP.
+  - Each corridor's transfers run on its own chain's orderbook, vault, wallet
+    and gas check, and the USDC check runs every active corridor in chain order,
+    each against its own band.
   - The corridor is recorded on each transfer when it starts. A transfer
     recorded before corridors existed reads as Base via CCTP, the only route
     there was.
@@ -168,26 +171,26 @@ config carries a `[chains.<name>.trading]` table is a **hedged** chain: the bot
 runs a fill watcher against its order book, accounts its fills and hedges them
 with offsetting broker orders. Exactly one hedged chain must set
 `primary = true` on that table -- the **primary** chain anchors the operator
-defaults (Base), and for now it is the only chain a cash corridor may be keyed
-by. The corridor table names the cash chain; the cash transfer executor runs on
-that chain's orderbook, vault, wallet and gas check. The cash inventory state is
-kept per corridor chain too: its trigger, inflight and busy marker address that
-chain's vault; equity rebalancing, hedging and vault balance polling happen on
-every hedged chain. Vault balance polling runs once per hedged chain, each on
-that chain's own Raindex service, its own chain-qualified vault registry and one
-pinned block, so every hedged chain's inventory slot is seeded and corrected. A
-secondary chain's fill updates that chain's own inventory slot: inventory is not
-fungible across chains. It schedules the symbol's equity check when that chain's
-listing rebalances the symbol, and the USDC check only when that chain is the
-cash corridor's chain; a hedge-only listing is prefunded and schedules neither.
-The distinction exists so that fill watching and inventory polling can go
+defaults (Base). The corridor table names the cash chain, whichever hedged chain
+it is; the cash transfer executor runs on that chain's orderbook, vault, wallet
+and gas check. The cash inventory state is kept per corridor chain too: its
+trigger, inflight and busy marker address that chain's vault; equity
+rebalancing, hedging and vault balance polling happen on every hedged chain.
+Vault balance polling runs once per hedged chain, each on that chain's own
+Raindex service, its own chain-qualified vault registry and one pinned block, so
+every hedged chain's inventory slot is seeded and corrected. A secondary chain's
+fill updates that chain's own inventory slot: inventory is not fungible across
+chains. It schedules the symbol's equity check when that chain's listing
+rebalances the symbol, and the USDC check only when that chain is an active cash
+corridor's chain; a hedge-only listing is prefunded and schedules neither. The
+distinction exists so that fill watching and inventory polling can go
 multi-chain before rebalancing does: it names the chain the still-single-chain
-paths use. Equity rebalancing is already per chain (see Equity Allocation
-Planner); once the USDC corridors are too, `primary` shrinks to the operator's
-default chain, or is removed. Zero or multiple primary claimants fail startup
-with a named error. Chains without a trading table are **transport** chains
-(RPC + confirmations only, e.g. Ethereum while it only carries CCTP transfers).
-Watch settings are per chain: poll interval, ingestion cutoff, asset tables with
+paths use. Equity and cash rebalancing are per chain (see Equity Allocation
+Planner and USDC Rebalancing), so `primary` is only the operator's default
+chain, and may be removed. Zero or multiple primary claimants fail startup with
+a named error. Chains without a trading table are **transport** chains (RPC +
+confirmations only, e.g. Ethereum while it only carries CCTP transfers). Watch
+settings are per chain: poll interval, ingestion cutoff, asset tables with
 per-chain enable/disable flags. The periodic position check sweeps a symbol when
 any hedged chain enables it and sizes the hedge with the tightest operational
 limit among those chains (one `Position` per symbol cannot say which chain its
@@ -1986,10 +1989,10 @@ rule fails startup with a named error:
 6. `hop = "relay"` on any chain: this build has no Relay hop.
 7. USDC mode enabled and a chain that is not disabled, whose cash table enables
    rebalancing, has no corridor table: there is no implicit corridor.
-8. A corridor chain other than the primary chain, until the trigger checks every
-   corridor and the executors' Ethereum-tx checks use Ethereum's own depth. With
-   no corridor table the served corridor is Base via CCTP, so the primary must
-   then be Base.
+8. No served corridor. The build serves every corridor table, whatever the mode,
+   and Base via CCTP whenever Base is a hedged chain with a cash vault, so
+   in-flight Base transfers always recover. A config that serves neither has no
+   cash transfer service to start.
 9. Transitional: `target` or `deviation` still set directly under
    `[rebalancing.usdc]` and different from the corridor's value. The released
    image reads those two keys and ignores the corridor tables, so both stay in
@@ -4144,21 +4147,22 @@ action that already succeeded. Each phase records its intent (and the relevant
 chain head) before the action, so resume can scan the chain to adopt an
 already-submitted action instead of re-issuing it.
 
-A cash transfer service serves one corridor, fixed by what the build wires
-(today Base via CCTP), whether or not USDC mode is enabled, so in-flight
-transfers always recover. A fresh transfer must ask for that corridor and
-records it on its originating command. A resume or recheck of a transfer
-recorded on another corridor, or a fresh transfer asking for another corridor,
-fails closed before any send and leaves the transfer untouched; the error starts
-with "USDC transfer corridor mismatch" and names both corridors. Automation
-treats a recorded transfer on another corridor as permanent for the build: its
-job re-queues itself every 10 minutes without a retry cost, so a build that
-serves the corridor finds a job to resume it, until the transfer holds no guard
+One cash transfer service runs per served corridor (every corridor table, and
+Base via CCTP while Base holds a cash vault; see Cash corridor rules), whether
+or not USDC mode is enabled, so in-flight transfers always recover. A fresh
+transfer must ask for a served corridor and records it on its originating
+command. A resume or recheck of a transfer recorded on a corridor the build does
+not serve, or a fresh transfer asking for one, fails closed before any send and
+leaves the transfer untouched; the error starts with "USDC transfer corridor
+mismatch" and names the recorded corridor and the served ones. Automation treats
+a recorded transfer on another corridor as permanent for the build: its job
+re-queues itself every 10 minutes without a retry cost, so a build that serves
+the corridor finds a job to resume it, until the transfer holds no guard
 (reconciled, say), when the job ends; startup recovery (even while a job is
 live) and the timeout sweep never re-arm it, and its corridor's guard stays
 held. Other corridors keep running, with two limits: an Alpaca-outbound held
 transfer blocks Alpaca-outbound claims on every corridor (its page says so), and
-because guards are keyed by chain, an unserved corridor on the served chain with
+because guards are keyed by chain, an unserved corridor on a served chain with
 another hop holds the served corridor's own guard. A fresh job asking for
 another corridor has no transfer to hold: it retries, dead-letters, and its
 dead-letter alert pages once. Startup recovery pages once per transfer per run
@@ -6374,10 +6378,11 @@ effect rather than a generic intent:
   aggregate's persisted amount. Routing through the bot closes the CLI-vs-server
   race: the CLI process never drives an aggregate the bot's worker may also
   drive. The manual `transfer-usdc` command still starts a fresh transfer
-  directly, but hands off to this endpoint at the FIRST bot-resumable wait
-  (attestation timeout, settlement lag, inconclusive poll); when the bot is
-  unreachable, the transfer is durable -- a bot restart re-arms it
-  automatically. Like the whole `server_port` recovery surface
+  directly, on the served corridor `--chain` names (optional while the build
+  serves one corridor), but hands off to this endpoint at the FIRST
+  bot-resumable wait (attestation timeout, settlement lag, inconclusive poll);
+  when the bot is unreachable, the transfer is durable -- a bot restart re-arms
+  it automatically. Like the whole `server_port` recovery surface
   (`/transfers/resume`, `/transfers/recheck`, `/transfers/fail`), its bare path
   is restricted to loopback callers for the in-container CLI. Network operators
   use the IAP-verified `/liquidity-write/transfers/*` mounts.
