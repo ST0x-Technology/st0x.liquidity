@@ -1671,6 +1671,28 @@ fn validate_asset_tables(
                 });
             }
         }
+
+        // A hedge capped below the partial hedge minimum is a sell the broker
+        // preflight can fill from a book that Position treats as unable to
+        // sell, so it would let a transfer reservation block a live hedge.
+        let minimum = HedgeFloor::minimum_shares();
+        let equities = &trading.assets.equities;
+        let chain_limit = equities.operational_limit.map(|limit| (None, limit));
+        let symbol_limits = equities.symbols.iter().filter_map(|(symbol, asset)| {
+            asset
+                .operational_limit
+                .map(|limit| (Some(symbol.clone()), limit))
+        });
+        for (symbol, limit) in chain_limit.into_iter().chain(symbol_limits) {
+            if limit.inner().inner().lt(minimum.inner())? {
+                return Err(CtxError::EquityOperationalLimitBelowMinimumHedge {
+                    chain: *chain,
+                    symbol,
+                    configured: limit.inner(),
+                    minimum,
+                });
+            }
+        }
     }
 
     // Startup seeds one vault per rebalancing-enabled equity, so a row that
@@ -3062,6 +3084,17 @@ pub enum CtxError {
     )]
     MissingCashVaultId,
     #[error(
+        "[chains.{chain}.trading.assets.equities] operational_limit {configured} (symbol \
+         {symbol:?}; None is the chain-wide limit) is below the smallest partial hedge, \
+         {minimum} shares"
+    )]
+    EquityOperationalLimitBelowMinimumHedge {
+        chain: Chain,
+        symbol: Option<Symbol>,
+        configured: FractionalShares,
+        minimum: FractionalShares,
+    },
+    #[error(
         "vault_ids in [chains.<name>.trading.assets.equities.{symbol}] is required when \
          rebalancing is enabled but not configured"
     )]
@@ -3160,6 +3193,9 @@ impl CtxError {
             Self::ChainRegistry(_) => "chain registry error",
             Self::CashOperationalLimitBelowMinimumTransfer { .. } => {
                 "cash operational limit below minimum transfer"
+            }
+            Self::EquityOperationalLimitBelowMinimumHedge { .. } => {
+                "equity operational limit below minimum hedge"
             }
             Self::CorridorChainNotConfigured { .. } => "USDC corridor chain not configured",
             Self::CorridorChainDisabled { .. } => "USDC corridor chain disabled",
@@ -5436,6 +5472,73 @@ mod tests {
             ),
             "a listed symbol with no [chains.<name>.trading.assets.equities] entry must be refused, got: {error:#}"
         );
+    }
+
+    /// A hedge capped below 0.01 share is a sell the broker can fill from a
+    /// book that Position treats as unable to sell, so a transfer reservation
+    /// admitted for a blocked sell hedge could block it.
+    #[tokio::test]
+    async fn an_equity_operational_limit_below_the_minimum_hedge_is_rejected() {
+        let config = toml_file(
+            r#"
+            database_url = ":memory:"
+            log_level = "debug"
+            server_port = 8080
+            board_port = 8081
+            apalis_finished_job_cleanup_interval_secs = 3600
+            inventory_divergence_threshold = 10
+            hedge_order_gate_reconciliation_timeout_secs = 10
+
+            [chains.base]
+            lifecycle = "active"
+            required_confirmations = 3
+
+            [chains.base.trading]
+            orderbook = "0x1111111111111111111111111111111111111111"
+            inventory_mode = "managed"
+            inventory_adapters = []
+            inventory = "0x2222222222222222222222222222222222222222"
+            vault_owner = "0x3333333333333333333333333333333333333333"
+            deployment_block = 1
+            ingestion_cutoff = "safe"
+            order_fill_poll_interval_secs = 1
+            primary = true
+
+            [chains.base.trading.assets.equities]
+            operational_limit = 0.005
+
+            [chains.ethereum]
+            lifecycle = "active"
+            required_confirmations = 12
+
+            [chains.hyperevm]
+            lifecycle = "observe-only"
+            required_confirmations = 1
+
+            [chains.robinhood]
+            lifecycle = "observe-only"
+            required_confirmations = 1
+
+        "#,
+        );
+        let secrets = alpaca_secrets_toml();
+        let error = Ctx::load_files(config.path(), secrets.path(), None)
+            .await
+            .unwrap_err();
+
+        let CtxError::EquityOperationalLimitBelowMinimumHedge {
+            chain,
+            symbol,
+            configured,
+            minimum,
+        } = error
+        else {
+            panic!("Expected EquityOperationalLimitBelowMinimumHedge, got: {error:#}");
+        };
+        assert_eq!(chain, Chain::Base);
+        assert_eq!(symbol, None);
+        assert_eq!(configured, FractionalShares::new(float!(0.005)));
+        assert_eq!(minimum, HedgeFloor::minimum_shares());
     }
 
     #[tokio::test]

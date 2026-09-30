@@ -3098,7 +3098,10 @@ enum TriggerReason {
   inventory view and the configured hedge floor. It drops the reservation before
   confirmation if the post-reservation plan is not a redemption or reports more
   broker shares. `transfer-equity --direction to-alpaca` reports it from the
-  broker inventory. Startup restoration always uses the standard admission.
+  broker inventory. Startup restoration always uses the standard admission. The
+  rule compares against the whole net, which is the hedge request because config
+  refuses an equity `operational_limit` (chain-wide or per symbol) below the
+  0.01-share partial hedge minimum.
 - A reservation that Position keeps rejecting for a needed hedge increments
   `equity_plan_declined_total{reason="blocked_by_hedge"}` and logs a warning
   after 5 minutes, then at most every 5 minutes per symbol.
