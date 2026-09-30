@@ -3533,6 +3533,10 @@ mod tests {
             unserved.starts_with("no served USDC corridor runs on"),
             "{unserved}"
         );
+        let none_served = transfer_usdc_corridor(&BTreeSet::new(), None)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(none_served, "this build serves no USDC corridor");
     }
 
     #[tokio::test]
