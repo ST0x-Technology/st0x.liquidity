@@ -2115,9 +2115,9 @@ type HedgedChainTokenizations =
     BTreeMap<Chain, ChainTokenization<Arc<dyn Wallet<Provider = RootProvider>>>>;
 
 /// One [`ChainTokenization`] per hedged chain. The primary always carries
-/// the equity leg: the rebalancer, the cash corridor and the recovery jobs
-/// run on its services until chain selection moves into the global
-/// rebalancer. A secondary carries it only when one of its equities opts
+/// the equity leg: the rebalancer and the recovery jobs run on its services
+/// until chain selection moves into the global rebalancer. Each cash
+/// corridor runs on its own chain's services. A secondary carries it only when one of its equities opts
 /// into rebalancing; otherwise it is hedge-only, keeps just its signer, and
 /// is logged as such. A chain carrying the leg without its own redemption
 /// wallet refuses startup naming the chain, rather than borrowing the

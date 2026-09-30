@@ -1930,9 +1930,10 @@ fn validate_config(
 }
 
 /// Checks the cash corridors against the chain tables: each corridor's chain
-/// is configured, enabled, holds a cash vault and is the primary (the cash
-/// path still runs there), and with USDC mode enabled every chain whose cash
-/// rebalances has a corridor.
+/// is configured, enabled and holds a cash vault, and with USDC mode enabled
+/// every chain whose cash rebalances has a corridor. Each corridor runs on its
+/// own chain; the primary pin is only SPEC rule 8, until the trigger checks
+/// every corridor.
 fn validate_usdc_corridor_chains(
     usdc: &UsdcRebalancing,
     chains: &BTreeMap<Chain, ChainConfig>,
@@ -12303,8 +12304,8 @@ mod tests {
         );
     }
 
-    /// The cash path still runs on the primary chain, so a corridor elsewhere
-    /// would size and guard transfers off the wrong vault.
+    /// SPEC rule 8 pins the corridor to the primary until the trigger checks
+    /// every corridor.
     #[test]
     fn corridor_chain_other_than_primary_is_refused() {
         let mut config = prod_config();
