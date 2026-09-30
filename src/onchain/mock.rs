@@ -96,6 +96,8 @@ pub struct MockRaindex {
     withdrawals_mined: bool,
     mined_txs: HashMap<TxHash, MinedTx>,
     mined_tx_read_errors: HashSet<TxHash>,
+    accounts_with_code: HashSet<Address>,
+    code_read_errors: HashSet<Address>,
 }
 
 fn successful_receipt(tx_hash: TxHash, logs: Vec<Log>) -> TransactionReceipt {
@@ -170,6 +172,8 @@ impl MockRaindex {
             withdrawals_mined: false,
             mined_txs: HashMap::new(),
             mined_tx_read_errors: HashSet::new(),
+            accounts_with_code: HashSet::new(),
+            code_read_errors: HashSet::new(),
         }
     }
 
@@ -201,6 +205,22 @@ impl MockRaindex {
     #[cfg(test)]
     pub(crate) fn with_mined_tx_read_error(mut self, tx_hash: TxHash) -> Self {
         self.mined_tx_read_errors.insert(tx_hash);
+        self
+    }
+
+    /// Makes `had_code_in_block` report `address` as holding code in every
+    /// block; every other address reads as codeless.
+    #[cfg(test)]
+    pub(crate) fn with_code_at(mut self, address: Address) -> Self {
+        self.accounts_with_code.insert(address);
+        self
+    }
+
+    /// Makes `had_code_in_block` fail to read `address` with a transport
+    /// error, as a node without that block's state would.
+    #[cfg(test)]
+    pub(crate) fn with_code_read_error(mut self, address: Address) -> Self {
+        self.code_read_errors.insert(address);
         self
     }
 
@@ -506,6 +526,16 @@ impl Raindex for MockRaindex {
         }
 
         Ok(self.mined_txs.get(&tx_hash).copied())
+    }
+
+    async fn had_code_in_block(&self, address: Address, _block: u64) -> Result<bool, RaindexError> {
+        if self.code_read_errors.contains(&address) {
+            return Err(RaindexError::RpcTransport(
+                alloy::transports::TransportErrorKind::backend_gone(),
+            ));
+        }
+
+        Ok(self.accounts_with_code.contains(&address))
     }
 
     async fn confirm_tx_receipt(

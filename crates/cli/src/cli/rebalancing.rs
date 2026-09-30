@@ -2070,27 +2070,30 @@ pub(crate) async fn reconcile_equity_transfer_command<W: Write>(
             }
 
             // The aggregate command is pure, so the chain proof that the
-            // signed withdrawal can never land is read here, before it.
-            match (entity.prepared_withdrawal(), superseding_tx) {
+            // signed withdrawal can never land is read here, before it, and the
+            // command refuses if the redemption holds another one by then.
+            let proven_withdrawal = match (entity.prepared_withdrawal(), superseding_tx) {
                 (Some(prepared), _) => {
                     verify_withdrawal(entity.chain(), prepared, superseding_tx)
                         .await
                         .with_context(|| {
                             format!("transfer reconcile: refusing to reconcile redemption {id}")
                         })?;
+                    Some(prepared.tx_hash())
                 }
                 (None, Some(_)) => anyhow::bail!(
                     "transfer reconcile: --superseding-tx applies only to a redemption with a \
                      signed vault withdrawal; redemption {id} has none. Refusing to act."
                 ),
-                (None, None) => {}
-            }
+                (None, None) => None,
+            };
 
             st0x_event_sorcery::send_command::<EquityRedemption>(
                 pool,
                 &redemption_id,
                 EquityRedemptionCommand::Reconcile {
                     reason: reason.into(),
+                    proven_withdrawal,
                 },
                 services,
             )
@@ -6193,6 +6196,7 @@ mod tests {
             id,
             EquityRedemptionCommand::Reconcile {
                 reason: "deposited manually via vault-deposit".to_string(),
+                proven_withdrawal: None,
             },
         )
         .await;

@@ -1359,10 +1359,8 @@ pub struct MinedTx {
     pub has_calldata: bool,
     /// The EIP-2718 type byte. `EIP7702_TX_TYPE_ID` sets code on accounts.
     pub tx_type: u8,
-    /// Whether `to` held code as the inclusion block started or as it ended: a
-    /// contract, or an account with an EIP-7702 delegation. `false` for a
-    /// contract creation.
-    pub to_has_code: bool,
+    /// The inclusion block.
+    pub block_number: u64,
     /// `false` when it reverted. A reverted tx still used its nonce.
     pub succeeded: bool,
     pub confirmations: u64,
@@ -1404,35 +1402,39 @@ pub async fn mined_tx(
         return Ok(None);
     };
 
-    let to = tx.to();
-    let to_has_code = match to {
-        // An EIP-7702 delegation runs code even on a plain call to the
-        // account, and any tx can set or clear it, so the head proves nothing
-        // about this tx: read the code before (as of the parent block) and at
-        // the end of the inclusion block. A node without that block's state
-        // fails the read rather than guessing.
-        Some(address) => {
-            let before = provider
-                .get_code_at(address)
-                .number(tx_block.saturating_sub(1))
-                .await?;
-            let after = provider.get_code_at(address).number(tx_block).await?;
-            !before.is_empty() || !after.is_empty()
-        }
-        None => false,
-    };
-
     Ok(Some(MinedTx {
         from: receipt.from,
-        to,
+        to: tx.to(),
         nonce: tx.nonce(),
         value: tx.value(),
         has_calldata: !tx.input().is_empty(),
         tx_type: tx.ty(),
-        to_has_code,
+        block_number: tx_block,
         succeeded: receipt.status(),
         confirmations: head.saturating_sub(tx_block).saturating_add(1),
     }))
+}
+
+/// Whether `address` held code as `block` started (as of its parent) or as it
+/// ended: a contract, or an account with an EIP-7702 delegation.
+///
+/// A delegation runs code even on a plain call to the account, and any tx can
+/// set or clear it, so the head proves nothing about a tx in `block`. Reading
+/// historical state needs a node that still holds it (a full node prunes it
+/// after about 128 blocks); one that does not fails the read rather than
+/// guessing.
+pub async fn had_code_in_block(
+    provider: &impl Provider,
+    address: Address,
+    block: u64,
+) -> alloy::transports::TransportResult<bool> {
+    let before = provider
+        .get_code_at(address)
+        .number(block.saturating_sub(1))
+        .await?;
+    let after = provider.get_code_at(address).number(block).await?;
+
+    Ok(!before.is_empty() || !after.is_empty())
 }
 
 /// Polls for a transaction receipt with confirmation depth, bypassing alloy's
@@ -2249,7 +2251,7 @@ mod tests {
             value: U256::from(1),
             has_calldata: false,
             tx_type: EIP1559_TX_TYPE_ID,
-            to_has_code: false,
+            block_number: 1,
             succeeded: true,
             confirmations: 1,
         };
@@ -2295,7 +2297,7 @@ mod tests {
                 value: U256::ZERO,
                 has_calldata: true,
                 tx_type: EIP1559_TX_TYPE_ID,
-                to_has_code: false,
+                block_number: 1,
                 succeeded: true,
                 confirmations: 1,
             })
@@ -2343,10 +2345,47 @@ mod tests {
                 value: U256::ZERO,
                 has_calldata: false,
                 tx_type: EIP1559_TX_TYPE_ID,
-                to_has_code: true,
+                block_number: 2,
                 succeeded: false,
                 confirmations: 1,
             })
+        );
+    }
+
+    #[tokio::test]
+    async fn had_code_in_block_sees_a_contract_but_not_an_eoa() {
+        let anvil = Anvil::new().spawn();
+        let provider = ProviderBuilder::new()
+            .wallet(anvil_signer(&anvil))
+            .connect_http(anvil.endpoint_url());
+
+        let deployment = provider
+            .send_transaction(
+                TransactionRequest::default().with_deploy_code(ALWAYS_REVERTS_INIT_CODE),
+            )
+            .await
+            .unwrap()
+            .get_receipt()
+            .await
+            .unwrap();
+        let deployed_in = deployment.block_number.unwrap();
+        let contract = deployment.contract_address.unwrap();
+
+        // Created during the block: no code as it started, code as it ended.
+        assert!(
+            had_code_in_block(&provider, contract, deployed_in)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !had_code_in_block(&provider, contract, deployed_in - 1)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !had_code_in_block(&provider, anvil.addresses()[0], deployed_in)
+                .await
+                .unwrap()
         );
     }
 

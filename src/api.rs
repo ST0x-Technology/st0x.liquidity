@@ -3254,7 +3254,7 @@ async fn reconcile_equity_transfer(
                     }),
                 ));
             }
-            check_signed_withdrawal_superseded(
+            let proven_withdrawal = check_signed_withdrawal_superseded(
                 &state,
                 &redemption_id,
                 &entity,
@@ -3264,7 +3264,10 @@ async fn reconcile_equity_transfer(
             send_command::<EquityRedemption>(
                 &state.pool,
                 &redemption_id,
-                EquityRedemptionCommand::Reconcile { reason },
+                EquityRedemptionCommand::Reconcile {
+                    reason,
+                    proven_withdrawal,
+                },
                 services,
             )
             .await
@@ -3291,14 +3294,17 @@ async fn reconcile_equity_transfer(
 
 /// The redemption command is pure, so the chain proof that a signed vault
 /// withdrawal can never land is read before it, through the bot's equity
-/// transfer on the redemption's own chain. A `supersedingTx` on a redemption
-/// with no signed withdrawal is a `400`.
+/// transfer on the redemption's own chain. Returns the proven withdrawal's
+/// hash (`None` when there is none), which the command checks is still the
+/// redemption's, so a withdrawal signed during the check is never reconciled
+/// unproven. A `supersedingTx` on a redemption with no signed withdrawal is a
+/// `400`.
 async fn check_signed_withdrawal_superseded(
     state: &AppState,
     id: &RedemptionAggregateId,
     redemption: &EquityRedemption,
     superseding_tx: Option<TxHash>,
-) -> Result<(), (StatusCode, Json<ErrorResponse>)> {
+) -> Result<Option<TxHash>, (StatusCode, Json<ErrorResponse>)> {
     let Some(prepared) = redemption.prepared_withdrawal() else {
         return match superseding_tx {
             Some(_) => Err((
@@ -3310,7 +3316,7 @@ async fn check_signed_withdrawal_superseded(
                     ),
                 }),
             )),
-            None => Ok(()),
+            None => Ok(None),
         };
     };
 
@@ -3339,15 +3345,19 @@ async fn check_signed_withdrawal_superseded(
         Err(error) => Err(error),
     };
 
-    verified.map_err(|error| {
-        warn!(?error, %id, "Refused to reconcile a redemption with a signed vault withdrawal");
-        let (status, message) = withdrawal_not_superseded_response(id, &error);
-        (status, Json(ErrorResponse { error: message }))
-    })
+    verified
+        .map(|()| Some(prepared.tx_hash()))
+        .map_err(|error| {
+            warn!(?error, %id, "Refused to reconcile a redemption with a signed vault withdrawal");
+            let (status, message) = withdrawal_not_superseded_response(id, &error);
+            (status, Json(ErrorResponse { error: message }))
+        })
 }
 
 /// Maps a refused vault withdrawal chain check to an HTTP status: an unproven
 /// withdrawal is a `409` naming why; a failed chain read is a transient `502`.
+/// A failed wallet code read is a `409` with its reason, since it keeps failing
+/// on a node that pruned the block's state.
 fn withdrawal_not_superseded_response(
     id: &RedemptionAggregateId,
     error: &WithdrawalNotSuperseded,
@@ -3364,6 +3374,7 @@ fn withdrawal_not_superseded_response(
         | WithdrawalNotSuperseded::SupersedingTxAtAnotherNonce { .. }
         | WithdrawalNotSuperseded::SupersedingTxUnconfirmed { .. }
         | WithdrawalNotSuperseded::SupersedingTxNotAPlainCancel { .. }
+        | WithdrawalNotSuperseded::WalletCodeUnreadable { .. }
         | WithdrawalNotSuperseded::NoConfirmationDepth { .. }
         | WithdrawalNotSuperseded::ChainServicesMissing(_) => (
             StatusCode::CONFLICT,
@@ -9985,7 +9996,7 @@ mod tests {
                 value: U256::ZERO,
                 has_calldata: false,
                 tx_type: EIP1559_TX_TYPE_ID,
-                to_has_code: false,
+                block_number: 1,
                 succeeded: true,
                 confirmations: 1,
             },
@@ -10036,7 +10047,7 @@ mod tests {
                 value: U256::ZERO,
                 has_calldata: true,
                 tx_type: EIP1559_TX_TYPE_ID,
-                to_has_code: true,
+                block_number: 1,
                 succeeded: false,
                 confirmations: 1,
             },
@@ -10230,6 +10241,21 @@ mod tests {
             },
         );
         assert_eq!(status, StatusCode::BAD_GATEWAY);
+
+        // A pruned node fails this read on every retry, so it is not a 502.
+        let unreadable_code = WithdrawalNotSuperseded::WalletCodeUnreadable {
+            superseding: tx,
+            bot_wallet: Address::repeat_byte(0xB0),
+            block: 42,
+            source: Box::new(st0x_raindex::RaindexError::ZeroAmount),
+        };
+        assert_eq!(
+            withdrawal_not_superseded_response(&id, &unreadable_code),
+            (
+                StatusCode::CONFLICT,
+                format!("Redemption {id}: refusing to reconcile: {unreadable_code}")
+            )
+        );
     }
 
     #[tokio::test]

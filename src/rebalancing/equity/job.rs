@@ -3316,6 +3316,7 @@ mod tests {
                 &id,
                 EquityRedemptionCommand::Reconcile {
                     reason: "withdrawal verified dead onchain".to_string(),
+                    proven_withdrawal: Some(prepared.tx_hash()),
                 },
             )
             .await

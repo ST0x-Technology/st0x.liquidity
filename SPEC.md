@@ -6152,8 +6152,9 @@ withdrawal itself mined and reverted, which used its nonce and moved nothing, so
 no replacement is named. Or the withdrawal has no receipt and the named tx is a
 different tx from the bot wallet at its nonce that moved nothing: it either
 reverted, or is a plain cancel, a 0-value transfer with no calldata from the bot
-wallet to itself that is not EIP-7702 while the wallet holds no code. Any other
-successful tx (a fee bumped copy of the withdrawal, a call through another
+wallet to itself that is not EIP-7702 while the wallet held no code in that tx's
+block (read only for such a cancel, since it needs that block's state). Any
+other successful tx (a fee bumped copy of the withdrawal, a call through another
 contract, a contract creation, or code run at the wallet through an EIP-7702
 delegation) may have withdrawn the vault and is refused. Either way nothing
 moved, so the manual equity settlement is the same. A withdrawal that mined
@@ -6165,11 +6166,14 @@ lagging node refuses rather than proves. The check runs before the pure
 `Reconcile` command in both the CLI and the bot's reconcile route (`409` with
 the reason, `502` on a failed chain read, `503` before the bot is ready); a
 `supersedingTx` on a mint, or on a redemption with no signed withdrawal, is
-refused. In both cases a mined transaction already used the nonce, and that is
-what lets later sends proceed. The release is bookkeeping: it drops the bot's
-hold on the used nonce and does not rewind nonce allocation onto it. A prepared
-transaction discarded before broadcast (a persist-failure rollback) is
-different: its nonce is unused, so allocation is rewound to refill it.
+refused. The command carries the hash of the withdrawal it proved (none when the
+redemption held none) and refuses if the redemption now holds a different one,
+such as a withdrawal the live job signed while the check ran. In both cases a
+mined transaction already used the nonce, and that is what lets later sends
+proceed. The release is bookkeeping: it drops the bot's hold on the used nonce
+and does not rewind nonce allocation onto it. A prepared transaction discarded
+before broadcast (a persist-failure rollback) is different: its nonce is unused,
+so allocation is rewound to refill it.
 
 The `Reconciled` state retains the identifying fields (symbol, quantity,
 original failure reason, request/redemption identifiers) so the dashboard
