@@ -16,6 +16,7 @@
 //! `Wallet::submit` (write transactions), so consumers get
 //! human-readable revert reasons without manual wiring.
 
+use alloy::consensus::transaction::SignerRecoverable as _;
 use alloy::consensus::{Transaction, TxEnvelope};
 use alloy::eips::BlockId;
 #[cfg(any(feature = "turnkey", feature = "local-signer"))]
@@ -730,6 +731,21 @@ impl PreparedTransaction {
     pub fn raw(&self) -> &Bytes {
         &self.raw
     }
+
+    /// The account that signed these bytes, or `None` when they are not a
+    /// signed envelope a signer can be recovered from.
+    pub fn signer(&self) -> Option<Address> {
+        TxEnvelope::decode_2718_exact(self.raw.as_ref())
+            .ok()?
+            .recover_signer()
+            .ok()
+    }
+
+    /// The address these bytes call, or `None` when they are not a signed
+    /// envelope or create a contract.
+    pub fn to(&self) -> Option<Address> {
+        TxEnvelope::decode_2718_exact(self.raw.as_ref()).ok()?.to()
+    }
 }
 
 impl<'de> Deserialize<'de> for PreparedTransaction {
@@ -1330,6 +1346,60 @@ impl ReceiptWaitConfig {
             dropped_consecutive_misses: DROPPED_TX_CONSECUTIVE_MISSES,
         }
     }
+}
+
+/// A mined transaction as the node reports it: who sent it, what it called,
+/// at which nonce, whether it succeeded, and how deep it is (the inclusion
+/// block counts as confirmation 1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MinedTx {
+    pub from: Address,
+    /// `None` for a contract creation.
+    pub to: Option<Address>,
+    pub nonce: u64,
+    /// `false` when it reverted. A reverted tx still used its nonce.
+    pub succeeded: bool,
+    pub confirmations: u64,
+}
+
+/// Returns `tx_hash` as mined, or `None` while the node shows no receipt or
+/// no transaction for it, or the receipt's block is not the canonical block
+/// at its height. Does not wait.
+pub async fn mined_tx(
+    provider: &impl Provider,
+    tx_hash: TxHash,
+) -> Result<Option<MinedTx>, EvmError> {
+    let Some(receipt) = provider.get_transaction_receipt(tx_hash).await? else {
+        return Ok(None);
+    };
+
+    let (Some(tx_block), Some(receipt_block_hash)) = (receipt.block_number, receipt.block_hash)
+    else {
+        return Ok(None);
+    };
+
+    // Reads are not pinned to one node, so a lagging node can serve a
+    // receipt from a reorged-out block while the head comes from another:
+    // count confirmations only for a receipt in the canonical block.
+    let canonical = provider.get_block_by_number(tx_block.into()).await?;
+    if canonical.is_none_or(|block| block.header.hash != receipt_block_hash) {
+        warn!(target: "wallet", %tx_hash, tx_block, %receipt_block_hash, "Receipt block is not the canonical block at its height; treating the tx as not mined");
+        return Ok(None);
+    }
+
+    let Some(tx) = provider.get_transaction_by_hash(tx_hash).await? else {
+        return Ok(None);
+    };
+
+    let head = provider.get_block_number().await?;
+
+    Ok(Some(MinedTx {
+        from: receipt.from,
+        to: tx.to(),
+        nonce: tx.nonce(),
+        succeeded: receipt.status(),
+        confirmations: head.saturating_sub(tx_block).saturating_add(1),
+    }))
 }
 
 /// Polls for a transaction receipt with confirmation depth, bypassing alloy's

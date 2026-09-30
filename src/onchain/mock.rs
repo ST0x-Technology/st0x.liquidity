@@ -7,12 +7,13 @@ use alloy::sol_types::SolEvent;
 #[cfg(test)]
 use alloy::transports::{RpcError, TransportErrorKind};
 use async_trait::async_trait;
+use std::collections::HashMap;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 #[cfg(test)]
 use st0x_evm::EvmError;
-use st0x_evm::{IERC20, PreparedTransaction};
+use st0x_evm::{IERC20, MinedTx, PreparedTransaction};
 use st0x_raindex::{Raindex, RaindexError, RaindexVaultId};
 
 /// Whether `submit_deposit` should succeed, fail generically, or fail
@@ -93,6 +94,7 @@ pub struct MockRaindex {
     fail_restore: bool,
     released_superseded_withdrawals: Mutex<Vec<TxHash>>,
     withdrawals_mined: bool,
+    mined_txs: HashMap<TxHash, MinedTx>,
 }
 
 fn successful_receipt(tx_hash: TxHash, logs: Vec<Log>) -> TransactionReceipt {
@@ -165,6 +167,7 @@ impl MockRaindex {
             fail_restore: false,
             released_superseded_withdrawals: Mutex::new(Vec::new()),
             withdrawals_mined: false,
+            mined_txs: HashMap::new(),
         }
     }
 
@@ -180,6 +183,14 @@ impl MockRaindex {
     #[cfg(test)]
     pub(crate) fn with_mined_withdrawals(mut self) -> Self {
         self.withdrawals_mined = true;
+        self
+    }
+
+    /// Makes `mined_tx` report `tx_hash` as `mined`; every other hash reads
+    /// as not mined.
+    #[cfg(test)]
+    pub(crate) fn with_mined_tx(mut self, tx_hash: TxHash, mined: MinedTx) -> Self {
+        self.mined_txs.insert(tx_hash, mined);
         self
     }
 
@@ -475,6 +486,10 @@ impl Raindex for MockRaindex {
 
     async fn tx_mined(&self, _tx_hash: TxHash) -> Result<bool, RaindexError> {
         Ok(self.withdrawals_mined)
+    }
+
+    async fn mined_tx(&self, tx_hash: TxHash) -> Result<Option<MinedTx>, RaindexError> {
+        Ok(self.mined_txs.get(&tx_hash).copied())
     }
 
     async fn confirm_tx_receipt(

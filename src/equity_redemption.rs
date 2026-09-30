@@ -1409,10 +1409,11 @@ impl EquityRedemption {
     /// Whether an operator may `Reconcile` this redemption to the terminal
     /// `Reconciled` state: the `Failed` terminal, or a withdrawal submission
     /// state (`VaultWithdrawPending`, `VaultWithdrawSubmitting`,
-    /// `VaultWithdrawSubmitted`) whose fate the operator has verified onchain.
-    /// The timeout sweep never fails those submission states, because their
-    /// withdrawal may have landed, so reconcile is their manual escape hatch
-    /// once the operator confirms the withdrawal will never land.
+    /// `VaultWithdrawSubmitted`). The timeout sweep never fails those
+    /// submission states, because their withdrawal may have landed, so
+    /// reconcile is their manual escape hatch. The command is pure, so for one
+    /// holding a [`prepared_withdrawal`](Self::prepared_withdrawal) the caller
+    /// proves on chain that it can never land before sending it.
     pub fn is_operator_reconcilable(&self) -> bool {
         self.is_failed()
             || matches!(
@@ -1421,6 +1422,27 @@ impl EquityRedemption {
                     | Self::VaultWithdrawSubmitting { .. }
                     | Self::VaultWithdrawSubmitted { .. }
             )
+    }
+
+    /// The exact signed vault withdrawal this redemption persisted before its
+    /// first broadcast, while it is unresolved. A legacy hash-only
+    /// `VaultWithdrawSubmitted` carries none.
+    pub fn prepared_withdrawal(&self) -> Option<&PreparedTransaction> {
+        match self {
+            Self::VaultWithdrawSubmitting { prepared, .. } => Some(prepared),
+            Self::VaultWithdrawSubmitted { prepared, .. } => prepared.as_ref(),
+            Self::VaultWithdrawPending { .. }
+            | Self::WithdrawnFromRaindex { .. }
+            | Self::UnwrapPending { .. }
+            | Self::UnwrapSubmitted { .. }
+            | Self::TokensUnwrapped { .. }
+            | Self::SendPending { .. }
+            | Self::TokensSent { .. }
+            | Self::Pending { .. }
+            | Self::Completed { .. }
+            | Self::Failed { .. }
+            | Self::Reconciled { .. } => None,
+        }
     }
 
     pub(crate) fn to_dto(&self, id: &RedemptionAggregateId) -> TransferOperation {

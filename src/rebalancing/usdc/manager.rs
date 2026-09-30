@@ -4,7 +4,6 @@
 //! `CctpBridge`, `RaindexService`, and the `UsdcRebalance` aggregate to
 //! execute USDC transfers between Alpaca and Base.
 
-use alloy::consensus::transaction::SignerRecoverable as _;
 use alloy::consensus::{Transaction as _, TxEnvelope};
 use alloy::eips::eip2718::Decodable2718 as _;
 use alloy::primitives::{Address, B256, TxHash, U256};
@@ -19,13 +18,13 @@ use tracing::{debug, error, info, instrument, warn};
 use uuid::Uuid;
 
 use st0x_bridge::cctp::{
-    AttestationResponse, CctpBridge, CctpError, MinedTx, MintScanFloorCheck, UsdcTransferStatus,
+    AttestationResponse, CctpBridge, CctpError, MintScanFloorCheck, UsdcTransferStatus,
 };
 use st0x_bridge::corridor::UsdcCorridor;
 use st0x_bridge::{Attestation, Bridge, BridgeDirection, BurnReceipt, BurnTxStatus, MintReceipt};
 use st0x_config::{ALPACA_MINIMUM_WITHDRAWAL, ALPACA_TO_BASE_MINIMUM_TRANSFER, ChainRegistry};
 use st0x_event_sorcery::Store;
-use st0x_evm::{Chain, IERC20, PreparedTransaction, USDC_BASE, Wallet};
+use st0x_evm::{Chain, IERC20, MinedTx, PreparedTransaction, USDC_BASE, Wallet};
 use st0x_execution::alpaca_broker_api::CryptoOrderResponse;
 use st0x_execution::{
     AlpacaAmount, AlpacaBrokerApiError, AlpacaTransferId, AlpacaWalletError, AlpacaWalletService,
@@ -6615,7 +6614,8 @@ pub async fn verify_deposit_send_superseded<Helper: UsdcBridgeHelper + ?Sized>(
         return Err(DepositSendNotSuperseded::SupersedingTxIsTheSend { tx });
     }
 
-    let signer = deposit_send_signer(prepared)
+    let signer = prepared
+        .signer()
         .ok_or(DepositSendNotSuperseded::UnreadableDepositSend { tx })?;
     if signer != bot_wallet {
         return Err(DepositSendNotSuperseded::SendSignedByAnotherWallet {
@@ -6634,6 +6634,7 @@ pub async fn verify_deposit_send_superseded<Helper: UsdcBridgeHelper + ?Sized>(
         from,
         nonce: superseding_nonce,
         confirmations,
+        ..
     }) = mined
     else {
         return Err(DepositSendNotSuperseded::SupersedingTxNotMined { superseding });
@@ -6694,14 +6695,6 @@ pub async fn verify_deposit_send_superseded<Helper: UsdcBridgeHelper + ?Sized>(
 
     info!(target: "rebalance", %id, %superseding, %recorded_by, "Superseding tx is another transfer's deposit send");
     Ok(())
-}
-
-/// The account that signed the deposit send.
-fn deposit_send_signer(prepared: &PreparedTransaction) -> Option<Address> {
-    TxEnvelope::decode_2718_exact(prepared.raw().as_ref())
-        .ok()?
-        .recover_signer()
-        .ok()
 }
 
 /// The address a signed deposit send pays: the `to` of its USDC `transfer`.

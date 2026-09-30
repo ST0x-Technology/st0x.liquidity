@@ -747,10 +747,10 @@ pub(crate) struct TransferEquityToHedgingCtx {
     /// (ADR 0017 SS4: "failure in cost recording never blocks trading")
     /// instead of consuming the apalis retry budget.
     pub(crate) job_queue: TransferEquityToHedgingJobQueue,
-    /// Operational-alert channel. A stuck prepared withdrawal the market
-    /// out-fees can never confirm and is never fee-bumped; once its durable
-    /// deadline elapses the reconciliation redrive pages the operator through
-    /// this notifier instead of stalling silently forever.
+    /// Operational alert channel. A stuck prepared withdrawal the market
+    /// outbids will not confirm at its fee and is never fee bumped; once its
+    /// durable deadline elapses the reconciliation redrive pages the operator
+    /// through this notifier instead of stalling silently forever.
     pub(crate) notifier: Arc<dyn Notifier>,
 }
 
@@ -1055,13 +1055,16 @@ impl Job<TransferEquityToHedgingCtx> for TransferEquityToHedging {
                 let message = format!(
                     "Equity redemption {} ({}) exhausted its transfer job budget while its \
                      Raindex vault withdrawal is unresolved, and no live job remains to drive \
-                     it. Verify the withdrawal onchain. To abandon it, send a 0-value \
-                     self-transfer at its nonce and wait for that to confirm (skip this if the \
-                     withdrawal itself mined and reverted); only then reconcile it \
-                     (`stox transfer reconcile --kind redemption --id {}`), which releases its \
-                     reservation and the wallet's hold on its nonce. If the withdrawal mined \
-                     successfully, do not reconcile: run `stox transfer resume --kind equity` \
-                     or restart the bot so a new resume confirms it.",
+                     it. Check the withdrawal onchain. If it mined successfully, do not \
+                     reconcile: run `stox transfer resume --kind equity` or restart the bot so \
+                     a new resume confirms it. If it mined and reverted, it moved nothing: \
+                     reconcile it (`stox transfer reconcile --kind redemption --id {}`). \
+                     Otherwise it will not confirm at its current fee but can still mine when \
+                     fees drop, so cancel it first: send a 0-value self-transfer from the bot \
+                     wallet at its nonce, with fees above the withdrawal's, and wait for that \
+                     to confirm. Only then settle the equity by hand and reconcile with \
+                     `--superseding-tx <cancel tx>`, which releases its reservation and the \
+                     wallet's hold on its nonce.",
                     self.aggregate_id, self.symbol, self.aggregate_id,
                 );
                 if let Err(alert_error) = ctx.notifier.notify(&message).await {

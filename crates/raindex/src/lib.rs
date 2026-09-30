@@ -12,7 +12,7 @@ use alloy::rpc::types::TransactionReceipt;
 use alloy::transports::{RpcError, TransportErrorKind};
 use async_trait::async_trait;
 
-use st0x_evm::{EvmError, PreparedTransaction, is_transient_rpc};
+use st0x_evm::{EvmError, MinedTx, PreparedTransaction, is_transient_rpc};
 
 #[cfg(feature = "rain")]
 mod service;
@@ -286,6 +286,10 @@ pub trait Raindex: Send + Sync {
 
     /// Whether `tx_hash` has a receipt now, reverted or not. Does not wait.
     async fn tx_mined(&self, tx_hash: TxHash) -> Result<bool, RaindexError>;
+
+    /// `tx_hash` as mined on this chain, or `None` while the node shows no
+    /// canonical receipt for it. Does not wait. See [`st0x_evm::mined_tx`].
+    async fn mined_tx(&self, tx_hash: TxHash) -> Result<Option<MinedTx>, RaindexError>;
 
     /// Wait for a previously submitted transaction to be confirmed.
     async fn confirm_tx(&self, tx_hash: TxHash) -> Result<(), RaindexError> {

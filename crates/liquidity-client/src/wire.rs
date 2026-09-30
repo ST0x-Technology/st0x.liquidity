@@ -28,8 +28,13 @@ pub(crate) enum ReconcileUsdcReason {
 /// Body of `POST /transfers/{kind}/{id}/reconcile` for an equity mint or
 /// redemption.
 #[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 pub(crate) struct ReconcileEquityRequest {
     pub(crate) reason: String,
+    /// The tx that took a redemption's signed vault withdrawal nonce;
+    /// omitted when absent, as the bot's `#[serde(default)]` expects.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) superseding_tx: Option<String>,
 }
 
 /// Body of `POST /transfers/usdc/{id}/clear-pending-burn`.

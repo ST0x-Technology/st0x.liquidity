@@ -81,7 +81,8 @@ use st0x_float_macro::float;
 use tracing::{debug, info, warn};
 
 use st0x_evm::{
-    Chain, EvmError, IntoErrorRegistry, OpenChainErrorRegistry, PreparedTransaction, Wallet,
+    Chain, EvmError, IntoErrorRegistry, MinedTx, OpenChainErrorRegistry, PreparedTransaction,
+    Wallet,
 };
 use st0x_float_serde::{deserialize_float_from_number_or_string, format_float_with_fallback};
 
@@ -454,15 +455,6 @@ pub enum UsdcTransferStatus {
     Reverted,
     /// Absent from the mempool past the drop grace window, never mined.
     Dropped,
-}
-
-/// A mined Ethereum transaction: who sent it, at which nonce, and how deep
-/// it is (the inclusion block counts as confirmation 1).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct MinedTx {
-    pub from: Address,
-    pub nonce: u64,
-    pub confirmations: u64,
 }
 
 /// Errors that can occur during CCTP bridge operations.
@@ -1302,8 +1294,8 @@ impl<EthWallet: Wallet, BaseWallet: Wallet> CctpBridge<EthWallet, BaseWallet> {
         self.ethereum.tx_confirmations(tx_hash).await
     }
 
-    /// Returns the sender, nonce and confirmations of `tx_hash` on Ethereum,
-    /// or `None` while the node shows no receipt for it.
+    /// Returns `tx_hash` as mined on Ethereum, or `None` while the node shows
+    /// no canonical receipt for it.
     pub async fn ethereum_mined_tx(&self, tx_hash: TxHash) -> Result<Option<MinedTx>, CctpError> {
         self.ethereum.mined_tx(tx_hash).await
     }

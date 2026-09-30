@@ -32,7 +32,7 @@ use tokio::sync::Mutex;
 use st0x_bridge::corridor::UsdcCorridor;
 use st0x_config::ChainEquities;
 use st0x_event_sorcery::{RetryOnBusy, Store, StoreBuilder};
-use st0x_evm::{Chain, IERC20, PreparedTransaction};
+use st0x_evm::{Chain, IERC20, MinedTx, PreparedTransaction};
 use st0x_execution::{AlpacaTransferId, ClientOrderId, FractionalShares, Network, Symbol};
 use st0x_finance::Usdc;
 use st0x_raindex::{Raindex, RaindexError, RaindexVaultId};
@@ -918,6 +918,10 @@ impl Raindex for FixtureRaindex {
 
     async fn tx_mined(&self, _tx_hash: TxHash) -> Result<bool, RaindexError> {
         unimplemented!("FixtureRaindex: redemption fixture never restores at startup")
+    }
+
+    async fn mined_tx(&self, _tx_hash: TxHash) -> Result<Option<MinedTx>, RaindexError> {
+        unimplemented!("FixtureRaindex: redemption fixture never reconciles a withdrawal")
     }
 
     async fn confirm_tx_receipt(
