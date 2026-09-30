@@ -9233,7 +9233,7 @@ mod tests {
     /// The shipped prod and staging configs run Robinhood Chain as a
     /// prefunded hedge-only secondary: fills on every listed equity are
     /// ingested and hedged, nothing is rebalanced, and Bebop is not mapped.
-    /// Both list the two launch equities; prod also lists PLBY and GRND.
+    /// Both list the two launch equities; prod also lists PLBY, GRND, and SNES.
     #[test]
     fn shipped_configs_hedge_robinhood_prefunded_without_rebalancing() {
         let orderbook = address!("0x37FC0EFec37D19f8A221aa4F8F7600C9ba2AcD20");
@@ -9267,6 +9267,13 @@ mod tests {
                 (
                     address!("0xdca06fddf5320870C8E9D0534aa102677C36bCc4"),
                     address!("0xB80Bd4D599EeBBF2851d4E7F5594918B82FF1823"),
+                ),
+            ),
+            (
+                Symbol::new("SNES").unwrap(),
+                (
+                    address!("0xF8bF43D61E4Cd2a5b5DfaD01BaC84693d7B95e51"),
+                    address!("0x06096908dBC38fc54509024674E4fd1891B5F7CA"),
                 ),
             ),
         ];
