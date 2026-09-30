@@ -82,23 +82,6 @@ impl GasReadiness {
         }
     }
 
-    /// Build readiness for the rebalancer from the validated alert thresholds
-    /// and the two signing wallets of the USDC corridor; equity legs submit on
-    /// Base.
-    pub fn from_wallets<Signer: Wallet + ?Sized>(
-        alerts: &AlertsCtx,
-        base_wallet: &Signer,
-        ethereum_wallet: &Signer,
-    ) -> anyhow::Result<Arc<Self>> {
-        Self::for_equity_chain(
-            alerts,
-            Chain::Base,
-            base_wallet,
-            base_wallet,
-            ethereum_wallet,
-        )
-    }
-
     /// Build readiness for the USDC transfers of the corridor on
     /// `corridor_chain`: its route checks `chain_wallet` there and
     /// `ethereum_wallet` on the Ethereum hub. The equity slot reads the
@@ -498,7 +481,7 @@ mod tests {
     }
 
     #[test]
-    fn from_wallets_uses_each_wallet_and_validated_threshold() {
+    fn for_usdc_corridor_on_base_uses_each_wallet_and_validated_threshold() {
         let base_wallet = StubWallet::stub(Address::with_last_byte(1));
         let ethereum_wallet = StubWallet::stub(Address::with_last_byte(2));
         let alerts = AlertsCtx::for_test(
@@ -511,10 +494,13 @@ mod tests {
         );
 
         let readiness =
-            GasReadiness::from_wallets(&alerts, &base_wallet, &ethereum_wallet).unwrap();
+            GasReadiness::for_usdc_corridor(&alerts, Chain::Base, &base_wallet, &ethereum_wallet)
+                .unwrap();
 
+        assert_eq!(readiness.usdc_chain.chain, Chain::Base);
         assert_eq!(readiness.usdc_chain.wallet, base_wallet.address());
         assert_eq!(readiness.usdc_chain.threshold, U256::from(50_u64));
+        assert_eq!(readiness.ethereum.chain, Chain::Ethereum);
         assert_eq!(readiness.ethereum.wallet, ethereum_wallet.address());
         assert_eq!(readiness.ethereum.threshold, U256::from(100_u64));
         assert_eq!(readiness.equity.chain, Chain::Base);
