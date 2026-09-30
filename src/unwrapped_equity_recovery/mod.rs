@@ -4,8 +4,9 @@
 //! - [`aggregate`]: event-sourced aggregate that records each recovery
 //!   action's lifecycle for audit.
 //! - [`job`]: apalis job consumed by the recovery worker; enqueued by the
-//!   rebalancing reactor whenever a `BaseWalletUnwrappedEquity` snapshot
-//!   event reports a positive balance.
+//!   rebalancing reactor whenever a chain's unwrapped wallet snapshot event
+//!   (`BaseWalletUnwrappedEquity` on Base, `ChainWalletUnwrappedEquity`
+//!   elsewhere) reports a positive balance.
 
 pub(crate) mod aggregate;
 mod job;

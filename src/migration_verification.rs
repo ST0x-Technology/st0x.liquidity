@@ -493,6 +493,12 @@ impl DurableSymbolReferences for InventorySnapshot {
             .chain(self.offchain_equity.keys())
             .chain(self.base_wallet_unwrapped_equity.keys())
             .chain(self.base_wallet_wrapped_equity.keys())
+            .chain(
+                self.wallet_unwrapped_equity
+                    .values()
+                    .flat_map(BTreeMap::keys),
+            )
+            .chain(self.wallet_wrapped_equity.values().flat_map(BTreeMap::keys))
             .chain(self.inflight_mints.keys())
             .chain(self.inflight_redemptions.keys());
         for symbol in symbols {
