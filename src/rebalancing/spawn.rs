@@ -1,6 +1,5 @@
 //! Builds the rebalancing transfer infrastructure.
 
-use alloy::primitives::Address;
 use alloy::providers::RootProvider;
 use sqlx::SqlitePool;
 use std::collections::HashMap;
@@ -14,7 +13,7 @@ use st0x_config::{ChainEquityAsset, OnchainWalletCtx};
 use st0x_event_sorcery::Store;
 use st0x_evm::Wallet;
 use st0x_execution::{AlpacaWalletService, EmptySymbolError, Symbol};
-use st0x_raindex::{RaindexService, RaindexVaultId};
+use st0x_raindex::{RaindexContracts, RaindexService, RaindexVaultId};
 use st0x_wrapper::WrappedEquity;
 
 use super::usdc::{
@@ -71,6 +70,16 @@ pub(crate) struct UsdcTransferResumeHandles {
     pub(crate) recover_cctp_mint: Arc<dyn RecoverCctpMint>,
 }
 
+/// Where one served cash corridor's transfers run: the signer, orderbook
+/// contracts, cash vault and confirmation depth of its chain.
+pub(crate) struct UsdcCorridorEndpoints<Signer> {
+    pub(crate) corridor: UsdcCorridor,
+    pub(crate) chain_wallet: Signer,
+    pub(crate) contracts: RaindexContracts,
+    pub(crate) vault_id: RaindexVaultId,
+    pub(crate) required_confirmations: u64,
+}
+
 #[derive(Clone)]
 pub(crate) struct EthereumWallet<Signer>(pub(crate) Signer);
 
@@ -106,8 +115,6 @@ pub(crate) struct RebalancerServices<Signer: Wallet> {
     broker: InstrumentedAlpacaBroker,
     wallet: Arc<AlpacaWalletService>,
     cctp: Arc<CctpBridge<Signer, Signer>>,
-    /// The cash corridor the CCTP pair carries.
-    corridor: UsdcCorridor,
     raindex: Arc<RaindexService<Signer>>,
     settlement: UsdcSettlementParams,
 }
@@ -130,7 +137,6 @@ impl<Signer: Wallet + Clone> RebalancerServices<Signer> {
             ethereum: EthereumWallet(ethereum_wallet),
             base: BaseWallet(base_wallet),
         } = wallets;
-        let usdc_corridor = corridor.usdc_corridor();
         let cctp = Arc::new(
             CctpBridge::try_from_ctx(CctpCtx {
                 corridor,
@@ -150,7 +156,6 @@ impl<Signer: Wallet + Clone> RebalancerServices<Signer> {
             broker,
             wallet,
             cctp,
-            corridor: usdc_corridor,
             raindex,
             settlement,
         })
@@ -164,8 +169,7 @@ impl<Signer: Wallet + Clone> RebalancerServices<Signer> {
     /// required query processors.
     pub(crate) fn into_usdc_transfer_handles(
         self,
-        market_maker_wallet: Address,
-        usdc_vault_id: RaindexVaultId,
+        market_making_endpoints: MarketMakingUsdcEndpoints,
         usdc: Arc<Store<UsdcRebalance>>,
         pool: SqlitePool,
         bot_gas_enqueuer: BotGasReceiptCostEnqueuer,
@@ -179,7 +183,7 @@ impl<Signer: Wallet + Clone> RebalancerServices<Signer> {
                 self.cctp,
                 self.raindex,
                 usdc,
-                MarketMakingUsdcEndpoints::new(self.corridor, market_maker_wallet, usdc_vault_id),
+                market_making_endpoints,
                 &self.settlement,
                 bot_gas_enqueuer,
             )
@@ -211,7 +215,7 @@ mod tests {
     use crate::inventory::PollFreshness;
     use alloy::network::Ethereum;
     use alloy::node_bindings::Anvil;
-    use alloy::primitives::{B256, U256, address, b256};
+    use alloy::primitives::{Address, B256, U256, address, b256};
     use alloy::providers::ext::AnvilApi as _;
     use alloy::providers::fillers::{
         BlobGasFiller, ChainIdFiller, FillProvider, GasFiller, JoinFill, NonceFiller,
@@ -467,7 +471,6 @@ mod tests {
         ));
 
         let services = RebalancerServices {
-            corridor: UsdcCorridor::BASE_CCTP,
             broker,
             wallet,
             cctp,
@@ -564,8 +567,11 @@ mod tests {
             restore_deposit_sends: _,
             recover_cctp_mint: _,
         } = services.into_usdc_transfer_handles(
-            Address::random(),
-            RaindexVaultId(B256::ZERO),
+            MarketMakingUsdcEndpoints::new(
+                UsdcCorridor::BASE_CCTP,
+                Address::random(),
+                RaindexVaultId(B256::ZERO),
+            ),
             usdc_store,
             pool,
             BotGasReceiptCostEnqueuer::Disabled,

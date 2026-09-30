@@ -37,6 +37,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 use url::Url;
 
+use st0x_bridge::corridor::UsdcCorridor;
 use st0x_config::{
     AlertsCtx, BrokerCtx, ChainAssets, ChainRole, Ctx, CtxError, ExecutionThreshold, HedgedChain,
     HedgingAssets, InventoryMode, IssuanceStatusCtx, OnchainWalletCtx, OperationMode,
@@ -126,13 +127,15 @@ use crate::rebalancing::equity::{
 };
 use crate::rebalancing::trigger::{GUARD_GENERATION, GuardGeneration, GuardState};
 use crate::rebalancing::usdc::{
-    RecheckUsdcDeposit, RecoverCctpMint, RestoredDepositSends, TransferUsdcToHedging,
-    TransferUsdcToHedgingCtx, TransferUsdcToMarketMaking, TransferUsdcToMarketMakingCtx,
-    UsdcDriverPause, UsdcSettlementParams, deposit_send_required_confirmations,
+    MarketMakingUsdcEndpoints, RecheckUsdcDeposit, RecoverCctpMint, RestoredDepositSends,
+    TransferUsdcToHedging, TransferUsdcToHedgingCtx, TransferUsdcToMarketMaking,
+    TransferUsdcToMarketMakingCtx, UsdcDriverPause, UsdcSettlementParams,
+    deposit_send_required_confirmations,
 };
 use crate::rebalancing::{
     BaseWallet, ChainRebalancingConfig, ChainWallets, EthereumWallet, RebalancerServices,
-    RebalancingSchedulers, RebalancingService, RebalancingServiceConfig, to_wrapped_equities,
+    RebalancingSchedulers, RebalancingService, RebalancingServiceConfig, UsdcCorridorEndpoints,
+    to_wrapped_equities,
 };
 use crate::startup::StartupToken;
 use crate::telemetry::broker::InstrumentedAlpacaBroker;
@@ -2443,6 +2446,34 @@ fn build_rebalancing_raindex_service<Signer: Wallet + Clone>(
     ))
 }
 
+/// Resolves where `corridor`'s transfers run: the signer, orderbook
+/// contracts, first cash vault and confirmation depth of the primary chain.
+fn usdc_corridor_endpoints<Signer: Wallet + Clone>(
+    ctx: &Ctx,
+    tokenizations: &BTreeMap<Chain, ChainTokenization<Signer>>,
+    corridor: UsdcCorridor,
+) -> anyhow::Result<UsdcCorridorEndpoints<Signer>> {
+    let hedged = ctx.chains.primary();
+    let chain = hedged.chain;
+    let tokenization = tokenizations
+        .get(&chain)
+        .with_context(|| format!("no tokenization services were built for {chain}"))?;
+    let vault_id = hedged
+        .assets
+        .cash
+        .as_ref()
+        .and_then(|cash| cash.vault_ids.first().copied())
+        .ok_or(CtxError::MissingCashVaultId)?;
+
+    Ok(UsdcCorridorEndpoints {
+        corridor,
+        chain_wallet: tokenization.wallet.clone(),
+        contracts: crate::onchain::raindex_contracts(hedged),
+        vault_id: RaindexVaultId(vault_id),
+        required_confirmations: hedged.required_confirmations,
+    })
+}
+
 /// Startup preflight for the shared-inventory rebalancing path: the bot must
 /// hold `OPERATOR_ROLE` on the configured inventory or every rebalance
 /// deposit/withdraw reverts. Fails fast with a clear error rather than burning
@@ -3367,12 +3398,10 @@ fn build_hedged_equity_services<Signer: Wallet + Clone + 'static>(
 /// The primary chain's rebalancing services, and the shared handles the rest
 /// of the rebalancing wiring hangs off, once the startup preflights have
 /// passed.
-struct PrimaryRebalancingServices<Signer: Wallet> {
+struct PrimaryRebalancingServices {
     primary_chain: Chain,
-    market_maker_wallet: Address,
     gas_readiness: Arc<GasReadiness>,
     bot_gas_enqueuer: BotGasReceiptCostEnqueuer,
-    raindex_service: Arc<RaindexService<Signer>>,
     tokenizer: Arc<dyn Tokenizer>,
     mint_authorization: MintAuthorizationInfra,
 }
@@ -3386,7 +3415,7 @@ async fn build_primary_rebalancing_services<Signer: Wallet + Clone>(
     deps: &RebalancingDeps,
     tokenizations: &BTreeMap<Chain, ChainTokenization<Signer>>,
     wallets: &ChainWallets<Signer>,
-) -> anyhow::Result<PrimaryRebalancingServices<Signer>> {
+) -> anyhow::Result<PrimaryRebalancingServices> {
     let primary_chain = deps.ctx.chains.primary().chain;
     let primary = tokenizations.get(&primary_chain).with_context(|| {
         format!("no tokenization services were built for the primary chain {primary_chain}")
@@ -3437,10 +3466,8 @@ async fn build_primary_rebalancing_services<Signer: Wallet + Clone>(
 
     Ok(PrimaryRebalancingServices {
         primary_chain,
-        market_maker_wallet,
         gas_readiness,
         bot_gas_enqueuer,
-        raindex_service,
         tokenizer,
         mint_authorization,
     })
@@ -3468,10 +3495,8 @@ fn spawn_rebalancing_infrastructure<Signer: Wallet + Clone>(
 
         let PrimaryRebalancingServices {
             primary_chain,
-            market_maker_wallet,
             gas_readiness,
             bot_gas_enqueuer,
-            raindex_service,
             tokenizer,
             mint_authorization,
         } = build_primary_rebalancing_services(&deps, &tokenizations, &wallets).await?;
@@ -3558,13 +3583,24 @@ fn spawn_rebalancing_infrastructure<Signer: Wallet + Clone>(
             .recover_usdc_guard(&deps.pool, &built.usdc)
             .await?;
 
+        let usdc_endpoints = usdc_corridor_endpoints(
+            &deps.ctx,
+            &tokenizations,
+            rebalancing_ctx.cctp_corridor.usdc_corridor(),
+        )?;
+
         let cash = deps.ctx.assets.cash.as_ref();
+        let market_maker_wallet = usdc_endpoints.chain_wallet.address();
         let services = build_rebalancer_services(
             alpaca_auth,
             wallets,
-            raindex_service,
+            Arc::new(RaindexService::new(
+                usdc_endpoints.chain_wallet.clone(),
+                usdc_endpoints.contracts,
+                market_maker_wallet,
+            )),
             &rebalancing_ctx,
-            deps.ctx.chains.primary().required_confirmations,
+            usdc_endpoints.required_confirmations,
             deposit_send_required_confirmations(&deps.ctx.chains)
                 .inspect_err(|error| {
                     warn!(target: "rebalance", %error, "Reconcile of a signed Alpaca deposit send is refused until [chains.ethereum] is configured");
@@ -3575,23 +3611,16 @@ fn spawn_rebalancing_infrastructure<Signer: Wallet + Clone>(
         )
         .await?;
 
-        let usdc_vault_id = deps
-            .ctx
-            .chains
-            .primary()
-            .assets
-            .cash
-            .as_ref()
-            .and_then(|cash| cash.vault_ids.first().copied())
-            .ok_or(CtxError::MissingCashVaultId)?;
-
         // Cloned before `built.usdc` is consumed below: the transfer handles
         // take one handle and the recovery handle needs another for the
         // `fail-usdc-transfer` route.
         let recovery_usdc_store = built.usdc.clone();
         let usdc_handles = services.into_usdc_transfer_handles(
-            market_maker_wallet,
-            RaindexVaultId(usdc_vault_id),
+            MarketMakingUsdcEndpoints::new(
+                usdc_endpoints.corridor,
+                market_maker_wallet,
+                usdc_endpoints.vault_id,
+            ),
             built.usdc,
             deps.pool.clone(),
             bot_gas_enqueuer.clone(),
