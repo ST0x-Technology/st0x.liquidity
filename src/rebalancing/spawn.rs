@@ -275,6 +275,7 @@ mod tests {
         AlpacaAccountId, AlpacaBrokerApi, AlpacaBrokerApiCtx, AlpacaBrokerApiMode,
         AlpacaWalletService, Executor, Symbol, TimeInForce,
     };
+    use st0x_finance::Usdc;
     use st0x_float_macro::float;
     use st0x_raindex::RaindexContracts;
     use st0x_wrapper::WrappedEquity;
@@ -283,9 +284,10 @@ mod tests {
     use crate::bindings::DeployableERC20;
     use crate::inventory::ImbalanceThreshold;
     use crate::rebalancing::RebalancingServiceConfig;
-    use crate::rebalancing::usdc::UsdcSettlementParams;
+    use crate::rebalancing::usdc::{UsdcRecheckError, UsdcSettlementParams, UsdcTransferError};
     use crate::telemetry::TelemetrySender;
     use crate::test_utils::spawn_anvil;
+    use crate::usdc_rebalance::{RebalanceDirection, UsdcRebalanceCommand, UsdcRebalanceId};
 
     #[test]
     fn to_wrapped_equities_maps_underlying_and_derivative() {
@@ -567,21 +569,18 @@ mod tests {
         }
     }
 
+    /// The handles reach the built corridor's service and refuse a corridor
+    /// no service carries. Only Base via CCTP has a bridge today, so the
+    /// routing between two built services is covered in `usdc::corridors`.
     #[tokio::test]
-    async fn into_usdc_corridor_transfers_produces_resume_handles() {
+    async fn into_usdc_corridor_transfers_routes_served_and_refuses_unserved() {
         let server = MockServer::start();
         let (services, base_wallet) = make_services_with_mock_wallet(&server).await;
 
         let pool = crate::test_utils::setup_test_db().await;
         let usdc_store = Arc::new(test_store(pool.clone(), ()));
 
-        let UsdcTransferResumeHandles {
-            resume_base_to_alpaca: _,
-            resume_alpaca_to_base: _,
-            recheck_deposit: _,
-            restore_deposit_sends: _,
-            recover_cctp_mint: _,
-        } = services
+        let handles = services
             .into_usdc_corridor_transfers(
                 vec![corridor_endpoints(UsdcCorridor::BASE_CCTP, base_wallet)],
                 &usdc_store,
@@ -590,6 +589,52 @@ mod tests {
                 &UsdcDriverGate::unpaused(),
             )
             .unwrap();
+
+        // A transfer mid-withdrawal on Base reaches the Base service, whose
+        // recheck refuses its state without any chain or Alpaca call.
+        let base_transfer = UsdcRebalanceId(Uuid::new_v4());
+        usdc_store
+            .send(
+                &base_transfer,
+                UsdcRebalanceCommand::BeginWithdrawal {
+                    direction: RebalanceDirection::BaseToAlpaca,
+                    corridor: UsdcCorridor::BASE_CCTP,
+                    amount: Usdc::new(float!(1)),
+                    from_block: 0,
+                },
+            )
+            .await
+            .unwrap();
+        let error = handles
+            .recheck_deposit
+            .recheck_deposit(&base_transfer, None)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, UsdcRecheckError::NotDepositFailed { ref id, .. } if *id == base_transfer),
+            "got {error:?}"
+        );
+
+        let unserved = UsdcCorridor::HubRouted {
+            chain: Chain::Robinhood,
+            hop: HopKind::Relay,
+        };
+        let error = handles
+            .resume_alpaca_to_base
+            .resume_alpaca_to_base(
+                &UsdcRebalanceId(Uuid::new_v4()),
+                Usdc::new(float!(1)),
+                unserved,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                UsdcTransferError::CorridorNotServed { requested, .. } if requested == unserved
+            ),
+            "got {error:?}"
+        );
     }
 
     /// A corridor with no bridge wired refuses startup by name rather than
