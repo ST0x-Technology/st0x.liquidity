@@ -1516,7 +1516,7 @@ pub mod process_tx {
 
     use st0x_config::{Ctx, HedgedChain};
     use st0x_event_sorcery::{Projection, Store, StoreBuilder};
-    use st0x_evm::{Chain, ReadOnlyEvm};
+    use st0x_evm::{Chain, Evm, ReadOnlyEvm};
     use st0x_execution::{
         BuyingPowerReservationCents, ClientOrderId, CounterTradePreflight, CounterTradeReservation,
         CounterTradeSkipReason, Direction, FractionalShares, MarketOrder, MockExecutor, Positive,
@@ -1525,9 +1525,10 @@ pub mod process_tx {
     use st0x_registry::SymbolCache;
 
     use crate::conductor::{
-        ExcludedFillOutcome, FillAccountingOutcome, account_for_fill_excluded_from_hedging,
-        account_for_onchain_fill, execute_mark_acknowledged, execute_settle_fill,
-        is_expected_place_offchain_order_rejection,
+        ExcludedFillOutcome, FillAccountingOutcome, WitnessedFill,
+        account_for_fill_excluded_from_hedging, account_for_onchain_fill,
+        execute_mark_acknowledged, execute_settle_fill, is_expected_place_offchain_order_rejection,
+        normalized_fill_economics, skip_zero_underlying_fill,
     };
     use crate::offchain::order::{
         CounterTradeOrderKind, OffchainOrder, OffchainOrderCommand, OffchainOrderId,
@@ -1545,6 +1546,7 @@ pub mod process_tx {
         BuyingPowerReservationError, acquire_counter_trade_submission_file_lock,
         live_buying_power_reservations,
     };
+    use crate::trading::onchain::trade_accountant::witness_then_load_wrapper_ratio;
 
     use super::{OperatorError, RejectionReason};
 
@@ -1581,16 +1583,21 @@ pub mod process_tx {
         pub price: Float,
     }
 
-    impl From<&OnchainTrade> for ProcessTxFill {
-        fn from(trade: &OnchainTrade) -> Self {
-            Self {
+    impl ProcessTxFill {
+        fn try_from_trade(
+            trade: &OnchainTrade,
+        ) -> Result<Self, crate::trading::onchain::trade_accountant::NormalizedFillEconomicsError>
+        {
+            let economics = normalized_fill_economics(trade)?;
+
+            Ok(Self {
                 tx_hash: trade.tx_hash,
                 log_index: trade.log_index,
                 symbol: trade.symbol().clone(),
                 direction: trade.direction,
-                quantity: trade.amount,
-                price: trade.price(),
-            }
+                quantity: economics.amount,
+                price: economics.price_usdc,
+            })
         }
     }
 
@@ -1648,6 +1655,15 @@ pub mod process_tx {
         /// order, an equity transfer, or a changed net), so the fill was settled
         /// without placing a hedge.
         PlacementRejected { symbol: Symbol },
+        /// The fill's wrapped quantity converts to zero underlying shares at
+        /// its fill-block ratio, for example a dust fill at a ratio below 1. It
+        /// is recorded in `skipped_fills` and acknowledged, and never hedged;
+        /// `detail` is the recorded reason for manual reconciliation.
+        SkippedZeroUnderlying {
+            symbol: Symbol,
+            chain: Chain,
+            detail: String,
+        },
         /// The fill was accounted, but the placement preflight deferred the
         /// hedge, and `reason` says why. The broker preflight skips a buy that
         /// cash buying power cannot cover, a sell that offchain equity cannot
@@ -1875,13 +1891,32 @@ pub mod process_tx {
 
         match OnchainTrade::try_from_tx_hash(tx_hash, &read_evm, cache, trading_chain, actors).await
         {
-            Ok(Some(onchain_trade)) => {
+            Ok(Some(mut onchain_trade)) => {
                 // The decoder is fed the requested chain, so a decoded fill on a
                 // different chain is an invariant break: refuse rather than hedge
                 // a fill from a chain the operator did not select.
                 ensure_decoded_chain_matches(onchain_trade.chain, trading_chain.chain)
                     .map_err(|mismatch| OperatorError::Operational(mismatch.into()))?;
-                let fill = ProcessTxFill::from(&onchain_trade);
+                let fill = match witness_found_fill(
+                    pool,
+                    &stores.onchain_trade,
+                    &mut onchain_trade,
+                    &read_evm,
+                )
+                .await?
+                {
+                    FoundFill::Witnessed(fill) => fill,
+                    FoundFill::SkippedZeroUnderlying { detail } => {
+                        return Ok(ProcessTxReport {
+                            fill: None,
+                            outcome: ProcessTxOutcome::SkippedZeroUnderlying {
+                                symbol: onchain_trade.symbol().clone(),
+                                chain: onchain_trade.chain,
+                                detail,
+                            },
+                        });
+                    }
+                };
                 let outcome = process_found_trade(
                     onchain_trade,
                     ctx,
@@ -1892,10 +1927,7 @@ pub mod process_tx {
                     poll_enrollment,
                 )
                 .await?;
-                Ok(ProcessTxReport {
-                    fill: Some(fill),
-                    outcome,
-                })
+                Ok(ProcessTxReport { fill, outcome })
             }
             Ok(None) => Ok(ProcessTxReport {
                 fill: None,
@@ -1912,6 +1944,75 @@ pub mod process_tx {
             }
             Err(error) => Err(OperatorError::Operational(anyhow::Error::new(error))),
         }
+    }
+
+    /// Witnesses a decoded fill, then reads its exact-block wrapper ratio only
+    /// when this run must write new fill economics. A rerun on an acknowledged
+    /// fill, or on one whose accounting is already durable, needs no historical
+    /// state and reports no fill, since its broker-share figures were fixed
+    /// when it was first accounted.
+    async fn witness_found_fill<E: Evm>(
+        pool: &SqlitePool,
+        onchain_trade_store: &Store<OnChainTrade>,
+        onchain_trade: &mut OnchainTrade,
+        evm: &E,
+    ) -> Result<FoundFill, OperatorError> {
+        let Some(block_number) = onchain_trade.block_number else {
+            return Err(OperatorError::Operational(
+                FillMissingBlockNumber {
+                    trade_id: OnChainTradeId::new(
+                        onchain_trade.chain,
+                        onchain_trade.tx_hash,
+                        onchain_trade.log_index,
+                    ),
+                }
+                .into(),
+            ));
+        };
+
+        let witnessed = witness_then_load_wrapper_ratio(
+            pool,
+            onchain_trade_store,
+            onchain_trade,
+            block_number,
+            evm,
+        )
+        .await
+        .map_err(|error| OperatorError::Operational(anyhow::Error::new(error)))?;
+
+        if let Some(detail) = skip_zero_underlying_fill(
+            pool,
+            onchain_trade_store,
+            onchain_trade,
+            "process-tx",
+            &witnessed,
+        )
+        .await
+        .map_err(|error| OperatorError::Operational(anyhow::Error::new(error)))?
+        {
+            return Ok(FoundFill::SkippedZeroUnderlying { detail });
+        }
+
+        // A pending fill whose `Position` fill or exclusion record is already
+        // durable resumes without a ratio read, so it has no new broker-share
+        // figures to report, like an acknowledged fill.
+        match (witnessed, onchain_trade.underlying_per_wrapped) {
+            (WitnessedFill::Pending { .. }, Some(_)) => {
+                ProcessTxFill::try_from_trade(onchain_trade)
+                    .map(|fill| FoundFill::Witnessed(Some(fill)))
+                    .map_err(|error| OperatorError::Operational(anyhow::Error::new(error)))
+            }
+            (WitnessedFill::Pending { .. }, None) | (WitnessedFill::AlreadyAcknowledged, _) => {
+                Ok(FoundFill::Witnessed(None))
+            }
+        }
+    }
+
+    /// A decoded fill once witnessed: the broker-share report this run
+    /// computed, if any, or the zero-underlying skip that settled it.
+    enum FoundFill {
+        Witnessed(Option<ProcessTxFill>),
+        SkippedZeroUnderlying { detail: String },
     }
 
     /// Accounts a decoded fill, reconciles any pending hedge, and places a new hedge when needed.
@@ -3124,8 +3225,10 @@ pub mod process_tx {
 
         use alloy::primitives::{Address, B256, TxHash, U256};
         use alloy::providers::{ProviderBuilder, mock::Asserter};
+        use alloy::sol_types::SolCall;
         use async_trait::async_trait;
         use chrono::Utc;
+        use rain_math_float::Float;
         use tokio::sync::Mutex;
 
         use st0x_config::{
@@ -3133,20 +3236,22 @@ pub mod process_tx {
             TradingScheduleConfig, TradingScheduleMode,
         };
         use st0x_event_sorcery::{AggregateError, SendError, StoreBuilder};
-        use st0x_evm::Chain;
+        use st0x_evm::{Chain, ReadOnlyEvm};
         use st0x_execution::{
             AlpacaBrokerApiError, BuyingPowerReservationCents, CancellationOutcome, ClientOrderId,
             CounterTradePreflight, CounterTradeReservation, CounterTradeSkipReason, Direction,
             ExecutorOrderId, FractionalShares, LimitOrder, MarketOrder, MockExecutor, Positive,
             SupportedExecutor, Symbol,
         };
+        use st0x_float_macro::float;
         use st0x_registry::SymbolCache;
 
+        use crate::bindings::IERC4626;
         use crate::bindings::IRaindexV6::{ClearConfigV2, ClearV3};
         use crate::conductor::job::find_backpressure;
         use crate::conductor::{
             TradeProcessingCqrs, execute_acknowledge_fill, execute_mark_acknowledged,
-            process_queued_trade,
+            process_queued_trade, witness_onchain_fill,
         };
         use crate::offchain::order::{
             BrokerOrderPlacement, CancellationReason, CounterTradeOrderKind, ExecutorOrderPlacer,
@@ -3154,6 +3259,7 @@ pub mod process_tx {
             OrderPlacer, PlacementAdmission, PollOrderStatusJobQueue, RetainedFill,
             noop_order_placer,
         };
+        use crate::onchain::io::Usdc;
         use crate::onchain::trade::RaindexTradeEvent;
         use crate::onchain_trade::{
             InventoryVenue, OnChainTrade as OnChainTradeCqrs, OnChainTradeCommand, OnChainTradeId,
@@ -3166,15 +3272,17 @@ pub mod process_tx {
             try_setup_test_db, try_setup_test_pools,
         };
         use crate::trading::onchain::inclusion::EmittedOnChain;
+        use crate::trading::onchain::skipped_fill::{SkipReason, record_skipped_fill};
         use crate::trading::onchain::trade_accountant::TradeAccountingError;
 
         use super::{
-            FillMissingBlockNumber, HedgeDisposition, OperatorError, PlacedHedgeDisposition,
-            PlacementContext, PreflightReservationMismatch, PreflightVerdict,
-            ProcessTxChainContext, ProcessTxOutcome, ProcessTxStores, RejectionReason,
-            ensure_decoded_chain_matches, gate_fill_for_placement, preflight_placement,
-            process_found_trade, process_tx, reconcile_failed_anchor,
-            reconcile_offchain_order_state, reconcile_post_place_state, resolve_chain,
+            FillMissingBlockNumber, FoundFill, HedgeDisposition, OperatorError,
+            PlacedHedgeDisposition, PlacementContext, PreflightReservationMismatch,
+            PreflightVerdict, ProcessTxChainContext, ProcessTxFill, ProcessTxOutcome,
+            ProcessTxStores, RejectionReason, ensure_decoded_chain_matches,
+            gate_fill_for_placement, preflight_placement, process_found_trade, process_tx,
+            reconcile_failed_anchor, reconcile_offchain_order_state, reconcile_post_place_state,
+            resolve_chain, witness_found_fill,
         };
 
         /// Parses a positive share quantity for process-tx fixtures.
@@ -3192,6 +3300,235 @@ pub mod process_tx {
         /// Returns the valid baseline onchain trade fixture used throughout this module.
         fn onchain_trade_builder() -> OnchainTradeBuilder {
             OnchainTradeBuilder::try_new().expect("default onchain trade fixture must be valid")
+        }
+
+        #[test]
+        fn process_tx_fill_reports_broker_share_units() {
+            let mut trade = onchain_trade_builder().build();
+            trade.amount = FractionalShares::new(float!(2));
+            trade.price = Usdc::new(float!(101)).unwrap();
+            trade.underlying_per_wrapped =
+                Some(alloy::primitives::U256::from(1_010_000_000_000_000_000u64));
+
+            let fill = ProcessTxFill::try_from_trade(&trade).unwrap();
+
+            assert!(fill.quantity.inner().eq(float!(2.02)).unwrap());
+            assert!(
+                (fill.quantity.inner() * fill.price)
+                    .unwrap()
+                    .eq(float!(202))
+                    .unwrap(),
+                "normalized process-tx economics must preserve the wrapped fill notional"
+            );
+        }
+
+        #[tokio::test]
+        async fn witness_found_fill_skips_ratio_read_for_acknowledged_fill() {
+            let pool = setup_test_db().await;
+            let order_placer = noop_order_placer();
+            let stores = stores_for(&pool, &order_placer).await;
+            let mut onchain_trade = onchain_trade_builder().with_block_number(42).build();
+            onchain_trade.underlying_per_wrapped = None;
+            let trade_id =
+                OnChainTradeId::new(Chain::Base, onchain_trade.tx_hash, onchain_trade.log_index);
+            witness_onchain_fill(&stores.onchain_trade, &onchain_trade, 42)
+                .await
+                .unwrap();
+            stores
+                .onchain_trade
+                .send(&trade_id, OnChainTradeCommand::Acknowledge)
+                .await
+                .unwrap();
+            // No queued response: any historical ratio read fails the call.
+            let evm =
+                ReadOnlyEvm::new(ProviderBuilder::new().connect_mocked_client(Asserter::new()));
+
+            let FoundFill::Witnessed(fill) =
+                witness_found_fill(&pool, &stores.onchain_trade, &mut onchain_trade, &evm)
+                    .await
+                    .unwrap()
+            else {
+                panic!("a non-dust fill must not be skipped");
+            };
+
+            assert!(fill.is_none(), "an acknowledged fill reports no new fill");
+            assert_eq!(onchain_trade.underlying_per_wrapped, None);
+        }
+
+        #[tokio::test]
+        async fn process_tx_resumes_durable_exclusion_without_wrapper_ratio() {
+            let pool = setup_test_db().await;
+            let ctx = create_base_test_ctx();
+            let order_placer = noop_order_placer();
+            let stores = stores_for(&pool, &order_placer).await;
+            let mut onchain_trade = onchain_trade_builder().with_block_number(42).build();
+            onchain_trade.underlying_per_wrapped = None;
+            record_skipped_fill(
+                &pool,
+                onchain_trade.chain,
+                onchain_trade.tx_hash,
+                onchain_trade.log_index,
+                "test",
+                SkipReason::TradingDisabled,
+                "recorded cover detail",
+            )
+            .await
+            .unwrap();
+            // No queued response: any historical ratio read fails the call.
+            let evm =
+                ReadOnlyEvm::new(ProviderBuilder::new().connect_mocked_client(Asserter::new()));
+
+            let FoundFill::Witnessed(fill) =
+                witness_found_fill(&pool, &stores.onchain_trade, &mut onchain_trade, &evm)
+                    .await
+                    .unwrap()
+            else {
+                panic!("a non-dust fill must not be skipped");
+            };
+            assert!(fill.is_none(), "a durable resume reports no new fill");
+            let outcome = process_found_trade(
+                onchain_trade,
+                &ctx,
+                &pool,
+                &stores,
+                order_placer,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+            assert!(
+                matches!(
+                    &outcome,
+                    ProcessTxOutcome::ExcludedFromHedging { detail, .. }
+                        if detail == "recorded cover detail"
+                ),
+                "got {outcome:?}"
+            );
+        }
+
+        #[tokio::test]
+        async fn process_tx_resumes_durable_position_fill_without_wrapper_ratio() {
+            let pool = setup_test_db().await;
+            let order_placer = noop_order_placer();
+            let stores = stores_for(&pool, &order_placer).await;
+            let mut onchain_trade = onchain_trade_builder().with_block_number(42).build();
+            witness_onchain_fill(&stores.onchain_trade, &onchain_trade, 42)
+                .await
+                .unwrap();
+            execute_acknowledge_fill(
+                &stores.position,
+                &onchain_trade,
+                ExecutionThreshold::whole_share(),
+                onchain_trade.block_timestamp.unwrap(),
+            )
+            .await
+            .unwrap();
+            onchain_trade.underlying_per_wrapped = None;
+            let evm =
+                ReadOnlyEvm::new(ProviderBuilder::new().connect_mocked_client(Asserter::new()));
+
+            let FoundFill::Witnessed(fill) =
+                witness_found_fill(&pool, &stores.onchain_trade, &mut onchain_trade, &evm)
+                    .await
+                    .unwrap()
+            else {
+                panic!("a non-dust fill must not be skipped");
+            };
+
+            assert!(fill.is_none(), "a durable resume reports no new fill");
+            assert_eq!(onchain_trade.underlying_per_wrapped, None);
+        }
+
+        /// A dust fill at a ratio below 1 converts to zero underlying shares:
+        /// `process-tx` records and acknowledges it instead of failing, and a
+        /// rerun reports the same skip without a ratio read.
+        #[tokio::test]
+        async fn process_tx_skips_a_fill_that_converts_to_zero_underlying_shares() {
+            let pool = setup_test_db().await;
+            let order_placer = noop_order_placer();
+            let stores = stores_for(&pool, &order_placer).await;
+            let mut onchain_trade = onchain_trade_builder().with_block_number(42).build();
+            onchain_trade.amount =
+                FractionalShares::new(Float::from_fixed_decimal(U256::from(1), 18).unwrap());
+            onchain_trade.underlying_per_wrapped = None;
+            let trade_id =
+                OnChainTradeId::new(Chain::Base, onchain_trade.tx_hash, onchain_trade.log_index);
+            let asserter = Asserter::new();
+            for _ in 0..2 {
+                asserter.push_success(
+                    &<IERC4626::convertToAssetsCall as SolCall>::abi_encode_returns(&U256::from(
+                        500_000_000_000_000_000u64,
+                    )),
+                );
+            }
+            let evm = ReadOnlyEvm::new(ProviderBuilder::new().connect_mocked_client(asserter));
+
+            let first = witness_found_fill(&pool, &stores.onchain_trade, &mut onchain_trade, &evm)
+                .await
+                .unwrap();
+            let FoundFill::SkippedZeroUnderlying { detail } = first else {
+                panic!("a dust fill that converts to zero shares must be skipped");
+            };
+            assert!(
+                stores
+                    .onchain_trade
+                    .load(&trade_id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .is_acknowledged()
+            );
+
+            // The rerun has no queued ratio response, so any ratio read fails it.
+            let rerun_evm =
+                ReadOnlyEvm::new(ProviderBuilder::new().connect_mocked_client(Asserter::new()));
+            onchain_trade.underlying_per_wrapped = None;
+            let rerun =
+                witness_found_fill(&pool, &stores.onchain_trade, &mut onchain_trade, &rerun_evm)
+                    .await
+                    .unwrap();
+            let FoundFill::SkippedZeroUnderlying {
+                detail: rerun_detail,
+            } = rerun
+            else {
+                panic!("a rerun must report the recorded skip, not an accounted fill");
+            };
+            assert_eq!(rerun_detail, detail);
+        }
+
+        #[tokio::test]
+        async fn witness_found_fill_reports_broker_units_for_pending_fill() {
+            let pool = setup_test_db().await;
+            let order_placer = noop_order_placer();
+            let stores = stores_for(&pool, &order_placer).await;
+            let mut onchain_trade = onchain_trade_builder().with_block_number(42).build();
+            onchain_trade.amount = FractionalShares::new(float!(2));
+            onchain_trade.underlying_per_wrapped = None;
+            let trade_id =
+                OnChainTradeId::new(Chain::Base, onchain_trade.tx_hash, onchain_trade.log_index);
+            let asserter = Asserter::new();
+            for _ in 0..2 {
+                asserter.push_success(
+                    &<IERC4626::convertToAssetsCall as SolCall>::abi_encode_returns(&U256::from(
+                        1_010_000_000_000_000_000u64,
+                    )),
+                );
+            }
+            let evm = ReadOnlyEvm::new(ProviderBuilder::new().connect_mocked_client(asserter));
+
+            let FoundFill::Witnessed(Some(fill)) =
+                witness_found_fill(&pool, &stores.onchain_trade, &mut onchain_trade, &evm)
+                    .await
+                    .unwrap()
+            else {
+                panic!("a pending fill must be reported");
+            };
+
+            assert!(fill.quantity.inner().eq(float!(2.02)).unwrap());
+            let witnessed = stores.onchain_trade.load(&trade_id).await.unwrap().unwrap();
+            assert!(!witnessed.is_acknowledged());
         }
 
         #[tokio::test]
@@ -4558,7 +4895,7 @@ pub mod process_tx {
                         symbol: onchain_trade.symbol().clone(),
                         amount: onchain_trade.amount.inner(),
                         direction: onchain_trade.direction,
-                        price_usdc: onchain_trade.price(),
+                        price_usdc: onchain_trade.price.value(),
                         block_number: 1,
                         block_timestamp,
                         filled_at: block_timestamp,
@@ -4686,7 +5023,7 @@ pub mod process_tx {
                         symbol: onchain_trade.symbol().clone(),
                         amount: onchain_trade.amount.inner(),
                         direction: onchain_trade.direction,
-                        price_usdc: onchain_trade.price(),
+                        price_usdc: onchain_trade.price.value(),
                         block_number: 1,
                         block_timestamp,
                     },
@@ -4804,7 +5141,9 @@ pub mod process_tx {
                 executor: MockExecutor::new(),
                 close_flatten_policy: None,
             });
-            let onchain_trade = onchain_trade_builder().with_block_number(42).build();
+            let mut onchain_trade = onchain_trade_builder().with_block_number(42).build();
+            onchain_trade.underlying_per_wrapped =
+                Some(alloy::primitives::U256::from(1_010_000_000_000_000_000u64));
             let trade_id =
                 OnChainTradeId::new(Chain::Base, onchain_trade.tx_hash, onchain_trade.log_index);
 
@@ -4825,6 +5164,7 @@ pub mod process_tx {
             assert_eq!(symbol, Symbol::new("AAPL").unwrap());
             // The fixture is an onchain buy, so the operator covers with a sell.
             assert!(detail.contains("cover by SELL"), "{detail}");
+            assert!(detail.contains("cover by SELL 1.01 AAPL"), "{detail}");
 
             let rerun = process_found_trade(
                 onchain_trade,
@@ -5811,7 +6151,7 @@ pub mod process_tx {
                         symbol: onchain_trade.symbol().clone(),
                         amount: onchain_trade.amount.inner(),
                         direction: onchain_trade.direction,
-                        price_usdc: onchain_trade.price(),
+                        price_usdc: onchain_trade.price.value(),
                         block_number: 42,
                         block_timestamp,
                     },
@@ -5898,7 +6238,7 @@ pub mod process_tx {
                         symbol: onchain_trade.symbol().clone(),
                         amount: onchain_trade.amount.inner(),
                         direction: onchain_trade.direction,
-                        price_usdc: onchain_trade.price(),
+                        price_usdc: onchain_trade.price.value(),
                         block_number: 42,
                         block_timestamp,
                     },
@@ -6024,7 +6364,7 @@ pub mod process_tx {
                         symbol: fill_a.symbol().clone(),
                         amount: fill_a.amount.inner(),
                         direction: fill_a.direction,
-                        price_usdc: fill_a.price(),
+                        price_usdc: fill_a.price.value(),
                         block_number: 10,
                         block_timestamp: block_timestamp_a,
                     },
@@ -6054,7 +6394,7 @@ pub mod process_tx {
                         symbol: fill_b.symbol().clone(),
                         amount: fill_b.amount.inner(),
                         direction: fill_b.direction,
-                        price_usdc: fill_b.price(),
+                        price_usdc: fill_b.price.value(),
                         block_number: 11,
                         block_timestamp: block_timestamp_b,
                     },
@@ -6193,7 +6533,7 @@ pub mod process_tx {
                         symbol: fill_b.symbol().clone(),
                         amount: fill_b.amount.inner(),
                         direction: fill_b.direction,
-                        price_usdc: fill_b.price(),
+                        price_usdc: fill_b.price.value(),
                         block_number: 11,
                         block_timestamp: block_timestamp_b,
                     },

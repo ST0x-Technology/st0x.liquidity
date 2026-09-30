@@ -16,11 +16,12 @@ use tracing::{debug, error, info, warn};
 
 use st0x_config::{Ctx, HedgedChain};
 use st0x_event_sorcery::{SendError, Store};
-use st0x_evm::{Chain, ReadOnlyEvm};
+use st0x_evm::{Chain, Evm, ReadOnlyEvm};
 use st0x_execution::alpaca_broker_api::AlpacaBrokerApiError;
 use st0x_execution::{ExecutionError, Executor, Permanence};
 use st0x_raindex::RaindexContracts;
 use st0x_registry::{SymbolCache, get_symbol_lock};
+use st0x_wrapper::RatioError;
 
 use super::inclusion::EmittedOnChain;
 use super::skipped_fill::{SkipReason, record_skipped_fill};
@@ -30,13 +31,15 @@ use crate::conductor::job::{
     advance_backpressure, apply_backpressure_step, find_backpressure, find_permanence,
 };
 use crate::conductor::{
-    ExcludedFillOutcome, TradeProcessingCqrs, VaultDiscoveryCtx,
-    account_for_fill_excluded_from_hedging, discover_vaults_for_trade, process_queued_trade,
-    recorded_trading_disabled_detail,
+    ExcludedFillOutcome, TradeProcessingCqrs, VaultDiscoveryCtx, WitnessedFill,
+    account_for_witnessed_fill_excluded_from_hedging, discover_vaults_for_trade,
+    fill_accounting_already_durable, process_witnessed_queued_trade, recorded_fill_skip_detail,
+    skip_zero_underlying_fill, witness_onchain_fill,
 };
 use crate::offchain::order::PlaceOffchainOrderError;
 use crate::onchain::trade::{RaindexTradeEvent, TradeValidationError};
 use crate::onchain::{OnChainError, OnchainTrade};
+use crate::onchain_trade::OnChainTrade;
 use crate::vault_registry::VaultRegistry;
 
 /// Persistent job queue for DEX trade accounting.
@@ -192,7 +195,7 @@ where
             Err(error) => return Err(error.into()),
         };
 
-        let Some(trade) = onchain_trade else {
+        let Some(mut trade) = onchain_trade else {
             debug!(
                 target: "hedge",
                 event_type = trade_event.event.kind(),
@@ -224,6 +227,27 @@ where
 
         let symbol_lock = get_symbol_lock(trade.symbol.base()).await;
         let _guard = symbol_lock.lock().await;
+        let witnessed = witness_then_load_wrapper_ratio(
+            &ctx.cqrs.pool,
+            &ctx.cqrs.onchain_trade,
+            &mut trade,
+            trade_event.block_number,
+            &chain_ctx.evm,
+        )
+        .await?;
+
+        if skip_zero_underlying_fill(
+            &ctx.cqrs.pool,
+            &ctx.cqrs.onchain_trade,
+            &trade,
+            trade_event.event.kind(),
+            &witnessed,
+        )
+        .await?
+        .is_some()
+        {
+            return Ok(());
+        }
 
         // Per the fill's own chain: `Position` is one net per symbol across
         // every hedged chain, so a disabled chain's fill must stay out of it
@@ -234,13 +258,13 @@ where
             .assets
             .is_trading_enabled(trade.symbol.base())
         {
-            let outcome = account_for_fill_excluded_from_hedging(
+            let outcome = account_for_witnessed_fill_excluded_from_hedging(
                 &ctx.cqrs.pool,
                 &ctx.cqrs.onchain_trade,
                 &ctx.cqrs.position,
                 &trade,
-                trade_event.block_number,
                 trade_event.event.kind(),
+                witnessed,
             )
             .await?;
 
@@ -266,12 +290,12 @@ where
         }
 
         let alert_trade = trade.clone();
-        match process_queued_trade(
+        match process_witnessed_queued_trade(
             &ctx.executor,
-            trade_event,
             trade,
             &ctx.cqrs,
             &chain_ctx.trading.assets,
+            witnessed,
         )
         .await
         {
@@ -281,8 +305,12 @@ where
             // a crash between its exclusion marker and its alert. It stays
             // excluded, so it must still be surfaced.
             Ok(None) => {
-                if let Some(detail) =
-                    recorded_trading_disabled_detail(&ctx.cqrs.pool, &alert_trade).await?
+                if let Some(detail) = recorded_fill_skip_detail(
+                    &ctx.cqrs.pool,
+                    &alert_trade,
+                    SkipReason::TradingDisabled,
+                )
+                .await?
                 {
                     self.alert_disabled_asset_fill(
                         &ctx.notifier,
@@ -458,6 +486,31 @@ async fn persist_skipped_fill(
     }
 }
 
+/// Witnesses the raw fill before reading its exact-block wrapper ratio, so a
+/// failed historical read still leaves the audit record. The ratio is read
+/// only when this attempt must write new fill economics: an acknowledged fill,
+/// or one whose `Position` fill or exclusion record is already durable,
+/// resumes without archive state.
+pub(crate) async fn witness_then_load_wrapper_ratio<E: Evm>(
+    pool: &SqlitePool,
+    onchain_trade: &Store<OnChainTrade>,
+    trade: &mut OnchainTrade,
+    block_number: u64,
+    evm: &E,
+) -> Result<WitnessedFill, TradeAccountingError> {
+    let witnessed = witness_onchain_fill(onchain_trade, trade, block_number).await?;
+    match &witnessed {
+        WitnessedFill::Pending { trade_id, .. } => {
+            if !fill_accounting_already_durable(pool, trade, trade_id).await? {
+                trade.load_underlying_per_wrapped(evm).await?;
+            }
+        }
+        WitnessedFill::AlreadyAcknowledged => {}
+    }
+
+    Ok(witnessed)
+}
+
 impl AccountForDexTrade {
     /// Operational alert for every fill on a disabled asset. The flag is the
     /// per symbol hedge kill switch, so the fill is never counter traded, but
@@ -500,7 +553,7 @@ async fn decode_trade_event<Node: Provider + Clone + 'static>(
 
     let order_owner = chain_ctx.trading.vault_owner;
 
-    match &trade_event.event {
+    let trade = match &trade_event.event {
         ClearV3(clear_event) => {
             OnchainTrade::try_from_clear_v3(
                 &chain_ctx.trading,
@@ -542,7 +595,9 @@ async fn decode_trade_event<Node: Provider + Clone + 'static>(
             )
             .await
         }
-    }
+    }?;
+
+    Ok(trade)
 }
 
 fn reconstruct_log(contracts: RaindexContracts, trade: &EmittedOnChain<RaindexTradeEvent>) -> Log {
@@ -600,6 +655,14 @@ pub enum TradeAccountingError {
     OffchainOrderPlacement(#[from] PlaceOffchainOrderError),
     #[error("Execution error: {0}")]
     Execution(#[from] ExecutionError),
+    #[error("Wrapper ratio conversion failed: {0}")]
+    Ratio(#[from] RatioError),
+    #[error("Wrapped-fill arithmetic failed: {0}")]
+    Float(#[from] rain_math_float::FloatError),
+    #[error("Fill {trade_id} has no exact-block wrapper ratio")]
+    MissingWrapperRatio { trade_id: crate::position::TradeId },
+    #[error("Fill {trade_id} converts to zero underlying shares")]
+    ZeroUnderlyingAmount { trade_id: crate::position::TradeId },
     // TODO: TradeAccountingError should not be coupled to a concrete executor error type.
     #[error("Alpaca broker API error: {0}")]
     AlpacaBrokerApi(#[from] AlpacaBrokerApiError),
@@ -826,6 +889,33 @@ pub(crate) enum ErrorScope {
     ProcessScoped,
 }
 
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum NormalizedFillEconomicsError {
+    #[error("Wrapper ratio conversion failed: {0}")]
+    Ratio(#[from] RatioError),
+    #[error("Wrapped-fill arithmetic failed: {0}")]
+    Float(#[from] rain_math_float::FloatError),
+    #[error("Fill {trade_id} has no exact-block wrapper ratio")]
+    MissingWrapperRatio { trade_id: crate::position::TradeId },
+    #[error("Fill {trade_id} converts to zero underlying shares")]
+    ZeroUnderlyingAmount { trade_id: crate::position::TradeId },
+}
+
+impl From<NormalizedFillEconomicsError> for TradeAccountingError {
+    fn from(error: NormalizedFillEconomicsError) -> Self {
+        match error {
+            NormalizedFillEconomicsError::Ratio(error) => Self::Ratio(error),
+            NormalizedFillEconomicsError::Float(error) => Self::Float(error),
+            NormalizedFillEconomicsError::MissingWrapperRatio { trade_id } => {
+                Self::MissingWrapperRatio { trade_id }
+            }
+            NormalizedFillEconomicsError::ZeroUnderlyingAmount { trade_id } => {
+                Self::ZeroUnderlyingAmount { trade_id }
+            }
+        }
+    }
+}
+
 impl TradeAccountingError {
     /// Classifies this error against the position claim.
     ///
@@ -895,6 +985,10 @@ impl TradeAccountingError {
             | Self::OffchainOrderCommand(_)
             | Self::OffchainOrderPlacement(_)
             | Self::Execution(_)
+            | Self::Ratio(_)
+            | Self::Float(_)
+            | Self::MissingWrapperRatio { .. }
+            | Self::ZeroUnderlyingAmount { .. }
             | Self::AlpacaBrokerApi(_)
             | Self::EnqueueJob(_)
             | Self::PositionFillLookup(_)
@@ -935,7 +1029,7 @@ mod tests {
     use st0x_config::{ChainAssets, ChainEquities, ChainEquityAsset, OperationMode};
     use st0x_event_sorcery::{AggregateError, LifecycleError, StoreBuilder};
     use st0x_evm::IERC20::{decimalsCall, symbolCall};
-    use st0x_evm::{Chain, USDC_HYPEREVM};
+    use st0x_evm::{Chain, ReadOnlyEvm, USDC_HYPEREVM};
     use st0x_execution::{
         CancellationOutcome, FractionalShares, InventoryResult, MockExecutor, MockExecutorCtx,
         Positive, SupportedExecutor, Symbol, TryIntoExecutor,
@@ -943,11 +1037,16 @@ mod tests {
     use st0x_float_macro::float;
 
     use super::*;
+    use crate::bindings::IERC4626;
     use crate::bindings::IRaindexInventory::{OperatorDeposit, OperatorWithdraw};
     use crate::bindings::IRaindexV6;
     use crate::bindings::IRaindexV6::{
         AfterClearV2, ClearConfigV2, ClearStateChangeV2, ClearV3, SignedContextV1,
         TakeOrderConfigV4, TakeOrderV3 as TakeOrderV3Event,
+    };
+    use crate::conductor::{
+        ExcludedFillOutcome, FillAccountingOutcome, WitnessedFill,
+        account_for_witnessed_onchain_fill, execute_acknowledge_fill,
     };
     use crate::offchain::order::{OffchainOrder, noop_order_placer};
     use crate::onchain::backfill::{BackfillRange, load_backfill_checkpoint};
@@ -958,6 +1057,334 @@ mod tests {
     use crate::test_utils::{
         TEST_POLL_INTERVAL, get_test_log, get_test_order, panic_revert_payload, setup_test_pools,
     };
+
+    /// Answers both wrapper-ratio reads: at the fill block and the block before it.
+    fn push_identity_wrapper_ratio(asserter: &Asserter) {
+        for _ in 0..2 {
+            asserter.push_success(
+                &<IERC4626::convertToAssetsCall as SolCall>::abi_encode_returns(
+                    &st0x_wrapper::RATIO_ONE,
+                ),
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn wrapper_ratio_failure_leaves_the_raw_fill_witnessed() {
+        let (pool, _apalis_pool) = setup_test_pools().await;
+        let (store, _) = StoreBuilder::<OnChainTrade>::new(pool.clone())
+            .build(())
+            .await
+            .unwrap();
+        let asserter = Asserter::new();
+        asserter.push_failure(panic_revert_payload());
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+        let evm = ReadOnlyEvm::new(provider);
+        let mut trade = crate::test_utils::OnchainTradeBuilder::new()
+            .with_block_number(42)
+            .build();
+        trade.underlying_per_wrapped = None;
+        let trade_id =
+            crate::onchain_trade::OnChainTradeId::new(trade.chain, trade.tx_hash, trade.log_index);
+
+        let Err(error) = witness_then_load_wrapper_ratio(&pool, &store, &mut trade, 42, &evm).await
+        else {
+            panic!("the historical wrapper-ratio read must fail closed");
+        };
+        assert!(
+            matches!(error, TradeAccountingError::OnChain(OnChainError::Evm(_))),
+            "the historical wrapper-ratio read must fail closed, got {error:?}"
+        );
+        assert_eq!(trade.underlying_per_wrapped, None);
+
+        let witnessed = store
+            .load(&trade_id)
+            .await
+            .unwrap()
+            .expect("the raw fill must be durable before the ratio read");
+        assert!(!witnessed.is_acknowledged());
+    }
+
+    /// A dust fill at a ratio below 1 converts to zero underlying shares.
+    /// That can never succeed on retry, so it is skipped per fill and
+    /// acknowledged instead of failing the worker.
+    #[tokio::test]
+    async fn zero_underlying_fill_is_skipped_and_acknowledged() {
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let accountant = build_test_accountant_ctx(
+            pool.clone(),
+            &apalis_pool,
+            create_test_ctx_with_order_owner(Address::ZERO),
+            SymbolCache::default(),
+            ProviderBuilder::new().connect_mocked_client(Asserter::new()),
+            MockExecutorCtx.try_into_executor().await.unwrap(),
+            ExecutionThreshold::whole_share(),
+        )
+        .await;
+        let job = test_job();
+        let mut trade = crate::test_utils::OnchainTradeBuilder::new()
+            .with_block_number(42)
+            .build();
+        trade.amount = FractionalShares::new(Float::from_fixed_decimal(U256::from(1), 18).unwrap());
+        trade.underlying_per_wrapped = Some(U256::from(500_000_000_000_000_000u64));
+        let witnessed = witness_onchain_fill(&accountant.cqrs.onchain_trade, &trade, 42)
+            .await
+            .unwrap();
+
+        let skipped = skip_zero_underlying_fill(
+            &pool,
+            &accountant.cqrs.onchain_trade,
+            &trade,
+            job.trade.event.kind(),
+            &witnessed,
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            skipped.is_some(),
+            "a zero converted amount must be skipped per fill"
+        );
+        let reasons: Vec<(String,)> = sqlx::query_as("SELECT reason FROM skipped_fills")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+        assert_eq!(reasons, vec![("zero_underlying_amount".to_owned(),)]);
+        let trade_id =
+            crate::onchain_trade::OnChainTradeId::new(trade.chain, trade.tx_hash, trade.log_index);
+        assert!(
+            accountant
+                .cqrs
+                .onchain_trade
+                .load(&trade_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .is_acknowledged()
+        );
+    }
+
+    /// A wrapper whose ratio at the fill block is zero (drained or written
+    /// down) can never convert the fill, so it takes the per-fill skip too.
+    #[tokio::test]
+    async fn zero_wrapper_ratio_fill_is_skipped_and_acknowledged() {
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let accountant = build_test_accountant_ctx(
+            pool.clone(),
+            &apalis_pool,
+            create_test_ctx_with_order_owner(Address::ZERO),
+            SymbolCache::default(),
+            ProviderBuilder::new().connect_mocked_client(Asserter::new()),
+            MockExecutorCtx.try_into_executor().await.unwrap(),
+            ExecutionThreshold::whole_share(),
+        )
+        .await;
+        let job = test_job();
+        let mut trade = crate::test_utils::OnchainTradeBuilder::new()
+            .with_block_number(42)
+            .build();
+        trade.underlying_per_wrapped = Some(U256::ZERO);
+        let witnessed = witness_onchain_fill(&accountant.cqrs.onchain_trade, &trade, 42)
+            .await
+            .unwrap();
+
+        let skipped = skip_zero_underlying_fill(
+            &pool,
+            &accountant.cqrs.onchain_trade,
+            &trade,
+            job.trade.event.kind(),
+            &witnessed,
+        )
+        .await
+        .unwrap();
+
+        assert!(skipped.is_some(), "a zero ratio must be skipped per fill");
+        let trade_id =
+            crate::onchain_trade::OnChainTradeId::new(trade.chain, trade.tx_hash, trade.log_index);
+        assert!(
+            accountant
+                .cqrs
+                .onchain_trade
+                .load(&trade_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .is_acknowledged()
+        );
+    }
+
+    /// When the skip record cannot be written, the fill must stay pending so
+    /// the retry records it, not be acknowledged with no record.
+    #[tokio::test]
+    async fn zero_underlying_fill_stays_pending_when_the_skip_record_fails() {
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let accountant = build_test_accountant_ctx(
+            pool.clone(),
+            &apalis_pool,
+            create_test_ctx_with_order_owner(Address::ZERO),
+            SymbolCache::default(),
+            ProviderBuilder::new().connect_mocked_client(Asserter::new()),
+            MockExecutorCtx.try_into_executor().await.unwrap(),
+            ExecutionThreshold::whole_share(),
+        )
+        .await;
+        let job = test_job();
+        let mut trade = crate::test_utils::OnchainTradeBuilder::new()
+            .with_block_number(42)
+            .build();
+        trade.amount = FractionalShares::new(Float::from_fixed_decimal(U256::from(1), 18).unwrap());
+        trade.underlying_per_wrapped = Some(U256::from(500_000_000_000_000_000u64));
+        let witnessed = witness_onchain_fill(&accountant.cqrs.onchain_trade, &trade, 42)
+            .await
+            .unwrap();
+        sqlx::query("DROP TABLE skipped_fills")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let Err(error) = skip_zero_underlying_fill(
+            &pool,
+            &accountant.cqrs.onchain_trade,
+            &trade,
+            job.trade.event.kind(),
+            &witnessed,
+        )
+        .await
+        else {
+            panic!("a failed skip record must propagate");
+        };
+
+        assert!(
+            matches!(error, TradeAccountingError::ExcludedFillRecord { .. }),
+            "got {error:?}"
+        );
+        let trade_id =
+            crate::onchain_trade::OnChainTradeId::new(trade.chain, trade.tx_hash, trade.log_index);
+        assert!(
+            !accountant
+                .cqrs
+                .onchain_trade
+                .load(&trade_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .is_acknowledged(),
+            "the fill must stay pending for the retry"
+        );
+    }
+
+    /// A fill whose `Position` fill became durable before a crash resumes
+    /// with no historical wrapper-ratio read.
+    #[tokio::test]
+    async fn durable_position_fill_resumes_without_wrapper_ratio() {
+        let (pool, _apalis_pool) = setup_test_pools().await;
+        let (onchain_store, _) = StoreBuilder::<OnChainTrade>::new(pool.clone())
+            .build(())
+            .await
+            .unwrap();
+        let (position_store, _) = StoreBuilder::<Position>::new(pool.clone())
+            .build(())
+            .await
+            .unwrap();
+        let mut trade = crate::test_utils::OnchainTradeBuilder::new()
+            .with_block_number(42)
+            .build();
+        trade.underlying_per_wrapped = Some(st0x_wrapper::RATIO_ONE);
+        witness_onchain_fill(&onchain_store, &trade, 42)
+            .await
+            .unwrap();
+        execute_acknowledge_fill(
+            &position_store,
+            &trade,
+            ExecutionThreshold::whole_share(),
+            trade.block_timestamp.unwrap(),
+        )
+        .await
+        .unwrap();
+        trade.underlying_per_wrapped = None;
+        // No queued response: any historical ratio read fails the call.
+        let evm = ReadOnlyEvm::new(ProviderBuilder::new().connect_mocked_client(Asserter::new()));
+
+        let witnessed =
+            witness_then_load_wrapper_ratio(&pool, &onchain_store, &mut trade, 42, &evm)
+                .await
+                .unwrap();
+        assert_eq!(trade.underlying_per_wrapped, None);
+        let outcome = account_for_witnessed_onchain_fill(
+            &pool,
+            &onchain_store,
+            &position_store,
+            &trade,
+            ExecutionThreshold::whole_share(),
+            witnessed,
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(outcome, FillAccountingOutcome::Accounted { .. }));
+    }
+
+    /// A trading-disabled fill whose exclusion record became durable before a
+    /// crash finishes its exclusion with no historical wrapper-ratio read.
+    #[tokio::test]
+    async fn durable_exclusion_record_resumes_without_wrapper_ratio() {
+        let (pool, _apalis_pool) = setup_test_pools().await;
+        let (onchain_store, _) = StoreBuilder::<OnChainTrade>::new(pool.clone())
+            .build(())
+            .await
+            .unwrap();
+        let (position_store, _) = StoreBuilder::<Position>::new(pool.clone())
+            .build(())
+            .await
+            .unwrap();
+        let mut trade = crate::test_utils::OnchainTradeBuilder::new()
+            .with_block_number(42)
+            .build();
+        trade.underlying_per_wrapped = None;
+        record_skipped_fill(
+            &pool,
+            trade.chain,
+            trade.tx_hash,
+            trade.log_index,
+            "test",
+            SkipReason::TradingDisabled,
+            "recorded cover detail",
+        )
+        .await
+        .unwrap();
+        let evm = ReadOnlyEvm::new(ProviderBuilder::new().connect_mocked_client(Asserter::new()));
+
+        let witnessed =
+            witness_then_load_wrapper_ratio(&pool, &onchain_store, &mut trade, 42, &evm)
+                .await
+                .unwrap();
+        assert!(matches!(witnessed, WitnessedFill::Pending { .. }));
+        let outcome = account_for_witnessed_fill_excluded_from_hedging(
+            &pool,
+            &onchain_store,
+            &position_store,
+            &trade,
+            "test",
+            witnessed,
+        )
+        .await
+        .unwrap();
+
+        let ExcludedFillOutcome::Excluded { detail } = outcome else {
+            panic!("the durable exclusion record must finish the exclusion");
+        };
+        assert_eq!(detail, "recorded cover detail");
+        let trade_id =
+            crate::onchain_trade::OnChainTradeId::new(trade.chain, trade.tx_hash, trade.log_index);
+        assert!(
+            onchain_store
+                .load(&trade_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .is_acknowledged()
+        );
+    }
 
     /// Builds the CQRS stores, job queue, and `AccountantCtx` shared by every
     /// `perform()` test in this module -- callers supply only what actually
@@ -1316,7 +1743,9 @@ mod tests {
         };
         // Both symbols are preloaded below and TakeOrderV3 amounts are already
         // Float-encoded, so no token introspection reaches either provider.
-        let secondary_provider = ProviderBuilder::new().connect_mocked_client(Asserter::new());
+        let secondary_asserter = Asserter::new();
+        push_identity_wrapper_ratio(&secondary_asserter);
+        let secondary_provider = ProviderBuilder::new().connect_mocked_client(secondary_asserter);
         let primary_provider = ProviderBuilder::new().connect_mocked_client(Asserter::new());
         let executor = MockExecutorCtx.try_into_executor().await.unwrap();
         let cache = SymbolCache::default();
@@ -2001,6 +2430,7 @@ mod tests {
 
         asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&6u8)); // USDC
         asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&18u8)); // wtCOIN
+        push_identity_wrapper_ratio(&asserter);
 
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
         let executor = MockExecutorCtx.try_into_executor().await.unwrap();
@@ -2157,6 +2587,7 @@ mod tests {
         for _ in 0..3 {
             asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&6u8));
             asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&18u8));
+            push_identity_wrapper_ratio(&asserter);
         }
 
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
@@ -2351,6 +2782,7 @@ mod tests {
 
             asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&6u8));
             asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&18u8));
+            push_identity_wrapper_ratio(&asserter);
             let provider = ProviderBuilder::new().connect_mocked_client(asserter);
             let executor = MockExecutorCtx.try_into_executor().await.unwrap();
             let mut ctx = create_test_ctx_with_order_owner(Address::ZERO);
@@ -2580,6 +3012,7 @@ mod tests {
 
         asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&6u8));
         asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&18u8));
+        push_identity_wrapper_ratio(&asserter);
 
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
         let executor = RateLimitedPreflightExecutor;
@@ -2711,6 +3144,7 @@ mod tests {
 
         asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&18u8)); // wtCOIN
         asserter.push_success(&<decimalsCall as SolCall>::abi_encode_returns(&6u8)); // USDC
+        push_identity_wrapper_ratio(&asserter);
 
         let provider = ProviderBuilder::new().connect_mocked_client(asserter);
         let executor = MockExecutorCtx.try_into_executor().await.unwrap();

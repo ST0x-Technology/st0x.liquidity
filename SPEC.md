@@ -2606,6 +2606,72 @@ This means blockchain fills are recorded in both OnChainTradeEvent::Filled
 (audit trail) and PositionEvent::OnChainOrderFilled (position tracking), but
 they serve different purposes in different bounded contexts.
 
+Raindex settles equity in ERC-4626 wrapped shares while the broker, Position,
+and P&L domains use underlying shares. `OnChainTradeEvent::Filled` therefore
+retains the wrapped quantity and wrapped-share price as the immutable chain
+facts. Accounting witnesses that raw fill first. Only a fill that is not yet
+acknowledged, and whose Position fill or trading-disabled exclusion record is
+not already durable, then reads the wrapper's underlying-per-wrapped ratio on
+the fill's chain at the fill's confirmed block, so the accounting RPC must serve
+historical (archive) state. A retry after a crash in either window resumes
+without that read. That read returns end-of-block state, so accounting also
+reads the ratio at the previous block and logs a warning when the two differ:
+the fill is then normalized with the end-of-block ratio, and an operator checks
+it. `PositionEvent::OnChainOrderFilled` stores the resulting
+underlying-equivalent quantity and price, plus the exact wrapped quantity, while
+the same atomic Position acknowledgement stores the proven ratio on its
+fill-application event. The quantity is the wrapped quantity times the ratio,
+floored to 18 decimals, and the price is the wrapped-share price divided by the
+exact ratio, so quantity times price equals the original cash notional up to
+that floor. The price never absorbs the floor: a few-wei fill must not write a
+distorted last price. Onchain inventory vault slots hold wrapped shares, so the
+inventory reactor applies the wrapped quantity, not the underlying one. The
+cover instruction for a fill on a trading-disabled asset and the `process-tx`
+report also use the underlying-equivalent quantity and price, because the
+operator covers at the broker. A missing block, unavailable historical state, or
+invalid ratio fails accounting closed before a Position write or broker hedge.
+It never falls back to the latest ratio or assumes 1:1. A fill whose wrapped
+quantity converts to zero underlying shares, for example a dust fill at a ratio
+below 1 or any fill on a wrapper whose ratio at the fill block is zero, can
+never succeed on retry, so it is recorded in `skipped_fills` as
+`zero_underlying_amount`, acknowledged, and logged for manual reconciliation
+instead of stopping the fill worker. The record is written before the
+acknowledgement, and a failed write leaves the fill pending for the retry. The
+fill worker and `process-tx` share this skip, and an existing record finishes it
+on a resume or a rerun with no ratio read.
+
+Position events written before ratio evidence was persisted remain replayable,
+and P&L counts their fills 1:1 in wrapped shares, as before. That is exact for a
+wrapper whose ratio has always been 1. For a wrapper whose ratio is above 1,
+such as SGOV, P&L that includes those fills is approximate, off by about the
+ratio minus 1. The report warns when the queried range includes such fills for a
+symbol, unless every ratio recorded for that symbol is exactly 1. Fills after
+this change carry their proven ratio and are exact.
+
+Position replay has the same legacy offset. The old bot booked wrapped fills 1:1
+and hedged them 1:1 with broker shares, so on a wrapper whose ratio is not 1 the
+real exposure differs from the Position net, even when that net is zero. The
+real exposure is the vault's wrapped holdings times the current ratio against
+the broker position, or the legacy fills recomputed at each fill's own ratio. It
+is bounded and does not grow. An operator can correct it after deploy while the
+market is closed: record a manual adjustment to a net of zero, then a second
+manual adjustment to the real exposure in underlying shares, with a price, so
+the bot hedges it at the next open. A manual adjustment only rewrites the net
+and places no broker order, and the Position rejects one while a hedge is
+pending.
+
+Exclusion records that the old bot wrote for fills on a trading-disabled asset
+state their cover in wrapped shares, and this change repeats a recorded detail
+word for word when it resumes or alerts that fill again. Operators cover the
+outstanding `TradingDisabled` rows for wrapped symbols whose ratio is not 1 at
+the wrapped quantity times the ratio at its fill block, not at the recorded
+figure.
+
+The dashboard trade feed shows onchain fills in wrapped shares, because the
+`OnChainTrade` record keeps the raw chain facts, and labels them as wrapped.
+Broker hedges are in underlying shares, so at a ratio other than 1 an onchain
+fill and its hedge show different quantities for the same exposure.
+
 ### Aggregate Design
 
 #### EventSourced Trait
@@ -2755,8 +2821,10 @@ enum OnChainTradeCommand {
 enum OnChainTradeEvent {
     Filled {
         symbol: Symbol,
+        // Immutable chain facts, in ERC-4626 wrapped shares.
         amount: Decimal,
         direction: Direction,
+        // USDC per wrapped share.
         price_usdc: Decimal,
         block_number: u64,
         block_timestamp: DateTime<Utc>,
@@ -2822,6 +2890,21 @@ struct TradeId {
 }
 
 enum PositionCommand {
+    // Production fill command: the fill is already normalized into
+    // underlying shares at the ratio read at its confirmed block.
+    AcknowledgeNormalizedOnChainFill {
+        symbol: Symbol,
+        threshold: ExecutionThreshold,
+        trade_id: TradeId,
+        amount: FractionalShares,
+        wrapped_amount: FractionalShares,
+        direction: Direction,
+        price_usdc: Decimal,
+        block_timestamp: DateTime<Utc>,
+        block_number: Option<u64>,
+        underlying_per_wrapped: U256,
+    },
+    // Legacy shape with no ratio evidence; tests and fixtures only.
     AcknowledgeOnChainFill {
         trade_id: TradeId,
         amount: FractionalShares,
@@ -2881,11 +2964,24 @@ enum PositionCommand {
 enum PositionEvent {
     OnChainOrderFilled {
         trade_id: TradeId,
+        // Underlying (broker) shares after wrapper-ratio normalization.
         amount: FractionalShares,
+        // Exact wrapped shares moved onchain; `None` on legacy events, which
+        // were recorded 1:1. Inventory applies this, not `amount`.
+        wrapped_amount: Option<FractionalShares>,
         direction: Direction,
+        // USDC per underlying share; amount * price_usdc keeps the notional.
         price_usdc: Decimal,
         block_timestamp: DateTime<Utc>,
         seen_at: DateTime<Utc>,
+    },
+    // Emitted atomically with the fill it applies.
+    OnChainFillApplied {
+        trade_id: TradeId,
+        // Underlying-per-wrapped ratio (18 decimals) read at the fill block;
+        // `None` on legacy events, which P&L counts 1:1.
+        underlying_per_wrapped: Option<U256>,
+        applied_at: DateTime<Utc>,
     },
     EquityTransferReserved {
         reservation_id: EquityTransferReservationId,
@@ -2945,8 +3041,12 @@ enum TriggerReason {
 
 **Business Rules** (enforced in `handle()`):
 
-- `AcknowledgeOnChainFill` serves as the genesis event (initializes the
-  aggregate on first fill)
+- `AcknowledgeNormalizedOnChainFill` serves as the genesis event (initializes
+  the aggregate on first fill). It carries the fill already normalized into
+  underlying shares plus the exact wrapped quantity and the proven
+  underlying-per-wrapped ratio, and records the ratio on `OnChainFillApplied` in
+  the same transaction. The legacy `AcknowledgeOnChainFill`, which records no
+  ratio, exists only for tests and fixtures.
 - `ManuallyAdjustPosition` is an audited operator repair command that sets the
   absolute net exposure after manual trading or rebalancing outside the bot. It
   may initialize a missing position, including a zero target, using the

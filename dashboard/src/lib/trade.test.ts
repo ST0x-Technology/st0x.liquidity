@@ -7,6 +7,7 @@ import {
   legacyCompatibleVenues,
   mergeTradeHistory,
   normalizeTrade,
+  shareUnitLabel,
   tradeFailureReason,
   tradeOutcomeShares,
   tradeOutcomeClass,
@@ -244,6 +245,15 @@ describe('live trade history', () => {
     expect(isOnchainVenue('unknown_onchain')).toBe(true)
     expect(isOnchainVenue('alpaca')).toBe(false)
     expect(isOnchainVenue('dry_run')).toBe(false)
+  })
+
+  it('labels onchain quantities as wrapped shares and broker quantities as shares', () => {
+    expect(shareUnitLabel('raindex')).toBe('wrapped shares')
+    expect(shareUnitLabel('bebop')).toBe('wrapped shares')
+    expect(shareUnitLabel('uniswap_v4')).toBe('wrapped shares')
+    expect(shareUnitLabel('unknown_onchain')).toBe('wrapped shares')
+    expect(shareUnitLabel('alpaca')).toBe('shares')
+    expect(shareUnitLabel('dry_run')).toBe('shares')
   })
 
   it('collapses adapter venue filters for pre-v3 backends', () => {

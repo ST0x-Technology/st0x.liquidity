@@ -390,15 +390,41 @@ async fn load_position_rows(
 
     let mut onchain = QueryBuilder::<Sqlite>::new(
         "SELECT event_rowid, symbol, tx_hash, log_index, shares, direction, price_usd, \
-         executed_at FROM pnl_onchain_fill WHERE event_rowid <= ",
+         executed_at, \
+         CASE WHEN underlying_per_wrapped_event_rowid <= ",
+    );
+    onchain.push_bind(as_of_rowid);
+    onchain.push(
+        " THEN underlying_per_wrapped_fixed18 ELSE NULL END \
+         FROM pnl_onchain_fill \
+         WHERE event_rowid <= ",
     );
     onchain.push_bind(as_of_rowid);
     push_symbol_filter(&mut onchain, symbols);
-    for (event_rowid, symbol, tx_hash, log_index, shares, direction, price_usd, executed_at) in
-        onchain
-            .build_query_as::<(i64, String, String, i64, String, String, String, String)>()
-            .fetch_all(pool)
-            .await?
+    for (
+        event_rowid,
+        symbol,
+        tx_hash,
+        log_index,
+        shares,
+        direction,
+        price_usd,
+        executed_at,
+        underlying_per_wrapped_fixed18,
+    ) in onchain
+        .build_query_as::<(
+            i64,
+            String,
+            String,
+            i64,
+            String,
+            String,
+            String,
+            String,
+            Option<String>,
+        )>()
+        .fetch_all(pool)
+        .await?
     {
         rows.push(PositionLedgerRow::OnchainFill(OnchainFillRow {
             event_rowid,
@@ -409,6 +435,7 @@ async fn load_position_rows(
             direction: ledger_direction("pnl_onchain_fill", event_rowid, &direction)?,
             price_usd,
             executed_at,
+            underlying_per_wrapped_fixed18,
         }));
     }
 

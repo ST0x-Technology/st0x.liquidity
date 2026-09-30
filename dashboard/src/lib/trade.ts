@@ -88,6 +88,12 @@ export const isTradingVenue = (value: unknown): value is TradingVenue =>
 
 export const isOnchainVenue = (venue: TradingVenue): boolean => VENUE_IS_ONCHAIN[venue]
 
+// Onchain fills settle in ERC-4626 wrapped shares, while broker hedges are in
+// underlying shares. At a wrapper ratio other than 1 the two quantities differ
+// for the same exposure, so onchain quantities must say which unit they use.
+export const shareUnitLabel = (venue: TradingVenue): string =>
+  isOnchainVenue(venue) ? 'wrapped shares' : 'shares'
+
 export type TradeProtocol = 'terminal_outcomes_v3' | 'terminal_outcomes_v2' | 'terminal_outcomes_v1'
 
 const TRADE_PROTOCOL_FALLBACK = {

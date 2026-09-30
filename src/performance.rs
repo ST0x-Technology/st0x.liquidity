@@ -60,6 +60,8 @@ use st0x_execution::{
 use st0x_finance::Usd;
 #[cfg(any(test, feature = "test-support"))]
 use st0x_float_macro::float;
+#[cfg(any(test, feature = "test-support"))]
+use st0x_wrapper::RATIO_ONE;
 
 #[cfg(any(test, feature = "test-support"))]
 use crate::offchain::order::{
@@ -69,7 +71,7 @@ use crate::offchain::order::{
 #[cfg(any(test, feature = "test-support"))]
 use crate::onchain_trade::{OnChainTrade, OnChainTradeCommand, OnChainTradeId, OnChainTradeSource};
 #[cfg(any(test, feature = "test-support"))]
-use crate::position::{Position, PositionCommand, TradeId};
+use crate::position::{NormalizedOnChainFillCommand, Position, PositionCommand, TradeId};
 
 pub(crate) mod equity_timing;
 pub(crate) mod infra;
@@ -259,19 +261,23 @@ pub async fn seed_simulated_hedge_latency_history(
             position
                 .send(
                     symbol,
-                    PositionCommand::AcknowledgeOnChainFillAt {
-                        symbol: symbol.clone(),
-                        threshold,
-                        trade_id: TradeId {
-                            chain: Chain::Base,
-                            tx_hash,
-                            log_index,
+                    PositionCommand::AcknowledgeNormalizedOnChainFillAt {
+                        command: NormalizedOnChainFillCommand {
+                            symbol: symbol.clone(),
+                            threshold,
+                            trade_id: TradeId {
+                                chain: Chain::Base,
+                                tx_hash,
+                                log_index,
+                            },
+                            amount: amount.inner(),
+                            wrapped_amount: amount.inner(),
+                            direction: Direction::Buy,
+                            price_usdc: onchain_price,
+                            block_timestamp,
+                            block_number: None,
+                            underlying_per_wrapped: RATIO_ONE,
                         },
-                        amount: amount.inner(),
-                        direction: Direction::Buy,
-                        price_usdc: onchain_price,
-                        block_timestamp,
-                        block_number: None,
                         seen_at,
                     },
                 )
@@ -545,6 +551,7 @@ pub(super) mod test_helpers {
                 log_index,
             },
             amount: FractionalShares::new(float!(1)),
+            wrapped_amount: None,
             direction: Direction::Buy,
             price_usdc: float!(150),
             block_timestamp: timestamp(block_offset),
@@ -651,7 +658,31 @@ mod simulated_history_tests {
 
     use super::report::{ReportRange, hedge_latency_report, load_hedge_performance};
     use super::*;
+    use crate::dashboard::pnl::{PnlQuery, build_pnl_report};
     use crate::test_utils::setup_test_db;
+
+    #[tokio::test]
+    async fn simulated_history_seeds_fills_with_wrapper_ratio_evidence() {
+        let pool = setup_test_db().await;
+        let now = Utc.with_ymd_and_hms(2026, 7, 1, 18, 0, 0).unwrap();
+
+        seed_simulated_hedge_latency_history(&pool, now, 14)
+            .await
+            .unwrap();
+
+        let report = build_pnl_report(&pool, &PnlQuery::default(), Vec::new(), now)
+            .await
+            .unwrap();
+
+        assert!(
+            !report
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("before per-fill wrapper ratios")),
+            "seeded fills must carry ratio evidence: {:?}",
+            report.warnings
+        );
+    }
 
     #[tokio::test]
     async fn simulated_hedge_latency_history_populates_daily_percentile_buckets() {

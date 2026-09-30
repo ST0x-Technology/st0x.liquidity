@@ -226,6 +226,7 @@ pub(crate) struct OnchainFillRow {
     pub(crate) direction: Direction,
     pub(crate) price_usd: String,
     pub(crate) executed_at: String,
+    pub(crate) underlying_per_wrapped_fixed18: Option<String>,
 }
 
 #[derive(Debug, Clone)]

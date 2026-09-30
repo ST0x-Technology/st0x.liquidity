@@ -26,6 +26,7 @@
     TRADING_VENUES,
     fallbackTradeProtocol,
     isOnchainVenue,
+    shareUnitLabel,
     legacyCompatibleVenues,
     mergeTradeHistory,
     normalizeTrade,
@@ -336,11 +337,14 @@
 
   const fmtSize = (value: string): string => formatDecimal(value, 3)
 
+  // The position price is per underlying share, so it cannot value wrapped
+  // shares: onchain rows name the unit and leave out the USD value.
   const shareTooltip = (trade: TradeEntry): string =>
-    `${trade.outcome.status !== 'filled' ? 'Order quantity. ' : ''}${equityUsdTooltip(
-      trade.shares,
-      positionPrices.get(trade.symbol) ?? null
-    )}`
+    `${trade.outcome.status !== 'filled' ? 'Order quantity. ' : ''}${
+      isOnchainVenue(trade.venue)
+        ? 'Wrapped shares; the broker hedge is in underlying shares.'
+        : equityUsdTooltip(trade.shares, positionPrices.get(trade.symbol) ?? null)
+    }`
 
   const isNumeric = (value: unknown): boolean =>
     typeof value === 'string' && value !== '' && !Number.isNaN(Number(value))
@@ -598,7 +602,9 @@
                 <HoverTooltip tooltip={shareTooltip(trade)}>
                   <span
                     class="cursor-help hover:underline hover:decoration-dotted hover:decoration-muted-foreground hover:underline-offset-4"
-                    >{fmtSize(trade.shares)}</span
+                    >{fmtSize(trade.shares)}{#if isOnchainVenue(trade.venue)}<span
+                        class="ml-1 text-muted-foreground">wrapped</span
+                      >{/if}</span
                   >
                 </HoverTooltip>
               </Table.Cell>
@@ -645,7 +651,7 @@
         <HoverTooltip tooltip={shareTooltip(trade)}>
           <span
             class="cursor-help font-mono text-xs font-normal text-muted-foreground hover:underline hover:decoration-dotted hover:decoration-muted-foreground hover:underline-offset-4"
-            >{fmtSize(trade.shares)} shares</span
+            >{fmtSize(trade.shares)} {shareUnitLabel(trade.venue)}</span
           >
         </HoverTooltip>
         <span class="text-xs font-normal {venueColor(trade.venue)}">{venueLabel(trade.venue)}</span>

@@ -781,6 +781,16 @@ fn render_process_tx_outcome<W: Write>(
                 "The fill was excluded from hedging while trading was disabled and is recorded in skipped_fills. The pipeline will not hedge it: {detail}"
             )?;
         }
+        ProcessTxOutcome::SkippedZeroUnderlying {
+            symbol,
+            chain,
+            detail,
+        } => {
+            writeln!(
+                stdout,
+                "The fill on {chain} converts to zero {symbol} shares at its fill-block wrapper ratio, so it was recorded in skipped_fills and is not hedged. Reconcile it by hand: {detail}"
+            )?;
+        }
         ProcessTxOutcome::PlacementRejected { symbol } => {
             writeln!(
                 stdout,
@@ -2957,6 +2967,20 @@ mod tests {
                 },
                 format!(
                     "{fill_summary}The fill was excluded from hedging while trading was disabled and is recorded in skipped_fills. The pipeline will not hedge it: cover by SELL\n"
+                ),
+            ),
+            (
+                ProcessTxReport {
+                    fill: None,
+                    outcome: ProcessTxOutcome::SkippedZeroUnderlying {
+                        symbol: symbol(),
+                        chain: st0x_evm::Chain::Base,
+                        detail: "converts to zero underlying shares".to_string(),
+                    },
+                },
+                format!(
+                    "The fill on base converts to zero {} shares at its fill-block wrapper ratio, so it was recorded in skipped_fills and is not hedged. Reconcile it by hand: converts to zero underlying shares\n",
+                    symbol()
                 ),
             ),
             (
