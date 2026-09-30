@@ -910,7 +910,7 @@ async fn run_usdc_transfer<Writer: Write>(
     let wallet_ctx = ctx.wallet()?;
 
     // The corridor the CCTP bridge below carries: the transfer runs on that
-    // chain's vault, signer and confirmation depth.
+    // chain's vault and signer.
     let rebalancing_ctx = &ctx.rebalancing;
     let corridor = rebalancing_ctx.cctp_corridor.usdc_corridor();
     let corridor_chain = corridor.chain();
@@ -1020,7 +1020,7 @@ async fn run_usdc_transfer<Writer: Write>(
         &UsdcSettlementParams {
             attestation_retry_deadline: rebalancing_ctx.attestation_retry_deadline,
             settlement_retry_deadline: rebalancing_ctx.settlement_retry_deadline,
-            required_confirmations: hedged.required_confirmations,
+            required_confirmations: ctx.chains.primary().required_confirmations,
             ethereum_required_confirmations: Some(deposit_send_required_confirmations(
                 &ctx.chains,
             )?),

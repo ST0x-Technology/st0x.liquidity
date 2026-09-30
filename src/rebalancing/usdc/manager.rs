@@ -95,7 +95,7 @@ const BURN_BROADCAST_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 ///
 /// Bundled together so constructors that require these values stay within
 /// the 8-argument clippy threshold.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct UsdcSettlementParams {
     pub attestation_retry_deadline: Duration,
     /// Upper bound on the retryable settlement wait after an Alpaca

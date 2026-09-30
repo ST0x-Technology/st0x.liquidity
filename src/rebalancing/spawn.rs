@@ -73,13 +73,12 @@ pub(crate) struct UsdcTransferResumeHandles {
 }
 
 /// Where one served cash corridor's transfers run: the signer, orderbook
-/// contracts, cash vault and confirmation depth of its chain.
+/// contracts and cash vault of its chain.
 pub(crate) struct UsdcCorridorEndpoints<Signer> {
     pub(crate) corridor: UsdcCorridor,
     pub(crate) chain_wallet: Signer,
     pub(crate) contracts: RaindexContracts,
     pub(crate) vault_id: RaindexVaultId,
-    pub(crate) required_confirmations: u64,
     /// The USDC route's gas check: this chain's wallet and the Ethereum hub.
     pub(crate) gas_readiness: Arc<GasReadiness>,
 }
@@ -119,8 +118,7 @@ pub(crate) struct RebalancerServices<Signer: Wallet> {
     wallet: Arc<AlpacaWalletService>,
     ethereum_wallet: Signer,
     cctp_corridor: CctpCorridor,
-    /// Settlement tuning shared by every corridor; each corridor's service
-    /// replaces `required_confirmations` with its own chain's depth.
+    /// Settlement tuning shared by every corridor.
     settlement: UsdcSettlementParams,
 }
 
@@ -142,7 +140,7 @@ impl<Signer: Wallet + Clone + 'static> RebalancerServices<Signer> {
     }
 
     /// Builds one cross-venue cash transfer per served corridor, each on its
-    /// own chain's orderbook, vault, wallet, confirmations and gas check, and
+    /// own chain's orderbook, vault, wallet and gas check, and
     /// returns the trait-erased entry points of the dispatcher that routes
     /// every call to the transfer's corridor.
     ///
@@ -167,10 +165,6 @@ impl<Signer: Wallet + Clone + 'static> RebalancerServices<Signer> {
                 endpoints.contracts,
                 chain_wallet.address(),
             ));
-            let settlement = UsdcSettlementParams {
-                required_confirmations: endpoints.required_confirmations,
-                ..self.settlement.clone()
-            };
             let transfer: Arc<dyn CorridorTransfer> = Arc::new(
                 CrossVenueCashTransfer::new(
                     self.broker.clone(),
@@ -183,7 +177,7 @@ impl<Signer: Wallet + Clone + 'static> RebalancerServices<Signer> {
                         chain_wallet.address(),
                         endpoints.vault_id,
                     ),
-                    &settlement,
+                    &self.settlement,
                     bot_gas_enqueuer.clone(),
                 )
                 .with_gas_readiness(endpoints.gas_readiness)
@@ -560,7 +554,6 @@ mod tests {
                 orderbook: TEST_ORDERBOOK,
             },
             vault_id: RaindexVaultId(B256::ZERO),
-            required_confirmations: 0,
             gas_readiness: crate::native_gas::GasReadiness::always_ready_for_test(),
         }
     }

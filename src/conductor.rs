@@ -2448,8 +2448,8 @@ fn build_rebalancing_raindex_service<Signer: Wallet + Clone>(
 }
 
 /// Resolves where `corridor`'s transfers run: the signer, orderbook
-/// contracts, first cash vault and confirmation depth of the corridor's own
-/// chain, whatever the primary is, and the gas check of that chain's wallet
+/// contracts and first cash vault of the corridor's own chain, whatever the
+/// primary is, and the gas check of that chain's wallet
 /// and `ethereum_wallet`. A corridor chain without a gas threshold refuses
 /// startup by name.
 fn usdc_corridor_endpoints<Signer: Wallet + Clone>(
@@ -2483,7 +2483,6 @@ fn usdc_corridor_endpoints<Signer: Wallet + Clone>(
         chain_wallet: tokenization.wallet.clone(),
         contracts: crate::onchain::raindex_contracts(hedged),
         vault_id: RaindexVaultId(vault_id),
-        required_confirmations: hedged.required_confirmations,
         gas_readiness,
     })
 }
@@ -3587,7 +3586,7 @@ fn spawn_rebalancing_infrastructure<Signer: Wallet + Clone>(
             alpaca_auth,
             ethereum_wallet,
             &rebalancing_ctx,
-            usdc_endpoints.required_confirmations,
+            deps.ctx.chains.primary().required_confirmations,
             deposit_send_required_confirmations(&deps.ctx.chains)
                 .inspect_err(|error| {
                     warn!(target: "rebalance", %error, "Reconcile of a signed Alpaca deposit send is refused until [chains.ethereum] is configured");
@@ -19641,7 +19640,7 @@ mod tests {
     }
 
     /// An Ethereum primary with no cash vault, and Base hedged with
-    /// `base_vault` as its cash vault, three confirmations deep.
+    /// `base_vault` as its cash vault.
     fn ethereum_primary_with_base_cash_ctx(base_vault: B256) -> Ctx {
         let mut ctx = create_test_ctx_with_order_owner(Address::ZERO);
         ctx.chains = ChainRegistry::single_hedged_chain(ethereum_hedged_chain(
@@ -19653,7 +19652,6 @@ mod tests {
             HedgedChain::test()
                 .chain(Chain::Base)
                 .orderbook(Address::repeat_byte(0xb0))
-                .required_confirmations(3)
                 .assets(ChainAssets {
                     equities: ChainEquities::default(),
                     cash: Some(ChainCashAsset {
@@ -19693,8 +19691,8 @@ mod tests {
         .collect()
     }
 
-    /// A corridor's transfers run on its own chain's orderbook, cash vault,
-    /// signer and confirmation depth, not the primary chain's.
+    /// A corridor's transfers run on its own chain's orderbook, cash vault
+    /// and signer, not the primary chain's.
     #[test]
     fn usdc_transfer_runs_on_the_corridor_chains_vault() {
         let base_vault = B256::repeat_byte(0xba);
@@ -19718,7 +19716,6 @@ mod tests {
             endpoints.chain_wallet.address(),
             wallet_ctx.base_wallet().address()
         );
-        assert_eq!(endpoints.required_confirmations, 3);
     }
 
     /// One set of tokenization services per hedged chain that rebalances
