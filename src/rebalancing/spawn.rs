@@ -159,6 +159,8 @@ impl<Signer: Wallet + Clone + 'static> RebalancerServices<Signer> {
         bot_gas_enqueuer: &BotGasReceiptCostEnqueuer,
         driver_gate: &UsdcDriverGate,
     ) -> Result<UsdcTransferResumeHandles, SpawnRebalancerError> {
+        // Every service signs deposit sends on the one Ethereum wallet.
+        let deposit_send_lock = Arc::new(tokio::sync::Mutex::new(()));
         let mut by_corridor = BTreeMap::new();
         for endpoints in corridors {
             let corridor = endpoints.corridor;
@@ -186,7 +188,8 @@ impl<Signer: Wallet + Clone + 'static> RebalancerServices<Signer> {
                 )
                 .with_gas_readiness(endpoints.gas_readiness)
                 .with_credit_ledger(pool.clone())
-                .with_driver_gate(driver_gate.clone()),
+                .with_driver_gate(driver_gate.clone())
+                .with_deposit_send_lock(Arc::clone(&deposit_send_lock)),
             );
 
             if by_corridor.insert(corridor, transfer).is_some() {

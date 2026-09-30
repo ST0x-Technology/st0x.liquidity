@@ -417,7 +417,8 @@ pub struct CrossVenueCashTransfer<Signer: Wallet, B = CctpBridge<Signer, Signer>
     credit_ledger: CreditLedger,
     /// Held across the sign and persist of a deposit send, so a redrive
     /// waits for a timed-out attempt's prepare and takes its persisted send
-    /// instead of signing at the next nonce.
+    /// instead of signing at the next nonce. Shared by every corridor's
+    /// service, since all sign on the one Ethereum wallet.
     deposit_send_prepare: Arc<tokio::sync::Mutex<()>>,
     /// The USDC driver gate the conductor's workers claim. The detached burn
     /// task claims through it too, so an operator pause waits for a burn
@@ -932,6 +933,14 @@ impl<
     #[must_use]
     pub(crate) fn with_driver_gate(mut self, gate: UsdcDriverGate) -> Self {
         self.driver_gate = Some(gate);
+        self
+    }
+
+    /// Signs and persists deposit sends under `lock`, shared with every other
+    /// service that signs on the same Ethereum wallet.
+    #[must_use]
+    pub(crate) fn with_deposit_send_lock(mut self, lock: Arc<tokio::sync::Mutex<()>>) -> Self {
+        self.deposit_send_prepare = lock;
         self
     }
 
@@ -18025,6 +18034,50 @@ mod tests {
         assert_eq!(bridge.usdc_prepare_calls(), 1, "only one send is signed");
         assert_eq!(
             (redrive.tx_hash(), redrive.nonce()),
+            (first.tx_hash(), first.nonce())
+        );
+        assert!(bridge.usdc_discarded().is_empty(), "no nonce is released");
+    }
+
+    /// Two corridors' services signing on the one Ethereum wallet share the
+    /// deposit-send lock, so a prepare on one waits for the other's and takes
+    /// its persisted send.
+    #[tokio::test]
+    async fn services_sharing_the_deposit_send_lock_sign_once() {
+        let bridge = Arc::new(
+            MockBridge::new()
+                .with_send_usdc_tx(MOCK_DEPOSIT_SEND_TX)
+                .with_first_usdc_prepare_delay(Duration::from_millis(300)),
+        );
+        let cqrs = create_test_store_instance().await;
+        let lock = Arc::new(tokio::sync::Mutex::new(()));
+        let (first_service, _first_server, _first_anvil) =
+            deposit_send_manager(cqrs.clone(), Arc::clone(&bridge)).await;
+        let (second_service, _second_server, _second_anvil) =
+            deposit_send_manager(cqrs.clone(), Arc::clone(&bridge)).await;
+        let first_service = first_service.with_deposit_send_lock(Arc::clone(&lock));
+        let second_service = second_service.with_deposit_send_lock(lock);
+
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        stage_bridged_with_mint_tx(&cqrs, &id, usdc("100"), usdc("99.99"), TxHash::ZERO).await;
+        let deposit_address = Address::random();
+        let amount = U256::from(99_990_000);
+
+        let (first, second) = tokio::join!(
+            first_service.prepare_and_persist_deposit_send(&id, deposit_address, amount),
+            async {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                second_service
+                    .prepare_and_persist_deposit_send(&id, deposit_address, amount)
+                    .await
+            },
+        );
+
+        let (first, _) = first.expect("the first prepare persists its send");
+        let (second, _) = second.expect("the second takes the persisted send");
+        assert_eq!(bridge.usdc_prepare_calls(), 1, "only one send is signed");
+        assert_eq!(
+            (second.tx_hash(), second.nonce()),
             (first.tx_hash(), first.nonce())
         );
         assert!(bridge.usdc_discarded().is_empty(), "no nonce is released");
