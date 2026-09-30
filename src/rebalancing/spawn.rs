@@ -22,7 +22,7 @@ use super::usdc::{
     UsdcCorridorTransfers, UsdcDriverGate, UsdcSettlementParams,
 };
 use crate::bot_gas::BotGasReceiptCostEnqueuer;
-use crate::native_gas::GasReadiness;
+use crate::native_gas::{ConfiguredGasReadiness, GasReadiness};
 use crate::telemetry::broker::InstrumentedAlpacaBroker;
 use crate::usdc_rebalance::UsdcRebalance;
 
@@ -39,6 +39,14 @@ pub(crate) enum SpawnRebalancerError {
     NoCorridor,
     #[error("the {corridor} corridor is listed twice")]
     DuplicateCorridor { corridor: UsdcCorridor },
+    #[error(
+        "the {corridor} corridor runs on {chain}, where another served corridor already runs: \
+         {chain} has one USDC gas check"
+    )]
+    SharedCorridorChain {
+        chain: Chain,
+        corridor: UsdcCorridor,
+    },
 }
 
 /// Adapts the config-layer equity asset map to the narrow per-symbol token pairs
@@ -85,6 +93,29 @@ pub(crate) struct UsdcCorridorEndpoints<Signer> {
     pub(crate) vault_id: RaindexVaultId,
     /// The USDC route's gas check: this chain's wallet and the Ethereum hub.
     pub(crate) gas_readiness: Arc<GasReadiness>,
+}
+
+/// Each served corridor's gas check, keyed by its chain as the transfer
+/// admission guard looks it up. A second corridor on one chain would replace
+/// the first's check, so it is refused by name.
+pub(crate) fn usdc_gas_readiness_by_chain<Signer>(
+    corridors: &[UsdcCorridorEndpoints<Signer>],
+) -> Result<BTreeMap<Chain, ConfiguredGasReadiness>, SpawnRebalancerError> {
+    let mut by_chain = BTreeMap::new();
+
+    for endpoints in corridors {
+        let chain = endpoints.corridor.chain();
+        let readiness = ConfiguredGasReadiness::Wired(endpoints.gas_readiness.clone());
+
+        if by_chain.insert(chain, readiness).is_some() {
+            return Err(SpawnRebalancerError::SharedCorridorChain {
+                chain,
+                corridor: endpoints.corridor,
+            });
+        }
+    }
+
+    Ok(by_chain)
 }
 
 #[derive(Clone)]
@@ -702,6 +733,36 @@ mod tests {
                 SpawnRebalancerError::DuplicateCorridor {
                     corridor: UsdcCorridor::BASE_CCTP
                 }
+            ),
+            "got {error:?}"
+        );
+    }
+
+    /// The admission guard keeps one gas check per chain, so a second served
+    /// corridor on a chain is refused rather than replacing the first's check.
+    #[tokio::test]
+    async fn second_corridor_on_one_chain_refuses_its_gas_check() {
+        let server = MockServer::start();
+        let (_services, chain_wallet) = make_services_with_mock_wallet(&server).await;
+        let base_relay = UsdcCorridor::HubRouted {
+            chain: Chain::Base,
+            hop: HopKind::Relay,
+        };
+
+        let Err(error) = usdc_gas_readiness_by_chain(&[
+            corridor_endpoints(UsdcCorridor::BASE_CCTP, chain_wallet.clone()),
+            corridor_endpoints(base_relay, chain_wallet),
+        ]) else {
+            panic!("a second corridor on one chain must be refused");
+        };
+
+        assert!(
+            matches!(
+                error,
+                SpawnRebalancerError::SharedCorridorChain {
+                    chain: Chain::Base,
+                    corridor,
+                } if corridor == base_relay
             ),
             "got {error:?}"
         );

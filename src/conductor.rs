@@ -134,7 +134,7 @@ use crate::rebalancing::usdc::{
 use crate::rebalancing::{
     BaseWallet, ChainRebalancingConfig, ChainWallets, EthereumWallet, RebalancerServices,
     RebalancingSchedulers, RebalancingService, RebalancingServiceConfig, UsdcCorridorEndpoints,
-    to_wrapped_equities,
+    to_wrapped_equities, usdc_gas_readiness_by_chain,
 };
 use crate::startup::StartupToken;
 use crate::telemetry::broker::InstrumentedAlpacaBroker;
@@ -3521,15 +3521,7 @@ fn spawn_rebalancing_infrastructure<Signer: Wallet + Clone>(
 
         wire_transfer_admission_guards(
             &rebalancing_service,
-            usdc_endpoints
-                .iter()
-                .map(|endpoints| {
-                    (
-                        endpoints.corridor.chain(),
-                        ConfiguredGasReadiness::Wired(endpoints.gas_readiness.clone()),
-                    )
-                })
-                .collect(),
+            usdc_gas_readiness_by_chain(&usdc_endpoints)?,
             equity_gas_readiness,
             rebalancing_ctx.freeze_check,
             &deps.ctx.issuance,
