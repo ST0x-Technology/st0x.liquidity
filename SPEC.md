@@ -6330,9 +6330,10 @@ effect rather than a generic intent:
   always safe: a consumed CCTP nonce cannot be minted twice, and a rerun whose
   mint already landed adopts that mint. A mint whose outcome could not be
   confirmed is an explicit retryable `502` telling the operator to verify
-  onchain; a complete but malformed attestation or a deterministic mint failure
-  is a `500`. The route touches no aggregate; bring the stuck `UsdcRebalance`
-  back in sync afterwards with `resume` or `reconcile`.
+  onchain; a complete but malformed attestation (including an envelope too short
+  to recover or carrying a placeholder nonce) or a deterministic mint failure is
+  a `500`. The route touches no aggregate; bring the stuck `UsdcRebalance` back
+  in sync afterwards with `resume` or `reconcile`.
 - **`view rebuild` through the running bot pauses every projection writer.**
   `POST /liquidity-write/views/{view}/rebuild` refuses with `503` until startup
   completes and fully validates the request first (an unknown view, a malformed

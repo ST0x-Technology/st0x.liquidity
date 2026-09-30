@@ -2353,7 +2353,14 @@ async fn reconcile_usdc_transfer(
     })?;
     let _projection_write = state.projection_maintenance.enter().await;
 
-    let _driver_paused = quiesce_usdc_driver(&handle.usdc_driver_pause, &id, None).await?;
+    let _driver_paused = quiesce_usdc_driver(
+        &handle.usdc_driver_pause,
+        UsdcDriverPauseRequest::Rebalance {
+            id: &id,
+            direction: None,
+        },
+    )
+    .await?;
 
     reconcile_stuck_usdc_transfer(
         &handle.usdc_store,
@@ -3589,6 +3596,16 @@ struct ProcessTransactionQuery {
     chain: Option<Chain>,
 }
 
+/// What keeps the detached process-tx task accounted for once the request is
+/// gone: the tracker the shutdown drain waits on, and the projection claim a
+/// view rebuild waits on. The workload folds position and offchain order
+/// projections, so the claim moves into the task rather than dropping with the
+/// request.
+struct DetachedProcessTx<'a> {
+    tracker: &'a TaskTracker,
+    projection_write: crate::conductor::projection_pause::ProjectionWrite,
+}
+
 /// Runs the process-tx workload on a detached `tokio` task and awaits its
 /// result, mapping a task-join failure and the operator error to HTTP
 /// responses.
@@ -3607,8 +3624,12 @@ async fn spawn_and_join_process_tx<ChainProvider: alloy::providers::Provider + C
     provider: ChainProvider,
     cache: SymbolCache,
     handle: &ProcessTxHandle,
-    detached_tasks: &TaskTracker,
+    detached: DetachedProcessTx<'_>,
 ) -> Result<ProcessTxReport, (StatusCode, Json<ErrorResponse>)> {
+    let DetachedProcessTx {
+        tracker: detached_tasks,
+        projection_write,
+    } = detached;
     let stores = handle.stores.clone();
     let order_placer = Arc::clone(&handle.order_placer);
     let counter_trade_submission_lock = Arc::clone(&handle.counter_trade_submission_lock);
@@ -3630,6 +3651,7 @@ async fn spawn_and_join_process_tx<ChainProvider: alloy::providers::Provider + C
         ));
     }
     let task = detached_tasks.spawn(async move {
+        let _projection_write = projection_write;
         let result = process_tx::process_tx(
             tx_hash,
             &ctx,
@@ -3706,7 +3728,7 @@ async fn process_transaction(
             }),
         )
     })?;
-    let _projection_write = state.projection_maintenance.enter().await;
+    let projection_write = state.projection_maintenance.enter().await;
 
     // The conductor's bounded, instrumented provider for the chain: a hung
     // endpoint surfaces as an error instead of parking this request, and the
@@ -3735,7 +3757,10 @@ async fn process_transaction(
         provider,
         SymbolCache::default(),
         handle,
-        &state.detached_tasks,
+        DetachedProcessTx {
+            tracker: &state.detached_tasks,
+            projection_write,
+        },
     )
     .await?;
 
@@ -9338,7 +9363,9 @@ mod tests {
                 .store(self.gate.try_enter().is_some(), Ordering::SeqCst);
             Err(CctpMintRecoveryError::Attestation {
                 burn_tx,
-                source: st0x_bridge::cctp::CctpError::PlaceholderNonce,
+                source: st0x_bridge::cctp::CctpError::AttestationNotReady {
+                    source: st0x_bridge::cctp::AttestationError::NotYetAvailable { status: 404 },
+                },
             })
         }
 
@@ -9410,11 +9437,26 @@ mod tests {
         let burn_tx = TxHash::repeat_byte(0x33);
         let attestation = CctpMintRecoveryError::Attestation {
             burn_tx,
-            source: st0x_bridge::cctp::CctpError::PlaceholderNonce,
+            source: st0x_bridge::cctp::CctpError::AttestationNotReady {
+                source: st0x_bridge::cctp::AttestationError::NotYetAvailable { status: 404 },
+            },
         };
         let (status, message) = cctp_mint_recovery_error_response(&attestation);
         assert_eq!(status, StatusCode::BAD_GATEWAY);
         assert!(message.contains(&burn_tx.to_string()), "{message}");
+
+        // A complete response whose envelope fails validation is as
+        // deterministic as a malformed one: a 500, not a retryable 502.
+        for source in [
+            st0x_bridge::cctp::CctpError::PlaceholderNonce,
+            st0x_bridge::cctp::CctpError::MessageTooShort { length: 12 },
+            st0x_bridge::cctp::CctpError::MessageTooShortForRecovery { length: 100 },
+        ] {
+            let invalid = CctpMintRecoveryError::Attestation { burn_tx, source };
+            let (status, message) = cctp_mint_recovery_error_response(&invalid);
+            assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{invalid}");
+            assert_eq!(message, "CCTP mint recovery failed");
+        }
 
         // A complete but malformed attestation is a hard failure: retrying
         // cannot fix it, so it is a 500 with the detail withheld, not a 502.
@@ -10622,6 +10664,14 @@ mod tests {
         }
     }
 
+    /// A projection claim on a fresh, non global gate, for the process-tx
+    /// seam tests that do not pause it.
+    async fn unpaused_projection_write() -> crate::conductor::projection_pause::ProjectionWrite {
+        crate::conductor::projection_pause::ProjectionMaintenance::for_test()
+            .enter()
+            .await
+    }
+
     /// Aborting the HTTP request future after the broker placement has begun
     /// must NOT cancel that placement: `process_transaction` runs the process-tx
     /// workload on a detached task, so a live broker order completes even when
@@ -10632,7 +10682,9 @@ mod tests {
     /// finishes and that the detached task records its own outcome. Awaiting
     /// the workload inline instead of the tracked `detached_tasks.spawn(...).await`
     /// would cancel the parked placement and hang `finished`, which is the
-    /// regression this test guards.
+    /// regression this test guards. The request's projection claim moves into
+    /// the detached task too, so a view rebuild asked for after the request is
+    /// gone must wait until the placement finishes.
     #[tracing_test::traced_test]
     #[tokio::test]
     async fn process_tx_task_survives_request_cancellation() {
@@ -10655,6 +10707,9 @@ mod tests {
         let trading_chain = ctx.chains.primary().clone();
 
         let handle = process_tx_handle(&pool, &apalis_pool, &ctx, order_placer).await;
+        let projection_maintenance =
+            Arc::new(crate::conductor::projection_pause::ProjectionMaintenance::for_test());
+        let projection_write = projection_maintenance.enter().await;
 
         let request = tokio::spawn(async move {
             spawn_and_join_process_tx(
@@ -10665,7 +10720,10 @@ mod tests {
                 provider,
                 cache,
                 &handle,
-                &TaskTracker::new(),
+                DetachedProcessTx {
+                    tracker: &TaskTracker::new(),
+                    projection_write,
+                },
             )
             .await
         });
@@ -10676,10 +10734,22 @@ mod tests {
         request.abort();
         assert!(request.await.unwrap_err().is_cancelled());
 
+        match tokio::time::timeout(Duration::from_millis(100), projection_maintenance.pause()).await
+        {
+            Err(_) => {}
+            Ok(_) => panic!("a rebuild must wait for the detached placement's projection writes"),
+        }
+
         release.notify_one();
         tokio::time::timeout(Duration::from_secs(5), finished.notified())
             .await
             .expect("the detached broker placement must finish after request cancellation");
+        drop(
+            tokio::time::timeout(Duration::from_secs(5), projection_maintenance.pause())
+                .await
+                .expect("the rebuild must be granted once the detached task finishes")
+                .expect("an idle projection gate must quiesce"),
+        );
 
         // The request future was aborted before the workload finished, so the
         // detached task's own log is the only record of what it did.
@@ -10716,7 +10786,10 @@ mod tests {
             provider,
             SymbolCache::default(),
             &handle,
-            &TaskTracker::new(),
+            DetachedProcessTx {
+                tracker: &TaskTracker::new(),
+                projection_write: unpaused_projection_write().await,
+            },
         )
         .await
         else {
@@ -10751,7 +10824,10 @@ mod tests {
             provider,
             SymbolCache::default(),
             &handle,
-            &detached_tasks,
+            DetachedProcessTx {
+                tracker: &detached_tasks,
+                projection_write: unpaused_projection_write().await,
+            },
         )
         .await
         else {
@@ -10813,7 +10889,10 @@ mod tests {
             provider,
             cache,
             &handle,
-            &TaskTracker::new(),
+            DetachedProcessTx {
+                tracker: &TaskTracker::new(),
+                projection_write: unpaused_projection_write().await,
+            },
         )
         .await
         else {
@@ -10899,7 +10978,10 @@ mod tests {
             provider,
             cache,
             &handle,
-            &TaskTracker::new(),
+            DetachedProcessTx {
+                tracker: &TaskTracker::new(),
+                projection_write: unpaused_projection_write().await,
+            },
         )
         .await
         else {

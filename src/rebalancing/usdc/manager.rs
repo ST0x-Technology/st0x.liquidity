@@ -6857,8 +6857,9 @@ pub(crate) enum RecoveredMintAmounts {
 
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum CctpMintRecoveryError {
-    /// Circle has not attested the burn yet, or the attestation call failed;
-    /// retryable once the attestation is complete.
+    /// The attestation fetch failed: retryable only when Circle has not
+    /// attested the burn yet or the call hit a transient error (see
+    /// [`Self::is_retryable`]).
     #[error("attestation not available for burn {burn_tx}: {source}")]
     Attestation {
         burn_tx: TxHash,
@@ -6875,16 +6876,21 @@ pub(crate) enum CctpMintRecoveryError {
 }
 
 impl CctpMintRecoveryError {
-    /// Whether the operator should retry. Circle not having attested the burn
-    /// yet, or a transient transport hiccup, is retryable. A complete but
-    /// malformed attestation is a definitively hard failure (see
-    /// [`CctpError::MalformedAttestation`]) that retrying cannot fix, as is a
-    /// deterministic mint submission failure.
+    /// Whether the operator should retry. An allow list: only
+    /// [`CctpError::AttestationNotReady`] is retryable, which the single
+    /// request fetch returns both for a burn Circle has not attested yet and
+    /// for a transient transport error. Everything else the fetch returns is
+    /// deterministic for a response Circle already reports complete: a
+    /// malformed attestation, or an envelope `AttestationResponse` validation
+    /// rejects (too short, or a placeholder nonce). Retrying cannot fix those,
+    /// and neither can a deterministic mint submission failure.
     pub(crate) fn is_retryable(&self) -> bool {
         matches!(
             self,
-            Self::Attestation { source, .. }
-                if !matches!(source, CctpError::MalformedAttestation { .. })
+            Self::Attestation {
+                source: CctpError::AttestationNotReady { .. },
+                ..
+            }
         )
     }
 

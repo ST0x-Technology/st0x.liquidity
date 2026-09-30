@@ -1,21 +1,24 @@
-//! Projection-maintenance pause for every in-process projection writer.
+//! Projection maintenance pause for the projection writers in this process.
 //!
 //! Event-sorcery folds projections synchronously inside `Store::send`.
-//! [`work`](super::job::work) and detached burn submission claim the
-//! process-global gate through [`enter_projection_gate`], while the inventory
-//! monitor and operator HTTP handlers claim through the injected
-//! [`ProjectionMaintenance`] controller. Both are the same gate, so a rebuild
-//! pauses it, waits for existing slots to drain, and holds the pause through
-//! delete and replay.
+//! [`work`](super::job::work) claims the process global gate through
+//! [`enter_projection_gate`], while the inventory monitor and operator HTTP
+//! handlers claim through the injected [`ProjectionMaintenance`] controller.
+//! Both are the same gate, so a rebuild pauses it, waits for existing slots to
+//! drain, and holds the pause through delete and replay.
+//!
+//! Detached work outlives the claim of the task that spawned it, so it carries
+//! a claim of its own into the spawned task: the burn submission, the deposit
+//! send persist and the terminal reservation releases take
+//! [`projection_slot_for_detached_work`] before the spawn, and the `process-tx`
+//! route moves its [`ProjectionWrite`] into its detached task.
 //!
 //! These writers do not enter this gate: an operator HTTP write route that does
-//! not claim through [`ProjectionMaintenance`], the HTTP route detached tasks
-//! (`AppState::detached_tasks`, the in bot `process-tx`), and every write from
-//! another process, such as the operator CLI (`stox`), which opens the same
-//! SQLite database and folds projections through its own stores while the bot
-//! runs (`fail_usdc_transfer_command` and the repair commands, for example).
-//! The gate is process local, so a rebuild must exclude those writers
-//! separately.
+//! not claim through [`ProjectionMaintenance`], and every write from another
+//! process, such as the operator CLI (`stox`), which opens the same SQLite
+//! database and folds projections through its own stores while the bot runs
+//! (`fail_usdc_transfer_command` and the repair commands, for example). The
+//! gate is process local, so a rebuild must exclude those writers separately.
 //!
 //! A job runs inside [`in_projection_slot`], so work it spawns and awaits takes
 //! a non parking continuation of the job's slot through
