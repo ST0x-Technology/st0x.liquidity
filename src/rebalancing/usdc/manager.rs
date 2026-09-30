@@ -25,7 +25,7 @@ use st0x_bridge::corridor::UsdcCorridor;
 use st0x_bridge::{Attestation, Bridge, BridgeDirection, BurnReceipt, BurnTxStatus, MintReceipt};
 use st0x_config::{ALPACA_MINIMUM_WITHDRAWAL, ALPACA_TO_BASE_MINIMUM_TRANSFER, ChainRegistry};
 use st0x_event_sorcery::Store;
-use st0x_evm::{Chain, IERC20, PreparedTransaction, USDC_BASE, Wallet};
+use st0x_evm::{Chain, IERC20, PreparedTransaction, Wallet};
 use st0x_execution::alpaca_broker_api::CryptoOrderResponse;
 use st0x_execution::{
     AlpacaAmount, AlpacaBrokerApiError, AlpacaTransferId, AlpacaWalletError, AlpacaWalletService,
@@ -2152,7 +2152,7 @@ impl<
                         // `confirm_deposit` advances the aggregate to its terminal
                         // state.
                         self.enqueue_bot_gas_cost(
-                            Chain::Base,
+                            self.corridor.chain(),
                             deposit_tx,
                             BotGasOperationCategory::VaultDeposit,
                         )
@@ -3648,7 +3648,11 @@ impl<
         // re-depositing.
         let deposit_tx = match self
             .raindex
-            .submit_deposit_usdc(self.vault_id, amount)
+            .submit_deposit_usdc(
+                self.corridor.chain().settlement_stable(),
+                self.vault_id,
+                amount,
+            )
             .await
         {
             Ok(tx) => tx,
@@ -3681,7 +3685,7 @@ impl<
         self.raindex.confirm_tx(deposit_tx).await?;
 
         self.enqueue_bot_gas_cost(
-            Chain::Base,
+            self.corridor.chain(),
             deposit_tx,
             BotGasOperationCategory::VaultDeposit,
         )
@@ -5242,7 +5246,12 @@ impl<
             )
             .await?;
 
-        let withdraw_tx = match self.raindex.withdraw_usdc(self.vault_id, amount_u256).await {
+        let stable = self.corridor.chain().settlement_stable();
+        let withdraw_tx = match self
+            .raindex
+            .withdraw_usdc(stable, self.vault_id, amount_u256)
+            .await
+        {
             Ok(tx) => tx,
             Err(error) => return Err(classify_vault_withdrawal_error(error)),
         };
@@ -5267,7 +5276,11 @@ impl<
     ) -> Result<(), UsdcTransferError> {
         let (existing_tx, withdrawn) = self
             .raindex
-            .find_recent_withdrawal(USDC_BASE, self.vault_id, from_block)
+            .find_recent_withdrawal(
+                self.corridor.chain().settlement_stable().address,
+                self.vault_id,
+                from_block,
+            )
             .await
             .map_err(|error| classify_vault_withdrawal_scan_error(id, initiated_at, error))?;
 
@@ -5311,7 +5324,7 @@ impl<
         // succeeds) proceeds to genuinely fail the transfer for
         // reconciliation below.
         self.enqueue_bot_gas_cost(
-            Chain::Base,
+            self.corridor.chain(),
             existing_tx,
             BotGasOperationCategory::VaultWithdraw,
         )
@@ -5356,7 +5369,7 @@ impl<
         // Enqueue BEFORE `Initiate`/`ConfirmWithdrawal` (see
         // `enqueue_bot_gas_cost`'s doc for why the ordering matters here).
         self.enqueue_bot_gas_cost(
-            Chain::Base,
+            self.corridor.chain(),
             withdraw_tx,
             BotGasOperationCategory::VaultWithdraw,
         )
@@ -7069,7 +7082,9 @@ mod tests {
     use st0x_config::HedgedChain;
     use st0x_event_sorcery::{AggregateError, LifecycleError, test_store};
     use st0x_evm::local::RawPrivateKeyWallet;
-    use st0x_evm::{AbiDecodedErrorType, Evm, EvmError, IERC20, NoOpErrorRegistry, Wallet};
+    use st0x_evm::{
+        AbiDecodedErrorType, Evm, EvmError, IERC20, NoOpErrorRegistry, USDC_BASE, Wallet,
+    };
     use st0x_execution::{AlpacaTransferId, AlpacaWalletClient, AlpacaWalletError, PollingConfig};
     use st0x_raindex::{RaindexContracts, RaindexService};
 
