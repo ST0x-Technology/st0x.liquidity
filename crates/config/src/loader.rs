@@ -12355,6 +12355,49 @@ mod tests {
         );
     }
 
+    /// With no corridor table the served corridor is Base via CCTP, so a
+    /// primary other than Base is refused at load, not deep in startup.
+    #[test]
+    fn full_validation_refuses_a_non_base_primary_without_a_corridor_table() {
+        let mut deployed: toml::Table =
+            toml::from_str(include_str!("../../../config/prod/st0x-hedge.toml")).unwrap();
+        let chains = deployed["chains"].as_table_mut().unwrap();
+        let mut ethereum_trading = chains["base"]["trading"].clone();
+        ethereum_trading
+            .as_table_mut()
+            .unwrap()
+            .insert("primary".to_string(), toml::Value::Boolean(true));
+        chains["base"]["trading"]
+            .as_table_mut()
+            .unwrap()
+            .insert("primary".to_string(), toml::Value::Boolean(false));
+        chains["ethereum"]
+            .as_table_mut()
+            .unwrap()
+            .insert("trading".to_string(), ethereum_trading);
+        deployed["rebalancing"].as_table_mut().unwrap().insert(
+            "usdc".to_string(),
+            toml::Value::Table(toml::Table::from_iter([(
+                "mode".to_string(),
+                toml::Value::String("disabled".to_string()),
+            )])),
+        );
+        let config = toml_file(&toml::to_string(&deployed).unwrap());
+
+        let error = Ctx::validate_config_file(config.path(), TokenFile::Skipped).unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                CtxError::CorridorChainNotPrimary {
+                    chain: Chain::Base,
+                    primary: Chain::Ethereum,
+                }
+            ),
+            "got {error:?}"
+        );
+    }
+
     #[test]
     fn disabled_chain_with_stale_cash_rebalancing_needs_no_corridor() {
         let mut config = prod_config();
