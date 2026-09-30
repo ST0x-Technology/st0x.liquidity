@@ -7105,7 +7105,7 @@ mod tests {
         TestMintBurnToken, deploy_cctp_on_chain, link_chains, mint_usdc, set_max_burn_amount,
     };
     use st0x_bridge::corridor::HopKind;
-    use st0x_config::HedgedChain;
+    use st0x_config::{ChainCtx, HedgedChain};
     use st0x_event_sorcery::{AggregateError, LifecycleError, test_store};
     use st0x_evm::local::RawPrivateKeyWallet;
     use st0x_evm::{
@@ -16947,12 +16947,11 @@ mod tests {
         let without_ethereum = UsdcSettlementParams::for_chains(&rebalancing, &chains, None);
         assert_eq!(without_ethereum.ethereum_required_confirmations, None);
 
-        chains.insert_secondary(
-            HedgedChain::test()
-                .chain(Chain::Ethereum)
-                .required_confirmations(5)
-                .call(),
-        );
+        chains.insert_transport(ChainCtx {
+            chain: Chain::Ethereum,
+            rpc_url: "http://127.0.0.1:0".parse().unwrap(),
+            required_confirmations: 5,
+        });
         let settlement = UsdcSettlementParams::for_chains(&rebalancing, &chains, None);
 
         assert_eq!(settlement.ethereum_required_confirmations, Some(5));
