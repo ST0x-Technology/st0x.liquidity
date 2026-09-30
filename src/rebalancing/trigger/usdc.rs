@@ -742,8 +742,10 @@ impl RebalancingService {
     /// Retries the load of every transfer blocking all corridors: a loaded
     /// one holds its own corridor when its state holds a guard, a missing
     /// one latches every corridor until a restart, and a failed load waits
-    /// for the next sweep.
+    /// for the next sweep. A loaded one also resolves its inventory marker:
+    /// it names the corridor while the guard holds, and is dropped otherwise.
     pub(super) async fn read_unread_corridors(&self) {
+        let _event_sync_guard = self.usdc_event_sync.lock().await;
         for id in self.usdc_guards.unread_ids() {
             match self.durable_corridor(&id).await {
                 DurableCorridor::Unread => {}
@@ -756,8 +758,19 @@ impl RebalancingService {
                     direction,
                     holds_guard,
                 } => {
-                    self.usdc_guards
-                        .resolve_unread(&id, holds_guard.then_some((corridor.chain(), direction)));
+                    let holder = holds_guard.then_some((corridor.chain(), direction));
+                    self.usdc_guards.resolve_unread(&id, holder);
+                    let mut inventory = self.inventory.write().await;
+                    if inventory.active_usdc_rebalance_entry(&id).is_none() {
+                        continue;
+                    }
+                    *inventory = match holder {
+                        Some((chain, direction)) => inventory.clone().set_active_usdc_rebalance(
+                            id,
+                            ActiveUsdcRebalance::Known { chain, direction },
+                        ),
+                        None => inventory.clone().clear_active_usdc_rebalance(&id),
+                    };
                 }
             }
         }
