@@ -228,7 +228,9 @@ impl<W: Wallet> RaindexService<W> {
             .await?;
 
         info!(target: "inventory", tx_hash = %receipt.transaction_hash, %token, spender = %self.orderbook_address, "Revoked stale orderbook allowance");
-        Ok(RevokeOutcome::Revoked)
+        Ok(RevokeOutcome::Revoked {
+            tx: receipt.transaction_hash,
+        })
     }
 
     async fn deposit4_to_vault<Registry: IntoErrorRegistry>(
@@ -1752,10 +1754,9 @@ mod tests {
             .revoke_orderbook_allowance::<NoOpErrorRegistry>(local_evm.token_address)
             .await
             .unwrap();
-        assert_eq!(
-            outcome,
-            RevokeOutcome::Revoked,
-            "non-zero allowance must trigger a revoke tx"
+        assert!(
+            matches!(outcome, RevokeOutcome::Revoked { .. }),
+            "non-zero allowance must trigger a revoke tx, got {outcome:?}"
         );
 
         // Idempotent: a second call sees zero and does nothing.

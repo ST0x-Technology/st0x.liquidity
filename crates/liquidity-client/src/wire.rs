@@ -93,3 +93,61 @@ pub(crate) struct SetEquityMarkRequest {
     pub(crate) source: String,
     pub(crate) reason: String,
 }
+
+/// Body of `POST /capital/transfer-usdc`.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct TransferUsdcRequest {
+    pub(crate) direction: TransferUsdcDirection,
+    pub(crate) amount: String,
+}
+
+/// The venue a USDC transfer moves funds to, kebab cased on the wire exactly
+/// as the bot's transfer request expects it: `to-raindex` is the bot's
+/// `AlpacaToBase` and `to-alpaca` its `BaseToAlpaca`.
+#[derive(Clone, Copy, Serialize, clap::ValueEnum)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum TransferUsdcDirection {
+    /// Transfer to Raindex (onchain venue).
+    ToRaindex,
+    /// Transfer to Alpaca (offchain venue).
+    ToAlpaca,
+}
+
+/// Body of `POST /capital/vault-deposit` and `POST /capital/vault-withdraw`.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct VaultTransferRequest {
+    pub(crate) chain: &'static str,
+    pub(crate) token: String,
+    pub(crate) vault_id: String,
+    pub(crate) amount: String,
+}
+
+/// Body of `POST /capital/vault-withdraw-usdc`.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct VaultWithdrawUsdcRequest {
+    pub(crate) chain: &'static str,
+    pub(crate) amount: String,
+}
+
+/// Body of `POST /capital/cctp-bridge`: exactly one of `amount` or `all`.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct CctpBridgeRequest {
+    pub(crate) from: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) amount: Option<String>,
+    /// Omitted when false, unlike `RebuildViewRequest::all`: the bot's body
+    /// carries either `amount` or `all: true`, never both keys.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub(crate) all: bool,
+}
+
+/// Body of `POST /capital/reset-allowance`.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ResetAllowanceRequest {
+    pub(crate) chain: &'static str,
+}

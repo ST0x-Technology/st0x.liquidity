@@ -288,6 +288,33 @@ issuer. A resumed mint (`--issuer-request-id`) must be given the network it
 started on; a `--network` that disagrees with the record is refused, and the
 `transfer` recovery verbs carry no network at all.
 
+Without container access, the capital verbs run in the bot through IAP with
+`st0x-liquidity-client --env <env> capital <verb>`, which needs the write tier
+Workspace group and signs with the bot's own wallets:
+
+```bash
+st0x-liquidity-client --env <env> capital vault-deposit --amount 10 --token <wrapped-token> --vault-id <vault-id> --network ethereum
+st0x-liquidity-client --env <env> capital vault-withdraw --amount 10 --token <token> --vault-id <vault-id> --network ethereum
+st0x-liquidity-client --env <env> capital vault-withdraw-usdc --amount <amount> --network <chain>
+st0x-liquidity-client --env <env> capital reset-allowance --network <chain>
+# starts the transfer on the bot's worker and prints its id at once
+st0x-liquidity-client --env <env> capital transfer-usdc --direction <to-raindex|to-alpaca> --amount <amount>
+# burns only and prints the burn tx; finish with debug cctp complete-mint
+st0x-liquidity-client --env <env> capital cctp-bridge --from <ethereum|base> --amount <amount>
+st0x-liquidity-client --env <env> debug cctp complete-mint --burn-tx <burn-tx> --source-chain <ethereum|base>
+```
+
+`--network` defaults to `base`, as in `st0x-cli`. `capital transfer-usdc` is
+refused with `409` while another USDC transfer is in flight or holds the
+corridor guard, so retrying it cannot start a second transfer alongside the
+first. `capital cctp-bridge` does not wait for Circle: it returns the burn tx,
+and `debug cctp complete-mint` fetches the attestation and mints once Circle has
+attested it (a `502` means not yet, retry). A request that times out on the
+client may still complete in the bot; check the bot logs for the transaction
+before retrying a vault or allowance verb. The tokenization and issuer verbs
+(`transfer-equity`, `wrap-equity`, `unwrap-equity`, `donate-equity`,
+`dividend-bump`) have no client subcommand and stay on `st0x-cli`.
+
 ### Orchestrator Rollout per Chain
 
 Issuance keys an asset's `vault_mode` by symbol, so cutting an asset over to

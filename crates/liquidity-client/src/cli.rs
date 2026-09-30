@@ -4,7 +4,7 @@
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
 use crate::target::Env;
-use crate::wire::ReconcileUsdcReason;
+use crate::wire::{ReconcileUsdcReason, TransferUsdcDirection};
 
 /// Rejects an empty or whitespace-only audit `--reason` at parse time, before
 /// the value can reach auth or the network. The server rejects blank reasons
@@ -39,6 +39,10 @@ pub(crate) enum Command {
     /// Safe recovery operations (debug tier).
     #[command(subcommand)]
     Debug(Debug),
+    /// Capital movement operations, signed by the bot's own wallets (capital
+    /// tier).
+    #[command(subcommand)]
+    Capital(Capital),
 }
 
 #[derive(Subcommand)]
@@ -189,8 +193,8 @@ pub(crate) enum Debug {
     Cctp(Cctp),
 }
 
-/// A hedged chain, spelled as the bot's `chain` query value (the `Chain` wire
-/// names in `st0x-evm`).
+/// A hedged chain, spelled as the bot's `chain` wire value (the `Chain` wire
+/// names in `st0x-evm`): the `process-tx` query and the capital request bodies.
 #[derive(Clone, Copy, ValueEnum)]
 pub(crate) enum HedgedChain {
     Base,
@@ -273,6 +277,16 @@ pub(crate) enum CctpSourceChain {
     Ethereum,
     Base,
 }
+
+impl CctpSourceChain {
+    pub(crate) fn wire_name(self) -> &'static str {
+        match self {
+            Self::Ethereum => "ethereum",
+            Self::Base => "base",
+        }
+    }
+}
+
 /// Equity transfer kind, spelled as the bot's reconcile path segment.
 #[derive(Clone, Copy, ValueEnum)]
 pub(crate) enum EquityTransferKind {
@@ -354,6 +368,84 @@ pub(crate) struct SetMarkArgs {
     pub(crate) reason: String,
 }
 
+#[derive(Subcommand)]
+pub(crate) enum Capital {
+    /// Start a USDC transfer between Alpaca and Raindex on the bot's transfer
+    /// worker, the path the rebalancer uses. Returns the new transfer id at
+    /// once; follow it with `read` and recover it with `debug resume-usdc`.
+    TransferUsdc {
+        /// Direction of transfer.
+        #[arg(short = 'd', long, value_enum)]
+        direction: TransferUsdcDirection,
+        /// Amount of USDC to transfer, as a decimal.
+        #[arg(short = 'a', long)]
+        amount: String,
+    },
+    /// Deposit tokens from the bot's wallet into a Raindex vault: approves,
+    /// then deposits, resolving token decimals from onchain metadata.
+    VaultDeposit(VaultArgs),
+    /// Withdraw tokens from a Raindex vault to the bot's wallet, resolving
+    /// token decimals from onchain metadata.
+    VaultWithdraw(VaultArgs),
+    /// Withdraw USDC from the chain's configured Raindex cash vault.
+    VaultWithdrawUsdc {
+        /// Amount of USDC to withdraw, as a decimal.
+        #[arg(short = 'a', long)]
+        amount: String,
+        /// Chain of the cash vault: its canonical USDC and its
+        /// `[chains.<name>.trading.assets.cash]` vault; a chain with no pinned
+        /// USDC is refused.
+        #[arg(long, value_enum, default_value_t = HedgedChain::Base)]
+        network: HedgedChain,
+    },
+    /// Burn USDC on Ethereum or Base for a CCTP transfer to the other chain.
+    /// Returns the burn tx without waiting for Circle's attestation; finish
+    /// with `debug cctp complete-mint` once it is attested.
+    CctpBridge {
+        /// Amount of USDC to bridge, as a decimal (omit to use --all).
+        #[arg(
+            short = 'a',
+            long,
+            conflicts_with = "all",
+            required_unless_present = "all"
+        )]
+        amount: Option<String>,
+        /// Bridge the entire USDC balance of the source wallet.
+        #[arg(long, conflicts_with = "amount", required_unless_present = "amount")]
+        all: bool,
+        /// Source chain to burn from; the mint lands on the other one.
+        #[arg(long, value_enum)]
+        from: CctpSourceChain,
+    },
+    /// Reset the bot wallet's USDC allowance for the orderbook to zero.
+    ResetAllowance {
+        /// Chain whose USDC allowance to reset: its wallet, canonical USDC
+        /// and `[chains.<name>.trading]` orderbook.
+        #[arg(long, value_enum, default_value_t = HedgedChain::Base)]
+        network: HedgedChain,
+    },
+}
+
+/// Shared by `vault-deposit` and `vault-withdraw`, whose requests carry the
+/// same body.
+#[derive(Args)]
+pub(crate) struct VaultArgs {
+    /// Amount of tokens as a decimal (for example 100 for 100 tokens).
+    #[arg(short = 'a', long)]
+    pub(crate) amount: String,
+    /// Token contract address.
+    #[arg(short = 't', long)]
+    pub(crate) token: String,
+    /// Vault ID.
+    #[arg(short = 'v', long)]
+    pub(crate) vault_id: String,
+    /// Chain of the vault: selects the wallet and the
+    /// `[chains.<name>.trading]` orderbook; a chain without that table is
+    /// refused.
+    #[arg(long, value_enum, default_value_t = HedgedChain::Base)]
+    pub(crate) network: HedgedChain,
+}
+
 #[derive(Clone, Copy, ValueEnum)]
 pub(crate) enum ReadResource {
     Pnl,
@@ -404,11 +496,11 @@ mod tests {
     use clap::Parser as _;
 
     use super::{
-        Cli, Command, Debug, EquityTransferKind, PortfolioSnapshot, Position, UsdcDirection,
-        parse_key_value,
+        Capital, CctpSourceChain, Cli, Command, Debug, EquityTransferKind, PortfolioSnapshot,
+        Position, UsdcDirection, parse_key_value,
     };
     use crate::target::Env;
-    use crate::wire::ReconcileUsdcReason;
+    use crate::wire::{ReconcileUsdcReason, TransferUsdcDirection};
 
     #[test]
     fn parses_key_and_value() {
@@ -464,7 +556,7 @@ mod tests {
             .chain(args.iter().copied());
         Cli::try_parse_from(full).map(|cli| match cli.command {
             Command::Debug(debug) => debug,
-            Command::Read(_) => panic!("expected a debug command"),
+            Command::Read(_) | Command::Capital(_) => panic!("expected a debug command"),
         })
     }
 
@@ -754,5 +846,214 @@ mod tests {
                 "{argv:?} must require its flags"
             );
         }
+    }
+
+    /// Parses a full argv (after `--env staging`) into the capital command.
+    fn capital(args: &[&str]) -> Result<Capital, clap::Error> {
+        let full = ["st0x-liquidity-client", "--env", "staging", "capital"]
+            .into_iter()
+            .chain(args.iter().copied());
+        Cli::try_parse_from(full).map(|cli| match cli.command {
+            Command::Capital(capital) => capital,
+            Command::Read(_) | Command::Debug(_) => panic!("expected a capital command"),
+        })
+    }
+
+    /// The capital verbs keep the flag names and short flags of their
+    /// st0x-cli counterparts, and pass amounts through verbatim.
+    #[test]
+    fn parses_capital_verbs() {
+        assert!(matches!(
+            capital(&[
+                "transfer-usdc",
+                "--direction",
+                "to-raindex",
+                "--amount",
+                "250.5"
+            ])
+            .unwrap(),
+            Capital::TransferUsdc {
+                direction: TransferUsdcDirection::ToRaindex,
+                amount,
+            } if amount == "250.5"
+        ));
+        assert!(matches!(
+            capital(&["transfer-usdc", "-d", "to-alpaca", "-a", "10"]).unwrap(),
+            Capital::TransferUsdc {
+                direction: TransferUsdcDirection::ToAlpaca,
+                amount,
+            } if amount == "10"
+        ));
+
+        let Capital::VaultDeposit(deposit) = capital(&[
+            "vault-deposit",
+            "-a",
+            "1.5",
+            "-t",
+            "0xtoken",
+            "-v",
+            "0xvault",
+            "--network",
+            "ethereum",
+        ])
+        .unwrap() else {
+            panic!("expected vault-deposit");
+        };
+        assert_eq!(deposit.amount, "1.5");
+        assert_eq!(deposit.token, "0xtoken");
+        assert_eq!(deposit.vault_id, "0xvault");
+        assert_eq!(deposit.network.wire_name(), "ethereum");
+
+        let Capital::VaultWithdraw(withdraw) = capital(&[
+            "vault-withdraw",
+            "--amount",
+            "2",
+            "--token",
+            "0xtoken",
+            "--vault-id",
+            "0xvault",
+            "--network",
+            "robinhood",
+        ])
+        .unwrap() else {
+            panic!("expected vault-withdraw");
+        };
+        assert_eq!(withdraw.amount, "2");
+        assert_eq!(withdraw.vault_id, "0xvault");
+        assert_eq!(withdraw.network.wire_name(), "robinhood");
+
+        let Capital::VaultWithdrawUsdc { amount, network } =
+            capital(&["vault-withdraw-usdc", "-a", "100", "--network", "hyperevm"]).unwrap()
+        else {
+            panic!("expected vault-withdraw-usdc");
+        };
+        assert_eq!(amount, "100");
+        assert_eq!(network.wire_name(), "hyperevm");
+
+        let Capital::ResetAllowance { network } =
+            capital(&["reset-allowance", "--network", "ethereum"]).unwrap()
+        else {
+            panic!("expected reset-allowance");
+        };
+        assert_eq!(network.wire_name(), "ethereum");
+
+        for argv in [
+            &["transfer-usdc", "--direction", "to-raindex"][..],
+            &["vault-deposit", "-a", "1", "-t", "0xtoken"][..],
+            &["vault-withdraw", "-a", "1", "-v", "0xvault"][..],
+            &["vault-withdraw-usdc", "--network", "base"][..],
+            &["cctp-bridge", "--amount", "1"][..],
+        ] {
+            let Err(error) = capital(argv) else {
+                panic!("{argv:?} must require its flags");
+            };
+            assert_eq!(
+                error.kind(),
+                clap::error::ErrorKind::MissingRequiredArgument,
+                "{argv:?} must require its flags"
+            );
+        }
+    }
+
+    /// Like st0x-cli, every capital `--network` defaults to base.
+    #[test]
+    fn capital_network_defaults_to_base() {
+        for argv in [
+            &["vault-deposit", "-a", "1", "-t", "0xtoken", "-v", "0xvault"][..],
+            &[
+                "vault-withdraw",
+                "-a",
+                "1",
+                "-t",
+                "0xtoken",
+                "-v",
+                "0xvault",
+            ][..],
+            &["vault-withdraw-usdc", "-a", "1"][..],
+            &["reset-allowance"][..],
+        ] {
+            let network = match capital(argv).unwrap() {
+                Capital::VaultDeposit(args) | Capital::VaultWithdraw(args) => args.network,
+                Capital::VaultWithdrawUsdc { network, .. }
+                | Capital::ResetAllowance { network } => network,
+                Capital::TransferUsdc { .. } | Capital::CctpBridge { .. } => {
+                    panic!("{argv:?} takes no --network")
+                }
+            };
+            assert_eq!(network.wire_name(), "base", "{argv:?}");
+        }
+    }
+
+    /// `cctp-bridge` takes exactly one of `--amount` and `--all`, refused by
+    /// clap before the bot's own check.
+    #[test]
+    fn cctp_bridge_requires_exactly_one_of_amount_and_all() {
+        assert!(matches!(
+            capital(&["cctp-bridge", "--from", "ethereum", "--amount", "100"]).unwrap(),
+            Capital::CctpBridge {
+                amount: Some(amount),
+                all: false,
+                from: CctpSourceChain::Ethereum,
+            } if amount == "100"
+        ));
+        assert!(matches!(
+            capital(&["cctp-bridge", "--from", "base", "--all"]).unwrap(),
+            Capital::CctpBridge {
+                amount: None,
+                all: true,
+                from: CctpSourceChain::Base,
+            }
+        ));
+
+        let Err(error) = capital(&["cctp-bridge", "--from", "base", "--amount", "1", "--all"])
+        else {
+            panic!("--amount with --all must be refused");
+        };
+        assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+
+        let Err(error) = capital(&["cctp-bridge", "--from", "base"]) else {
+            panic!("neither --amount nor --all must be refused");
+        };
+        assert_eq!(
+            error.kind(),
+            clap::error::ErrorKind::MissingRequiredArgument
+        );
+    }
+
+    /// Capital value enums refuse unknown spellings before any network call,
+    /// and `reset-allowance` takes `--network`, not `--chain`, like st0x-cli.
+    #[test]
+    fn capital_value_enums_reject_unknown_spellings() {
+        for argv in [
+            &["transfer-usdc", "--direction", "sideways", "--amount", "1"][..],
+            &[
+                "vault-deposit",
+                "-a",
+                "1",
+                "-t",
+                "0xtoken",
+                "-v",
+                "0xvault",
+                "--network",
+                "solana",
+            ][..],
+            &["vault-withdraw-usdc", "-a", "1", "--network", "solana"][..],
+            &["reset-allowance", "--network", "solana"][..],
+            &["cctp-bridge", "--from", "hyperevm", "--all"][..],
+        ] {
+            let Err(error) = capital(argv) else {
+                panic!("{argv:?} must be refused");
+            };
+            assert_eq!(
+                error.kind(),
+                clap::error::ErrorKind::InvalidValue,
+                "{argv:?} must be refused"
+            );
+        }
+
+        let Err(error) = capital(&["reset-allowance", "--chain", "base"]) else {
+            panic!("--chain must be refused");
+        };
+        assert_eq!(error.kind(), clap::error::ErrorKind::UnknownArgument);
     }
 }

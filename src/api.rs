@@ -93,6 +93,8 @@ use crate::view_rebuild::{
     validate_rebuild_scope,
 };
 
+mod capital;
+
 /// Comma-separated filter for transfer kinds in query parameters.
 ///
 /// Parses `"equity_mint,usdc_bridge"` into `vec![EquityMint, UsdcBridge]`.
@@ -1315,6 +1317,10 @@ struct ErrorResponse {
     error: String,
 }
 
+/// The status and body every ops route returns on failure. Named because
+/// clippy's `type_complexity` refuses it nested inside another generic type.
+type OpsError = (StatusCode, Json<ErrorResponse>);
+
 /// Shared handle for operating on tokenization transfers at runtime, set by
 /// the conductor after startup completes.
 pub(crate) struct RecoveryHandle {
@@ -1384,6 +1390,10 @@ enum UsdcDriverPauseRequest<'a> {
         burn_tx: TxHash,
         direction: BridgeDirection,
     },
+    /// `capital transfer-usdc`, which starts a transfer that has no id yet.
+    ManualTransfer { direction: RebalanceDirection },
+    /// `capital cctp-bridge`, which burns the rebalancing wallet's USDC.
+    CctpBurn { direction: BridgeDirection },
 }
 
 /// Quiesces the USDC rebalancing driver for the caller's mutation window:
@@ -1405,6 +1415,14 @@ async fn quiesce_usdc_driver(
                 %burn_tx,
                 ?direction,
                 "USDC driver did not quiesce for a CCTP mint recovery; refusing"
+            ),
+            UsdcDriverPauseRequest::ManualTransfer { direction } => warn!(
+                ?direction,
+                "USDC driver did not quiesce for a manual USDC transfer; refusing"
+            ),
+            UsdcDriverPauseRequest::CctpBurn { direction } => warn!(
+                ?direction,
+                "USDC driver did not quiesce for a CCTP burn; refusing"
             ),
         }
         (
@@ -2047,7 +2065,7 @@ fn usdc_resume_error_response(error: &UsdcResumeError) -> (StatusCode, String) {
         NotReady => (StatusCode::SERVICE_UNAVAILABLE, error.to_string()),
         Aggregate(_) | Database(_) | ApalisDatabase(_) | Queue(_) => (
             StatusCode::INTERNAL_SERVER_ERROR,
-            "Failed to enqueue USDC resume".to_string(),
+            "Failed to enqueue the USDC transfer job".to_string(),
         ),
     }
 }
@@ -3610,16 +3628,58 @@ struct DetachedProcessTx<'a> {
     projection_write: crate::conductor::projection_pause::ProjectionWrite,
 }
 
-/// Runs the process-tx workload on a detached `tokio` task and awaits its
-/// result, mapping a task-join failure and the operator error to HTTP
-/// responses.
+/// Spawns `work` on a detached `tokio` task tracked by `detached_tasks` and
+/// returns the future that joins it, refusing with 503 once the shutdown
+/// drain closed the tracker and mapping a task join failure to 500.
+/// `operation` names the route in both messages.
 ///
-/// The workload is spawned (not awaited inline) so that dropping the request
-/// future -- a client disconnect or cancellation -- detaches the in-flight
-/// broker placement instead of cancelling it: a hedge that has already reached
-/// the broker must run through to its `Submitted` event even when nobody is
-/// waiting on the response. Awaiting `process_tx` inline here would
-/// reintroduce that cancellation bug.
+/// The work is spawned (not awaited inline) so that dropping the request
+/// future (a client disconnect or cancellation) detaches the work instead of
+/// cancelling it midway: a hedge that has reached the broker, or a
+/// transaction that has been broadcast, must run through to its outcome even
+/// when nobody is waiting on the response. The work must therefore log its
+/// own outcome. Awaiting the work inline here would reintroduce that
+/// cancellation bug. The spawn happens before this returns, so the caller's
+/// future only ever holds the join handle, never the work itself.
+fn spawn_detached<Output: Send + 'static>(
+    detached_tasks: &TaskTracker,
+    operation: &'static str,
+    work: impl Future<Output = Output> + Send + 'static,
+) -> Result<impl Future<Output = Result<Output, OpsError>>, OpsError> {
+    // Tracked so graceful shutdown waits for work already under way instead
+    // of dropping it with the runtime. The token is taken before the closed
+    // check: the drain closes the tracker and then checks it is empty, so
+    // either the drain sees this request as running or the request sees the
+    // tracker closed and refuses. Spawning into a drained tracker would let
+    // the task be dropped at exit.
+    let admission = detached_tasks.token();
+    if detached_tasks.is_closed() {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ErrorResponse {
+                error: format!("{operation} is unavailable while the bot shuts down"),
+            }),
+        ));
+    }
+    let task = detached_tasks.spawn(work);
+    drop(admission);
+    Ok(async move {
+        task.await.map_err(|error| {
+            error!(%error, "{} worker task failed", operation);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse {
+                    error: format!("{operation} worker task failed: {error}"),
+                }),
+            )
+        })
+    })
+}
+
+/// Runs the process-tx workload through [`spawn_detached`], mapping
+/// the operator error to an HTTP response. The detached task keeps the
+/// in flight broker placement alive after a client disconnect, and the
+/// request's projection claim moves into it.
 async fn spawn_and_join_process_tx<ChainProvider: alloy::providers::Provider + Clone + 'static>(
     tx_hash: TxHash,
     ctx: Ctx,
@@ -3639,22 +3699,7 @@ async fn spawn_and_join_process_tx<ChainProvider: alloy::providers::Provider + C
     let counter_trade_submission_lock = Arc::clone(&handle.counter_trade_submission_lock);
     let poll_status_queue = handle.poll_status_queue.clone();
     let poll_interval = handle.poll_interval;
-    // Tracked so graceful shutdown waits for a placement already under way
-    // instead of dropping it with the runtime. The token is taken before the
-    // closed check: the drain closes the tracker and then checks it is empty,
-    // so either the drain sees this request as running or the request sees the
-    // tracker closed and refuses. Spawning into a drained tracker would let the
-    // task be dropped at exit.
-    let admission = detached_tasks.token();
-    if detached_tasks.is_closed() {
-        return Err((
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(ErrorResponse {
-                error: "process-tx is unavailable while the bot shuts down".to_string(),
-            }),
-        ));
-    }
-    let task = detached_tasks.spawn(async move {
+    spawn_detached(detached_tasks, "process-tx", async move {
         let _projection_write = projection_write;
         let result = process_tx::process_tx(
             tx_hash,
@@ -3678,21 +3723,11 @@ async fn spawn_and_join_process_tx<ChainProvider: alloy::providers::Provider + C
             Err(error) => error!(%tx_hash, %error, "process-tx failed"),
         }
         result
-    });
-    drop(admission);
-    task.await
-        .map_err(|error| {
-            error!(%tx_hash, %error, "process-tx worker task failed");
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(ErrorResponse {
-                    error: format!("process-tx worker task failed: {error}"),
-                }),
-            )
-        })?
-        // The detached task above already logged the failure, so render it
-        // without logging it a second time.
-        .map_err(operator_error_response)
+    })?
+    .await?
+    // The detached task above already logged the failure, so render it
+    // without logging it a second time.
+    .map_err(operator_error_response)
 }
 
 /// Accounts a missed on-chain fill and places the opposite hedge inside the
@@ -3989,6 +4024,30 @@ fn ops_api_routes(ops_api: Option<&OpsApiConfig>) -> Router<AppState> {
         .route(
             "/liquidity-write/cctp/complete-mint",
             post(complete_cctp_mint),
+        )
+        .route(
+            "/liquidity-write/capital/transfer-usdc",
+            post(capital::transfer_usdc),
+        )
+        .route(
+            "/liquidity-write/capital/vault-deposit",
+            post(capital::vault_deposit),
+        )
+        .route(
+            "/liquidity-write/capital/vault-withdraw",
+            post(capital::vault_withdraw),
+        )
+        .route(
+            "/liquidity-write/capital/vault-withdraw-usdc",
+            post(capital::vault_withdraw_usdc),
+        )
+        .route(
+            "/liquidity-write/capital/cctp-bridge",
+            post(capital::cctp_bridge),
+        )
+        .route(
+            "/liquidity-write/capital/reset-allowance",
+            post(capital::reset_allowance),
         )
         .layer(axum::middleware::from_fn(move |request, next| {
             let verifier = Arc::clone(&write_verifier);
@@ -7155,6 +7214,12 @@ mod tests {
             ("POST", "/liquidity-write/transactions/x/process"),
             ("POST", "/liquidity-write/views/position/rebuild"),
             ("POST", "/liquidity-write/cctp/complete-mint"),
+            ("POST", "/liquidity-write/capital/transfer-usdc"),
+            ("POST", "/liquidity-write/capital/vault-deposit"),
+            ("POST", "/liquidity-write/capital/vault-withdraw"),
+            ("POST", "/liquidity-write/capital/vault-withdraw-usdc"),
+            ("POST", "/liquidity-write/capital/cctp-bridge"),
+            ("POST", "/liquidity-write/capital/reset-allowance"),
         ] {
             let response = app
                 .clone()
@@ -7207,6 +7272,12 @@ mod tests {
             ("POST", "/liquidity-write/transactions/x/process"),
             ("POST", "/liquidity-write/views/position/rebuild"),
             ("POST", "/liquidity-write/cctp/complete-mint"),
+            ("POST", "/liquidity-write/capital/transfer-usdc"),
+            ("POST", "/liquidity-write/capital/vault-deposit"),
+            ("POST", "/liquidity-write/capital/vault-withdraw"),
+            ("POST", "/liquidity-write/capital/vault-withdraw-usdc"),
+            ("POST", "/liquidity-write/capital/cctp-bridge"),
+            ("POST", "/liquidity-write/capital/reset-allowance"),
         ] {
             let response = app
                 .clone()
@@ -7431,24 +7502,13 @@ mod tests {
     /// call. The heavy handle dependencies are never touched on the 503 path
     /// (the route refuses at the pause), but must exist to construct the handle.
     async fn recovery_state_with_driver_pause() -> (AppState, UsdcDriverGate) {
-        let ctx = create_test_ctx_with_order_owner(Address::ZERO);
-        let state = empty_app_state(ctx).await;
+        recovery_state_for_ctx(create_test_ctx_with_order_owner(Address::ZERO)).await
+    }
 
-        let services = EquityTransferServices::panicking();
-        let (mint_store, _) = StoreBuilder::<TokenizedEquityMint>::new(state.pool.clone())
-            .build(services.clone())
-            .await
-            .unwrap();
-        let (redemption_store, _) =
-            StoreBuilder::<crate::equity_redemption::EquityRedemption>::new(state.pool.clone())
-                .build(services.clone())
-                .await
-                .unwrap();
-        let transfer = Arc::new(CrossVenueEquityTransfer::new(
-            services,
-            mint_store.clone(),
-            redemption_store.clone(),
-        ));
+    /// [`recovery_state_with_driver_pause`] over a caller supplied `ctx`, for
+    /// the capital routes that need a configured wallet.
+    async fn recovery_state_for_ctx(ctx: Ctx) -> (AppState, UsdcDriverGate) {
+        let state = empty_app_state(ctx).await;
 
         let (event_sender, _) = broadcast::channel(16);
         let rebalancing_inventory = Arc::new(BroadcastingInventory::new(
@@ -7497,6 +7557,35 @@ mod tests {
             Arc::new(crate::alerts::LogNotifier),
         ));
 
+        let usdc_store = standalone_usdc_store(&state.pool).await;
+        let gate = publish_recovery_handle(&state, rebalancing_service, usdc_store).await;
+        (state, gate)
+    }
+
+    /// Publishes a recovery handle over `rebalancing_service` and `usdc_store`
+    /// and returns the gate of its USDC driver pause. The equity services
+    /// panic if touched: the USDC and capital routes never reach them.
+    async fn publish_recovery_handle(
+        state: &AppState,
+        rebalancing_service: Arc<RebalancingService>,
+        usdc_store: Arc<Store<UsdcRebalance>>,
+    ) -> UsdcDriverGate {
+        let services = EquityTransferServices::panicking();
+        let (mint_store, _) = StoreBuilder::<TokenizedEquityMint>::new(state.pool.clone())
+            .build(services.clone())
+            .await
+            .unwrap();
+        let (redemption_store, _) =
+            StoreBuilder::<crate::equity_redemption::EquityRedemption>::new(state.pool.clone())
+                .build(services.clone())
+                .await
+                .unwrap();
+        let transfer = Arc::new(CrossVenueEquityTransfer::new(
+            services,
+            mint_store.clone(),
+            redemption_store.clone(),
+        ));
+
         let (pause, gate) = usdc_driver_pause();
 
         state
@@ -7511,12 +7600,12 @@ mod tests {
                 // CCTP mint recovery, so any double fills the slot.
                 cctp_mint_recovery: Arc::new(InconclusiveMint),
                 usdc_driver_pause: Arc::new(pause),
-                usdc_store: standalone_usdc_store(&state.pool).await,
+                usdc_store,
             })
             .ok()
             .expect("recovery cell must start empty");
 
-        (state, gate)
+        gate
     }
 
     /// Production integration for the resume route's driver-pause call: with a
@@ -7574,6 +7663,281 @@ mod tests {
         assert_eq!(
             body.error,
             "A USDC transfer is executing; retry once it is not in flight"
+        );
+    }
+
+    fn capital_request<Request: serde::de::DeserializeOwned>(
+        body: serde_json::Value,
+    ) -> Json<Request> {
+        Json(serde_json::from_value(body).unwrap())
+    }
+
+    /// A zero or negative amount is refused as input before the resume lock
+    /// is even tried: with the lock held, a 409 here would mean the amount
+    /// was not checked first.
+    #[tokio::test]
+    async fn transfer_usdc_refuses_a_non_positive_amount_before_the_resume_lock() {
+        let state = empty_app_state(create_test_ctx_with_order_owner(Address::ZERO)).await;
+        let resume_lock = Arc::clone(&state.resume_lock);
+        let _held = resume_lock.0.try_lock().unwrap();
+
+        for amount in ["0", "-5"] {
+            let Err((status, Json(body))) = capital::transfer_usdc(
+                State(state.clone()),
+                capital_request(serde_json::json!({"direction": "to-raindex", "amount": amount})),
+            )
+            .await
+            else {
+                panic!("amount {amount} must be refused");
+            };
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{amount}: {}", body.error);
+        }
+    }
+
+    /// Like the resume route, the manual transfer takes the resume lock
+    /// before it needs the recovery handle, so a held lock is a 409 even
+    /// while the conductor is still starting.
+    #[tokio::test]
+    async fn transfer_usdc_returns_409_while_the_resume_lock_is_held() {
+        let state = empty_app_state(create_test_ctx_with_order_owner(Address::ZERO)).await;
+        let resume_lock = Arc::clone(&state.resume_lock);
+        let _held = resume_lock.0.try_lock().unwrap();
+
+        let Err((status, Json(body))) = capital::transfer_usdc(
+            State(state.clone()),
+            capital_request(serde_json::json!({"direction": "to-alpaca", "amount": "10"})),
+        )
+        .await
+        else {
+            panic!("a held resume lock must refuse the transfer");
+        };
+
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(
+            body.error,
+            "A resume or recheck operation is already in progress"
+        );
+    }
+
+    #[tokio::test]
+    async fn transfer_usdc_returns_503_before_the_recovery_handle_is_ready() {
+        let state = empty_app_state(create_test_ctx_with_order_owner(Address::ZERO)).await;
+
+        let Err((status, Json(body))) = capital::transfer_usdc(
+            State(state),
+            capital_request(serde_json::json!({"direction": "to-raindex", "amount": "10"})),
+        )
+        .await
+        else {
+            panic!("the transfer must wait for the recovery handle");
+        };
+
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            body.error,
+            "Recovery not ready yet (conductor still starting)"
+        );
+    }
+
+    /// With a worker execution in flight the manual transfer refuses at the
+    /// driver pause. Without the pause call it would reach the unwired
+    /// fixture service, whose `NotReady` 503 carries a different message.
+    #[tokio::test]
+    async fn transfer_usdc_route_returns_503_when_driver_cannot_quiesce() {
+        let (state, gate) = recovery_state_with_driver_pause().await;
+        let _executing = gate.enter().await;
+        tokio::time::pause();
+
+        let Err((status, Json(body))) = capital::transfer_usdc(
+            State(state),
+            capital_request(serde_json::json!({"direction": "to-raindex", "amount": "10"})),
+        )
+        .await
+        else {
+            panic!("the transfer must refuse while another transfer is executing");
+        };
+
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            body.error,
+            "A USDC transfer is executing; retry once it is not in flight"
+        );
+    }
+
+    /// End to end through the handler and the conductor wired service: the
+    /// response carries a fresh id, echoes the wire direction and amount, and
+    /// exactly one job of the direction's type sits on the bot's own queue
+    /// under that id.
+    #[tokio::test]
+    async fn transfer_usdc_enqueues_a_job_under_the_returned_id() {
+        let state = empty_app_state(create_test_ctx_with_order_owner(Address::ZERO)).await;
+        let apalis_pool = crate::test_utils::setup_test_apalis_pool().await;
+        let (service, store) =
+            crate::rebalancing::trigger::wire_usdc_reactor_store(&state.pool, &apalis_pool).await;
+        let _gate = publish_recovery_handle(&state, service, store).await;
+
+        let Ok(Json(body)) = capital::transfer_usdc(
+            State(state.clone()),
+            capital_request(serde_json::json!({"direction": "to-raindex", "amount": "250.5"})),
+        )
+        .await
+        else {
+            panic!("the transfer must be enqueued");
+        };
+
+        let body = serde_json::to_value(&body).unwrap();
+        assert_eq!(body["direction"], "to-raindex");
+        assert_eq!(body["amount"], "250.5");
+        assert_eq!(body["outcome"], "enqueued");
+        let transfer_id = body["transferId"].as_str().unwrap().to_string();
+        transfer_id
+            .parse::<UsdcRebalanceId>()
+            .expect("the transfer id must be a rebalance id");
+
+        let rows: Vec<(String, Vec<u8>)> = sqlx_apalis::query_as(
+            "SELECT job_type, job FROM Jobs WHERE json_extract(job, '$.id') = ?",
+        )
+        .bind(&transfer_id)
+        .fetch_all(&apalis_pool)
+        .await
+        .unwrap();
+        assert_eq!(rows.len(), 1, "exactly one job row under the returned id");
+        assert_eq!(
+            rows[0].0,
+            std::any::type_name::<crate::rebalancing::usdc::TransferUsdcToMarketMaking>(),
+            "to-raindex must enqueue the Alpaca to Base job"
+        );
+    }
+
+    /// Every route that acts on one chain's trading table refuses a chain
+    /// without one as input. No `[wallet]` is configured, so the 400 also
+    /// proves the table is checked before the wallet is required.
+    #[tokio::test]
+    async fn capital_chain_routes_refuse_a_chain_without_a_trading_table() {
+        let state = empty_app_state(create_test_ctx_with_order_owner(Address::ZERO)).await;
+        let vault = serde_json::json!({
+            "chain": "ethereum",
+            "token": "0x0000000000000000000000000000000000000001",
+            "vaultId": "0x0000000000000000000000000000000000000000000000000000000000000002",
+            "amount": "1",
+        });
+
+        let deposit =
+            capital::vault_deposit(State(state.clone()), capital_request(vault.clone())).await;
+        let withdraw = capital::vault_withdraw(State(state.clone()), capital_request(vault)).await;
+        let withdraw_usdc = capital::vault_withdraw_usdc(
+            State(state.clone()),
+            capital_request(serde_json::json!({"chain": "ethereum", "amount": "1"})),
+        )
+        .await;
+        let reset = capital::reset_allowance(
+            State(state),
+            capital_request(serde_json::json!({"chain": "ethereum"})),
+        )
+        .await;
+
+        for (route, result) in [
+            ("vault-deposit", deposit.err()),
+            ("vault-withdraw", withdraw.err()),
+            ("vault-withdraw-usdc", withdraw_usdc.err()),
+            ("reset-allowance", reset.err()),
+        ] {
+            let (status, Json(body)) = result.unwrap_or_else(|| panic!("{route} must refuse"));
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{route}: {}", body.error);
+            assert!(
+                body.error.contains("[chains.ethereum.trading]"),
+                "{route}: {}",
+                body.error
+            );
+        }
+    }
+
+    /// A zero or negative vault amount is input, refused before the chain or
+    /// the wallet is resolved.
+    #[tokio::test]
+    async fn vault_deposit_refuses_a_non_positive_amount() {
+        let state = empty_app_state(create_test_ctx_with_order_owner(Address::ZERO)).await;
+
+        for amount in ["0", "-1"] {
+            let Err((status, Json(body))) = capital::vault_deposit(
+                State(state.clone()),
+                capital_request(serde_json::json!({
+                    "chain": "base",
+                    "token": "0x0000000000000000000000000000000000000001",
+                    "vaultId": "0x0000000000000000000000000000000000000000000000000000000000000002",
+                    "amount": amount,
+                })),
+            )
+            .await
+            else {
+                panic!("amount {amount} must be refused");
+            };
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{amount}: {}", body.error);
+        }
+    }
+
+    /// A missing `[wallet]` on a chain with a trading table is the bot's own
+    /// fault: a generic 500, never a 400 that blames the request.
+    #[tokio::test]
+    async fn capital_chain_routes_without_a_wallet_return_500() {
+        let state = empty_app_state(create_test_ctx_with_order_owner(Address::ZERO)).await;
+
+        let Err((status, Json(body))) = capital::reset_allowance(
+            State(state),
+            capital_request(serde_json::json!({"chain": "base"})),
+        )
+        .await
+        else {
+            panic!("a bot without a wallet must refuse");
+        };
+
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(body.error, "The bot has no signing wallet configured");
+    }
+
+    /// Both or neither of `amount` and `all` is input, refused before the
+    /// recovery handle is needed.
+    #[tokio::test]
+    async fn cctp_bridge_refuses_both_or_neither_of_amount_and_all() {
+        let state = empty_app_state(create_test_ctx_with_order_owner(Address::ZERO)).await;
+
+        for body in [
+            serde_json::json!({"from": "base", "amount": "100", "all": true}),
+            serde_json::json!({"from": "base"}),
+        ] {
+            let Err((status, Json(error))) =
+                capital::cctp_bridge(State(state.clone()), capital_request(body.clone())).await
+            else {
+                panic!("{body} must be refused");
+            };
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{body}: {}", error.error);
+        }
+    }
+
+    /// The burn spends the rebalancing wallet's USDC, so like the CCTP mint
+    /// recovery it refuses while another operator write holds the resume
+    /// lock, from inside the detached task that owns the burn.
+    #[tokio::test]
+    async fn cctp_bridge_returns_409_while_the_resume_lock_is_held() {
+        let mut ctx = create_test_ctx_with_order_owner(Address::ZERO);
+        ctx.wallet = Some(st0x_config::OnchainWalletCtx::stub());
+        let (state, _gate) = recovery_state_for_ctx(ctx).await;
+        let resume_lock = Arc::clone(&state.resume_lock);
+        let _held = resume_lock.0.try_lock().unwrap();
+
+        let Err((status, Json(body))) = capital::cctp_bridge(
+            State(state.clone()),
+            capital_request(serde_json::json!({"from": "base", "amount": "100"})),
+        )
+        .await
+        else {
+            panic!("a held resume lock must refuse the burn");
+        };
+
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(
+            body.error,
+            "A resume or recheck operation is already in progress"
         );
     }
 
@@ -7647,7 +8011,7 @@ mod tests {
         let (status, message) =
             usdc_resume_error_response(&UsdcResumeError::Database(sqlx::Error::RowNotFound));
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
-        assert_eq!(message, "Failed to enqueue USDC resume");
+        assert_eq!(message, "Failed to enqueue the USDC transfer job");
     }
 
     /// Mirrors `recheck_error_response_distinguishes_recoverability` for the

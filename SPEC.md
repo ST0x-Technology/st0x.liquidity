@@ -6309,10 +6309,11 @@ effect rather than a generic intent:
   caveat is the bot concurrently driving the same on-chain mint); or the running
   bot (REST). `fail`, `recheck`, `transfer resume --kind equity`, and
   `transfer resume --kind usdc` require the bot. `cctp complete-mint`,
-  `process-tx`, and `view rebuild` also have running bot routes under the
-  IAP-verified `/liquidity-write/` prefix (client: `st0x-liquidity-client`),
-  which remove the stop the bot precondition of their direct paths; their
-  contracts are the next three bullets and the `process-tx` bullet below.
+  `process-tx`, `view rebuild`, and the capital verbs also have running bot
+  routes under the IAP-verified `/liquidity-write/` prefix (client:
+  `st0x-liquidity-client`), which remove the stop the bot precondition of their
+  direct paths; their contracts are the next four bullets and the `process-tx`
+  bullet below.
 - **`cctp complete-mint` through the running bot is two phase and never waits on
   Circle.** `POST /liquidity-write/cctp/complete-mint` fetches the burn's
   attestation with a single request, holding no lock: a burn Circle has not
@@ -6354,6 +6355,33 @@ effect rather than a generic intent:
   `stox view
   rebuild` CLI runs the same rebuild direct-DB and must run only
   while the bot is stopped.
+- **The capital verbs through the running bot sign with the bot's own wallets
+  and never wait on settlement.** `st0x-liquidity-client capital` posts to
+  `POST /liquidity-write/capital/{verb}` for `transfer-usdc`, `vault-deposit`,
+  `vault-withdraw`, `vault-withdraw-usdc`, `cctp-bridge` and `reset-allowance`,
+  the network counterparts of the `st0x-cli` verbs of the same names. The routes
+  sign with the wallets the conductor uses, so they share its nonce manager
+  instead of running a second one. The ops load balancer times a request out
+  after 60 seconds, so no route waits on CCTP attestation or USDC settlement.
+  `transfer-usdc` starts a fresh transfer on the bot's own transfer worker, the
+  path the rebalancer uses, and returns its new id at once: it takes the
+  recovery lock (`409`), quiesces the USDC rebalancing driver (`503`), then
+  applies the same single flight gates as `transfer resume --kind usdc` (a live
+  USDC job row, a durable guard holder, the corridor guard, or an every corridor
+  latch refuses with `409`). A retried request can therefore not start a second
+  transfer while the first is in flight. `cctp-bridge` only burns, holding the
+  recovery lock and the driver pause around the burn like `cctp complete-mint`
+  does around the mint, and returns the burn tx; the operator finishes with
+  `cctp complete-mint`. The vault verbs and `reset-allowance` take neither the
+  lock nor the pause, like the `st0x-cli` verbs: pausing the driver would refuse
+  every vault operation for the length of each USDC transfer. Every route that
+  sends a transaction runs it on a tracked detached task, like `process-tx`, so
+  a client or load balancer timeout cannot drop a transaction between its
+  broadcast and its receipt, graceful shutdown waits for it, and the task logs
+  its own outcome. The tokenization and issuer verbs (`transfer-equity`,
+  `wrap-equity`, `unwrap-equity`, `donate-equity`, `dividend-bump`) have no
+  route: they touch tokenization and the issuer wallet, not liquidity capital
+  (RAI-2695).
 - **`transfer resume --kind usdc` routes through the running bot.** The CLI
   posts to `POST /transfers/usdc/resume/{direction}/{id}`. The endpoint
   validates server-side (unknown id refuses -- a mistyped id must never start a
