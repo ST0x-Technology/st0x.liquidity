@@ -2233,7 +2233,7 @@ impl RebalancingService {
         let message = format!(
             "USDC transfer corridor mismatch: transfer {id} runs on the {corridor} corridor, \
              which this build does not serve (it serves {served}). It holds the {corridor} \
-             guard and is not re-armed; deploy a build that serves {corridor} \
+             guard and is not re-armed; deploy a build and config that serve {corridor} \
              (docs/cli-ops.md).{outbound}"
         );
 
@@ -36770,6 +36770,11 @@ mod tests {
         let pages = corridor_pages(&notifier);
         assert_eq!(pages.len(), 1, "got {pages:?}");
         assert!(pages[0].contains(&id.to_string()), "{}", pages[0]);
+        assert!(
+            pages[0].contains("deploy a build and config that serve"),
+            "{}",
+            pages[0]
+        );
         assert!(
             pages[0].contains("Alpaca-outbound transfers are blocked on every corridor"),
             "a held Alpaca-outbound transfer blocks every corridor's outbound claims: {}",
