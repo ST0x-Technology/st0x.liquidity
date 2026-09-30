@@ -86,7 +86,7 @@ cd st0x.liquidity
 direnv allow      # or `nix develop` if not using direnv
 sqlx db create    # create SQLite database for sqlx macros
 sqlx migrate run  # apply migrations
-cargo check       # verify setup
+cargo check --workspace --all-targets --all-features # verify setup
 ```
 
 Solidity ABIs are produced as per-feature Nix derivations under `nix/`
@@ -470,7 +470,7 @@ https://grafana.t0trade.com/d/t0-deployments/deployments
 To reproduce CI checks locally, use the same dev shell CI uses:
 
 ```bash
-nix develop .#ci-backend -c cargo check --workspace
+nix develop .#ci-backend -c cargo check --workspace --all-targets --all-features
 nix develop .#ci-backend -c cargo nextest run --workspace --all-features
 nix develop .#ci-backend -c cargo clippy --workspace --all-targets --all-features
 ```
@@ -602,7 +602,7 @@ dashboard/                 # SvelteKit operations dashboard
 ### Building and Testing
 
 ```bash
-cargo check                  # fast compilation check
+cargo check --workspace --all-targets --all-features # fast compilation check
 cargo nextest run --workspace --all-features # run all tests
 cargo clippy --workspace --all-targets --all-features -- -D clippy::all
 cargo fmt                    # format Rust code

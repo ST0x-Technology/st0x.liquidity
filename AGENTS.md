@@ -631,7 +631,7 @@ reviewing code that uses configuration instead of reading secrets directly.
 
   For iteration (e.g. backend-only), run individual steps in the corresponding
   shell:
-  1. `cargo check --workspace`
+  1. `cargo check --workspace --all-targets --all-features`
   2. `cargo nextest run --workspace --all-features` -- spawns anvil for CCTP
      integration tests; only the `ci-backend` shell exposes the foundry binary.
      Run via `nix develop .#ci-backend -c cargo nextest run ...`.
