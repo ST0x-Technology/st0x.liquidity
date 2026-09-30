@@ -39,7 +39,8 @@ inventory_divergence_threshold = 10
 # Durable-read deadline (seconds) for reconciling open hedge order gates.
 # Covers loading every Position before each offchain inventory poll; after a
 # Position SCHEMA_VERSION bump discards snapshots, idle symbols replay full
-# histories (~11s for the slowest on 2026-09-30), and 10 aborted every poll.
+# histories (about 11s for the slowest on 2026-09-30), so the former 10s
+# deadline aborted the offchain portion of every inventory poll.
 hedge_order_gate_reconciliation_timeout_secs = 60
 
 [pricing]
