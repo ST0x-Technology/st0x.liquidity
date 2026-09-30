@@ -796,17 +796,21 @@ stox transfer reconcile --kind redemption --id <redemption-aggregate-id> \
   `<cancel>` is mined from the bot wallet, at the withdrawal's nonce, is not the
   withdrawal itself, has the chain's required confirmations, and either reverted
   or is a plain cancel: a 0-value transfer with no calldata to the bot wallet
-  itself, not EIP-7702, while the wallet held no code in the cancel's block (no
-  EIP-7702 delegation). Any other successful tx may have withdrawn the vault.
-  Each refusal names the failed check. No receipt for the withdrawal is not
-  proof: a lagging node shows none for one that did mine. "could not read tx"
-  (the API: `502`) is transient; retry. The wallet code check reads the state of
-  the cancel's block, which a full node prunes after about 128 blocks: reconcile
-  soon after the cancel confirms, or against an archive RPC ("could not read the
-  bot wallet's code", the API: `409`). A reverted withdrawal needs no such read.
-  The withdrawal must be signed by the chain's configured bot wallet, since
-  nonces are per sender: one signed by a key rotated out since is refused;
-  cancel it from that key and run the CLI reconcile configured with that key.
+  itself, not EIP-7702, while the wallet held no code when the cancel ran (no
+  EIP-7702 delegation). The bot reads the wallet's code as the cancel's block
+  started, and refuses the cancel if any tx before it in that block carries an
+  EIP-7702 authorization signed by the bot wallet, even one the chain may have
+  skipped, so a delegation set and cleared around the cancel within the block is
+  caught. Any other successful tx may have withdrawn the vault. Each refusal
+  names the failed check. No receipt for the withdrawal is not proof: a lagging
+  node shows none for one that did mine. "could not read tx" (the API: `502`) is
+  transient; retry. The wallet code check reads the state before the cancel's
+  block, which a full node prunes after about 128 blocks: reconcile soon after
+  the cancel confirms, or against an archive RPC ("could not read the bot
+  wallet's code", the API: `409`). A reverted withdrawal needs no such read. The
+  withdrawal must be signed by the chain's configured bot wallet, since nonces
+  are per sender: one signed by a key rotated out since is refused; cancel it
+  from that key and run the CLI reconcile configured with that key.
   `--superseding-tx` is refused for a mint and for a redemption with no signed
   withdrawal (the API with `400`).
 

@@ -924,10 +924,11 @@ impl Raindex for FixtureRaindex {
         unimplemented!("FixtureRaindex: redemption fixture never reconciles a withdrawal")
     }
 
-    async fn had_code_in_block(
+    async fn had_code_at_tx(
         &self,
         _address: Address,
         _block: u64,
+        _tx_hash: TxHash,
     ) -> Result<bool, RaindexError> {
         unimplemented!("FixtureRaindex: redemption fixture never reconciles a withdrawal")
     }

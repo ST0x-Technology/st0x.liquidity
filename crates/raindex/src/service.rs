@@ -796,8 +796,13 @@ impl<W: Wallet> Raindex for RaindexService<W> {
         Ok(st0x_evm::mined_tx(self.evm.provider(), tx_hash).await?)
     }
 
-    async fn had_code_in_block(&self, address: Address, block: u64) -> Result<bool, RaindexError> {
-        Ok(st0x_evm::had_code_in_block(self.evm.provider(), address, block).await?)
+    async fn had_code_at_tx(
+        &self,
+        address: Address,
+        block: u64,
+        tx_hash: TxHash,
+    ) -> Result<bool, RaindexError> {
+        Ok(st0x_evm::had_code_at_tx(self.evm.provider(), address, block, tx_hash).await?)
     }
 
     async fn confirm_tx_receipt(

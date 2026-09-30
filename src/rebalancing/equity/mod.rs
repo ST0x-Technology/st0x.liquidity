@@ -282,10 +282,10 @@ pub enum WithdrawalNotSuperseded {
     /// Only a plain-looking successful cancel reaches this read. Historical
     /// state needs a node that still holds it, so it can keep failing.
     #[error(
-        "could not read the bot wallet {bot_wallet}'s code around block {block}, where \
-         superseding tx {superseding} mined, to rule out an EIP-7702 delegation: retry, and if \
-         it keeps failing the RPC no longer holds that block's state (a full node keeps about \
-         128 blocks), so reconcile against an archive RPC"
+        "could not read the bot wallet {bot_wallet}'s code where superseding tx {superseding} ran \
+         in block {block}, to rule out an EIP-7702 delegation: retry, and if it keeps failing \
+         the RPC no longer holds the state before that block (a full node keeps about 128 \
+         blocks), so reconcile against an archive RPC"
     )]
     WalletCodeUnreadable {
         superseding: TxHash,
@@ -416,7 +416,7 @@ pub async fn verify_withdrawal_superseded(
     }
 
     let wallet_had_code = raindex
-        .had_code_in_block(bot_wallet, block_number)
+        .had_code_at_tx(bot_wallet, block_number, superseding)
         .await
         .map_err(|source| WithdrawalNotSuperseded::WalletCodeUnreadable {
             superseding,
@@ -809,7 +809,7 @@ impl Raindex for PanickingRaindex {
         unimplemented!("PanickingRaindex: not available in CLI context")
     }
 
-    async fn had_code_in_block(&self, _: Address, _: u64) -> Result<bool, RaindexError> {
+    async fn had_code_at_tx(&self, _: Address, _: u64, _: TxHash) -> Result<bool, RaindexError> {
         unimplemented!("PanickingRaindex: not available in CLI context")
     }
 

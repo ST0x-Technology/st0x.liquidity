@@ -208,15 +208,15 @@ impl MockRaindex {
         self
     }
 
-    /// Makes `had_code_in_block` report `address` as holding code in every
-    /// block; every other address reads as codeless.
+    /// Makes `had_code_at_tx` report `address` as holding code at every tx;
+    /// every other address reads as codeless.
     #[cfg(test)]
     pub(crate) fn with_code_at(mut self, address: Address) -> Self {
         self.accounts_with_code.insert(address);
         self
     }
 
-    /// Makes `had_code_in_block` fail to read `address` with a transport
+    /// Makes `had_code_at_tx` fail to read `address` with a transport
     /// error, as a node without that block's state would.
     #[cfg(test)]
     pub(crate) fn with_code_read_error(mut self, address: Address) -> Self {
@@ -528,7 +528,12 @@ impl Raindex for MockRaindex {
         Ok(self.mined_txs.get(&tx_hash).copied())
     }
 
-    async fn had_code_in_block(&self, address: Address, _block: u64) -> Result<bool, RaindexError> {
+    async fn had_code_at_tx(
+        &self,
+        address: Address,
+        _block: u64,
+        _tx_hash: TxHash,
+    ) -> Result<bool, RaindexError> {
         if self.code_read_errors.contains(&address) {
             return Err(RaindexError::RpcTransport(
                 alloy::transports::TransportErrorKind::backend_gone(),
