@@ -120,6 +120,16 @@ pub struct EquityTransferReservation {
     pub status: EquityTransferReservationStatus,
 }
 
+/// How a transfer reservation treats a position that is due a hedge.
+#[derive(Debug, Clone, Copy)]
+enum TransferAdmission {
+    /// Any due hedge blocks the transfer.
+    HedgeClear,
+    /// A redemption that is admitted over a due sell hedge when the broker's
+    /// `hedgeable` shares cannot cover it.
+    FundsSellHedge { hedgeable: FractionalShares },
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Position {
     pub symbol: Symbol,
@@ -614,6 +624,12 @@ impl EventSourced for Position {
                 symbol,
                 threshold,
                 reservation_id,
+            }
+            | ReserveHedgeFundingRedemption {
+                symbol,
+                threshold,
+                reservation_id,
+                ..
             } => {
                 let now = Utc::now();
                 Ok(vec![
@@ -633,6 +649,12 @@ impl EventSourced for Position {
                 symbol,
                 threshold,
                 reservation_id,
+            }
+            | RestoreHedgeFundingRedemption {
+                symbol,
+                threshold,
+                reservation_id,
+                ..
             } => {
                 let now = Utc::now();
                 Ok(vec![
@@ -764,9 +786,21 @@ impl EventSourced for Position {
                 None,
             ),
 
-            ReserveEquityTransfer { reservation_id, .. } => {
-                self.reserve_equity_transfer_events(reservation_id, Utc::now())
-            }
+            ReserveEquityTransfer { reservation_id, .. } => self.reserve_equity_transfer_events(
+                reservation_id,
+                TransferAdmission::HedgeClear,
+                Utc::now(),
+            ),
+
+            ReserveHedgeFundingRedemption {
+                reservation_id,
+                hedgeable,
+                ..
+            } => self.reserve_equity_transfer_events(
+                reservation_id,
+                TransferAdmission::FundsSellHedge { hedgeable },
+                Utc::now(),
+            ),
 
             ConfirmEquityTransfer { reservation_id } => {
                 self.confirm_equity_transfer_events(reservation_id, Utc::now())
@@ -776,9 +810,22 @@ impl EventSourced for Position {
                 Ok(self.release_equity_transfer_events(reservation_id, Utc::now()))
             }
 
-            RestoreEquityTransferReservation { reservation_id, .. } => {
-                self.restore_equity_transfer_reservation_events(reservation_id, Utc::now())
-            }
+            RestoreEquityTransferReservation { reservation_id, .. } => self
+                .restore_equity_transfer_reservation_events(
+                    reservation_id,
+                    TransferAdmission::HedgeClear,
+                    Utc::now(),
+                ),
+
+            RestoreHedgeFundingRedemption {
+                reservation_id,
+                hedgeable,
+                ..
+            } => self.restore_equity_transfer_reservation_events(
+                reservation_id,
+                TransferAdmission::FundsSellHedge { hedgeable },
+                Utc::now(),
+            ),
 
             SettleOnChainFill { trade_id } => {
                 Ok(self.settle_onchain_fill_events(trade_id, Utc::now()))
@@ -1240,6 +1287,7 @@ impl Position {
     fn reserve_equity_transfer_events(
         &self,
         reservation_id: EquityTransferReservationId,
+        admission: TransferAdmission,
         now: DateTime<Utc>,
     ) -> Result<Vec<PositionEvent>, PositionError> {
         if let Some(pending) = self.pending_offchain_order_id {
@@ -1259,7 +1307,9 @@ impl Position {
             });
         }
 
-        if self.create_trigger_reason(&self.threshold)?.is_some() {
+        if self.create_trigger_reason(&self.threshold)?.is_some()
+            && !self.admission_funds_sell_hedge(admission)?
+        {
             return Err(PositionError::EquityTransferBlockedByHedge {
                 net_position: self.net,
                 threshold: self.threshold,
@@ -1280,6 +1330,19 @@ impl Position {
             reservation_id,
             reserved_at: now,
         }])
+    }
+
+    /// Whether a due hedge is a sell the broker cannot fill, and `admission`
+    /// is the redemption that brings it the shares. A buy hedge spends cash,
+    /// which a redemption does not supply, so it keeps blocking.
+    fn admission_funds_sell_hedge(&self, admission: TransferAdmission) -> Result<bool, FloatError> {
+        match admission {
+            TransferAdmission::HedgeClear => Ok(false),
+            TransferAdmission::FundsSellHedge { hedgeable } => {
+                let net = self.net.inner();
+                Ok(net.gt(Float::zero()?)? && hedgeable.inner().lt(net)?)
+            }
+        }
     }
 
     fn confirm_equity_transfer_events(
@@ -1330,6 +1393,7 @@ impl Position {
     fn restore_equity_transfer_reservation_events(
         &self,
         reservation_id: EquityTransferReservationId,
+        admission: TransferAdmission,
         now: DateTime<Utc>,
     ) -> Result<Vec<PositionEvent>, PositionError> {
         if let Some(pending) = self.pending_offchain_order_id {
@@ -1357,7 +1421,8 @@ impl Position {
                 actual: reservation_id,
             }),
             None => {
-                let mut events = self.reserve_equity_transfer_events(reservation_id, now)?;
+                let mut events =
+                    self.reserve_equity_transfer_events(reservation_id, admission, now)?;
                 events.push(PositionEvent::EquityTransferReservationConfirmed {
                     reservation_id,
                     confirmed_at: now,
@@ -1898,6 +1963,18 @@ pub enum PositionCommand {
         threshold: ExecutionThreshold,
         reservation_id: EquityTransferReservationId,
     },
+    /// Claims this symbol for a redemption, which delivers shares to the
+    /// broker. Unlike `ReserveEquityTransfer`, a due sell hedge does not block
+    /// it when the broker cannot fill that sell: `hedgeable` is the broker's
+    /// available shares above the hedge floor, and the sell needs the live net.
+    /// Without this, the hedge waits for broker shares and the redemption that
+    /// would supply them waits for the hedge.
+    ReserveHedgeFundingRedemption {
+        symbol: Symbol,
+        threshold: ExecutionThreshold,
+        reservation_id: EquityTransferReservationId,
+        hedgeable: FractionalShares,
+    },
     /// Commits the exact reservation immediately before durable job enqueue.
     ConfirmEquityTransfer {
         reservation_id: EquityTransferReservationId,
@@ -1912,6 +1989,16 @@ pub enum PositionCommand {
         symbol: Symbol,
         threshold: ExecutionThreshold,
         reservation_id: EquityTransferReservationId,
+    },
+    /// `RestoreEquityTransferReservation` for a redemption, admitted like
+    /// `ReserveHedgeFundingRedemption`. A redemption that released its
+    /// reservation to wait for gas must get it back over the sell hedge it
+    /// funds, or the two wait on each other again.
+    RestoreHedgeFundingRedemption {
+        symbol: Symbol,
+        threshold: ExecutionThreshold,
+        reservation_id: EquityTransferReservationId,
+        hedgeable: FractionalShares,
     },
     PlaceOffChainOrder {
         offchain_order_id: OffchainOrderId,
@@ -2495,6 +2582,8 @@ impl PartialEq for TriggerReason {
 impl Eq for TriggerReason {}
 
 impl std::fmt::Debug for PositionCommand {
+    // One flat arm per command; splitting it would only scatter the variants.
+    #[allow(clippy::too_many_lines)]
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             #[cfg(any(test, feature = "test-support"))]
@@ -2562,6 +2651,18 @@ impl std::fmt::Debug for PositionCommand {
                 .field("threshold", threshold)
                 .field("reservation_id", reservation_id)
                 .finish(),
+            Self::ReserveHedgeFundingRedemption {
+                symbol,
+                threshold,
+                reservation_id,
+                hedgeable,
+            } => f
+                .debug_struct("ReserveHedgeFundingRedemption")
+                .field("symbol", symbol)
+                .field("threshold", threshold)
+                .field("reservation_id", reservation_id)
+                .field("hedgeable", hedgeable)
+                .finish(),
             Self::ConfirmEquityTransfer { reservation_id } => f
                 .debug_struct("ConfirmEquityTransfer")
                 .field("reservation_id", reservation_id)
@@ -2579,6 +2680,18 @@ impl std::fmt::Debug for PositionCommand {
                 .field("symbol", symbol)
                 .field("threshold", threshold)
                 .field("reservation_id", reservation_id)
+                .finish(),
+            Self::RestoreHedgeFundingRedemption {
+                symbol,
+                threshold,
+                reservation_id,
+                hedgeable,
+            } => f
+                .debug_struct("RestoreHedgeFundingRedemption")
+                .field("symbol", symbol)
+                .field("threshold", threshold)
+                .field("reservation_id", reservation_id)
+                .field("hedgeable", hedgeable)
                 .finish(),
             Self::PlaceOffChainOrder {
                 offchain_order_id,
@@ -3853,6 +3966,134 @@ mod tests {
         assert!(matches!(
             error,
             LifecycleError::Apply(PositionError::EquityTransferBlockedByHedge { .. })
+        ));
+    }
+
+    fn hedge_ready_history(direction: Direction, amount: Float) -> Vec<PositionEvent> {
+        vec![
+            PositionEvent::Initialized {
+                symbol: Symbol::new("FGI").unwrap(),
+                threshold: one_share_threshold(),
+                initialized_at: Utc::now(),
+            },
+            PositionEvent::OnChainOrderFilled {
+                trade_id: TradeId {
+                    chain: Chain::Base,
+                    tx_hash: TxHash::random(),
+                    log_index: 1,
+                },
+                amount: FractionalShares::new(amount),
+                wrapped_amount: None,
+                direction,
+                price_usdc: float!(30),
+                block_timestamp: Utc::now(),
+                block_number: None,
+                seen_at: Utc::now(),
+            },
+        ]
+    }
+
+    fn hedge_funding_redemption(
+        reservation_id: EquityTransferReservationId,
+        hedgeable: &str,
+    ) -> PositionCommand {
+        PositionCommand::ReserveHedgeFundingRedemption {
+            symbol: Symbol::new("FGI").unwrap(),
+            threshold: one_share_threshold(),
+            reservation_id,
+            hedgeable: FractionalShares::new(Float::parse(hedgeable.to_owned()).unwrap()),
+        }
+    }
+
+    /// The production deadlock: 585 shares long, a sell hedge due, and the
+    /// broker holding only its floor. The redemption that brings the shares
+    /// must get the symbol, or the hedge waits for it forever.
+    #[tokio::test]
+    async fn redemption_is_admitted_over_a_sell_hedge_the_broker_cannot_fill() {
+        let reservation_id = EquityTransferReservationId::generate();
+        let events = TestHarness::<Position>::with(())
+            .given(hedge_ready_history(Direction::Buy, float!(585)))
+            .when(hedge_funding_redemption(reservation_id, "1"))
+            .await
+            .events();
+
+        assert!(
+            matches!(
+                events.as_slice(),
+                [PositionEvent::EquityTransferReserved { reservation_id: reserved, .. }]
+                    if *reserved == reservation_id
+            ),
+            "expected only the reservation, got {events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn redemption_waits_for_a_sell_hedge_the_broker_can_fill() {
+        for hedgeable in ["585", "600"] {
+            let error = TestHarness::<Position>::with(())
+                .given(hedge_ready_history(Direction::Buy, float!(585)))
+                .when(hedge_funding_redemption(
+                    EquityTransferReservationId::generate(),
+                    hedgeable,
+                ))
+                .await
+                .then_expect_error();
+
+            assert!(
+                matches!(
+                    error,
+                    LifecycleError::Apply(PositionError::EquityTransferBlockedByHedge { .. })
+                ),
+                "hedgeable {hedgeable}: {error:?}"
+            );
+        }
+    }
+
+    /// A buy hedge spends broker cash, which a redemption does not bring, so
+    /// the redemption keeps waiting even with no shares at the broker.
+    #[tokio::test]
+    async fn redemption_waits_for_a_buy_hedge() {
+        let error = TestHarness::<Position>::with(())
+            .given(hedge_ready_history(Direction::Sell, float!(585)))
+            .when(hedge_funding_redemption(
+                EquityTransferReservationId::generate(),
+                "0",
+            ))
+            .await
+            .then_expect_error();
+
+        assert!(matches!(
+            error,
+            LifecycleError::Apply(PositionError::EquityTransferBlockedByHedge { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn redemption_waits_for_a_pending_broker_order() {
+        let mut history = hedge_ready_history(Direction::Buy, float!(585));
+        history.push(PositionEvent::OffChainOrderPlaced {
+            offchain_order_id: OffchainOrderId::new(),
+            shares: Positive::new(FractionalShares::new(float!(1))).unwrap(),
+            direction: Direction::Sell,
+            executor: SupportedExecutor::AlpacaBrokerApi,
+            trigger_reason: TriggerReason::SharesThreshold {
+                net_position_shares: float!(585),
+                threshold_shares: float!(1),
+            },
+            placed_at: Utc::now(),
+        });
+        let error = TestHarness::<Position>::with(())
+            .given(history)
+            .when(hedge_funding_redemption(
+                EquityTransferReservationId::generate(),
+                "0",
+            ))
+            .await
+            .then_expect_error();
+
+        assert!(matches!(
+            error,
+            LifecycleError::Apply(PositionError::PendingExecution { .. })
         ));
     }
 

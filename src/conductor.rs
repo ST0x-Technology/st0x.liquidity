@@ -71,6 +71,7 @@ use crate::bot_gas::{
 use crate::conductor::exit::{ConductorExit, ConductorExitError, MonitorTaskError};
 use crate::conductor::job::{BACKPRESSURE_RESCHEDULE_LIMIT, BackpressureStreak};
 use crate::conductor::monitor::order_fills::{CutoffProbe, probe_cutoff_block_support};
+use crate::dashboard::equity_price::EquityPriceStore;
 use crate::dashboard::pnl::{LedgerHead, PnlLedger, PnlLedgerReactor};
 use crate::dashboard::{Broadcaster, DashboardTradeDelivery};
 use crate::database_file_lock::{DatabaseFileLock, acquire_database_file_lock};
@@ -124,7 +125,7 @@ use crate::rebalancing::equity::{
     ResumeTokenizationTarget, TransferEquityToHedging, TransferEquityToHedgingCtx,
     TransferEquityToMarketMaking, TransferEquityToMarketMakingCtx,
 };
-use crate::rebalancing::trigger::{GUARD_GENERATION, GuardGeneration, GuardState};
+use crate::rebalancing::trigger::{FillPriceOrMark, GUARD_GENERATION, GuardGeneration, GuardState};
 use crate::rebalancing::usdc::{
     RecheckUsdcDeposit, RecoverCctpMint, RestoredDepositSends, TransferUsdcToHedging,
     TransferUsdcToHedgingCtx, TransferUsdcToMarketMaking, TransferUsdcToMarketMakingCtx,
@@ -1013,6 +1014,7 @@ pub(crate) struct ServerHandles {
     pub(crate) process_tx_cell: Arc<tokio::sync::OnceCell<crate::api::ProcessTxHandle>>,
     pub(crate) pnl_ledger: Arc<PnlLedger>,
     pub(crate) projection_maintenance: Arc<projection_pause::ProjectionMaintenance>,
+    pub(crate) equity_prices: EquityPriceStore,
 }
 
 async fn setup_trading_schedule(
@@ -1055,6 +1057,7 @@ impl Conductor {
             process_tx_cell,
             pnl_ledger,
             projection_maintenance,
+            equity_prices,
         }: ServerHandles,
         shutdown_token: CancellationToken,
         startup_tokens: ConductorStartupTokens,
@@ -1165,6 +1168,7 @@ impl Conductor {
                 telemetry: telemetry.clone(),
                 notifier: notifier.clone(),
                 record_bot_gas_receipt_cost_queue: record_bot_gas_receipt_cost_queue.clone(),
+                equity_prices,
             },
             &backfill_queues,
         ))
@@ -2013,6 +2017,7 @@ struct RebalancingDeps {
     telemetry: TelemetrySender,
     notifier: Arc<dyn crate::alerts::Notifier>,
     record_bot_gas_receipt_cost_queue: RecordBotGasReceiptCostJobQueue,
+    equity_prices: EquityPriceStore,
 }
 
 /// Position + rebalancing infrastructure produced during conductor startup.
@@ -2387,11 +2392,13 @@ async fn wire_freeze_guard(
 /// Hands the trigger the handles only the query manifest can produce: the
 /// stores it emits timeout failures through, the Position authority that
 /// arbitrates transfer admission against hedges, and the position projection
-/// it values minimum operation sizes with.
+/// it values minimum operation sizes with, falling back to `equity_prices`
+/// for a symbol that has never filled.
 async fn attach_manifest_handles(
     rebalancing_service: &RebalancingService,
     built: &BuiltFrameworks,
     execution_threshold: ExecutionThreshold,
+    equity_prices: EquityPriceStore,
 ) {
     rebalancing_service
         .set_stores(
@@ -2408,7 +2415,10 @@ async fn attach_manifest_handles(
         )
         .await;
     rebalancing_service
-        .set_last_price_reader(built.position_projection.clone())
+        .set_last_price_reader(Arc::new(FillPriceOrMark {
+            fills: built.position_projection.clone(),
+            marks: equity_prices,
+        }))
         .await;
 }
 
@@ -3518,7 +3528,13 @@ fn spawn_rebalancing_infrastructure<Signer: Wallet + Clone>(
         )
         .await?;
 
-        attach_manifest_handles(&rebalancing_service, &built, deps.ctx.execution_threshold).await;
+        attach_manifest_handles(
+            &rebalancing_service,
+            &built,
+            deps.ctx.execution_threshold,
+            deps.equity_prices,
+        )
+        .await;
 
         let recovery_transfer = Arc::new(
             CrossVenueEquityTransfer::new(
@@ -3660,6 +3676,7 @@ fn spawn_rebalancing_infrastructure<Signer: Wallet + Clone>(
             equity_in_progress: rebalancing_service.equity_in_progress.clone(),
             redemption_store: built.redemption.clone(),
             position_authority: Some((built.position.clone(), deps.ctx.execution_threshold)),
+            hedge_capacity: Some(rebalancing_service.clone()),
             job_queue: deps.schedulers.transfer_equity_to_hedging.clone(),
             notifier: deps.notifier.clone(),
         });

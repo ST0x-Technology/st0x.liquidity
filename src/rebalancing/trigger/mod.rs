@@ -7,8 +7,9 @@ mod usdc;
 mod usdc_guard;
 
 pub(crate) use equity::{
-    GUARD_GENERATION, GuardGeneration, GuardState, LastPriceReader, RecoveryGuard,
-    claim_guard_for_recovery_or_orphan, remove_active_transfer,
+    EquityTriggerError, FillPriceOrMark, GUARD_GENERATION, GuardGeneration, GuardState,
+    HedgeCapacity, LastPriceReader, RecoveryGuard, claim_guard_for_recovery_or_orphan,
+    remove_active_transfer,
 };
 #[cfg(test)]
 pub(crate) use equity::{InProgressGuard, StubLastPrice};
@@ -843,7 +844,7 @@ pub(crate) struct RebalancingService {
     /// When each `(symbol, chain)` pair last dispatched an operation, so a
     /// transfer truncated by a limit is not re-planned every tick.
     equity_cooldowns: RwLock<HashMap<(Symbol, Chain), DateTime<Utc>>>,
-    /// Each symbol's last onchain fill price, attached through
+    /// Each symbol's price for valuing the minimum, attached through
     /// `set_last_price_reader`; without one no minimum can be valued and
     /// every plan declines.
     last_prices: RwLock<Option<Arc<dyn LastPriceReader>>>,
@@ -4124,23 +4125,31 @@ impl RebalancingService {
         Ok((store, threshold))
     }
 
+    /// Reserves `symbol` for the planned `direction`. A redemption brings the
+    /// broker shares, so it also carries how many shares the broker can sell
+    /// today: the Position then admits it over a due sell hedge that the
+    /// broker cannot fill, which otherwise waits for this very redemption.
     async fn try_reserve_equity_transfer(
         &self,
         symbol: &Symbol,
         reservation_id: EquityTransferReservationId,
+        direction: PlannedDirection,
     ) -> Result<bool, equity::EquityTriggerError> {
         let (store, threshold) = self.position_authority().await?;
-        match store
-            .send(
-                symbol,
-                PositionCommand::ReserveEquityTransfer {
-                    symbol: symbol.clone(),
-                    threshold,
-                    reservation_id,
-                },
-            )
-            .await
-        {
+        let command = match direction {
+            PlannedDirection::Mint => PositionCommand::ReserveEquityTransfer {
+                symbol: symbol.clone(),
+                threshold,
+                reservation_id,
+            },
+            PlannedDirection::Redemption => PositionCommand::ReserveHedgeFundingRedemption {
+                symbol: symbol.clone(),
+                threshold,
+                reservation_id,
+                hedgeable: self.hedgeable_shares(symbol).await?,
+            },
+        };
+        match store.send(symbol, command).await {
             Ok(()) => Ok(true),
             Err(AggregateError::UserError(LifecycleError::Apply(error)))
                 if matches!(
@@ -4969,17 +4978,16 @@ impl RebalancingService {
         // remains authoritative; it reuses this plan's registry and gas
         // probes.
         let mut probes = BTreeMap::new();
-        if self
+        let Some(preflight) = self
             .plan_equity_operation_or_skip(symbol, &mut probes)
             .await?
-            .is_none()
-        {
+        else {
             return Ok(());
-        }
+        };
 
         let reservation_id = EquityTransferReservationId::generate();
         if !self
-            .try_reserve_equity_transfer(symbol, reservation_id)
+            .try_reserve_equity_transfer(symbol, reservation_id, preflight.direction)
             .await?
         {
             return Ok(());
@@ -4992,6 +5000,20 @@ impl RebalancingService {
             else {
                 return Ok(false);
             };
+
+            // The reservation was admitted for the preflight direction: a
+            // redemption may hold it over a due sell hedge, which a mint must
+            // never do.
+            if operation.direction != preflight.direction {
+                debug!(
+                    target: "rebalance",
+                    %symbol,
+                    reserved = ?preflight.direction,
+                    planned = ?operation.direction,
+                    "Skipped equity dispatch: direction changed after reservation"
+                );
+                return Ok(false);
+            }
 
             // The restart taint needs no matching re-check: it is only seeded
             // at boot, so it cannot appear during planning. Snapshot divergence
@@ -8656,6 +8678,33 @@ pub(crate) async fn wire_usdc_reactor_store(
     (service, usdc_store)
 }
 
+#[async_trait]
+impl HedgeCapacity for RebalancingService {
+    /// Matches the broker's sell preflight for a whole-share asset: available
+    /// shares truncated to whole shares, less the floor rounded up to whole
+    /// shares. That is never above what the broker would sell, so a starved
+    /// hedge always reads as starved. For a fractional asset it can read low,
+    /// which only lets a redemption go ahead of a partial hedge. An unpolled
+    /// broker has none.
+    async fn hedgeable_shares(
+        &self,
+        symbol: &Symbol,
+    ) -> Result<FractionalShares, equity::EquityTriggerError> {
+        let offchain = self.inventory.read().await.equity_venues(symbol)?.offchain;
+        let Some(balance) = offchain else {
+            return Ok(FractionalShares::ZERO);
+        };
+
+        let (available, _) = balance.available().truncate_to_decimals(0)?;
+        let floor = self.config.hedge_floor.whole_share_floor_for(symbol)?;
+        if available.inner().lte(floor.inner())? {
+            return Ok(FractionalShares::ZERO);
+        }
+
+        Ok((available - floor)?)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use alloy::primitives::{Address, B256, TxHash, U256, address, fixed_bytes};
@@ -8696,6 +8745,7 @@ mod tests {
     use crate::alerts::{CapturingNotifier, LogNotifier};
     use crate::conductor::job::Job;
     use crate::conductor::job::TaskIdentity;
+    use crate::dashboard::equity_price::EquityPriceStore;
     use crate::equity_redemption::{
         DetectionFailure, EquityRedemptionCommand, UnwrappedProvenance, redemption_aggregate_id,
     };
@@ -33017,6 +33067,202 @@ mod tests {
             panic!("Expected exactly one redemption job, got {dispatched:?}");
         };
         assert_eq!(job.symbol, symbol);
+    }
+
+    async fn price_by_fill_or(trigger: &RebalancingService, marks: EquityPriceStore) {
+        let fills = trigger.position_projection.read().await.clone().unwrap();
+        trigger
+            .set_last_price_reader(Arc::new(FillPriceOrMark { fills, marks }))
+            .await;
+    }
+
+    /// An operator seeded the vault at listing (SPY in production), so the
+    /// symbol is over target but has never filled. The pricing service's mark
+    /// values the minimum operation instead.
+    #[tokio::test]
+    async fn equity_check_values_a_never_filled_symbol_at_its_mark() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let inventory = InventoryView::default()
+            .with_equity(symbol.clone(), shares(26), shares(1))
+            .with_usdc(usdc(1_000_000), usdc(1_000_000));
+        let trigger = make_trigger_with_inventory_and_registry(inventory, &symbol).await;
+        price_by_fill_or(
+            &trigger,
+            EquityPriceStore::with_live_mark(symbol.clone(), float!(766.59)),
+        )
+        .await;
+
+        EquityRebalancingCheck {
+            symbol: symbol.clone(),
+        }
+        .perform(&trigger)
+        .await
+        .unwrap();
+
+        let dispatched = take_pending_equity_redemption_jobs(&trigger).await;
+        let [job] = dispatched.as_slice() else {
+            panic!("Expected exactly one redemption job, got {dispatched:?}");
+        };
+        assert_eq!(job.symbol, symbol);
+    }
+
+    #[tokio::test]
+    async fn fill_price_wins_over_the_mark() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let inventory = InventoryView::default()
+            .with_equity(symbol.clone(), shares(50), shares(50))
+            .with_usdc(usdc(1_000_000), usdc(1_000_000));
+        let trigger = make_trigger_with_inventory_and_registry(inventory, &symbol).await;
+        acknowledge_onchain_buy(&trigger, &symbol, 1).await;
+        let reader = FillPriceOrMark {
+            fills: trigger.position_projection.read().await.clone().unwrap(),
+            marks: EquityPriceStore::with_live_mark(symbol.clone(), float!(766.59)),
+        };
+
+        let price = reader.last_price(&symbol).await.unwrap().unwrap();
+
+        assert_eq!(price.price.format().unwrap(), "100");
+    }
+
+    #[tokio::test]
+    async fn equity_check_declines_a_never_filled_symbol_without_a_mark() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let inventory = InventoryView::default()
+            .with_equity(symbol.clone(), shares(26), shares(1))
+            .with_usdc(usdc(1_000_000), usdc(1_000_000));
+        let trigger = make_trigger_with_inventory_and_registry(inventory, &symbol).await;
+        price_by_fill_or(&trigger, EquityPriceStore::new([])).await;
+
+        EquityRebalancingCheck {
+            symbol: symbol.clone(),
+        }
+        .perform(&trigger)
+        .await
+        .unwrap();
+
+        assert_eq!(count_pending_equity_redemption_jobs(&trigger).await, 0);
+    }
+
+    /// Makes `symbol` due a sell hedge of `shares`, as an onchain buy does.
+    async fn acknowledge_onchain_buy(trigger: &RebalancingService, symbol: &Symbol, amount: i64) {
+        let (store, threshold) = trigger.position_authority().await.unwrap();
+        store
+            .send(
+                symbol,
+                PositionCommand::AcknowledgeOnChainFill {
+                    symbol: symbol.clone(),
+                    threshold,
+                    trade_id: TradeId {
+                        chain: Chain::Base,
+                        tx_hash: TxHash::random(),
+                        log_index: 1,
+                    },
+                    amount: shares(amount),
+                    direction: Direction::Buy,
+                    price_usdc: float!(100),
+                    block_timestamp: Utc::now(),
+                    block_number: None,
+                },
+            )
+            .await
+            .unwrap();
+    }
+
+    /// The production deadlock: the broker holds one share, so the due sell
+    /// hedge of 50 cannot fill, and the over-target vault's redemption is what
+    /// brings the broker those shares.
+    #[tokio::test]
+    async fn equity_check_redeems_to_fund_a_sell_hedge_the_broker_cannot_fill() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let inventory = InventoryView::default()
+            .with_equity(symbol.clone(), shares(80), shares(1))
+            .with_usdc(usdc(1_000_000), usdc(1_000_000));
+        let trigger = make_trigger_with_inventory_and_registry(inventory, &symbol).await;
+        acknowledge_onchain_buy(&trigger, &symbol, 50).await;
+
+        EquityRebalancingCheck {
+            symbol: symbol.clone(),
+        }
+        .perform(&trigger)
+        .await
+        .unwrap();
+
+        let dispatched = take_pending_equity_redemption_jobs(&trigger).await;
+        let [job] = dispatched.as_slice() else {
+            panic!("Expected exactly one redemption job, got {dispatched:?}");
+        };
+        assert_eq!(job.symbol, symbol);
+    }
+
+    /// For a whole-share asset the broker truncates 1.9 shares to 1 and
+    /// rounds the 0.01 floor up to 1, so it cannot sell even one share. The
+    /// trigger must read that as starved, not as one sellable share.
+    #[tokio::test]
+    async fn equity_check_reads_a_fractional_broker_balance_as_the_broker_does() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let inventory = InventoryView::default()
+            .with_equity(
+                symbol.clone(),
+                shares(80),
+                FractionalShares::new(float!(1.9)),
+            )
+            .with_usdc(usdc(1_000_000), usdc(1_000_000));
+        let config = RebalancingServiceConfig {
+            hedge_floor: HedgeFloor::new(FractionalShares::new(float!(0.01)), HashMap::new()),
+            ..test_config()
+        };
+        let trigger =
+            make_trigger_with_inventory_and_registry_config(inventory, &symbol, config).await;
+        acknowledge_onchain_buy(&trigger, &symbol, 1).await;
+
+        EquityRebalancingCheck {
+            symbol: symbol.clone(),
+        }
+        .perform(&trigger)
+        .await
+        .unwrap();
+
+        assert_eq!(count_pending_equity_redemption_jobs(&trigger).await, 1);
+    }
+
+    /// A broker that can fill the sell keeps the hedge first: the redemption
+    /// would only delay it.
+    #[tokio::test]
+    async fn equity_check_waits_for_a_sell_hedge_the_broker_can_fill() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let inventory = InventoryView::default()
+            .with_equity(symbol.clone(), shares(300), shares(60))
+            .with_usdc(usdc(1_000_000), usdc(1_000_000));
+        let trigger = make_trigger_with_inventory_and_registry(inventory, &symbol).await;
+        acknowledge_onchain_buy(&trigger, &symbol, 50).await;
+
+        EquityRebalancingCheck {
+            symbol: symbol.clone(),
+        }
+        .perform(&trigger)
+        .await
+        .unwrap();
+
+        assert_eq!(count_pending_equity_redemption_jobs(&trigger).await, 0);
+    }
+
+    #[tokio::test]
+    async fn equity_check_does_not_mint_while_a_hedge_is_due() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let inventory = InventoryView::default()
+            .with_equity(symbol.clone(), shares(20), shares(80))
+            .with_usdc(usdc(1_000_000), usdc(1_000_000));
+        let trigger = make_trigger_with_inventory_and_registry(inventory, &symbol).await;
+        acknowledge_onchain_buy(&trigger, &symbol, 50).await;
+
+        EquityRebalancingCheck {
+            symbol: symbol.clone(),
+        }
+        .perform(&trigger)
+        .await
+        .unwrap();
+
+        assert_eq!(count_pending_equity_mint_jobs(&trigger).await, 0);
     }
 
     #[tokio::test]

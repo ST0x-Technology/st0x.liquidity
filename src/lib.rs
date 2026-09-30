@@ -318,7 +318,7 @@ async fn run_bot_session_inner(
         pool: pools.cqrs.clone(),
         event_sender: event_sender.clone(),
         inventory: inventory.clone(),
-        equity_prices,
+        equity_prices: equity_prices.clone(),
         settings: dashboard::settings_from_ctx(&ctx),
         recovery: recovery_cell.clone(),
         process_tx: process_tx_cell.clone(),
@@ -364,6 +364,7 @@ async fn run_bot_session_inner(
             process_tx_cell,
             pnl_ledger,
             projection_maintenance,
+            equity_prices,
         },
         shutdown_token.clone(),
         ConductorStartupTokens {
@@ -1572,6 +1573,7 @@ mod tests {
                 projection_maintenance: Arc::new(
                     conductor::projection_pause::ProjectionMaintenance::for_test(),
                 ),
+                equity_prices: dashboard::equity_price::EquityPriceStore::new([]),
             },
             tokio_util::sync::CancellationToken::new(),
             create_test_startup_tokens(),
@@ -1612,6 +1614,7 @@ mod tests {
                 projection_maintenance: Arc::new(
                     conductor::projection_pause::ProjectionMaintenance::for_test(),
                 ),
+                equity_prices: dashboard::equity_price::EquityPriceStore::new([]),
             },
             tokio_util::sync::CancellationToken::new(),
             create_test_startup_tokens(),

@@ -40,8 +40,9 @@ pub(crate) struct EquityPlanInput {
     pub(crate) hedge_floor: FractionalShares,
     /// Chains that ran an operation for this symbol too recently.
     pub(crate) cooldowns: BTreeSet<Chain>,
-    /// The symbol's last onchain fill price, used to value the minimum
-    /// operation size. Its age does not matter: it only sizes a dust bound.
+    /// The symbol's last onchain fill price, else its live mark, used to value
+    /// the minimum operation size. Its age does not matter: it only sizes a
+    /// dust bound.
     pub(crate) last_price: Option<PriceObservation>,
     /// The only chain wallet recovery runs on. A redemption anywhere else
     /// is never chosen: a failed one would strand its tokens with nothing

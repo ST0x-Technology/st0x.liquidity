@@ -206,6 +206,7 @@ impl Job<ResumeTokenizationCtx> for ResumeTokenizationAggregate {
             symbol,
             *position_threshold,
             reservation_id,
+            None,
         )
         .await?
         {

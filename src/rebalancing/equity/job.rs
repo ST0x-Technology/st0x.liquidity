@@ -57,7 +57,9 @@ use crate::conductor::job::{
 use crate::equity_redemption::{EquityRedemption, RedemptionAggregateId};
 use crate::position::{EquityTransferReservationId, Position, PositionCommand, PositionError};
 use crate::position_check::equity_transfer_retry_delay;
-use crate::rebalancing::trigger::{GuardGeneration, GuardState, remove_active_transfer};
+use crate::rebalancing::trigger::{
+    EquityTriggerError, GuardGeneration, GuardState, HedgeCapacity, remove_active_transfer,
+};
 use crate::tokenized_equity_mint::TokenizedEquityMint;
 
 /// Delay before re-enqueueing an equity transfer job after a bot-gas receipt
@@ -213,23 +215,30 @@ pub(crate) struct TransferEquityToMarketMaking {
 
 pub(crate) type PositionReservationAuthority = (Arc<Store<Position>>, ExecutionThreshold);
 
+/// Restores a transfer's missing reservation. `hedgeable` marks a redemption:
+/// the broker's sell capacity, so the Position admits it over the sell hedge
+/// it funds, as at dispatch. `None` keeps the strict rule.
 pub(super) async fn restore_position_reservation(
     store: &Store<Position>,
     symbol: &Symbol,
     threshold: ExecutionThreshold,
     reservation_id: EquityTransferReservationId,
+    hedgeable: Option<FractionalShares>,
 ) -> Result<bool, SendError<Position>> {
-    match store
-        .send(
-            symbol,
-            PositionCommand::RestoreEquityTransferReservation {
-                symbol: symbol.clone(),
-                threshold,
-                reservation_id,
-            },
-        )
-        .await
-    {
+    let command = hedgeable.map_or_else(
+        || PositionCommand::RestoreEquityTransferReservation {
+            symbol: symbol.clone(),
+            threshold,
+            reservation_id,
+        },
+        |hedgeable| PositionCommand::RestoreHedgeFundingRedemption {
+            symbol: symbol.clone(),
+            threshold,
+            reservation_id,
+            hedgeable,
+        },
+    );
+    match store.send(symbol, command).await {
         Ok(()) => Ok(true),
         Err(AggregateError::UserError(LifecycleError::Apply(
             PositionError::PendingExecution { .. }
@@ -299,6 +308,7 @@ impl Job<TransferEquityToMarketMakingCtx> for TransferEquityToMarketMaking {
                 &self.symbol,
                 *position_threshold,
                 EquityTransferReservationId::from_uuid(self.issuer_request_id.0),
+                None,
             )
             .await?
         {
@@ -743,6 +753,10 @@ pub(crate) struct TransferEquityToHedgingCtx {
     /// Position authority that restores this job's reservation before any
     /// transfer side effect and releases it after terminal completion.
     pub(crate) position_authority: Option<PositionReservationAuthority>,
+    /// The broker's sell capacity. A retry that restores a released
+    /// reservation, for example after a gas refusal, must be admitted over
+    /// the sell hedge it funds; `None` restores under the strict rule.
+    pub(crate) hedge_capacity: Option<Arc<dyn HedgeCapacity>>,
     /// Used to delayed-redrive on a bot-gas receipt cost enqueue failure
     /// (ADR 0017 SS4: "failure in cost recording never blocks trading")
     /// instead of consuming the apalis retry budget.
@@ -763,13 +777,15 @@ pub(crate) enum TransferEquityToHedgingJobError {
     Enqueue(#[from] QueuePushError),
     #[error(transparent)]
     PositionReservation(#[from] SendError<Position>),
+    #[error("failed to read the broker's sell capacity: {0}")]
+    HedgeCapacity(#[from] EquityTriggerError),
 }
 
 impl BotGasFailureClassifier for TransferEquityToHedgingJobError {
     fn is_bot_gas_enqueue_failure(&self) -> bool {
         match self {
             Self::Transfer(inner) => inner.is_bot_gas_enqueue_failure(),
-            Self::Enqueue(_) | Self::PositionReservation(_) => false,
+            Self::Enqueue(_) | Self::PositionReservation(_) | Self::HedgeCapacity(_) => false,
         }
     }
 }
@@ -906,12 +922,17 @@ impl Job<TransferEquityToHedgingCtx> for TransferEquityToHedging {
             return Ok(());
         }
 
+        let hedgeable = match &ctx.hedge_capacity {
+            Some(capacity) => Some(capacity.hedgeable_shares(&self.symbol).await?),
+            None => None,
+        };
         if let Some((position_store, position_threshold)) = &ctx.position_authority
             && !restore_position_reservation(
                 position_store,
                 &self.symbol,
                 *position_threshold,
                 EquityTransferReservationId::from_uuid(self.aggregate_id.0),
+                hedgeable,
             )
             .await?
         {
@@ -2879,6 +2900,106 @@ mod tests {
                 && run_at <= after + i64::try_from(retry_interval.as_secs()).unwrap() + 5
         );
     }
+    /// A broker with no sell capacity for any symbol.
+    struct EmptyBroker;
+
+    #[async_trait]
+    impl HedgeCapacity for EmptyBroker {
+        async fn hedgeable_shares(
+            &self,
+            _symbol: &Symbol,
+        ) -> Result<FractionalShares, EquityTriggerError> {
+            Ok(FractionalShares::ZERO)
+        }
+    }
+
+    /// A funding redemption releases its reservation when gas is low. Once gas
+    /// recovers, the retry must get the reservation back over the sell hedge it
+    /// funds, or the hedge and the redemption wait on each other again.
+    #[tokio::test]
+    async fn funding_redemption_resumes_after_a_gas_refusal() {
+        let apalis_pool = crate::test_utils::setup_test_apalis_pool().await;
+        let symbol = Symbol::new("AAPL").unwrap();
+        let aggregate_id = redemption_aggregate_id("funding-low-gas");
+        let reservation_id = EquityTransferReservationId::from_uuid(aggregate_id.0);
+        let position_store = Arc::new(test_store::<Position>(
+            crate::test_utils::setup_test_db().await,
+            (),
+        ));
+        position_store
+            .send(
+                &symbol,
+                PositionCommand::AcknowledgeOnChainFill {
+                    symbol: symbol.clone(),
+                    threshold: ExecutionThreshold::whole_share(),
+                    trade_id: TradeId {
+                        chain: Chain::Base,
+                        tx_hash: TxHash::random(),
+                        log_index: 1,
+                    },
+                    amount: FractionalShares::new(float!(10)),
+                    direction: Direction::Buy,
+                    price_usdc: float!(150),
+                    block_timestamp: chrono::Utc::now(),
+                    block_number: None,
+                },
+            )
+            .await
+            .unwrap();
+        for command in [
+            PositionCommand::ReserveHedgeFundingRedemption {
+                symbol: symbol.clone(),
+                threshold: ExecutionThreshold::whole_share(),
+                reservation_id,
+                hedgeable: FractionalShares::ZERO,
+            },
+            PositionCommand::ConfirmEquityTransfer { reservation_id },
+        ] {
+            position_store.send(&symbol, command).await.unwrap();
+        }
+        let job = TransferEquityToHedging {
+            chain: Chain::Base,
+            aggregate_id: aggregate_id.clone(),
+            symbol: symbol.clone(),
+            quantity: FractionalShares::new(float!(10)),
+            generation: GuardGeneration::default(),
+            backpressure_streak: BackpressureStreak::default(),
+            position_reservation_retry_attempts: 0,
+        };
+        let mut ctx = redemption_test_ctx(
+            Arc::new(GasReadinessFailureRedemptionResume(Duration::from_secs(23))),
+            TransferEquityToHedgingJobQueue::new(&apalis_pool),
+        )
+        .await;
+        ctx.position_authority = Some((
+            Arc::clone(&position_store),
+            ExecutionThreshold::whole_share(),
+        ));
+        ctx.hedge_capacity = Some(Arc::new(EmptyBroker));
+
+        Job::perform(&job, &ctx).await.unwrap();
+        let released = position_store.load(&symbol).await.unwrap().unwrap();
+        assert_eq!(released.equity_transfer_reservation, None);
+
+        let recovered = Arc::new(RecordingRedemptionResume {
+            fail: false,
+            captured: Mutex::new(None),
+        });
+        ctx.transfer = recovered.clone();
+        Job::perform(&job, &ctx).await.unwrap();
+
+        assert_eq!(
+            recovered
+                .captured
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map(|(id, ..)| id.clone()),
+            Some(aggregate_id),
+            "the retry must run the redemption once gas recovers"
+        );
+    }
+
     #[tokio::test]
     async fn fresh_redemption_reconciliation_pending_enqueues_uncapped_delayed_redrive() {
         let apalis_pool = crate::test_utils::setup_test_apalis_pool().await;
@@ -3139,6 +3260,7 @@ mod tests {
             redemption_store: Arc::new(test_store(pool.clone(), services)),
             position_authority: None,
             job_queue,
+            hedge_capacity: None,
             notifier: Arc::new(crate::alerts::LogNotifier),
         };
         (ctx, pool)
@@ -3318,6 +3440,7 @@ mod tests {
             equity_in_progress: Arc::new(RwLock::new(HashMap::new())),
             redemption_store,
             position_authority: None,
+            hedge_capacity: None,
             job_queue: TransferEquityToHedgingJobQueue::new(&apalis_pool),
             notifier: Arc::new(crate::alerts::LogNotifier),
         };

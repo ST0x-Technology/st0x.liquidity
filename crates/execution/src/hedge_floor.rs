@@ -52,6 +52,12 @@ impl HedgeFloor {
             .copied()
             .unwrap_or(self.default_shares)
     }
+
+    /// Floor for `symbol` as the broker applies it to an asset it trades only
+    /// in whole shares: rounded up to at least one share, unless disabled.
+    pub fn whole_share_floor_for(&self, symbol: &Symbol) -> Result<FractionalShares, FloatError> {
+        whole_share_floor(self.for_symbol(symbol))
+    }
 }
 
 /// Rounds a floor up to whole shares for an asset the broker only trades in
@@ -100,6 +106,20 @@ mod tests {
         assert_eq!(whole_share_floor(shares("1.2")).unwrap(), shares("2"));
         assert_eq!(whole_share_floor(shares("3")).unwrap(), shares("3"));
         assert_eq!(whole_share_floor(shares("0")).unwrap(), shares("0"));
+    }
+
+    #[test]
+    fn whole_share_floor_for_rounds_the_symbols_floor() {
+        let fgi = Symbol::new("FGI").unwrap();
+        let floor = HedgeFloor::new(shares("0.01"), HashMap::from([(fgi.clone(), shares("0"))]));
+
+        assert_eq!(
+            floor
+                .whole_share_floor_for(&Symbol::new("SPYM").unwrap())
+                .unwrap(),
+            shares("1")
+        );
+        assert_eq!(floor.whole_share_floor_for(&fgi).unwrap(), shares("0"));
     }
 
     #[test]
