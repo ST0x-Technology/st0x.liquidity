@@ -18,11 +18,12 @@
 
 use alloy::consensus::transaction::SignerRecoverable as _;
 use alloy::consensus::{Transaction, TxEnvelope};
-use alloy::eips::BlockId;
 use alloy::eips::Typed2718 as _;
 #[cfg(any(feature = "turnkey", feature = "local-signer"))]
 use alloy::eips::eip2718::Encodable2718;
 use alloy::eips::eip2718::{Decodable2718, Eip2718Error};
+use alloy::eips::eip7702::SignedAuthorization;
+use alloy::eips::{BlockId, BlockNumberOrTag};
 use alloy::primitives::{Address, B256, Bytes, Signature, TxHash, U256};
 use alloy::providers::Provider;
 use alloy::rpc::types::{TransactionReceipt, TransactionRequest};
@@ -1427,6 +1428,9 @@ pub async fn mined_tx(
 /// Reading the parent's state needs a node that still holds it (a full node
 /// prunes it after about 128 blocks); one that does not fails the read rather
 /// than guessing. A block that no longer holds `tx_hash` fails too.
+///
+/// The block's txs are read untyped, since a block holds tx types the Ethereum
+/// envelope rejects (the Base deposit tx, `0x7e`, opens every Base block).
 pub async fn had_code_at_tx(
     provider: &impl Provider,
     address: Address,
@@ -1441,17 +1445,19 @@ pub async fn had_code_at_tx(
         return Ok(true);
     }
 
-    let Some(block_body) = provider.get_block_by_number(block.into()).full().await? else {
+    let Some(block_txs) = provider
+        .raw_request::<_, Option<BlockTxs>>(
+            "eth_getBlockByNumber".into(),
+            (BlockNumberOrTag::Number(block), true),
+        )
+        .await?
+    else {
         return Err(TransportErrorKind::custom_str(&format!(
             "block {block} is not available"
         )));
     };
-    let Some(txs) = block_body.transactions.as_transactions() else {
-        return Err(TransportErrorKind::custom_str(&format!(
-            "block {block} came back without its transactions"
-        )));
-    };
-    let Some(position) = txs.iter().position(|tx| *tx.inner.tx_hash() == tx_hash) else {
+    let txs = block_txs.transactions;
+    let Some(position) = txs.iter().position(|tx| tx.hash == tx_hash) else {
         return Err(TransportErrorKind::custom_str(&format!(
             "block {block} does not hold tx {tx_hash}"
         )));
@@ -1459,13 +1465,28 @@ pub async fn had_code_at_tx(
 
     Ok(txs[..position]
         .iter()
-        .filter_map(Transaction::authorization_list)
+        .filter_map(|tx| tx.authorization_list.as_deref())
         .flatten()
         .any(|authorization| {
             authorization
                 .recover_authority()
                 .is_ok_and(|authority| authority == address)
         }))
+}
+
+/// A block's txs with only the fields `had_code_at_tx` reads, so any tx type
+/// the chain defines decodes.
+#[derive(Debug, Deserialize)]
+struct BlockTxs {
+    transactions: Vec<BlockTx>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BlockTx {
+    hash: TxHash,
+    /// Present only on EIP-7702 txs.
+    authorization_list: Option<Vec<SignedAuthorization>>,
 }
 
 /// Polls for a transaction receipt with confirmation depth, bypassing alloy's
@@ -2537,6 +2558,65 @@ mod tests {
                 .await
                 .unwrap(),
             "a delegation counts only from the tx after the one carrying it"
+        );
+    }
+
+    /// Every Base block opens with a deposit tx (type `0x7e`), which the
+    /// Ethereum envelope rejects, so the block must still read and the
+    /// delegation check must still see an authorization before the tx.
+    #[tokio::test]
+    async fn had_code_at_tx_reads_a_block_holding_a_base_deposit_tx() {
+        let authority = PrivateKeySigner::random();
+        let authorization = Authorization {
+            chain_id: U256::from(8453),
+            address: Address::repeat_byte(0xDE),
+            nonce: 0,
+        };
+        let signature = authority
+            .sign_hash_sync(&authorization.signature_hash())
+            .unwrap();
+        let deposit_hash = B256::repeat_byte(0xD0);
+        let delegation_hash = B256::repeat_byte(0xD1);
+        let cancel_hash = B256::repeat_byte(0xCA);
+        let deposit = serde_json::json!({
+            "type": "0x7e",
+            "hash": deposit_hash,
+            "sourceHash": B256::repeat_byte(0x50),
+            "from": Address::repeat_byte(0xDE),
+            "to": Address::repeat_byte(0x15),
+            "mint": "0x0",
+            "value": "0x0",
+            "gas": "0xf4240",
+            "isSystemTx": false,
+            "input": "0x098999be",
+            "nonce": "0x1",
+            "transactionIndex": "0x0",
+        });
+        let delegation = serde_json::json!({
+            "type": "0x4",
+            "hash": delegation_hash,
+            "authorizationList": [authorization.into_signed(signature)],
+        });
+        let cancel = serde_json::json!({ "type": "0x2", "hash": cancel_hash });
+        let block = |transactions: Vec<serde_json::Value>| serde_json::json!({ "number": "0x64", "transactions": transactions });
+
+        let asserter = Asserter::new();
+        asserter.push_success(&"0x");
+        asserter.push_success(&block(vec![deposit.clone(), cancel.clone()]));
+        asserter.push_success(&"0x");
+        asserter.push_success(&block(vec![deposit, delegation, cancel]));
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+
+        assert!(
+            !had_code_at_tx(&provider, authority.address(), 100, cancel_hash)
+                .await
+                .unwrap()
+        );
+        assert!(
+            had_code_at_tx(&provider, authority.address(), 100, cancel_hash)
+                .await
+                .unwrap(),
+            "a delegation signed by the wallet before the cancel counts as code"
         );
     }
 

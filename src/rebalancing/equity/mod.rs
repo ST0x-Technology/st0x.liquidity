@@ -283,9 +283,9 @@ pub enum WithdrawalNotSuperseded {
     /// state needs a node that still holds it, so it can keep failing.
     #[error(
         "could not read the bot wallet {bot_wallet}'s code where superseding tx {superseding} ran \
-         in block {block}, to rule out an EIP-7702 delegation: retry, and if it keeps failing \
-         the RPC no longer holds the state before that block (a full node keeps about 128 \
-         blocks), so reconcile against an archive RPC"
+         in block {block}, to rule out an EIP-7702 delegation ({source}): retry. If the error \
+         says the state is missing, the RPC no longer holds the state before that block (a \
+         full node keeps about 128 blocks), so reconcile against an archive RPC"
     )]
     WalletCodeUnreadable {
         superseding: TxHash,
