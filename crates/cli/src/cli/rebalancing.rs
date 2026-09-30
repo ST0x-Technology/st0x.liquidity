@@ -200,6 +200,44 @@ where
     })
 }
 
+/// [`redemption_admission`], or the standard admission when the broker cannot
+/// be built or read. A failed read proves nothing about the sell hedge, and the
+/// standard admission is the rule the redemption had before this exception, so
+/// a broker outage never blocks a redemption that does not need it. Position
+/// still refuses the redemption if the hedge is needed.
+async fn redemption_admission_or_standard<Writer, Broker>(
+    stdout: &mut Writer,
+    broker: anyhow::Result<Broker>,
+    hedge_floor: &HedgeFloor,
+    symbol: &Symbol,
+) -> anyhow::Result<RedemptionAdmission>
+where
+    Writer: Write,
+    Broker: Executor,
+    Broker::Error: std::error::Error + Send + Sync + 'static,
+{
+    let read = match broker {
+        Ok(broker) => redemption_admission(&broker, hedge_floor, symbol).await,
+        Err(error) => Err(error),
+    };
+
+    match read {
+        Ok(admission) => Ok(admission),
+        Err(error) => {
+            writeln!(
+                stdout,
+                "   Warning: could not read the broker inventory ({error:#}); the redemption \
+                 is admitted only if the {symbol} position needs no hedge"
+            )?;
+            Ok(RedemptionAdmission {
+                available: None,
+                floor: hedge_floor.for_symbol(symbol),
+                admission: EquityTransferAdmission::Standard,
+            })
+        }
+    }
+}
+
 async fn admit_operator_equity_transfer(
     position_store: &Store<Position>,
     symbol: &Symbol,
@@ -676,12 +714,13 @@ pub(super) async fn transfer_equity_command<Writer: Write>(
                 .clone()
                 .try_into_executor()
                 .await
-                .context("failed to build the broker client for the redemption admission")?;
+                .context("failed to build the broker client for the redemption admission");
             let RedemptionAdmission {
                 available,
                 floor,
                 admission: hedge_admission,
-            } = redemption_admission(&broker, &alpaca_auth.hedge_floor, &symbol).await?;
+            } = redemption_admission_or_standard(stdout, broker, &alpaca_auth.hedge_floor, &symbol)
+                .await?;
             let available =
                 available.map_or_else(|| "unknown".to_string(), |shares| shares.to_string());
             let sellable = match hedge_admission {
@@ -2469,6 +2508,49 @@ mod tests {
                 .unwrap();
         assert_eq!(unreported.available, None);
         assert_eq!(unreported.admission, EquityTransferAdmission::Standard);
+    }
+
+    /// A broker that cannot be built or read falls back to the standard
+    /// admission with a warning, so an Alpaca outage does not block a
+    /// redemption that needs no exception.
+    #[tokio::test]
+    async fn redemption_admission_falls_back_to_standard_when_the_broker_fails() {
+        let symbol = Symbol::new("COIN").unwrap();
+        let floor = HedgeFloor::new(
+            FractionalShares::new(float!(0.01)),
+            std::collections::HashMap::new(),
+        );
+
+        let mut stdout = Vec::new();
+        let unreadable = redemption_admission_or_standard(
+            &mut stdout,
+            Ok(st0x_execution::MockExecutor::with_failure(
+                "positions endpoint down",
+            )),
+            &floor,
+            &symbol,
+        )
+        .await
+        .unwrap();
+        assert_eq!(unreadable.admission, EquityTransferAdmission::Standard);
+        assert_eq!(unreadable.available, None);
+        let printed = String::from_utf8(stdout).unwrap();
+        assert!(
+            printed.contains("could not read the broker inventory"),
+            "{printed}"
+        );
+
+        let mut stdout = Vec::new();
+        let unbuilt = redemption_admission_or_standard::<_, st0x_execution::MockExecutor>(
+            &mut stdout,
+            Err(anyhow::anyhow!("client construction failed")),
+            &floor,
+            &symbol,
+        )
+        .await
+        .unwrap();
+        assert_eq!(unbuilt.admission, EquityTransferAdmission::Standard);
+        assert_eq!(unbuilt.floor, FractionalShares::new(float!(0.01)));
     }
 
     /// The 2026-09-30 COIN incident: a long position needs a sell hedge and

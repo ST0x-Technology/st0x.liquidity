@@ -7023,7 +7023,7 @@ mod tests {
     use crate::onchain::approvals::{ApprovalPurpose, ApprovalTarget};
     use crate::onchain::mock::MockRaindex;
     use crate::onchain::trade::{InventoryTrade, OnchainTrade};
-    use crate::position::EquityTransferReservationStatus;
+    use crate::position::{EquityTransferAdmission, EquityTransferReservationStatus};
     use crate::rebalancing::equity::{
         EquityTransferServices, ResumeTokenizationAggregate, ResumeTokenizationJobQueue,
         ResumeTokenizationTarget, TransferEquityToHedging, TransferEquityToMarketMaking,
@@ -9432,6 +9432,7 @@ mod tests {
                 generation: GuardGeneration::default(),
                 backpressure_streak: BackpressureStreak::default(),
                 position_reservation_retry_attempts: 0,
+                admission: EquityTransferAdmission::Standard,
             })
             .await
             .unwrap();
@@ -10020,6 +10021,7 @@ mod tests {
                 generation: GuardGeneration::default(),
                 backpressure_streak: BackpressureStreak::default(),
                 position_reservation_retry_attempts: 0,
+                admission: EquityTransferAdmission::Standard,
             })
             .await
             .unwrap();

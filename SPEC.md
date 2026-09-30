@@ -3095,16 +3095,22 @@ enum TriggerReason {
   what the sell hedge needs. The pending order, failed-order anchor, and
   existing reservation checks still apply, and a short position (buy hedge) is
   still rejected. The equity trigger reports `broker_sellable` from the
-  inventory view and the configured hedge floor. It drops the reservation before
-  confirmation if the post-reservation plan is not a redemption or reports more
-  broker shares. `transfer-equity --direction to-alpaca` reports it from the
-  broker inventory. Startup restoration always uses the standard admission. The
-  rule compares against the whole net, which is the hedge request because config
-  refuses an equity `operational_limit` (chain-wide or per symbol) below the
-  0.01-share partial hedge minimum.
-- A reservation that Position keeps rejecting for a needed hedge increments
-  `equity_plan_declined_total{reason="blocked_by_hedge"}` and logs a warning
-  after 5 minutes, then at most every 5 minutes per symbol.
+  inventory view and the configured hedge floor, and uses the standard admission
+  instead when the broker balance was not polled within
+  `inventory_staleness_bound`. A redemption that fallback leaves refused for a
+  needed hedge schedules one delayed equity check of the symbol five minutes
+  later, because an unchanged broker poll emits no inventory event to check it
+  again; a terminal transfer event cancels only checks already due, not delayed
+  ones. It drops the reservation before confirmation if the post-reservation
+  plan is not a redemption or reports more broker shares, and schedules the same
+  delayed check when the broker balance went missing or too old in between.
+  `transfer-equity --direction to-alpaca` reports it from the broker inventory.
+  Startup restoration always uses the standard admission. The rule compares
+  against the whole net, which is the hedge request because config refuses an
+  equity `operational_limit` (chain-wide or per symbol) below the 0.01-share
+  partial hedge minimum.
+- Each reservation that Position rejects for a needed hedge increments
+  `equity_plan_declined_total{reason="blocked_by_hedge"}`.
 - `PlaceOffChainOrder` is rejected while any transfer reservation owns the
   symbol. A newly committed onchain fill invalidates an unconfirmed reservation;
   confirmation of that exact ID must succeed immediately before the transfer job
@@ -3119,7 +3125,11 @@ enum TriggerReason {
   `Position` reservation before enqueueing the delayed redrive, so a low wallet
   cannot suppress hedging. The replacement job may recreate a missing confirmed
   reservation only under the same pending-order, hedge-readiness, and price
-  eligibility checks as fresh transfer admission.
+  eligibility checks as fresh transfer admission. A redemption admitted over a
+  sell hedge the broker floor blocks keeps its reservation instead, recorded by
+  the `admission` its job carries: recreating it uses the standard admission,
+  which would refuse it and leave the job rescheduling forever. No hedge order
+  is placed for the symbol until the wallet has gas again.
 - `ManuallyAdjustPosition` and `UpdateThreshold` are rejected while a confirmed
   transfer reservation owns the symbol. Transfer ownership must be released
   before either operator mutation can proceed.

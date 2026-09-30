@@ -468,11 +468,23 @@ impl<Task: Serialize + DeserializeOwned + Send + Sync + Unpin + 'static> JobQueu
     /// callers that need to discard stale work after a terminal domain event
     /// invalidates everything queued before it.
     pub(crate) async fn cancel_all_pending(&self) {
+        self.cancel_pending_rows("").await;
+    }
+
+    /// Like [`Self::cancel_all_pending`], but keeps rows pushed with a delay
+    /// that has not elapsed yet: those are deliberate retries scheduled for
+    /// later, not work queued against the state the terminal event replaced.
+    pub(crate) async fn cancel_due_pending(&self) {
+        self.cancel_pending_rows(" AND run_at <= CAST(strftime('%s', 'now') AS INTEGER)")
+            .await;
+    }
+
+    async fn cancel_pending_rows(&self, filter: &str) {
         let job_type = self.queue_key();
-        if let Err(error) = sqlx_apalis::query(
+        if let Err(error) = sqlx_apalis::query(&format!(
             "UPDATE Jobs SET status = 'Done' \
-             WHERE status = 'Pending' AND job_type = ?",
-        )
+             WHERE status = 'Pending' AND job_type = ?{filter}"
+        ))
         .bind(job_type)
         .execute(self.pool())
         .await
@@ -484,6 +496,28 @@ impl<Task: Serialize + DeserializeOwned + Send + Sync + Unpin + 'static> JobQueu
                 "Failed to cancel pending rows for job type",
             );
         }
+    }
+
+    /// Whether a pending row of this queue that `matches` was pushed with a
+    /// delay that has not elapsed yet. A row whose payload no longer decodes
+    /// as `Task` does not match.
+    pub(crate) async fn has_scheduled(
+        &self,
+        matches: impl Fn(&Task) -> bool,
+    ) -> Result<bool, SqlxError> {
+        let payloads: Vec<Vec<u8>> = sqlx_apalis::query_scalar(
+            "SELECT job FROM Jobs \
+             WHERE status = 'Pending' AND job_type = ? \
+             AND run_at > CAST(strftime('%s', 'now') AS INTEGER)",
+        )
+        .bind(self.queue_key())
+        .fetch_all(self.pool())
+        .await?;
+
+        Ok(payloads
+            .iter()
+            .filter_map(|payload| serde_json::from_slice::<Task>(payload).ok())
+            .any(|task| matches(&task)))
     }
 
     /// Resets this queue's in-flight rows (`Running`/`Queued`) back to

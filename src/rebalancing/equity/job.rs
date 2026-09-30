@@ -55,7 +55,9 @@ use crate::conductor::job::{
     BackpressureStreak, Job, JobQueue, Label, QueuePushError, TaskIdentity,
 };
 use crate::equity_redemption::{EquityRedemption, RedemptionAggregateId};
-use crate::position::{EquityTransferReservationId, Position, PositionCommand, PositionError};
+use crate::position::{
+    EquityTransferAdmission, EquityTransferReservationId, Position, PositionCommand, PositionError,
+};
 use crate::position_check::equity_transfer_retry_delay;
 use crate::rebalancing::trigger::{GuardGeneration, GuardState, remove_active_transfer};
 use crate::tokenized_equity_mint::TokenizedEquityMint;
@@ -806,6 +808,12 @@ pub(crate) struct TransferEquityToHedging {
     /// the replacement payload so a long-lived hedge backs off across rows.
     #[serde(default)]
     pub(crate) position_reservation_retry_attempts: u32,
+    /// The admission the Position reservation was taken with. A gas deferral
+    /// keeps a reservation admitted over a sell hedge the broker floor blocks,
+    /// because the retry could only restore it under the standard admission.
+    /// Rows queued before this field existed were all standard.
+    #[serde(default)]
+    pub(crate) admission: EquityTransferAdmission,
 }
 
 impl TransferEquityToHedging {
@@ -972,7 +980,17 @@ impl Job<TransferEquityToHedgingCtx> for TransferEquityToHedging {
         }
 
         if let Some(delay) = error.gas_readiness_retry_interval() {
-            if let Some((position_store, _)) = &ctx.position_authority {
+            // A standard reservation is released, like the mint job does, so
+            // a low wallet cannot suppress hedging; the retry restores it once
+            // hedging allows. A reservation admitted over a sell hedge the
+            // broker floor blocks is kept: `restore_position_reservation` only
+            // knows the standard admission, so the retry would be refused and
+            // reschedule forever, which is the deadlock that admission exists
+            // to break. Meanwhile no hedge order runs for the symbol, and the
+            // broker could not fill one when the redemption was admitted.
+            if self.admission == EquityTransferAdmission::Standard
+                && let Some((position_store, _)) = &ctx.position_authority
+            {
                 position_store
                     .send(
                         &self.symbol,
@@ -1730,6 +1748,7 @@ mod tests {
             generation: GuardGeneration::default(),
             backpressure_streak: BackpressureStreak::default(),
             position_reservation_retry_attempts: 3,
+            admission: EquityTransferAdmission::Standard,
         };
 
         let scheduled_after = chrono::Utc::now().timestamp();
@@ -1784,6 +1803,7 @@ mod tests {
             generation: GuardGeneration::default(),
             backpressure_streak: BackpressureStreak::default(),
             position_reservation_retry_attempts: 3,
+            admission: EquityTransferAdmission::Standard,
         };
 
         Job::perform(&job, &ctx).await.unwrap();
@@ -2819,8 +2839,15 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn redemption_gas_readiness_failure_releases_reservation_before_delayed_redrive() {
+    /// Runs a fresh redemption holding a confirmed reservation taken with
+    /// `admission` into a gas-readiness refusal. Returns the Position
+    /// reservation afterwards and the delayed redrive payload.
+    async fn perform_low_gas_redemption(
+        admission: EquityTransferAdmission,
+    ) -> (
+        Option<crate::position::EquityTransferReservation>,
+        TransferEquityToHedging,
+    ) {
         let apalis_pool = crate::test_utils::setup_test_apalis_pool().await;
         let retry_interval = Duration::from_secs(23);
         let symbol = Symbol::new("AAPL").unwrap();
@@ -2847,6 +2874,7 @@ mod tests {
             generation: GuardGeneration::default(),
             backpressure_streak: BackpressureStreak(4),
             position_reservation_retry_attempts: 0,
+            admission,
         };
 
         let before = chrono::Utc::now().timestamp();
@@ -2854,16 +2882,12 @@ mod tests {
             .await
             .expect("low gas must delayed-redrive without consuming the apalis retry budget");
         let after = chrono::Utc::now().timestamp();
-        assert_eq!(
-            position_store
-                .load(&symbol)
-                .await
-                .unwrap()
-                .unwrap()
-                .equity_transfer_reservation,
-            None,
-            "the gas redrive must release its exact Position reservation"
-        );
+        let reservation = position_store
+            .load(&symbol)
+            .await
+            .unwrap()
+            .unwrap()
+            .equity_transfer_reservation;
 
         let (payload, run_at): (Vec<u8>, i64) = sqlx_apalis::query_as(
             "SELECT job, run_at FROM Jobs WHERE job_type = ? AND status = 'Pending'",
@@ -2879,7 +2903,48 @@ mod tests {
             run_at >= before + i64::try_from(retry_interval.as_secs()).unwrap() - 5
                 && run_at <= after + i64::try_from(retry_interval.as_secs()).unwrap() + 5
         );
+
+        (reservation, redriven)
     }
+
+    #[tokio::test]
+    async fn redemption_gas_readiness_failure_releases_standard_reservation_before_delayed_redrive()
+    {
+        let (reservation, _) = perform_low_gas_redemption(EquityTransferAdmission::Standard).await;
+
+        assert_eq!(
+            reservation, None,
+            "the gas redrive must release a standard reservation, so a low \
+             wallet cannot suppress hedging"
+        );
+    }
+
+    #[tokio::test]
+    async fn redemption_gas_readiness_failure_keeps_floor_admitted_reservation_for_delayed_redrive()
+    {
+        let admission = EquityTransferAdmission::Redemption {
+            broker_sellable: FractionalShares::ZERO,
+        };
+
+        let (reservation, redriven) = perform_low_gas_redemption(admission).await;
+
+        assert_eq!(
+            reservation,
+            Some(crate::position::EquityTransferReservation {
+                id: EquityTransferReservationId::from_uuid(redriven.aggregate_id.0),
+                status: crate::position::EquityTransferReservationStatus::Confirmed,
+            }),
+            "the gas redrive must keep a reservation admitted over a blocked \
+             sell hedge, because the retry could only restore it under the \
+             standard admission"
+        );
+        assert_eq!(
+            redriven.admission, admission,
+            "the redrive must carry the admission so its next gas refusal \
+             keeps the reservation too"
+        );
+    }
+
     #[tokio::test]
     async fn fresh_redemption_reconciliation_pending_enqueues_uncapped_delayed_redrive() {
         let apalis_pool = crate::test_utils::setup_test_apalis_pool().await;
@@ -2896,6 +2961,7 @@ mod tests {
             generation: GuardGeneration::default(),
             backpressure_streak: BackpressureStreak(3),
             position_reservation_retry_attempts: 2,
+            admission: EquityTransferAdmission::Standard,
         };
 
         let before = chrono::Utc::now().timestamp();
@@ -2989,6 +3055,7 @@ mod tests {
             generation: GuardGeneration::default(),
             backpressure_streak: BackpressureStreak::default(),
             position_reservation_retry_attempts: 0,
+            admission: EquityTransferAdmission::Standard,
         };
 
         let before = chrono::Utc::now().timestamp();
@@ -3039,6 +3106,7 @@ mod tests {
             generation: GuardGeneration::default(),
             backpressure_streak: BackpressureStreak::default(),
             position_reservation_retry_attempts: 0,
+            admission: EquityTransferAdmission::Standard,
         };
 
         let before = chrono::Utc::now().timestamp();
@@ -3330,6 +3398,7 @@ mod tests {
             generation: GuardGeneration::default(),
             backpressure_streak: BackpressureStreak::default(),
             position_reservation_retry_attempts: 0,
+            admission: EquityTransferAdmission::Standard,
         };
 
         (ctx, job, raindex, prepared)
@@ -3391,6 +3460,7 @@ mod tests {
             generation: GuardGeneration::default(),
             backpressure_streak: BackpressureStreak::default(),
             position_reservation_retry_attempts: 0,
+            admission: EquityTransferAdmission::Standard,
         };
 
         let before = chrono::Utc::now().timestamp();
@@ -3459,6 +3529,7 @@ mod tests {
             generation: GuardGeneration::default(),
             backpressure_streak: BackpressureStreak::default(),
             position_reservation_retry_attempts: 0,
+            admission: EquityTransferAdmission::Standard,
         };
 
         Job::perform(&job, &ctx).await.unwrap();
@@ -3490,6 +3561,7 @@ mod tests {
             generation: GuardGeneration::default(),
             backpressure_streak: BackpressureStreak::default(),
             position_reservation_retry_attempts: 0,
+            admission: EquityTransferAdmission::Standard,
         };
 
         let error = Job::perform(&job, &ctx).await.unwrap_err();
@@ -3848,6 +3920,7 @@ mod tests {
             generation,
             backpressure_streak: BackpressureStreak::default(),
             position_reservation_retry_attempts: 0,
+            admission: EquityTransferAdmission::Standard,
         };
 
         Job::on_terminal_attempt(
@@ -3897,6 +3970,7 @@ mod tests {
                 generation,
                 backpressure_streak: BackpressureStreak::default(),
                 position_reservation_retry_attempts: 0,
+                admission: EquityTransferAdmission::Standard,
             };
 
             Job::on_terminal_attempt(
@@ -3955,6 +4029,7 @@ mod tests {
             generation,
             backpressure_streak: BackpressureStreak::default(),
             position_reservation_retry_attempts: 0,
+            admission: EquityTransferAdmission::Standard,
         };
 
         Job::on_terminal_attempt(
@@ -4029,6 +4104,7 @@ mod tests {
             generation,
             backpressure_streak: BackpressureStreak::default(),
             position_reservation_retry_attempts: 0,
+            admission: EquityTransferAdmission::Standard,
         };
 
         Job::on_terminal_attempt(
@@ -4061,6 +4137,9 @@ mod tests {
             generation: GuardGeneration::from_parts(NonZeroU32::new(1).unwrap(), 1),
             backpressure_streak: BackpressureStreak::default(),
             position_reservation_retry_attempts: 0,
+            admission: EquityTransferAdmission::Redemption {
+                broker_sellable: FractionalShares::new(float!(0.005)),
+            },
         };
 
         let expected = json!({
@@ -4071,6 +4150,7 @@ mod tests {
             "generation": 4_294_967_297_u64,
             "backpressure_streak": 0_u32,
             "position_reservation_retry_attempts": 0_u32,
+            "admission": { "Redemption": { "broker_sellable": "0.005" } },
         });
         assert_eq!(serde_json::to_value(&job).unwrap(), expected);
         let deserialized: TransferEquityToHedging = serde_json::from_value(expected).unwrap();
@@ -4083,9 +4163,11 @@ mod tests {
             deserialized.position_reservation_retry_attempts,
             job.position_reservation_retry_attempts
         );
+        assert_eq!(deserialized.admission, job.admission);
     }
 
-    /// Rows queued before the payload carried a chain were all Base.
+    /// Rows queued before the payload carried a chain were all Base, and rows
+    /// queued before it carried an admission were all standard.
     #[test]
     fn equity_transfer_payloads_without_a_chain_deserialize_as_base() {
         let mint: TransferEquityToMarketMaking = serde_json::from_value(json!({
@@ -4103,6 +4185,7 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(redemption.chain, Chain::Base);
+        assert_eq!(redemption.admission, EquityTransferAdmission::Standard);
     }
 
     #[test]
@@ -4130,6 +4213,7 @@ mod tests {
             generation: GuardGeneration::default(),
             backpressure_streak: BackpressureStreak::default(),
             position_reservation_retry_attempts: 0,
+            admission: EquityTransferAdmission::Standard,
         };
         let serialized = serde_json::to_value(&redemption).unwrap();
         assert_eq!(serialized["chain"], json!("ethereum"));

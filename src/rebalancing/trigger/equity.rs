@@ -539,8 +539,35 @@ impl EquityRebalancingCheckScheduler {
         }
     }
 
+    /// Best-effort delayed enqueue, skipped when a delayed check for `symbol`
+    /// is already scheduled, so repeated triggers keep one retry per symbol.
+    pub(super) async fn enqueue_delayed_check(&self, symbol: Symbol, delay: std::time::Duration) {
+        match self
+            .queue
+            .has_scheduled(|check| check.symbol == symbol)
+            .await
+        {
+            Ok(true) => return,
+            Ok(false) => {}
+            Err(error) => {
+                warn!(target: "rebalance", %symbol, %error, "Failed to read scheduled EquityRebalancingCheck jobs");
+                return;
+            }
+        }
+
+        let mut queue = self.queue.clone();
+        if let Err(QueuePushError(error)) = queue
+            .push_with_delay(EquityRebalancingCheck { symbol }, delay)
+            .await
+        {
+            warn!(target: "rebalance", %error, "Failed to enqueue delayed EquityRebalancingCheck job");
+        }
+    }
+
+    /// Keeps delayed checks: they retry a symbol whose redemption waits on
+    /// fresh broker data, which a terminal event elsewhere does not supply.
     pub(super) async fn cancel_pending(&self) {
-        self.queue.cancel_all_pending().await;
+        self.queue.cancel_due_pending().await;
     }
 }
 
@@ -1027,5 +1054,47 @@ mod tests {
         scheduler.enqueue_check(symbol).await;
 
         assert_eq!(count_pending_equity_check_jobs(&apalis_pool).await, 1);
+    }
+
+    #[tokio::test]
+    async fn equity_scheduler_delayed_check_keeps_one_row_per_symbol() {
+        let apalis_pool = crate::test_utils::setup_test_apalis_pool().await;
+        let scheduler = EquityRebalancingCheckScheduler::new(&apalis_pool);
+        let aapl = Symbol::new("AAPL").unwrap();
+        let delay = std::time::Duration::from_secs(300);
+
+        scheduler.enqueue_check(aapl.clone()).await;
+        scheduler.enqueue_delayed_check(aapl.clone(), delay).await;
+        scheduler.enqueue_delayed_check(aapl, delay).await;
+        scheduler
+            .enqueue_delayed_check(Symbol::new("MSFT").unwrap(), delay)
+            .await;
+
+        assert_eq!(
+            count_pending_equity_check_jobs(&apalis_pool).await,
+            3,
+            "an immediate check must not stand in for the delayed one, and a \
+             second delayed check for the same symbol must be skipped"
+        );
+    }
+
+    #[tokio::test]
+    async fn equity_scheduler_cancel_pending_keeps_delayed_checks() {
+        let apalis_pool = crate::test_utils::setup_test_apalis_pool().await;
+        let scheduler = EquityRebalancingCheckScheduler::new(&apalis_pool);
+        let symbol = Symbol::new("AAPL").unwrap();
+
+        scheduler.enqueue_check(symbol.clone()).await;
+        scheduler
+            .enqueue_delayed_check(symbol, std::time::Duration::from_secs(300))
+            .await;
+        scheduler.cancel_pending().await;
+
+        assert_eq!(
+            count_pending_equity_check_jobs(&apalis_pool).await,
+            1,
+            "a terminal event must not drop a delayed check, which waits for \
+             data that event does not bring"
+        );
     }
 }

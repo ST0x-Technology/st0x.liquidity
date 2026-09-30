@@ -1679,6 +1679,7 @@ mod tests {
     use crate::mint_authorization::ConfiguredMintAuthorizer;
     use crate::native_gas::ConfiguredGasReadiness;
     use crate::onchain::mock::MockRaindex;
+    use crate::position::EquityTransferAdmission;
     use crate::rebalancing::equity::ChainEquityServices;
     use crate::rebalancing::equity::{
         EquityTransferServices, MintError, MintTransferError, RedemptionError,
@@ -2497,6 +2498,7 @@ mod tests {
                 generation,
                 backpressure_streak: BackpressureStreak::default(),
                 position_reservation_retry_attempts: 0,
+                admission: EquityTransferAdmission::Standard,
             })
             .await
             .unwrap();
@@ -2534,6 +2536,7 @@ mod tests {
                 generation: GuardGeneration::default(),
                 backpressure_streak: BackpressureStreak::default(),
                 position_reservation_retry_attempts: 0,
+                admission: EquityTransferAdmission::Standard,
             })
             .await
             .unwrap();
