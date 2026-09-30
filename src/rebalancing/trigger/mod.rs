@@ -36524,9 +36524,12 @@ mod tests {
             chains: BTreeMap::from([(Chain::Robinhood, base.chains[&Chain::Base].clone())]),
             ..base
         };
-        let inventory = InventoryView::for_primary_chain(Chain::Robinhood)
-            .with_usdc(usdc(100), usdc(900))
+        // Base, the primary, sits on target: only Robinhood's own USDC is
+        // under its band.
+        let inventory = InventoryView::default()
+            .with_usdc(usdc(900), usdc(900))
             .with_withdrawable_cash_cents(90_000);
+        let inventory = with_onchain_usdc(inventory, Chain::Robinhood, usdc(100));
         let trigger = make_trigger_with_inventory_config(inventory, config).await;
 
         trigger.check_and_trigger_usdc().await;
@@ -36631,9 +36634,10 @@ mod tests {
             ),
             ..with_cash_on(test_config(), &[Chain::Robinhood])
         };
-        let inventory = InventoryView::for_primary_chain(Chain::Robinhood)
-            .with_usdc(usdc(100), usdc(900))
+        let inventory = InventoryView::default()
+            .with_usdc(usdc(900), usdc(900))
             .with_withdrawable_cash_cents(90_000);
+        let inventory = with_onchain_usdc(inventory, Chain::Robinhood, usdc(100));
         let trigger = make_trigger_with_inventory_config(inventory, config).await;
         let low_gas = || {
             ConfiguredGasReadiness::Wired(crate::native_gas::GasReadiness::for_test(
@@ -36685,11 +36689,12 @@ mod tests {
         };
         let pool = crate::test_utils::setup_test_db().await;
         let store = Arc::new(test_store::<UsdcRebalance>(pool.clone(), ()));
-        let trigger = make_trigger_with_inventory_config(
-            InventoryView::for_primary_chain(Chain::Robinhood).with_usdc(usdc(500), usdc(900)),
-            config,
-        )
-        .await;
+        let inventory = with_onchain_usdc(
+            InventoryView::default().with_usdc(usdc(900), usdc(900)),
+            Chain::Robinhood,
+            usdc(500),
+        );
+        let trigger = make_trigger_with_inventory_config(inventory, config).await;
         trigger
             .set_stores(
                 Arc::new(test_store::<TokenizedEquityMint>(
