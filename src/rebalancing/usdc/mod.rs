@@ -772,21 +772,37 @@ fn refuse_unserved_corridor(
     served: &BTreeSet<UsdcCorridor>,
     state: Option<&UsdcRebalance>,
 ) -> Result<(), UsdcTransferError> {
-    let error = match state {
-        Some(state) if !served.contains(&state.corridor()) => UsdcTransferError::CorridorMismatch {
+    let corridor = state.map_or(requested, UsdcRebalance::corridor);
+    if served.contains(&corridor) {
+        return Ok(());
+    }
+
+    Err(unserved_corridor(id, requested, served, state))
+}
+
+/// The refusal of a transfer on a corridor none of `served` carries: a
+/// mismatch for a recorded one, not served for a fresh one. Logged here,
+/// where the refusal is decided.
+fn unserved_corridor(
+    id: &UsdcRebalanceId,
+    requested: UsdcCorridor,
+    served: &BTreeSet<UsdcCorridor>,
+    state: Option<&UsdcRebalance>,
+) -> UsdcTransferError {
+    let error = state.map_or_else(
+        || UsdcTransferError::CorridorNotServed {
+            id: id.clone(),
+            requested,
+            served: served.clone(),
+        },
+        |state| UsdcTransferError::CorridorMismatch {
             id: id.clone(),
             recorded: state.corridor(),
             served: served.clone(),
             holds_guard: state.holds_rebalance_guard(),
         },
-        None if !served.contains(&requested) => UsdcTransferError::CorridorNotServed {
-            id: id.clone(),
-            requested,
-            served: served.clone(),
-        },
-        Some(_) | None => return Ok(()),
-    };
+    );
 
     error!(target: "rebalance", %id, "{error}");
-    Err(error)
+    error
 }

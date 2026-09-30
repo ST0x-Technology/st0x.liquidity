@@ -25,7 +25,7 @@ use super::manager::RecoveredCctpMint;
 use super::{
     CctpMintRecoveryError, DepositSendNotSuperseded, RecheckUsdcDeposit, RecoverCctpMint,
     RestorePreparedDepositSends, RestoredDepositSends, ResumeAlpacaToBase, ResumeBaseToAlpaca,
-    UsdcRecheckError, UsdcTransferError, refuse_unserved_corridor,
+    UsdcRecheckError, UsdcTransferError, unserved_corridor,
 };
 use crate::rebalancing::equity::RecheckOutcome;
 use crate::usdc_rebalance::{UsdcRebalance, UsdcRebalanceId};
@@ -94,13 +94,7 @@ impl UsdcCorridorTransfers {
         }
 
         let served = self.by_corridor.keys().copied().collect::<BTreeSet<_>>();
-        refuse_unserved_corridor(id, requested, &served, state.as_ref())?;
-
-        Err(UsdcTransferError::CorridorNotServed {
-            id: id.clone(),
-            requested: corridor,
-            served,
-        })
+        Err(unserved_corridor(id, requested, &served, state.as_ref()))
     }
 
     /// The Base via CCTP service, the one corridor whose bridge carries a
