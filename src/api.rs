@@ -2051,7 +2051,8 @@ async fn resume_usdc_transfer(
 fn usdc_resume_error_response(error: &UsdcResumeError) -> (StatusCode, String) {
     use UsdcResumeError::{
         Aggregate, AlreadyInFlight, AlreadyTerminal, ApalisDatabase, CorridorNotServed, Database,
-        DirectionMismatch, EveryCorridorLatched, GuardHeldElsewhere, NotFound, NotReady, Queue,
+        DirectionMismatch, EveryCorridorLatched, GasNotReady, GuardHeldElsewhere, NotFound,
+        NotReady, Queue,
     };
 
     match error {
@@ -2062,7 +2063,7 @@ fn usdc_resume_error_response(error: &UsdcResumeError) -> (StatusCode, String) {
         AlreadyInFlight { .. } | GuardHeldElsewhere | EveryCorridorLatched => {
             (StatusCode::CONFLICT, error.to_string())
         }
-        NotReady => (StatusCode::SERVICE_UNAVAILABLE, error.to_string()),
+        NotReady | GasNotReady(_) => (StatusCode::SERVICE_UNAVAILABLE, error.to_string()),
         Aggregate(_) | Database(_) | ApalisDatabase(_) | Queue(_) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             "Failed to enqueue the USDC transfer job".to_string(),
@@ -3631,7 +3632,9 @@ struct DetachedProcessTx<'a> {
 /// Spawns `work` on a detached `tokio` task tracked by `detached_tasks` and
 /// returns the future that joins it, refusing with 503 once the shutdown
 /// drain closed the tracker and mapping a task join failure to 500.
-/// `operation` names the route in both messages.
+/// `operation` names the route in both messages; `subject` names what the
+/// work acted on (a tx hash, a chain, a token) in the join failure log, since
+/// a panicked task leaves no outcome log of its own.
 ///
 /// The work is spawned (not awaited inline) so that dropping the request
 /// future (a client disconnect or cancellation) detaches the work instead of
@@ -3641,11 +3644,21 @@ struct DetachedProcessTx<'a> {
 /// own outcome. Awaiting the work inline here would reintroduce that
 /// cancellation bug. The spawn happens before this returns, so the caller's
 /// future only ever holds the join handle, never the work itself.
-fn spawn_detached<Output: Send + 'static>(
+///
+/// The join future does not borrow `detached_tasks` (`use<..>` leaves its
+/// lifetime out), so a caller that answers before the work ends can hand
+/// the join to a tracked task of its own and keep the failure log.
+fn spawn_detached<Output, Subject, Work>(
     detached_tasks: &TaskTracker,
     operation: &'static str,
-    work: impl Future<Output = Output> + Send + 'static,
-) -> Result<impl Future<Output = Result<Output, OpsError>>, OpsError> {
+    subject: Subject,
+    work: Work,
+) -> Result<impl Future<Output = Result<Output, OpsError>> + use<Output, Subject, Work>, OpsError>
+where
+    Output: Send + 'static,
+    Subject: std::fmt::Display + Send + 'static,
+    Work: Future<Output = Output> + Send + 'static,
+{
     // Tracked so graceful shutdown waits for work already under way instead
     // of dropping it with the runtime. The token is taken before the closed
     // check: the drain closes the tracker and then checks it is empty, so
@@ -3665,7 +3678,7 @@ fn spawn_detached<Output: Send + 'static>(
     drop(admission);
     Ok(async move {
         task.await.map_err(|error| {
-            error!(%error, "{} worker task failed", operation);
+            error!(%error, %subject, "{} worker task failed", operation);
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ErrorResponse {
@@ -3699,7 +3712,7 @@ async fn spawn_and_join_process_tx<ChainProvider: alloy::providers::Provider + C
     let counter_trade_submission_lock = Arc::clone(&handle.counter_trade_submission_lock);
     let poll_status_queue = handle.poll_status_queue.clone();
     let poll_interval = handle.poll_interval;
-    spawn_detached(detached_tasks, "process-tx", async move {
+    spawn_detached(detached_tasks, "process-tx", tx_hash, async move {
         let _projection_write = projection_write;
         let result = process_tx::process_tx(
             tx_hash,
@@ -7701,10 +7714,11 @@ mod tests {
 
     /// Like the resume route, the manual transfer takes the resume lock
     /// before it needs the recovery handle, so a held lock is a 409 even
-    /// while the conductor is still starting.
+    /// before the recovery handle is published.
     #[tokio::test]
     async fn transfer_usdc_returns_409_while_the_resume_lock_is_held() {
         let state = empty_app_state(create_test_ctx_with_order_owner(Address::ZERO)).await;
+        state.health.set_ready();
         let resume_lock = Arc::clone(&state.resume_lock);
         let _held = resume_lock.0.try_lock().unwrap();
 
@@ -7727,6 +7741,7 @@ mod tests {
     #[tokio::test]
     async fn transfer_usdc_returns_503_before_the_recovery_handle_is_ready() {
         let state = empty_app_state(create_test_ctx_with_order_owner(Address::ZERO)).await;
+        state.health.set_ready();
 
         let Err((status, Json(body))) = capital::transfer_usdc(
             State(state),
@@ -7750,6 +7765,7 @@ mod tests {
     #[tokio::test]
     async fn transfer_usdc_route_returns_503_when_driver_cannot_quiesce() {
         let (state, gate) = recovery_state_with_driver_pause().await;
+        state.health.set_ready();
         let _executing = gate.enter().await;
         tokio::time::pause();
 
@@ -7776,6 +7792,7 @@ mod tests {
     #[tokio::test]
     async fn transfer_usdc_enqueues_a_job_under_the_returned_id() {
         let state = empty_app_state(create_test_ctx_with_order_owner(Address::ZERO)).await;
+        state.health.set_ready();
         let apalis_pool = crate::test_utils::setup_test_apalis_pool().await;
         let (service, store) =
             crate::rebalancing::trigger::wire_usdc_reactor_store(&state.pool, &apalis_pool).await;
@@ -7947,13 +7964,53 @@ mod tests {
         );
     }
 
-    /// Every capital route that signs refuses with 503 until startup
-    /// completes, as process-tx does: the recovery handle and the wallets
-    /// exist before the chain id and `OPERATOR_ROLE` preflights have passed.
-    /// The request is otherwise valid for each route, so a 503 proves the
-    /// gate fires before any onchain call.
+    /// Like every other corridor move, the burn refuses while the corridor's
+    /// signing wallets are below their gas thresholds, before it takes the
+    /// resume lock or touches the chain.
     #[tokio::test]
-    async fn capital_signing_routes_return_503_until_startup_completes() {
+    async fn cctp_bridge_returns_503_while_the_corridor_wallets_are_not_gas_ready() {
+        let mut ctx = create_test_ctx_with_order_owner(Address::ZERO);
+        ctx.wallet = Some(st0x_config::OnchainWalletCtx::stub());
+        let (state, _gate) = recovery_state_for_ctx(ctx).await;
+        state.health.set_ready();
+        state
+            .recovery
+            .get()
+            .unwrap()
+            .rebalancing_service
+            .set_gas_readiness(crate::native_gas::GasReadiness::for_test(
+                U256::MAX,
+                U256::from(1_u64),
+                U256::ZERO,
+                U256::from(1_u64),
+            ))
+            .await;
+
+        let Err((status, Json(body))) = capital::cctp_bridge(
+            State(state),
+            capital_request(serde_json::json!({"from": "base", "amount": "100"})),
+        )
+        .await
+        else {
+            panic!("a corridor wallet below its gas threshold must refuse the burn");
+        };
+
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            body.error.contains("signing wallets are not gas ready"),
+            "{}",
+            body.error
+        );
+    }
+
+    /// Every capital route refuses with 503 until startup completes, as
+    /// process-tx does: the recovery handle and the wallets exist before the
+    /// chain id and `OPERATOR_ROLE` preflights have passed, and the job
+    /// `transfer-usdc` enqueues signs with those same wallets. The request is
+    /// otherwise valid for each route, so a 503 proves the gate fires before
+    /// any onchain call or enqueue.
+    #[tokio::test]
+    async fn capital_routes_return_503_until_startup_completes() {
         let mut ctx = create_test_ctx_with_order_owner(Address::ZERO);
         ctx.wallet = Some(st0x_config::OnchainWalletCtx::stub());
         ctx.chains.primary_mut().assets.cash = Some(ChainCashAsset {
@@ -7969,6 +8026,11 @@ mod tests {
             "amount": "1",
         });
 
+        let transfer = capital::transfer_usdc(
+            State(state.clone()),
+            capital_request(serde_json::json!({"direction": "to-raindex", "amount": "1"})),
+        )
+        .await;
         let deposit =
             capital::vault_deposit(State(state.clone()), capital_request(vault.clone())).await;
         let withdraw = capital::vault_withdraw(State(state.clone()), capital_request(vault)).await;
@@ -7989,6 +8051,7 @@ mod tests {
         .await;
 
         for (route, result) in [
+            ("transfer-usdc", transfer.err()),
             ("vault-deposit", deposit.err()),
             ("vault-withdraw", withdraw.err()),
             ("vault-withdraw-usdc", withdraw_usdc.err()),
@@ -8284,7 +8347,8 @@ mod tests {
 
     /// End to end against CCTP V2 deployed on two Anvil nodes, reached
     /// through the ctx's test overrides: an exact burn from Base reports the
-    /// route, the raw amount and the mined burn, and exactly that amount
+    /// route, the raw amount and the burn tx at the broadcast, keeps the
+    /// resume lock held until the burn confirms, and exactly that amount
     /// leaves the bot's Base wallet. Nothing is minted, so no attestation is
     /// involved; the Circle API only serves the fast transfer fee.
     #[cfg(feature = "test-support")]
@@ -8319,11 +8383,16 @@ mod tests {
         let body = capital_success(
             "cctp-bridge",
             capital::cctp_bridge(
-                State(state),
+                State(state.clone()),
                 capital_request(serde_json::json!({"from": "base", "amount": "1"})),
             )
             .await,
         );
+        // The request is answered at the broadcast while the task still awaits
+        // the receipt, so the lock is held here, before anything else awaits.
+        let Err(_) = state.resume_lock.0.try_lock() else {
+            panic!("the burn must hold the resume lock until it confirms");
+        };
 
         let burn_tx: TxHash = serde_json::from_value(body["burnTx"].clone()).unwrap();
         assert_eq!(
@@ -8335,6 +8404,11 @@ mod tests {
                 "amountRaw": "1000000",
             })
         );
+        state.detached_tasks.close();
+        state.detached_tasks.wait().await;
+        let Ok(_released) = state.resume_lock.0.try_lock() else {
+            panic!("the confirmed burn must release the resume lock");
+        };
         let receipt = mined_receipt(&cctp.base_wallet, burn_tx).await;
         assert_eq!(receipt.to, Some(cctp.token_messenger));
         assert_eq!(
@@ -8409,6 +8483,18 @@ mod tests {
 
         let (status, _) = usdc_resume_error_response(&UsdcResumeError::NotReady);
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+
+        let (status, message) = usdc_resume_error_response(&UsdcResumeError::GasNotReady(
+            crate::native_gas::GasReadinessFailure::below_threshold_for_test(
+                Chain::Base,
+                std::time::Duration::from_secs(60),
+            ),
+        ));
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            message.contains("signing wallets are not gas ready"),
+            "the 503 must tell the operator to fund the wallets; got: {message}"
+        );
 
         let (status, message) =
             usdc_resume_error_response(&UsdcResumeError::Database(sqlx::Error::RowNotFound));

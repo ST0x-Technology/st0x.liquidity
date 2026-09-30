@@ -6366,24 +6366,37 @@ effect rather than a generic intent:
   `transfer-usdc` starts a fresh transfer on the bot's own transfer worker, the
   path the rebalancer uses, and returns its new id at once: an amount that is
   not positive or is finer than USDC's six decimals is refused with `400` before
-  anything else, then it takes the recovery lock (`409`), quiesces the USDC
-  rebalancing driver (`503`), then applies the same single flight gates as
-  `transfer resume --kind usdc` (a live USDC job row, a durable guard holder,
-  the corridor guard, or an every corridor latch refuses with `409`). A retried
-  request can therefore not start a second transfer while the first is in
-  flight. Everything after the input check runs on a tracked detached task, so a
-  dropped request cannot release the corridor claim after the job is queued.
-  `cctp-bridge` only burns, holding the recovery lock and the driver pause
-  around the burn like `cctp complete-mint` does around the mint, and returns
-  the burn tx; the operator finishes with `cctp complete-mint`. It records no
+  anything else, then it refuses with `503` until startup completes, then it
+  takes the recovery lock (`409`), quiesces the USDC rebalancing driver (`503`),
+  then applies the same single flight gates as `transfer resume --kind usdc` (a
+  live USDC job row, a durable guard holder, the corridor guard, or an every
+  corridor latch refuses with `409`), and then, like the trigger before every
+  fresh transfer, refuses with `503` while the Base or Ethereum signing wallet
+  cannot be shown to pay gas. A retried request can therefore not start a second
+  transfer while the first is in flight. Everything after the startup gate runs
+  on a tracked detached task, so a dropped request cannot release the corridor
+  claim after the job is queued. `cctp-bridge` only burns: it applies the same
+  corridor gas check (`503`) as `transfer-usdc`, since the burn and the mint
+  that completes it spend both wallets' gas, then holds the recovery lock and
+  the driver pause around the burn like `cctp complete-mint` does around the
+  mint, and returns the burn tx as soon as the burn is broadcast, not when it
+  confirms: an approve plus the burn's confirmations can outlast the 60 second
+  load balancer cut, and a request that timed out after the broadcast would
+  leave the operator without the burn tx. The detached task then awaits the
+  receipt, still holding the lock and the pause, until the burn has the source
+  chain's required confirmations or the wait gives up, and logs the outcome.
+  Meanwhile `cctp complete-mint` answers `502` until Circle attests the burn and
+  `409` once it has, since it fetches the attestation before it tries the lock.
+  A failure to confirm includes a receipt timeout, so it does not prove the burn
+  failed. The operator finishes with `cctp complete-mint`. It records no
   operation id, so it is not idempotent: a retried request burns again, and the
   second burn's USDC lands in the bot's wallet on the other chain once minted.
   The vault verbs and `reset-allowance` take neither the lock nor the pause,
   like the `st0x-cli` verbs: pausing the driver would refuse every vault
-  operation for the length of each USDC transfer. Every route that sends a
-  transaction refuses with `503` until startup completes, like `process-tx`,
-  since the startup preflights (each chain's id, the inventory `OPERATOR_ROLE`)
-  have not passed before then. It runs the transaction on a tracked detached
+  operation for the length of each USDC transfer. Every capital route refuses
+  with `503` until startup completes, like `process-tx`, since the startup
+  preflights (each chain's id, the inventory `OPERATOR_ROLE`) have not passed
+  before then. Each route that sends a transaction runs it on a tracked detached
   task, like `process-tx`, so a client or load balancer timeout cannot drop a
   transaction between its broadcast and its receipt, graceful shutdown waits for
   it, and the task logs its own outcome. The tokenization and issuer verbs

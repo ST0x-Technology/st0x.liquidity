@@ -74,7 +74,9 @@ use crate::inventory::{
     PendingRequestOwnershipSnapshot, PollFreshness, PortfolioAsset, PortfolioLocation, TransferOp,
     Venue,
 };
-use crate::native_gas::{ConfiguredGasReadiness, GasReadiness, TransferGasRoute};
+use crate::native_gas::{
+    ConfiguredGasReadiness, GasReadiness, GasReadinessFailure, TransferGasRoute,
+};
 use crate::offchain::order::OffchainOrderId;
 use crate::position::{
     EquityTransferReservationId, EquityTransferReservationStatus, Position, PositionCommand,
@@ -230,6 +232,11 @@ pub(crate) enum UsdcResumeError {
     EveryCorridorLatched,
     #[error("USDC rebalancing stores are not wired yet (conductor still starting)")]
     NotReady,
+    #[error(
+        "the USDC corridor's signing wallets are not gas ready ({0}); fund a wallet \
+         that is below its gas threshold, or retry if its balance could not be read"
+    )]
+    GasNotReady(#[source] GasReadinessFailure),
     #[error(
         "USDC transfer corridor mismatch: transfer {id} runs on the {recorded} corridor, \
          this build serves {served}; nothing was enqueued"
@@ -1298,6 +1305,14 @@ impl RebalancingService {
                 false
             }
         }
+    }
+
+    /// Proves the USDC corridor's Base and Ethereum signing wallets can pay
+    /// gas, for the operator started corridor moves (a manual transfer start
+    /// and a manual CCTP burn), which refuse outright where the trigger skips.
+    pub(crate) async fn ensure_usdc_corridor_gas_ready(&self) -> Result<(), GasReadinessFailure> {
+        let readiness = self.gas_readiness.read().await.clone();
+        readiness.ensure_ready(TransferGasRoute::Usdc).await
     }
 
     async fn transfer_gas_is_ready(&self, route: TransferGasRoute) -> bool {
@@ -5922,7 +5937,9 @@ impl RebalancingService {
     /// drive. The worker treats the id's empty state as a fresh transfer,
     /// exactly as it does for a trigger enqueue. Shares the single flight
     /// gates of [`Self::resume_usdc_transfer`] in the same order, so a manual
-    /// start cannot race the trigger, a resume, or a transfer in flight.
+    /// start cannot race the trigger, a resume, or a transfer in flight, and
+    /// then applies the trigger's gas readiness gate, since unlike a resume it
+    /// starts a fresh transfer.
     pub(crate) async fn start_manual_usdc_transfer(
         &self,
         pool: &SqlitePool,
@@ -5968,6 +5985,22 @@ impl RebalancingService {
         // id's latch, but a fresh id has none, so every durable holder refuses.
         if any_rebalance_holds_guard(pool, &store, None, chain, direction).await? {
             return Err(UsdcResumeError::GuardHeldElsewhere);
+        }
+
+        // The worker gates gas itself before any withdrawal, but only after the
+        // enqueue: without this check the route would answer with an id whose
+        // job parks on the gas retry interval while its claim holds the
+        // corridor guard and blocks the rebalancer. Refusing here mirrors the
+        // trigger's fresh dispatch skip, and before the claim nothing needs
+        // releasing.
+        if let Err(failure) = self.ensure_usdc_corridor_gas_ready().await {
+            warn!(
+                target: "rebalance",
+                %id,
+                %failure,
+                "Manual USDC transfer refused: its signing wallets are not gas ready"
+            );
+            return Err(UsdcResumeError::GasNotReady(failure));
         }
 
         // Every refusal refuses, including `CorridorHeld`, which a resume
@@ -18459,6 +18492,39 @@ mod tests {
             "got {error:?}"
         );
         assert!(market_making_job_rows(&trigger).await.is_empty());
+    }
+
+    /// A manual start is a fresh transfer, so signing wallets below their gas
+    /// thresholds refuse it, as the trigger's fresh dispatch skips it: nothing
+    /// is enqueued and no guard is left claimed.
+    #[tokio::test]
+    async fn manual_start_is_refused_while_the_signing_wallets_are_not_gas_ready() {
+        let (trigger, pool, _store) = make_resume_trigger().await;
+        trigger
+            .set_gas_readiness(crate::native_gas::GasReadiness::for_test(
+                U256::MAX,
+                U256::from(1_u64),
+                U256::ZERO,
+                U256::from(1_u64),
+            ))
+            .await;
+
+        let error = trigger
+            .start_manual_usdc_transfer(&pool, RebalanceDirection::AlpacaToBase, positive_usdc(250))
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(error, UsdcResumeError::GasNotReady(_)),
+            "got {error:?}"
+        );
+        assert!(market_making_job_rows(&trigger).await.is_empty());
+        assert!(
+            !trigger
+                .usdc_guards
+                .is_held(trigger.config.served_usdc_corridor.chain()),
+            "a gas refusal must leave no corridor guard claimed"
+        );
     }
 
     #[tokio::test]

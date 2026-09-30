@@ -39,8 +39,8 @@ pub(crate) enum Command {
     /// Safe recovery operations (debug tier).
     #[command(subcommand)]
     Debug(Debug),
-    /// Capital movement operations, signed by the bot's own wallets (capital
-    /// tier).
+    /// Capital movement operations, signed by the bot's own wallets (write
+    /// tier, the same IAP group as debug).
     #[command(subcommand)]
     Capital(Capital),
 }
@@ -399,10 +399,10 @@ pub(crate) enum Capital {
         network: HedgedChain,
     },
     /// Burn USDC on Ethereum or Base for a CCTP transfer to the other chain.
-    /// Returns the burn tx without waiting for Circle's attestation; finish
-    /// with `debug cctp complete-mint` once it is attested. Not idempotent:
-    /// after a timeout, find the burn in the bot logs instead of retrying,
-    /// since a retry burns again.
+    /// Returns the burn tx as soon as the burn is broadcast, without waiting
+    /// for its receipt or Circle's attestation; finish with
+    /// `debug cctp complete-mint` once it is attested. Not idempotent: a retry
+    /// burns again, so after a timeout find the burn in the bot logs instead.
     CctpBridge {
         /// Amount of USDC to bridge, as a decimal (omit to use --all).
         #[arg(

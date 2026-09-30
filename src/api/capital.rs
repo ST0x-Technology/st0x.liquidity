@@ -4,12 +4,13 @@
 //!
 //! No route waits on CCTP attestation or on USDC settlement, since the ops
 //! load balancer times out first: `transfer-usdc` enqueues the transfer on
-//! the bot's own worker and returns its id, and `cctp-bridge` only burns. The
-//! routes that send transactions, and the `transfer-usdc` enqueue, run through
-//! `spawn_detached`, so a dropped request cannot cancel them midway (between
-//! broadcast and receipt, or between the enqueue and the corridor claim it
-//! keeps), and graceful shutdown waits for them. The routes that sign refuse
-//! until startup completes, like `process-tx`.
+//! the bot's own worker and returns its id, and `cctp-bridge` returns its burn
+//! tx at the broadcast. The routes that send transactions, and the
+//! `transfer-usdc` enqueue, run through `spawn_detached`, so a dropped request
+//! cannot cancel them midway (between broadcast and receipt, or between the
+//! enqueue and the corridor claim it keeps), and graceful shutdown waits for
+//! them. Every capital route refuses until startup completes, like
+//! `process-tx`.
 
 use std::fmt::Debug;
 use std::sync::Arc;
@@ -36,6 +37,7 @@ use super::{
     quiesce_usdc_driver, spawn_detached, usdc_resume_error_response,
 };
 use crate::AppState;
+use crate::rebalancing::UsdcResumeError;
 use crate::usdc_rebalance::RebalanceDirection;
 
 /// The direction of a manual USDC transfer, spelled on the wire like the
@@ -173,9 +175,10 @@ pub(super) struct ResetAllowanceResponse {
 /// Progress is observed like any rebalance. Mirrors `st0x-cli transfer-usdc`,
 /// except that the bot drives the whole transfer.
 ///
-/// Ordered like `resume_usdc_transfer`: input validation, the resume lock,
+/// Input validation and the startup gate come first, as on every capital
+/// route. The rest is ordered like `resume_usdc_transfer`: the resume lock,
 /// the recovery handle, the driver pause, then the enqueue gates. Everything
-/// after the input validation runs detached: the enqueue commits before the
+/// after the startup gate runs detached: the enqueue commits before the
 /// start keeps its corridor claim, so a request dropped between the two would
 /// release the claim and the driver pause with the job still queued, letting
 /// the trigger start a second transfer on the corridor.
@@ -188,9 +191,10 @@ pub(super) async fn transfer_usdc(
     // The worker converts the amount to USDC base units before it records
     // anything, so an amount off the six decimal grid is refused here.
     let (amount, _) = positive_usdc(&request.amount)?;
+    require_startup_complete(&state, "transfer-usdc")?;
 
     let detached_tasks = state.detached_tasks.clone();
-    let transfer_id = spawn_detached(&detached_tasks, "transfer-usdc", async move {
+    let transfer_id = spawn_detached(&detached_tasks, "transfer-usdc", amount, async move {
         let _guard = state.resume_lock.0.try_lock().map_err(|_| {
             (
                 StatusCode::CONFLICT,
@@ -388,16 +392,23 @@ pub(super) async fn vault_withdraw_usdc(
 }
 
 /// Burns USDC on the source chain through CCTP toward the bot's wallet on the
-/// other chain and returns the burn tx. It never waits for the attestation or
-/// mints; the operator finishes with the existing `cctp complete-mint` route,
-/// passing the burn tx and this source chain. Mirrors the burn step of
-/// `st0x-cli cctp-bridge`.
+/// other chain and returns the burn tx as soon as the burn is broadcast. It
+/// never waits for the attestation or mints; the operator finishes with the
+/// existing `cctp complete-mint` route, passing the burn tx and this source
+/// chain. Mirrors the burn step of `st0x-cli cctp-bridge`.
 ///
 /// Like `complete_cctp_mint`, the recovery handle is checked before the
-/// resume lock, and the lock and the driver pause are held only around the
-/// work that spends the rebalancing wallet's USDC. Both are taken inside the
-/// detached task, so they stay held until the burn finishes even when the
-/// request is dropped. Nothing records the burn, so the route is not
+/// resume lock, and the lock and the driver pause are held around the work
+/// that spends the rebalancing wallet's USDC, from the balance read through
+/// the burn's confirmation. Both are taken inside the detached task, so they
+/// stay held until the burn confirms even when the request is dropped.
+///
+/// The task answers the request at the broadcast, not at the receipt: an
+/// approve plus the burn's confirmations can outlast the load balancer's 60
+/// second cut, and a request that times out after the broadcast would leave
+/// the operator without the one value `cctp complete-mint` needs, inviting a
+/// retry that burns again. The task then awaits the receipt and logs whether
+/// the burn confirmed. Nothing records the burn, so the route is not
 /// idempotent: a retried request burns again (see the operator docs).
 pub(super) async fn cctp_bridge(
     State(state): State<AppState>,
@@ -410,6 +421,23 @@ pub(super) async fn cctp_bridge(
 
     require_startup_complete(&state, "cctp-bridge")?;
     let handle = state.recovery.get().ok_or_else(recovery_not_ready)?;
+    // Every other corridor move proves both wallets can pay gas first: the
+    // burn spends the source wallet's gas, and the `complete-mint` it leads to
+    // spends the destination wallet's. Refused before anything is locked.
+    handle
+        .rebalancing_service
+        .ensure_usdc_corridor_gas_ready()
+        .await
+        .map_err(|failure| {
+            warn!(
+                %failure,
+                ?direction,
+                "CCTP burn refused: the USDC corridor's signing wallets are not gas ready"
+            );
+            let (status, message) =
+                usdc_resume_error_response(&UsdcResumeError::GasNotReady(failure));
+            (status, Json(ErrorResponse { error: message }))
+        })?;
     let wallets = bot_wallets(&state)?;
     let corridor = state.ctx.rebalancing.cctp_corridor;
     let (source_wallet, source_usdc, recipient) = match from {
@@ -455,66 +483,119 @@ pub(super) async fn cctp_bridge(
 
     let resume_lock = Arc::clone(&state.resume_lock);
     let driver_pause = Arc::clone(&handle.usdc_driver_pause);
-    let response = spawn_detached(&state.detached_tasks, "cctp-bridge", async move {
-        let _guard = resume_lock.0.try_lock().map_err(|_| {
-            (
-                StatusCode::CONFLICT,
-                Json(ErrorResponse {
-                    error: "A resume or recheck operation is already in progress".to_string(),
-                }),
-            )
-        })?;
-        let _driver_paused = quiesce_usdc_driver(
-            &driver_pause,
-            UsdcDriverPauseRequest::CctpBurn { direction },
-        )
-        .await?;
-
-        let amount = match amount {
-            BurnAmount::Exact(amount) => amount,
-            // Read under the driver pause, so no transfer spends the balance
-            // between this read and the burn.
-            BurnAmount::All => {
-                let balance = source_wallet
-                    .call::<OpenChainErrorRegistry, _>(
-                        source_usdc,
-                        IERC20::balanceOfCall {
-                            account: source_wallet.address(),
-                        },
+    let (respond, response) =
+        tokio::sync::oneshot::channel::<Result<CctpBridgeResponse, OpsError>>();
+    let worker = spawn_detached(
+        &state.detached_tasks,
+        "cctp-bridge",
+        source_chain,
+        async move {
+            let broadcast = async {
+                let guard = resume_lock.0.try_lock().map_err(|_| {
+                    (
+                        StatusCode::CONFLICT,
+                        Json(ErrorResponse {
+                            error: "A resume or recheck operation is already in progress".to_string(),
+                        }),
                     )
+                })?;
+                let driver_paused = quiesce_usdc_driver(
+                    &driver_pause,
+                    UsdcDriverPauseRequest::CctpBurn { direction },
+                )
+                .await?;
+
+                let amount = match &amount {
+                    BurnAmount::Exact(amount) => *amount,
+                    // Read under the driver pause, so no transfer spends the
+                    // balance between this read and the burn.
+                    BurnAmount::All => {
+                        let balance = source_wallet
+                            .call::<OpenChainErrorRegistry, _>(
+                                source_usdc,
+                                IERC20::balanceOfCall {
+                                    account: source_wallet.address(),
+                                },
+                            )
+                            .await
+                            .map_err(|error| onchain_failure("cctp-bridge", source_chain, &error))?;
+                        if balance.is_zero() {
+                            warn!(%source_chain, "CCTP burn of the whole balance refused: it is zero");
+                            return Err(ops_precondition_error(format!(
+                                "the {source_chain} wallet's USDC balance is zero"
+                            )));
+                        }
+                        balance
+                    }
+                };
+
+                let burn_tx = bridge
+                    .submit_burn(direction, amount, recipient)
                     .await
                     .map_err(|error| onchain_failure("cctp-bridge", source_chain, &error))?;
-                if balance.is_zero() {
-                    warn!(%source_chain, "CCTP burn of the whole balance refused: it is zero");
-                    return Err(ops_precondition_error(format!(
-                        "the {source_chain} wallet's USDC balance is zero"
-                    )));
-                }
-                balance
+                info!(%burn_tx, ?direction, %amount, "CCTP burn broadcast via API");
+                Ok::<_, OpsError>((guard, driver_paused, amount, burn_tx))
             }
-        };
+            .await;
 
-        let burn = bridge
-            .burn(direction, amount, recipient)
-            .await
-            .map_err(|error| onchain_failure("cctp-bridge", source_chain, &error))?;
-        info!(
-            burn_tx = %burn.tx,
-            ?direction,
-            amount = %burn.amount,
-            "CCTP burn submitted via API"
-        );
+            // The lock and the pause stay held through the confirmation below.
+            let (_guard, _driver_paused, amount, burn_tx) = match broadcast {
+                Ok(broadcast) => broadcast,
+                Err(refusal) => {
+                    // A refusal, the balance read, or a reverted send broadcast
+                    // nothing. A transport error from `submit_burn` may have
+                    // broadcast anyway, which is why `onchain_failure` tells the
+                    // operator to check the chain before retrying. A dropped
+                    // request has no receiver left.
+                    let _ = respond.send(Err(refusal));
+                    return;
+                }
+            };
+            let _ = respond.send(Ok(CctpBridgeResponse {
+                burn_tx,
+                source_chain,
+                destination_chain,
+                amount_raw: amount.to_string(),
+            }));
 
-        Ok::<_, (StatusCode, Json<ErrorResponse>)>(CctpBridgeResponse {
-            burn_tx: burn.tx,
-            source_chain,
-            destination_chain,
-            amount_raw: burn.amount.to_string(),
-        })
-    })?
-    .await??;
+            match bridge.confirm_burn(direction, burn_tx, amount).await {
+                Ok(receipt) => info!(
+                    burn_tx = %receipt.tx,
+                    ?direction,
+                    amount = %receipt.amount,
+                    "CCTP burn confirmed via API"
+                ),
+                Err(error) => error!(
+                    %burn_tx,
+                    ?direction,
+                    %amount,
+                    ?error,
+                    "CCTP burn broadcast via API did not confirm; check the tx onchain \
+                     before completing the mint or retrying"
+                ),
+            }
+        },
+    )?;
 
-    Ok(Json(response))
+    // The task answers at the broadcast and keeps running to confirm the burn,
+    // so the request cannot be the one to join it: a tracked watcher does, and
+    // a panic in either phase still reaches the join failure log of
+    // `spawn_detached`, after the response or a dropped request alike.
+    state.detached_tasks.spawn(async move {
+        let _joined = worker.await;
+    });
+
+    match response.await {
+        Ok(answer) => answer.map(Json),
+        // The task dropped its sender without answering: it panicked before
+        // the broadcast, and the watcher logs the join failure.
+        Err(_answerless) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: "cctp-bridge worker task failed".to_string(),
+            }),
+        )),
+    }
 }
 
 /// Zeroes the chosen chain's settlement stable allowance for that chain's
@@ -533,14 +614,19 @@ pub(super) async fn reset_allowance(
     let owner = wallet.address();
     let raindex = RaindexService::new(wallet, contracts, owner);
 
-    let outcome = spawn_detached(&state.detached_tasks, "reset-allowance", async move {
-        let outcome = raindex
-            .revoke_orderbook_allowance::<OpenChainErrorRegistry>(token)
-            .await
-            .map_err(|error| onchain_failure("reset-allowance", chain, &error))?;
-        info!(%chain, %token, %spender, ?outcome, "Orderbook allowance reset via API");
-        Ok::<_, (StatusCode, Json<ErrorResponse>)>(outcome)
-    })?
+    let outcome = spawn_detached(
+        &state.detached_tasks,
+        "reset-allowance",
+        chain,
+        async move {
+            let outcome = raindex
+                .revoke_orderbook_allowance::<OpenChainErrorRegistry>(token)
+                .await
+                .map_err(|error| onchain_failure("reset-allowance", chain, &error))?;
+            info!(%chain, %token, %spender, ?outcome, "Orderbook allowance reset via API");
+            Ok::<_, (StatusCode, Json<ErrorResponse>)>(outcome)
+        },
+    )?
     .await??;
 
     let (outcome, tx) = match outcome {
@@ -625,8 +711,9 @@ fn recovery_not_ready() -> (StatusCode, Json<ErrorResponse>) {
     )
 }
 
-/// Refuses a route that signs transactions until startup completes, with the
-/// same 503 as `process-tx`. The recovery handle and the wallets exist before
+/// Refuses a capital route until startup completes, with the same 503 as
+/// `process-tx`: the routes sign with the bot's wallets, and so does the job
+/// `transfer-usdc` enqueues. The recovery handle and the wallets exist before
 /// the startup preflights (each chain's id, the inventory `OPERATOR_ROLE`)
 /// have passed, and `health.is_ready()` gates on all of them.
 fn require_startup_complete(state: &AppState, route: &'static str) -> Result<(), OpsError> {
@@ -746,7 +833,7 @@ async fn run_vault_operation(
     } = target;
     let route = operation.route();
 
-    spawn_detached(&state.detached_tasks, route, async move {
+    spawn_detached(&state.detached_tasks, route, token, async move {
         let decimals = wallet
             .call::<OpenChainErrorRegistry, _>(token, IERC20::decimalsCall {})
             .await
