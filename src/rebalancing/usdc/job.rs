@@ -2223,6 +2223,7 @@ impl TransferUsdcToMarketMaking {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
     use std::sync::atomic::{AtomicBool, Ordering};
 
     use alloy::primitives::{Address, TxHash, U256};
@@ -2610,7 +2611,7 @@ mod tests {
                         chain: Chain::Robinhood,
                         hop: HopKind::Relay,
                     },
-                    served: UsdcCorridor::BASE_CCTP,
+                    served: BTreeSet::from([UsdcCorridor::BASE_CCTP]),
                     holds_guard: true,
                 },
             }

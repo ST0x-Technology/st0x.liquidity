@@ -13,6 +13,7 @@ use chrono::{DateTime, Utc};
 use itertools::Itertools;
 use rain_math_float::Float;
 use sqlx::SqlitePool;
+use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::{debug, error, info, instrument, warn};
@@ -25,7 +26,7 @@ use st0x_bridge::corridor::UsdcCorridor;
 use st0x_bridge::{Attestation, Bridge, BridgeDirection, BurnReceipt, BurnTxStatus, MintReceipt};
 use st0x_config::{ALPACA_MINIMUM_WITHDRAWAL, ALPACA_TO_BASE_MINIMUM_TRANSFER, ChainRegistry};
 use st0x_event_sorcery::Store;
-use st0x_evm::{Chain, IERC20, PreparedTransaction, USDC_BASE, Wallet};
+use st0x_evm::{Chain, IERC20, PreparedTransaction, Wallet};
 use st0x_execution::alpaca_broker_api::CryptoOrderResponse;
 use st0x_execution::{
     AlpacaAmount, AlpacaBrokerApiError, AlpacaTransferId, AlpacaWalletError, AlpacaWalletService,
@@ -37,7 +38,9 @@ use st0x_float_macro::float;
 use st0x_raindex::{Raindex, RaindexError, RaindexService, RaindexVaultId};
 
 use super::driver_pause::UsdcDriverGate;
-use super::{DepositSendPending, UnresolvedDepositSend, UsdcTransferError};
+use super::{
+    DepositSendPending, UnresolvedDepositSend, UsdcTransferError, refuse_unserved_corridor,
+};
 use crate::bot_gas::{BotGasOperationCategory, BotGasReceiptCostEnqueuer, RecordBotGasReceiptCost};
 use crate::inventory::view::alpaca_to_base_usdc_capacity;
 use crate::native_gas::{ConfiguredGasReadiness, GasReadiness, TransferGasRoute};
@@ -297,7 +300,7 @@ impl<EthWallet: Wallet, BaseWallet: Wallet> UsdcBridgeHelper for CctpBridge<EthW
     }
 }
 
-/// Classifies a failed vault `withdraw_usdc`. An atomic
+/// Classifies a failed vault `withdraw`. An atomic
 /// [`RaindexError::InsufficientVaultLiquidity`] revert means the vault could not
 /// cover the request; it withdrew nothing (atomic revert), so retrying only
 /// reverts again until the vault is refunded. It is surfaced as a distinct,
@@ -414,7 +417,8 @@ pub struct CrossVenueCashTransfer<Signer: Wallet, B = CctpBridge<Signer, Signer>
     credit_ledger: CreditLedger,
     /// Held across the sign and persist of a deposit send, so a redrive
     /// waits for a timed-out attempt's prepare and takes its persisted send
-    /// instead of signing at the next nonce.
+    /// instead of signing at the next nonce. Shared by every corridor's
+    /// service, since all sign on the one Ethereum wallet.
     deposit_send_prepare: Arc<tokio::sync::Mutex<()>>,
     /// The USDC driver gate the conductor's workers claim. The detached burn
     /// task claims through it too, so an operator pause waits for a burn
@@ -742,35 +746,14 @@ impl<
     }
 
     /// Refuses, before any call, a transfer this service's corridor does not
-    /// carry: one recorded on another corridor, or a fresh one asking for
-    /// another. The transfer is left untouched. A recorded one that holds the
-    /// guard re-queues its job for a build that serves it and the rebalancing
-    /// service pages once (one that holds none ends its job); a fresh one
-    /// retries and dead-letters, which pages once.
+    /// carry (see [`refuse_unserved_corridor`]).
     fn require_served_corridor(
         &self,
         id: &UsdcRebalanceId,
         requested: UsdcCorridor,
         state: Option<&UsdcRebalance>,
     ) -> Result<(), UsdcTransferError> {
-        let served = self.corridor;
-        let error = match state {
-            Some(state) if state.corridor() != served => UsdcTransferError::CorridorMismatch {
-                id: id.clone(),
-                recorded: state.corridor(),
-                served,
-                holds_guard: state.holds_rebalance_guard(),
-            },
-            None if requested != served => UsdcTransferError::CorridorNotServed {
-                id: id.clone(),
-                requested,
-                served,
-            },
-            Some(_) | None => return Ok(()),
-        };
-
-        error!(target: "rebalance", %id, "{error}");
-        Err(error)
+        refuse_unserved_corridor(id, requested, &BTreeSet::from([self.corridor]), state)
     }
 
     /// Checks the Ethereum wallet against the credits of the open transfers in
@@ -950,6 +933,14 @@ impl<
     #[must_use]
     pub(crate) fn with_driver_gate(mut self, gate: UsdcDriverGate) -> Self {
         self.driver_gate = Some(gate);
+        self
+    }
+
+    /// Signs and persists deposit sends under `lock`, shared with every other
+    /// service that signs on the same Ethereum wallet.
+    #[must_use]
+    pub(crate) fn with_deposit_send_lock(mut self, lock: Arc<tokio::sync::Mutex<()>>) -> Self {
+        self.deposit_send_prepare = lock;
         self
     }
 
@@ -2152,7 +2143,7 @@ impl<
                         // `confirm_deposit` advances the aggregate to its terminal
                         // state.
                         self.enqueue_bot_gas_cost(
-                            Chain::Base,
+                            self.corridor.chain(),
                             deposit_tx,
                             BotGasOperationCategory::VaultDeposit,
                         )
@@ -3646,9 +3637,10 @@ impl<
         // Persisting the hash first lands a crash in `DepositInitiated`, whose
         // resume arm re-verifies the recorded tx via `confirm_tx` instead of
         // re-depositing.
+        let stable = self.corridor.chain().settlement_stable();
         let deposit_tx = match self
             .raindex
-            .submit_deposit_usdc(self.vault_id, amount)
+            .submit_deposit(stable.address, self.vault_id, amount, stable.decimals)
             .await
         {
             Ok(tx) => tx,
@@ -3681,7 +3673,7 @@ impl<
         self.raindex.confirm_tx(deposit_tx).await?;
 
         self.enqueue_bot_gas_cost(
-            Chain::Base,
+            self.corridor.chain(),
             deposit_tx,
             BotGasOperationCategory::VaultDeposit,
         )
@@ -5242,7 +5234,12 @@ impl<
             )
             .await?;
 
-        let withdraw_tx = match self.raindex.withdraw_usdc(self.vault_id, amount_u256).await {
+        let stable = self.corridor.chain().settlement_stable();
+        let withdraw_tx = match self
+            .raindex
+            .withdraw(stable.address, self.vault_id, amount_u256, stable.decimals)
+            .await
+        {
             Ok(tx) => tx,
             Err(error) => return Err(classify_vault_withdrawal_error(error)),
         };
@@ -5267,7 +5264,11 @@ impl<
     ) -> Result<(), UsdcTransferError> {
         let (existing_tx, withdrawn) = self
             .raindex
-            .find_recent_withdrawal(USDC_BASE, self.vault_id, from_block)
+            .find_recent_withdrawal(
+                self.corridor.chain().settlement_stable().address,
+                self.vault_id,
+                from_block,
+            )
             .await
             .map_err(|error| classify_vault_withdrawal_scan_error(id, initiated_at, error))?;
 
@@ -5311,7 +5312,7 @@ impl<
         // succeeds) proceeds to genuinely fail the transfer for
         // reconciliation below.
         self.enqueue_bot_gas_cost(
-            Chain::Base,
+            self.corridor.chain(),
             existing_tx,
             BotGasOperationCategory::VaultWithdraw,
         )
@@ -5356,7 +5357,7 @@ impl<
         // Enqueue BEFORE `Initiate`/`ConfirmWithdrawal` (see
         // `enqueue_bot_gas_cost`'s doc for why the ordering matters here).
         self.enqueue_bot_gas_cost(
-            Chain::Base,
+            self.corridor.chain(),
             withdraw_tx,
             BotGasOperationCategory::VaultWithdraw,
         )
@@ -6873,6 +6874,9 @@ pub(crate) enum CctpMintRecoveryError {
         #[source]
         source: CctpError,
     },
+    /// No service in this build carries the corridor a CCTP burn runs on.
+    #[error("no cash transfer service in this build serves the {corridor} corridor")]
+    CorridorNotServed { corridor: UsdcCorridor },
 }
 
 impl CctpMintRecoveryError {
@@ -7069,7 +7073,9 @@ mod tests {
     use st0x_config::HedgedChain;
     use st0x_event_sorcery::{AggregateError, LifecycleError, test_store};
     use st0x_evm::local::RawPrivateKeyWallet;
-    use st0x_evm::{AbiDecodedErrorType, Evm, EvmError, IERC20, NoOpErrorRegistry, Wallet};
+    use st0x_evm::{
+        AbiDecodedErrorType, Evm, EvmError, IERC20, NoOpErrorRegistry, USDC_BASE, Wallet,
+    };
     use st0x_execution::{AlpacaTransferId, AlpacaWalletClient, AlpacaWalletError, PollingConfig};
     use st0x_raindex::{RaindexContracts, RaindexService};
 
@@ -8506,6 +8512,15 @@ mod tests {
         id: &UsdcRebalanceId,
         amount: Usdc,
     ) {
+        advance_to_attested_alpaca_to_base_on(cqrs, id, amount, UsdcCorridor::BASE_CCTP).await;
+    }
+
+    async fn advance_to_attested_alpaca_to_base_on(
+        cqrs: &Store<UsdcRebalance>,
+        id: &UsdcRebalanceId,
+        amount: Usdc,
+        corridor: UsdcCorridor,
+    ) {
         use UsdcRebalanceCommand::*;
 
         let burn_tx =
@@ -8514,7 +8529,7 @@ mod tests {
         cqrs.send(
             id,
             InitiateConversion {
-                corridor: UsdcCorridor::BASE_CCTP,
+                corridor,
                 direction: RebalanceDirection::AlpacaToBase,
                 amount,
                 order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
@@ -8533,7 +8548,7 @@ mod tests {
         cqrs.send(
             id,
             Initiate {
-                corridor: UsdcCorridor::BASE_CCTP,
+                corridor,
                 direction: RebalanceDirection::AlpacaToBase,
                 amount,
                 withdrawal: TransferRef::AlpacaId(AlpacaTransferId::from(Uuid::new_v4())),
@@ -8573,7 +8588,16 @@ mod tests {
         id: &UsdcRebalanceId,
         amount: Usdc,
     ) {
-        advance_to_attested_alpaca_to_base(cqrs, id, amount).await;
+        advance_to_bridged_alpaca_to_base_on(cqrs, id, amount, UsdcCorridor::BASE_CCTP).await;
+    }
+
+    async fn advance_to_bridged_alpaca_to_base_on(
+        cqrs: &Store<UsdcRebalance>,
+        id: &UsdcRebalanceId,
+        amount: Usdc,
+        corridor: UsdcCorridor,
+    ) {
+        advance_to_attested_alpaca_to_base_on(cqrs, id, amount, corridor).await;
 
         let mint_tx =
             fixed_bytes!("0xaaaa111111111111111111111111111111111111111111111111111111111111");
@@ -18012,6 +18036,50 @@ mod tests {
         assert!(bridge.usdc_discarded().is_empty(), "no nonce is released");
     }
 
+    /// Two corridors' services signing on the one Ethereum wallet share the
+    /// deposit-send lock, so a prepare on one waits for the other's and takes
+    /// its persisted send.
+    #[tokio::test]
+    async fn services_sharing_the_deposit_send_lock_sign_once() {
+        let bridge = Arc::new(
+            MockBridge::new()
+                .with_send_usdc_tx(MOCK_DEPOSIT_SEND_TX)
+                .with_first_usdc_prepare_delay(Duration::from_millis(300)),
+        );
+        let cqrs = create_test_store_instance().await;
+        let lock = Arc::new(tokio::sync::Mutex::new(()));
+        let (first_service, _first_server, _first_anvil) =
+            deposit_send_manager(cqrs.clone(), Arc::clone(&bridge)).await;
+        let (second_service, _second_server, _second_anvil) =
+            deposit_send_manager(cqrs.clone(), Arc::clone(&bridge)).await;
+        let first_service = first_service.with_deposit_send_lock(Arc::clone(&lock));
+        let second_service = second_service.with_deposit_send_lock(lock);
+
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        stage_bridged_with_mint_tx(&cqrs, &id, usdc("100"), usdc("99.99"), TxHash::ZERO).await;
+        let deposit_address = Address::random();
+        let amount = U256::from(99_990_000);
+
+        let (first, second) = tokio::join!(
+            first_service.prepare_and_persist_deposit_send(&id, deposit_address, amount),
+            async {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                second_service
+                    .prepare_and_persist_deposit_send(&id, deposit_address, amount)
+                    .await
+            },
+        );
+
+        let (first, _) = first.expect("the first prepare persists its send");
+        let (second, _) = second.expect("the second takes the persisted send");
+        assert_eq!(bridge.usdc_prepare_calls(), 1, "only one send is signed");
+        assert_eq!(
+            (second.tx_hash(), second.nonce()),
+            (first.tx_hash(), first.nonce())
+        );
+        assert!(bridge.usdc_discarded().is_empty(), "no nonce is released");
+    }
+
     /// Startup restores the nonce of every signed send still on `Bridged`,
     /// recorded or not, and of no other transfer.
     #[tokio::test]
@@ -24404,6 +24472,19 @@ mod tests {
         apalis_sqlite::SqlitePool,
         MockServer,
     ) {
+        manager_on_corridor_with_bot_gas_queue(UsdcCorridor::BASE_CCTP, cqrs, wallet, bridge).await
+    }
+
+    async fn manager_on_corridor_with_bot_gas_queue<Signer: Wallet + Clone>(
+        corridor: UsdcCorridor,
+        cqrs: Arc<Store<UsdcRebalance>>,
+        wallet: Signer,
+        bridge: MockBridge,
+    ) -> (
+        CrossVenueCashTransfer<Signer, MockBridge>,
+        apalis_sqlite::SqlitePool,
+        MockServer,
+    ) {
         let (_apalis_only_pool, apalis_pool) = crate::test_utils::setup_test_pools().await;
         let queue = crate::bot_gas::RecordBotGasReceiptCostJobQueue::new(&apalis_pool);
 
@@ -24429,7 +24510,7 @@ mod tests {
             Arc::new(bridge),
             Arc::new(vault_service),
             cqrs,
-            MarketMakingUsdcEndpoints::new(UsdcCorridor::BASE_CCTP, recipient, TEST_VAULT_ID),
+            MarketMakingUsdcEndpoints::new(corridor, recipient, TEST_VAULT_ID),
             &test_settlement_params(),
             BotGasReceiptCostEnqueuer::Enabled(queue),
         );
@@ -24659,6 +24740,155 @@ mod tests {
         assert_eq!(jobs[0].chain, Chain::Base);
         assert_eq!(jobs[0].tx_hash, withdraw_tx);
         assert_eq!(jobs[0].symbol, None, "USDC paths carry no symbol");
+    }
+
+    /// A corridor off Base scans its own chain's stable for the withdrawal
+    /// it adopts and books that withdrawal's gas on its own chain.
+    #[tokio::test]
+    async fn vault_legs_use_the_corridor_chains_stable_and_gas_chain() {
+        let corridor = UsdcCorridor::HubRouted {
+            chain: Chain::Robinhood,
+            hop: HopKind::Cctp,
+        };
+        let pool = SqlitePool::connect(":memory:").await.unwrap();
+        sqlx::migrate!().run(&pool).await.unwrap();
+        let cqrs = Arc::new(test_store(pool, ()));
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let amount = usdc("1");
+        let amount_u256 = usdc_to_u256(amount).unwrap();
+        let from_block = 100;
+        cqrs.send(
+            &id,
+            UsdcRebalanceCommand::BeginWithdrawal {
+                corridor,
+                direction: RebalanceDirection::BaseToAlpaca,
+                amount,
+                from_block,
+            },
+        )
+        .await
+        .unwrap();
+
+        let withdraw_tx =
+            fixed_bytes!("0xdddd000000000000000000000000000000000000000000000000000000000003");
+        let withdrawal = crate::bindings::IRaindexInventory::OperatorWithdraw {
+            operator: address!("0x2222222222222222222222222222222222222222"),
+            token: Chain::Robinhood.settlement_stable().address,
+            vaultId: TEST_VAULT_ID.0,
+            amount: amount_u256,
+        };
+        let log = alloy::rpc::types::Log {
+            inner: alloy::primitives::Log {
+                address: ORDERBOOK_ADDRESS,
+                data: withdrawal.encode_log_data(),
+            },
+            block_hash: None,
+            block_number: Some(from_block + 1),
+            block_timestamp: None,
+            transaction_hash: Some(withdraw_tx),
+            transaction_index: None,
+            log_index: None,
+            removed: false,
+        };
+        let asserter = alloy::providers::mock::Asserter::new();
+        asserter.push_success(&json!([log]));
+        let wallet = RawPrivateKeyWallet::new(
+            &B256::repeat_byte(0x11),
+            ProviderBuilder::new().connect_mocked_client(asserter),
+            1,
+        )
+        .unwrap();
+        let (manager, apalis_pool, _server) =
+            manager_on_corridor_with_bot_gas_queue(corridor, cqrs, wallet, MockBridge::new()).await;
+
+        manager
+            .resume_withdrawal_submitting(&id, amount, amount_u256, from_block, Utc::now())
+            .await
+            .unwrap();
+
+        let jobs = pending_bot_gas_jobs(&apalis_pool).await;
+        assert_eq!(jobs.len(), 1, "expected exactly one bot-gas job");
+        assert_eq!(jobs[0].category, BotGasOperationCategory::VaultWithdraw);
+        assert_eq!(jobs[0].chain, Chain::Robinhood);
+        assert_eq!(jobs[0].tx_hash, withdraw_tx);
+    }
+
+    /// A fresh deposit, its resume from `DepositInitiated`, and a fresh
+    /// withdrawal on a corridor off Base move their own chain's stable and
+    /// book their gas on their own chain. Only USDG has token code here, so
+    /// a deposit of any other token fails its allowance read.
+    #[tokio::test]
+    async fn fresh_vault_legs_use_the_corridor_chains_stable_and_gas_chain() {
+        let corridor = UsdcCorridor::HubRouted {
+            chain: Chain::Robinhood,
+            hop: HopKind::Cctp,
+        };
+        let usdg = Chain::Robinhood.settlement_stable().address;
+        let pool = SqlitePool::connect(":memory:").await.unwrap();
+        sqlx::migrate!().run(&pool).await.unwrap();
+        let cqrs = Arc::new(test_store(pool, ()));
+        let deposit_id = UsdcRebalanceId(Uuid::new_v4());
+        let withdrawal_id = UsdcRebalanceId(Uuid::new_v4());
+        let amount = usdc("1");
+        let amount_u256 = usdc_to_u256(amount).unwrap();
+        advance_to_bridged_alpaca_to_base_on(&cqrs, &deposit_id, amount, corridor).await;
+
+        let (_anvil, endpoint, private_key) = setup_anvil();
+        let wallet = create_test_wallet(&endpoint, &private_key);
+        wallet
+            .provider()
+            .anvil_set_code(
+                usdg,
+                crate::bindings::DeployableERC20::DEPLOYED_BYTECODE.clone(),
+            )
+            .await
+            .unwrap();
+        let (manager, apalis_pool, _server) = manager_on_corridor_with_bot_gas_queue(
+            corridor,
+            cqrs,
+            wallet.clone(),
+            MockBridge::new(),
+        )
+        .await;
+
+        manager
+            .deposit_to_vault(&deposit_id, amount_u256)
+            .await
+            .unwrap();
+        manager
+            .resume_alpaca_to_base(&deposit_id, amount, corridor)
+            .await
+            .unwrap();
+        manager
+            .withdraw_from_vault(&withdrawal_id, amount, amount_u256)
+            .await
+            .unwrap();
+
+        let jobs = pending_bot_gas_jobs(&apalis_pool).await;
+        let booked = jobs
+            .iter()
+            .map(|job| (job.category, job.chain))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            booked,
+            vec![
+                (BotGasOperationCategory::VaultDeposit, Chain::Robinhood),
+                (BotGasOperationCategory::VaultDeposit, Chain::Robinhood),
+                (BotGasOperationCategory::VaultWithdraw, Chain::Robinhood),
+            ]
+        );
+
+        let withdraw_tx = wallet
+            .provider()
+            .get_transaction_by_hash(jobs[2].tx_hash)
+            .await
+            .unwrap()
+            .unwrap();
+        let withdraw = crate::bindings::IRaindexInventory::withdraw4Call::abi_decode(
+            withdraw_tx.inner.input(),
+        )
+        .unwrap();
+        assert_eq!(withdraw.token, usdg);
     }
 
     /// An enqueue failure for a confirmed vault withdrawal propagates as a
@@ -27263,9 +27493,9 @@ mod tests {
                 error,
                 UsdcTransferError::CorridorMismatch {
                     recorded: ROBINHOOD_RELAY,
-                    served: UsdcCorridor::BASE_CCTP,
+                    ref served,
                     ..
-                }
+                } if *served == BTreeSet::from([UsdcCorridor::BASE_CCTP])
             ),
             "got {error:?}"
         );
@@ -27309,9 +27539,9 @@ mod tests {
                 error,
                 UsdcTransferError::CorridorMismatch {
                     recorded: ROBINHOOD_RELAY,
-                    served: UsdcCorridor::BASE_CCTP,
+                    ref served,
                     ..
-                }
+                } if *served == BTreeSet::from([UsdcCorridor::BASE_CCTP])
             ),
             "got {error:?}"
         );
@@ -27345,9 +27575,9 @@ mod tests {
                 error,
                 UsdcTransferError::CorridorNotServed {
                     requested: ROBINHOOD_RELAY,
-                    served: UsdcCorridor::BASE_CCTP,
+                    ref served,
                     ..
-                }
+                } if *served == BTreeSet::from([UsdcCorridor::BASE_CCTP])
             ),
             "got {error:?}"
         );
@@ -27383,9 +27613,9 @@ mod tests {
                 *error,
                 UsdcTransferError::CorridorMismatch {
                     recorded: ROBINHOOD_RELAY,
-                    served: UsdcCorridor::BASE_CCTP,
+                    ref served,
                     ..
-                }
+                } if *served == BTreeSet::from([UsdcCorridor::BASE_CCTP])
             ),
             "got {error:?}"
         );

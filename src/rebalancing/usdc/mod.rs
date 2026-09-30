@@ -5,10 +5,12 @@
 //! with matching `resume_*` paths for apalis-driven crash recovery. Each
 //! transfer handles USD/USDC conversion, withdrawal, CCTP bridging, and deposit.
 
+mod corridors;
 mod driver_pause;
 mod job;
 mod manager;
 
+pub(crate) use corridors::{CorridorTransfer, UsdcCorridorTransfers};
 pub(crate) use driver_pause::{
     DriverNotQuiesced, UsdcDriverGate, UsdcDriverPause, UsdcDriverPauseGuard, usdc_driver_pause,
 };
@@ -29,12 +31,15 @@ pub use manager::{
     verify_deposit_send_superseded,
 };
 
+use std::collections::BTreeSet;
 use std::time::Duration;
 
 use alloy::primitives::{Address, TxHash, U256};
 use chrono::{DateTime, Utc};
+use itertools::Itertools;
 use rain_math_float::FloatError;
 use thiserror::Error;
+use tracing::error;
 
 use st0x_bridge::cctp::CctpError;
 use st0x_bridge::corridor::UsdcCorridor;
@@ -251,24 +256,26 @@ pub enum UsdcTransferError {
     PreviouslyFailedAggregate { id: UsdcRebalanceId },
     #[error(
         "USDC transfer corridor mismatch: transfer {id} runs on the {recorded} corridor, \
-         this service serves {served}; left untouched for the operator"
+         this service serves {}; left untouched for the operator",
+        .served.iter().join(", ")
     )]
     CorridorMismatch {
         id: UsdcRebalanceId,
         recorded: UsdcCorridor,
-        served: UsdcCorridor,
+        served: BTreeSet<UsdcCorridor>,
         /// Whether the transfer still holds the rebalance guard, so a build
         /// that serves `recorded` must still resume it.
         holds_guard: bool,
     },
     #[error(
         "USDC transfer corridor mismatch: transfer {id} asks for the {requested} corridor, \
-         this service serves {served}; nothing was recorded"
+         this service serves {}; nothing was recorded",
+        .served.iter().join(", ")
     )]
     CorridorNotServed {
         id: UsdcRebalanceId,
         requested: UsdcCorridor,
-        served: UsdcCorridor,
+        served: BTreeSet<UsdcCorridor>,
     },
     #[error(
         "USDC rebalance {id} DepositInitiated has non-onchain deposit ref; \
@@ -751,4 +758,51 @@ impl From<SendError<UsdcRebalance>> for UsdcTransferError {
     fn from(error: SendError<UsdcRebalance>) -> Self {
         Self::Aggregate(Box::new(error))
     }
+}
+
+/// Refuses, before any call, a transfer none of the `served` corridors
+/// carries: one recorded on another corridor, or a fresh one asking for
+/// another. The transfer is left untouched. A recorded one that holds the
+/// guard re-queues its job for a build that serves it and the rebalancing
+/// service pages once (one that holds none ends its job); a fresh one
+/// retries and dead-letters, which pages once.
+fn refuse_unserved_corridor(
+    id: &UsdcRebalanceId,
+    requested: UsdcCorridor,
+    served: &BTreeSet<UsdcCorridor>,
+    state: Option<&UsdcRebalance>,
+) -> Result<(), UsdcTransferError> {
+    let corridor = state.map_or(requested, UsdcRebalance::corridor);
+    if served.contains(&corridor) {
+        return Ok(());
+    }
+
+    Err(unserved_corridor(id, requested, served, state))
+}
+
+/// The refusal of a transfer on a corridor none of `served` carries: a
+/// mismatch for a recorded one, not served for a fresh one. Logged here,
+/// where the refusal is decided.
+fn unserved_corridor(
+    id: &UsdcRebalanceId,
+    requested: UsdcCorridor,
+    served: &BTreeSet<UsdcCorridor>,
+    state: Option<&UsdcRebalance>,
+) -> UsdcTransferError {
+    let error = state.map_or_else(
+        || UsdcTransferError::CorridorNotServed {
+            id: id.clone(),
+            requested,
+            served: served.clone(),
+        },
+        |state| UsdcTransferError::CorridorMismatch {
+            id: id.clone(),
+            recorded: state.corridor(),
+            served: served.clone(),
+            holds_guard: state.holds_rebalance_guard(),
+        },
+    );
+
+    error!(target: "rebalance", %id, "{error}");
+    error
 }
