@@ -168,10 +168,10 @@ config carries a `[chains.<name>.trading]` table is a **hedged** chain: the bot
 runs a fill watcher against its order book, accounts its fills and hedges them
 with offsetting broker orders. Exactly one hedged chain must set
 `primary = true` on that table -- the **primary** chain anchors the operator
-defaults (Base), and the cash transfer executors still run on its orderbook and
-vault, so for now it is the only chain a cash corridor may be keyed by. The
-corridor table names the cash chain, and the cash inventory state is kept per
-corridor chain: the trigger, the inflight and the busy marker address that
+defaults (Base), and for now it is the only chain a cash corridor may be keyed
+by. The corridor table names the cash chain; the cash transfer executor runs on
+that chain's orderbook, vault, wallet and gas check. The cash inventory state is
+kept per corridor chain too: its trigger, inflight and busy marker address that
 chain's vault; equity rebalancing, hedging and vault balance polling happen on
 every hedged chain. Vault balance polling runs once per hedged chain, each on
 that chain's own Raindex service, its own chain-qualified vault registry and one
@@ -1986,8 +1986,8 @@ rule fails startup with a named error:
 6. `hop = "relay"` on any chain: this build has no Relay hop.
 7. USDC mode enabled and a chain that is not disabled, whose cash table enables
    rebalancing, has no corridor table: there is no implicit corridor.
-8. A corridor chain other than the primary chain, until the cash transfer
-   executors run on each corridor's chain.
+8. A corridor chain other than the primary chain, until the trigger checks every
+   corridor and the executors' Ethereum-tx checks use Ethereum's own depth.
 9. Transitional: `target` or `deviation` still set directly under
    `[rebalancing.usdc]` and different from the corridor's value. The released
    image reads those two keys and ignores the corridor tables, so both stay in
