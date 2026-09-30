@@ -3098,9 +3098,11 @@ async fn complete_cctp_mint_recovery(
 /// transport hiccup) is a 502 with the typed message. A hard failure (a complete
 /// but malformed attestation, a deterministic mint failure, an amount decode, or
 /// a gas-ledger enqueue) is a 500 whose detail is logged at the call site rather
-/// than returned.
+/// than returned. No service serving the CCTP corridor is a 409 naming it.
 fn cctp_mint_recovery_error_response(error: &CctpMintRecoveryError) -> (StatusCode, String) {
-    if error.is_mint_inconclusive() {
+    if let CctpMintRecoveryError::CorridorNotServed { .. } = error {
+        (StatusCode::CONFLICT, error.to_string())
+    } else if error.is_mint_inconclusive() {
         (
             StatusCode::BAD_GATEWAY,
             "CCTP mint recovery is inconclusive: the destination mint may already \
@@ -9476,6 +9478,15 @@ mod tests {
         let (status, message) = cctp_mint_recovery_error_response(&malformed);
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(message, "CCTP mint recovery failed");
+
+        // No service carries the CCTP corridor in this build: a 409 naming it.
+        let unserved = CctpMintRecoveryError::CorridorNotServed {
+            corridor: UsdcCorridor::BASE_CCTP,
+        };
+        let (status, message) = cctp_mint_recovery_error_response(&unserved);
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(message, unserved.to_string());
+        assert!(message.contains("base via cctp"), "{message}");
 
         let mint = CctpMintRecoveryError::Mint {
             burn_tx,
