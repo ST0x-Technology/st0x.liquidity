@@ -2069,7 +2069,7 @@ fn build_wrapper<Signer: Wallet + Clone>(
 
 /// The signer for `chain`. An exhaustive match, so a new variant must name
 /// its wallet here rather than silently inheriting another chain's.
-fn chain_wallet(
+pub(crate) fn chain_wallet(
     wallet_ctx: &OnchainWalletCtx,
     chain: Chain,
 ) -> anyhow::Result<&Arc<dyn Wallet<Provider = RootProvider>>> {
@@ -2922,7 +2922,7 @@ async fn revoke_stale_orderbook_allowances<Signer: Wallet + Clone>(
                 .revoke_orderbook_allowance::<OpenChainErrorRegistry>(token)
                 .await
             {
-                Ok(RevokeOutcome::Revoked | RevokeOutcome::AlreadyZero) => {}
+                Ok(RevokeOutcome::Revoked { .. } | RevokeOutcome::AlreadyZero) => {}
                 Err(error) => warn!(
                     target: "inventory",
                     %chain,

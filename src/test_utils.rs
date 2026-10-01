@@ -4,35 +4,50 @@
 #[cfg(test)]
 use alloy::hex;
 #[cfg(test)]
-use alloy::network::TransactionBuilder;
+use alloy::network::{EthereumWallet, TransactionBuilder};
 #[cfg(test)]
 use alloy::node_bindings::{Anvil, AnvilInstance};
 #[cfg(test)]
 use alloy::primitives::LogData;
 use alloy::primitives::{Address, B256, TxHash, address, bytes, fixed_bytes};
 #[cfg(test)]
-use alloy::providers::Provider;
+use alloy::primitives::{U256, keccak256};
 #[cfg(test)]
 use alloy::providers::ext::AnvilApi as _;
 #[cfg(test)]
-use alloy::rpc::types::{Log, TransactionRequest};
+use alloy::providers::{Provider, ProviderBuilder, RootProvider};
+#[cfg(test)]
+use alloy::rpc::client::RpcClient;
+#[cfg(test)]
+use alloy::rpc::types::{Log, TransactionReceipt, TransactionRequest};
+#[cfg(test)]
+use alloy::signers::local::PrivateKeySigner;
 use chrono::{DateTime, Utc};
 use rain_math_float::Float;
 use sqlx::SqlitePool;
 use std::sync::atomic::{AtomicU64, Ordering};
 #[cfg(test)]
-use std::sync::{Condvar, LazyLock, Mutex};
+use std::sync::{Arc, Condvar, LazyLock, Mutex};
 use std::time::Duration;
 
+#[cfg(test)]
+#[cfg(feature = "test-support")]
+use st0x_bridge::cctp::{deploy_cctp_on_chain, link_chains, mint_usdc};
 use st0x_config::{BrokerCtx, ChainEquities, ChainEquityAsset, OperationMode};
 #[cfg(any(test, feature = "test-support"))]
 use st0x_event_sorcery::{DomainEvent, EventSourced};
 use st0x_evm::Chain;
+#[cfg(test)]
+use st0x_evm::local::RawPrivateKeyWallet;
+#[cfg(test)]
+use st0x_evm::{Evm, IERC20, NoOpErrorRegistry, Wallet};
 use st0x_execution::{AlpacaBrokerApiMode, Direction, FractionalShares, Positive, Symbol};
 #[cfg(test)]
 use st0x_execution::{CounterTradePreflight, CounterTradeReservation, MarketOrder};
 
 use crate::bindings::IRaindexV6::{EvaluableV4, IOV2, OrderV4};
+#[cfg(test)]
+use crate::bindings::{DeployableERC20, IRaindexV6, RaindexV6};
 use crate::onchain::OnchainTrade;
 use crate::onchain::io::{TokenizedSymbol, Usdc, WrappedTokenizedShares};
 use crate::onchain_trade::OnChainTradeSource;
@@ -308,6 +323,255 @@ pub(crate) async fn deploy_tofu_singleton<P: Provider>(provider: &P) {
         .anvil_set_code(TOFU_TOKEN_DECIMALS, runtime)
         .await
         .unwrap();
+}
+
+/// The bot's signer over an Anvil node: the private key wallet the bot builds
+/// from its `[wallet]` table, behind the `dyn Wallet` the bot's routes take.
+#[cfg(test)]
+pub(crate) fn anvil_wallet(
+    endpoint: url::Url,
+    private_key: &B256,
+) -> Arc<dyn Wallet<Provider = RootProvider>> {
+    let provider: RootProvider = RootProvider::new(RpcClient::builder().http(endpoint));
+    Arc::new(RawPrivateKeyWallet::new(private_key, provider, 1).unwrap())
+}
+
+/// A provider signing as `private_key`, for fixture deployments that must not
+/// touch the bot wallet's nonces.
+#[cfg(test)]
+fn fixture_signer(endpoint: url::Url, private_key: B256) -> impl Provider {
+    let signer = PrivateKeySigner::from_bytes(&private_key).unwrap();
+    ProviderBuilder::new()
+        .wallet(EthereumWallet::from(signer))
+        .connect_http(endpoint)
+}
+
+/// `account`'s balance of the ERC-20 `token`.
+#[cfg(test)]
+pub(crate) async fn erc20_balance(
+    wallet: &Arc<dyn Wallet<Provider = RootProvider>>,
+    token: Address,
+    account: Address,
+) -> U256 {
+    wallet
+        .call::<NoOpErrorRegistry, _>(token, IERC20::balanceOfCall { account })
+        .await
+        .unwrap()
+}
+
+/// The ERC-20 allowance `owner` granted `spender` over `token`.
+#[cfg(test)]
+pub(crate) async fn erc20_allowance(
+    wallet: &Arc<dyn Wallet<Provider = RootProvider>>,
+    token: Address,
+    owner: Address,
+    spender: Address,
+) -> U256 {
+    wallet
+        .call::<NoOpErrorRegistry, _>(token, IERC20::allowanceCall { owner, spender })
+        .await
+        .unwrap()
+}
+
+/// The receipt of `tx`, which must be mined and must have succeeded.
+#[cfg(test)]
+pub(crate) async fn mined_receipt(
+    wallet: &Arc<dyn Wallet<Provider = RootProvider>>,
+    tx: TxHash,
+) -> TransactionReceipt {
+    let receipt = wallet
+        .provider()
+        .get_transaction_receipt(tx)
+        .await
+        .unwrap()
+        .unwrap_or_else(|| panic!("{tx} must be mined"));
+    assert!(receipt.status(), "{tx} must succeed: {receipt:?}");
+    receipt
+}
+
+/// A fresh Anvil node with a Raindex orderbook deployed and the bot's signer
+/// (Anvil account 0) over it. Contracts are deployed from Anvil account 1, so
+/// the bot's nonces start untouched. In the Legacy inventory mode the bot's
+/// vaults live on this orderbook under the bot's own address.
+#[cfg(test)]
+pub(crate) struct AnvilRaindexChain {
+    _anvil: TestAnvilInstance,
+    pub(crate) endpoint: url::Url,
+    deployer_key: B256,
+    pub(crate) orderbook: Address,
+    pub(crate) bot: Address,
+    pub(crate) bot_wallet: Arc<dyn Wallet<Provider = RootProvider>>,
+}
+
+#[cfg(test)]
+impl AnvilRaindexChain {
+    pub(crate) async fn deploy() -> Self {
+        let anvil = spawn_anvil(Anvil::new());
+        let endpoint = anvil.endpoint_url();
+        let bot_key = B256::from_slice(&anvil.keys()[0].to_bytes());
+        let deployer_key = B256::from_slice(&anvil.keys()[1].to_bytes());
+
+        let deployer = fixture_signer(endpoint.clone(), deployer_key);
+        deploy_tofu_singleton(&deployer).await;
+        let orderbook = *RaindexV6::deploy(&deployer).await.unwrap().address();
+
+        let bot_wallet = anvil_wallet(endpoint.clone(), &bot_key);
+
+        Self {
+            _anvil: anvil,
+            endpoint,
+            deployer_key,
+            orderbook,
+            bot: bot_wallet.address(),
+            bot_wallet,
+        }
+    }
+
+    /// Deploys an ERC-20 with `decimals` whose whole `supply` sits in the
+    /// bot's wallet.
+    pub(crate) async fn deploy_bot_token(&self, decimals: u8, supply: U256) -> Address {
+        let deployer = fixture_signer(self.endpoint.clone(), self.deployer_key);
+        let token = DeployableERC20::deploy(
+            &deployer,
+            "Capital Test Token".to_owned(),
+            "CAPT".to_owned(),
+            decimals,
+            self.bot,
+            supply,
+        )
+        .await
+        .unwrap();
+        *token.address()
+    }
+
+    /// Places a 6-decimal ERC-20 at `token`, a canonical address no deploy
+    /// lands on, with `balance` in the bot's wallet. The storage follows the
+    /// deployable ERC-20's layout: balances at slot 0, the total supply at
+    /// slot 2 and the decimals at slot 5.
+    pub(crate) async fn etch_bot_stable(&self, token: Address, balance: U256) {
+        let provider = ProviderBuilder::new().connect_http(self.endpoint.clone());
+        provider
+            .anvil_set_code(token, DeployableERC20::DEPLOYED_BYTECODE.clone())
+            .await
+            .unwrap();
+        provider
+            .anvil_set_storage_at(token, U256::from(2), balance.into())
+            .await
+            .unwrap();
+        provider
+            .anvil_set_storage_at(token, U256::from(5), U256::from(6).into())
+            .await
+            .unwrap();
+
+        let mut balance_key = [0_u8; 64];
+        balance_key[12..32].copy_from_slice(self.bot.as_slice());
+        let balance_slot = U256::from_be_bytes(keccak256(balance_key).0);
+        provider
+            .anvil_set_storage_at(token, balance_slot, balance.into())
+            .await
+            .unwrap();
+    }
+
+    /// Grants `spender` an allowance of `amount` over `token` from the bot's
+    /// wallet.
+    pub(crate) async fn approve_from_bot(&self, token: Address, spender: Address, amount: U256) {
+        self.bot_wallet
+            .submit::<NoOpErrorRegistry, _>(
+                token,
+                IERC20::approveCall { spender, amount },
+                "test standing allowance",
+            )
+            .await
+            .unwrap();
+    }
+
+    /// The bot's balance of `token` in its vault `vault_id`, in the token's
+    /// smallest unit.
+    pub(crate) async fn vault_balance(&self, token: Address, vault_id: B256, decimals: u8) -> U256 {
+        let balance = self
+            .bot_wallet
+            .call::<NoOpErrorRegistry, _>(
+                self.orderbook,
+                IRaindexV6::vaultBalance2Call {
+                    owner: self.bot,
+                    token,
+                    vaultId: vault_id,
+                },
+            )
+            .await
+            .unwrap();
+        Float::from_raw(balance).to_fixed_decimal(decimals).unwrap()
+    }
+}
+
+/// CCTP V2 on two fresh Anvil nodes standing in for Base and Ethereum, linked
+/// both ways, with the bot's signer (Anvil account 0, one address on both) on
+/// each. Deploying from Anvil account 1 with the same nonces lands every
+/// contract, the mint/burn USDC included, at one address on both nodes.
+#[cfg(test)]
+#[cfg(feature = "test-support")]
+pub(crate) struct AnvilCctpPair {
+    _base_anvil: TestAnvilInstance,
+    _ethereum_anvil: TestAnvilInstance,
+    pub(crate) usdc: Address,
+    pub(crate) token_messenger: Address,
+    pub(crate) message_transmitter: Address,
+    pub(crate) bot: Address,
+    pub(crate) base_wallet: Arc<dyn Wallet<Provider = RootProvider>>,
+    pub(crate) ethereum_wallet: Arc<dyn Wallet<Provider = RootProvider>>,
+}
+
+/// Deploys an [`AnvilCctpPair`] with `base_usdc` of USDC in the bot's Base
+/// wallet.
+// Two attributes, not `cfg(all(test, ...))`: clippy's `allow-unwrap-in-tests`
+// only recognizes a plain `cfg(test)` on the enclosing item.
+#[cfg(test)]
+#[cfg(feature = "test-support")]
+pub(crate) async fn deploy_anvil_cctp_pair(base_usdc: U256) -> AnvilCctpPair {
+    let (base_anvil, ethereum_anvil) = spawn_anvil_pair(
+        Anvil::new(),
+        Anvil::new().chain_id(Chain::Ethereum.chain_id()),
+    );
+    let base_endpoint = base_anvil.endpoint();
+    let ethereum_endpoint = ethereum_anvil.endpoint();
+    let bot_key = B256::from_slice(&base_anvil.keys()[0].to_bytes());
+    let deployer_key = B256::from_slice(&base_anvil.keys()[1].to_bytes());
+    // Only a mint checks the attestation, and no burn test mints.
+    let attester = Address::repeat_byte(0xA7);
+
+    let ethereum = deploy_cctp_on_chain(&ethereum_endpoint, &deployer_key, 0, attester)
+        .await
+        .unwrap();
+    let base = deploy_cctp_on_chain(&base_endpoint, &deployer_key, 6, attester)
+        .await
+        .unwrap();
+    link_chains(
+        &ethereum_endpoint,
+        &base_endpoint,
+        &deployer_key,
+        &ethereum,
+        &base,
+    )
+    .await
+    .unwrap();
+
+    let base_wallet = anvil_wallet(base_anvil.endpoint_url(), &bot_key);
+    let ethereum_wallet = anvil_wallet(ethereum_anvil.endpoint_url(), &bot_key);
+    let bot = base_wallet.address();
+    mint_usdc(&base_endpoint, &deployer_key, base.usdc, bot, base_usdc)
+        .await
+        .unwrap();
+
+    AnvilCctpPair {
+        _base_anvil: base_anvil,
+        _ethereum_anvil: ethereum_anvil,
+        usdc: base.usdc,
+        token_messenger: base.token_messenger,
+        message_transmitter: base.message_transmitter,
+        bot,
+        base_wallet,
+        ethereum_wallet,
+    }
 }
 
 /// Returns a test `OrderV4` instance that is shared across multiple
