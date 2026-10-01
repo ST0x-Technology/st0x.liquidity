@@ -7,16 +7,19 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, RwLock};
 
 use async_trait::async_trait;
+use chrono::Utc;
+use rain_math_float::FloatError;
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 
 use st0x_event_sorcery::{Projection, ProjectionError, SendError};
-use st0x_execution::Symbol;
+use st0x_execution::{FractionalShares, Symbol};
 use st0x_wrapper::WrapperError;
 
 use super::allocation::EquityPlanError;
 use super::{RebalancingService, TokenAddressError};
 use crate::conductor::job::{Job, JobQueue, Label, QueuePushError};
+use crate::dashboard::equity_price::EquityPriceStore;
 use crate::inventory::EquityVenuesError;
 use crate::position::{Position, PriceObservation};
 
@@ -39,10 +42,12 @@ pub(crate) enum EquityTriggerError {
     PositionReservation(#[from] SendError<Position>),
     #[error("failed to read the symbol's last price: {0}")]
     LastPrice(#[from] ProjectionError<Position>),
+    #[error(transparent)]
+    Float(#[from] FloatError),
 }
 
-/// Reads a symbol's last onchain fill price, block-timestamped, so the
-/// planner can value the minimum operation size.
+/// Reads the price the planner values a symbol's minimum operation size with:
+/// its last onchain fill, or a stand-in such as [`FillPriceOrMark`]'s mark.
 #[async_trait]
 pub(crate) trait LastPriceReader: Send + Sync {
     async fn last_price(
@@ -64,6 +69,40 @@ impl LastPriceReader for Projection<Position> {
     }
 }
 
+/// The broker shares of a symbol that a sell hedge could take now. A
+/// redemption is admitted over a due sell hedge only when this is below the
+/// live net, so the reading must never be above what the broker would sell.
+/// `None` when no broker reading exists, which admits nothing.
+#[async_trait]
+pub(crate) trait HedgeCapacity: Send + Sync {
+    async fn hedgeable_shares(
+        &self,
+        symbol: &Symbol,
+    ) -> Result<Option<FractionalShares>, EquityTriggerError>;
+}
+
+/// Prices a symbol by its last onchain fill, else by the pricing service's
+/// live mark. An asset an operator seeds at listing holds inventory but has
+/// never filled, so without the mark it could not rebalance until a trade.
+pub(crate) struct FillPriceOrMark {
+    pub(crate) fills: Arc<Projection<Position>>,
+    pub(crate) marks: EquityPriceStore,
+}
+
+#[async_trait]
+impl LastPriceReader for FillPriceOrMark {
+    async fn last_price(
+        &self,
+        symbol: &Symbol,
+    ) -> Result<Option<PriceObservation>, ProjectionError<Position>> {
+        if let Some(fill) = self.fills.last_price(symbol).await? {
+            return Ok(Some(fill));
+        }
+
+        Ok(self.marks.mark(symbol, Utc::now()).await)
+    }
+}
+
 /// Test double: every symbol was last priced at the given price just now.
 #[cfg(test)]
 pub(crate) struct StubLastPrice(pub(crate) rain_math_float::Float);
@@ -79,7 +118,7 @@ impl LastPriceReader for StubLastPrice {
 
         Ok(Some(PriceObservation {
             price: *price,
-            observed_at: chrono::Utc::now(),
+            observed_at: Utc::now(),
         }))
     }
 }

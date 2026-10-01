@@ -2511,6 +2511,7 @@ mod tests {
             equity_in_progress: equity_in_progress.clone(),
             redemption_store,
             position_authority: None,
+            hedge_capacity: None,
             job_queue: queue.clone(),
             notifier: Arc::new(crate::alerts::LogNotifier),
         });

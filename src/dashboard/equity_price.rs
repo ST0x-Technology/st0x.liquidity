@@ -6,7 +6,7 @@ use futures_util::{SinkExt, StreamExt};
 use rain_math_float::{Float, FloatError};
 use rand::Rng;
 use st0x_pricing_types::{
-    ClientFrame, ErrorFrame, PongFrame, PriceFrame, ServerFrame, SubscribeFrame, Venue,
+    ClientFrame, ErrorFrame, PongFrame, PriceFrame, ServerFrame, SubscribeFrame, Venue, WireFloat,
 };
 use std::collections::HashMap;
 use std::io;
@@ -25,6 +25,8 @@ use st0x_dto::{EquityPrice, EquityPriceStatus, Statement};
 use st0x_evm::{Chain, SettlementStable};
 use st0x_finance::Symbol;
 use st0x_float_macro::float;
+
+use crate::position::PriceObservation;
 
 // The pricing service's existing `oracle` identity is scoped to Raindex quotes.
 const CONSUMER: &str = "oracle";
@@ -78,14 +80,34 @@ struct ExpectedPrice {
 #[derive(Clone, Debug)]
 struct AvailablePrice {
     price_usd: Float,
+    /// Mid price of one underlying share, `None` when the frame does not carry
+    /// the underlying rates.
+    underlying_price_usd: Option<Float>,
     observed_at: DateTime<Utc>,
     expires_at: DateTime<Utc>,
 }
 
-/// Process-local latest-price view used only by dashboard projections.
-#[derive(Clone, Debug)]
+/// Told when a symbol gains a usable mark, so a check that declined for want
+/// of a price runs again. Nothing else wakes it while balances are unchanged.
+#[async_trait::async_trait]
+pub(crate) trait MarkListener: Send + Sync {
+    async fn mark_available(&self, symbol: &Symbol);
+}
+
+/// Process-local latest-price view: dashboard projections read every symbol,
+/// and the equity rebalancer values a never-filled symbol with [`Self::mark`].
+#[derive(Clone)]
 pub(crate) struct EquityPriceStore {
     prices: Arc<RwLock<HashMap<Symbol, Option<AvailablePrice>>>>,
+    mark_listener: Arc<std::sync::OnceLock<Arc<dyn MarkListener>>>,
+}
+
+impl std::fmt::Debug for EquityPriceStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EquityPriceStore")
+            .field("prices", &self.prices)
+            .finish_non_exhaustive()
+    }
 }
 
 impl EquityPriceStore {
@@ -102,6 +124,15 @@ impl EquityPriceStore {
 
         Self {
             prices: Arc::new(RwLock::new(prices)),
+            mark_listener: Arc::default(),
+        }
+    }
+
+    /// Attaches the listener told when a symbol gains a usable mark. Only the
+    /// first listener is kept.
+    pub(crate) fn notify_marks_to(&self, listener: Arc<dyn MarkListener>) {
+        if self.mark_listener.set(listener).is_err() {
+            warn!(target: "dashboard", "A mark listener is already attached; keeping the first");
         }
     }
 
@@ -130,6 +161,50 @@ impl EquityPriceStore {
         snapshot
     }
 
+    /// A store holding one live mark for `symbol`, observed now, with a
+    /// wrapper ratio of 1.
+    #[cfg(test)]
+    pub(crate) fn with_live_mark(symbol: Symbol, price_usd: Float) -> Self {
+        let now = Utc::now();
+        let price = AvailablePrice {
+            price_usd,
+            underlying_price_usd: Some(price_usd),
+            observed_at: now,
+            expires_at: now + chrono::TimeDelta::seconds(30),
+        };
+
+        Self {
+            prices: Arc::new(RwLock::new(HashMap::from([(symbol, Some(price))]))),
+            mark_listener: Arc::default(),
+        }
+    }
+
+    /// The symbol's mark if one is live at `now`: the mid price of one
+    /// underlying share in the settlement stable. `None` when the live frame
+    /// does not carry the underlying rates.
+    pub(crate) async fn mark(
+        &self,
+        symbol: &Symbol,
+        now: DateTime<Utc>,
+    ) -> Option<PriceObservation> {
+        self.prices
+            .read()
+            .await
+            .get(symbol)?
+            .as_ref()
+            .filter(|price| price.expires_at > now)
+            .and_then(|price| {
+                Some(PriceObservation {
+                    price: price.underlying_price_usd?,
+                    observed_at: price.observed_at,
+                })
+            })
+    }
+
+    /// Stores `price` unless an equal or newer one is held, and tells the mark
+    /// listener when the symbol had no usable mark before. A held mark that
+    /// has expired counts as missing, as it does for [`Self::mark`], even
+    /// before the expiry sweep removes it.
     async fn update(&self, symbol: &Symbol, price: AvailablePrice) -> bool {
         let mut prices = self.prices.write().await;
         let Some(value) = prices.get_mut(symbol) else {
@@ -143,8 +218,17 @@ impl EquityPriceStore {
             return false;
         }
 
+        let now = Utc::now();
+        let mark_arrives = price.underlying_price_usd.is_some()
+            && value.as_ref().is_none_or(|current| {
+                current.underlying_price_usd.is_none() || current.expires_at <= now
+            });
         *value = Some(price);
         drop(prices);
+
+        if mark_arrives && let Some(listener) = self.mark_listener.get() {
+            listener.mark_available(symbol).await;
+        }
         true
     }
 
@@ -597,8 +681,44 @@ fn validated_price(
         return Err(InvalidPrice::Expired);
     }
 
-    let bid = Float::from_raw(B256::from(frame.rate_base_to_quote.0));
-    let quote_to_base = Float::from_raw(B256::from(frame.rate_quote_to_base.0));
+    let price_usd = mid_price(&frame.rate_base_to_quote, &frame.rate_quote_to_base)?;
+
+    // Both underlying rates zero is the wire sentinel for "not carried".
+    let underlying_bid = Float::from_raw(B256::from(frame.underlying_rate_base_to_quote.0));
+    let underlying_quote_to_base =
+        Float::from_raw(B256::from(frame.underlying_rate_quote_to_base.0));
+    let underlying_price_usd = if underlying_bid.is_zero()? && underlying_quote_to_base.is_zero()? {
+        None
+    } else {
+        // Only the rebalancer reads the underlying price, so a bad pair must
+        // not cost the dashboard its wrapped price.
+        mid_price(
+            &frame.underlying_rate_base_to_quote,
+            &frame.underlying_rate_quote_to_base,
+        )
+        .inspect_err(|error| {
+            warn!(
+                target: "dashboard",
+                symbol = %expected.symbol,
+                %error,
+                "Ignoring an invalid underlying rate pair; the symbol has no mark"
+            );
+        })
+        .ok()
+    };
+
+    Ok(AvailablePrice {
+        price_usd,
+        underlying_price_usd,
+        observed_at,
+        expires_at,
+    })
+}
+
+/// Mid of a directional rate pair, refusing non-positive or crossed rates.
+fn mid_price(base_to_quote: &WireFloat, quote_to_base: &WireFloat) -> Result<Float, InvalidPrice> {
+    let bid = Float::from_raw(B256::from(base_to_quote.0));
+    let quote_to_base = Float::from_raw(B256::from(quote_to_base.0));
     if !bid.gt(float!(0))? || !quote_to_base.gt(float!(0))? {
         return Err(InvalidPrice::NonPositive);
     }
@@ -606,13 +726,8 @@ fn validated_price(
     if bid.gt(ask)? {
         return Err(InvalidPrice::Crossed);
     }
-    let price_usd = ((bid + ask)? / float!(2))?;
 
-    Ok(AvailablePrice {
-        price_usd,
-        observed_at,
-        expires_at,
-    })
+    Ok(((bid + ask)? / float!(2))?)
 }
 
 fn encode_frame<T: serde::Serialize>(
@@ -803,6 +918,168 @@ mod tests {
             validated_price(&frame(float!(99), float!(0.01), now), &expected(), now).unwrap();
 
         assert_eq!(price.price_usd.format().unwrap(), "99.5");
+    }
+
+    /// A vault share worth more than one underlying share (SGOV, SPYM) is
+    /// priced per wrapped share for the dashboard, while the rebalancer's mark
+    /// is the underlying mid the frame carries.
+    #[tokio::test]
+    async fn mark_is_the_underlying_price_not_the_wrapped_one() {
+        let now = Utc::now();
+        let mut vault_frame = frame(float!(101), float!(0.0099), now);
+        vault_frame.underlying_rate_base_to_quote = wire_float(float!(99));
+        vault_frame.underlying_rate_quote_to_base = wire_float(float!(0.01));
+        let price = validated_price(&vault_frame, &expected(), now).unwrap();
+        let symbol = Symbol::new("AAPL").unwrap();
+        let store = EquityPriceStore {
+            prices: Arc::new(RwLock::new(HashMap::from([(symbol.clone(), None)]))),
+            mark_listener: Arc::default(),
+        };
+        assert!(store.update(&symbol, price).await);
+
+        let mark = store.mark(&symbol, now).await.unwrap();
+
+        assert_eq!(mark.price.format().unwrap(), "99.5");
+    }
+
+    #[derive(Default)]
+    struct RecordingMarkListener(tokio::sync::Mutex<Vec<Symbol>>);
+
+    #[async_trait::async_trait]
+    impl MarkListener for RecordingMarkListener {
+        async fn mark_available(&self, symbol: &Symbol) {
+            self.0.lock().await.push(symbol.clone());
+        }
+    }
+
+    fn price_with_mark(now: DateTime<Utc>, carries_underlying: bool) -> AvailablePrice {
+        let (base_to_quote, quote_to_base) = if carries_underlying {
+            (float!(99), float!(0.01))
+        } else {
+            (float!(0), float!(0))
+        };
+        let mut vault_frame = frame(float!(101), float!(0.0099), now);
+        vault_frame.underlying_rate_base_to_quote = wire_float(base_to_quote);
+        vault_frame.underlying_rate_quote_to_base = wire_float(quote_to_base);
+        validated_price(&vault_frame, &expected(), now).unwrap()
+    }
+
+    /// The listener hears a symbol once when it gains a usable mark, not on
+    /// every later quote, and not for a quote without the underlying rates.
+    #[tokio::test]
+    async fn only_a_newly_usable_mark_notifies_the_listener() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let store = EquityPriceStore {
+            prices: Arc::new(RwLock::new(HashMap::from([(symbol.clone(), None)]))),
+            mark_listener: Arc::default(),
+        };
+        let listener = Arc::new(RecordingMarkListener::default());
+        store.notify_marks_to(listener.clone());
+        let start = Utc::now();
+
+        assert!(store.update(&symbol, price_with_mark(start, false)).await);
+        assert!(listener.0.lock().await.is_empty(), "no mark yet");
+
+        let marked = start + TimeDelta::seconds(1);
+        assert!(store.update(&symbol, price_with_mark(marked, true)).await);
+        let refreshed = start + TimeDelta::seconds(2);
+        assert!(
+            store
+                .update(&symbol, price_with_mark(refreshed, true))
+                .await
+        );
+        assert_eq!(*listener.0.lock().await, vec![symbol.clone()]);
+
+        assert!(store.make_unavailable(&symbol).await);
+        let returned = start + TimeDelta::seconds(3);
+        assert!(store.update(&symbol, price_with_mark(returned, true)).await);
+        assert_eq!(
+            *listener.0.lock().await,
+            vec![symbol.clone(), symbol],
+            "a mark that comes back after an outage must notify again"
+        );
+    }
+
+    /// A held mark past its expiry already reads as missing to the planner,
+    /// so a fresh quote replacing it before the expiry sweep runs must notify.
+    #[tokio::test]
+    async fn fresh_mark_over_an_expired_unswept_one_notifies_the_listener() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let observed = Utc::now() - TimeDelta::seconds(60);
+        let store = EquityPriceStore {
+            prices: Arc::new(RwLock::new(HashMap::from([(
+                symbol.clone(),
+                Some(AvailablePrice {
+                    expires_at: observed + TimeDelta::seconds(30),
+                    ..price_with_mark(observed, true)
+                }),
+            )]))),
+            mark_listener: Arc::default(),
+        };
+        let listener = Arc::new(RecordingMarkListener::default());
+        store.notify_marks_to(listener.clone());
+        assert!(
+            store.mark(&symbol, Utc::now()).await.is_none(),
+            "the held mark has expired"
+        );
+
+        assert!(
+            store
+                .update(&symbol, price_with_mark(Utc::now(), true))
+                .await
+        );
+
+        assert_eq!(*listener.0.lock().await, vec![symbol]);
+    }
+
+    #[tokio::test]
+    async fn invalid_underlying_rates_give_no_mark_but_keep_the_dashboard_price() {
+        let now = Utc::now();
+        let mut half_frame = frame(float!(99), float!(0.01), now);
+        half_frame.underlying_rate_base_to_quote = wire_float(float!(99));
+        half_frame.underlying_rate_quote_to_base = wire_float(float!(0));
+        let price = validated_price(&half_frame, &expected(), now).unwrap();
+        let symbol = Symbol::new("AAPL").unwrap();
+        let store = EquityPriceStore {
+            prices: Arc::new(RwLock::new(HashMap::from([(symbol.clone(), None)]))),
+            mark_listener: Arc::default(),
+        };
+        assert!(store.update(&symbol, price).await);
+
+        assert!(store.mark(&symbol, now).await.is_none());
+        let EquityPriceStatus::Available { price_usd, .. } = store.snapshot(now).await[0].status
+        else {
+            panic!("the dashboard should keep the wrapped price")
+        };
+        assert_eq!(price_usd.format().unwrap(), "99.5");
+    }
+
+    /// Frames from producers that predate the underlying rates carry zero for
+    /// both. The dashboard still shows the wrapped price, but the rebalancer
+    /// gets no mark rather than a wrapped price posing as an underlying one.
+    #[tokio::test]
+    async fn frame_without_underlying_rates_gives_no_mark() {
+        let now = Utc::now();
+        let mut legacy_frame = frame(float!(99), float!(0.01), now);
+        legacy_frame.underlying_rate_base_to_quote = wire_float(float!(0));
+        legacy_frame.underlying_rate_quote_to_base = wire_float(float!(0));
+        let price = validated_price(&legacy_frame, &expected(), now).unwrap();
+        let symbol = Symbol::new("AAPL").unwrap();
+        let store = EquityPriceStore {
+            prices: Arc::new(RwLock::new(HashMap::from([(symbol.clone(), None)]))),
+            mark_listener: Arc::default(),
+        };
+        assert!(store.update(&symbol, price).await);
+
+        assert!(
+            store.mark(&symbol, now).await.is_none(),
+            "a wrapped price must not stand in for the underlying one"
+        );
+        let EquityPriceStatus::Available { price_usd, .. } = store.snapshot(now).await[0].status
+        else {
+            panic!("the dashboard should still show the wrapped price")
+        };
+        assert_eq!(price_usd.format().unwrap(), "99.5");
     }
 
     #[tokio::test]
@@ -1007,6 +1284,7 @@ mod tests {
                     &symbol,
                     AvailablePrice {
                         price_usd: float!(100),
+                        underlying_price_usd: None,
                         observed_at: now,
                         expires_at: now + TimeDelta::seconds(30),
                     },
@@ -1066,10 +1344,12 @@ mod tests {
                 symbol.clone(),
                 Some(AvailablePrice {
                     price_usd: float!(100),
+                    underlying_price_usd: None,
                     observed_at: Utc::now() - TimeDelta::seconds(60),
                     expires_at: Utc::now() - TimeDelta::seconds(30),
                 }),
             )]))),
+            mark_listener: Arc::default(),
         };
 
         let snapshot = store.snapshot(Utc::now()).await;
@@ -1079,19 +1359,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn mark_is_the_live_price_until_it_expires() {
+        let symbol = Symbol::new("SPY").unwrap();
+        let store = EquityPriceStore::with_live_mark(symbol.clone(), float!(766.59));
+        let now = Utc::now();
+
+        let mark = store.mark(&symbol, now).await.unwrap();
+        assert_eq!(mark.price.format().unwrap(), "766.59");
+
+        assert!(
+            store
+                .mark(&symbol, now + TimeDelta::seconds(31))
+                .await
+                .is_none(),
+            "an expired mark must not price the symbol"
+        );
+        assert!(
+            store
+                .mark(&Symbol::new("AAPL").unwrap(), now)
+                .await
+                .is_none(),
+            "a symbol the store does not track has no mark"
+        );
+    }
+
+    #[tokio::test]
     async fn older_quote_cannot_replace_a_newer_price() {
         let symbol = Symbol::new("AAPL").unwrap();
         let store = EquityPriceStore {
             prices: Arc::new(RwLock::new(HashMap::from([(symbol.clone(), None)]))),
+            mark_listener: Arc::default(),
         };
         let now = Utc::now();
         let newer = AvailablePrice {
             price_usd: float!(101),
+            underlying_price_usd: None,
             observed_at: now,
             expires_at: now + TimeDelta::seconds(30),
         };
         let older = AvailablePrice {
             price_usd: float!(99),
+            underlying_price_usd: None,
             observed_at: now - TimeDelta::seconds(1),
             expires_at: now + TimeDelta::seconds(30),
         };
@@ -1110,6 +1418,7 @@ mod tests {
         let symbol = Symbol::new("AAPL").unwrap();
         let store = EquityPriceStore {
             prices: Arc::new(RwLock::new(HashMap::from([(symbol.clone(), None)]))),
+            mark_listener: Arc::default(),
         };
         let now = Utc::now();
         let original_expiry = now + TimeDelta::seconds(30);
@@ -1119,6 +1428,7 @@ mod tests {
                     &symbol,
                     AvailablePrice {
                         price_usd: float!(101),
+                        underlying_price_usd: None,
                         observed_at: now,
                         expires_at: original_expiry,
                     },
@@ -1132,6 +1442,7 @@ mod tests {
                     &symbol,
                     AvailablePrice {
                         price_usd: float!(99),
+                        underlying_price_usd: None,
                         observed_at: now,
                         expires_at: now + TimeDelta::seconds(60),
                     },
@@ -1215,6 +1526,7 @@ mod tests {
                     &symbol,
                     AvailablePrice {
                         price_usd: float!(100),
+                        underlying_price_usd: None,
                         observed_at: now,
                         expires_at: now + TimeDelta::seconds(30),
                     },
@@ -1278,6 +1590,7 @@ mod tests {
                     &symbol,
                     AvailablePrice {
                         price_usd: float!(100),
+                        underlying_price_usd: None,
                         observed_at: now,
                         expires_at: now + TimeDelta::seconds(30),
                     },
@@ -1382,6 +1695,7 @@ mod tests {
                     &symbol,
                     AvailablePrice {
                         price_usd: float!(100),
+                        underlying_price_usd: None,
                         observed_at: now,
                         expires_at: now + TimeDelta::seconds(30),
                     },

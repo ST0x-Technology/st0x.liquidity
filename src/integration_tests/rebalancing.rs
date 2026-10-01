@@ -1077,6 +1077,7 @@ async fn equity_onchain_imbalance_triggers_redemption() {
             Arc::clone(&position_cqrs),
             ExecutionThreshold::whole_share(),
         )),
+        hedge_capacity: None,
         job_queue: TransferEquityToHedgingJobQueue::new(&apalis_pool),
         notifier: Arc::new(crate::alerts::LogNotifier),
     };

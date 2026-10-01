@@ -3087,6 +3087,22 @@ enum TriggerReason {
   reservation exists, and the current net position is below the hedge threshold.
   A nonzero position whose dollar threshold cannot be valued is rejected
   fail-closed.
+- One exception to the hedge threshold: a redemption is admitted over a due sell
+  hedge that the broker cannot fill. The trigger passes the broker's sell
+  capacity, counted as the broker counts it for an asset it trades only in whole
+  shares: available shares truncated to whole shares, less the hedge floor
+  rounded up to whole shares. That count is never above what the broker would
+  sell, so a starved hedge always reads as starved. The aggregate admits the
+  redemption when the count is below the live net. The redemption brings the
+  broker the shares that sell needs, so blocking it would leave both waiting on
+  each other. The hedge still waits for the reservation to release. A mint, a
+  buy hedge, or a sell the broker can fill keeps the strict rule. A redemption
+  that released its reservation to wait for gas restores it under the same
+  exception. With no broker reading the capacity is unknown, not zero: the
+  trigger reserves under the strict rule and a restoring job waits and retries.
+  A job reads the capacity only to recreate a missing reservation, so one that
+  still holds its reservation never depends on that read, and a failed read
+  defers the job instead of failing it.
 - `PlaceOffChainOrder` is rejected while any transfer reservation owns the
   symbol. A newly committed onchain fill invalidates an unconfirmed reservation;
   confirmation of that exact ID must succeed immediately before the transfer job
@@ -5503,8 +5519,9 @@ emits imbalance detection events.
     available at the broker; beside it the hedge floor keeps its fixed number of
     shares
   - Minimum operation size: `min_operation_usd`, valued at the symbol's last
-    onchain fill price (the block-timestamped `Position.last_price`),
-    overridable per chain with the trading table's `min_operation_usd`
+    onchain fill price (the block-timestamped `Position.last_price`), or at the
+    pricing service's live mark for a symbol that has never filled, overridable
+    per chain with the trading table's `min_operation_usd`
   - Cooldown: `cooldown_secs` per `(symbol, chain)` after a dispatch
   - At load, per symbol, the chain targets plus the floor must not exceed 1, and
     a positive target must exceed the band: an empty chain is only
@@ -5523,10 +5540,10 @@ trigger can vouch for: the broker balance, one slot per hedged chain that
 rebalances the symbol (its wrapped vault balance converted through that chain's
 ERC-4626 ratio, its effective target share, the band, its operational limit, its
 minimum operation size, whether its vault registry knows the token and whether
-its wallet is gas-ready), the floors, the cooling chains and the symbol's last
-onchain fill price. A hedge-only listing (`rebalancing = "disabled"`) is neither
-slotted nor counted: its prefunded inventory is outside the planner's total, so
-it never moves the other chains' targets.
+its wallet is gas-ready), the floors, the cooling chains and the symbol's price.
+A hedge-only listing (`rebalancing = "disabled"`) is neither slotted nor
+counted: its prefunded inventory is outside the planner's total, so it never
+moves the other chains' targets.
 
 - Guards, in order: the broker venue unpolled, no chain slot at all, a
   rebalancing chain without a slot, or any transfer in flight for the symbol
@@ -5553,9 +5570,15 @@ it never moves the other chains' targets.
   the hedge floor available; a broker at or below that declines the whole symbol
   (the floor is symbol-wide, so no other mint could pass). The result is
   truncated to nine decimals.
-- Minimum: with no last price the plan declines; the price's age does not
-  matter, since it only values this dust bound. A candidate whose quantity times
-  price is below the chain's minimum is skipped and the next one evaluated.
+- Minimum: the price is the symbol's last onchain fill. A symbol that has never
+  filled, such as one an operator seeds at listing, uses the pricing service's
+  live mark instead: the mid price of one underlying share, from the underlying
+  rates the pricing frame carries. A frame without them gives no mark. With
+  neither price the plan declines, and a symbol whose usable mark arrives later
+  is checked again, since nothing else wakes it while balances are unchanged.
+  The price's age does not matter, since it only values this dust bound. A
+  candidate whose quantity times price is below the chain's minimum is skipped
+  and the next one evaluated.
 - Dispatch: the operation is enqueued as the chosen chain's mint or redemption
   and the `(symbol, chain)` cooldown starts. One operation per symbol is in
   flight at a time (the per-symbol lock, the job row and the transfer's first
