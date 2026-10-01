@@ -220,8 +220,11 @@ chain's confirmations and requires a `RelayErc20Deposit` from our wallet, in the
 origin stable, for the order id.
 
 `find_recent_deposits` scans the depository's logs from a captured
-`origin_block` to the head in 10,000-block chunks, decodes each, and returns our
-deposits for any of a set of order ids, with the head it scanned to. Orders stay
+`origin_block` in 10,000-block chunks, decodes each, and returns our deposits
+for any of a set of order ids, with the last block it scanned. The scan stops
+the origin chain's confirmations behind the head (`RelayCtx` takes each end's
+count, the same its wallet waits for): a lagging load-balanced node may not have
+indexed the newest blocks, and a deposit there is not confirmed yet. Orders stay
 fillable for about a week (`RelayQuote::deadline`), so the scan takes whatever
 floor the caller gives it; no shorter window is assumed.
 
