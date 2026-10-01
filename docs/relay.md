@@ -223,9 +223,9 @@ origin stable, for the order id.
 `origin_block` in 10,000-block chunks, decodes each, and returns our deposits
 for any of a set of order ids, with the last block it scanned. The scan stops at
 the newest block with the origin chain's confirmations, counting the inclusion
-block (`RelayCtx` takes each end's count, the same its wallet waits for): a
-lagging load-balanced node may not have indexed the newest blocks, and a deposit
-there is not confirmed yet. Orders stay fillable for about a week
+block (`RelayCtx` takes each end's count, at least 1, the same its wallet waits
+for): a lagging load-balanced node may not have indexed the newest blocks, and a
+deposit there is not confirmed yet. Orders stay fillable for about a week
 (`RelayQuote::deadline`), so the scan takes whatever floor the caller gives it;
 no shorter window is assumed.
 
