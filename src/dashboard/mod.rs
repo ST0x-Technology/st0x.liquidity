@@ -856,6 +856,7 @@ mod tests {
                 tokio::sync::Mutex::new(()),
             ))),
             vault_deposit_lock: Arc::new(tokio::sync::Mutex::new(())),
+            vault_withdraw_lock: Arc::new(tokio::sync::Mutex::new(())),
             projection_maintenance: Arc::new(
                 crate::conductor::projection_pause::ProjectionMaintenance::for_test(),
             ),

@@ -4692,6 +4692,7 @@ mod tests {
             process_tx: Arc::new(tokio::sync::OnceCell::new()),
             resume_lock: Arc::new(ResumeLock(Arc::new(Mutex::new(())))),
             vault_deposit_lock: Arc::new(Mutex::new(())),
+            vault_withdraw_lock: Arc::new(Mutex::new(())),
             projection_maintenance: Arc::new(
                 crate::conductor::projection_pause::ProjectionMaintenance::for_test(),
             ),
@@ -8517,6 +8518,38 @@ mod tests {
         );
     }
 
+    /// `vault-withdraw-usdc` shares the withdraw lock with `vault-withdraw`:
+    /// while either holds it, a request refuses with 409 before any chain call.
+    #[tokio::test]
+    async fn vault_withdraw_usdc_returns_409_while_another_withdrawal_holds_the_lock() {
+        let mut ctx = create_test_ctx_with_order_owner(Address::ZERO);
+        ctx.wallet = Some(st0x_config::OnchainWalletCtx::stub());
+        ctx.chains.primary_mut().assets.cash = Some(ChainCashAsset {
+            vault_ids: vec![B256::with_last_byte(7)],
+            rebalancing: OperationMode::Disabled,
+            operational_limit: None,
+        });
+        let (state, _gate) = recovery_state_for_ctx(ctx, EquityTransferServices::panicking()).await;
+        state.health.set_ready();
+        let withdraw_lock = Arc::clone(&state.vault_withdraw_lock);
+        let _held = withdraw_lock.try_lock().unwrap();
+
+        let Err((status, Json(body))) = capital::vault_withdraw_usdc(
+            State(state),
+            capital_request(serde_json::json!({"chain": "base", "amount": "1"})),
+        )
+        .await
+        else {
+            panic!("a held withdraw lock must refuse the withdrawal");
+        };
+
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(
+            body.error,
+            "Another vault withdrawal is in progress; retry once it finishes"
+        );
+    }
+
     /// Every capital route refuses with 503 until startup completes, as
     /// process-tx does: the recovery handle and the wallets exist before the
     /// chain id and `OPERATOR_ROLE` preflights have passed, and the job
@@ -8706,8 +8739,9 @@ mod tests {
     }
 
     /// After a deposit, a partial withdraw answers with its tx at the
-    /// broadcast, confirms afterwards, and returns exactly the reported raw
-    /// amount from the vault to the bot's wallet.
+    /// broadcast, a rerun of it refuses with 409 until that withdraw confirms
+    /// (the vault balance has not moved yet), and exactly the reported raw
+    /// amount returns from the vault to the bot's wallet, once.
     #[tokio::test]
     async fn vault_withdraw_moves_the_scaled_amount_back_to_the_bots_wallet() {
         let chain = AnvilRaindexChain::deploy().await;
@@ -8735,7 +8769,23 @@ mod tests {
             )
             .await,
         );
+        let Err((status, Json(rerun))) = capital::vault_withdraw(
+            State(state.clone()),
+            capital_request(vault_request(token, vault_id, "0.25")),
+        )
+        .await
+        else {
+            panic!("a rerun before the confirmation must not withdraw again");
+        };
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(
+            rerun.error,
+            "Another vault withdrawal is in progress; retry once it finishes"
+        );
         confirm_after_the_answer(&state, &gate).await;
+        let Ok(_released) = state.vault_withdraw_lock.try_lock() else {
+            panic!("the confirmed withdraw must release the withdraw lock");
+        };
 
         let withdraw_tx: TxHash = serde_json::from_value(body["withdrawTx"].clone()).unwrap();
         assert_eq!(

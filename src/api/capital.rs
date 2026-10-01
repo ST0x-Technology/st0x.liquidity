@@ -838,24 +838,29 @@ async fn run_vault_operation(
     } = target;
     let route = operation.route();
 
-    let deposit_lock = Arc::clone(&state.vault_deposit_lock);
+    // Each vault verb holds its lock from before its first read until its tx
+    // confirms, inside the task so a dropped request cannot release it early;
+    // see `AppState::vault_deposit_lock` and `AppState::vault_withdraw_lock`.
+    let (lock, refusal) = match operation {
+        VaultOperation::Deposit => (
+            Arc::clone(&state.vault_deposit_lock),
+            "Another vault deposit is in progress; retry once it finishes",
+        ),
+        VaultOperation::Withdraw | VaultOperation::WithdrawUsdc => (
+            Arc::clone(&state.vault_withdraw_lock),
+            "Another vault withdrawal is in progress; retry once it finishes",
+        ),
+    };
     answer_from_detached(&state.detached_tasks, route, token, async move {
-        // Held through the approve, the deposit and its confirmation, inside
-        // the task so a dropped request cannot release it early; see
-        // `AppState::vault_deposit_lock`. Withdrawals approve nothing.
-        let deposit_guard = match operation {
-            VaultOperation::Deposit => Some(deposit_lock.try_lock_owned().map_err(|_| {
-                warn!(route, %chain, %token, "Vault deposit refused: another deposit is in progress");
-                (
-                    StatusCode::CONFLICT,
-                    Json(ErrorResponse {
-                        error: "Another vault deposit is in progress; retry once it finishes"
-                            .to_string(),
-                    }),
-                )
-            })?),
-            VaultOperation::Withdraw | VaultOperation::WithdrawUsdc => None,
-        };
+        let vault_guard = lock.try_lock_owned().map_err(|_| {
+            warn!(route, %chain, %token, "Vault operation refused: {refusal}");
+            (
+                StatusCode::CONFLICT,
+                Json(ErrorResponse {
+                    error: refusal.to_string(),
+                }),
+            )
+        })?;
         let decimals = wallet
             .call::<OpenChainErrorRegistry, _>(token, IERC20::decimalsCall {})
             .await
@@ -884,8 +889,8 @@ async fn run_vault_operation(
         info!(route, %chain, %token, %vault_id, %amount_raw, %tx, "Vault operation broadcast via API");
 
         let confirm = async move {
-            // The deposit guard stays held until the deposit confirms.
-            let _deposit_guard = deposit_guard;
+            // The vault lock stays held until the tx confirms.
+            let _vault_guard = vault_guard;
             match raindex.confirm_tx(tx).await {
                 Ok(()) => info!(
                     route, %chain, %token, %vault_id, %amount_raw, %tx,

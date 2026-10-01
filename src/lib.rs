@@ -190,6 +190,13 @@ pub(crate) struct AppState {
     /// approval when the MAX grant is missing; the worker's deposit then
     /// reverts and its transfer needs a redrive.
     pub(crate) vault_deposit_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Serializes `capital vault-withdraw` and `capital vault-withdraw-usdc`
+    /// requests against each other, from before the decimals read until the
+    /// withdraw confirms. Both answer at the broadcast while the vault balance
+    /// is still unchanged, so without it a rerun on the strength of that
+    /// balance would withdraw a second time. The bot's own withdrawals (the
+    /// USDC transfer workers) do not take this lock.
+    pub(crate) vault_withdraw_lock: Arc<tokio::sync::Mutex<()>>,
     pub(crate) projection_maintenance: Arc<conductor::projection_pause::ProjectionMaintenance>,
     pub(crate) pnl_report_admission: dashboard::pnl::PnlReportAdmission,
     pub(crate) pnl_ledger: Arc<dashboard::pnl::PnlLedger>,
@@ -349,6 +356,7 @@ async fn run_bot_session_inner(
         process_tx: process_tx_cell.clone(),
         resume_lock,
         vault_deposit_lock: Arc::new(tokio::sync::Mutex::new(())),
+        vault_withdraw_lock: Arc::new(tokio::sync::Mutex::new(())),
         projection_maintenance: projection_maintenance.clone(),
         pnl_report_admission: dashboard::pnl::pnl_report_admission(),
         pnl_ledger: pnl_ledger.clone(),

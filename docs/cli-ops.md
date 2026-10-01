@@ -323,13 +323,15 @@ first. Like the automatic rebalancer, it is also refused with `409` while a cash
 snapshot divergence is unresolved or the cash balance is restart tainted; retry
 once the inventory poller has cleared it. `capital vault-deposit` is refused
 with `409` while another `capital vault-deposit` runs, until that deposit
-confirms; the lock does not cover the bot's own transfer deposits.
-`capital transfer-usdc` and `capital cctp-bridge` both answer `503` while the
-Base or Ethereum signing wallet cannot be shown to pay gas: fund a wallet that
-is below its gas threshold, or retry if the message says its balance could not
-be read. `capital cctp-bridge` waits for neither Circle nor the burn's receipt:
-it returns the burn tx as soon as the burn is broadcast, and
-`debug cctp complete-mint` fetches the attestation and mints once Circle has
+confirms; the lock does not cover the bot's own transfer deposits. Likewise
+`capital vault-withdraw` and `capital vault-withdraw-usdc` share one lock:
+either is refused with `409` while the other, or a rerun of itself, runs, until
+that withdraw confirms. `capital transfer-usdc` and `capital cctp-bridge` both
+answer `503` while the Base or Ethereum signing wallet cannot be shown to pay
+gas: fund a wallet that is below its gas threshold, or retry if the message says
+its balance could not be read. `capital cctp-bridge` waits for neither Circle
+nor the burn's receipt: it returns the burn tx as soon as the burn is broadcast,
+and `debug cctp complete-mint` fetches the attestation and mints once Circle has
 attested it.
 
 After answering, the bot keeps the recovery lock and the driver pause until the
@@ -370,12 +372,10 @@ before retrying. When the allowance is short, `capital vault-deposit` first
 approves and waits for the approve to confirm, so a deposit of a token without
 the startup MAX grant can still time out on a chain that needs many
 confirmations. The answer comes before the onchain effect: the vault balance or
-the allowance changes only once the tx confirms. A rerun before that sends a
-second tx: `capital vault-withdraw` and `capital vault-withdraw-usdc` withdraw
-again, and `capital reset-allowance` sends a redundant `approve(0)`.
-`capital vault-deposit` answers `409` until its deposit confirms. Wait for the
-confirmed line with the answered tx before rerunning a verb or reading the new
-balance.
+the allowance changes only once the tx confirms. A rerun of a vault verb before
+that answers `409`, so it cannot withdraw or deposit twice; retry once the
+confirmed line for the answered tx shows up. A rerun of
+`capital reset-allowance` sends a redundant `approve(0)`, which moves no funds.
 
 A request that times out on the client may still complete in the bot; check the
 bot logs and the chain for the transaction before retrying a vault or allowance

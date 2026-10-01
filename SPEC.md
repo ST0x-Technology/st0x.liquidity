@@ -6655,11 +6655,14 @@ effect rather than a generic intent:
   without the startup MAX grant could overwrite each other's approval. The lock
   covers these requests only: without the MAX grant, a request can still use up
   the exact approval of a USDC transfer worker's deposit, which then reverts and
-  needs a redrive. Every capital route refuses with `503` until startup
-  completes, like `process-tx`, since the startup preflights (each chain's id,
-  the inventory `OPERATOR_ROLE`) have not passed before then. Each route that
-  sends a transaction runs it on a tracked detached task, like `process-tx`, so
-  a client or load balancer timeout cannot drop a transaction between its
+  needs a redrive. `vault-withdraw` and `vault-withdraw-usdc` share a withdraw
+  lock of their own (`409` while either runs), held until the withdraw confirms,
+  for the rerun reason below; it does not cover the bot's own transfer
+  withdrawals. Every capital route refuses with `503` until startup completes,
+  like `process-tx`, since the startup preflights (each chain's id, the
+  inventory `OPERATOR_ROLE`) have not passed before then. Each route that sends
+  a transaction runs it on a tracked detached task, like `process-tx`, so a
+  client or load balancer timeout cannot drop a transaction between its
   broadcast and its receipt, graceful shutdown waits for it, and the task logs
   its own outcome. The vault verbs and `reset-allowance` answer at the broadcast
   like `cctp-bridge`, with the same response bodies, since the tx hash, the raw
@@ -6670,15 +6673,17 @@ effect rather than a generic intent:
   or prod today, so that cost applies once Ethereum gets one. The task then
   awaits the confirmation and logs the outcome with the tx hash, so a tx that
   reverts or drops after the answer shows only in the bot logs. The answer also
-  comes before the onchain effect, so a rerun before the confirmation sends a
-  second tx: a second withdraw, or a redundant `approve(0)`. `vault-deposit`
-  holds its lock until the deposit confirms, so its rerun answers `409` until
-  then, and when the allowance is short it still awaits the approve's
-  confirmation before it broadcasts the deposit, so only a deposit of a token
-  without the startup MAX grant can still outlast the cut. The tokenization and
-  issuer verbs (`transfer-equity`, `wrap-equity`, `unwrap-equity`,
-  `donate-equity`, `dividend-bump`) have no route: they touch tokenization and
-  the issuer wallet, not liquidity capital.
+  comes before the onchain effect, so the vault balance has not moved yet. The
+  vault verbs hold their lock until their tx confirms, so a rerun of
+  `vault-deposit`, `vault-withdraw`, or `vault-withdraw-usdc` answers `409`
+  until then instead of sending a second tx. A rerun of `reset-allowance` still
+  sends a redundant `approve(0)`, which moves no funds. When the allowance is
+  short `vault-deposit` still awaits the approve's confirmation before it
+  broadcasts the deposit, so only a deposit of a token without the startup MAX
+  grant can still outlast the cut. The tokenization and issuer verbs
+  (`transfer-equity`, `wrap-equity`, `unwrap-equity`, `donate-equity`,
+  `dividend-bump`) have no route: they touch tokenization and the issuer wallet,
+  not liquidity capital.
 - **`transfer resume --kind usdc` routes through the running bot.** The CLI
   posts to `POST /transfers/usdc/resume/{direction}/{id}`. The endpoint
   validates server-side (unknown id refuses -- a mistyped id must never start a

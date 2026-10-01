@@ -425,14 +425,13 @@ pub(crate) enum Capital {
     /// Withdraw tokens from a Raindex vault to the bot's wallet, resolving
     /// token decimals from onchain metadata. Returns the withdraw tx as soon
     /// as it is broadcast; the bot confirms it afterwards and logs the
-    /// outcome. Not idempotent: a rerun withdraws again, even while the first
-    /// withdraw is still unconfirmed.
+    /// outcome. A rerun, or a `vault-withdraw-usdc`, answers 409 until it
+    /// confirms.
     VaultWithdraw(VaultArgs),
     /// Withdraw the chain's settlement stable (USDC, or USDG on Robinhood)
     /// from its configured Raindex cash vault. Returns the withdraw tx as
     /// soon as it is broadcast; the bot confirms it afterwards and logs the
-    /// outcome. Not idempotent: a rerun withdraws again, even while the first
-    /// withdraw is still unconfirmed.
+    /// outcome. A rerun, or a `vault-withdraw`, answers 409 until it confirms.
     VaultWithdrawUsdc {
         /// Amount of the settlement stable to withdraw, as a decimal.
         #[arg(short = 'a', long, allow_negative_numbers = true)]
