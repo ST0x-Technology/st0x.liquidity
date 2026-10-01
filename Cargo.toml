@@ -145,7 +145,7 @@ wasm-bindgen = "=0.2.122"
 
 [workspace.dependencies.st0x-event-sorcery]
 git = "https://github.com/ST0x-Technology/event-sorcery.git"
-tag = "v0.3.0"
+tag = "v0.3.1"
 package = "event-sorcery"
 
 [patch."https://github.com/rainlanguage/rain.math.float"]
