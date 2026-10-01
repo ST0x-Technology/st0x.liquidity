@@ -4142,7 +4142,8 @@ impl RebalancingService {
     /// Reserves `symbol` for the planned `direction`. A redemption brings the
     /// broker shares, so it also carries how many shares the broker can sell
     /// today: the Position then admits it over a due sell hedge that the
-    /// broker cannot fill, which otherwise waits for this very redemption.
+    /// broker can place none of, which otherwise waits for this very
+    /// redemption.
     /// With no broker reading the capacity is unknown, so the redemption keeps
     /// the strict rule.
     async fn try_reserve_equity_transfer(
@@ -33218,14 +33219,15 @@ mod tests {
             .unwrap();
     }
 
-    /// The production deadlock: the broker holds one share, so the due sell
-    /// hedge of 50 cannot fill, and the over-target vault's redemption is what
-    /// brings the broker those shares.
+    /// The production deadlock: the broker holds no share above its floor, so
+    /// it can place none of the due sell hedge of 50, and the over-target
+    /// vault's redemption is what brings the broker those shares. (A broker
+    /// that can sell some places that partial hedge first.)
     #[tokio::test]
     async fn equity_check_redeems_to_fund_a_sell_hedge_the_broker_cannot_fill() {
         let symbol = Symbol::new("AAPL").unwrap();
         let inventory = InventoryView::default()
-            .with_equity(symbol.clone(), shares(80), shares(1))
+            .with_equity(symbol.clone(), shares(80), shares(0))
             .with_usdc(usdc(1_000_000), usdc(1_000_000));
         let trigger = make_trigger_with_inventory_and_registry(inventory, &symbol).await;
         acknowledge_onchain_buy(&trigger, &symbol, 50).await;

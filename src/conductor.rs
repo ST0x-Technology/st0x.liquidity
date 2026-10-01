@@ -3563,7 +3563,8 @@ fn spawn_rebalancing_infrastructure<Signer: Wallet + Clone>(
         // A symbol that declined for want of a price is checked again once its
         // mark arrives; nothing else wakes it while balances are unchanged.
         deps.equity_prices
-            .notify_marks_to(rebalancing_service.clone() as Arc<dyn MarkListener>);
+            .notify_marks_to(rebalancing_service.clone() as Arc<dyn MarkListener>)
+            .await;
         attach_manifest_handles(
             &rebalancing_service,
             &built,
