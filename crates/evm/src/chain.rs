@@ -119,6 +119,17 @@ impl Chain {
         }
     }
 
+    /// The name Relay gives this chain in a quote's order (`chainId` on the
+    /// order output, payment details and refunds). `Some` exactly where
+    /// [`Self::relay_depository`] is.
+    pub const fn relay_name(self) -> Option<&'static str> {
+        match self {
+            Self::Ethereum => Some("ethereum"),
+            Self::Robinhood => Some("robinhood"),
+            Self::Base | Self::HyperEvm => None,
+        }
+    }
+
     /// The fastest block cadence to expect on this chain. A time span turned
     /// into blocks with it over-covers the span when blocks come slower.
     pub const fn min_block_interval(self) -> Duration {
@@ -336,6 +347,16 @@ mod tests {
                 None,
                 Some(address!("0x4cd00e387622c35bddb9b4c962c136462338bc31")),
             ]
+        );
+    }
+
+    /// Quote checks compare these to the order's chain names, so they are
+    /// asserted as literals, as Relay spelled them in live quotes.
+    #[test]
+    fn relay_names_are_pinned_literals() {
+        assert_eq!(
+            Chain::ALL.map(Chain::relay_name),
+            [None, Some("ethereum"), None, Some("robinhood")]
         );
     }
 
