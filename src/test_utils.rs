@@ -1004,6 +1004,12 @@ mod held_receipt {
         Panic,
         /// Fails with a revert, as a confirmation that does not land.
         Fail,
+        /// Fails with a receipt timeout, as a confirmation whose outcome is
+        /// still unknown: the tx may yet land.
+        TimeOut,
+        /// Fails with a formal JSON-RPC error reply, as a receipt poll that a
+        /// struggling node answers with an error: the tx's fate is unknown.
+        RpcError,
     }
 
     /// Delegates to the wrapped wallet, except that `await_receipt` waits
@@ -1115,6 +1121,17 @@ mod held_receipt {
                     panic!("HeldReceiptWallet panics at the receipt of {tx_hash}")
                 }
                 ReceiptGate::Fail => Err(EvmError::Reverted { tx_hash }),
+                ReceiptGate::TimeOut => Err(EvmError::ReceiptTimeout {
+                    tx_hash,
+                    timeout_secs: 0,
+                }),
+                ReceiptGate::RpcError => Err(EvmError::Transport(
+                    alloy::transports::RpcError::ErrorResp(alloy::rpc::json_rpc::ErrorPayload {
+                        code: -32603,
+                        message: "internal error".into(),
+                        data: None,
+                    }),
+                )),
                 ReceiptGate::Held => unreachable!("wait_for returned a held gate"),
             }
         }

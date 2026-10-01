@@ -181,7 +181,9 @@ pub(crate) struct AppState {
     pub(crate) process_tx: Arc<tokio::sync::OnceCell<api::ProcessTxHandle>>,
     pub(crate) resume_lock: Arc<api::ResumeLock>,
     /// Serializes `capital vault-deposit` requests against each other, and
-    /// nothing else, from the allowance read until the deposit confirms.
+    /// nothing else, from before the decimals read until the deposit's fate is proven
+    /// (confirmed, reverted, or dropped), or until a restart after a panic
+    /// while confirming; see `vault_withdraw_lock`.
     /// `Raindex::submit_deposit` reads the allowance, approves exactly the
     /// amount when it is short, then deposits, so two concurrent
     /// requests for a token without the startup MAX grant could overwrite each
@@ -192,10 +194,13 @@ pub(crate) struct AppState {
     pub(crate) vault_deposit_lock: Arc<tokio::sync::Mutex<()>>,
     /// Serializes `capital vault-withdraw` and `capital vault-withdraw-usdc`
     /// requests against each other, from before the decimals read until the
-    /// withdraw confirms. Both answer at the broadcast while the vault balance
-    /// is still unchanged, so without it a rerun on the strength of that
-    /// balance would withdraw a second time. The bot's own withdrawals (the
-    /// USDC transfer workers) do not take this lock.
+    /// withdraw's fate is proven (confirmed, reverted, or dropped), or until a
+    /// restart after a panic while confirming. A failed send frees it, since
+    /// its error cannot tell whether the tx went out. Both answer at the
+    /// broadcast, often before the vault balance moves, so without it a rerun
+    /// on the strength of that balance would withdraw a second time. It lives
+    /// in memory, so a restart frees it. The bot's own
+    /// withdrawals (the USDC transfer workers) do not take this lock.
     pub(crate) vault_withdraw_lock: Arc<tokio::sync::Mutex<()>>,
     pub(crate) projection_maintenance: Arc<conductor::projection_pause::ProjectionMaintenance>,
     pub(crate) pnl_report_admission: dashboard::pnl::PnlReportAdmission,

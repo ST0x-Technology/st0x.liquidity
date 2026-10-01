@@ -24,6 +24,7 @@ use alloy::providers::RootProvider;
 use axum::Json;
 use axum::extract::State;
 use axum::http::StatusCode;
+use futures_util::FutureExt as _;
 use rain_math_float::Float;
 use serde::{Deserialize, Serialize};
 use tracing::{error, info, warn};
@@ -35,7 +36,7 @@ use st0x_config::{HedgedChain, OnchainWalletCtx};
 use st0x_evm::{Chain, Evm, IERC20, OpenChainErrorRegistry, Wallet};
 use st0x_finance::{HasZero, Positive, Usdc};
 use st0x_float_serde::format_float_with_fallback;
-use st0x_raindex::{Raindex, RaindexService, RaindexVaultId, RevokeOutcome};
+use st0x_raindex::{Raindex, RaindexError, RaindexService, RaindexVaultId, RevokeOutcome};
 
 use super::{
     CctpSourceChain, ErrorResponse, OpsError, UsdcDriverPauseRequest, answer_from_detached,
@@ -804,6 +805,11 @@ struct VaultOutcome {
     tx: TxHash,
 }
 
+/// How long a vault route waits before it awaits its tx's confirmation again
+/// after an inconclusive outcome (a receipt timeout or an RPC failure). The
+/// graceful shutdown drain has its own timeout, so the wait never blocks exit.
+const VAULT_CONFIRM_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// Reads the token's decimals, scales the amount to the token's smallest unit
 /// like the CLI's `float_to_u256`, and runs the operation through the chain's
 /// `RaindexService`, built from the bot's signer like the startup revoke. The
@@ -813,8 +819,9 @@ struct VaultOutcome {
 /// Answers as soon as the vault transaction is broadcast, like `cctp_bridge`:
 /// the chain's required confirmations (12 on Ethereum in production) outlast
 /// the 60 second load balancer cut. The task then awaits the confirmation
-/// through `Raindex::confirm_tx`, as the USDC transfer worker does
-/// after its own `submit_deposit`, and logs the outcome. A deposit still
+/// through `Raindex::confirm_tx`, as the USDC transfer worker does after its
+/// own `submit_deposit`, waits again while the outcome is inconclusive, and
+/// logs the outcome. The verb's lock is held until then. A deposit still
 /// awaits its approve's confirmation before the broadcast when the allowance
 /// is short, so only a deposit of a token without the startup MAX grant can
 /// still wait that long.
@@ -838,17 +845,23 @@ async fn run_vault_operation(
     } = target;
     let route = operation.route();
 
-    // Each vault verb holds its lock from before its first read until its tx
-    // confirms, inside the task so a dropped request cannot release it early;
-    // see `AppState::vault_deposit_lock` and `AppState::vault_withdraw_lock`.
+    // Each vault verb holds its lock from before its first read until its tx's
+    // fate is proven (confirmed, reverted, or dropped), inside the task so a
+    // dropped request cannot release it early; see `AppState::vault_deposit_lock`
+    // and `AppState::vault_withdraw_lock`. A panic while confirming leaves the
+    // fate unknown, so it keeps the lock until a restart. A failed send frees
+    // it, like `st0x-cli`: its error cannot tell whether the tx went out, which
+    // `onchain_failure` tells the operator to check before retrying.
     let (lock, refusal) = match operation {
         VaultOperation::Deposit => (
             Arc::clone(&state.vault_deposit_lock),
-            "Another vault deposit is in progress; retry once it finishes",
+            "Another vault deposit is in progress or its outcome is unknown; check the bot \
+             logs for it before retrying",
         ),
         VaultOperation::Withdraw | VaultOperation::WithdrawUsdc => (
             Arc::clone(&state.vault_withdraw_lock),
-            "Another vault withdrawal is in progress; retry once it finishes",
+            "Another vault withdrawal is in progress or its outcome is unknown; check the bot \
+             logs for it before retrying",
         ),
     };
     answer_from_detached(&state.detached_tasks, route, token, async move {
@@ -889,18 +902,52 @@ async fn run_vault_operation(
         info!(route, %chain, %token, %vault_id, %amount_raw, %tx, "Vault operation broadcast via API");
 
         let confirm = async move {
-            // The vault lock stays held until the tx confirms.
-            let _vault_guard = vault_guard;
-            match raindex.confirm_tx(tx).await {
-                Ok(()) => info!(
-                    route, %chain, %token, %vault_id, %amount_raw, %tx,
-                    "Vault operation confirmed via API"
-                ),
-                Err(error) => error!(
-                    route, %chain, %token, %vault_id, %amount_raw, %tx, ?error,
-                    "Vault operation broadcast via API did not confirm; check the tx onchain \
-                     before retrying"
-                ),
+            let wait = async {
+                loop {
+                    match raindex.confirm_tx(tx).await {
+                        Ok(()) => {
+                            info!(
+                                route, %chain, %token, %vault_id, %amount_raw, %tx,
+                                "Vault operation confirmed via API"
+                            );
+                            return;
+                        }
+                        Err(error) if proves_vault_tx_failed(&error) => {
+                            error!(
+                                route, %chain, %token, %vault_id, %amount_raw, %tx, ?error,
+                                "Vault operation broadcast via API did not confirm"
+                            );
+                            return;
+                        }
+                        // A receipt timeout or any RPC failure proves nothing:
+                        // the tx can still land, and releasing the lock would
+                        // let a rerun send a second one.
+                        Err(error) => {
+                            warn!(
+                                route, %chain, %token, %vault_id, %amount_raw, %tx, ?error,
+                                "Vault operation broadcast via API is not confirmed yet; keeping \
+                                 its lock and waiting again"
+                            );
+                            tokio::time::sleep(VAULT_CONFIRM_RETRY_DELAY).await;
+                        }
+                    }
+                }
+            };
+            // A panic would unwind through the guard and free the lock while
+            // the tx's fate is unknown, so it is caught here, the guard is
+            // kept until a restart, and the panic resumes for the watcher's
+            // join failure log.
+            match std::panic::AssertUnwindSafe(wait).catch_unwind().await {
+                Ok(()) => drop(vault_guard),
+                Err(panic) => {
+                    error!(
+                        route, %chain, %token, %vault_id, %amount_raw, %tx,
+                        "Vault operation confirmation panicked; keeping its lock until a \
+                         restart. Check the tx onchain before retrying"
+                    );
+                    std::mem::forget(vault_guard);
+                    std::panic::resume_unwind(panic);
+                }
             }
         };
         let outcome = VaultOutcome {
@@ -911,6 +958,24 @@ async fn run_vault_operation(
         Ok::<_, OpsError>((outcome, confirm))
     })
     .await
+}
+
+/// Whether a vault tx's confirmation error proves the tx failed for good:
+/// it reverted (including a decoded `InsufficientVaultLiquidity`) or was
+/// dropped from the mempool. Every other error leaves its fate unknown.
+fn proves_vault_tx_failed(error: &RaindexError) -> bool {
+    match error {
+        RaindexError::Evm(evm) => evm.is_revert() || evm.is_transaction_dropped(),
+        RaindexError::InsufficientVaultLiquidity { .. } => true,
+        RaindexError::Contract(_)
+        | RaindexError::Float(_)
+        | RaindexError::ZeroAmount
+        | RaindexError::RpcTransport(_)
+        | RaindexError::SolType(_)
+        | RaindexError::ScanInconclusive { .. }
+        | RaindexError::ScanAnomalousLog { .. }
+        | RaindexError::MissingOperatorRole { .. } => false,
+    }
 }
 
 /// Records an onchain failure inside a capital route's detached task, where

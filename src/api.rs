@@ -4085,6 +4085,11 @@ where
     Confirm: Future<Output = ()> + Send + 'static,
 {
     let (answer, answered) = tokio::sync::oneshot::channel();
+    // Held until the watcher is spawned too, as `spawn_detached` holds its own
+    // across its spawn: otherwise a worker that ends at once could leave the
+    // tracker empty for a shutdown drain to return before the watcher exists,
+    // and a panic's join failure log would be lost.
+    let admission = detached_tasks.token();
     let worker = spawn_detached(detached_tasks, operation, subject, async move {
         // A dropped request has no receiver left, so a failed send is fine.
         match broadcast.await {
@@ -4100,6 +4105,7 @@ where
     detached_tasks.spawn(async move {
         let _joined = worker.await;
     });
+    drop(admission);
 
     match answered.await {
         Ok(answer) => answer,
@@ -8514,7 +8520,8 @@ mod tests {
         assert_eq!(status, StatusCode::CONFLICT);
         assert_eq!(
             body.error,
-            "Another vault deposit is in progress; retry once it finishes"
+            "Another vault deposit is in progress or its outcome is unknown; check the bot \
+             logs for it before retrying"
         );
     }
 
@@ -8546,7 +8553,8 @@ mod tests {
         assert_eq!(status, StatusCode::CONFLICT);
         assert_eq!(
             body.error,
-            "Another vault withdrawal is in progress; retry once it finishes"
+            "Another vault withdrawal is in progress or its outcome is unknown; check the bot \
+             logs for it before retrying"
         );
     }
 
@@ -8739,9 +8747,10 @@ mod tests {
     }
 
     /// After a deposit, a partial withdraw answers with its tx at the
-    /// broadcast, a rerun of it refuses with 409 until that withdraw confirms
-    /// (the vault balance has not moved yet), and exactly the reported raw
-    /// amount returns from the vault to the bot's wallet, once.
+    /// broadcast, a rerun of it refuses with 409 while the bot still waits for
+    /// that withdraw's receipt (the gate holds the wait; Anvil has already
+    /// mined it), and exactly the reported raw amount returns from the vault
+    /// to the bot's wallet, once.
     #[tokio::test]
     async fn vault_withdraw_moves_the_scaled_amount_back_to_the_bots_wallet() {
         let chain = AnvilRaindexChain::deploy().await;
@@ -8780,7 +8789,8 @@ mod tests {
         assert_eq!(status, StatusCode::CONFLICT);
         assert_eq!(
             rerun.error,
-            "Another vault withdrawal is in progress; retry once it finishes"
+            "Another vault withdrawal is in progress or its outcome is unknown; check the bot \
+             logs for it before retrying"
         );
         confirm_after_the_answer(&state, &gate).await;
         let Ok(_released) = state.vault_withdraw_lock.try_lock() else {
@@ -9053,6 +9063,119 @@ mod tests {
             Ok(())
         });
         assert!(!logs_contain("confirmed via API"));
+    }
+
+    /// Deposits into a vault, then withdraws from it with the receipt gate
+    /// set to `gate`, waits until `outcome_logged` sees the confirmation's
+    /// outcome, and returns the refusal of an immediate rerun of the same
+    /// withdraw. Panics if the rerun is not refused.
+    async fn rerun_after_withdraw_outcome(
+        gate: ReceiptGate,
+        outcome_logged: impl Fn() -> bool + Send + Sync,
+    ) -> (StatusCode, ErrorResponse) {
+        let chain = AnvilRaindexChain::deploy().await;
+        let supply = U256::from(1_000_u64) * U256::from(10_u64).pow(U256::from(18_u64));
+        let token = chain.deploy_bot_token(18, supply).await;
+        let vault_id = B256::with_last_byte(4);
+        let (ctx, receipts) = capital_ctx_on(&chain);
+        let state = empty_app_state(ctx).await;
+        state.health.set_ready();
+        capital_success(
+            "vault-deposit",
+            capital::vault_deposit(
+                State(state.clone()),
+                capital_request(vault_request(token, vault_id, "1.5")),
+            )
+            .await,
+        );
+        confirm_after_the_answer(&state, &receipts).await;
+        receipts.send_replace(gate);
+
+        capital_success(
+            "vault-withdraw",
+            capital::vault_withdraw(
+                State(state.clone()),
+                capital_request(vault_request(token, vault_id, "0.25")),
+            )
+            .await,
+        );
+        // Wait until the task has handled the gate's outcome, whichever way,
+        // so the rerun below is what decides the test.
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !outcome_logged() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the confirmation must reach an outcome");
+
+        let Err((status, Json(rerun))) = capital::vault_withdraw(
+            State(state.clone()),
+            capital_request(vault_request(token, vault_id, "0.25")),
+        )
+        .await
+        else {
+            panic!("a rerun before the withdraw's fate is proven must not withdraw again");
+        };
+        (status, rerun)
+    }
+
+    fn assert_withdraw_lock_refusal((status, refusal): (StatusCode, ErrorResponse)) {
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(
+            refusal.error,
+            "Another vault withdrawal is in progress or its outcome is unknown; check the bot \
+             logs for it before retrying"
+        );
+    }
+
+    /// A receipt timeout does not prove the withdraw failed: the tx can still
+    /// land. The route keeps the withdraw lock and waits again, so a rerun
+    /// still answers 409 instead of broadcasting a second withdraw.
+    #[tracing_test::traced_test]
+    #[tokio::test]
+    async fn a_withdraw_whose_receipt_times_out_keeps_its_lock() {
+        let refusal = rerun_after_withdraw_outcome(ReceiptGate::TimeOut, || {
+            logs_contain("is not confirmed yet") || logs_contain("did not confirm")
+        })
+        .await;
+
+        assert_withdraw_lock_refusal(refusal);
+        assert!(!logs_contain(
+            "Vault operation broadcast via API did not confirm"
+        ));
+    }
+
+    /// A formal JSON-RPC error reply to the receipt poll proves nothing about
+    /// the tx either, so it keeps the lock like a timeout does.
+    #[tracing_test::traced_test]
+    #[tokio::test]
+    async fn a_withdraw_whose_receipt_poll_errors_keeps_its_lock() {
+        let refusal = rerun_after_withdraw_outcome(ReceiptGate::RpcError, || {
+            logs_contain("is not confirmed yet") || logs_contain("did not confirm")
+        })
+        .await;
+
+        assert_withdraw_lock_refusal(refusal);
+        assert!(!logs_contain(
+            "Vault operation broadcast via API did not confirm"
+        ));
+    }
+
+    /// A panic while confirming leaves the tx's fate unknown, so the lock is
+    /// kept until a restart and the panic still reaches the join failure log.
+    #[tracing_test::traced_test]
+    #[tokio::test]
+    async fn a_withdraw_whose_confirmation_panics_keeps_its_lock() {
+        let refusal = rerun_after_withdraw_outcome(ReceiptGate::Panic, || {
+            logs_contain("vault-withdraw worker task failed")
+        })
+        .await;
+
+        assert_withdraw_lock_refusal(refusal);
+        assert!(logs_contain(
+            "Vault operation confirmation panicked; keeping its lock until a restart"
+        ));
     }
 
     /// End to end against CCTP V2 deployed on two Anvil nodes, reached

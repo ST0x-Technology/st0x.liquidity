@@ -6656,34 +6656,43 @@ effect rather than a generic intent:
   covers these requests only: without the MAX grant, a request can still use up
   the exact approval of a USDC transfer worker's deposit, which then reverts and
   needs a redrive. `vault-withdraw` and `vault-withdraw-usdc` share a withdraw
-  lock of their own (`409` while either runs), held until the withdraw confirms,
-  for the rerun reason below; it does not cover the bot's own transfer
-  withdrawals. Every capital route refuses with `503` until startup completes,
-  like `process-tx`, since the startup preflights (each chain's id, the
-  inventory `OPERATOR_ROLE`) have not passed before then. Each route that sends
-  a transaction runs it on a tracked detached task, like `process-tx`, so a
-  client or load balancer timeout cannot drop a transaction between its
-  broadcast and its receipt, graceful shutdown waits for it, and the task logs
-  its own outcome. The vault verbs and `reset-allowance` answer at the broadcast
-  like `cctp-bridge`, with the same response bodies, since the tx hash, the raw
-  amount and the decimals are all known before the send: the 12 confirmations
-  production requires on Ethereum take about two and a half minutes, longer than
-  the load balancer cut. These verbs refuse a chain without a
-  `[chains.<name>.trading]` table with `400`, and Ethereum has none in staging
+  lock of their own (`409` while either runs), held until the outcome of the tx
+  it answered with is known, for the rerun reason below; it does not cover the
+  bot's own transfer withdrawals. Every capital route refuses with `503` until
+  startup completes, like `process-tx`, since the startup preflights (each
+  chain's id, the inventory `OPERATOR_ROLE`) have not passed before then. Each
+  route that sends a transaction runs it on a tracked detached task, like
+  `process-tx`, so a client or load balancer timeout cannot drop a transaction
+  between its broadcast and its receipt, graceful shutdown waits for it, and the
+  task logs its own outcome. The vault verbs and `reset-allowance` answer at the
+  broadcast like `cctp-bridge`, with the same response bodies, since the tx
+  hash, the raw amount and the decimals are all known before the send: the 12
+  confirmations production requires on Ethereum take about two and a half
+  minutes, longer than the load balancer cut. These verbs refuse a chain without
+  a `[chains.<name>.trading]` table with `400`, and Ethereum has none in staging
   or prod today, so that cost applies once Ethereum gets one. The task then
   awaits the confirmation and logs the outcome with the tx hash, so a tx that
-  reverts or drops after the answer shows only in the bot logs. The answer also
-  comes before the onchain effect, so the vault balance has not moved yet. The
-  vault verbs hold their lock until their tx confirms, so a rerun of
+  reverts or drops after the answer shows only in the bot logs. The answer does
+  not wait for the onchain effect, so the vault balance may not have moved yet
+  when it arrives (or may have, if the tx was included quickly). The vault verbs
+  hold their lock until their tx's fate is proven: it confirms, reverts, or is
+  dropped. Any other confirmation error (a receipt timeout, a transport failure,
+  a JSON-RPC error reply) proves none of those, so the task keeps the lock and
+  waits for the receipt again 30 seconds later; each wait can itself take up to
+  5 minutes for inclusion plus 30 minutes for the confirmations, so the lock can
+  stay held for hours. A panic while confirming leaves the fate unknown, so the
+  task keeps the lock until a restart. A failed send frees the lock and answers
+  `500`, like `st0x-cli`: its error cannot tell whether the tx went out, so the
+  operator checks onchain before a rerun. Until the lock is freed a rerun of
   `vault-deposit`, `vault-withdraw`, or `vault-withdraw-usdc` answers `409`
-  until then instead of sending a second tx. A rerun of `reset-allowance` still
-  sends a redundant `approve(0)`, which moves no funds. When the allowance is
-  short `vault-deposit` still awaits the approve's confirmation before it
-  broadcasts the deposit, so only a deposit of a token without the startup MAX
-  grant can still outlast the cut. The tokenization and issuer verbs
-  (`transfer-equity`, `wrap-equity`, `unwrap-equity`, `donate-equity`,
-  `dividend-bump`) have no route: they touch tokenization and the issuer wallet,
-  not liquidity capital.
+  instead of sending a second tx. The locks live in memory, so a restart frees
+  them. A rerun of `reset-allowance` still sends a redundant `approve(0)`, which
+  moves no funds. When the allowance is short `vault-deposit` still awaits the
+  approve's confirmation before it broadcasts the deposit, so only a deposit of
+  a token without the startup MAX grant can still outlast the cut. The
+  tokenization and issuer verbs (`transfer-equity`, `wrap-equity`,
+  `unwrap-equity`, `donate-equity`, `dividend-bump`) have no route: they touch
+  tokenization and the issuer wallet, not liquidity capital.
 - **`transfer resume --kind usdc` routes through the running bot.** The CLI
   posts to `POST /transfers/usdc/resume/{direction}/{id}`. The endpoint
   validates server-side (unknown id refuses -- a mistyped id must never start a
