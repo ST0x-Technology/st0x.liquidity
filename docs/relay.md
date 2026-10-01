@@ -199,10 +199,10 @@ chain, and serves both directions (`HopDirection::ToHub`, `FromHub`).
 
 `prepare_deposit` signs the approve and the deposit on the origin chain without
 broadcasting them, at consecutive nonces, and returns both
-`PreparedTransaction`s for the caller to persist. It refuses a step for another
-chain than the wallet's, a step that calls another contract than the origin's
-stable (approve) or depository (deposit), and a deposit that credits another
-depositor than the signing wallet.
+`PreparedTransaction`s (`PreparedSwap::Deposit`) for the caller to persist. It
+refuses a step for another chain than the wallet's, a step that calls another
+contract than the origin's stable (approve) or depository (deposit), and a
+deposit that credits another depositor than the signing wallet.
 
 - The approve is estimated and padded as usual. With no approve step in the
   quote, the bridge reads the allowance and signs its own exact
@@ -212,12 +212,17 @@ depositor than the signing wallet.
   funded test's deposits (49,083 on Ethereum), padded by the wallet to 85,671.
 
 Another send from the same wallet between the two signs takes the nonce in
-between, so `prepare_deposit` discards a pair whose nonces are not consecutive
-(deposit first, then approve) and refuses it with `PairNonces`.
-`broadcast_deposit` sends the approve and then the deposit, refusing such a pair
-again; a repeat sends the same bytes. `confirm_deposit` waits for the origin
-chain's confirmations and requires a `RelayErc20Deposit` from our wallet, in the
-origin stable, for the order id.
+between. Then `prepare_deposit` discards only the deposit and returns
+`PreparedSwap::ApproveOnly`: the caller persists the approve, sends it alone
+with `broadcast_approve` and prepares the deposit again. Discarding the approve
+too would leave its nonce as a gap that the other send waits behind and that a
+retry, rewound to it, splits again. An approve to our own pinned depository is
+harmless alone; the retry finds the allowance and signs only the deposit, or
+signs a fresh pair. `broadcast_deposit` sends the approve and then the deposit,
+refusing a pair that is not consecutive with `PairNonces`; a repeat sends the
+same bytes. `confirm_deposit` waits for the origin chain's confirmations and
+requires a `RelayErc20Deposit` from our wallet, in the origin stable, for the
+order id.
 
 `find_recent_deposits` scans the depository's logs from a captured
 `origin_block` in 10,000-block chunks, decodes each, and returns our deposits
