@@ -13,8 +13,8 @@ use std::process::ExitCode;
 
 use crate::auth::{AuthError, StaticToken, TokenSource};
 use crate::cli::{
-    Capital, Cctp, Cli, Command, Debug, EquityTransferKind, PortfolioSnapshot, Position, Read,
-    RebuildableView, RecheckTransferType, UsdcDirection, VaultArgs, View,
+    Capital, Cctp, Cli, Command, Debug, PortfolioSnapshot, Position, Read, RebuildableView,
+    RecheckTransferType, UsdcDirection, VaultArgs, View,
 };
 use crate::output::OutputError;
 use crate::target::Auth;
@@ -172,12 +172,25 @@ async fn dispatch<A: TokenSource + Sync>(
             );
             client.get(&path, &args.params).await?
         }
-        Command::Debug(Debug::Resume) => client.post("/transfers/resume", &[]).await?,
-        Command::Debug(Debug::Recheck {
+        Command::Debug(debug) => send_debug(client, debug).await?,
+        Command::Capital(capital) => dispatch_capital(client, capital).await?,
+    };
+    output::print(&value).map_err(ApiError::from)
+}
+
+/// Sends one operator write through the write prefix and returns the bot's
+/// response for `dispatch` to print.
+async fn send_debug<A: TokenSource + Sync>(
+    client: &Client<A>,
+    debug: Debug,
+) -> Result<serde_json::Value, TransportError> {
+    let value = match debug {
+        Debug::Resume => client.post("/transfers/resume", &[]).await?,
+        Debug::Recheck {
             kind,
             id,
             deposit_tx,
-        }) => {
+        } => {
             let kind = match kind {
                 RecheckTransferType::Mint => "equity_mint",
                 RecheckTransferType::Redemption => "equity_redemption",
@@ -189,7 +202,7 @@ async fn dispatch<A: TokenSource + Sync>(
                 .post(&format!("/transfers/recheck/{kind}/{id}"), &params)
                 .await?
         }
-        Command::Debug(Debug::ResumeUsdc { direction, id }) => {
+        Debug::ResumeUsdc { direction, id } => {
             let direction = match direction {
                 UsdcDirection::AlpacaToBase => "alpaca_to_base",
                 UsdcDirection::BaseToAlpaca => "base_to_alpaca",
@@ -199,11 +212,11 @@ async fn dispatch<A: TokenSource + Sync>(
                 .post(&format!("/transfers/usdc/resume/{direction}/{id}"), &[])
                 .await?
         }
-        Command::Debug(Debug::ReconcileUsdc {
+        Debug::ReconcileUsdc {
             id,
             reason,
             superseding_tx,
-        }) => {
+        } => {
             let id = encode_segment(&id);
             client
                 .post_json(
@@ -215,20 +228,41 @@ async fn dispatch<A: TokenSource + Sync>(
                 )
                 .await?
         }
-        Command::Debug(Debug::ReconcileEquity { kind, id, reason }) => {
-            let kind = match kind {
-                EquityTransferKind::Mint => "equity_mint",
-                EquityTransferKind::Redemption => "equity_redemption",
-            };
+        Debug::ReconcileEquity {
+            kind,
+            id,
+            reason,
+            superseding_tx,
+        } => {
+            let kind = kind.route_segment();
             let id = encode_segment(&id);
             client
                 .post_json(
                     &format!("/transfers/{kind}/{id}/reconcile"),
-                    &wire::ReconcileEquityRequest { reason },
+                    &wire::ReconcileEquityRequest {
+                        reason,
+                        superseding_tx,
+                    },
                 )
                 .await?
         }
-        Command::Debug(Debug::ClearPendingBurn { id, reason }) => {
+        Debug::AdoptWithdrawal {
+            id,
+            replacement_tx,
+            reason,
+        } => {
+            let id = encode_segment(&id);
+            client
+                .post_json(
+                    &format!("/transfers/equity_redemption/{id}/adopt-withdrawal"),
+                    &wire::AdoptWithdrawalRequest {
+                        reason,
+                        replacement_tx,
+                    },
+                )
+                .await?
+        }
+        Debug::ClearPendingBurn { id, reason } => {
             let id = encode_segment(&id);
             client
                 .post_json(
@@ -237,7 +271,7 @@ async fn dispatch<A: TokenSource + Sync>(
                 )
                 .await?
         }
-        Command::Debug(Debug::FailUsdcTransfer { id, reason }) => {
+        Debug::FailUsdcTransfer { id, reason } => {
             let id = encode_segment(&id);
             client
                 .post_json(
@@ -246,11 +280,8 @@ async fn dispatch<A: TokenSource + Sync>(
                 )
                 .await?
         }
-        Command::Debug(Debug::FailEquityTransfer { kind, id, reason }) => {
-            let kind = match kind {
-                EquityTransferKind::Mint => "equity_mint",
-                EquityTransferKind::Redemption => "equity_redemption",
-            };
+        Debug::FailEquityTransfer { kind, id, reason } => {
+            let kind = kind.route_segment();
             let id = encode_segment(&id);
             client
                 .post_json(
@@ -259,7 +290,7 @@ async fn dispatch<A: TokenSource + Sync>(
                 )
                 .await?
         }
-        Command::Debug(Debug::Position(Position::Set(args))) => {
+        Debug::Position(Position::Set(args)) => {
             let symbol = encode_segment(&args.symbol);
             client
                 .post_json(
@@ -272,7 +303,7 @@ async fn dispatch<A: TokenSource + Sync>(
                 )
                 .await?
         }
-        Command::Debug(Debug::Position(Position::ReleaseHedge(args))) => {
+        Debug::Position(Position::ReleaseHedge(args)) => {
             let symbol = encode_segment(&args.symbol);
             client
                 .post_json(
@@ -284,7 +315,7 @@ async fn dispatch<A: TokenSource + Sync>(
                 )
                 .await?
         }
-        Command::Debug(Debug::PortfolioSnapshot(PortfolioSnapshot::SetMark(args))) => {
+        Debug::PortfolioSnapshot(PortfolioSnapshot::SetMark(args)) => {
             client
                 .post_json(
                     "/portfolio-snapshot/marks",
@@ -299,14 +330,14 @@ async fn dispatch<A: TokenSource + Sync>(
                 )
                 .await?
         }
-        Command::Debug(Debug::ProcessTx { tx_hash, chain }) => {
+        Debug::ProcessTx { tx_hash, chain } => {
             let tx_hash = encode_segment(&tx_hash);
             let params = optional_query("chain", chain.map(|chain| chain.wire_name().to_owned()));
             client
                 .post(&format!("/transactions/{tx_hash}/process"), &params)
                 .await?
         }
-        Command::Debug(Debug::View(View::Rebuild(args))) => {
+        Debug::View(View::Rebuild(args)) => {
             let view = match args.view {
                 RebuildableView::Position => "position",
                 RebuildableView::OffchainOrder => "offchain-order",
@@ -326,10 +357,10 @@ async fn dispatch<A: TokenSource + Sync>(
                 )
                 .await?
         }
-        Command::Debug(Debug::Cctp(Cctp::CompleteMint {
+        Debug::Cctp(Cctp::CompleteMint {
             burn_tx,
             source_chain,
-        })) => {
+        }) => {
             client
                 .post_json(
                     "/cctp/complete-mint",
@@ -340,14 +371,12 @@ async fn dispatch<A: TokenSource + Sync>(
                 )
                 .await?
         }
-        Command::Capital(capital) => dispatch_capital(client, capital).await?,
     };
-    output::print(&value).map_err(ApiError::from)
+    Ok(value)
 }
 
-/// Sends one `capital` verb and returns the bot's response for `dispatch` to
-/// print. Split out of `dispatch` only to keep that function under clippy's
-/// `too_many_lines` threshold; failures take the same `ApiError` path.
+/// Sends one `capital` verb through the write prefix and returns the bot's
+/// response for `dispatch` to print, like `send_debug` for the debug verbs.
 async fn dispatch_capital<A: TokenSource + Sync>(
     client: &Client<A>,
     capital: Capital,
@@ -676,6 +705,7 @@ mod tests {
             kind: EquityTransferKind::Redemption,
             id: "abc".to_owned(),
             reason: "settled by hand".to_owned(),
+            superseding_tx: None,
         }))
         .await?;
         assert_eq!(
@@ -685,6 +715,53 @@ mod tests {
         assert_eq!(
             request_body(&request),
             serde_json::json!({ "reason": "settled by hand" })
+        );
+        Ok(())
+    }
+
+    /// A redemption's superseding tx travels as the camelCase `supersedingTx`
+    /// the bot's equity reconcile body reads.
+    #[tokio::test]
+    async fn reconcile_equity_sends_the_superseding_tx_when_given()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let request = request_for(Command::Debug(Debug::ReconcileEquity {
+            kind: EquityTransferKind::Redemption,
+            id: "abc".to_owned(),
+            reason: "cancelled at its nonce".to_owned(),
+            superseding_tx: Some("0xcancel".to_owned()),
+        }))
+        .await?;
+        assert_eq!(
+            request_body(&request),
+            serde_json::json!({
+                "reason": "cancelled at its nonce",
+                "supersedingTx": "0xcancel",
+            })
+        );
+        Ok(())
+    }
+
+    /// The adopt route takes the redemption id in the path and the replacement
+    /// as the camelCase `replacementTx` the bot's body reads.
+    #[tokio::test]
+    async fn adopt_withdrawal_posts_the_replacement_and_reason()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let request = request_for(Command::Debug(Debug::AdoptWithdrawal {
+            id: "abc".to_owned(),
+            replacement_tx: "0xspeedup".to_owned(),
+            reason: "wallet sped up the withdrawal".to_owned(),
+        }))
+        .await?;
+        assert_eq!(
+            request_line(&request),
+            "POST /liquidity-write/transfers/equity_redemption/abc/adopt-withdrawal HTTP/1.1"
+        );
+        assert_eq!(
+            request_body(&request),
+            serde_json::json!({
+                "reason": "wallet sped up the withdrawal",
+                "replacementTx": "0xspeedup",
+            })
         );
         Ok(())
     }

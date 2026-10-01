@@ -3087,6 +3087,22 @@ enum TriggerReason {
   reservation exists, and the current net position is below the hedge threshold.
   A nonzero position whose dollar threshold cannot be valued is rejected
   fail-closed.
+- One exception to the hedge threshold: a redemption is admitted over a due sell
+  hedge that the broker cannot fill. The trigger passes the broker's sell
+  capacity, counted as the broker counts it for an asset it trades only in whole
+  shares: available shares truncated to whole shares, less the hedge floor
+  rounded up to whole shares. That count is never above what the broker would
+  sell, so a starved hedge always reads as starved. The aggregate admits the
+  redemption when the count is below the live net. The redemption brings the
+  broker the shares that sell needs, so blocking it would leave both waiting on
+  each other. The hedge still waits for the reservation to release. A mint, a
+  buy hedge, or a sell the broker can fill keeps the strict rule. A redemption
+  that released its reservation to wait for gas restores it under the same
+  exception. With no broker reading the capacity is unknown, not zero: the
+  trigger reserves under the strict rule and a restoring job waits and retries.
+  A job reads the capacity only to recreate a missing reservation, so one that
+  still holds its reservation never depends on that read, and a failed read
+  defers the job instead of failing it.
 - `PlaceOffChainOrder` is rejected while any transfer reservation owns the
   symbol. A newly committed onchain fill invalidates an unconfirmed reservation;
   confirmation of that exact ID must succeed immediately before the transfer job
@@ -3583,6 +3599,8 @@ Arc<dyn Tokenizer>, wrapper: Arc<dyn Wrapper> }`
 stateDiagram-v2
     [*] --> VaultWithdrawSubmitting: Redeem (persists signed transaction)
     VaultWithdrawSubmitting --> VaultWithdrawSubmitted: RecordWithdrawSubmission
+    VaultWithdrawSubmitting --> VaultWithdrawSubmitted: AdoptWithdrawalReplacement
+    VaultWithdrawSubmitted --> VaultWithdrawSubmitted: AdoptWithdrawalReplacement
     VaultWithdrawSubmitted --> WithdrawnFromRaindex: ConfirmWithdraw
     WithdrawnFromRaindex --> TokensUnwrapped: Unwrap
     WithdrawnFromRaindex --> Failed
@@ -3638,10 +3656,14 @@ enum EquityRedemption {
         wrapped_amount: U256,
         tx_hash: TxHash,
         // Retained so restart can restore nonce ownership before any wallet send.
-        // None only when replaying an event from before version 9; the nonce
-        // restores by transaction hash, but the exact bytes cannot be rebroadcast.
+        // None only when replaying an event from before version 9, or after an
+        // adoption; the nonce restores by transaction hash, but the exact bytes
+        // cannot be rebroadcast.
         prepared: Option<PreparedTransaction>,
         submitted_at: DateTime<Utc>,
+        // The signed withdrawal an adoption replaced with tx_hash; None
+        // otherwise.
+        adopted_from: Option<TxHash>,
     },
     WithdrawnFromRaindex {
         symbol: Symbol,
@@ -3736,6 +3758,14 @@ enum EquityRedemptionCommand {
     RejectRedemption { reason: String },
     // Operator or timeout-driven failure before the tokens leave custody
     FailTransfer { reason: String },
+    // Operator adoption of a mined tx that took the signed withdrawal's nonce
+    // and did the withdrawal itself; the bot checks it on chain first.
+    AdoptWithdrawalReplacement {
+        replacement_tx: TxHash,
+        // The signed withdrawal the caller checked the replacement against.
+        replaced_withdrawal: TxHash,
+        reason: String,
+    },
 }
 ```
 
@@ -3802,6 +3832,14 @@ enum EquityRedemptionEvent {
         tx_hash: Option<TxHash>,
         failed_at: DateTime<Utc>,
     },
+    // Leaves the redemption in VaultWithdrawSubmitted with tx_hash =
+    // replacement_tx, no signed bytes, and the original submitted_at.
+    VaultWithdrawReplacementAdopted {
+        replacement_tx: TxHash,
+        replaced_tx: TxHash,
+        reason: String,
+        adopted_at: DateTime<Utc>,
+    },
 
     Detected {
         tokenization_request_id: TokenizationRequestId,
@@ -3836,8 +3874,13 @@ state: a redemption stuck before tokens leave custody takes `FailTransfer`, a
 and a `Pending` redemption takes `RejectRedemption { reason }`. In every case
 the replayed `Failed` state materializes the operator's reason. The verb refuses
 a redemption with a signed vault withdrawal (`VaultWithdrawSubmitting` or
-`VaultWithdrawSubmitted`): the withdrawal can still mine, so the operator
-verifies it onchain and reconciles the redemption instead.
+`VaultWithdrawSubmitted`), because the withdrawal can still mine. Instead the
+operator checks it on chain: one that mined successfully went through and is not
+reconciled; one that mined and reverted is reconciled with no cancel once
+confirmed; one with no receipt, whose nonce another tx from the bot wallet
+already used to do the withdrawal itself, is adopted; one with no receipt and
+nothing at its nonce is cancelled first and then reconciled. Reconcile requires
+the chain proof described under operator reconciliation.
 
 Vault withdrawal submission is an irreversible uncertainty boundary. The
 orchestrator prepares and signs the transaction, then the pure aggregate
@@ -3886,6 +3929,17 @@ redemption polling, and `Wrapper` methods for ERC-4626 wrapping/unwrapping.
   `VaultWithdrawSubmitting` transaction and never broadcasts it
 - `RecordWithdrawSubmission` only from `VaultWithdrawSubmitting`
 - `ConfirmWithdraw` only from `VaultWithdrawSubmitted`
+- `AdoptWithdrawalReplacement` only from `VaultWithdrawSubmitting`, or from a
+  `VaultWithdrawSubmitted` that retains its signed bytes, and only while those
+  signed bytes are the `replaced_withdrawal` the caller checked; refused for the
+  withdrawal's own hash and for a blank reason. It emits
+  `VaultWithdrawReplacementAdopted`, leaving `VaultWithdrawSubmitted` with the
+  adopted hash, no signed bytes, the original submitted time and the replaced
+  hash in `adopted_from`, so resume restores and confirms the adopted hash and
+  never rebroadcasts the replaced withdrawal
+- `Reconcile` is refused for a `VaultWithdrawSubmitted` with `adopted_from` set:
+  the bot proved the adopted tx moved the equity, so only the redrive resolves
+  it
 - a resume from `VaultWithdrawSubmitting` always rebroadcasts the exact
   persisted bytes; retries never sign or submit a different withdrawal
 - if a later transfer step fails after withdrawal, the aggregate retains the
@@ -5500,8 +5554,9 @@ emits imbalance detection events.
     available at the broker; beside it the hedge floor keeps its fixed number of
     shares
   - Minimum operation size: `min_operation_usd`, valued at the symbol's last
-    onchain fill price (the block-timestamped `Position.last_price`),
-    overridable per chain with the trading table's `min_operation_usd`
+    onchain fill price (the block-timestamped `Position.last_price`), or at the
+    pricing service's live mark for a symbol that has never filled, overridable
+    per chain with the trading table's `min_operation_usd`
   - Cooldown: `cooldown_secs` per `(symbol, chain)` after a dispatch
   - At load, per symbol, the chain targets plus the floor must not exceed 1, and
     a positive target must exceed the band: an empty chain is only
@@ -5520,10 +5575,10 @@ trigger can vouch for: the broker balance, one slot per hedged chain that
 rebalances the symbol (its wrapped vault balance converted through that chain's
 ERC-4626 ratio, its effective target share, the band, its operational limit, its
 minimum operation size, whether its vault registry knows the token and whether
-its wallet is gas-ready), the floors, the cooling chains and the symbol's last
-onchain fill price. A hedge-only listing (`rebalancing = "disabled"`) is neither
-slotted nor counted: its prefunded inventory is outside the planner's total, so
-it never moves the other chains' targets.
+its wallet is gas-ready), the floors, the cooling chains and the symbol's price.
+A hedge-only listing (`rebalancing = "disabled"`) is neither slotted nor
+counted: its prefunded inventory is outside the planner's total, so it never
+moves the other chains' targets.
 
 - Guards, in order: the broker venue unpolled, no chain slot at all, a
   rebalancing chain without a slot, or any transfer in flight for the symbol
@@ -5550,9 +5605,15 @@ it never moves the other chains' targets.
   the hedge floor available; a broker at or below that declines the whole symbol
   (the floor is symbol-wide, so no other mint could pass). The result is
   truncated to nine decimals.
-- Minimum: with no last price the plan declines; the price's age does not
-  matter, since it only values this dust bound. A candidate whose quantity times
-  price is below the chain's minimum is skipped and the next one evaluated.
+- Minimum: the price is the symbol's last onchain fill. A symbol that has never
+  filled, such as one an operator seeds at listing, uses the pricing service's
+  live mark instead: the mid price of one underlying share, from the underlying
+  rates the pricing frame carries. A frame without them gives no mark. With
+  neither price the plan declines, and a symbol whose usable mark arrives later
+  is checked again, since nothing else wakes it while balances are unchanged.
+  The price's age does not matter, since it only values this dust bound. A
+  candidate whose quantity times price is below the chain's minimum is skipped
+  and the next one evaluated.
 - Dispatch: the operation is enqueued as the chosen chain's mint or redemption
   and the `(symbol, chain)` cooldown starts. One operation per symbol is in
   flight at a time (the per-symbol lock, the job row and the transfer's first
@@ -6140,18 +6201,97 @@ hash without a restart: the redemption's resume job releases it when it loads
 `Reconciled`, in `perform` and in its terminal attempt, and the timeout sweep
 enqueues a resume job for a reconcile it observes (a failed enqueue is kept and
 retried on later sweep ticks). The release is ownership-checked and idempotent.
-It does not cancel the signed withdrawal, so the operator reconciles only after
-another transaction from the bot wallet has mined at the withdrawal's nonce. A
-withdrawal that is only missing from a mempool can still mine, so the operator
-first sends a 0-value self-transfer at that nonce and waits for it to confirm. A
-withdrawal that itself mined and reverted, or mined with no matching vault
-transfer, already used the nonce and moved nothing, so the operator reconciles
-it directly with no replacement. In both cases a mined transaction already used
-the nonce, and that is what lets later sends proceed. The release is
-bookkeeping: it drops the bot's hold on the used nonce and does not rewind nonce
-allocation onto it. A prepared transaction discarded before broadcast (a
-persist-failure rollback) is different: its nonce is unused, so allocation is
-rewound to refill it.
+It does not cancel the signed withdrawal, so reconcile of a redemption holding
+one is refused unless the chain proves the withdrawal can never land. A signed
+withdrawal stuck below the market fee will not confirm at that fee but can still
+mine when fees drop. If the withdrawal mined and reverted, the operator waits
+for its required confirmations, settles the equity by hand and reconciles with
+no `--superseding-tx`. If it has no receipt, the operator first cancels it: a
+higher fee 0-value self-transfer from the bot wallet at its nonce, mined. Only
+then does the operator settle the equity by hand and reconcile, naming the
+cancel (`--superseding-tx`, the API's `supersedingTx`). The bot reads the chain
+of the redemption, through that chain's raindex and bot wallet, and accepts only
+one of two proofs, each with that chain's required confirmations. Either the
+withdrawal itself mined and reverted, which used its nonce and moved nothing, so
+no replacement is named. Or the withdrawal has no receipt and the named tx is a
+different tx from the bot wallet at its nonce that moved nothing: it either
+reverted, or is a plain cancel, a 0-value transfer with no calldata from the bot
+wallet to itself that is not EIP-7702 and whose receipt holds no logs. A vault
+withdrawal always logs (the inventory's withdraw event and the token transfer),
+and a reverted frame drops its logs, so a successful tx with none moved nothing,
+even if code ran at the wallet through an EIP-7702 delegation; the check reads
+only the receipt, so it needs no historical state. Any other successful tx (a
+fee bumped copy of the withdrawal, a call through another contract, a contract
+creation, or one that emitted logs) may have withdrawn the vault and is refused.
+Either way nothing moved, so the manual equity settlement is the same. A
+withdrawal that mined successfully went through and is refused: its withdraw4
+settles atomically, so a success moved tokens even when its logs do not match
+what the bot expected. The withdrawal must be signed by the chain's configured
+bot wallet, since nonces are per sender. Only a tx the node shows mined in the
+canonical chain counts, so a lagging node refuses rather than proves. The check
+runs before the pure `Reconcile` command in both the CLI and the bot's reconcile
+route (`409` with the reason, `502` on a failed chain read, `503` before the bot
+is ready); a `supersedingTx` on a mint, or on a redemption with no signed
+withdrawal, is refused. The command carries the hash of the withdrawal it proved
+(none when the redemption held none) and refuses if the redemption now holds a
+different one, such as a withdrawal the live job signed while the check ran. In
+both cases a mined transaction already used the nonce, and that is what lets
+later sends proceed. The release is bookkeeping: it drops the bot's hold on the
+used nonce and does not rewind nonce allocation onto it. A prepared transaction
+discarded before broadcast (a persist-failure rollback) is different: its nonce
+is unused, so allocation is rewound to refill it.
+
+A tx that took the signed withdrawal's nonce but is not a plain cancel may have
+moved the equity, so reconcile refuses it; when it did the withdrawal itself (a
+wallet "speed up" that sent the same `withdraw4` again at a higher fee), the
+redemption adopts it instead. The
+`AdoptWithdrawalReplacement { replacement_tx,
+replaced_withdrawal, reason }`
+command is valid only while the redemption still holds the signed withdrawal the
+caller checked (`VaultWithdrawSubmitting`, or a `VaultWithdrawSubmitted` that
+retains its signed bytes), refuses the withdrawal itself as its own replacement,
+and requires a reason. It emits `VaultWithdrawReplacementAdopted`, which leaves
+the redemption in `VaultWithdrawSubmitted` with the adopted hash, no signed
+bytes and the original submitted time, so the reconciliation deadline keeps
+running. The command is pure: the bot's route
+`POST
+/liquidity-write/transfers/equity_redemption/{id}/adopt-withdrawal`
+(client: `debug adopt-withdrawal`; `stox` has no adopt verb) first checks on the
+redemption's chain, through that chain's raindex and bot wallet, that the tx is
+mined in the canonical chain from the bot wallet, at the withdrawal's nonce, is
+not the withdrawal itself, has the chain's required confirmations, succeeded,
+and is a `withdraw4` to the contract the withdrawal calls, from the same token
+and vault, for at most the signed withdrawal's amount, whose receipt shows a
+transfer of that token to the bot wallet, which `withdraw4` pays as its caller,
+and is not already another redemption's recorded vault withdrawal (`409` naming
+the failed check, `502` on a failed chain read, `503` before the bot is ready,
+`400` for a redemption with no signed withdrawal). The route holds the recovery
+lock and sends the command through the conductor owned store, so the live
+transfer reactor sees the adoption. The redemption's redrive then resumes from
+`VaultWithdrawSubmitted` as for any hash only submission: it restores the
+adopted hash at its nonce, `ConfirmWithdraw` confirms it and records the vault
+transfer its receipt shows (refusing a receipt that paid the withdrawal's token
+nowhere the bot expects), and confirming it releases the whole nonce entry,
+including the signed withdrawal's reservation. Nothing is rebroadcast, since the
+nonce is used. A restart restores the same hash only reservation, so the release
+does not depend on the process that adopted it.
+
+An adopted redemption is never reconciled: `Reconcile` refuses a
+`VaultWithdrawSubmitted` whose `adopted_from` is set, whatever a node shows for
+the adopted tx, since the bot proved it moved the equity. A legacy redemption
+holding only a withdrawal hash (from before the signed bytes were kept) has no
+nonce to prove unused, so it reconciles on the operator's word, except once that
+hash mined and succeeded: then the equity left the vault, and reconcile refuses
+it as it does a signed withdrawal that went through (both the CLI and the bot's
+route read the hash first, the route `503` before the bot is ready).
+
+Rollback floor for withdrawal adoption: a build before it cannot replay
+`VaultWithdrawReplacementAdopted`. The pre deploy `verify-migrations` gate
+replays every persisted aggregate, completed ones included, so once any
+redemption has an adoption event a build before adoption fails that gate and
+cannot be deployed. The first release with adoption is therefore a permanent
+rollback floor from the first adoption on, whether or not the adopted redemption
+has finished.
 
 The `Reconciled` state retains the identifying fields (symbol, quantity,
 original failure reason, request/redemption identifiers) so the dashboard

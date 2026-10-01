@@ -1,6 +1,5 @@
 //! Single-chain CCTP operations.
 
-use alloy::consensus::Transaction as _;
 use alloy::primitives::{Address, B256, Bytes, FixedBytes, TxHash, U256};
 use alloy::providers::Provider;
 use alloy::rpc::types::{Filter, TransactionReceipt};
@@ -14,13 +13,13 @@ use tracing::{debug, info, trace, warn};
 #[cfg(test)]
 use st0x_evm::Evm;
 use st0x_evm::{
-    Chain, EvmError, IntoErrorRegistry, NODE_SYNC_MAX_ATTEMPTS, NODE_SYNC_POLL_INTERVAL,
+    Chain, EvmError, IntoErrorRegistry, MinedTx, NODE_SYNC_MAX_ATTEMPTS, NODE_SYNC_POLL_INTERVAL,
     PreparedTransaction, Wallet, wait_for_node_sync,
 };
 
 use super::{
-    CctpError, CctpReceivedMessage, FAST_TRANSFER_THRESHOLD, MessageTransmitterV2, MinedTx,
-    MintReceipt, MintScanFloorCheck, TokenMessengerV2, UsdcTransferStatus, parse_received_message,
+    CctpError, CctpReceivedMessage, FAST_TRANSFER_THRESHOLD, MessageTransmitterV2, MintReceipt,
+    MintScanFloorCheck, TokenMessengerV2, UsdcTransferStatus, parse_received_message,
 };
 use crate::BridgeDirection;
 
@@ -807,41 +806,10 @@ impl<W: Wallet> CctpEndpoint<W> {
         Ok(Some(head.saturating_sub(tx_block).saturating_add(1)))
     }
 
-    /// Returns the sender, nonce and confirmations of `tx_hash`, or `None`
-    /// while this endpoint's node shows no receipt or no transaction for it,
-    /// or the receipt's block is not the canonical block at its height.
-    /// Confirmations follow [`tx_confirmations`](Self::tx_confirmations).
+    /// Returns `tx_hash` as mined on this endpoint's chain; see
+    /// [`st0x_evm::mined_tx`].
     pub(super) async fn mined_tx(&self, tx_hash: TxHash) -> Result<Option<MinedTx>, CctpError> {
-        let provider = self.wallet.provider();
-        let Some(receipt) = provider.get_transaction_receipt(tx_hash).await? else {
-            return Ok(None);
-        };
-
-        let (Some(tx_block), Some(receipt_block_hash)) = (receipt.block_number, receipt.block_hash)
-        else {
-            return Ok(None);
-        };
-
-        // Reads are not pinned to one node, so a lagging node can serve a
-        // receipt from a reorged-out block while the head comes from another:
-        // count confirmations only for a receipt in the canonical block.
-        let canonical = provider.get_block_by_number(tx_block.into()).await?;
-        if canonical.is_none_or(|block| block.header.hash != receipt_block_hash) {
-            warn!(target: "bridge", %tx_hash, tx_block, %receipt_block_hash, "Receipt block is not the canonical block at its height; treating the tx as not mined");
-            return Ok(None);
-        }
-
-        let Some(tx) = provider.get_transaction_by_hash(tx_hash).await? else {
-            return Ok(None);
-        };
-
-        let head = provider.get_block_number().await?;
-
-        Ok(Some(MinedTx {
-            from: receipt.from,
-            nonce: tx.nonce(),
-            confirmations: head.saturating_sub(tx_block).saturating_add(1),
-        }))
+        Ok(st0x_evm::mined_tx(self.wallet.provider(), tx_hash).await?)
     }
 
     /// Sums the USDC `Transfer` logs in `tx_hash`'s receipt that pay `recipient`:

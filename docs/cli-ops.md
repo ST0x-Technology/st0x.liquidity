@@ -551,8 +551,12 @@ transfer should be marked resolved rather than left in `Failed`.
 
 `transfer fail --kind redemption` refuses a redemption with a signed vault
 withdrawal (`VaultWithdrawSubmitting` or `VaultWithdrawSubmitted`), because the
-withdrawal can still mine. Verify the withdrawal onchain and reconcile the
-redemption instead (see the `--kind redemption` notes below).
+withdrawal can still mine. Check the withdrawal on chain and reconcile the
+redemption instead (see the `--kind redemption` notes below): a reverted
+withdrawal needs no cancel; one with no receipt whose nonce another tx from the
+bot wallet already used to do the withdrawal itself is adopted with
+`st0x-liquidity-client --env <env> debug adopt-withdrawal`; one with no receipt
+and nothing at its nonce must be cancelled first.
 
 ### Withdrawal poll inconclusive (Alpaca->Base stuck at `Withdrawing`)
 
@@ -835,22 +839,76 @@ stox transfer reconcile --kind redemption --id <redemption-aggregate-id> \
   `--reason` is free text.
 - Reconciling a redemption with a signed vault withdrawal releases the wallet
   nonce reservation of that withdrawal in the running bot, with no restart. The
-  release is bookkeeping only. It does not cancel the withdrawal, and it is the
-  mined replacement below that lets later sends proceed. Reconcile only after
-  another transaction from the bot wallet has mined at the withdrawal's nonce. A
-  withdrawal that is not pending on one node can still mine from another node's
-  mempool or a rebroadcast, so "not pending" is not enough. Send a 0-value
-  self-transfer from the bot wallet at the withdrawal's nonce, with fees above
-  the withdrawal's, and wait until it confirms. Then reconcile. If the
-  withdrawal itself mined and reverted, or mined with no matching vault
-  transfer, it already used the nonce and moved nothing: the bot cannot confirm
-  it and `fail` refuses it, so reconcile directly with no replacement. Only if
-  the withdrawal mined successfully, do not reconcile: the redemption must
-  continue. A live redrive confirms it by itself. If the give-up page fired (the
-  job budget is spent and no job remains), run
-  `stox transfer resume --kind
-  equity` or restart the bot so that a new resume
-  confirms it.
+  release is bookkeeping only. It does not cancel the withdrawal: a withdrawal
+  stuck below the market fee will not confirm at that fee, but it can still mine
+  when fees drop, including from another node's mempool or a rebroadcast. So
+  reconcile refuses unless the chain proves the withdrawal can never land. Check
+  the withdrawal on chain:
+  - Mined successfully: do not reconcile. The withdrawal went through, and
+    reconcile refuses with "the withdrawal went through". A live redrive
+    confirms it by itself. If the give-up page fired (the job budget is spent
+    and no job remains), run `stox transfer resume --kind equity` or restart the
+    bot so that a new resume confirms it.
+  - Mined and reverted: it used the nonce and moved nothing. Once it has the
+    chain's required confirmations (`[chains.<chain>] required_confirmations`),
+    settle the equity by hand and reconcile with no `--superseding-tx`:
+    `stox transfer reconcile --kind redemption --id <id> --reason <reason>`.
+  - No receipt, but another tx from the bot wallet already mined at the
+    withdrawal's nonce and did the withdrawal itself (for example a wallet
+    "speed up" that sent the same `withdraw4` again at a higher fee): do **not**
+    settle the equity by hand or reconcile. The equity moved, and reconcile
+    refuses it as not a plain cancel. Adopt that tx as the redemption's
+    withdrawal instead, against the live bot:
+    `st0x-liquidity-client --env <env> debug adopt-withdrawal <id> --replacement-tx <tx> --reason <reason>`
+    (the API is
+    `POST /liquidity-write/transfers/equity_redemption/{id}/adopt-withdrawal`
+    with `replacementTx` and `reason` in the body; `stox` has no adopt verb).
+    The bot refuses (the API with `409`, naming the failed check) unless `<tx>`
+    is mined from the bot wallet, at the withdrawal's nonce, is not the
+    withdrawal itself, has the chain's required confirmations, succeeded, and is
+    a `withdraw4` to the contract the withdrawal calls, from the same token and
+    vault, and its receipt shows a transfer of that token to the bot wallet; the
+    amount may be smaller but not larger. A reverted tx withdrew nothing:
+    reconcile with it as the `--superseding-tx` instead. After adoption the
+    redemption's redrive confirms `<tx>`, records the vault transfer its receipt
+    shows, releases the withdrawal's nonce and continues with the unwrap and
+    send. After the reconciliation deadline the redrive runs every 30 minutes,
+    so to continue at once, or when the job budget page fired and no job
+    remains, run `stox transfer resume --kind equity` or restart the bot. Once
+    adopted, reconcile always refuses the redemption; the redrive is the only
+    exit. A legacy redemption holding only a withdrawal hash is refused too once
+    that hash mined successfully ("the withdrawal went through").
+  - No receipt (pending, or dropped): do **not** settle the equity or reconcile
+    yet. Cancel it: from the bot wallet on the redemption's chain, send a
+    0-value transfer with no calldata to the wallet itself (any tx type except
+    EIP-7702) at the withdrawal's nonce, with `maxFeePerGas` and
+    `maxPriorityFeePerGas` at least 10% above the withdrawal's. Never fee bump
+    the withdrawal itself (the same call at a higher fee), or cancel through a
+    contract: that can withdraw the vault, and reconcile refuses any successful
+    cancel that is not this plain self-transfer. Wait until the cancel has the
+    chain's required confirmations. If the withdrawal mined instead, follow the
+    cases above. Then settle the equity by hand (the same settlement as for a
+    reverted withdrawal: nothing moved in either case) and run
+    `stox transfer reconcile --kind redemption --id <id> --reason <reason> --superseding-tx <cancel>`
+    (or, against the live bot,
+    `st0x-liquidity-client --env <env> debug reconcile-equity redemption <id> --reason <reason> --superseding-tx <cancel>`;
+    the API takes `supersedingTx` in the body).
+
+  Reconcile reads the redemption's chain and refuses (the API with `409`) unless
+  `<cancel>` is mined from the bot wallet, at the withdrawal's nonce, is not the
+  withdrawal itself, has the chain's required confirmations, and either reverted
+  or is a plain cancel: a 0-value transfer with no calldata to the bot wallet
+  itself, not EIP-7702, whose receipt holds no logs. A vault withdrawal always
+  logs, so a successful cancel with no logs moved nothing, even if code ran at
+  the wallet through an EIP-7702 delegation. Any other successful tx may have
+  withdrawn the vault. Each refusal names the failed check. No receipt for the
+  withdrawal is not proof: a lagging node shows none for one that did mine.
+  "could not read tx" (the API: `502`) is transient; retry. The withdrawal must
+  be signed by the chain's configured bot wallet, since nonces are per sender:
+  one signed by a key rotated out since is refused; cancel it from that key and
+  run the CLI reconcile configured with that key. `--superseding-tx` is refused
+  for a mint and for a redemption with no signed withdrawal (the API with
+  `400`).
 
 ### Base->Alpaca deposit send pages
 

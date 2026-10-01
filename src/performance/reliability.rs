@@ -512,7 +512,8 @@ fn equity_redemption_failure(
         | EquityRedemptionEvent::Detected { .. }
         | EquityRedemptionEvent::Completed { .. }
         | EquityRedemptionEvent::ProviderCompletionRecovered { .. }
-        | EquityRedemptionEvent::OperatorReconciled { .. } => None,
+        | EquityRedemptionEvent::OperatorReconciled { .. }
+        | EquityRedemptionEvent::VaultWithdrawReplacementAdopted { .. } => None,
     }
 }
 

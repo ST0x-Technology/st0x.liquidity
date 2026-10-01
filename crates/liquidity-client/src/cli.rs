@@ -137,6 +137,26 @@ pub(crate) enum Debug {
         /// Free text audit reason, persisted on the event.
         #[arg(long, value_parser = nonblank_reason)]
         reason: String,
+        /// The tx mined at a signed vault withdrawal's nonce, for a
+        /// redemption whose withdrawal was cancelled: a reverted tx, or a
+        /// 0-value self-transfer with no calldata (not EIP-7702) from the bot
+        /// wallet. The bot verifies it on chain before reconciling.
+        #[arg(long)]
+        superseding_tx: Option<String>,
+    },
+    /// Adopt a mined tx that took a stuck redemption's signed vault withdrawal
+    /// nonce and did the withdrawal itself (e.g. a wallet "speed up" of the
+    /// same withdraw4), so the redemption finishes. The bot verifies it on
+    /// chain before adopting it.
+    AdoptWithdrawal {
+        /// Redemption aggregate id.
+        id: String,
+        /// The mined tx at the withdrawal's nonce to adopt.
+        #[arg(long)]
+        replacement_tx: String,
+        /// Free text audit reason, persisted on the event.
+        #[arg(long, value_parser = nonblank_reason)]
+        reason: String,
     },
     /// Clear a dropped CCTP burn hash from a USDC rebalance so the guard can
     /// be released.
@@ -292,6 +312,16 @@ impl CctpSourceChain {
 pub(crate) enum EquityTransferKind {
     Mint,
     Redemption,
+}
+
+impl EquityTransferKind {
+    /// The `{kind}` segment of the bot's equity transfer routes.
+    pub(crate) const fn route_segment(self) -> &'static str {
+        match self {
+            Self::Mint => "equity_mint",
+            Self::Redemption => "equity_redemption",
+        }
+    }
 }
 
 /// Recheck transfer kind. A superset of `EquityTransferKind`: a failed USDC
@@ -582,6 +612,13 @@ mod tests {
         let blanks = ["", "   ", "\t", "\n"];
         let verbs: &[&[&str]] = &[
             &["reconcile-equity", "mint", "abc", "--reason"],
+            &[
+                "adopt-withdrawal",
+                "abc",
+                "--replacement-tx",
+                "0xa",
+                "--reason",
+            ],
             &["clear-pending-burn", "abc", "--reason"],
             &["fail-usdc-transfer", "abc", "--reason"],
             &["fail-equity-transfer", "redemption", "abc", "--reason"],
@@ -662,7 +699,24 @@ mod tests {
                 kind: EquityTransferKind::Redemption,
                 id,
                 reason,
+                superseding_tx: None,
             } if id == "abc" && reason == "settled"
+        ));
+        assert!(matches!(
+            debug(&[
+                "reconcile-equity",
+                "redemption",
+                "abc",
+                "--reason",
+                "settled",
+                "--superseding-tx",
+                "0xcancel",
+            ])
+            .unwrap(),
+            Debug::ReconcileEquity {
+                superseding_tx: Some(tx),
+                ..
+            } if tx == "0xcancel"
         ));
         assert!(matches!(
             debug(&["clear-pending-burn", "abc", "--reason", "dropped"]).unwrap(),

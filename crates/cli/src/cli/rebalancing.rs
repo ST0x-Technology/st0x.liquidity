@@ -33,6 +33,8 @@ use st0x_hedge::operator::native_gas::{ConfiguredGasReadiness, GasReadiness};
 use st0x_hedge::operator::position::{EquityTransferReservationId, Position, PositionCommand};
 use st0x_hedge::operator::rebalancing::equity::{
     ChainEquityServices, CrossVenueEquityTransfer, EquityTransferServices,
+    verify_hash_only_withdrawal_not_through, verify_withdrawal_superseded,
+    withdrawal_required_confirmations,
 };
 use st0x_hedge::operator::rebalancing::to_wrapped_equities;
 use st0x_hedge::operator::rebalancing::usdc::{
@@ -306,6 +308,15 @@ pub(super) fn tokenization_network_context(
     network: TokenizationNetwork,
 ) -> anyhow::Result<(Arc<dyn Wallet<Provider = RootProvider>>, Chain)> {
     let chain = Chain::from(network);
+
+    Ok((chain_wallet(wallet_ctx, chain)?, chain))
+}
+
+/// The bot wallet that signs on `chain`.
+fn chain_wallet(
+    wallet_ctx: &OnchainWalletCtx,
+    chain: Chain,
+) -> anyhow::Result<Arc<dyn Wallet<Provider = RootProvider>>> {
     let wallet = match chain {
         Chain::Base => wallet_ctx.base_wallet(),
         Chain::Ethereum => wallet_ctx.ethereum_wallet(),
@@ -315,7 +326,7 @@ pub(super) fn tokenization_network_context(
         })?,
     };
 
-    Ok((wallet.clone(), chain))
+    Ok(wallet.clone())
 }
 
 pub(super) fn require_equity_mutation_network(network: TokenizationNetwork) -> anyhow::Result<()> {
@@ -344,7 +355,12 @@ pub(super) fn hedged_chain_context(
     ctx: &Ctx,
     network: TokenizationNetwork,
 ) -> anyhow::Result<HedgedChainContext<'_>> {
-    let chain = Chain::from(network);
+    hedged_chain_context_on(ctx, Chain::from(network))
+}
+
+/// [`hedged_chain_context`] for a chain read off a record rather than chosen
+/// by the operator.
+fn hedged_chain_context_on(ctx: &Ctx, chain: Chain) -> anyhow::Result<HedgedChainContext<'_>> {
     let Some(trading) = ctx.chains.hedged_chain(chain) else {
         anyhow::bail!(
             "{chain} has no [chains.{chain}.trading] table: vault operations need \
@@ -352,7 +368,7 @@ pub(super) fn hedged_chain_context(
         );
     };
 
-    let (wallet, chain) = tokenization_network_context(ctx.wallet()?, network)?;
+    let wallet = chain_wallet(ctx.wallet()?, chain)?;
 
     Ok(HedgedChainContext {
         chain,
@@ -1544,6 +1560,57 @@ pub(super) async fn verify_deposit_send_superseded_on_chain(
     .await?)
 }
 
+/// The vault withdrawal a redemption reconcile checks on chain first.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WithdrawalCheck<'a> {
+    /// A signed withdrawal, and the tx the operator names as having taken its
+    /// nonce.
+    Signed {
+        prepared: &'a PreparedTransaction,
+        superseding_tx: Option<TxHash>,
+    },
+    /// A legacy withdrawal known only by its hash. An adopted replacement is
+    /// not checked: the command refuses it.
+    HashOnly(TxHash),
+}
+
+/// Checks `check` on the bot wallet of `chain`. A signed withdrawal must be
+/// proven never to land: `superseding_tx` is the wallet's tx at its nonce,
+/// with the confirmation depth the bot's transfers on that chain use. A hash
+/// only withdrawal must not have gone through.
+pub(super) async fn verify_withdrawal_on_chain(
+    ctx: &Ctx,
+    chain: Chain,
+    check: WithdrawalCheck<'_>,
+) -> anyhow::Result<()> {
+    let HedgedChainContext {
+        wallet, trading, ..
+    } = hedged_chain_context_on(ctx, chain)?;
+    let bot_wallet = wallet.address();
+    let raindex = RaindexService::new(
+        wallet,
+        st0x_hedge::operator::onchain::raindex_contracts(trading),
+        bot_wallet,
+    );
+
+    match check {
+        WithdrawalCheck::Signed {
+            prepared,
+            superseding_tx,
+        } => Ok(verify_withdrawal_superseded(
+            &raindex,
+            prepared,
+            superseding_tx,
+            bot_wallet,
+            withdrawal_required_confirmations(&ctx.chains, chain)?,
+        )
+        .await?),
+        WithdrawalCheck::HashOnly(tx) => {
+            Ok(verify_hash_only_withdrawal_not_through(&raindex, tx).await?)
+        }
+    }
+}
+
 /// Resolves the tokenized-equity (tStock) address for a tokenization
 /// command: an explicit `--token` override wins; otherwise the selected
 /// chain's `[chains.<name>.trading.assets.equities]` entry. A chain with no
@@ -1973,20 +2040,28 @@ fn connect_error(url: &str, error: reqwest::Error) -> anyhow::Error {
     }
 }
 
-/// Reconciles a mint or redemption stranded in the terminal `Failed` state to
-/// the terminal `Reconciled` state.
+/// Reconciles a mint or redemption stranded in the terminal `Failed` state,
+/// or a redemption stuck submitting its vault withdrawal, to the terminal
+/// `Reconciled` state.
 ///
-/// Loads the aggregate, verifies it is in `Failed` (bails with a clear operator
-/// error otherwise -- the aggregate command also gates this, but the preflight
-/// gives a clearer message first), and sends the `Reconcile` command. This is a
-/// pure bookkeeping resolution: the residual equity was handled out-of-band
-/// (e.g. via wrap-equity/vault-deposit), so there is no inventory side-effect.
+/// Loads the aggregate, verifies it is reconcilable (bails with a clear
+/// operator error otherwise; the aggregate command also gates this, but the
+/// preflight gives a clearer message first), and sends the `Reconcile`
+/// command. This is a pure bookkeeping resolution: the residual equity was
+/// handled out of band (e.g. via wrap-equity/vault-deposit), so there is no
+/// inventory side effect. A redemption with a signed vault withdrawal
+/// reconciles only once `verify_withdrawal` proves on its chain that the
+/// withdrawal can never land, and one holding only a withdrawal hash only
+/// once it shows that hash did not go through. `superseding_tx` applies to a
+/// redemption only; the CLI refuses it for a mint before this runs.
 pub(crate) async fn reconcile_equity_transfer_command<W: Write>(
     stdout: &mut W,
     transfer_type: TransferType,
     id: &str,
     reason: AuditReason,
+    superseding_tx: Option<TxHash>,
     pool: &SqlitePool,
+    verify_withdrawal: impl AsyncFnOnce(Chain, WithdrawalCheck<'_>) -> anyhow::Result<()>,
 ) -> anyhow::Result<()> {
     let services = EquityTransferServices::panicking();
 
@@ -2038,11 +2113,42 @@ pub(crate) async fn reconcile_equity_transfer_command<W: Write>(
                 );
             }
 
+            // The aggregate command is pure, so the chain check is read here,
+            // before it, and the command refuses if the redemption holds
+            // another signed withdrawal by then.
+            let check = match (
+                entity.prepared_withdrawal(),
+                entity.hash_only_withdrawal(),
+                superseding_tx,
+            ) {
+                (Some(prepared), _, _) => Some(WithdrawalCheck::Signed {
+                    prepared,
+                    superseding_tx,
+                }),
+                (None, _, Some(_)) => anyhow::bail!(
+                    "transfer reconcile: --superseding-tx applies only to a redemption with a \
+                     signed vault withdrawal; redemption {id} has none. Refusing to act."
+                ),
+                (None, Some(tx), None) => Some(WithdrawalCheck::HashOnly(tx)),
+                (None, None, None) => None,
+            };
+            if let Some(check) = check {
+                verify_withdrawal(entity.chain(), check)
+                    .await
+                    .with_context(|| {
+                        format!("transfer reconcile: refusing to reconcile redemption {id}")
+                    })?;
+            }
+            let proven_withdrawal = entity
+                .prepared_withdrawal()
+                .map(PreparedTransaction::tx_hash);
+
             st0x_event_sorcery::send_command::<EquityRedemption>(
                 pool,
                 &redemption_id,
                 EquityRedemptionCommand::Reconcile {
                     reason: reason.into(),
+                    proven_withdrawal,
                 },
                 services,
             )
@@ -6145,6 +6251,7 @@ mod tests {
             id,
             EquityRedemptionCommand::Reconcile {
                 reason: "deposited manually via vault-deposit".to_string(),
+                proven_withdrawal: None,
             },
         )
         .await;
@@ -6204,7 +6311,9 @@ mod tests {
             TransferType::Mint,
             &issuer_request_id("cli-no-such-mint").to_string(),
             "handled out-of-band".parse().unwrap(),
+            None,
             &pool,
+            no_withdrawal_to_verify,
         )
         .await;
 
@@ -6238,7 +6347,9 @@ mod tests {
             TransferType::Mint,
             &id.to_string(),
             "handled out-of-band".parse().unwrap(),
+            None,
             &pool,
+            no_withdrawal_to_verify,
         )
         .await;
 
@@ -6261,7 +6372,9 @@ mod tests {
             TransferType::Mint,
             &id.to_string(),
             "wrapped manually via wrap-equity".parse().unwrap(),
+            None,
             &pool,
+            no_withdrawal_to_verify,
         )
         .await
         .unwrap();
@@ -6299,7 +6412,9 @@ mod tests {
             TransferType::Mint,
             &id.to_string(),
             "second reconcile attempt".parse().unwrap(),
+            None,
             &pool,
+            no_withdrawal_to_verify,
         )
         .await;
 
@@ -6411,7 +6526,9 @@ mod tests {
             TransferType::Redemption,
             &redemption_aggregate_id("cli-no-such-redemption").to_string(),
             "handled out-of-band".parse().unwrap(),
+            None,
             &pool,
+            no_withdrawal_to_verify,
         )
         .await;
 
@@ -6434,7 +6551,9 @@ mod tests {
             TransferType::Redemption,
             &id.to_string(),
             "handled out-of-band".parse().unwrap(),
+            None,
             &pool,
+            no_withdrawal_to_verify,
         )
         .await;
 
@@ -6445,21 +6564,93 @@ mod tests {
         );
     }
 
+    /// Redemptions without a vault withdrawal have nothing to check on chain.
+    async fn no_withdrawal_to_verify(
+        chain: Chain,
+        check: WithdrawalCheck<'_>,
+    ) -> anyhow::Result<()> {
+        panic!("no vault withdrawal to verify, got {check:?} on {chain}")
+    }
+
+    /// A signed withdrawal that can still mine is not reconciled: the CLI
+    /// names the redemption and the chain check's reason, and leaves it
+    /// unresolved.
     #[tokio::test]
-    async fn reconcile_equity_redemption_succeeds_from_submitting() {
+    async fn reconcile_equity_redemption_refuses_a_signed_withdrawal_that_can_still_mine() {
+        use st0x_hedge::operator::rebalancing::equity::WithdrawalNotSuperseded;
+
         let pool = setup_test_db().await;
-        let id = redemption_aggregate_id("cli-reconcile-from-submitting");
+        let id = redemption_aggregate_id("cli-reconcile-unproven-withdrawal");
         seed_redemption_to_submitting(&pool, &id).await;
+
+        let mut stdout = Vec::new();
+        let error = reconcile_equity_transfer_command(
+            &mut stdout,
+            TransferType::Redemption,
+            &id.to_string(),
+            "withdrawal outrun by fees".parse().unwrap(),
+            None,
+            &pool,
+            async |_, check: WithdrawalCheck<'_>| {
+                let WithdrawalCheck::Signed { prepared, .. } = check else {
+                    panic!("a signed withdrawal is checked as signed, got {check:?}");
+                };
+                Err(WithdrawalNotSuperseded::NoSupersedingTx {
+                    tx: prepared.tx_hash(),
+                    nonce: prepared.nonce(),
+                }
+                .into())
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            format!("{error:#}").starts_with(&format!(
+                "transfer reconcile: refusing to reconcile redemption {id}: vault withdrawal"
+            )),
+            "the refusal names the redemption and the chain check's reason, got: {error:#}"
+        );
+        let entity = st0x_event_sorcery::load_entity::<EquityRedemption>(&pool, &id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(entity, EquityRedemption::VaultWithdrawSubmitting { .. }),
+            "a refused reconcile leaves the redemption unresolved, got: {entity:?}"
+        );
+    }
+
+    /// Once the chain proves the signed withdrawal can never land, the
+    /// redemption reconciles; the check reads the redemption's own chain and
+    /// withdrawal, and the operator's superseding tx.
+    #[tokio::test]
+    async fn reconcile_equity_redemption_reconciles_a_signed_withdrawal_proven_superseded() {
+        let pool = setup_test_db().await;
+        let id = redemption_aggregate_id("cli-reconcile-proven-withdrawal");
+        seed_redemption_to_submitting(&pool, &id).await;
+        let cancel = TxHash::repeat_byte(0xCA);
 
         let mut stdout = Vec::new();
         reconcile_equity_transfer_command(
             &mut stdout,
             TransferType::Redemption,
             &id.to_string(),
-            "withdrawal never broadcast; verified on-chain"
-                .parse()
-                .unwrap(),
+            "cancelled at its nonce".parse().unwrap(),
+            Some(cancel),
             &pool,
+            async |chain, check: WithdrawalCheck<'_>| {
+                assert_eq!(chain, Chain::Base, "the check reads the redemption's chain");
+                assert_eq!(
+                    check,
+                    WithdrawalCheck::Signed {
+                        prepared: &PreparedTransaction::for_test(TxHash::ZERO, 0),
+                        superseding_tx: Some(cancel),
+                    },
+                    "the check reads the persisted withdrawal and the operator's tx"
+                );
+                Ok(())
+            },
         )
         .await
         .unwrap();
@@ -6470,7 +6661,96 @@ mod tests {
             .unwrap();
         assert!(
             matches!(entity, EquityRedemption::Reconciled { .. }),
-            "a stuck submitting redemption must reconcile, got: {entity:?}"
+            "a proven withdrawal reconciles, got: {entity:?}"
+        );
+    }
+
+    /// An adopted replacement moved the equity, so the CLI refuses to
+    /// reconcile it without reading the chain: the command refuses it.
+    #[tokio::test]
+    async fn reconcile_equity_redemption_refuses_an_adopted_replacement_without_a_chain_check() {
+        let pool = setup_test_db().await;
+        let id = redemption_aggregate_id("cli-reconcile-adopted-replacement");
+        seed_redemption_to_submitting(&pool, &id).await;
+        let speed_up = TxHash::repeat_byte(0x5E);
+        send_redemption_command(
+            &pool,
+            &id,
+            EquityRedemptionCommand::AdoptWithdrawalReplacement {
+                replacement_tx: speed_up,
+                replaced_withdrawal: TxHash::ZERO,
+                reason: "wallet sped up the withdrawal".to_string(),
+            },
+        )
+        .await;
+
+        let mut stdout = Vec::new();
+        let error = reconcile_equity_transfer_command(
+            &mut stdout,
+            TransferType::Redemption,
+            &id.to_string(),
+            "settled by hand".parse().unwrap(),
+            None,
+            &pool,
+            no_withdrawal_to_verify,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            format!("{error:#}").contains("is an adopted replacement that moved the equity"),
+            "got: {error:#}"
+        );
+        let entity = st0x_event_sorcery::load_entity::<EquityRedemption>(&pool, &id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(entity, EquityRedemption::VaultWithdrawSubmitted { .. }),
+            "a refused reconcile leaves the redemption unresolved, got: {entity:?}"
+        );
+    }
+
+    /// A superseding tx names what took a signed withdrawal's nonce, so it is
+    /// refused on a redemption with none rather than silently ignored.
+    #[tokio::test]
+    async fn reconcile_equity_redemption_refuses_a_superseding_tx_without_a_signed_withdrawal() {
+        let pool = setup_test_db().await;
+        let id = redemption_aggregate_id("cli-reconcile-superseding-without-withdrawal");
+        seed_redemption_to_tokens_sent(&pool, &id).await;
+        send_redemption_command(
+            &pool,
+            &id,
+            EquityRedemptionCommand::FailDetection {
+                failure: DetectionFailure::Timeout,
+            },
+        )
+        .await;
+
+        let mut stdout = Vec::new();
+        let error = reconcile_equity_transfer_command(
+            &mut stdout,
+            TransferType::Redemption,
+            &id.to_string(),
+            "handled out-of-band".parse().unwrap(),
+            Some(TxHash::repeat_byte(0xCA)),
+            &pool,
+            no_withdrawal_to_verify,
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            error.to_string().contains("has none"),
+            "a superseding tx without a signed withdrawal must be refused, got: {error}"
+        );
+        let entity = st0x_event_sorcery::load_entity::<EquityRedemption>(&pool, &id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(entity, EquityRedemption::Failed { .. }),
+            "a refused reconcile must not reconcile, got: {entity:?}"
         );
     }
 
@@ -6494,7 +6774,9 @@ mod tests {
             TransferType::Redemption,
             &id.to_string(),
             "deposited manually via vault-deposit".parse().unwrap(),
+            None,
             &pool,
+            no_withdrawal_to_verify,
         )
         .await
         .unwrap();
@@ -6530,7 +6812,9 @@ mod tests {
             TransferType::Redemption,
             &id.to_string(),
             "second reconcile attempt".parse().unwrap(),
+            None,
             &pool,
+            no_withdrawal_to_verify,
         )
         .await;
 

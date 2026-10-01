@@ -74,6 +74,7 @@ use crate::performance::reliability::{
 use crate::performance::{ReportRange, hedge_latency_report, load_hedge_performance};
 use crate::rebalancing::equity::{
     CrossVenueEquityTransfer, EquityTransferServices, RecheckError, RecheckOutcome,
+    ReplacementNotAdoptable, WithdrawalNotSuperseded, withdrawal_required_confirmations,
 };
 use crate::rebalancing::usdc::{
     CctpMintRecoveryError, DepositSendNotSuperseded, DriverNotQuiesced, RecheckUsdcDeposit,
@@ -1137,7 +1138,8 @@ fn stuck_redemption_info(rows: &[(String, String, i64)]) -> Option<StuckTransfer
             | UnwrapPending { .. }
             | UnwrapSubmitted { .. }
             | SendPending { .. }
-            | Detected { .. } => {}
+            | Detected { .. }
+            | VaultWithdrawReplacementAdopted { .. } => {}
         }
     }
 
@@ -3144,9 +3146,14 @@ fn cctp_mint_recovery_error_response(error: &CctpMintRecoveryError) -> (StatusCo
 
 /// Wire contract for the equity reconcile route (mint or redemption).
 #[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct ReconcileEquityRequest {
     /// Free-text operator audit reason (required; persisted on the event).
     reason: String,
+    /// For a redemption with a signed vault withdrawal, the tx that took
+    /// that withdrawal's nonce.
+    #[serde(default)]
+    superseding_tx: Option<TxHash>,
 }
 
 /// Reconciles an equity mint or redemption stuck in the `Failed` terminal to
@@ -3154,6 +3161,13 @@ struct ReconcileEquityRequest {
 /// loads the aggregate and sends `Reconcile`, dispatching no reactor effect and
 /// no inventory update, so it is safe against the live bot (a `Failed` terminal
 /// has no active driver).
+///
+/// A redemption with a signed vault withdrawal reconciles only once the bot
+/// proves on the redemption's chain that the withdrawal can never land (`409`
+/// until it does, `503` before the bot is ready): see
+/// [`verify_withdrawal_superseded`](crate::rebalancing::equity::verify_withdrawal_superseded).
+/// A `supersedingTx` on a mint, or on a redemption with no signed withdrawal,
+/// is a `400`.
 ///
 /// Mirrors `stox transfer reconcile --kind mint|redemption`.
 async fn reconcile_equity_transfer(
@@ -3182,6 +3196,16 @@ async fn reconcile_equity_transfer(
     })?;
     match transfer_kind {
         TransferKind::EquityMint => {
+            if request.superseding_tx.is_some() {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    Json(ErrorResponse {
+                        error: "supersedingTx applies only to a redemption with a signed vault \
+                                withdrawal"
+                            .to_string(),
+                    }),
+                ));
+            }
             let mint_id: IssuerRequestId = id.parse().map_err(|error| {
                 (
                     StatusCode::BAD_REQUEST,
@@ -3254,10 +3278,20 @@ async fn reconcile_equity_transfer(
                     }),
                 ));
             }
+            let proven_withdrawal = check_signed_withdrawal_superseded(
+                &state,
+                &redemption_id,
+                &entity,
+                request.superseding_tx,
+            )
+            .await?;
             send_command::<EquityRedemption>(
                 &state.pool,
                 &redemption_id,
-                EquityRedemptionCommand::Reconcile { reason },
+                EquityRedemptionCommand::Reconcile {
+                    reason,
+                    proven_withdrawal,
+                },
                 services,
             )
             .await
@@ -3280,6 +3314,306 @@ async fn reconcile_equity_transfer(
         transfer_id: id,
         outcome: "reconciled",
     }))
+}
+
+/// The redemption command is pure, so the chain proof that a signed vault
+/// withdrawal can never land is read before it, through the bot's equity
+/// transfer on the redemption's own chain. Returns the proven withdrawal's
+/// hash (`None` when there is none), which the command checks is still the
+/// redemption's, so a withdrawal signed during the check is never reconciled
+/// unproven. A `supersedingTx` on a redemption with no signed withdrawal is a
+/// `400`. A legacy redemption holding only a withdrawal hash is refused once
+/// that hash mined and succeeded; an adopted one is left for the command to
+/// refuse, with no chain read.
+async fn check_signed_withdrawal_superseded(
+    state: &AppState,
+    id: &RedemptionAggregateId,
+    redemption: &EquityRedemption,
+    superseding_tx: Option<TxHash>,
+) -> Result<Option<TxHash>, (StatusCode, Json<ErrorResponse>)> {
+    let prepared = redemption.prepared_withdrawal();
+    if prepared.is_none() && superseding_tx.is_some() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: format!(
+                    "Redemption {id} has no signed vault withdrawal; supersedingTx applies only \
+                     to one that has"
+                ),
+            }),
+        ));
+    }
+    let hash_only = redemption.hash_only_withdrawal();
+    if prepared.is_none() && hash_only.is_none() {
+        return Ok(None);
+    }
+
+    let handle = state.recovery.get().ok_or_else(|| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ErrorResponse {
+                error: "Recovery not ready yet (conductor still starting)".to_string(),
+            }),
+        )
+    })?;
+
+    let chain = redemption.chain();
+    let verified = match (prepared, hash_only) {
+        (Some(prepared), _) => match withdrawal_required_confirmations(&state.ctx.chains, chain) {
+            Ok(required_confirmations) => handle
+                .transfer
+                .verify_withdrawal_superseded(
+                    chain,
+                    prepared,
+                    superseding_tx,
+                    required_confirmations,
+                )
+                .await
+                .map(|()| Some(prepared.tx_hash())),
+            Err(error) => Err(error),
+        },
+        (None, Some(tx)) => handle
+            .transfer
+            .verify_hash_only_withdrawal_not_through(chain, tx)
+            .await
+            .map(|()| None),
+        (None, None) => Ok(None),
+    };
+
+    verified.map_err(|error| {
+        // `Display`, not `Debug`: a read error's `Debug` names the RPC URL,
+        // whose path carries the key.
+        warn!(%error, %id, "Refused to reconcile a redemption with an unresolved vault withdrawal");
+        let (status, message) = withdrawal_not_superseded_response(id, &error);
+        (status, Json(ErrorResponse { error: message }))
+    })
+}
+
+/// Maps a refused vault withdrawal chain check to an HTTP status: an unproven
+/// withdrawal is a `409` naming why; a failed chain read is a transient `502`.
+fn withdrawal_not_superseded_response(
+    id: &RedemptionAggregateId,
+    error: &WithdrawalNotSuperseded,
+) -> (StatusCode, String) {
+    match error {
+        WithdrawalNotSuperseded::UnreadableWithdrawal { .. }
+        | WithdrawalNotSuperseded::WithdrawalSignedByAnotherWallet { .. }
+        | WithdrawalNotSuperseded::WithdrawalWentThrough { .. }
+        | WithdrawalNotSuperseded::WithdrawalRevertUnconfirmed { .. }
+        | WithdrawalNotSuperseded::NoSupersedingTx { .. }
+        | WithdrawalNotSuperseded::SupersedingTxIsTheWithdrawal { .. }
+        | WithdrawalNotSuperseded::SupersedingTxNotMined { .. }
+        | WithdrawalNotSuperseded::SupersedingTxFromAnotherSender { .. }
+        | WithdrawalNotSuperseded::SupersedingTxAtAnotherNonce { .. }
+        | WithdrawalNotSuperseded::SupersedingTxUnconfirmed { .. }
+        | WithdrawalNotSuperseded::SupersedingTxNotAPlainCancel { .. }
+        | WithdrawalNotSuperseded::NoConfirmationDepth { .. }
+        | WithdrawalNotSuperseded::ChainServicesMissing(_) => (
+            StatusCode::CONFLICT,
+            format!("Redemption {id}: refusing to reconcile: {error}"),
+        ),
+        WithdrawalNotSuperseded::Read { .. } => (
+            StatusCode::BAD_GATEWAY,
+            "Chain RPC unavailable; retry later".to_string(),
+        ),
+    }
+}
+
+/// Wire contract for adopting a mined replacement of a redemption's signed
+/// vault withdrawal.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct AdoptWithdrawalReplacementRequest {
+    /// Operator audit reason, free text (required; persisted on the event).
+    reason: String,
+    /// The mined tx that took the signed withdrawal's nonce and did the
+    /// withdrawal itself.
+    replacement_tx: TxHash,
+}
+
+/// Adopts `replacementTx` as a redemption's vault withdrawal in place of its
+/// signed one, so the redemption finishes instead of waiting on a withdrawal
+/// that can never mine. For a tx that took the withdrawal's nonce but is not a
+/// plain cancel, e.g. a wallet "speed up" that sent the same `withdraw4` again
+/// at a higher fee: reconcile refuses it, because it may have moved the equity.
+///
+/// The bot first checks on the redemption's chain that the tx did what the
+/// withdrawal would have done (see
+/// [`verify_withdrawal_replacement`](crate::rebalancing::equity::verify_withdrawal_replacement)):
+/// `409` naming the failed check, `502` on a failed chain read, `503` before
+/// the bot is ready, `400` for a redemption holding no signed withdrawal. The
+/// command goes through the conductor owned store, as `fail_transfer` does, so
+/// the live transfer reactor sees the adoption and the write queues behind any
+/// command the redemption's job is sending. The redemption's redrive then
+/// confirms the adopted tx, records the vault transfer from its receipt and
+/// continues with the unwrap and send. Confirming it releases the withdrawal's
+/// nonce hold.
+async fn adopt_withdrawal_replacement(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(request): Json<AdoptWithdrawalReplacementRequest>,
+) -> Result<Json<TransferOpResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let reason = request.reason.trim().to_owned();
+    if reason.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: "reason is required".to_string(),
+            }),
+        ));
+    }
+    let redemption_id: RedemptionAggregateId = id.parse().map_err(|error| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: format!("Invalid redemption id: {error}"),
+            }),
+        )
+    })?;
+
+    // Admit the projection write before taking the recovery lock, as
+    // `fail_transfer` does.
+    let _projection_write = state.projection_maintenance.enter().await;
+    let _guard = state.resume_lock.0.try_lock().map_err(|_| {
+        (
+            StatusCode::CONFLICT,
+            Json(ErrorResponse {
+                error: "A transfer recovery operation is already in progress".to_string(),
+            }),
+        )
+    })?;
+    let handle = state.recovery.get().ok_or_else(|| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ErrorResponse {
+                error: "Recovery not ready yet (conductor still starting)".to_string(),
+            }),
+        )
+    })?;
+
+    let entity = handle
+        .redemption_store
+        .load(&redemption_id)
+        .await
+        .map_err(ops_store_error)?
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                Json(ErrorResponse {
+                    error: format!("Redemption aggregate not found: {id}"),
+                }),
+            )
+        })?;
+    let Some(prepared) = entity.prepared_withdrawal() else {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: format!(
+                    "Redemption {id} holds no signed vault withdrawal to replace; adopt applies \
+                     only to VaultWithdrawSubmitting or VaultWithdrawSubmitted with a signed \
+                     withdrawal"
+                ),
+            }),
+        ));
+    };
+
+    let chain = entity.chain();
+    let verified = match state.ctx.chains.required_confirmations(chain) {
+        Some(required_confirmations) => {
+            handle
+                .transfer
+                .verify_withdrawal_replacement(
+                    chain,
+                    prepared,
+                    request.replacement_tx,
+                    required_confirmations,
+                )
+                .await
+        }
+        None => Err(ReplacementNotAdoptable::NoConfirmationDepth { chain }),
+    };
+    let verified = match verified {
+        Ok(()) => match crate::equity_redemption::redemption_recording_withdrawal(
+            &state.pool,
+            request.replacement_tx,
+            &redemption_id,
+        )
+        .await
+        .map_err(ops_store_error)?
+        {
+            Some(redemption) => Err(
+                ReplacementNotAdoptable::ReplacementIsAnotherRedemptionsWithdrawal {
+                    replacement: request.replacement_tx,
+                    redemption,
+                },
+            ),
+            None => Ok(()),
+        },
+        Err(error) => Err(error),
+    };
+    verified.map_err(|error| {
+        // `Display`, not `Debug`: a read error's `Debug` names the RPC URL, whose
+        // path carries the key.
+        warn!(%error, %id, "Refused to adopt a vault withdrawal replacement");
+        let (status, message) = replacement_not_adoptable_response(&redemption_id, &error);
+        (status, Json(ErrorResponse { error: message }))
+    })?;
+
+    handle
+        .redemption_store
+        .send(
+            &redemption_id,
+            EquityRedemptionCommand::AdoptWithdrawalReplacement {
+                replacement_tx: request.replacement_tx,
+                replaced_withdrawal: prepared.tx_hash(),
+                reason,
+            },
+        )
+        .await
+        .map_err(ops_command_error)?;
+
+    info!(
+        %id, replacement_tx = %request.replacement_tx,
+        "Vault withdrawal replacement adopted via API"
+    );
+    Ok(Json(TransferOpResponse {
+        transfer_id: id,
+        outcome: "withdrawal_replacement_adopted",
+    }))
+}
+
+/// Maps a refused replacement check to an HTTP status: an unadoptable tx is a
+/// `409` naming why; a failed chain read is a transient `502`.
+fn replacement_not_adoptable_response(
+    id: &RedemptionAggregateId,
+    error: &ReplacementNotAdoptable,
+) -> (StatusCode, String) {
+    match error {
+        ReplacementNotAdoptable::UnreadableWithdrawal { .. }
+        | ReplacementNotAdoptable::WithdrawalSignedByAnotherWallet { .. }
+        | ReplacementNotAdoptable::ReplacementIsTheWithdrawal { .. }
+        | ReplacementNotAdoptable::ReplacementNotMined { .. }
+        | ReplacementNotAdoptable::ReplacementFromAnotherSender { .. }
+        | ReplacementNotAdoptable::ReplacementAtAnotherNonce { .. }
+        | ReplacementNotAdoptable::ReplacementUnconfirmed { .. }
+        | ReplacementNotAdoptable::ReplacementReverted { .. }
+        | ReplacementNotAdoptable::ReplacementCallsAnotherContract { .. }
+        | ReplacementNotAdoptable::ReplacementNotAWithdrawal { .. }
+        | ReplacementNotAdoptable::ReplacementWithdrawsAnotherVault { .. }
+        | ReplacementNotAdoptable::ReplacementWithdrewNothing { .. }
+        | ReplacementNotAdoptable::ReplacementReceiptUnreadable { .. }
+        | ReplacementNotAdoptable::ReplacementWithdrawsMore { .. }
+        | ReplacementNotAdoptable::ReplacementIsAnotherRedemptionsWithdrawal { .. }
+        | ReplacementNotAdoptable::NoConfirmationDepth { .. }
+        | ReplacementNotAdoptable::ChainServicesMissing(_) => (
+            StatusCode::CONFLICT,
+            format!("Redemption {id}: refusing to adopt the replacement: {error}"),
+        ),
+        ReplacementNotAdoptable::Read { .. } => (
+            StatusCode::BAD_GATEWAY,
+            "Chain RPC unavailable; retry later".to_string(),
+        ),
+    }
 }
 
 /// Maps a request parse failure to a `400` with the operator-facing reason. The
@@ -4019,6 +4353,10 @@ fn ops_api_routes(ops_api: Option<&OpsApiConfig>) -> Router<AppState> {
             post(reconcile_equity_transfer),
         )
         .route(
+            "/liquidity-write/transfers/equity_redemption/{id}/adopt-withdrawal",
+            post(adopt_withdrawal_replacement),
+        )
+        .route(
             "/liquidity-write/positions/{symbol}/release-hedge",
             post(release_position_hedge),
         )
@@ -4163,11 +4501,16 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
 
+    use alloy::consensus::{SignableTransaction as _, TxEip1559, TxEnvelope};
+    use alloy::eips::eip2718::{EIP1559_TX_TYPE_ID, Encodable2718 as _};
+    use alloy::eips::eip2930::AccessList;
     use alloy::primitives::{
-        Address, B256, Bytes, IntoLogData, TxHash, address, fixed_bytes, uint,
+        Address, B256, Bytes, IntoLogData, TxHash, TxKind, address, fixed_bytes, uint,
     };
     use alloy::providers::{ProviderBuilder, mock::Asserter};
     use alloy::rpc::types::Log;
+    use alloy::signers::SignerSync as _;
+    use alloy::signers::local::PrivateKeySigner;
     use alloy::sol_types::SolCall;
     use async_trait::async_trait;
     use axum::body::{Body, to_bytes};
@@ -4189,7 +4532,7 @@ mod tests {
     };
     use st0x_dto::{Trade, TradeOutcome, TradingVenue};
     use st0x_event_sorcery::{ReactorHarness, StoreBuilder};
-    use st0x_evm::Chain;
+    use st0x_evm::{Chain, MinedTx, PreparedTransaction};
     use st0x_execution::alpaca_broker_api::AlpacaBrokerMock;
     use st0x_execution::{
         AlpacaAccountId, AlpacaBrokerApiCtx, AlpacaBrokerApiMode, AlpacaWalletError,
@@ -4213,6 +4556,7 @@ mod tests {
     use crate::offchain::order::{
         OffchainOrder, OffchainOrderEvent, OffchainOrderId, OrderPlacementResult,
     };
+    use crate::onchain::mock::MockRaindex;
     use crate::onchain_trade::{
         InventoryVenue, OnChainTrade, OnChainTradeCommand, OnChainTradeId, OnChainTradeSource,
     };
@@ -7230,6 +7574,10 @@ mod tests {
                 "POST",
                 "/liquidity-write/transfers/equity_redemption/x/reconcile",
             ),
+            (
+                "POST",
+                "/liquidity-write/transfers/equity_redemption/x/adopt-withdrawal",
+            ),
             ("POST", "/liquidity-write/positions/x/release-hedge"),
             ("POST", "/liquidity-write/positions/x/set"),
             ("POST", "/liquidity-write/portfolio-snapshot/marks"),
@@ -7287,6 +7635,10 @@ mod tests {
             (
                 "POST",
                 "/liquidity-write/transfers/equity_redemption/x/reconcile",
+            ),
+            (
+                "POST",
+                "/liquidity-write/transfers/equity_redemption/x/adopt-withdrawal",
             ),
             ("POST", "/liquidity-write/positions/x/release-hedge"),
             ("POST", "/liquidity-write/positions/x/set"),
@@ -7518,18 +7870,24 @@ mod tests {
         }
     }
 
-    /// Builds an `AppState` with a published recovery handle whose USDC driver
-    /// pause is returned alongside its gate, so a test can hold an execution
-    /// in flight and drive the two operator routes through their real quiesce
-    /// call. The heavy handle dependencies are never touched on the 503 path
-    /// (the route refuses at the pause), but must exist to construct the handle.
-    async fn recovery_state_with_driver_pause() -> (AppState, UsdcDriverGate) {
-        recovery_state_for_ctx(create_test_ctx_with_order_owner(Address::ZERO)).await
+    /// Builds an `AppState` with a published recovery handle whose equity
+    /// transfer runs on `services` and whose USDC driver pause is returned
+    /// alongside its gate, so a test can hold an execution in flight and drive
+    /// the two operator routes through their real quiesce call. The heavy
+    /// handle dependencies are never touched on the 503 path (the route
+    /// refuses at the pause), but must exist to construct the handle.
+    async fn recovery_state_with_driver_pause(
+        services: EquityTransferServices,
+    ) -> (AppState, UsdcDriverGate) {
+        recovery_state_for_ctx(create_test_ctx_with_order_owner(Address::ZERO), services).await
     }
 
     /// [`recovery_state_with_driver_pause`] over a caller supplied `ctx`, for
     /// the capital routes that need a configured wallet.
-    async fn recovery_state_for_ctx(ctx: Ctx) -> (AppState, UsdcDriverGate) {
+    async fn recovery_state_for_ctx(
+        ctx: Ctx,
+        services: EquityTransferServices,
+    ) -> (AppState, UsdcDriverGate) {
         let state = empty_app_state(ctx).await;
 
         let (event_sender, _) = broadcast::channel(16);
@@ -7580,19 +7938,19 @@ mod tests {
         ));
 
         let usdc_store = standalone_usdc_store(&state.pool).await;
-        let gate = publish_recovery_handle(&state, rebalancing_service, usdc_store).await;
+        let gate = publish_recovery_handle(&state, rebalancing_service, usdc_store, services).await;
         (state, gate)
     }
 
-    /// Publishes a recovery handle over `rebalancing_service` and `usdc_store`
-    /// and returns the gate of its USDC driver pause. The equity services
-    /// panic if touched: the USDC and capital routes never reach them.
+    /// Publishes a recovery handle over `rebalancing_service` and `usdc_store`,
+    /// with its equity transfer on `services`, and returns the gate of its
+    /// USDC driver pause.
     async fn publish_recovery_handle(
         state: &AppState,
         rebalancing_service: Arc<RebalancingService>,
         usdc_store: Arc<Store<UsdcRebalance>>,
+        services: EquityTransferServices,
     ) -> UsdcDriverGate {
-        let services = EquityTransferServices::panicking();
         let (mint_store, _) = StoreBuilder::<TokenizedEquityMint>::new(state.pool.clone())
             .build(services.clone())
             .await
@@ -7637,7 +7995,8 @@ mod tests {
     /// unknown id, failing this 503 assertion.
     #[tokio::test]
     async fn resume_usdc_route_returns_503_when_driver_cannot_quiesce() {
-        let (state, gate) = recovery_state_with_driver_pause().await;
+        let (state, gate) =
+            recovery_state_with_driver_pause(EquityTransferServices::panicking()).await;
         let _executing = gate.enter().await;
         // Pause the clock only after the DB pools are built, so the quiesce
         // window's 5-second timer auto-advances without a real wait while the
@@ -7666,7 +8025,8 @@ mod tests {
     /// `left_unchanged`), failing this 503 assertion.
     #[tokio::test]
     async fn recheck_usdc_route_returns_503_when_driver_cannot_quiesce() {
-        let (state, gate) = recovery_state_with_driver_pause().await;
+        let (state, gate) =
+            recovery_state_with_driver_pause(EquityTransferServices::panicking()).await;
         let _executing = gate.enter().await;
         tokio::time::pause();
         let id = uuid::Uuid::new_v4();
@@ -7770,7 +8130,8 @@ mod tests {
     /// fixture service, whose `NotReady` 503 carries a different message.
     #[tokio::test]
     async fn transfer_usdc_route_returns_503_when_driver_cannot_quiesce() {
-        let (state, gate) = recovery_state_with_driver_pause().await;
+        let (state, gate) =
+            recovery_state_with_driver_pause(EquityTransferServices::panicking()).await;
         state.health.set_ready();
         let _executing = gate.enter().await;
         tokio::time::pause();
@@ -7802,7 +8163,9 @@ mod tests {
         let apalis_pool = crate::test_utils::setup_test_apalis_pool().await;
         let (service, store) =
             crate::rebalancing::trigger::wire_usdc_reactor_store(&state.pool, &apalis_pool).await;
-        let _gate = publish_recovery_handle(&state, service, store).await;
+        let _gate =
+            publish_recovery_handle(&state, service, store, EquityTransferServices::panicking())
+                .await;
 
         let Ok(Json(body)) = capital::transfer_usdc(
             State(state.clone()),
@@ -7949,7 +8312,7 @@ mod tests {
     async fn cctp_bridge_returns_409_while_the_resume_lock_is_held() {
         let mut ctx = create_test_ctx_with_order_owner(Address::ZERO);
         ctx.wallet = Some(st0x_config::OnchainWalletCtx::stub());
-        let (state, _gate) = recovery_state_for_ctx(ctx).await;
+        let (state, _gate) = recovery_state_for_ctx(ctx, EquityTransferServices::panicking()).await;
         state.health.set_ready();
         let resume_lock = Arc::clone(&state.resume_lock);
         let _held = resume_lock.0.try_lock().unwrap();
@@ -7979,7 +8342,7 @@ mod tests {
     async fn cctp_bridge_returns_503_while_the_corridor_wallets_are_not_gas_ready() {
         let mut ctx = create_test_ctx_with_order_owner(Address::ZERO);
         ctx.wallet = Some(st0x_config::OnchainWalletCtx::stub());
-        let (state, _gate) = recovery_state_for_ctx(ctx).await;
+        let (state, _gate) = recovery_state_for_ctx(ctx, EquityTransferServices::panicking()).await;
         state.health.set_ready();
         state
             .recovery
@@ -8026,7 +8389,7 @@ mod tests {
     async fn vault_deposit_returns_409_while_another_deposit_holds_the_lock() {
         let mut ctx = create_test_ctx_with_order_owner(Address::ZERO);
         ctx.wallet = Some(st0x_config::OnchainWalletCtx::stub());
-        let (state, _gate) = recovery_state_for_ctx(ctx).await;
+        let (state, _gate) = recovery_state_for_ctx(ctx, EquityTransferServices::panicking()).await;
         state.health.set_ready();
         let deposit_lock = Arc::clone(&state.vault_deposit_lock);
         let _held = deposit_lock.try_lock().unwrap();
@@ -8067,7 +8430,7 @@ mod tests {
             rebalancing: OperationMode::Disabled,
             operational_limit: None,
         });
-        let (state, _gate) = recovery_state_for_ctx(ctx).await;
+        let (state, _gate) = recovery_state_for_ctx(ctx, EquityTransferServices::panicking()).await;
         let vault = serde_json::json!({
             "chain": "base",
             "token": "0x0000000000000000000000000000000000000001",
@@ -8426,7 +8789,7 @@ mod tests {
         ctx.rebalancing.circle_api_base = circle.base_url();
         ctx.rebalancing.token_messenger = cctp.token_messenger;
         ctx.rebalancing.message_transmitter = cctp.message_transmitter;
-        let (state, _gate) = recovery_state_for_ctx(ctx).await;
+        let (state, _gate) = recovery_state_for_ctx(ctx, EquityTransferServices::panicking()).await;
         state.health.set_ready();
 
         let body = capital_success(
@@ -9030,8 +9393,12 @@ mod tests {
     }
 
     /// Seeds an `EquityRedemption` into the non-terminal `VaultWithdrawSubmitting`
-    /// origin (exact withdrawal signed and persisted, not yet broadcast).
-    async fn seed_redemption_submitting(pool: &SqlitePool, id: &RedemptionAggregateId) {
+    /// origin (exact withdrawal `prepared` signed and persisted, not yet broadcast).
+    async fn seed_redemption_submitting(
+        pool: &SqlitePool,
+        id: &RedemptionAggregateId,
+        prepared: PreparedTransaction,
+    ) {
         let (store, _projection) = StoreBuilder::<EquityRedemption>::new(pool.clone())
             .build(EquityTransferServices::panicking())
             .await
@@ -9047,7 +9414,7 @@ mod tests {
                     vault_id: st0x_raindex::RaindexVaultId(alloy::primitives::B256::ZERO),
                     amount: U256::from(1000u64),
                     from_block: 0,
-                    prepared: crate::equity_redemption::prepared_withdrawal_for_test(),
+                    prepared,
                 },
             )
             .await
@@ -9055,9 +9422,15 @@ mod tests {
     }
 
     /// Seeds an `EquityRedemption` into the non-terminal, non-reconcilable
-    /// `VaultWithdrawSubmitted` state (withdrawal broadcast, awaiting confirmation).
-    async fn seed_redemption_submitted(pool: &SqlitePool, id: &RedemptionAggregateId) {
-        seed_redemption_submitting(pool, id).await;
+    /// `VaultWithdrawSubmitted` state (withdrawal `prepared` broadcast, awaiting
+    /// confirmation).
+    async fn seed_redemption_submitted(
+        pool: &SqlitePool,
+        id: &RedemptionAggregateId,
+        prepared: PreparedTransaction,
+    ) {
+        let tx_hash = prepared.tx_hash();
+        seed_redemption_submitting(pool, id, prepared).await;
         let (store, _projection) = StoreBuilder::<EquityRedemption>::new(pool.clone())
             .build(EquityTransferServices::panicking())
             .await
@@ -9065,12 +9438,87 @@ mod tests {
         store
             .send(
                 id,
-                EquityRedemptionCommand::RecordWithdrawSubmission {
-                    tx_hash: alloy::primitives::TxHash::ZERO,
-                },
+                EquityRedemptionCommand::RecordWithdrawSubmission { tx_hash },
             )
             .await
             .unwrap();
+    }
+
+    /// The bot wallet nonce the ready-path reconcile tests sign the vault
+    /// withdrawal at.
+    const SIGNED_WITHDRAWAL_NONCE: u64 = 12;
+    /// The contract the ready-path reconcile tests' vault withdrawal calls.
+    const SIGNED_WITHDRAWAL_TARGET: Address = Address::repeat_byte(0x1A);
+    /// The token and vault the ready path reconcile tests' vault withdrawal
+    /// withdraws.
+    const SIGNED_WITHDRAWAL_TOKEN: Address = Address::repeat_byte(0x70);
+    const SIGNED_WITHDRAWAL_VAULT: B256 = B256::repeat_byte(0x7A);
+
+    /// `withdraw4` calldata withdrawing `target_amount` of `token` from
+    /// `vault_id`, as the bot signs it.
+    fn withdraw4_calldata(token: Address, vault_id: B256, target_amount: B256) -> Bytes {
+        Bytes::from(
+            crate::bindings::IRaindexInventory::withdraw4Call {
+                token,
+                vaultId: vault_id,
+                targetAmount: target_amount,
+                tasks: Vec::new(),
+            }
+            .abi_encode(),
+        )
+    }
+
+    /// A vault withdrawal on Base genuinely signed by `signer`, so the chain
+    /// check can recover its signer and target.
+    fn sign_vault_withdrawal(signer: &PrivateKeySigner) -> PreparedTransaction {
+        let unsigned = TxEip1559 {
+            chain_id: 8453,
+            nonce: SIGNED_WITHDRAWAL_NONCE,
+            gas_limit: 300_000,
+            max_fee_per_gas: 1_000_000_000,
+            max_priority_fee_per_gas: 1_000_000,
+            to: TxKind::Call(SIGNED_WITHDRAWAL_TARGET),
+            value: U256::ZERO,
+            access_list: AccessList::default(),
+            input: withdraw4_calldata(
+                SIGNED_WITHDRAWAL_TOKEN,
+                SIGNED_WITHDRAWAL_VAULT,
+                float!(10).get_inner(),
+            ),
+        };
+        let signature = signer.sign_hash_sync(&unsigned.signature_hash()).unwrap();
+        let envelope = TxEnvelope::from(unsigned.into_signed(signature));
+        PreparedTransaction::from_raw(Bytes::from(envelope.encoded_2718())).unwrap()
+    }
+
+    /// A ready bot whose Base equity services sign as `bot_wallet` and read the
+    /// chain through `raindex`, holding redemption `id` in
+    /// `VaultWithdrawSubmitted` with the signed withdrawal `prepared`. The test
+    /// ctx gives Base `required_confirmations = 1`.
+    async fn signed_withdrawal_reconcile_state(
+        bot_wallet: Address,
+        raindex: MockRaindex,
+        id: &RedemptionAggregateId,
+        prepared: PreparedTransaction,
+    ) -> AppState {
+        let state = signed_withdrawal_ready_state(bot_wallet, raindex).await;
+        seed_redemption_submitted(&state.pool, id, prepared).await;
+        state
+    }
+
+    /// A ready bot whose Base equity services sign as `bot_wallet` and read the
+    /// chain through `raindex`, holding no redemption yet.
+    async fn signed_withdrawal_ready_state(bot_wallet: Address, raindex: MockRaindex) -> AppState {
+        let mut services = EquityTransferServices::panicking();
+        let base = services
+            .chains
+            .get_mut(&Chain::Base)
+            .expect("panicking services wire every chain");
+        base.wallet = bot_wallet;
+        base.raindex = Arc::new(raindex);
+
+        let (state, _gate) = recovery_state_with_driver_pause(services).await;
+        state
     }
 
     #[tokio::test]
@@ -9359,7 +9807,8 @@ mod tests {
     /// leave the aggregate as it was.
     #[tokio::test]
     async fn reconcile_usdc_transfer_route_returns_409_while_the_resume_lock_is_held() {
-        let (state, _gate) = recovery_state_with_driver_pause().await;
+        let (state, _gate) =
+            recovery_state_with_driver_pause(EquityTransferServices::panicking()).await;
         let id = UsdcRebalanceId(uuid::Uuid::new_v4());
         seed_usdc_bridging_failed(&state.pool, &id).await;
         let resume_lock = Arc::clone(&state.resume_lock);
@@ -9391,7 +9840,8 @@ mod tests {
     /// `RecoverBridging` is not rejected against `Reconciled`.
     #[tokio::test]
     async fn reconcile_usdc_transfer_route_returns_503_while_a_transfer_is_executing() {
-        let (state, gate) = recovery_state_with_driver_pause().await;
+        let (state, gate) =
+            recovery_state_with_driver_pause(EquityTransferServices::panicking()).await;
         let id = UsdcRebalanceId(uuid::Uuid::new_v4());
         seed_usdc_bridging_failed(&state.pool, &id).await;
         let executing = gate.enter().await;
@@ -9608,7 +10058,8 @@ mod tests {
     /// lock lets the failure through, failing both assertions.
     #[tokio::test]
     async fn fail_usdc_transfer_route_returns_409_while_the_resume_lock_is_held() {
-        let (state, _gate) = recovery_state_with_driver_pause().await;
+        let (state, _gate) =
+            recovery_state_with_driver_pause(EquityTransferServices::panicking()).await;
         let id = UsdcRebalanceId(uuid::Uuid::new_v4());
         seed_usdc_bridging_submitting(&state.pool, &id, false).await;
         let resume_lock = Arc::clone(&state.resume_lock);
@@ -9640,7 +10091,8 @@ mod tests {
     /// failure through, failing both assertions.
     #[tokio::test]
     async fn fail_usdc_transfer_route_returns_503_while_a_transfer_is_executing() {
-        let (state, gate) = recovery_state_with_driver_pause().await;
+        let (state, gate) =
+            recovery_state_with_driver_pause(EquityTransferServices::panicking()).await;
         let id = UsdcRebalanceId(uuid::Uuid::new_v4());
         seed_usdc_bridging_submitting(&state.pool, &id, false).await;
         let executing = gate.enter().await;
@@ -9678,7 +10130,8 @@ mod tests {
     /// resumes and the resume lock is free for the next operator request.
     #[tokio::test]
     async fn fail_usdc_transfer_route_releases_the_driver_and_the_lock_after_success() {
-        let (state, gate) = recovery_state_with_driver_pause().await;
+        let (state, gate) =
+            recovery_state_with_driver_pause(EquityTransferServices::panicking()).await;
         let id = UsdcRebalanceId(uuid::Uuid::new_v4());
         seed_usdc_alpaca_to_base_withdrawal_complete(&state.pool, &id).await;
 
@@ -10544,6 +10997,7 @@ mod tests {
             Path(("equity_mint".to_string(), id.to_string())),
             Json(ReconcileEquityRequest {
                 reason: "handled out-of-band".to_string(),
+                superseding_tx: None,
             }),
         )
         .await;
@@ -10577,6 +11031,7 @@ mod tests {
             Path(("equity_redemption".to_string(), id.to_string())),
             Json(ReconcileEquityRequest {
                 reason: "handled out-of-band".to_string(),
+                superseding_tx: None,
             }),
         )
         .await;
@@ -10610,6 +11065,7 @@ mod tests {
             Path(("equity_mint".to_string(), id.to_string())),
             Json(ReconcileEquityRequest {
                 reason: "handled out-of-band".to_string(),
+                superseding_tx: None,
             }),
         )
         .await;
@@ -10621,26 +11077,118 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reconcile_equity_transfer_reconciles_a_submitting_redemption() {
-        // The one in-flight state with no automatic exit: an operator who
-        // verified the withdrawal's on-chain fate reconciles it out-of-band.
+    async fn reconcile_equity_transfer_does_not_reconcile_a_signed_withdrawal_on_the_operators_word()
+     {
+        // A signed withdrawal stuck below the market fee can still mine when
+        // fees drop, so reconcile needs the bot's chain proof; before the bot
+        // is ready there is none, and the redemption stays unresolved.
         let ctx = create_test_ctx_with_order_owner(Address::ZERO);
         let state = empty_app_state(ctx).await;
-        let id = redemption_aggregate_id("api-redemption-submitting");
-        seed_redemption_submitting(&state.pool, &id).await;
+        let id = redemption_aggregate_id("api-redemption-submitted-reconcile");
+        seed_redemption_submitted(
+            &state.pool,
+            &id,
+            crate::equity_redemption::prepared_withdrawal_for_test(),
+        )
+        .await;
 
         let resp = reconcile_equity_transfer(
             State(state.clone()),
             Path(("equity_redemption".to_string(), id.to_string())),
             Json(ReconcileEquityRequest {
-                reason: "withdrawal never broadcast; verified on-chain".to_string(),
+                reason: "withdrawal outrun by fees; verified dead onchain".to_string(),
+                superseding_tx: None,
             }),
         )
         .await;
 
-        let Ok(Json(_)) = resp else {
-            panic!("a stuck submitting redemption must reconcile");
+        let Err((status, _)) = resp else {
+            panic!("a signed withdrawal must not reconcile without the chain proof");
         };
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        let entity = load_entity::<EquityRedemption>(&state.pool, &id)
+            .await
+            .unwrap()
+            .expect("redemption aggregate must exist");
+        assert!(
+            matches!(entity, EquityRedemption::VaultWithdrawSubmitted { .. }),
+            "the redemption must stay unresolved, got {entity:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_equity_transfer_refuses_a_superseding_tx_without_a_signed_withdrawal() {
+        let ctx = create_test_ctx_with_order_owner(Address::ZERO);
+        let state = empty_app_state(ctx).await;
+        let id = redemption_aggregate_id("api-redemption-failed-superseding");
+        seed_redemption_failed(&state.pool, &id).await;
+
+        let resp = reconcile_equity_transfer(
+            State(state.clone()),
+            Path(("equity_redemption".to_string(), id.to_string())),
+            Json(ReconcileEquityRequest {
+                reason: "handled out-of-band".to_string(),
+                superseding_tx: Some(TxHash::repeat_byte(0xCA)),
+            }),
+        )
+        .await;
+
+        let Err((status, _)) = resp else {
+            panic!("a superseding tx on a redemption with no signed withdrawal must be refused");
+        };
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        let entity = load_entity::<EquityRedemption>(&state.pool, &id)
+            .await
+            .unwrap()
+            .expect("redemption aggregate must exist");
+        assert!(
+            matches!(entity, EquityRedemption::Failed { .. }),
+            "a refused request must not reconcile, got {entity:?}",
+        );
+    }
+
+    /// A confirmed 0-value self-transfer from the bot wallet at the withdrawal's
+    /// nonce proves the withdrawal can never land, so the redemption reconciles.
+    #[tokio::test]
+    async fn reconcile_equity_transfer_reconciles_a_signed_withdrawal_after_a_confirmed_cancel() {
+        let signer = PrivateKeySigner::random();
+        let bot_wallet = signer.address();
+        let prepared = sign_vault_withdrawal(&signer);
+        let cancel = TxHash::repeat_byte(0xCA);
+        let raindex = MockRaindex::new().with_mined_tx(
+            cancel,
+            MinedTx {
+                from: bot_wallet,
+                to: Some(bot_wallet),
+                nonce: SIGNED_WITHDRAWAL_NONCE,
+                value: U256::ZERO,
+                input: Bytes::new(),
+                tx_type: EIP1559_TX_TYPE_ID,
+                succeeded: true,
+                emitted_logs: false,
+                confirmations: 1,
+            },
+        );
+        let id = redemption_aggregate_id("api-redemption-signed-cancelled");
+        let state = signed_withdrawal_reconcile_state(bot_wallet, raindex, &id, prepared).await;
+
+        let resp = reconcile_equity_transfer(
+            State(state.clone()),
+            Path(("equity_redemption".to_string(), id.to_string())),
+            Json(ReconcileEquityRequest {
+                reason: "withdrawal cancelled at its nonce".to_string(),
+                superseding_tx: Some(cancel),
+            }),
+        )
+        .await;
+
+        let Ok(Json(body)) = resp else {
+            panic!("a confirmed cancel must reconcile the redemption");
+        };
+        assert_eq!(
+            serde_json::to_value(&body).unwrap(),
+            serde_json::json!({ "transferId": id.to_string(), "outcome": "reconciled" }),
+        );
         let entity = load_entity::<EquityRedemption>(&state.pool, &id)
             .await
             .unwrap()
@@ -10651,28 +11199,51 @@ mod tests {
         );
     }
 
+    /// A confirmed revert used the withdrawal's nonce and moved nothing, so it
+    /// proves itself with no superseding tx.
     #[tokio::test]
-    async fn reconcile_equity_transfer_reconciles_a_submitted_redemption() {
-        // A broadcast withdrawal (`VaultWithdrawSubmitted`) may still be live
-        // onchain and is never failed automatically, so an operator who verified
-        // it will never land reconciles it out of band, like the submitting origin.
-        let ctx = create_test_ctx_with_order_owner(Address::ZERO);
-        let state = empty_app_state(ctx).await;
-        let id = redemption_aggregate_id("api-redemption-submitted-reconcile");
-        seed_redemption_submitted(&state.pool, &id).await;
+    async fn reconcile_equity_transfer_reconciles_a_confirmed_reverted_withdrawal() {
+        let signer = PrivateKeySigner::random();
+        let bot_wallet = signer.address();
+        let prepared = sign_vault_withdrawal(&signer);
+        let raindex = MockRaindex::new().with_mined_tx(
+            prepared.tx_hash(),
+            MinedTx {
+                from: bot_wallet,
+                to: Some(SIGNED_WITHDRAWAL_TARGET),
+                nonce: SIGNED_WITHDRAWAL_NONCE,
+                value: U256::ZERO,
+                input: withdraw4_calldata(
+                    SIGNED_WITHDRAWAL_TOKEN,
+                    SIGNED_WITHDRAWAL_VAULT,
+                    float!(10).get_inner(),
+                ),
+                tx_type: EIP1559_TX_TYPE_ID,
+                succeeded: false,
+                emitted_logs: false,
+                confirmations: 1,
+            },
+        );
+        let id = redemption_aggregate_id("api-redemption-signed-reverted");
+        let state = signed_withdrawal_reconcile_state(bot_wallet, raindex, &id, prepared).await;
 
         let resp = reconcile_equity_transfer(
             State(state.clone()),
             Path(("equity_redemption".to_string(), id.to_string())),
             Json(ReconcileEquityRequest {
-                reason: "withdrawal outrun by fees; verified dead onchain".to_string(),
+                reason: "withdrawal reverted onchain".to_string(),
+                superseding_tx: None,
             }),
         )
         .await;
 
-        let Ok(Json(_)) = resp else {
-            panic!("a stuck submitted redemption must reconcile");
+        let Ok(Json(body)) = resp else {
+            panic!("a confirmed reverted withdrawal must reconcile the redemption");
         };
+        assert_eq!(
+            serde_json::to_value(&body).unwrap(),
+            serde_json::json!({ "transferId": id.to_string(), "outcome": "reconciled" }),
+        );
         let entity = load_entity::<EquityRedemption>(&state.pool, &id)
             .await
             .unwrap()
@@ -10681,6 +11252,626 @@ mod tests {
             matches!(entity, EquityRedemption::Reconciled { .. }),
             "the redemption must land in the Reconciled terminal, got {entity:?}",
         );
+    }
+
+    /// A signed withdrawal with no receipt can still mine when fees drop, so
+    /// with no superseding tx the route refuses with a 409 naming the nonce.
+    #[tokio::test]
+    async fn reconcile_equity_transfer_refuses_an_unmined_withdrawal_without_a_superseding_tx() {
+        let signer = PrivateKeySigner::random();
+        let bot_wallet = signer.address();
+        let prepared = sign_vault_withdrawal(&signer);
+        let tx = prepared.tx_hash();
+        let id = redemption_aggregate_id("api-redemption-signed-unmined");
+        let state =
+            signed_withdrawal_reconcile_state(bot_wallet, MockRaindex::new(), &id, prepared).await;
+
+        let resp = reconcile_equity_transfer(
+            State(state.clone()),
+            Path(("equity_redemption".to_string(), id.to_string())),
+            Json(ReconcileEquityRequest {
+                reason: "withdrawal outrun by fees".to_string(),
+                superseding_tx: None,
+            }),
+        )
+        .await;
+
+        let Err((status, Json(body))) = resp else {
+            panic!("an unmined signed withdrawal must not reconcile without a superseding tx");
+        };
+        assert_eq!(status, StatusCode::CONFLICT);
+        let refused = WithdrawalNotSuperseded::NoSupersedingTx {
+            tx,
+            nonce: SIGNED_WITHDRAWAL_NONCE,
+        };
+        assert_eq!(
+            serde_json::to_value(&body).unwrap(),
+            serde_json::json!({
+                "error": format!("Redemption {id}: refusing to reconcile: {refused}")
+            }),
+        );
+        let entity = load_entity::<EquityRedemption>(&state.pool, &id)
+            .await
+            .unwrap()
+            .expect("redemption aggregate must exist");
+        assert!(
+            matches!(entity, EquityRedemption::VaultWithdrawSubmitted { .. }),
+            "a refused reconcile must leave the redemption unresolved, got {entity:?}",
+        );
+    }
+
+    /// A failed chain read proves nothing, so the route answers a transient 502
+    /// and leaves the redemption unresolved.
+    #[tokio::test]
+    async fn reconcile_equity_transfer_returns_502_when_the_chain_read_fails() {
+        let signer = PrivateKeySigner::random();
+        let bot_wallet = signer.address();
+        let prepared = sign_vault_withdrawal(&signer);
+        let raindex = MockRaindex::new().with_mined_tx_read_error(prepared.tx_hash());
+        let id = redemption_aggregate_id("api-redemption-signed-read-error");
+        let state = signed_withdrawal_reconcile_state(bot_wallet, raindex, &id, prepared).await;
+
+        let resp = reconcile_equity_transfer(
+            State(state.clone()),
+            Path(("equity_redemption".to_string(), id.to_string())),
+            Json(ReconcileEquityRequest {
+                reason: "withdrawal cancelled at its nonce".to_string(),
+                superseding_tx: Some(TxHash::repeat_byte(0xCA)),
+            }),
+        )
+        .await;
+
+        let Err((status, Json(body))) = resp else {
+            panic!("a failed chain read must not reconcile the redemption");
+        };
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            serde_json::to_value(&body).unwrap(),
+            serde_json::json!({ "error": "Chain RPC unavailable; retry later" }),
+        );
+        let entity = load_entity::<EquityRedemption>(&state.pool, &id)
+            .await
+            .unwrap()
+            .expect("redemption aggregate must exist");
+        assert!(
+            matches!(entity, EquityRedemption::VaultWithdrawSubmitted { .. }),
+            "a failed chain read must leave the redemption unresolved, got {entity:?}",
+        );
+    }
+
+    /// A `withdraw4` of the signed withdrawal's token and vault at its nonce,
+    /// for `target_amount`, as the chain reports it.
+    fn mined_at_withdrawal_nonce(from: Address, to: Address, target_amount: B256) -> MinedTx {
+        MinedTx {
+            from,
+            to: Some(to),
+            nonce: SIGNED_WITHDRAWAL_NONCE,
+            value: U256::ZERO,
+            input: withdraw4_calldata(
+                SIGNED_WITHDRAWAL_TOKEN,
+                SIGNED_WITHDRAWAL_VAULT,
+                target_amount,
+            ),
+            tx_type: EIP1559_TX_TYPE_ID,
+            succeeded: true,
+            emitted_logs: true,
+            confirmations: 1,
+        }
+    }
+
+    /// A chain showing `speed_up` as a confirmed `withdraw4` of the signed
+    /// withdrawal's token and vault at its nonce, whose receipt pays the bot
+    /// wallet.
+    fn adoptable_speed_up(bot_wallet: Address, speed_up: TxHash) -> MockRaindex {
+        MockRaindex::new()
+            .with_mined_tx(
+                speed_up,
+                mined_at_withdrawal_nonce(
+                    bot_wallet,
+                    SIGNED_WITHDRAWAL_TARGET,
+                    float!(5).get_inner(),
+                ),
+            )
+            .with_transfer_receipt(speed_up, SIGNED_WITHDRAWAL_TOKEN, bot_wallet, U256::from(7))
+    }
+
+    async fn adopt(
+        state: &AppState,
+        id: &RedemptionAggregateId,
+        replacement_tx: TxHash,
+    ) -> Result<Json<TransferOpResponse>, (StatusCode, Json<ErrorResponse>)> {
+        adopt_withdrawal_replacement(
+            State(state.clone()),
+            Path(id.to_string()),
+            Json(AdoptWithdrawalReplacementRequest {
+                reason: "wallet sped up the withdrawal".to_string(),
+                replacement_tx,
+            }),
+        )
+        .await
+    }
+
+    /// A successful `withdraw4` at the withdrawal's nonce to the contract it
+    /// calls, from the same token and vault, e.g. a wallet "speed up" of the
+    /// withdrawal, becomes the redemption's withdrawal, with no signed bytes
+    /// left. A different amount is adopted too: the receipt records what moved.
+    #[tokio::test]
+    async fn adopt_withdrawal_replacement_adopts_a_confirmed_call_to_the_withdrawal_target() {
+        let signer = PrivateKeySigner::random();
+        let bot_wallet = signer.address();
+        let prepared = sign_vault_withdrawal(&signer);
+        let speed_up = TxHash::repeat_byte(0x5E);
+        let raindex = adoptable_speed_up(bot_wallet, speed_up);
+        let id = redemption_aggregate_id("api-redemption-adopt");
+        let state = signed_withdrawal_reconcile_state(bot_wallet, raindex, &id, prepared).await;
+
+        let Ok(Json(body)) = adopt(&state, &id, speed_up).await else {
+            panic!("a confirmed call to the withdrawal target must be adopted");
+        };
+        assert_eq!(
+            serde_json::to_value(&body).unwrap(),
+            serde_json::json!({
+                "transferId": id.to_string(),
+                "outcome": "withdrawal_replacement_adopted",
+            }),
+        );
+        let entity = load_entity::<EquityRedemption>(&state.pool, &id)
+            .await
+            .unwrap()
+            .expect("redemption aggregate must exist");
+        assert!(
+            matches!(
+                entity,
+                EquityRedemption::VaultWithdrawSubmitted {
+                    tx_hash,
+                    prepared: None,
+                    ..
+                } if tx_hash == speed_up
+            ),
+            "the adopted tx must become the redemption's withdrawal, got {entity:?}",
+        );
+    }
+
+    /// The adoption goes through the conductor's store, so the redemption view
+    /// folds it: one adopted from `VaultWithdrawSubmitting` shows as submitted
+    /// with the adopted hash, which the next `ConfirmWithdraw` can follow.
+    #[tokio::test]
+    async fn adopting_from_submitting_updates_the_redemption_view() {
+        let signer = PrivateKeySigner::random();
+        let bot_wallet = signer.address();
+        let prepared = sign_vault_withdrawal(&signer);
+        let replaced = prepared.tx_hash();
+        let speed_up = TxHash::repeat_byte(0x5E);
+        let raindex = adoptable_speed_up(bot_wallet, speed_up);
+        let state = signed_withdrawal_ready_state(bot_wallet, raindex).await;
+        let id = redemption_aggregate_id("api-redemption-adopt-view");
+        seed_redemption_submitting(&state.pool, &id, prepared).await;
+        let (_store, view) = StoreBuilder::<EquityRedemption>::new(state.pool.clone())
+            .build(EquityTransferServices::panicking())
+            .await
+            .unwrap();
+        assert!(matches!(
+            view.load(&id).await.unwrap(),
+            Some(EquityRedemption::VaultWithdrawSubmitting { .. })
+        ));
+
+        let Ok(_) = adopt(&state, &id, speed_up).await else {
+            panic!("a confirmed call to the withdrawal target must be adopted");
+        };
+
+        let viewed = view.load(&id).await.unwrap();
+        assert!(
+            matches!(
+                viewed,
+                Some(EquityRedemption::VaultWithdrawSubmitted {
+                    tx_hash,
+                    prepared: None,
+                    adopted_from: Some(adopted_from),
+                    ..
+                }) if tx_hash == speed_up && adopted_from == replaced
+            ),
+            "the view must fold the adoption, got {viewed:?}"
+        );
+    }
+
+    /// An adopted replacement moved the equity, so reconcile refuses it as
+    /// adopted, without treating it as a legacy hash to read: the redrive
+    /// confirms it.
+    #[tokio::test]
+    async fn reconcile_refuses_an_adopted_replacement() {
+        let signer = PrivateKeySigner::random();
+        let bot_wallet = signer.address();
+        let speed_up = TxHash::repeat_byte(0x5E);
+        let raindex = adoptable_speed_up(bot_wallet, speed_up);
+        let id = redemption_aggregate_id("api-redemption-adopt-then-reconcile");
+        let state = signed_withdrawal_reconcile_state(
+            bot_wallet,
+            raindex,
+            &id,
+            sign_vault_withdrawal(&signer),
+        )
+        .await;
+        let Ok(_) = adopt(&state, &id, speed_up).await else {
+            panic!("a confirmed call to the withdrawal target must be adopted");
+        };
+
+        let Err((status, Json(body))) = reconcile_equity_transfer(
+            State(state.clone()),
+            Path(("equity_redemption".to_string(), id.to_string())),
+            Json(ReconcileEquityRequest {
+                reason: "settled by hand".to_string(),
+                superseding_tx: None,
+            }),
+        )
+        .await
+        else {
+            panic!("an adopted replacement must not be reconciled");
+        };
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert!(
+            body.error
+                .contains("is an adopted replacement that moved the equity"),
+            "{}",
+            body.error
+        );
+        assert!(matches!(
+            load_entity::<EquityRedemption>(&state.pool, &id)
+                .await
+                .unwrap(),
+            Some(EquityRedemption::VaultWithdrawSubmitted { .. })
+        ));
+    }
+
+    /// Each chain check refuses with its reason and leaves the signed
+    /// withdrawal in place.
+    #[tokio::test]
+    async fn adopt_withdrawal_replacement_refuses_each_unadoptable_tx() {
+        let signer = PrivateKeySigner::random();
+        let bot_wallet = signer.address();
+        let other = Address::repeat_byte(0x0E);
+        let candidate = TxHash::repeat_byte(0x5E);
+        let valid =
+            mined_at_withdrawal_nonce(bot_wallet, SIGNED_WITHDRAWAL_TARGET, float!(10).get_inner());
+        let cases: [(&str, Option<MinedTx>, &str); 10] = [
+            (
+                "another sender",
+                Some(MinedTx {
+                    from: other,
+                    ..valid.clone()
+                }),
+                "was sent by",
+            ),
+            (
+                "another nonce",
+                Some(MinedTx {
+                    nonce: SIGNED_WITHDRAWAL_NONCE + 1,
+                    ..valid.clone()
+                }),
+                "is at nonce",
+            ),
+            (
+                "unconfirmed",
+                Some(MinedTx {
+                    confirmations: 0,
+                    ..valid.clone()
+                }),
+                "required confirmations",
+            ),
+            (
+                "reverted",
+                Some(MinedTx {
+                    succeeded: false,
+                    ..valid.clone()
+                }),
+                "reverted, so it withdrew nothing",
+            ),
+            (
+                "another target",
+                Some(MinedTx {
+                    to: Some(other),
+                    ..valid.clone()
+                }),
+                "so it did not do the withdrawal",
+            ),
+            (
+                "not a withdraw4",
+                Some(MinedTx {
+                    input: Bytes::from_static(&[0xde, 0xad, 0xbe, 0xef]),
+                    ..valid.clone()
+                }),
+                "is not a withdraw4 call",
+            ),
+            (
+                "another token",
+                Some(MinedTx {
+                    input: withdraw4_calldata(
+                        other,
+                        SIGNED_WITHDRAWAL_VAULT,
+                        float!(10).get_inner(),
+                    ),
+                    ..valid.clone()
+                }),
+                "not token",
+            ),
+            (
+                "another vault",
+                Some(MinedTx {
+                    input: withdraw4_calldata(
+                        SIGNED_WITHDRAWAL_TOKEN,
+                        B256::repeat_byte(0x0E),
+                        float!(10).get_inner(),
+                    ),
+                    ..valid.clone()
+                }),
+                "from vault 0x0e0e0e0e",
+            ),
+            (
+                "a larger amount",
+                Some(MinedTx {
+                    input: withdraw4_calldata(
+                        SIGNED_WITHDRAWAL_TOKEN,
+                        SIGNED_WITHDRAWAL_VAULT,
+                        float!(20).get_inner(),
+                    ),
+                    ..valid
+                }),
+                "more than the 10 the vault withdrawal booked",
+            ),
+            ("not mined", None, "is not mined"),
+        ];
+
+        for (case, mined, reason) in cases {
+            let prepared = sign_vault_withdrawal(&signer);
+            let raindex = mined.map_or_else(MockRaindex::new, |mined| {
+                MockRaindex::new().with_mined_tx(candidate, mined)
+            });
+            let id = redemption_aggregate_id(&format!("api-redemption-adopt-{case}"));
+            let state = signed_withdrawal_reconcile_state(bot_wallet, raindex, &id, prepared).await;
+
+            let Err((status, Json(body))) = adopt(&state, &id, candidate).await else {
+                panic!("{case}: an unadoptable tx must be refused");
+            };
+            assert_eq!(status, StatusCode::CONFLICT, "{case}");
+            assert!(body.error.contains(reason), "{case}: {}", body.error);
+            let entity = load_entity::<EquityRedemption>(&state.pool, &id)
+                .await
+                .unwrap()
+                .expect("redemption aggregate must exist");
+            assert!(
+                matches!(
+                    entity,
+                    EquityRedemption::VaultWithdrawSubmitted {
+                        prepared: Some(_),
+                        ..
+                    }
+                ),
+                "{case}: a refusal must keep the signed withdrawal, got {entity:?}",
+            );
+        }
+
+        let prepared = sign_vault_withdrawal(&signer);
+        let itself = prepared.tx_hash();
+        let id = redemption_aggregate_id("api-redemption-adopt-itself");
+        let state =
+            signed_withdrawal_reconcile_state(bot_wallet, MockRaindex::new(), &id, prepared).await;
+        let Err((status, Json(body))) = adopt(&state, &id, itself).await else {
+            panic!("the withdrawal itself must not be adopted as its replacement");
+        };
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert!(
+            body.error.contains("is the vault withdrawal itself"),
+            "{}",
+            body.error
+        );
+
+        // A successful withdraw4 that paid the bot wallet nothing, e.g. one of
+        // zero, would leave ConfirmWithdraw no transfer to record.
+        let paid_elsewhere = TxHash::repeat_byte(0x6E);
+        let raindex = MockRaindex::new()
+            .with_mined_tx(
+                paid_elsewhere,
+                mined_at_withdrawal_nonce(
+                    bot_wallet,
+                    SIGNED_WITHDRAWAL_TARGET,
+                    float!(5).get_inner(),
+                ),
+            )
+            .with_transfer_receipt(
+                paid_elsewhere,
+                SIGNED_WITHDRAWAL_TOKEN,
+                other,
+                U256::from(7),
+            );
+        let id = redemption_aggregate_id("api-redemption-adopt-paid-nothing");
+        let state = signed_withdrawal_reconcile_state(
+            bot_wallet,
+            raindex,
+            &id,
+            sign_vault_withdrawal(&signer),
+        )
+        .await;
+        let Err((status, Json(body))) = adopt(&state, &id, paid_elsewhere).await else {
+            panic!("a replacement that paid the bot wallet nothing must not be adopted");
+        };
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert!(
+            body.error.contains("so it did not do the withdrawal")
+                && body.error.contains("paid the bot wallet"),
+            "{}",
+            body.error
+        );
+    }
+
+    /// After a nonce is reused (a lagging RPC served a stale pending nonce),
+    /// the tx at it can be an earlier redemption's withdrawal. It passes every
+    /// chain check, but that redemption already records its vault transfer.
+    #[tokio::test]
+    async fn adopt_withdrawal_replacement_refuses_another_redemptions_withdrawal() {
+        let signer = PrivateKeySigner::random();
+        let bot_wallet = signer.address();
+        let earlier_withdrawal = TxHash::repeat_byte(0x5E);
+        let id = redemption_aggregate_id("api-redemption-adopt-reused-nonce");
+        let state = signed_withdrawal_reconcile_state(
+            bot_wallet,
+            adoptable_speed_up(bot_wallet, earlier_withdrawal),
+            &id,
+            sign_vault_withdrawal(&signer),
+        )
+        .await;
+        let earlier = redemption_aggregate_id("api-redemption-earlier-at-the-nonce");
+        seed_redemption_submitted(
+            &state.pool,
+            &earlier,
+            PreparedTransaction::for_test(earlier_withdrawal, SIGNED_WITHDRAWAL_NONCE),
+        )
+        .await;
+
+        let Err((status, Json(body))) = adopt(&state, &id, earlier_withdrawal).await else {
+            panic!("another redemption's withdrawal must not be adopted");
+        };
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert!(
+            body.error.contains(&format!(
+                "is already the vault withdrawal of redemption {earlier}"
+            )),
+            "{}",
+            body.error
+        );
+        assert!(matches!(
+            load_entity::<EquityRedemption>(&state.pool, &id)
+                .await
+                .unwrap(),
+            Some(EquityRedemption::VaultWithdrawSubmitted {
+                prepared: Some(_),
+                ..
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn adopt_withdrawal_replacement_returns_502_when_the_chain_read_fails() {
+        let signer = PrivateKeySigner::random();
+        let bot_wallet = signer.address();
+        let prepared = sign_vault_withdrawal(&signer);
+        let candidate = TxHash::repeat_byte(0x5E);
+        let raindex = MockRaindex::new().with_mined_tx_read_error(candidate);
+        let id = redemption_aggregate_id("api-redemption-adopt-read-error");
+        let state = signed_withdrawal_reconcile_state(bot_wallet, raindex, &id, prepared).await;
+
+        let Err((status, _)) = adopt(&state, &id, candidate).await else {
+            panic!("a failed chain read must not adopt the replacement");
+        };
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+    }
+
+    /// Before the bot is ready there is no chain check, so nothing is adopted;
+    /// and a redemption holding no signed withdrawal has nothing to replace.
+    #[tokio::test]
+    async fn adopt_withdrawal_replacement_needs_a_ready_bot_and_a_signed_withdrawal() {
+        let ctx = create_test_ctx_with_order_owner(Address::ZERO);
+        let state = empty_app_state(ctx).await;
+        let submitted = redemption_aggregate_id("api-redemption-adopt-not-ready");
+        seed_redemption_submitted(
+            &state.pool,
+            &submitted,
+            crate::equity_redemption::prepared_withdrawal_for_test(),
+        )
+        .await;
+        let Err((status, _)) = adopt(&state, &submitted, TxHash::repeat_byte(0x5E)).await else {
+            panic!("nothing is adopted before the bot is ready");
+        };
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+
+        let (ready, _gate) =
+            recovery_state_with_driver_pause(EquityTransferServices::panicking()).await;
+        let failed = redemption_aggregate_id("api-redemption-adopt-failed");
+        seed_redemption_failed(&ready.pool, &failed).await;
+        let Err((status, Json(body))) = adopt(&ready, &failed, TxHash::repeat_byte(0x5E)).await
+        else {
+            panic!("a redemption with no signed withdrawal has nothing to replace");
+        };
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(
+            body.error.contains("holds no signed vault withdrawal"),
+            "{}",
+            body.error
+        );
+    }
+
+    /// A mint has no vault withdrawal, so a superseding tx on it is a 400.
+    #[tokio::test]
+    async fn reconcile_equity_transfer_refuses_a_superseding_tx_on_a_mint() {
+        let ctx = create_test_ctx_with_order_owner(Address::ZERO);
+        let state = empty_app_state(ctx).await;
+        let id = issuer_request_id("api-mint-failed-superseding");
+        seed_mint_failed(&state.pool, &id).await;
+
+        let resp = reconcile_equity_transfer(
+            State(state.clone()),
+            Path(("equity_mint".to_string(), id.to_string())),
+            Json(ReconcileEquityRequest {
+                reason: "handled out-of-band".to_string(),
+                superseding_tx: Some(TxHash::repeat_byte(0xCA)),
+            }),
+        )
+        .await;
+
+        let Err((status, Json(body))) = resp else {
+            panic!("a superseding tx on a mint must be refused");
+        };
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            serde_json::to_value(&body).unwrap(),
+            serde_json::json!({
+                "error": "supersedingTx applies only to a redemption with a signed vault withdrawal"
+            }),
+        );
+        let entity = load_entity::<TokenizedEquityMint>(&state.pool, &id)
+            .await
+            .unwrap()
+            .expect("mint aggregate must exist");
+        assert!(
+            matches!(entity, TokenizedEquityMint::Failed { .. }),
+            "a refused request must not reconcile, got {entity:?}",
+        );
+    }
+
+    #[test]
+    fn reconcile_equity_request_decodes_an_optional_superseding_tx() {
+        let request: ReconcileEquityRequest = serde_json::from_value(serde_json::json!({
+            "reason": "x",
+            "supersedingTx": "0xcacacacacacacacacacacacacacacacacacacacacacacacacacacacacacacaca",
+        }))
+        .unwrap();
+        assert_eq!(request.reason, "x");
+        assert_eq!(request.superseding_tx, Some(TxHash::repeat_byte(0xCA)));
+
+        let request: ReconcileEquityRequest =
+            serde_json::from_value(serde_json::json!({ "reason": "x" })).unwrap();
+        assert_eq!(request.superseding_tx, None);
+    }
+
+    #[test]
+    fn withdrawal_not_superseded_response_names_why_or_asks_to_retry() {
+        let id = redemption_aggregate_id("api-withdrawal-response");
+        let tx = TxHash::repeat_byte(0x66);
+
+        let refused = WithdrawalNotSuperseded::NoSupersedingTx { tx, nonce: 7 };
+        assert_eq!(
+            withdrawal_not_superseded_response(&id, &refused),
+            (
+                StatusCode::CONFLICT,
+                format!("Redemption {id}: refusing to reconcile: {refused}")
+            )
+        );
+        let (status, _) = withdrawal_not_superseded_response(
+            &id,
+            &WithdrawalNotSuperseded::Read {
+                tx,
+                source: Box::new(st0x_raindex::RaindexError::ZeroAmount),
+            },
+        );
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
     }
 
     #[tokio::test]
@@ -10694,6 +11885,7 @@ mod tests {
             Path(("equity_mint".to_string(), id.to_string())),
             Json(ReconcileEquityRequest {
                 reason: "handled out-of-band".to_string(),
+                superseding_tx: None,
             }),
         )
         .await;
@@ -10716,6 +11908,7 @@ mod tests {
             Path(("equity_mint".to_string(), id.to_string())),
             Json(ReconcileEquityRequest {
                 reason: "   ".to_string(),
+                superseding_tx: None,
             }),
         )
         .await;
@@ -10737,6 +11930,7 @@ mod tests {
             Path(("bogus".to_string(), id.to_string())),
             Json(ReconcileEquityRequest {
                 reason: "handled out-of-band".to_string(),
+                superseding_tx: None,
             }),
         )
         .await;
@@ -10758,6 +11952,7 @@ mod tests {
             Path(("usdc_bridge".to_string(), id.to_string())),
             Json(ReconcileEquityRequest {
                 reason: "handled out-of-band".to_string(),
+                superseding_tx: None,
             }),
         )
         .await;
@@ -11083,7 +12278,8 @@ mod tests {
     #[tokio::test]
     async fn recovery_routes_wait_for_a_rebuild_without_holding_the_resume_lock() {
         for route in ["resume", "fail", "recheck", "fail-usdc", "reconcile-usdc"] {
-            let (state, _gate) = recovery_state_with_driver_pause().await;
+            let (state, _gate) =
+                recovery_state_with_driver_pause(EquityTransferServices::panicking()).await;
             let rebuild = state.projection_maintenance.pause().await.unwrap();
 
             let mut request = tokio::spawn(run_recovery_route(state.clone(), route));

@@ -940,12 +940,18 @@ pub enum TransferCommand {
         /// `deposit-credited-offline`; for `mint`/`redemption` it is free text.
         #[arg(short = 'r', long = "reason")]
         reason: AuditReason,
-        /// usdc only, required for a transfer with a signed deposit send and
-        /// refused for any other: the tx that took the send's nonce (the
-        /// 0-value self-transfer cancel). The bot checks that it is from the
-        /// bot's Ethereum wallet, at the send's nonce, not the send itself, has
-        /// the required confirmations, and paid the deposit address no USDC
-        /// unless another transfer recorded it as its own deposit send.
+        /// usdc and redemption only. Required for a USDC transfer with a signed
+        /// deposit send, and for a redemption whose signed vault withdrawal has
+        /// no canonical receipt (a confirmed reverted withdrawal reconciles
+        /// without it); refused for a mint and for a USDC transfer or redemption
+        /// with no signed tx. It is the tx that took that signed tx's nonce (the
+        /// 0-value self-transfer cancel). The bot checks that it is from the bot
+        /// wallet on that chain, at the nonce, not the signed tx itself, has the
+        /// required confirmations, and did not do what the signed tx does: for
+        /// usdc, pay the deposit address USDC (unless another transfer recorded
+        /// it as its own deposit send); for a redemption, it must have reverted
+        /// or be a plain cancel (0 value, no calldata, to the bot wallet itself,
+        /// not EIP-7702, with no logs in its receipt).
         #[arg(long = "superseding-tx")]
         superseding_tx: Option<TxHash>,
     },
@@ -1232,6 +1238,7 @@ enum TransferRecoveryCommand {
         transfer_type: TransferType,
         id: String,
         reason: AuditReason,
+        superseding_tx: Option<TxHash>,
     },
     ClearPendingBurn {
         id: Uuid,
@@ -1615,9 +1622,10 @@ fn classify_command(command: Commands) -> anyhow::Result<CommandRoute> {
                         },
                     })
                 }
-                ReconcileKind::Mint | ReconcileKind::Redemption if superseding_tx.is_some() => {
+                ReconcileKind::Mint if superseding_tx.is_some() => {
                     anyhow::bail!(
-                        "transfer reconcile: --superseding-tx applies only to --kind usdc"
+                        "transfer reconcile: --superseding-tx applies only to --kind usdc and \
+                         --kind redemption"
                     )
                 }
                 ReconcileKind::Mint => CommandRoute::Simple(SimpleCommand::Transfer {
@@ -1625,6 +1633,7 @@ fn classify_command(command: Commands) -> anyhow::Result<CommandRoute> {
                         transfer_type: TransferType::Mint,
                         id,
                         reason,
+                        superseding_tx: None,
                     },
                 }),
                 ReconcileKind::Redemption => CommandRoute::Simple(SimpleCommand::Transfer {
@@ -1632,6 +1641,7 @@ fn classify_command(command: Commands) -> anyhow::Result<CommandRoute> {
                         transfer_type: TransferType::Redemption,
                         id,
                         reason,
+                        superseding_tx,
                     },
                 }),
             },
@@ -1927,13 +1937,18 @@ async fn run_transfer_command<W: Write>(
             transfer_type,
             id,
             reason,
+            superseding_tx,
         } => {
             let result = rebalancing::reconcile_equity_transfer_command(
                 stdout,
                 transfer_type,
                 &id,
                 reason,
+                superseding_tx,
                 pool,
+                async |chain, check: rebalancing::WithdrawalCheck<'_>| {
+                    rebalancing::verify_withdrawal_on_chain(ctx, chain, check).await
+                },
             )
             .await;
             finish_with_log_query_url(stdout, ctx, &id, result)
@@ -3889,6 +3904,7 @@ mod tests {
                         transfer_type,
                         id,
                         reason,
+                        superseding_tx: None,
                     },
             }) => {
                 assert!(matches!(transfer_type, TransferType::Mint));
@@ -3917,11 +3933,11 @@ mod tests {
         .unwrap();
 
         let Err(error) = classify_command(cli.command) else {
-            panic!("a superseding tx on an equity reconcile must be refused");
+            panic!("a superseding tx on a mint reconcile must be refused");
         };
-        assert_eq!(
-            error.to_string(),
-            "transfer reconcile: --superseding-tx applies only to --kind usdc"
+        assert!(
+            error.to_string().contains("--superseding-tx"),
+            "the refusal names the flag, got: {error}"
         );
     }
 
@@ -3937,6 +3953,8 @@ mod tests {
             "RED-001",
             "--reason",
             "deposited manually",
+            "--superseding-tx",
+            &TxHash::repeat_byte(0xcc).to_string(),
         ])
         .unwrap();
 
@@ -3947,11 +3965,13 @@ mod tests {
                         transfer_type,
                         id,
                         reason,
+                        superseding_tx,
                     },
             }) => {
                 assert!(matches!(transfer_type, TransferType::Redemption));
                 assert_eq!(id, "RED-001");
                 assert_eq!(reason.as_ref(), "deposited manually");
+                assert_eq!(superseding_tx, Some(TxHash::repeat_byte(0xcc)));
             }
             _ => panic!("expected reconcile equity (redemption) simple command"),
         }

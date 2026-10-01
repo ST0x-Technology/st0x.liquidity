@@ -271,6 +271,9 @@ impl StoredOperation {
                 self.completed_at = Some(*reconciled_at);
                 self.operator_reconciled = true;
             }
+            // The withdraw stage stays open through an adoption: the adopted tx
+            // is what `WithdrawnFromRaindex` later closes it on.
+            VaultWithdrawReplacementAdopted { .. } => {}
         }
     }
 
@@ -331,7 +334,8 @@ pub(super) fn redemption_observed_at(event: &EquityRedemptionEvent) -> DateTime<
         }
         | OperatorReconciled {
             reconciled_at: at, ..
-        } => *at,
+        }
+        | VaultWithdrawReplacementAdopted { adopted_at: at, .. } => *at,
     }
 }
 
