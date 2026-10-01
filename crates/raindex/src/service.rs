@@ -200,18 +200,7 @@ impl<W: Wallet> RaindexService<W> {
         &self,
         token: Address,
     ) -> Result<RevokeOutcome, RaindexError> {
-        let current_allowance: U256 = self
-            .evm
-            .call::<Registry, _>(
-                token,
-                IERC20::allowanceCall {
-                    owner: self.owner,
-                    spender: self.orderbook_address,
-                },
-            )
-            .await?;
-
-        if current_allowance.is_zero() {
+        if self.orderbook_allowance::<Registry>(token).await?.is_zero() {
             return Ok(RevokeOutcome::AlreadyZero);
         }
 
@@ -231,6 +220,50 @@ impl<W: Wallet> RaindexService<W> {
         Ok(RevokeOutcome::Revoked {
             tx: receipt.transaction_hash,
         })
+    }
+
+    /// Like [`revoke_orderbook_allowance`](Self::revoke_orderbook_allowance),
+    /// but returns as soon as the revoke is broadcast instead of waiting for
+    /// its receipt. Use [`Raindex::confirm_tx`] to wait for confirmation.
+    pub async fn submit_revoke_orderbook_allowance<Registry: IntoErrorRegistry>(
+        &self,
+        token: Address,
+    ) -> Result<RevokeOutcome, RaindexError> {
+        if self.orderbook_allowance::<Registry>(token).await?.is_zero() {
+            return Ok(RevokeOutcome::AlreadyZero);
+        }
+
+        let tx_hash = self
+            .evm
+            .submit_pending(
+                token,
+                IERC20::approveCall {
+                    spender: self.orderbook_address,
+                    amount: U256::ZERO,
+                },
+                "revoke stale orderbook allowance",
+            )
+            .await?;
+
+        info!(target: "inventory", %tx_hash, %token, spender = %self.orderbook_address, "Stale orderbook allowance revoke submitted");
+        Ok(RevokeOutcome::Revoked { tx: tx_hash })
+    }
+
+    /// The signing wallet's current `token` allowance for the orderbook.
+    async fn orderbook_allowance<Registry: IntoErrorRegistry>(
+        &self,
+        token: Address,
+    ) -> Result<U256, RaindexError> {
+        Ok(self
+            .evm
+            .call::<Registry, _>(
+                token,
+                IERC20::allowanceCall {
+                    owner: self.owner,
+                    spender: self.orderbook_address,
+                },
+            )
+            .await?)
     }
 
     async fn deposit4_to_vault<Registry: IntoErrorRegistry>(

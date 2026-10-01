@@ -416,13 +416,21 @@ pub(crate) enum Capital {
         chain: Option<HedgedChain>,
     },
     /// Deposit tokens from the bot's wallet into a Raindex vault: approves,
-    /// then deposits, resolving token decimals from onchain metadata.
+    /// then deposits, resolving token decimals from onchain metadata. Returns
+    /// the deposit tx as soon as it is broadcast; the bot confirms it
+    /// afterwards and logs the outcome. When the allowance is short it first
+    /// waits for the approve to confirm, so a token without the startup MAX
+    /// grant can still time out on Ethereum.
     VaultDeposit(VaultArgs),
     /// Withdraw tokens from a Raindex vault to the bot's wallet, resolving
-    /// token decimals from onchain metadata.
+    /// token decimals from onchain metadata. Returns the withdraw tx as soon
+    /// as it is broadcast; the bot confirms it afterwards and logs the
+    /// outcome.
     VaultWithdraw(VaultArgs),
     /// Withdraw the chain's settlement stable (USDC, or USDG on Robinhood)
-    /// from its configured Raindex cash vault.
+    /// from its configured Raindex cash vault. Returns the withdraw tx as
+    /// soon as it is broadcast; the bot confirms it afterwards and logs the
+    /// outcome.
     VaultWithdrawUsdc {
         /// Amount of the settlement stable to withdraw, as a decimal.
         #[arg(short = 'a', long, allow_negative_numbers = true)]
@@ -456,7 +464,8 @@ pub(crate) enum Capital {
         from: CctpSourceChain,
     },
     /// Reset the bot wallet's settlement stable allowance (USDC, or USDG on
-    /// Robinhood) for the orderbook to zero.
+    /// Robinhood) for the orderbook to zero. Returns the revoke tx as soon as
+    /// it is broadcast; the bot confirms it afterwards and logs the outcome.
     ResetAllowance {
         /// Chain whose allowance to reset: its wallet, its settlement stable
         /// and its `[chains.<name>.trading]` orderbook.

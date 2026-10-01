@@ -181,8 +181,9 @@ pub(crate) struct AppState {
     pub(crate) process_tx: Arc<tokio::sync::OnceCell<api::ProcessTxHandle>>,
     pub(crate) resume_lock: Arc<api::ResumeLock>,
     /// Serializes `capital vault-deposit` requests against each other, and
-    /// nothing else. `RaindexService::deposit` reads the allowance, approves
-    /// exactly the amount when it is short, then deposits, so two concurrent
+    /// nothing else, from the allowance read until the deposit confirms.
+    /// `Raindex::submit_deposit` reads the allowance, approves exactly the
+    /// amount when it is short, then deposits, so two concurrent
     /// requests for a token without the startup MAX grant could overwrite each
     /// other's approval. The bot's own deposits (the USDC transfer workers) do
     /// not take this lock, so a request can still use up a worker's exact

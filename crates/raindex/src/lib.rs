@@ -46,8 +46,9 @@ pub struct RaindexContracts {
 /// zero" without the boolean-blindness of a bare `bool` at the call site.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RevokeOutcome {
-    /// The allowance was nonzero; an `approve(spender, 0)` tx was submitted
-    /// and mined as `tx`.
+    /// The allowance was nonzero; an `approve(spender, 0)` tx was sent as
+    /// `tx`. `revoke_orderbook_allowance` returns it mined, and
+    /// `submit_revoke_orderbook_allowance` returns it once broadcast.
     Revoked { tx: TxHash },
     /// The allowance was already zero; no transaction was needed.
     AlreadyZero,

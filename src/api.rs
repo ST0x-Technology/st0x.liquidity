@@ -4055,6 +4055,53 @@ where
     })
 }
 
+/// Where a route's detached task sends its answer; see
+/// [`answer_from_detached`].
+type DetachedAnswer<Answer> = tokio::sync::oneshot::Sender<Result<Answer, OpsError>>;
+
+/// Runs `work` through [`spawn_detached`] for a route that answers at a
+/// broadcast rather than at the outcome: `work` sends the answer through the
+/// sender it is given as soon as the transaction is broadcast (or the refusal
+/// as soon as it refuses), then keeps running to await the confirmation and
+/// log it. That answer returns here at once, so a confirmation slower than
+/// the 60 second load balancer cut still reaches the operator with the tx
+/// hash. Whatever `work` holds (a lock, a driver pause) stays held until the
+/// task ends.
+///
+/// The request cannot be the one to join the task, since it returns before
+/// the task ends, so a tracked watcher joins it: a panic in either phase still
+/// reaches the join failure log of [`spawn_detached`], after the answer or a
+/// dropped request alike.
+async fn answer_from_detached<Answer, Subject, Work>(
+    detached_tasks: &TaskTracker,
+    operation: &'static str,
+    subject: Subject,
+    work: impl FnOnce(DetachedAnswer<Answer>) -> Work,
+) -> Result<Answer, OpsError>
+where
+    Answer: Send + 'static,
+    Subject: std::fmt::Display + Send + 'static,
+    Work: Future<Output = ()> + Send + 'static,
+{
+    let (answer, answered) = tokio::sync::oneshot::channel();
+    let worker = spawn_detached(detached_tasks, operation, subject, work(answer))?;
+    detached_tasks.spawn(async move {
+        let _joined = worker.await;
+    });
+
+    match answered.await {
+        Ok(answer) => answer,
+        // The task dropped its sender without answering: it panicked before
+        // the broadcast, and the watcher logs the join failure.
+        Err(_answerless) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: format!("{operation} worker task failed"),
+            }),
+        )),
+    }
+}
+
 /// Runs the process-tx workload through [`spawn_detached`], mapping
 /// the operator error to an HTTP response. The detached task keeps the
 /// in flight broker placement alive after a client disconnect, and the
@@ -4603,9 +4650,9 @@ mod tests {
     };
     use crate::rebalancing::{RebalancingSchedulers, RebalancingServiceConfig};
     use crate::test_utils::{
-        AnvilRaindexChain, TEST_POLL_INTERVAL, erc20_allowance, erc20_balance, get_test_order,
-        mined_receipt, reserving_counter_trade_preflight, seed_get_test_order_token_symbols,
-        setup_test_pools,
+        AnvilRaindexChain, HeldReceiptWallet, ReceiptGate, TEST_POLL_INTERVAL, erc20_allowance,
+        erc20_balance, get_test_order, mined_receipt, reserving_counter_trade_preflight,
+        seed_get_test_order_token_symbols, setup_test_pools,
     };
     use crate::tokenized_equity_mint::TokenizedEquityMint;
     use crate::usdc_rebalance::{ConversionAmounts, RebalanceDirection, TransferRef};
@@ -8551,43 +8598,77 @@ mod tests {
     }
 
     /// A ctx whose Base trading table is `chain`'s orderbook in Legacy mode,
-    /// where the bot's own vaults live, with every signer the bot's wallet
-    /// on that node.
-    fn capital_ctx_on(chain: &AnvilRaindexChain) -> Ctx {
+    /// where the bot's own vaults live, with every signer the bot's wallet on
+    /// that node behind a [`HeldReceiptWallet`]: each route's confirmation
+    /// waits until the returned gate moves, so the tests can observe a route
+    /// that answered at the broadcast while its confirmation is still pending.
+    fn capital_ctx_on(chain: &AnvilRaindexChain) -> (Ctx, tokio::sync::watch::Sender<ReceiptGate>) {
+        let (wallet, gate) = HeldReceiptWallet::wrap(Arc::clone(&chain.bot_wallet));
         let mut ctx = create_test_ctx_with_order_owner(chain.bot);
         let primary = ctx.chains.primary_mut();
         primary.rpc_url = chain.endpoint.clone();
         primary.orderbook = chain.orderbook;
         ctx.wallet = Some(st0x_config::OnchainWalletCtx::from_wallets(
-            Arc::clone(&chain.bot_wallet),
-            Arc::clone(&chain.bot_wallet),
-            Arc::clone(&chain.bot_wallet),
-            Arc::clone(&chain.bot_wallet),
+            Arc::clone(&wallet),
+            Arc::clone(&wallet),
+            Arc::clone(&wallet),
+            wallet,
         ));
-        ctx
+        (ctx, gate)
+    }
+
+    /// Checks that the capital route that just answered is still awaiting its
+    /// held confirmation, then releases it and waits until every capital task
+    /// has finished, leaving the gate held again for the next route.
+    async fn confirm_after_the_answer(
+        state: &AppState,
+        gate: &tokio::sync::watch::Sender<ReceiptGate>,
+    ) {
+        state.detached_tasks.close();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), state.detached_tasks.wait())
+                .await
+                .is_err(),
+            "the route's task must keep running until its confirmation"
+        );
+        gate.send_replace(ReceiptGate::Released);
+        state.detached_tasks.wait().await;
+        state.detached_tasks.reopen();
+        gate.send_replace(ReceiptGate::Held);
     }
 
     /// End to end through the handler against a deployed orderbook: the
     /// amount is scaled by the decimals read onchain, the response reports the
-    /// mined deposit, and exactly the reported raw amount moves from the bot's
-    /// wallet into its vault.
+    /// deposit tx at its broadcast while the deposit lock stays held until the
+    /// deposit confirms, and exactly the reported raw amount moves from the
+    /// bot's wallet into its vault.
+    #[tracing_test::traced_test]
     #[tokio::test]
     async fn vault_deposit_moves_the_scaled_amount_into_the_bots_vault() {
         let chain = AnvilRaindexChain::deploy().await;
         let supply = U256::from(1_000_u64) * U256::from(10_u64).pow(U256::from(18_u64));
         let token = chain.deploy_bot_token(18, supply).await;
         let vault_id = B256::with_last_byte(3);
-        let state = empty_app_state(capital_ctx_on(&chain)).await;
+        let (ctx, gate) = capital_ctx_on(&chain);
+        let state = empty_app_state(ctx).await;
         state.health.set_ready();
 
         let body = capital_success(
             "vault-deposit",
             capital::vault_deposit(
-                State(state),
+                State(state.clone()),
                 capital_request(vault_request(token, vault_id, "1.5")),
             )
             .await,
         );
+        let Err(_) = state.vault_deposit_lock.try_lock() else {
+            panic!("the deposit must hold the deposit lock until it confirms");
+        };
+        confirm_after_the_answer(&state, &gate).await;
+        let Ok(_released) = state.vault_deposit_lock.try_lock() else {
+            panic!("the confirmed deposit must release the deposit lock");
+        };
+        assert!(logs_contain("Vault operation confirmed via API"));
 
         let deposit_tx: TxHash = serde_json::from_value(body["depositTx"].clone()).unwrap();
         assert_eq!(
@@ -8613,7 +8694,8 @@ mod tests {
         );
     }
 
-    /// After a deposit, a partial withdraw returns exactly the reported raw
+    /// After a deposit, a partial withdraw answers with its tx at the
+    /// broadcast, confirms afterwards, and returns exactly the reported raw
     /// amount from the vault to the bot's wallet.
     #[tokio::test]
     async fn vault_withdraw_moves_the_scaled_amount_back_to_the_bots_wallet() {
@@ -8621,7 +8703,8 @@ mod tests {
         let supply = U256::from(1_000_u64) * U256::from(10_u64).pow(U256::from(18_u64));
         let token = chain.deploy_bot_token(18, supply).await;
         let vault_id = B256::with_last_byte(4);
-        let state = empty_app_state(capital_ctx_on(&chain)).await;
+        let (ctx, gate) = capital_ctx_on(&chain);
+        let state = empty_app_state(ctx).await;
         state.health.set_ready();
         capital_success(
             "vault-deposit",
@@ -8631,15 +8714,17 @@ mod tests {
             )
             .await,
         );
+        confirm_after_the_answer(&state, &gate).await;
 
         let body = capital_success(
             "vault-withdraw",
             capital::vault_withdraw(
-                State(state),
+                State(state.clone()),
                 capital_request(vault_request(token, vault_id, "0.25")),
             )
             .await,
         );
+        confirm_after_the_answer(&state, &gate).await;
 
         let withdraw_tx: TxHash = serde_json::from_value(body["withdrawTx"].clone()).unwrap();
         assert_eq!(
@@ -8670,9 +8755,10 @@ mod tests {
     }
 
     /// The USDC withdraw resolves the chain's settlement stable and the first
-    /// configured cash vault on its own: the response names both, the reported
-    /// raw amount (6 decimals) leaves that vault for the bot's wallet, and the
-    /// second configured cash vault is untouched.
+    /// configured cash vault on its own: the response names both and answers
+    /// at the broadcast, the reported raw amount (6 decimals) leaves that vault
+    /// for the bot's wallet, and the second configured cash vault is
+    /// untouched.
     #[tokio::test]
     async fn vault_withdraw_usdc_withdraws_the_stable_from_the_first_cash_vault() {
         let chain = AnvilRaindexChain::deploy().await;
@@ -8682,7 +8768,7 @@ mod tests {
             .await;
         let cash_vault = B256::with_last_byte(7);
         let second_cash_vault = B256::with_last_byte(8);
-        let mut ctx = capital_ctx_on(&chain);
+        let (mut ctx, gate) = capital_ctx_on(&chain);
         ctx.chains.primary_mut().assets.cash = Some(ChainCashAsset {
             vault_ids: vec![cash_vault, second_cash_vault],
             rebalancing: OperationMode::Disabled,
@@ -8698,15 +8784,17 @@ mod tests {
             )
             .await,
         );
+        confirm_after_the_answer(&state, &gate).await;
 
         let body = capital_success(
             "vault-withdraw-usdc",
             capital::vault_withdraw_usdc(
-                State(state),
+                State(state.clone()),
                 capital_request(serde_json::json!({"chain": "base", "amount": "2.5"})),
             )
             .await,
         );
+        confirm_after_the_answer(&state, &gate).await;
 
         let withdraw_tx: TxHash = serde_json::from_value(body["withdrawTx"].clone()).unwrap();
         assert_eq!(
@@ -8739,8 +8827,10 @@ mod tests {
     }
 
     /// A standing settlement stable allowance to the orderbook is revoked by
-    /// a mined approve on the stable, reported with its tx; a second reset
-    /// finds it already zero and sends nothing.
+    /// an approve on the stable, reported with its tx at the broadcast and
+    /// confirmed afterwards; a second reset finds it already zero and sends
+    /// nothing.
+    #[tracing_test::traced_test]
     #[tokio::test]
     async fn reset_allowance_revokes_a_standing_allowance_then_reports_already_zero() {
         let chain = AnvilRaindexChain::deploy().await;
@@ -8749,7 +8839,8 @@ mod tests {
         chain
             .approve_from_bot(usdc, chain.orderbook, U256::from(5_000_000_u64))
             .await;
-        let state = empty_app_state(capital_ctx_on(&chain)).await;
+        let (ctx, gate) = capital_ctx_on(&chain);
+        let state = empty_app_state(ctx).await;
         state.health.set_ready();
 
         let revoked = capital_success(
@@ -8760,6 +8851,8 @@ mod tests {
             )
             .await,
         );
+        confirm_after_the_answer(&state, &gate).await;
+        assert!(logs_contain("Orderbook allowance reset confirmed via API"));
 
         let revoke_tx: TxHash = serde_json::from_value(revoked["tx"].clone()).unwrap();
         assert_eq!(
@@ -8798,6 +8891,39 @@ mod tests {
                 "tx": null,
             })
         );
+    }
+
+    /// A route that answered at the broadcast and then panics while awaiting
+    /// the confirmation still reaches the join failure log through the
+    /// tracked watcher, since the request is long gone by then.
+    #[tracing_test::traced_test]
+    #[tokio::test]
+    async fn a_panic_after_the_answer_still_reaches_the_join_failure_log() {
+        let chain = AnvilRaindexChain::deploy().await;
+        let usdc = Chain::Base.settlement_stable().address;
+        chain.etch_bot_stable(usdc, U256::ZERO).await;
+        chain
+            .approve_from_bot(usdc, chain.orderbook, U256::from(5_000_000_u64))
+            .await;
+        let (ctx, gate) = capital_ctx_on(&chain);
+        gate.send_replace(ReceiptGate::Panic);
+        let state = empty_app_state(ctx).await;
+        state.health.set_ready();
+
+        let revoked = capital_success(
+            "reset-allowance",
+            capital::reset_allowance(
+                State(state.clone()),
+                capital_request(serde_json::json!({"chain": "base"})),
+            )
+            .await,
+        );
+        assert_eq!(revoked["outcome"], "revoked");
+
+        state.detached_tasks.close();
+        state.detached_tasks.wait().await;
+        assert!(logs_contain("reset-allowance worker task failed"));
+        assert!(!logs_contain("Orderbook allowance reset confirmed via API"));
     }
 
     /// End to end against CCTP V2 deployed on two Anvil nodes, reached

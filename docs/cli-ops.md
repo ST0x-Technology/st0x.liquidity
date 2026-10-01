@@ -322,13 +322,13 @@ corridor guard, so retrying it cannot start a second transfer alongside the
 first. Like the automatic rebalancer, it is also refused with `409` while a cash
 snapshot divergence is unresolved or the cash balance is restart tainted; retry
 once the inventory poller has cleared it. `capital vault-deposit` is refused
-with `409` while another `capital vault-deposit` runs; the lock does not cover
-the bot's own transfer deposits. `capital transfer-usdc` and
-`capital cctp-bridge` both answer `503` while the Base or Ethereum signing
-wallet cannot be shown to pay gas: fund a wallet that is below its gas
-threshold, or retry if the message says its balance could not be read.
-`capital cctp-bridge` waits for neither Circle nor the burn's receipt: it
-returns the burn tx as soon as the burn is broadcast, and
+with `409` while another `capital vault-deposit` runs, until that deposit
+confirms; the lock does not cover the bot's own transfer deposits.
+`capital transfer-usdc` and `capital cctp-bridge` both answer `503` while the
+Base or Ethereum signing wallet cannot be shown to pay gas: fund a wallet that
+is below its gas threshold, or retry if the message says its balance could not
+be read. `capital cctp-bridge` waits for neither Circle nor the burn's receipt:
+it returns the burn tx as soon as the burn is broadcast, and
 `debug cctp complete-mint` fetches the attestation and mints once Circle has
 attested it.
 
@@ -354,6 +354,18 @@ errors. A timed out receipt wait, or one that kept failing on RPC errors, does
 not prove the burn failed, so check the burn tx onchain before completing the
 mint or retrying; a burn that never confirmed never attests, and `complete-mint`
 keeps answering `502` for it.
+
+`capital vault-deposit`, `capital vault-withdraw`, `capital vault-withdraw-usdc`
+and `capital reset-allowance` also print their tx as soon as it is broadcast,
+and the bot confirms it afterwards, so they answer within the load balancer cut
+on Ethereum too. The outcome is `Vault operation confirmed via API` or
+`Vault operation broadcast via API did not confirm` for the vault verbs, and
+`Orderbook allowance reset confirmed via API` or
+`Orderbook allowance reset via API did not confirm` for `reset-allowance`, each
+with the tx hash. A tx that did not confirm may still land, so check it onchain
+before retrying. When the allowance is short, `capital vault-deposit` first
+approves and waits for the approve to confirm, so a deposit of a token without
+the startup MAX grant can still time out on Ethereum.
 
 A request that times out on the client may still complete in the bot; check the
 bot logs and the chain for the transaction before retrying a vault or allowance

@@ -6607,29 +6607,29 @@ effect rather than a generic intent:
   the network counterparts of the `st0x-cli` verbs of the same names. The routes
   sign with the wallets the conductor uses, so they share its nonce manager
   instead of running a second one. The ops load balancer times a request out
-  after 60 seconds, so no route waits on CCTP attestation or USDC settlement.
-  `transfer-usdc` starts a fresh transfer on the bot's own transfer worker, the
-  path the rebalancer uses, and returns its new id at once. It runs on the
-  served corridor its optional `chain` names, picked by the same rule as
-  `st0x-cli transfer-usdc --chain`: `chain` may be left out while the build
-  serves one corridor, and a missing or ambiguous choice is refused with `422`.
-  An amount that is not positive or is finer than USDC's six decimals is refused
-  with `400` before anything else, then it refuses with `503` until startup
-  completes, then it takes the recovery lock (`409`), quiesces the USDC
-  rebalancing driver (`503`), then applies the single flight gates of
-  `transfer resume --kind usdc` in order: an every corridor latch, a live USDC
-  job row, or a durable guard holder refuses with `409`; then, like the trigger
-  before every fresh transfer, it refuses with `409` while a cash snapshot
-  divergence is engaged or the cash balance is restart tainted (the transfer
-  would mark the cash venue busy and keep the poller from resolving either), and
-  with `503` while the Base or Ethereum signing wallet cannot be shown to pay
-  gas; last, a corridor guard held in memory refuses the claim with `409`. A
-  retried request can therefore not start a second transfer while the first is
-  in flight. Everything after the startup gate runs on a tracked detached task,
-  so a dropped request cannot release the corridor claim after the job is
-  queued. `cctp-bridge` only burns: it applies the same corridor gas check
-  (`503`) as `transfer-usdc`, since the burn and the mint that completes it
-  spend both wallets' gas, then holds the recovery lock and the driver pause
+  after 60 seconds, so no route waits on CCTP attestation, USDC settlement, or a
+  transaction's confirmations. `transfer-usdc` starts a fresh transfer on the
+  bot's own transfer worker, the path the rebalancer uses, and returns its new
+  id at once. It runs on the served corridor its optional `chain` names, picked
+  by the same rule as `st0x-cli transfer-usdc --chain`: `chain` may be left out
+  while the build serves one corridor, and a missing or ambiguous choice is
+  refused with `422`. An amount that is not positive or is finer than USDC's six
+  decimals is refused with `400` before anything else, then it refuses with
+  `503` until startup completes, then it takes the recovery lock (`409`),
+  quiesces the USDC rebalancing driver (`503`), then applies the single flight
+  gates of `transfer resume --kind usdc` in order: an every corridor latch, a
+  live USDC job row, or a durable guard holder refuses with `409`; then, like
+  the trigger before every fresh transfer, it refuses with `409` while a cash
+  snapshot divergence is engaged or the cash balance is restart tainted (the
+  transfer would mark the cash venue busy and keep the poller from resolving
+  either), and with `503` while the Base or Ethereum signing wallet cannot be
+  shown to pay gas; last, a corridor guard held in memory refuses the claim with
+  `409`. A retried request can therefore not start a second transfer while the
+  first is in flight. Everything after the startup gate runs on a tracked
+  detached task, so a dropped request cannot release the corridor claim after
+  the job is queued. `cctp-bridge` only burns: it applies the same corridor gas
+  check (`503`) as `transfer-usdc`, since the burn and the mint that completes
+  it spend both wallets' gas, then holds the recovery lock and the driver pause
   around the burn like `cctp complete-mint` does around the mint, and returns
   the burn tx as soon as the burn is broadcast, not when it confirms: an approve
   plus the burn's confirmations can outlast the 60 second load balancer cut, and
@@ -6659,9 +6659,19 @@ effect rather than a generic intent:
   sends a transaction runs it on a tracked detached task, like `process-tx`, so
   a client or load balancer timeout cannot drop a transaction between its
   broadcast and its receipt, graceful shutdown waits for it, and the task logs
-  its own outcome. The tokenization and issuer verbs (`transfer-equity`,
-  `wrap-equity`, `unwrap-equity`, `donate-equity`, `dividend-bump`) have no
-  route: they touch tokenization and the issuer wallet, not liquidity capital.
+  its own outcome. The vault verbs and `reset-allowance` answer at the broadcast
+  like `cctp-bridge`, with the same response bodies, since the tx hash, the raw
+  amount and the decimals are all known before the send: the 12 confirmations
+  production requires on Ethereum take about two and a half minutes, longer than
+  the load balancer cut. The task then awaits the confirmation and logs the
+  outcome with the tx hash, so a tx that reverts or drops after the answer shows
+  only in the bot logs. `vault-deposit` holds its lock until the deposit
+  confirms, and when the allowance is short it still awaits the approve's
+  confirmation before it broadcasts the deposit, so only a deposit of a token
+  without the startup MAX grant can still outlast the cut. The tokenization and
+  issuer verbs (`transfer-equity`, `wrap-equity`, `unwrap-equity`,
+  `donate-equity`, `dividend-bump`) have no route: they touch tokenization and
+  the issuer wallet, not liquidity capital.
 - **`transfer resume --kind usdc` routes through the running bot.** The CLI
   posts to `POST /transfers/usdc/resume/{direction}/{id}`. The endpoint
   validates server-side (unknown id refuses -- a mistyped id must never start a

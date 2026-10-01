@@ -504,6 +504,9 @@ impl AnvilRaindexChain {
     }
 }
 
+#[cfg(test)]
+pub(crate) use held_receipt::{HeldReceiptWallet, ReceiptGate};
+
 /// CCTP V2 on two fresh Anvil nodes standing in for Base and Ethereum, linked
 /// both ways, with the bot's signer (Anvil account 0, one address on both) on
 /// each. Deploying from Anvil account 1 with the same nonces lands every
@@ -975,5 +978,151 @@ impl IntoOptionalBlockNumber for u64 {
 impl IntoOptionalBlockNumber for Option<u64> {
     fn into_optional_block_number(self) -> Option<u64> {
         self
+    }
+}
+
+#[cfg(test)]
+mod held_receipt {
+    use std::sync::Arc;
+
+    use alloy::primitives::{Address, B256, Bytes, Signature, TxHash};
+    use alloy::providers::RootProvider;
+    use alloy::rpc::types::TransactionReceipt;
+    use async_trait::async_trait;
+    use tokio::sync::watch;
+
+    use st0x_evm::{Evm, EvmError, PreparedTransaction, Wallet};
+
+    /// What a [`HeldReceiptWallet`] does when asked for a receipt.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(crate) enum ReceiptGate {
+        /// Waits until the gate moves.
+        Held,
+        /// Waits for the receipt through the wrapped wallet.
+        Released,
+        /// Panics, as a confirmation that blows up after its broadcast.
+        Panic,
+    }
+
+    /// Delegates to the wrapped wallet, except that `await_receipt` waits
+    /// behind a gate the test moves. A route that answers at the broadcast and
+    /// confirms afterwards can then be observed while its confirmation is
+    /// still pending. `send` is not gated, since it runs the wrapped wallet's
+    /// own receipt wait, so a deposit's approve still confirms on its own.
+    pub(crate) struct HeldReceiptWallet {
+        inner: Arc<dyn Wallet<Provider = RootProvider>>,
+        gate: watch::Receiver<ReceiptGate>,
+    }
+
+    impl HeldReceiptWallet {
+        /// Wraps `inner` with every confirmation held; the returned sender
+        /// moves the gate.
+        pub(crate) fn wrap(
+            inner: Arc<dyn Wallet<Provider = RootProvider>>,
+        ) -> (
+            Arc<dyn Wallet<Provider = RootProvider>>,
+            watch::Sender<ReceiptGate>,
+        ) {
+            let (gate, receiver) = watch::channel(ReceiptGate::Held);
+            (
+                Arc::new(Self {
+                    inner,
+                    gate: receiver,
+                }),
+                gate,
+            )
+        }
+    }
+
+    #[async_trait]
+    impl Evm for HeldReceiptWallet {
+        type Provider = RootProvider;
+
+        fn provider(&self) -> &RootProvider {
+            self.inner.provider()
+        }
+    }
+
+    #[async_trait]
+    impl Wallet for HeldReceiptWallet {
+        fn address(&self) -> Address {
+            self.inner.address()
+        }
+
+        async fn sign_typed_data(
+            &self,
+            payload_json: String,
+            expected_digest: B256,
+        ) -> Result<Signature, EvmError> {
+            self.inner
+                .sign_typed_data(payload_json, expected_digest)
+                .await
+        }
+
+        async fn prepare_pending(
+            &self,
+            contract: Address,
+            calldata: Bytes,
+            note: &str,
+        ) -> Result<PreparedTransaction, EvmError> {
+            self.inner.prepare_pending(contract, calldata, note).await
+        }
+
+        async fn broadcast_prepared(
+            &self,
+            prepared: &PreparedTransaction,
+            note: &str,
+        ) -> Result<TxHash, EvmError> {
+            self.inner.broadcast_prepared(prepared, note).await
+        }
+
+        async fn discard_prepared(&self, tx_hash: TxHash) {
+            self.inner.discard_prepared(tx_hash).await;
+        }
+
+        async fn release_superseded(&self, tx_hash: TxHash) {
+            self.inner.release_superseded(tx_hash).await;
+        }
+
+        async fn restore_prepared(&self, prepared: &PreparedTransaction) {
+            self.inner.restore_prepared(prepared).await;
+        }
+
+        async fn restore_transaction(&self, tx_hash: TxHash) -> Result<(), EvmError> {
+            self.inner.restore_transaction(tx_hash).await
+        }
+
+        async fn send_pending(
+            &self,
+            contract: Address,
+            calldata: Bytes,
+            note: &str,
+        ) -> Result<TxHash, EvmError> {
+            self.inner.send_pending(contract, calldata, note).await
+        }
+
+        async fn await_receipt(&self, tx_hash: TxHash) -> Result<TransactionReceipt, EvmError> {
+            let mut gate = self.gate.clone();
+            let opened = *gate
+                .wait_for(|gate| *gate != ReceiptGate::Held)
+                .await
+                .expect("the test dropped the receipt gate while a receipt was held");
+            match opened {
+                ReceiptGate::Released => self.inner.await_receipt(tx_hash).await,
+                ReceiptGate::Panic => {
+                    panic!("HeldReceiptWallet panics at the receipt of {tx_hash}")
+                }
+                ReceiptGate::Held => unreachable!("wait_for returned a held gate"),
+            }
+        }
+
+        async fn send(
+            &self,
+            contract: Address,
+            calldata: Bytes,
+            note: &str,
+        ) -> Result<TransactionReceipt, EvmError> {
+            self.inner.send(contract, calldata, note).await
+        }
     }
 }

@@ -2,10 +2,12 @@
 //! of `st0x-cli`, run inside the bot so they sign with its own wallets and
 //! share their nonce state instead of building a second signer.
 //!
-//! No route waits on CCTP attestation or on USDC settlement, since the ops
-//! load balancer times out first: `transfer-usdc` enqueues the transfer on
-//! the bot's own worker and returns its id, and `cctp-bridge` returns its burn
-//! tx at the broadcast. The routes that send transactions, and the
+//! No route waits on CCTP attestation, on USDC settlement, or on a
+//! transaction's confirmations, since the ops load balancer times out first:
+//! `transfer-usdc` enqueues the transfer on the bot's own worker and returns
+//! its id, and every route that sends a transaction answers at its broadcast
+//! through `answer_from_detached` and confirms it on the task. The routes that
+//! send transactions, and the
 //! `transfer-usdc` enqueue, run through `spawn_detached`, so a dropped request
 //! cannot cancel them midway (between broadcast and receipt, or between the
 //! enqueue and the corridor claim it keeps), and graceful shutdown waits for
@@ -34,8 +36,8 @@ use st0x_float_serde::format_float_with_fallback;
 use st0x_raindex::{Raindex, RaindexService, RaindexVaultId, RevokeOutcome};
 
 use super::{
-    CctpSourceChain, ErrorResponse, OpsError, UsdcDriverPauseRequest, ops_precondition_error,
-    quiesce_usdc_driver, spawn_detached, usdc_resume_error_response,
+    CctpSourceChain, ErrorResponse, OpsError, UsdcDriverPauseRequest, answer_from_detached,
+    ops_precondition_error, quiesce_usdc_driver, spawn_detached, usdc_resume_error_response,
 };
 use crate::AppState;
 use crate::rebalancing::UsdcResumeError;
@@ -491,13 +493,11 @@ pub(super) async fn cctp_bridge(
 
     let resume_lock = Arc::clone(&state.resume_lock);
     let driver_pause = Arc::clone(&handle.usdc_driver_pause);
-    let (respond, response) =
-        tokio::sync::oneshot::channel::<Result<CctpBridgeResponse, OpsError>>();
-    let worker = spawn_detached(
+    answer_from_detached(
         &state.detached_tasks,
         "cctp-bridge",
         source_chain,
-        async move {
+        move |answer| async move {
             let broadcast = async {
                 let guard = resume_lock.0.try_lock().map_err(|_| {
                     (
@@ -555,11 +555,11 @@ pub(super) async fn cctp_bridge(
                     // broadcast anyway, which is why `onchain_failure` tells the
                     // operator to check the chain before retrying. A dropped
                     // request has no receiver left.
-                    let _ = respond.send(Err(refusal));
+                    let _ = answer.send(Err(refusal));
                     return;
                 }
             };
-            let _ = respond.send(Ok(CctpBridgeResponse {
+            let _ = answer.send(Ok(CctpBridgeResponse {
                 burn_tx,
                 source_chain,
                 destination_chain,
@@ -583,32 +583,16 @@ pub(super) async fn cctp_bridge(
                 ),
             }
         },
-    )?;
-
-    // The task answers at the broadcast and keeps running to confirm the burn,
-    // so the request cannot be the one to join it: a tracked watcher does, and
-    // a panic in either phase still reaches the join failure log of
-    // `spawn_detached`, after the response or a dropped request alike.
-    state.detached_tasks.spawn(async move {
-        let _joined = worker.await;
-    });
-
-    match response.await {
-        Ok(answer) => answer.map(Json),
-        // The task dropped its sender without answering: it panicked before
-        // the broadcast, and the watcher logs the join failure.
-        Err(_answerless) => Err((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse {
-                error: "cctp-bridge worker task failed".to_string(),
-            }),
-        )),
-    }
+    )
+    .await
+    .map(Json)
 }
 
 /// Zeroes the chosen chain's settlement stable allowance for that chain's
-/// orderbook, through `RaindexService::revoke_orderbook_allowance` like the
-/// startup revoke. Mirrors `st0x-cli reset-allowance`.
+/// orderbook through `RaindexService::submit_revoke_orderbook_allowance`, the
+/// broadcast half of the startup revoke. Mirrors `st0x-cli reset-allowance`.
+/// Like the vault routes, it answers at the broadcast and confirms the revoke
+/// on the detached task.
 pub(super) async fn reset_allowance(
     State(state): State<AppState>,
     Json(request): Json<ResetAllowanceRequest>,
@@ -622,20 +606,40 @@ pub(super) async fn reset_allowance(
     let owner = wallet.address();
     let raindex = RaindexService::new(wallet, contracts, owner);
 
-    let outcome = spawn_detached(
+    let outcome = answer_from_detached(
         &state.detached_tasks,
         "reset-allowance",
         chain,
-        async move {
-            let outcome = raindex
-                .revoke_orderbook_allowance::<OpenChainErrorRegistry>(token)
+        move |answer| async move {
+            let outcome = match raindex
+                .submit_revoke_orderbook_allowance::<OpenChainErrorRegistry>(token)
                 .await
-                .map_err(|error| onchain_failure("reset-allowance", chain, &error))?;
+            {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    let _ = answer.send(Err(onchain_failure("reset-allowance", chain, &error)));
+                    return;
+                }
+            };
             info!(%chain, %token, %spender, ?outcome, "Orderbook allowance reset via API");
-            Ok::<_, (StatusCode, Json<ErrorResponse>)>(outcome)
+            let _ = answer.send(Ok(outcome));
+
+            let RevokeOutcome::Revoked { tx } = outcome else {
+                return;
+            };
+            match raindex.confirm_tx_receipt(tx).await {
+                Ok(_receipt) => {
+                    info!(%chain, %token, %spender, %tx, "Orderbook allowance reset confirmed via API");
+                }
+                Err(error) => error!(
+                    %chain, %token, %spender, %tx, ?error,
+                    "Orderbook allowance reset via API did not confirm; check the tx onchain \
+                     before retrying"
+                ),
+            }
         },
-    )?
-    .await??;
+    )
+    .await?;
 
     let (outcome, tx) = match outcome {
         RevokeOutcome::Revoked { tx } => (ResetAllowanceOutcome::Revoked, Some(tx)),
@@ -821,6 +825,15 @@ struct VaultOutcome {
 /// `RaindexService`, built from the bot's signer like the startup revoke. The
 /// reads run in the detached task too, so the whole sequence is one tracked
 /// unit.
+///
+/// Answers as soon as the vault transaction is broadcast, like `cctp_bridge`:
+/// the chain's required confirmations (12 on Ethereum in production) outlast
+/// the 60 second load balancer cut. The task then awaits the confirmation
+/// through `Raindex::confirm_tx_receipt`, as the USDC transfer worker does
+/// after its own `submit_deposit`, and logs the outcome. A deposit still
+/// awaits its approve's confirmation before the broadcast when the allowance
+/// is short, so only a deposit of a token without the startup MAX grant can
+/// still wait that long.
 async fn run_vault_operation(
     state: &AppState,
     operation: VaultOperation,
@@ -842,62 +855,86 @@ async fn run_vault_operation(
     let route = operation.route();
 
     let deposit_lock = Arc::clone(&state.vault_deposit_lock);
-    spawn_detached(&state.detached_tasks, route, token, async move {
-        // Held for the whole approve then deposit sequence, inside the task so
-        // a dropped request cannot release it early; see
-        // `AppState::vault_deposit_lock`. Withdrawals approve nothing.
-        let _deposit_guard = match operation {
-            VaultOperation::Deposit => Some(deposit_lock.try_lock().map_err(|_| {
-                warn!(route, %chain, %token, "Vault deposit refused: another deposit is in progress");
-                (
-                    StatusCode::CONFLICT,
-                    Json(ErrorResponse {
-                        error: "Another vault deposit is in progress; retry once it finishes"
-                            .to_string(),
-                    }),
-                )
-            })?),
-            VaultOperation::Withdraw | VaultOperation::WithdrawUsdc => None,
-        };
-        let decimals = wallet
-            .call::<OpenChainErrorRegistry, _>(token, IERC20::decimalsCall {})
-            .await
-            .map_err(|error| onchain_failure(route, chain, &error))?;
-        let amount_raw = amount.inner().to_fixed_decimal(decimals).map_err(|error| {
-            warn!(route, %chain, %token, ?error, "Vault amount does not fit the token's decimals");
-            ops_precondition_error(format!(
-                "amount {} does not fit the token's {decimals} decimals: {error}",
-                format_float_with_fallback(&amount.inner())
-            ))
-        })?;
-
-        let submitted = match operation {
-            VaultOperation::Deposit => {
-                raindex
-                    .deposit::<OpenChainErrorRegistry>(
-                        token,
-                        RaindexVaultId(vault_id),
-                        amount_raw,
-                        decimals,
+    answer_from_detached(&state.detached_tasks, route, token, move |answer| async move {
+        let broadcast = async {
+            // Held through the approve, the deposit and its confirmation,
+            // inside the task so a dropped request cannot release it early;
+            // see `AppState::vault_deposit_lock`. Withdrawals approve nothing.
+            let deposit_guard = match operation {
+                VaultOperation::Deposit => Some(deposit_lock.try_lock().map_err(|_| {
+                    warn!(route, %chain, %token, "Vault deposit refused: another deposit is in progress");
+                    (
+                        StatusCode::CONFLICT,
+                        Json(ErrorResponse {
+                            error: "Another vault deposit is in progress; retry once it finishes"
+                                .to_string(),
+                        }),
                     )
-                    .await
-            }
-            VaultOperation::Withdraw | VaultOperation::WithdrawUsdc => {
-                raindex
-                    .withdraw(token, RaindexVaultId(vault_id), amount_raw, decimals)
-                    .await
+                })?),
+                VaultOperation::Withdraw | VaultOperation::WithdrawUsdc => None,
+            };
+            let decimals = wallet
+                .call::<OpenChainErrorRegistry, _>(token, IERC20::decimalsCall {})
+                .await
+                .map_err(|error| onchain_failure(route, chain, &error))?;
+            let amount_raw = amount.inner().to_fixed_decimal(decimals).map_err(|error| {
+                warn!(route, %chain, %token, ?error, "Vault amount does not fit the token's decimals");
+                ops_precondition_error(format!(
+                    "amount {} does not fit the token's {decimals} decimals: {error}",
+                    format_float_with_fallback(&amount.inner())
+                ))
+            })?;
+
+            let submitted = match operation {
+                VaultOperation::Deposit => {
+                    raindex
+                        .submit_deposit(token, RaindexVaultId(vault_id), amount_raw, decimals)
+                        .await
+                }
+                VaultOperation::Withdraw | VaultOperation::WithdrawUsdc => {
+                    raindex
+                        .submit_withdraw(token, RaindexVaultId(vault_id), amount_raw, decimals)
+                        .await
+                }
+            };
+            let tx = submitted.map_err(|error| onchain_failure(route, chain, &error))?;
+            info!(route, %chain, %token, %vault_id, %amount_raw, %tx, "Vault operation broadcast via API");
+            Ok::<_, OpsError>((
+                deposit_guard,
+                VaultOutcome {
+                    decimals,
+                    amount_raw,
+                    tx,
+                },
+            ))
+        }
+        .await;
+
+        // The deposit guard stays held through the confirmation below.
+        let (_deposit_guard, outcome) = match broadcast {
+            Ok(broadcast) => broadcast,
+            Err(refusal) => {
+                // A dropped request has no receiver left.
+                let _ = answer.send(Err(refusal));
+                return;
             }
         };
-        let tx = submitted.map_err(|error| onchain_failure(route, chain, &error))?;
-        info!(route, %chain, %token, %vault_id, %amount_raw, %tx, "Vault operation completed via API");
+        let VaultOutcome { amount_raw, tx, .. } = outcome;
+        let _ = answer.send(Ok(outcome));
 
-        Ok::<_, (StatusCode, Json<ErrorResponse>)>(VaultOutcome {
-            decimals,
-            amount_raw,
-            tx,
-        })
-    })?
-    .await?
+        match raindex.confirm_tx_receipt(tx).await {
+            Ok(_receipt) => info!(
+                route, %chain, %token, %vault_id, %amount_raw, %tx,
+                "Vault operation confirmed via API"
+            ),
+            Err(error) => error!(
+                route, %chain, %token, %vault_id, %amount_raw, %tx, ?error,
+                "Vault operation broadcast via API did not confirm; check the tx onchain \
+                 before retrying"
+            ),
+        }
+    })
+    .await
 }
 
 /// Records an onchain failure inside a capital route's detached task, where
