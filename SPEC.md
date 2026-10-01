@@ -3106,6 +3106,9 @@ enum TriggerReason {
   A job reads the capacity only to recreate a missing reservation, so one that
   still holds its reservation never depends on that read, and a failed read
   defers the job instead of failing it.
+- Each trigger reservation that Position rejects for a needed hedge increments
+  `equity_plan_declined_total{reason="blocked_by_hedge"}`, so a symbol held
+  behind a hedge is visible apart from an idle one.
 - `PlaceOffChainOrder` is rejected while any transfer reservation owns the
   symbol. A newly committed onchain fill invalidates an unconfirmed reservation;
   confirmation of that exact ID must succeed immediately before the transfer job

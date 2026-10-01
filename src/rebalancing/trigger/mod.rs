@@ -4192,6 +4192,13 @@ impl RebalancingService {
                         | PositionError::EquityTransferHedgeEligibilityUnknown { .. }
                 ) =>
             {
+                // A due hedge holding a redemption back is otherwise
+                // indistinguishable from an idle symbol, so it is counted next
+                // to the planner's own decline reasons.
+                if matches!(error, PositionError::EquityTransferBlockedByHedge { .. }) {
+                    counter!("equity_plan_declined_total", "reason" => "blocked_by_hedge")
+                        .increment(1);
+                }
                 debug!(
                     target: "rebalance",
                     %symbol,
