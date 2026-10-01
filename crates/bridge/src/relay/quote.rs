@@ -8,7 +8,7 @@ use alloy::sol;
 use alloy::sol_types::SolCall;
 use serde::{Deserialize, Serialize};
 
-use st0x_evm::{Chain, SettlementStable};
+use st0x_evm::Chain;
 
 use super::acceptance::{BasisPoints, QuoteAmounts};
 
@@ -170,8 +170,6 @@ pub enum QuoteMismatch {
         expected: u8,
         actual: u8,
     },
-    #[error("origin stable has {origin} decimals and destination stable {destination}")]
-    StableDecimals { origin: u8, destination: u8 },
     #[error("relayer fee is in {actual}, expected {expected}")]
     RelayerFeeCurrency {
         expected: QuotedCurrency,
@@ -402,10 +400,6 @@ impl QuoteResponse {
         let origin = request.origin;
         let origin_stable = origin.settlement_stable().address;
 
-        check_stable_decimals(
-            origin.settlement_stable(),
-            request.destination.settlement_stable(),
-        )?;
         check_currency(
             &self.details.currency_in.currency,
             origin,
@@ -461,22 +455,6 @@ impl QuoteResponse {
             },
             approve,
             deposit,
-        })
-    }
-}
-
-/// The acceptance math compares input and output units, so both stables
-/// must sit on the same decimal grid.
-fn check_stable_decimals(
-    origin: SettlementStable,
-    destination: SettlementStable,
-) -> Result<(), QuoteMismatch> {
-    if origin.decimals == destination.decimals {
-        Ok(())
-    } else {
-        Err(QuoteMismatch::StableDecimals {
-            origin: origin.decimals,
-            destination: destination.decimals,
         })
     }
 }
@@ -1326,26 +1304,17 @@ pub(super) mod tests {
         );
     }
 
+    /// The acceptance math compares input and output units, so every chain
+    /// Relay can move between must settle on the same decimal grid.
     #[test]
-    fn stables_on_different_decimal_grids_are_refused() {
-        let origin = Chain::Robinhood.settlement_stable();
-        let destination = SettlementStable {
-            decimals: 18,
-            ..Chain::Ethereum.settlement_stable()
-        };
+    fn relay_chains_share_one_stable_decimal_grid() {
+        let decimals: Vec<u8> = Chain::ALL
+            .into_iter()
+            .filter(|chain| chain.relay_depository().is_some())
+            .map(|chain| chain.settlement_stable().decimals)
+            .collect();
 
-        let error = check_stable_decimals(origin, destination).unwrap_err();
-
-        assert!(
-            matches!(
-                error,
-                QuoteMismatch::StableDecimals {
-                    origin: 6,
-                    destination: 18
-                }
-            ),
-            "{error:?}"
-        );
+        assert_eq!(decimals, [6, 6]);
     }
 
     /// Quoted live at Unix 1,790,882,607 with `ttl: 1800`: the deadline still
