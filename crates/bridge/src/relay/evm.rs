@@ -1568,6 +1568,82 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn zero_payment_is_neither_a_fill_nor_a_refund() {
+        let harness = Harness::new().await;
+        let order_id = B256::random();
+
+        let tx = harness
+            .hub
+            .pay(harness.hub.wallet(), U256::ZERO, order_id)
+            .await;
+
+        let fill = harness
+            .bridge
+            .verify_fill(
+                HopDirection::ToHub,
+                RelayOrderId(order_id),
+                U256::ZERO,
+                &[tx],
+            )
+            .await
+            .unwrap_err();
+        let refund = harness
+            .bridge
+            .verify_refund(HopDirection::ToHub, RelayOrderId(order_id), AMOUNT, &[tx])
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            unverified_fill(fill),
+            (vec![tx], UnverifiedReason::ZeroAmount)
+        );
+        assert_eq!(
+            unverified_refund(refund),
+            (vec![tx], UnverifiedReason::ZeroAmount)
+        );
+    }
+
+    #[tokio::test]
+    async fn self_transfer_is_neither_a_fill_nor_a_refund() {
+        let harness = Harness::new().await;
+        let order_id = B256::random();
+        let ours = harness.hub.wallet();
+        harness.hub.mint(ours, MINIMUM_OUT).await;
+        harness.hub.approve_relayer(ours).await;
+
+        let tx = harness
+            .hub
+            .pay_from(ours, ours, MINIMUM_OUT, order_id)
+            .await;
+
+        let fill = harness
+            .bridge
+            .verify_fill(
+                HopDirection::ToHub,
+                RelayOrderId(order_id),
+                MINIMUM_OUT,
+                &[tx],
+            )
+            .await
+            .unwrap_err();
+        let refund = harness
+            .bridge
+            .verify_refund(HopDirection::ToHub, RelayOrderId(order_id), AMOUNT, &[tx])
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            unverified_fill(fill),
+            (vec![tx], UnverifiedReason::SelfTransfer)
+        );
+        assert_eq!(
+            unverified_refund(refund),
+            (vec![tx], UnverifiedReason::SelfTransfer)
+        );
+        assert_eq!(harness.hub.balance(ours).await, MINIMUM_OUT);
+    }
+
+    #[tokio::test]
     async fn refund_on_destination_chain_is_verified() {
         let harness = Harness::new().await;
         let order_id = B256::random();
