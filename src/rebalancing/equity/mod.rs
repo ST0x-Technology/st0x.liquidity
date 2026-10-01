@@ -4352,6 +4352,7 @@ mod tests {
                 allocation: AllocationCtx::base_test(),
                 usdc: UsdcCorridors::base_cctp_disabled(),
                 transfer_timeout: Duration::from_secs(1800),
+                recovery_hold_alert_after: Duration::from_secs(60 * 60),
                 chains: BTreeMap::from([(
                     Chain::Base,
                     ChainRebalancingConfig::for_test(ChainAssets::default()),
@@ -4509,6 +4510,7 @@ mod tests {
                 allocation: AllocationCtx::base_test(),
                 usdc: UsdcCorridors::base_cctp_disabled(),
                 transfer_timeout: Duration::from_secs(1800),
+                recovery_hold_alert_after: Duration::from_secs(60 * 60),
                 chains: BTreeMap::from([(
                     Chain::Base,
                     ChainRebalancingConfig::for_test(ChainAssets::default()),
@@ -5014,6 +5016,7 @@ mod tests {
                 allocation: AllocationCtx::base_test(),
                 usdc: UsdcCorridors::base_cctp_disabled(),
                 transfer_timeout: Duration::from_secs(1800),
+                recovery_hold_alert_after: Duration::from_secs(60 * 60),
                 chains: BTreeMap::from([(
                     Chain::Base,
                     ChainRebalancingConfig::for_test(ChainAssets::default()),
@@ -5165,6 +5168,7 @@ mod tests {
                 allocation: AllocationCtx::base_test(),
                 usdc: UsdcCorridors::base_cctp_disabled(),
                 transfer_timeout: Duration::from_secs(1800),
+                recovery_hold_alert_after: Duration::from_secs(60 * 60),
                 chains: BTreeMap::from([(
                     Chain::Base,
                     ChainRebalancingConfig::for_test(ChainAssets::default()),

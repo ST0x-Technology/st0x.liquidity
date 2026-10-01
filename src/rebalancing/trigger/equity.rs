@@ -147,6 +147,14 @@ pub(crate) enum GuardState {
     /// tokens. A recovery on any other chain is refused like an active
     /// transfer, so it never takes over tokens it cannot reach.
     HeldForRecovery { chain: Chain },
+    /// A recovery job on `chain` owns the slot. Blocks new triggers, other
+    /// recovery claims, and the transfer timeout sweep, so a slow recovery
+    /// is never failed and unlatched while it still moves the tokens. The
+    /// `generation` identifies the claim, as for `ActiveTransfer`.
+    Recovering {
+        chain: Chain,
+        generation: GuardGeneration,
+    },
 }
 
 /// Identifies the exact process and claim that owns an active equity transfer.
@@ -361,15 +369,17 @@ enum RecoveryClaimOrigin {
 /// regardless of claim origin so the symbol is fully unblocked.
 ///
 /// In all cases, Drop only acts if the slot still holds
-/// `ActiveTransfer { generation: self.generation }` (i.e. this guard still
+/// `Recovering { chain, generation }` for this guard (i.e. this guard still
 /// owns it). A concurrent terminal event that cleared the slot and a new
-/// transfer claiming `ActiveTransfer` with a different generation are both
-/// safely left untouched -- this closes the ABA race.
+/// claim with a different generation are both safely left untouched -- this
+/// closes the ABA race.
 pub(crate) struct RecoveryGuard {
     symbol: Symbol,
     map: Arc<RwLock<HashMap<Symbol, GuardState>>>,
-    /// Generation token matching the `ActiveTransfer` entry this guard
-    /// inserted. Drop only acts when the map still holds this exact generation.
+    /// The chain whose recovery holds the claim.
+    chain: Chain,
+    /// Generation token matching the `Recovering` entry this guard inserted.
+    /// Drop only acts when the map still holds this exact generation.
     generation: GuardGeneration,
     /// Tracks the state the slot was in before this guard claimed it.
     claim_origin: RecoveryClaimOrigin,
@@ -389,6 +399,14 @@ impl RecoveryGuard {
         // Drop fires here at end of scope, executing Drop::drop with released=true.
     }
 
+    /// Leaves the slot `HeldForRecovery` for this guard's chain on drop,
+    /// whatever the claim origin. Used while a resumed mint is unfinished, so
+    /// neither a new transfer nor the timeout sweep acts on the symbol before
+    /// the retry finishes the mint.
+    pub(crate) fn hold(mut self) {
+        self.claim_origin = RecoveryClaimOrigin::HeldForRecovery { chain: self.chain };
+    }
+
     /// Returns `true` when this guard was claimed from a `HeldForRecovery` slot
     /// (the deadlock-break handoff) rather than from an absent slot (orphan).
     ///
@@ -404,15 +422,17 @@ impl RecoveryGuard {
             RecoveryClaimOrigin::Orphan => false,
         }
     }
+
+    fn owned_state(&self) -> GuardState {
+        GuardState::Recovering {
+            chain: self.chain,
+            generation: self.generation,
+        }
+    }
 }
 
 impl Drop for RecoveryGuard {
     fn drop(&mut self) {
-        if self.released {
-            remove_active_transfer(&self.map, &self.symbol, self.generation);
-            return;
-        }
-
         let mut guard = match self.map.write() {
             Ok(guard) => guard,
             Err(poisoned) => {
@@ -426,14 +446,20 @@ impl Drop for RecoveryGuard {
         };
         // Only act if this guard still owns the slot. We check the exact
         // generation token to close the ABA race: if (1) a terminal event
-        // cleared the slot, (2) a new transfer claimed ActiveTransfer with a
-        // different generation, and (3) this Drop fires, the generation
-        // mismatch causes us to leave the new claim untouched.
-        if guard.get(&self.symbol)
-            != Some(&GuardState::ActiveTransfer {
-                generation: self.generation,
-            })
-        {
+        // cleared the slot, (2) a new claim took it with a different
+        // generation, and (3) this Drop fires, the generation mismatch causes
+        // us to leave the new claim untouched.
+        if guard.get(&self.symbol) != Some(&self.owned_state()) {
+            warn!(
+                symbol = %self.symbol,
+                current_owner = ?guard.get(&self.symbol),
+                "Recovery guard release skipped: ownership does not match"
+            );
+            return;
+        }
+
+        if self.released {
+            guard.remove(&self.symbol);
             return;
         }
 
@@ -461,18 +487,18 @@ impl Drop for RecoveryGuard {
 /// RPC), and the inventory location -- not the guard -- decides which recovery
 /// job the reactor dispatches. Both must therefore be able to claim a
 /// `HeldForRecovery` slot, and the atomic check-and-insert below makes
-/// concurrent claims safe: the first transitions the slot to `ActiveTransfer`,
-/// the second sees `ActiveTransfer` and reschedules.
+/// concurrent claims safe: the first transitions the slot to `Recovering`,
+/// the second sees `Recovering` and reschedules.
 ///
-/// 1. `HeldForRecovery` -> `ActiveTransfer`: the deadlock-break path -- a live
+/// 1. `HeldForRecovery` -> `Recovering`: the deadlock-break path -- a live
 ///    transfer job set `HeldForRecovery` and returned `Ok(())`; recovery owns
 ///    the slot now. On drop, the slot is restored to `HeldForRecovery` so
 ///    recovery retries can proceed but new transfer jobs cannot start.
-/// 2. Absent -> `ActiveTransfer`: the orphan path -- no active transfer was in
+/// 2. Absent -> `Recovering`: the orphan path -- no active transfer was in
 ///    progress; recovery detected a wallet balance outside a mint cycle. On
 ///    drop, the slot is removed entirely.
-/// 3. `ActiveTransfer`: a live transfer job owns the slot; returns `None` so
-///    the caller reschedules.
+/// 3. `ActiveTransfer` or `Recovering`: a live transfer or another recovery
+///    attempt owns the slot; returns `None` so the caller reschedules.
 /// 4. `HeldForRecovery` for a chain other than `chain`: the tokens sit in
 ///    another chain's wallet, which this recovery cannot reach; returns
 ///    `None` so the caller reschedules until that chain's recovery finishes.
@@ -494,8 +520,9 @@ pub(crate) fn claim_guard_for_recovery_or_orphan(
     };
 
     let claim_origin = match guard.get(symbol) {
-        Some(GuardState::ActiveTransfer { .. }) => {
-            // A live transfer job owns the slot; reschedule.
+        Some(GuardState::ActiveTransfer { .. } | GuardState::Recovering { .. }) => {
+            // A live transfer or another recovery attempt owns the slot;
+            // reschedule.
             return None;
         }
         Some(GuardState::HeldForRecovery { chain: held_chain }) if *held_chain == chain => {
@@ -517,12 +544,13 @@ pub(crate) fn claim_guard_for_recovery_or_orphan(
         warn!(%symbol, "Equity guard generation counter exhausted; refusing recovery claim");
         return None;
     };
-    guard.insert(symbol.clone(), GuardState::ActiveTransfer { generation });
+    guard.insert(symbol.clone(), GuardState::Recovering { chain, generation });
     drop(guard);
 
     Some(RecoveryGuard {
         symbol: symbol.clone(),
         map: Arc::clone(map),
+        chain,
         generation,
         claim_origin,
         released: false,
@@ -905,13 +933,16 @@ mod tests {
         let _guard =
             claim_guard_for_recovery_or_orphan(&in_progress, &symbol, Chain::Base).unwrap();
 
-        // After claiming for recovery, state transitions to ActiveTransfer.
+        // After claiming for recovery, state transitions to Recovering.
         assert!(
             matches!(
                 in_progress.read().unwrap().get(&symbol),
-                Some(GuardState::ActiveTransfer { .. })
+                Some(GuardState::Recovering {
+                    chain: Chain::Base,
+                    ..
+                })
             ),
-            "claim_guard_for_recovery_or_orphan must transition state to ActiveTransfer"
+            "claim_guard_for_recovery_or_orphan must transition state to Recovering"
         );
     }
 
@@ -934,15 +965,22 @@ mod tests {
         assert!(
             matches!(
                 map.read().unwrap().get(&symbol),
-                Some(GuardState::ActiveTransfer { .. })
+                Some(GuardState::Recovering {
+                    chain: Chain::Base,
+                    ..
+                })
             ),
-            "claim must transition to ActiveTransfer"
+            "claim must transition to Recovering"
+        );
+        assert!(
+            claim_guard_for_recovery_or_orphan(&map, &symbol, Chain::Base).is_none(),
+            "a second recovery attempt must not take a slot a recovery already owns"
         );
 
         // Simulate recovery failure: drop without release().
         drop(guard);
 
-        // Must restore to HeldForRecovery (not absent, not ActiveTransfer).
+        // Must restore to HeldForRecovery (not absent, not Recovering).
         assert_eq!(
             map.read().unwrap().get(&symbol),
             Some(&GuardState::HeldForRecovery { chain: Chain::Base }),
@@ -956,9 +994,12 @@ mod tests {
         assert!(
             matches!(
                 map.read().unwrap().get(&symbol),
-                Some(GuardState::ActiveTransfer { .. })
+                Some(GuardState::Recovering {
+                    chain: Chain::Base,
+                    ..
+                })
             ),
-            "second claim must transition to ActiveTransfer"
+            "second claim must transition to Recovering"
         );
         drop(second_guard);
     }
@@ -987,7 +1028,10 @@ mod tests {
         assert!(guard.claimed_from_held_for_recovery());
         assert!(matches!(
             map.read().unwrap().get(&symbol),
-            Some(GuardState::ActiveTransfer { .. })
+            Some(GuardState::Recovering {
+                chain: Chain::Robinhood,
+                ..
+            })
         ));
 
         drop(guard);
@@ -1047,7 +1091,7 @@ mod tests {
     }
 
     /// An absent entry is treated as the orphan path: `claim_guard_for_recovery_or_orphan`
-    /// returns `Some` and inserts `ActiveTransfer`, unblocking recovery without requiring
+    /// returns `Some` and inserts `Recovering`, unblocking recovery without requiring
     /// a prior `HeldForRecovery` state.
     #[test]
     fn guard_absent_state_is_treated_as_orphan_by_recovery_claim() {
@@ -1060,9 +1104,12 @@ mod tests {
         assert!(
             matches!(
                 in_progress.read().unwrap().get(&symbol),
-                Some(GuardState::ActiveTransfer { .. })
+                Some(GuardState::Recovering {
+                    chain: Chain::Base,
+                    ..
+                })
             ),
-            "orphan claim from absent entry must insert ActiveTransfer"
+            "orphan claim from absent entry must insert Recovering"
         );
     }
 

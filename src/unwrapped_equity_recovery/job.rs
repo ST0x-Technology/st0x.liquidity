@@ -230,13 +230,13 @@ impl Job<UnwrappedEquityRecoveryCtx> for UnwrappedEquityRecoveryJob {
         }
 
         // Two-path guard claim:
-        // 1. `HeldForRecovery` -> `ActiveTransfer`: claim from a handoff set by
+        // 1. `HeldForRecovery` -> `Recovering`: claim from a handoff set by
         //    the transfer job after a PostReceipt error. When the mint aggregate
         //    is in TokensReceived or WrapSubmitted, the ERC-4626 wrap reverted,
         //    tokens are UNWRAPPED in the base wallet, and this job is the correct
         //    deadlock-break claimant. (WrappedEquityRecovery handles the deposit-
         //    failed path when the aggregate is in TokensWrapped.)
-        // 2. Absent -> `ActiveTransfer`: orphan path -- no active transfer was
+        // 2. Absent -> `Recovering`: orphan path -- no active transfer was
         //    in progress; inventory detected a wallet balance independently.
         // 3. `ActiveTransfer`, or `HeldForRecovery` of another chain: a live
         //    transfer or another chain's recovery owns the slot; reschedule.
@@ -311,6 +311,15 @@ impl Job<UnwrappedEquityRecoveryCtx> for UnwrappedEquityRecoveryJob {
         match result {
             Ok(()) => {
                 guard.release();
+                Ok(())
+            }
+            Err(error) if error.is_mint_resume_pending() => {
+                warn!(%error, "Mint recovery remains pending; retaining ownership and retrying");
+                ctx.queue
+                    .clone()
+                    .push_with_delay(self.clone(), ctx.reschedule_interval)
+                    .await?;
+                guard.hold();
                 Ok(())
             }
             Err(UnwrappedEquityRecoveryJobError::NoBalanceSkip { symbol: ref sym }) => {
@@ -459,7 +468,33 @@ async fn resume_from_detected(
     symbol: &Symbol,
     detected_shares: FractionalShares,
 ) -> Result<(), UnwrappedEquityRecoveryJobError> {
-    let Some(snapshot) = read_recovery_snapshot(&ctx.inventory, chain, symbol).await else {
+    let snapshot = read_recovery_snapshot(&ctx.inventory, chain, symbol).await;
+    if snapshot
+        .as_ref()
+        .is_none_or(|snapshot| snapshot.shares != detected_shares)
+        && let Some(mint_id) = unfinished_active_mint(ctx, chain, symbol).await?
+    {
+        // A failed mint resume may have wrapped or deposited the tokens
+        // before it failed, so the unwrapped balance no longer describes
+        // the work. Resume the mint until it is terminal instead.
+        info!(
+            target: "rebalance",
+            %symbol,
+            %recovery_id,
+            %mint_id,
+            "Resuming unfinished mint from Detected despite a changed unwrapped balance",
+        );
+        return dispatch_from_detected(
+            ctx,
+            chain,
+            recovery_id,
+            symbol,
+            DispatchDecision::ActiveMint(mint_id),
+        )
+        .await;
+    }
+
+    let Some(snapshot) = snapshot else {
         // Detected was persisted but the inventory no longer reports a positive
         // balance. The recovered tokens are either gone (recovered out-of-band)
         // or the previous snapshot was stale. Fail the aggregate so it leaves
@@ -616,6 +651,24 @@ async fn dispatch_from_detected(
     }
 }
 
+/// The chain's active mint for `symbol`, when it is not yet terminal.
+async fn unfinished_active_mint(
+    ctx: &UnwrappedEquityRecoveryCtx,
+    chain: Chain,
+    symbol: &Symbol,
+) -> Result<Option<IssuerRequestId>, UnwrappedEquityRecoveryJobError> {
+    let dispatch = decide_dispatch(&*ctx.inventory.read().await, chain, symbol);
+    let DispatchDecision::ActiveMint(mint_id) = dispatch else {
+        return Ok(None);
+    };
+    let unfinished = ctx
+        .mint_store
+        .load(&mint_id)
+        .await?
+        .is_some_and(|mint| mint.chain() == chain && !mint.is_terminal());
+    Ok(unfinished.then_some(mint_id))
+}
+
 fn is_business_validation_error(error: &UnwrappedEquityRecoveryJobError) -> bool {
     match error {
         UnwrappedEquityRecoveryJobError::ActiveMintQuantityMismatch { .. }
@@ -662,6 +715,15 @@ async fn fail_on_chain_mismatch(
 }
 
 impl UnwrappedEquityRecoveryJobError {
+    fn is_mint_resume_pending(&self) -> bool {
+        matches!(
+            self,
+            Self::Aggregate(AggregateError::UserError(LifecycleError::Apply(
+                UnwrappedEquityRecoveryError::MintResumePending { .. }
+            ))) | Self::Domain(UnwrappedEquityRecoveryError::MintResumePending { .. })
+        )
+    }
+
     fn is_chain_services_missing(&self) -> bool {
         match self {
             Self::Aggregate(AggregateError::UserError(LifecycleError::Apply(
@@ -1173,9 +1235,25 @@ mod tests {
         tokenizer: Arc<dyn Tokenizer>,
         raindex: Arc<dyn Raindex>,
     ) -> UnwrappedEquityRecoveryCtx {
+        test_ctx_with_wrapper(
+            view,
+            equity_in_progress,
+            tokenizer,
+            raindex,
+            Arc::new(MockWrapper::new()),
+        )
+        .await
+    }
+
+    async fn test_ctx_with_wrapper(
+        view: InventoryView,
+        equity_in_progress: HashMap<Symbol, GuardState>,
+        tokenizer: Arc<dyn Tokenizer>,
+        raindex: Arc<dyn Raindex>,
+        wrapper: Arc<dyn Wrapper>,
+    ) -> UnwrappedEquityRecoveryCtx {
         let (pool, apalis_pool) = crate::test_utils::setup_test_pools().await;
 
-        let wrapper: Arc<dyn Wrapper> = Arc::new(MockWrapper::new());
         let chain_services = ChainEquityServices {
             wallet: Address::ZERO,
             raindex: raindex.clone(),
@@ -1584,16 +1662,19 @@ mod tests {
         assert!(
             matches!(
                 map.read().unwrap().get(&symbol),
-                Some(GuardState::ActiveTransfer { .. })
+                Some(GuardState::Recovering {
+                    chain: Chain::Base,
+                    ..
+                })
             ),
-            "claiming from absent must insert ActiveTransfer",
+            "claiming from absent must insert Recovering",
         );
 
-        // ActiveTransfer -> blocks.
+        // Recovering -> blocks.
         let contended = claim_guard_for_recovery_or_orphan(&map, &symbol, Chain::Base);
         assert!(
             contended.is_none(),
-            "a second claim while ActiveTransfer must return None",
+            "a second claim while Recovering must return None",
         );
 
         drop(guard);
@@ -1620,9 +1701,12 @@ mod tests {
         assert!(
             matches!(
                 map.read().unwrap().get(&symbol),
-                Some(GuardState::ActiveTransfer { .. })
+                Some(GuardState::Recovering {
+                    chain: Chain::Base,
+                    ..
+                })
             ),
-            "HeldForRecovery claim must transition to ActiveTransfer",
+            "HeldForRecovery claim must transition to Recovering",
         );
 
         // Drop restores to HeldForRecovery (not removes) so recovery retries
@@ -2288,6 +2372,211 @@ mod tests {
     /// Job-level routing: an active mint for the symbol must dispatch
     /// `DispatchToMint` -- not the orphan path, which would wrap tokens that
     /// are already part of an in-flight mint.
+    #[tokio::test]
+    async fn failed_secondary_mint_resume_keeps_hold_and_redrives_detected_recovery() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let mint_id = issuer_request_id("secondary-failed-wrap");
+        let chain = Chain::Robinhood;
+        let now = Utc::now();
+        let view = InventoryView::default()
+            .set_inflight_equity_at_location(
+                InFlightEquityLocation::WalletUnwrapped(chain),
+                &BTreeMap::from([(symbol.clone(), FractionalShares::new(float!(5)))]),
+                now,
+                now,
+            )
+            .set_active_mint(symbol.clone(), chain, mint_id.clone());
+        let ctx = test_ctx_with_wrapper(
+            view,
+            HashMap::from([(symbol.clone(), GuardState::HeldForRecovery { chain })]),
+            Arc::new(MockTokenizer::new()),
+            Arc::new(MockRaindex::new()),
+            Arc::new(MockWrapper::failing()),
+        )
+        .await;
+        ctx.mint_store
+            .send(
+                &mint_id,
+                TokenizedEquityMintCommand::RequestMint {
+                    chain: Chain::Robinhood,
+                    issuer_request_id: mint_id.clone(),
+                    symbol: symbol.clone(),
+                    quantity: float!(5),
+                    wallet: Address::random(),
+                },
+            )
+            .await
+            .unwrap();
+        ctx.mint_store
+            .send(
+                &mint_id,
+                TokenizedEquityMintCommand::SubmitMintRequest {
+                    issuer_request_id: mint_id.clone(),
+                },
+            )
+            .await
+            .unwrap();
+        ctx.mint_store
+            .send(&mint_id, TokenizedEquityMintCommand::Poll)
+            .await
+            .unwrap();
+
+        let job = UnwrappedEquityRecoveryJob {
+            chain,
+            symbol: symbol.clone(),
+            recovery_id: UnwrappedEquityRecoveryId(Uuid::new_v4()),
+            backpressure_streak: BackpressureStreak::default(),
+        };
+        for expected_jobs in 1..=2 {
+            job.perform(&ctx).await.unwrap();
+            assert!(matches!(
+                ctx.store.load(&job.recovery_id).await.unwrap(),
+                Some(UnwrappedEquityRecovery::Detected { .. })
+            ));
+            assert!(matches!(
+                ctx.mint_store.load(&mint_id).await.unwrap(),
+                Some(TokenizedEquityMint::TokensReceived { .. })
+            ));
+            assert_eq!(
+                ctx.equity_in_progress.read().unwrap().get(&symbol),
+                Some(&GuardState::HeldForRecovery { chain })
+            );
+            assert_eq!(queued_recovery_jobs(&ctx).await.len(), expected_jobs);
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_orphan_origin_mint_resume_holds_the_symbol() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let mint_id = issuer_request_id("orphan-failed-wrap");
+        let chain = Chain::Robinhood;
+        let now = Utc::now();
+        let view = InventoryView::default()
+            .set_inflight_equity_at_location(
+                InFlightEquityLocation::WalletUnwrapped(chain),
+                &BTreeMap::from([(symbol.clone(), FractionalShares::new(float!(5)))]),
+                now,
+                now,
+            )
+            .set_active_mint(symbol.clone(), chain, mint_id.clone());
+        let ctx = test_ctx_with_wrapper(
+            view,
+            HashMap::new(),
+            Arc::new(MockTokenizer::new()),
+            Arc::new(MockRaindex::new()),
+            Arc::new(MockWrapper::failing()),
+        )
+        .await;
+        for command in [
+            TokenizedEquityMintCommand::RequestMint {
+                chain,
+                issuer_request_id: mint_id.clone(),
+                symbol: symbol.clone(),
+                quantity: float!(5),
+                wallet: Address::random(),
+            },
+            TokenizedEquityMintCommand::SubmitMintRequest {
+                issuer_request_id: mint_id.clone(),
+            },
+            TokenizedEquityMintCommand::Poll,
+        ] {
+            ctx.mint_store.send(&mint_id, command).await.unwrap();
+        }
+        let job = UnwrappedEquityRecoveryJob {
+            chain,
+            symbol: symbol.clone(),
+            recovery_id: UnwrappedEquityRecoveryId(Uuid::new_v4()),
+            backpressure_streak: BackpressureStreak::default(),
+        };
+
+        job.perform(&ctx).await.unwrap();
+
+        assert_eq!(
+            ctx.equity_in_progress.read().unwrap().get(&symbol),
+            Some(&GuardState::HeldForRecovery { chain })
+        );
+        assert_eq!(queued_recovery_jobs(&ctx).await.len(), 1);
+    }
+
+    /// A failed mint resume may wrap the tokens before it fails, so the
+    /// retried `Detected` record finds no unwrapped balance. It must keep
+    /// driving the unfinished mint instead of failing the recovery.
+    #[tokio::test]
+    async fn retried_job_resumes_a_mint_whose_wrap_landed() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let mint_id = issuer_request_id("wrap-landed");
+        let view =
+            InventoryView::default().set_active_mint(symbol.clone(), Chain::Base, mint_id.clone());
+        let ctx = test_ctx(view, HashMap::new()).await;
+        for command in [
+            TokenizedEquityMintCommand::RequestMint {
+                chain: Chain::Base,
+                issuer_request_id: mint_id.clone(),
+                symbol: symbol.clone(),
+                quantity: float!(5),
+                wallet: Address::random(),
+            },
+            TokenizedEquityMintCommand::SubmitMintRequest {
+                issuer_request_id: mint_id.clone(),
+            },
+            TokenizedEquityMintCommand::Poll,
+        ] {
+            ctx.mint_store.send(&mint_id, command).await.unwrap();
+        }
+        let wrap_tx_hash = TxHash::random();
+        ctx.mint_store
+            .send(
+                &mint_id,
+                TokenizedEquityMintCommand::SubmitWrap { wrap_tx_hash },
+            )
+            .await
+            .unwrap();
+        ctx.mint_store
+            .send(
+                &mint_id,
+                TokenizedEquityMintCommand::WrapTokens {
+                    wrap_tx_hash,
+                    wrapped_shares: U256::from(5_000_000_000_000_000_000u128),
+                    wrap_block: 1,
+                },
+            )
+            .await
+            .unwrap();
+        let job = UnwrappedEquityRecoveryJob {
+            chain: Chain::Base,
+            symbol: symbol.clone(),
+            recovery_id: UnwrappedEquityRecoveryId(Uuid::new_v4()),
+            backpressure_streak: BackpressureStreak::default(),
+        };
+        ctx.store
+            .send(
+                &job.recovery_id,
+                UnwrappedEquityRecoveryCommand::Detect {
+                    chain: Chain::Base,
+                    symbol: symbol.clone(),
+                    shares: FractionalShares::new(float!(5)),
+                },
+            )
+            .await
+            .unwrap();
+
+        job.perform(&ctx).await.unwrap();
+
+        let state = ctx.store.load(&job.recovery_id).await.unwrap();
+        assert!(
+            matches!(
+                state,
+                Some(UnwrappedEquityRecovery::DispatchedToMint { .. })
+            ),
+            "got {state:?}"
+        );
+        let mint = ctx.mint_store.load(&mint_id).await.unwrap();
+        assert!(
+            matches!(mint, Some(TokenizedEquityMint::DepositedIntoRaindex { .. })),
+            "got {mint:?}"
+        );
+    }
+
     #[tokio::test]
     async fn perform_drives_active_mint_path_to_dispatched_to_mint() {
         let symbol = Symbol::new("AAPL").unwrap();

@@ -2461,7 +2461,6 @@ mod tests {
             mint_store: Arc::new(test_store(cqrs_pool, services.clone())),
             position_authority: None,
             transfer_services: services,
-            primary_chain: Chain::Base,
             job_queue,
         })
     }

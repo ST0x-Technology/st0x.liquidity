@@ -50,6 +50,8 @@ pub enum RebalancingCtxError {
     ZeroTransferTimeout,
     #[error("rebalancing transfer_attempt_timeout_secs must be non-zero")]
     ZeroTransferAttemptTimeout,
+    #[error("rebalancing recovery_hold_alert_after_secs must be non-zero")]
+    ZeroRecoveryHoldAlertAfter,
     #[error("rebalancing attestation_retry_deadline_secs must be non-zero")]
     ZeroAttestationRetryDeadline,
     #[error("rebalancing settlement_retry_deadline_secs must be non-zero")]
@@ -336,6 +338,12 @@ pub struct RebalancingConfig {
     pub(crate) allocation: Option<AllocationConfig>,
     pub usdc: UsdcRebalancing,
     pub transfer_timeout_secs: u64,
+    /// Alert after a recovery keeps a symbol unavailable this long. Defaults
+    /// to one hour when absent, so a deployed config does not need a key that
+    /// released binaries refuse. Remove the default once released binaries
+    /// accept the key.
+    #[serde(default = "default_recovery_hold_alert_after_secs")]
+    pub recovery_hold_alert_after_secs: u64,
     /// Per-attempt wall-clock bound for a single Base->Alpaca transfer job
     /// attempt. A hung RPC is aborted after this so the attempt fails and
     /// retries rather than wedging forever. Distinct from
@@ -422,6 +430,10 @@ fn default_settlement_retry_deadline_secs() -> u64 {
     24 * 60 * 60
 }
 
+fn default_recovery_hold_alert_after_secs() -> u64 {
+    60 * 60
+}
+
 /// Runtime configuration for rebalancing operations.
 ///
 /// Constructed from `RebalancingConfig` after the parsed schema has been
@@ -435,6 +447,7 @@ pub struct RebalancingCtx {
     /// serves.
     pub usdc: UsdcCorridors,
     pub transfer_timeout: Duration,
+    pub recovery_hold_alert_after: Duration,
     /// Staleness bound for per-chain inventory snapshots. See
     /// [`RebalancingConfig::inventory_staleness_bound_secs`].
     pub inventory_staleness_bound: Duration,
@@ -494,6 +507,10 @@ impl RebalancingCtx {
             return Err(RebalancingCtxError::ZeroTransferAttemptTimeout);
         }
 
+        if config.recovery_hold_alert_after_secs == 0 {
+            return Err(RebalancingCtxError::ZeroRecoveryHoldAlertAfter);
+        }
+
         let usdc = config.usdc.corridors(base_cash_vault)?;
 
         if usdc.active().next().is_some() && config.max_burn_revert_redrives == 0 {
@@ -504,6 +521,7 @@ impl RebalancingCtx {
             allocation: AllocationCtx::new(allocation)?,
             usdc,
             transfer_timeout: Duration::from_secs(config.transfer_timeout_secs),
+            recovery_hold_alert_after: Duration::from_secs(config.recovery_hold_alert_after_secs),
             inventory_staleness_bound: Duration::from_secs(config.inventory_staleness_bound_secs),
             transfer_attempt_timeout: Duration::from_secs(config.transfer_attempt_timeout_secs),
             attestation_retry_deadline: Duration::from_secs(config.attestation_retry_deadline_secs),
@@ -533,6 +551,7 @@ impl RebalancingCtx {
         #[builder(default = AllocationCtx::base_test())] allocation: AllocationCtx,
         usdc: Option<ImbalanceThreshold>,
         #[builder(default = Duration::from_secs(30 * 60))] transfer_timeout: Duration,
+        #[builder(default = Duration::from_secs(60 * 60))] recovery_hold_alert_after: Duration,
         #[builder(default = Duration::from_secs(300))] inventory_staleness_bound: Duration,
         #[builder(default = Duration::from_secs(60 * 60))] transfer_attempt_timeout: Duration,
         #[builder(default = Duration::from_secs(24 * 60 * 60))]
@@ -545,6 +564,7 @@ impl RebalancingCtx {
             allocation,
             usdc: usdc.map_or_else(UsdcCorridors::base_cctp_disabled, UsdcCorridors::base_cctp),
             transfer_timeout,
+            recovery_hold_alert_after,
             inventory_staleness_bound,
             transfer_attempt_timeout,
             attestation_retry_deadline,
@@ -572,6 +592,7 @@ impl RebalancingCtx {
         #[builder(default = AllocationCtx::base_test())] allocation: AllocationCtx,
         usdc: Option<ImbalanceThreshold>,
         #[builder(default = Duration::from_secs(30 * 60))] transfer_timeout: Duration,
+        #[builder(default = Duration::from_secs(60 * 60))] recovery_hold_alert_after: Duration,
         #[builder(default = Duration::from_secs(300))] inventory_staleness_bound: Duration,
         #[builder(default = Duration::from_secs(60 * 60))] transfer_attempt_timeout: Duration,
         #[builder(default = Duration::from_secs(24 * 60 * 60))]
@@ -584,6 +605,7 @@ impl RebalancingCtx {
             allocation,
             usdc: usdc.map_or_else(UsdcCorridors::base_cctp_disabled, UsdcCorridors::base_cctp),
             transfer_timeout,
+            recovery_hold_alert_after,
             inventory_staleness_bound,
             transfer_attempt_timeout,
             attestation_retry_deadline,
@@ -651,6 +673,7 @@ mod tests {
     fn valid_rebalancing_config_toml() -> &'static str {
         r#"
             transfer_timeout_secs = 1800
+            recovery_hold_alert_after_secs = 3600
             inventory_staleness_bound_secs = 300
             transfer_attempt_timeout_secs = 3600
             attestation_retry_deadline_secs = 86400
@@ -717,6 +740,7 @@ mod tests {
         assert!(target.eq(float!(0.5)).unwrap());
         assert!(deviation.eq(float!(0.3)).unwrap());
         assert_eq!(config.transfer_timeout_secs, 1800);
+        assert_eq!(config.recovery_hold_alert_after_secs, 3600);
         assert_eq!(config.transfer_attempt_timeout_secs, 3600);
         assert_eq!(config.attestation_retry_deadline_secs, 86400);
         assert_eq!(config.max_burn_revert_redrives, 5);
@@ -728,6 +752,7 @@ mod tests {
         let config: RebalancingConfig = toml::from_str(
             r#"
             transfer_timeout_secs = 1800
+            recovery_hold_alert_after_secs = 3600
             inventory_staleness_bound_secs = 300
             transfer_attempt_timeout_secs = 3600
             attestation_retry_deadline_secs = 86400
@@ -762,6 +787,7 @@ mod tests {
     fn deserialize_missing_freeze_check_fails() {
         let toml_str = r#"
             transfer_timeout_secs = 1800
+            recovery_hold_alert_after_secs = 3600
             inventory_staleness_bound_secs = 300
             transfer_attempt_timeout_secs = 3600
             attestation_retry_deadline_secs = 86400
@@ -796,6 +822,7 @@ mod tests {
         let config: RebalancingConfig = toml::from_str(
             r#"
             transfer_timeout_secs = 1800
+            recovery_hold_alert_after_secs = 3600
             inventory_staleness_bound_secs = 300
             transfer_attempt_timeout_secs = 3600
             attestation_retry_deadline_secs = 7200
@@ -870,6 +897,7 @@ mod tests {
     fn deserialize_missing_inventory_staleness_bound_secs_defaults() {
         let toml_str = r#"
             transfer_timeout_secs = 1800
+            recovery_hold_alert_after_secs = 3600
             transfer_attempt_timeout_secs = 3600
             attestation_retry_deadline_secs = 86400
             settlement_retry_deadline_secs = 86400
@@ -897,9 +925,20 @@ mod tests {
     }
 
     #[test]
+    fn deserialize_missing_recovery_hold_alert_after_secs_defaults_to_one_hour() {
+        let toml_str =
+            valid_rebalancing_config_toml().replace("recovery_hold_alert_after_secs = 3600\n", "");
+        assert!(!toml_str.contains("recovery_hold_alert_after_secs"));
+
+        let config = toml::from_str::<RebalancingConfig>(&toml_str).unwrap();
+        assert_eq!(config.recovery_hold_alert_after_secs, 3600);
+    }
+
+    #[test]
     fn zero_inventory_staleness_bound_fails_validation() {
         let toml_str = r#"
             transfer_timeout_secs = 1800
+            recovery_hold_alert_after_secs = 3600
             inventory_staleness_bound_secs = 0
             transfer_attempt_timeout_secs = 3600
             attestation_retry_deadline_secs = 86400
@@ -930,6 +969,7 @@ mod tests {
     fn deserialize_missing_attestation_retry_deadline_secs_fails() {
         let toml_str = r#"
             transfer_timeout_secs = 1800
+            recovery_hold_alert_after_secs = 3600
             inventory_staleness_bound_secs = 300
             transfer_attempt_timeout_secs = 3600
             max_burn_revert_redrives = 5
@@ -963,6 +1003,7 @@ mod tests {
         let config: RebalancingConfig = toml::from_str(
             r#"
             transfer_timeout_secs = 1800
+            recovery_hold_alert_after_secs = 3600
             inventory_staleness_bound_secs = 300
             transfer_attempt_timeout_secs = 3600
             attestation_retry_deadline_secs = 0
@@ -999,6 +1040,7 @@ mod tests {
     fn deserialize_missing_settlement_retry_deadline_secs_defaults() {
         let toml_str = r#"
             transfer_timeout_secs = 1800
+            recovery_hold_alert_after_secs = 3600
             transfer_attempt_timeout_secs = 3600
             attestation_retry_deadline_secs = 86400
             max_burn_revert_redrives = 5
@@ -1029,6 +1071,7 @@ mod tests {
         let config: RebalancingConfig = toml::from_str(
             r#"
             transfer_timeout_secs = 1800
+            recovery_hold_alert_after_secs = 3600
             inventory_staleness_bound_secs = 300
             transfer_attempt_timeout_secs = 3600
             attestation_retry_deadline_secs = 86400
@@ -1066,6 +1109,7 @@ mod tests {
         let config: RebalancingConfig = toml::from_str(
             r#"
             transfer_timeout_secs = 1800
+            recovery_hold_alert_after_secs = 3600
             inventory_staleness_bound_secs = 300
             transfer_attempt_timeout_secs = 3600
             attestation_retry_deadline_secs = 86400
@@ -1099,6 +1143,7 @@ mod tests {
     fn deserialize_missing_usdc_fails() {
         let toml_str = r#"
             transfer_timeout_secs = 1800
+            recovery_hold_alert_after_secs = 3600
             inventory_staleness_bound_secs = 300
             transfer_attempt_timeout_secs = 3600
             attestation_retry_deadline_secs = 86400
@@ -1125,6 +1170,7 @@ mod tests {
     fn deserialize_missing_transfer_attempt_timeout_secs_fails() {
         let toml_str = r#"
             transfer_timeout_secs = 1800
+            recovery_hold_alert_after_secs = 3600
             inventory_staleness_bound_secs = 300
             attestation_retry_deadline_secs = 86400
             settlement_retry_deadline_secs = 86400
@@ -1159,6 +1205,7 @@ mod tests {
         let config: RebalancingConfig = toml::from_str(
             r#"
             transfer_timeout_secs = 1800
+            recovery_hold_alert_after_secs = 3600
             inventory_staleness_bound_secs = 300
             transfer_attempt_timeout_secs = 0
             attestation_retry_deadline_secs = 86400
@@ -1192,10 +1239,49 @@ mod tests {
     }
 
     #[test]
+    fn zero_recovery_hold_alert_after_secs_fails_validation() {
+        let config: RebalancingConfig = toml::from_str(
+            r#"
+            transfer_timeout_secs = 1800
+            recovery_hold_alert_after_secs = 0
+            inventory_staleness_bound_secs = 300
+            transfer_attempt_timeout_secs = 3600
+            attestation_retry_deadline_secs = 86400
+            settlement_retry_deadline_secs = 86400
+            max_burn_revert_redrives = 5
+            freeze_check = "enabled"
+
+            [allocation]
+            targets = { base = 0.5 }
+            alpaca_floor = 0.1
+            deviation = 0.2
+            min_operation_usd = 10
+            cooldown_secs = 300
+
+            [usdc]
+            mode = "enabled"
+
+            [usdc.corridors.base]
+            hop = "cctp"
+            target = "0.5"
+            deviation = "0.3"
+        "#,
+        )
+        .unwrap();
+
+        let error = RebalancingCtx::new(&config, BaseCashVault::Held).unwrap_err();
+        assert!(matches!(
+            error,
+            RebalancingCtxError::ZeroRecoveryHoldAlertAfter
+        ));
+    }
+
+    #[test]
     fn zero_max_burn_revert_redrives_fails_validation_when_usdc_enabled() {
         let config: RebalancingConfig = toml::from_str(
             r#"
             transfer_timeout_secs = 1800
+            recovery_hold_alert_after_secs = 3600
             inventory_staleness_bound_secs = 300
             transfer_attempt_timeout_secs = 3600
             attestation_retry_deadline_secs = 86400
@@ -1233,6 +1319,7 @@ mod tests {
         let config: RebalancingConfig = toml::from_str(
             r#"
             transfer_timeout_secs = 1800
+            recovery_hold_alert_after_secs = 3600
             inventory_staleness_bound_secs = 300
             transfer_attempt_timeout_secs = 3600
             attestation_retry_deadline_secs = 86400
@@ -1261,6 +1348,7 @@ mod tests {
     fn deserialize_missing_max_burn_revert_redrives_fails() {
         let toml_str = r#"
             transfer_timeout_secs = 1800
+            recovery_hold_alert_after_secs = 3600
             inventory_staleness_bound_secs = 300
             transfer_attempt_timeout_secs = 3600
             attestation_retry_deadline_secs = 86400
@@ -1462,6 +1550,7 @@ mod tests {
         let config: RebalancingConfig = toml::from_str(
             r#"
             transfer_timeout_secs = 1800
+            recovery_hold_alert_after_secs = 3600
             inventory_staleness_bound_secs = 300
             transfer_attempt_timeout_secs = 3600
             attestation_retry_deadline_secs = 86400
@@ -1501,6 +1590,7 @@ mod tests {
         let config: RebalancingConfig = toml::from_str(
             r#"
             transfer_timeout_secs = 1800
+            recovery_hold_alert_after_secs = 3600
             inventory_staleness_bound_secs = 300
             transfer_attempt_timeout_secs = 3600
             attestation_retry_deadline_secs = 86400
@@ -1531,6 +1621,7 @@ mod tests {
         let config: RebalancingConfig = toml::from_str(
             r#"
             transfer_timeout_secs = 1800
+            recovery_hold_alert_after_secs = 3600
             inventory_staleness_bound_secs = 300
             transfer_attempt_timeout_secs = 3600
             attestation_retry_deadline_secs = 86400
