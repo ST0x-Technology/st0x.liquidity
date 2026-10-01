@@ -132,6 +132,8 @@ pub enum QuoteField {
     PaymentMinimum,
     PaymentExpected,
     RefundRecipient,
+    /// A refund option's token, which must be the stable of the chain it pays on.
+    RefundCurrency,
     PaymentDetailsDepository,
     PaymentDetailsCurrency,
     PaymentDetailsAmount,
@@ -375,6 +377,7 @@ struct RawRefund {
     /// Relay's chain name, not the numeric id.
     chain_id: String,
     recipient: Address,
+    currency: Address,
 }
 
 #[derive(Debug, Deserialize)]
@@ -607,15 +610,23 @@ fn check_refunds(order: &RawOrderData, request: &QuoteRequest) -> Result<(), Quo
             refund.recipient,
         )?;
 
-        if refund.chain_id == origin || refund.chain_id == destination {
-            Ok(())
+        let chain = if refund.chain_id == origin {
+            request.origin
+        } else if refund.chain_id == destination {
+            request.destination
         } else {
-            Err(QuoteMismatch::RefundChain {
+            return Err(QuoteMismatch::RefundChain {
                 origin,
                 destination,
                 actual: refund.chain_id.clone(),
-            })
-        }
+            });
+        };
+
+        check_address(
+            QuoteField::RefundCurrency,
+            chain.settlement_stable().address,
+            refund.currency,
+        )
     })
 }
 
@@ -1390,6 +1401,27 @@ pub(super) mod tests {
                     destination: "ethereum",
                     ref actual,
                 } if actual == "base"
+            ),
+            "{error:?}"
+        );
+    }
+
+    #[test]
+    fn refund_in_another_token_is_refused() {
+        let error = refusal(|body| {
+            body["protocol"]["v2"]["orderData"]["inputs"][0]["refunds"][0]["currency"] =
+                json!(OTHER);
+        });
+
+        assert!(
+            matches!(
+                error,
+                QuoteMismatch::AddressMismatch {
+                    field: QuoteField::RefundCurrency,
+                    expected,
+                    actual,
+                }
+                    if expected == Chain::Robinhood.settlement_stable().address && actual == OTHER
             ),
             "{error:?}"
         );
