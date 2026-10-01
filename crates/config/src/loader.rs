@@ -33,6 +33,7 @@ use crate::chain::HedgedChain;
 use crate::pricing::PricingSecrets;
 use crate::rebalancing::BaseCashVault;
 use crate::registry::{self, RegistryLive, RegistrySource, TokenFile};
+use crate::registry_state::{self, BootClaim, RegistryStateError};
 use crate::wallet::{SigningChain, SigningChains};
 use crate::{
     AlertsConfig, AlertsCtx, AllocationConfigError, BotGasValuationConfig, ChainConfig,
@@ -76,6 +77,9 @@ pub struct Env {
     /// the bucket. For offline checks and development; boot reads the bucket.
     #[clap(long)]
     pub registry_file: Option<PathBuf>,
+    /// Persisted registry directory. Readers never mutate the manifest.
+    #[clap(long, conflicts_with = "registry_file")]
+    pub registry_state: Option<PathBuf>,
 }
 
 /// A migration/deprecation notice produced while parsing config + secrets.
@@ -730,8 +734,26 @@ enum BrokerSecrets {
     },
 }
 
-/// Combined runtime context for the server. Assembled from plaintext config,
-/// encrypted secrets, and derived runtime state.
+/// Original configuration inputs retained for registry candidate validation.
+/// Contents remain private and are omitted from debug output.
+#[derive(Clone)]
+pub(crate) struct RegistryInputs {
+    config: String,
+    config_path: PathBuf,
+    secrets: String,
+    secrets_path: PathBuf,
+}
+
+impl std::fmt::Debug for RegistryInputs {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RegistryInputs")
+            .field("config_path", &self.config_path)
+            .field("secrets_path", &self.secrets_path)
+            .finish_non_exhaustive()
+    }
+}
+
 #[derive(Clone)]
 pub struct Ctx {
     pub database_url: String,
@@ -1413,7 +1435,7 @@ impl std::fmt::Debug for Ctx {
             .field("bot_gas_valuation", &self.bot_gas_valuation)
             .field("orchestrator", &self.orchestrator);
 
-        debug_struct.finish()
+        debug_struct.finish_non_exhaustive()
     }
 }
 
@@ -2083,6 +2105,7 @@ fn config_table(
                     source,
                     static_config,
                     live,
+                    inputs: None,
                 }),
             ))
         }
@@ -2119,34 +2142,139 @@ fn config_from(
     Ok((merged, registry))
 }
 
+/// Where a load takes the token file from when the config names
+/// `[registry]`.
+#[derive(Debug, Clone, Copy)]
+pub enum TokenSource<'a> {
+    /// What this host runs, read without writing anything (the CLI, the
+    /// deploy gates): the local copy when one is given, else the pinned
+    /// generation, else the state directory's running record, else the
+    /// latest bucket copy. `registry_state` names the state directory;
+    /// without it, the one beside the database. See [`fetch_token_file`].
+    Running {
+        registry_file: Option<&'a Path>,
+        registry_state: Option<&'a Path>,
+    },
+    /// The token file the server claimed for its boot with
+    /// [`claim_boot_tokens`]; `None` when the config carries its tables
+    /// inline.
+    Claimed(Option<&'a [u8]>),
+}
+
+fn read_config_table(config_path: &Path) -> Result<toml::Table, CtxError> {
+    let config_str = std::fs::read_to_string(config_path).map_err(|source| CtxError::ConfigIo {
+        path: config_path.to_path_buf(),
+        source,
+    })?;
+    toml::from_str(&config_str).map_err(|source| CtxError::ConfigToml {
+        path: config_path.to_path_buf(),
+        source,
+    })
+}
+
 /// The token file bytes a config needs, or `None` when it carries its
-/// per-symbol tables inline. A local copy wins over the bucket.
+/// per-symbol tables inline, without writing anything.
+///
+/// A local copy wins;
+/// a pinned generation is read from the bucket; otherwise the record the
+/// server on this host runs, from `registry_state` or else the state beside
+/// its database; and the latest bucket copy when that state has no running
+/// record.
 pub async fn fetch_token_file(
     config_path: &Path,
     registry_file: Option<&Path>,
+    registry_state: Option<&Path>,
 ) -> Result<Option<Vec<u8>>, CtxError> {
-    let config_str = tokio::fs::read_to_string(config_path)
-        .await
-        .map_err(|source| CtxError::ConfigIo {
-            path: config_path.to_path_buf(),
-            source,
-        })?;
+    let table = read_config_table(config_path)?;
     let registry_error = |source| CtxError::Registry {
         path: config_path.to_path_buf(),
         source,
     };
-    let table: toml::Table =
-        toml::from_str(&config_str).map_err(|source| CtxError::ConfigToml {
-            path: config_path.to_path_buf(),
-            source,
-        })?;
     let Some(source) = registry::source_of(&table).map_err(registry_error)? else {
         return Ok(None);
     };
+    if registry_file.is_none() && source.generation.is_none() {
+        let running =
+            running_tokens(&table, registry_state).map_err(|source| CtxError::RegistryState {
+                path: config_path.to_path_buf(),
+                source,
+            })?;
+        if running.is_some() {
+            return Ok(running);
+        }
+    }
     registry::load_bytes(&source, registry_file)
         .await
         .map(Some)
         .map_err(registry_error)
+}
+
+/// The running record in `registry_state`, or else in the state beside the
+/// config's database; `None` when that state has no running record.
+fn running_tokens(
+    table: &toml::Table,
+    registry_state: Option<&Path>,
+) -> Result<Option<Vec<u8>>, RegistryStateError> {
+    let state_dir = registry_state.map(Path::to_path_buf).or_else(|| {
+        table
+            .get("database_url")
+            .and_then(toml::Value::as_str)
+            .and_then(registry_state::state_dir)
+    });
+    state_dir.map_or(Ok(None), |dir| registry_state::running_effective(&dir))
+}
+
+/// The exact persisted copies a deploy may boot, without claiming an attempt.
+/// A file override wins; without state, read the configured bucket copy.
+pub async fn fetch_gate_token_files(
+    config_path: &Path,
+    registry_file: Option<&Path>,
+    state_dir: Option<&Path>,
+) -> Result<Vec<Option<Vec<u8>>>, CtxError> {
+    let table = read_config_table(config_path)?;
+    let Some(source) = registry::source_of(&table).map_err(|source| CtxError::Registry {
+        path: config_path.to_path_buf(),
+        source,
+    })?
+    else {
+        return Ok(vec![None]);
+    };
+    if source.generation.is_none()
+        && registry_file.is_none()
+        && let Some(dir) = state_dir
+    {
+        let copies = registry_state::gate_effective(dir, &table).map_err(|source| {
+            CtxError::RegistryState {
+                path: dir.to_path_buf(),
+                source,
+            }
+        })?;
+        if !copies.is_empty() {
+            return Ok(copies.into_iter().map(Some).collect());
+        }
+    }
+    registry::load_bytes(&source, registry_file)
+        .await
+        .map(|bytes| vec![Some(bytes)])
+        .map_err(|source| CtxError::Registry {
+            path: config_path.to_path_buf(),
+            source,
+        })
+}
+
+/// Claims the token file this server boots, the one boot step that writes
+/// the registry state. See [`registry_state::claim_for_boot`].
+pub async fn claim_boot_tokens(
+    config_path: &Path,
+    registry_file: Option<&Path>,
+) -> Result<BootClaim, CtxError> {
+    let table = read_config_table(config_path)?;
+    registry_state::claim_for_boot(&table, registry_file, chrono::Utc::now().timestamp())
+        .await
+        .map_err(|source| CtxError::RegistryState {
+            path: config_path.to_path_buf(),
+            source,
+        })
 }
 
 /// Judge a fresh copy of the token file against the config this instance runs.
@@ -2411,12 +2539,60 @@ fn issuance_ctx(
 }
 
 impl Ctx {
-    /// `registry_file` replaces the bucket read when the config names
-    /// `[registry]`; boot passes `None` and reads the bucket.
+    /// Judges token-dependent configuration using the exact config and secrets
+    /// this process loaded. Reuses the existing wallet without constructing one.
+    pub fn registry_candidate(&self, effective: &[u8]) -> Result<Self, CtxError> {
+        let inputs = self
+            .registry
+            .as_ref()
+            .and_then(|live| live.inputs.as_ref())
+            .ok_or(CtxError::RegistryInputsMissing)?;
+        let parts = parse_and_validate_with(
+            &inputs.config,
+            &inputs.config_path,
+            TokenFile::Bytes(effective),
+            &inputs.secrets,
+            &inputs.secrets_path,
+        )?;
+        let mut candidate = self.clone();
+        candidate.chains = parts.chains;
+        candidate.assets = parts.assets;
+        candidate.broker = parts.broker;
+        candidate.rebalancing = parts.rebalancing;
+        candidate.registry = parts.registry;
+        if let Some(live) = &mut candidate.registry {
+            live.inputs = Some(inputs.clone());
+        }
+        candidate.pricing = parts.pricing;
+        candidate.startup_notices = parts.startup_notices;
+        Ok(candidate)
+    }
+
+    #[cfg(feature = "wallet-turnkey")]
+    pub fn registry_approval_inputs(
+        &self,
+        effective: &[u8],
+    ) -> Result<Option<TurnkeyApprovalPolicyInputs>, CtxError> {
+        let inputs = self
+            .registry
+            .as_ref()
+            .and_then(|live| live.inputs.as_ref())
+            .ok_or(CtxError::RegistryInputsMissing)?;
+        Self::turnkey_approval_inputs_from_text(
+            &inputs.config,
+            &inputs.config_path,
+            TokenFile::Bytes(effective),
+            &inputs.secrets,
+            &inputs.secrets_path,
+        )
+    }
+
+    /// `tokens` says where the per-symbol tables come from when the config
+    /// names `[registry]`; loading itself writes nothing.
     pub async fn load_files(
         config_path: &Path,
         secrets_path: &Path,
-        registry_file: Option<&Path>,
+        tokens: TokenSource<'_>,
     ) -> Result<Self, CtxError> {
         let config_str = tokio::fs::read_to_string(config_path)
             .await
@@ -2430,10 +2606,18 @@ impl Ctx {
                 path: secrets_path.to_path_buf(),
                 source,
             })?;
-        let tokens = fetch_token_file(config_path, registry_file).await?;
-        let tokens = tokens
-            .as_deref()
-            .map_or(TokenFile::Skipped, TokenFile::Bytes);
+        let fetched;
+        let tokens = match tokens {
+            TokenSource::Running {
+                registry_file,
+                registry_state,
+            } => {
+                fetched = fetch_token_file(config_path, registry_file, registry_state).await?;
+                fetched.as_deref()
+            }
+            TokenSource::Claimed(claimed) => claimed,
+        }
+        .map_or(TokenFile::Skipped, TokenFile::Bytes);
 
         let parts =
             parse_and_validate_with(&config_str, config_path, tokens, &secrets_str, secrets_path)?;
@@ -2449,6 +2633,15 @@ impl Ctx {
 
         let order_owner = wallet.base_wallet().address();
 
+        let mut registry = parts.registry;
+        if let Some(live) = &mut registry {
+            live.inputs = Some(std::sync::Arc::new(RegistryInputs {
+                config: config_str,
+                config_path: config_path.to_path_buf(),
+                secrets: secrets_str,
+                secrets_path: secrets_path.to_path_buf(),
+            }));
+        }
         Ok(Self {
             database_url: parts.database_url,
             log_level: parts.log_level,
@@ -2476,7 +2669,7 @@ impl Ctx {
             telemetry: parts.telemetry,
             alerts: parts.alerts,
             startup_notices: parts.startup_notices,
-            registry: parts.registry,
+            registry,
             pricing: parts.pricing,
             rebalancing: parts.rebalancing,
             order_owner,
@@ -2581,8 +2774,25 @@ impl Ctx {
                 path: secrets_path.to_path_buf(),
                 source,
             })?;
+        Self::turnkey_approval_inputs_from_text(
+            &config_str,
+            config_path,
+            tokens,
+            &secrets_str,
+            secrets_path,
+        )
+    }
+
+    #[cfg(feature = "wallet-turnkey")]
+    fn turnkey_approval_inputs_from_text(
+        config_str: &str,
+        config_path: &Path,
+        tokens: TokenFile<'_>,
+        secrets_str: &str,
+        secrets_path: &Path,
+    ) -> Result<Option<TurnkeyApprovalPolicyInputs>, CtxError> {
         let parts =
-            parse_and_validate_with(&config_str, config_path, tokens, &secrets_str, secrets_path)?;
+            parse_and_validate_with(config_str, config_path, tokens, secrets_str, secrets_path)?;
 
         if parts.wallet_meta.kind != "turnkey" {
             return Ok(None);
@@ -2943,6 +3153,11 @@ pub enum CtxError {
         path: PathBuf,
         source: registry::RegistryError,
     },
+    #[error("registry state for config {path}")]
+    RegistryState {
+        path: PathBuf,
+        source: RegistryStateError,
+    },
     #[error("duplicate symbol {symbol} in [assets.equities].retired_symbols")]
     DuplicateRetiredSymbol { symbol: Symbol },
     #[error(
@@ -3064,6 +3279,8 @@ pub enum CtxError {
          entry supplying an rpc_url for every chain it signs on"
     )]
     WalletNotConfigured,
+    #[error("registry reload needs the config and secrets loaded at boot")]
+    RegistryInputsMissing,
     #[error(transparent)]
     Wallet(#[from] crate::wallet::WalletCtxError),
     #[error(
@@ -3164,6 +3381,7 @@ impl CtxError {
             Self::BrokerPrivateKeyIo { .. } => "failed to read broker private key file",
             Self::ConfigToml { .. } => "failed to parse config",
             Self::Registry { .. } => "token file",
+            Self::RegistryState { .. } => "registry state",
             Self::DuplicateRetiredSymbol { .. } => "duplicate retired symbol",
             Self::ConfiguredSymbolMarkedRetired { .. } => "configured symbol marked retired",
             Self::SecretsToml { .. } => "failed to parse secrets",
@@ -3223,6 +3441,7 @@ impl CtxError {
             Self::FloatComparison(_) => "float comparison failed",
             Self::InvalidTravelRule { .. } => "invalid travel rule config",
             Self::MissingTravelRule => "missing travel rule config",
+            Self::RegistryInputsMissing => "registry boot inputs missing",
             Self::WalletNotConfigured => "wallet not configured",
             Self::Wallet(_) => "wallet construction error",
             Self::WalletMissingChain { .. } => "wallet missing a chain entry",
@@ -4425,9 +4644,16 @@ mod tests {
         "#,
         );
         let secrets = alpaca_secrets_toml();
-        let error = Ctx::load_files(config.path(), secrets.path(), None)
-            .await
-            .unwrap_err();
+        let error = Ctx::load_files(
+            config.path(),
+            secrets.path(),
+            TokenSource::Running {
+                registry_file: None,
+                registry_state: None,
+            },
+        )
+        .await
+        .unwrap_err();
 
         assert!(
             matches!(error, CtxError::ConfigToml { .. }),
@@ -4633,9 +4859,16 @@ mod tests {
         "#
         ));
         let secrets = alpaca_secrets_toml();
-        let error = Ctx::load_files(config.path(), secrets.path(), None)
-            .await
-            .unwrap_err();
+        let error = Ctx::load_files(
+            config.path(),
+            secrets.path(),
+            TokenSource::Running {
+                registry_file: None,
+                registry_state: None,
+            },
+        )
+        .await
+        .unwrap_err();
 
         assert!(
             matches!(
@@ -4708,9 +4941,16 @@ mod tests {
         "#
         ));
         let secrets = alpaca_secrets_toml();
-        let error = Ctx::load_files(config.path(), secrets.path(), None)
-            .await
-            .unwrap_err();
+        let error = Ctx::load_files(
+            config.path(),
+            secrets.path(),
+            TokenSource::Running {
+                registry_file: None,
+                registry_state: None,
+            },
+        )
+        .await
+        .unwrap_err();
 
         assert!(
             matches!(
@@ -4849,9 +5089,16 @@ mod tests {
             ("0.05", "not-a-number", Chain::Ethereum),
         ] {
             let config = alerts_config_toml(base_threshold, ethereum_threshold);
-            let error = Ctx::load_files(config.path(), secrets.path(), None)
-                .await
-                .unwrap_err();
+            let error = Ctx::load_files(
+                config.path(),
+                secrets.path(),
+                TokenSource::Running {
+                    registry_file: None,
+                    registry_state: None,
+                },
+            )
+            .await
+            .unwrap_err();
 
             assert!(
                 matches!(
@@ -4877,9 +5124,16 @@ mod tests {
         ));
         let secrets = alpaca_secrets_toml();
 
-        let error = Ctx::load_files(config.path(), secrets.path(), None)
-            .await
-            .unwrap_err();
+        let error = Ctx::load_files(
+            config.path(),
+            secrets.path(),
+            TokenSource::Running {
+                registry_file: None,
+                registry_state: None,
+            },
+        )
+        .await
+        .unwrap_err();
 
         assert!(
             matches!(error, CtxError::MissingRebalancing),
@@ -4905,9 +5159,16 @@ mod tests {
         );
         let secrets = alpaca_secrets_toml();
 
-        let error = Ctx::load_files(config.path(), secrets.path(), None)
-            .await
-            .unwrap_err();
+        let error = Ctx::load_files(
+            config.path(),
+            secrets.path(),
+            TokenSource::Running {
+                registry_file: None,
+                registry_state: None,
+            },
+        )
+        .await
+        .unwrap_err();
 
         assert!(
             matches!(error, CtxError::MissingTokenization),
@@ -4926,9 +5187,16 @@ mod tests {
         );
         let secrets = alpaca_secrets_toml();
 
-        let error = Ctx::load_files(config.path(), secrets.path(), None)
-            .await
-            .unwrap_err();
+        let error = Ctx::load_files(
+            config.path(),
+            secrets.path(),
+            TokenSource::Running {
+                registry_file: None,
+                registry_state: None,
+            },
+        )
+        .await
+        .unwrap_err();
 
         assert!(
             matches!(error, CtxError::MissingBotGasValuation),
@@ -4944,9 +5212,16 @@ mod tests {
         let config = minimal_config_toml();
         let secrets = dry_run_secrets_toml();
 
-        let error = Ctx::load_files(config.path(), secrets.path(), None)
-            .await
-            .unwrap_err();
+        let error = Ctx::load_files(
+            config.path(),
+            secrets.path(),
+            TokenSource::Running {
+                registry_file: None,
+                registry_state: None,
+            },
+        )
+        .await
+        .unwrap_err();
 
         let CtxError::SecretsToml { source, .. } = error else {
             panic!(
@@ -4985,9 +5260,16 @@ mod tests {
         );
         let secrets = alpaca_secrets_toml();
 
-        let error = Ctx::load_files(config.path(), secrets.path(), None)
-            .await
-            .unwrap_err();
+        let error = Ctx::load_files(
+            config.path(),
+            secrets.path(),
+            TokenSource::Running {
+                registry_file: None,
+                registry_state: None,
+            },
+        )
+        .await
+        .unwrap_err();
 
         assert!(matches!(error, CtxError::ConfigToml { .. }));
     }
@@ -5002,9 +5284,16 @@ mod tests {
         );
         let secrets = alpaca_secrets_toml();
 
-        let error = Ctx::load_files(config.path(), secrets.path(), None)
-            .await
-            .unwrap_err();
+        let error = Ctx::load_files(
+            config.path(),
+            secrets.path(),
+            TokenSource::Running {
+                registry_file: None,
+                registry_state: None,
+            },
+        )
+        .await
+        .unwrap_err();
 
         assert!(matches!(error, CtxError::MissingFileLogLevel));
     }
@@ -5019,9 +5308,16 @@ mod tests {
         );
         let secrets = alpaca_secrets_toml();
 
-        let error = Ctx::load_files(config.path(), secrets.path(), None)
-            .await
-            .unwrap_err();
+        let error = Ctx::load_files(
+            config.path(),
+            secrets.path(),
+            TokenSource::Running {
+                registry_file: None,
+                registry_state: None,
+            },
+        )
+        .await
+        .unwrap_err();
 
         assert!(matches!(error, CtxError::MissingLogDirectory));
     }
@@ -5091,9 +5387,16 @@ mod tests {
         "#,
         );
         let secrets = alpaca_secrets_toml();
-        let error = Ctx::load_files(config.path(), secrets.path(), None)
-            .await
-            .unwrap_err();
+        let error = Ctx::load_files(
+            config.path(),
+            secrets.path(),
+            TokenSource::Running {
+                registry_file: None,
+                registry_state: None,
+            },
+        )
+        .await
+        .unwrap_err();
 
         assert!(
             matches!(error, CtxError::ConfigToml { .. }),
@@ -5150,9 +5453,16 @@ mod tests {
         "#,
         );
         let secrets = alpaca_secrets_toml();
-        let error = Ctx::load_files(config.path(), secrets.path(), None)
-            .await
-            .unwrap_err();
+        let error = Ctx::load_files(
+            config.path(),
+            secrets.path(),
+            TokenSource::Running {
+                registry_file: None,
+                registry_state: None,
+            },
+        )
+        .await
+        .unwrap_err();
 
         assert!(
             matches!(error, CtxError::ConfigToml { .. }),
@@ -5218,9 +5528,16 @@ mod tests {
         "#,
         );
         let secrets = alpaca_secrets_toml();
-        let error = Ctx::load_files(config.path(), secrets.path(), None)
-            .await
-            .unwrap_err();
+        let error = Ctx::load_files(
+            config.path(),
+            secrets.path(),
+            TokenSource::Running {
+                registry_file: None,
+                registry_state: None,
+            },
+        )
+        .await
+        .unwrap_err();
 
         assert!(
             matches!(error, CtxError::ConfigToml { .. }),
@@ -5279,9 +5596,16 @@ mod tests {
         "#,
         );
         let secrets = alpaca_secrets_toml();
-        let error = Ctx::load_files(config.path(), secrets.path(), None)
-            .await
-            .unwrap_err();
+        let error = Ctx::load_files(
+            config.path(),
+            secrets.path(),
+            TokenSource::Running {
+                registry_file: None,
+                registry_state: None,
+            },
+        )
+        .await
+        .unwrap_err();
 
         assert!(
             matches!(error, CtxError::ConfigToml { .. }),
@@ -5339,9 +5663,16 @@ mod tests {
         "#,
         );
         let secrets = alpaca_secrets_toml();
-        let error = Ctx::load_files(config.path(), secrets.path(), None)
-            .await
-            .unwrap_err();
+        let error = Ctx::load_files(
+            config.path(),
+            secrets.path(),
+            TokenSource::Running {
+                registry_file: None,
+                registry_state: None,
+            },
+        )
+        .await
+        .unwrap_err();
 
         assert!(
             matches!(error, CtxError::ConfigToml { .. }),
@@ -5399,9 +5730,16 @@ mod tests {
         "#,
         );
         let secrets = alpaca_secrets_toml();
-        let error = Ctx::load_files(config.path(), secrets.path(), None)
-            .await
-            .unwrap_err();
+        let error = Ctx::load_files(
+            config.path(),
+            secrets.path(),
+            TokenSource::Running {
+                registry_file: None,
+                registry_state: None,
+            },
+        )
+        .await
+        .unwrap_err();
 
         assert!(
             matches!(error, CtxError::ConfigToml { .. }),
@@ -5469,9 +5807,16 @@ mod tests {
         "#,
         );
         let secrets = alpaca_secrets_toml();
-        let error = Ctx::load_files(config.path(), secrets.path(), None)
-            .await
-            .unwrap_err();
+        let error = Ctx::load_files(
+            config.path(),
+            secrets.path(),
+            TokenSource::Running {
+                registry_file: None,
+                registry_state: None,
+            },
+        )
+        .await
+        .unwrap_err();
 
         assert!(
             matches!(
@@ -5532,9 +5877,16 @@ mod tests {
         "#,
         );
         let secrets = alpaca_secrets_toml();
-        let error = Ctx::load_files(config.path(), secrets.path(), None)
-            .await
-            .unwrap_err();
+        let error = Ctx::load_files(
+            config.path(),
+            secrets.path(),
+            TokenSource::Running {
+                registry_file: None,
+                registry_state: None,
+            },
+        )
+        .await
+        .unwrap_err();
 
         assert!(
             matches!(
@@ -5556,9 +5908,16 @@ mod tests {
             ),
         );
         let secrets = alpaca_secrets_toml();
-        let error = Ctx::load_files(config.path(), secrets.path(), None)
-            .await
-            .unwrap_err();
+        let error = Ctx::load_files(
+            config.path(),
+            secrets.path(),
+            TokenSource::Running {
+                registry_file: None,
+                registry_state: None,
+            },
+        )
+        .await
+        .unwrap_err();
 
         let error_text = format!("{error:#}");
         assert!(
@@ -5614,9 +5973,16 @@ mod tests {
         "#,
         );
         let secrets = alpaca_secrets_toml();
-        let error = Ctx::load_files(config.path(), secrets.path(), None)
-            .await
-            .unwrap_err();
+        let error = Ctx::load_files(
+            config.path(),
+            secrets.path(),
+            TokenSource::Running {
+                registry_file: None,
+                registry_state: None,
+            },
+        )
+        .await
+        .unwrap_err();
 
         assert!(
             matches!(error, CtxError::ServerAndBoardPortsMatch { port: 8080 }),
@@ -5692,9 +6058,16 @@ mod tests {
             "#
             ));
             let secrets = alpaca_secrets_toml();
-            let error = Ctx::load_files(config.path(), secrets.path(), None)
-                .await
-                .unwrap_err();
+            let error = Ctx::load_files(
+                config.path(),
+                secrets.path(),
+                TokenSource::Running {
+                    registry_file: None,
+                    registry_state: None,
+                },
+            )
+            .await
+            .unwrap_err();
 
             let matched = match expect {
                 "equal" => matches!(error, CtxError::OpsApiAudiencesEqual),
@@ -5825,9 +6198,16 @@ mod tests {
         "#,
         );
 
-        let error = Ctx::load_files(config.path(), secrets.path(), None)
-            .await
-            .unwrap_err();
+        let error = Ctx::load_files(
+            config.path(),
+            secrets.path(),
+            TokenSource::Running {
+                registry_file: None,
+                registry_state: None,
+            },
+        )
+        .await
+        .unwrap_err();
         let CtxError::CashOperationalLimitBelowMinimumTransfer {
             configured,
             minimum,
@@ -5990,9 +6370,16 @@ mod tests {
         ));
         let secrets = alpaca_secrets_toml();
 
-        let error = Ctx::load_files(config.path(), secrets.path(), None)
-            .await
-            .unwrap_err();
+        let error = Ctx::load_files(
+            config.path(),
+            secrets.path(),
+            TokenSource::Running {
+                registry_file: None,
+                registry_state: None,
+            },
+        )
+        .await
+        .unwrap_err();
         assert!(
             matches!(error, CtxError::LogQueryUrlTemplateMissingIdPlaceholder),
             "expected LogQueryUrlTemplateMissingIdPlaceholder, got: {error:?}"
@@ -6009,9 +6396,16 @@ mod tests {
         ));
         let secrets = alpaca_secrets_toml();
 
-        let error = Ctx::load_files(config.path(), secrets.path(), None)
-            .await
-            .unwrap_err();
+        let error = Ctx::load_files(
+            config.path(),
+            secrets.path(),
+            TokenSource::Running {
+                registry_file: None,
+                registry_state: None,
+            },
+        )
+        .await
+        .unwrap_err();
         assert!(
             matches!(error, CtxError::LogQueryUrlTemplateNotAUrl { .. }),
             "expected LogQueryUrlTemplateNotAUrl, got: {error:?}"
@@ -6124,9 +6518,16 @@ mod tests {
         "#,
         );
 
-        let error = Ctx::load_files(config.path(), secrets.path(), None)
-            .await
-            .unwrap_err();
+        let error = Ctx::load_files(
+            config.path(),
+            secrets.path(),
+            TokenSource::Running {
+                registry_file: None,
+                registry_state: None,
+            },
+        )
+        .await
+        .unwrap_err();
         assert!(
             matches!(error, CtxError::SecretsToml { .. }),
             "Expected unsupported Schwab broker secrets to fail during parsing, got {error:?}"
@@ -6137,7 +6538,15 @@ mod tests {
     async fn unsupported_schwab_broker_fails_during_secret_parsing() {
         let config = minimal_config_toml();
         let secrets = unsupported_schwab_secrets_toml();
-        let result = Ctx::load_files(config.path(), secrets.path(), None).await;
+        let result = Ctx::load_files(
+            config.path(),
+            secrets.path(),
+            TokenSource::Running {
+                registry_file: None,
+                registry_state: None,
+            },
+        )
+        .await;
         assert!(
             matches!(result, Err(CtxError::SecretsToml { .. })),
             "Expected unsupported Schwab broker secrets to fail during parsing, got {result:?}"
@@ -6148,9 +6557,16 @@ mod tests {
     async fn unsupported_schwab_broker_with_order_owner_fails_during_secret_parsing() {
         let config = minimal_config_toml();
         let secrets = unsupported_schwab_secrets_toml();
-        let error = Ctx::load_files(config.path(), secrets.path(), None)
-            .await
-            .unwrap_err();
+        let error = Ctx::load_files(
+            config.path(),
+            secrets.path(),
+            TokenSource::Running {
+                registry_file: None,
+                registry_state: None,
+            },
+        )
+        .await
+        .unwrap_err();
         assert_eq!(
             error.kind(),
             "failed to parse secrets",
@@ -6166,9 +6582,16 @@ mod tests {
     #[cfg(feature = "wallet-private-key")]
     #[tokio::test]
     async fn example_config_and_secrets_parse_successfully() {
-        let ctx = Ctx::load_files(example_config_toml(), example_secrets_toml(), None)
-            .await
-            .unwrap();
+        let ctx = Ctx::load_files(
+            example_config_toml(),
+            example_secrets_toml(),
+            TokenSource::Running {
+                registry_file: None,
+                registry_state: None,
+            },
+        )
+        .await
+        .unwrap();
 
         // Example configs configure rebalancing with a private-key wallet;
         // a successful parse proves the required [rebalancing] section and
@@ -6292,9 +6715,16 @@ mod tests {
         );
         let secrets = secrets_only_secrets_toml(CREDENTIALS_ONLY_BROKER, API_KEY_ONLY_ISSUANCE);
 
-        let ctx = Ctx::load_files(config.path(), secrets.path(), None)
-            .await
-            .unwrap();
+        let ctx = Ctx::load_files(
+            config.path(),
+            secrets.path(),
+            TokenSource::Running {
+                registry_file: None,
+                registry_state: None,
+            },
+        )
+        .await
+        .unwrap();
 
         let BrokerCtx::AlpacaBrokerApi(alpaca) = ctx.broker;
         assert_eq!(
@@ -6329,9 +6759,16 @@ mod tests {
         );
         let secrets = secrets_only_secrets_toml("", API_KEY_ONLY_ISSUANCE);
 
-        let ctx = Ctx::load_files(config.path(), secrets.path(), None)
-            .await
-            .unwrap();
+        let ctx = Ctx::load_files(
+            config.path(),
+            secrets.path(),
+            TokenSource::Running {
+                registry_file: None,
+                registry_state: None,
+            },
+        )
+        .await
+        .unwrap();
 
         let BrokerCtx::AlpacaBrokerApi(alpaca) = ctx.broker;
         assert!(
@@ -6357,9 +6794,16 @@ mod tests {
         );
         let secrets = alpaca_secrets_toml();
 
-        let ctx = Ctx::load_files(config.path(), secrets.path(), None)
-            .await
-            .unwrap();
+        let ctx = Ctx::load_files(
+            config.path(),
+            secrets.path(),
+            TokenSource::Running {
+                registry_file: None,
+                registry_state: None,
+            },
+        )
+        .await
+        .unwrap();
 
         let BrokerCtx::AlpacaBrokerApi(alpaca) = ctx.broker;
         assert_eq!(
@@ -6392,9 +6836,16 @@ mod tests {
         );
         let secrets = alpaca_secrets_toml();
 
-        let error = Ctx::load_files(config.path(), secrets.path(), None)
-            .await
-            .unwrap_err();
+        let error = Ctx::load_files(
+            config.path(),
+            secrets.path(),
+            TokenSource::Running {
+                registry_file: None,
+                registry_state: None,
+            },
+        )
+        .await
+        .unwrap_err();
 
         assert!(
             matches!(
@@ -6412,9 +6863,16 @@ mod tests {
         let config = broker_identity_config_toml(r#"type = "alpaca-broker-api-kms""#);
         let secrets = alpaca_secrets_toml();
 
-        let error = Ctx::load_files(config.path(), secrets.path(), None)
-            .await
-            .unwrap_err();
+        let error = Ctx::load_files(
+            config.path(),
+            secrets.path(),
+            TokenSource::Running {
+                registry_file: None,
+                registry_state: None,
+            },
+        )
+        .await
+        .unwrap_err();
 
         assert!(
             matches!(error, CtxError::BrokerIdentityConflict { field: "type" }),
@@ -6427,9 +6885,16 @@ mod tests {
         let config = alpaca_trading_config_toml();
         let secrets = secrets_only_secrets_toml("", API_KEY_ONLY_ISSUANCE);
 
-        let error = Ctx::load_files(config.path(), secrets.path(), None)
-            .await
-            .unwrap_err();
+        let error = Ctx::load_files(
+            config.path(),
+            secrets.path(),
+            TokenSource::Running {
+                registry_file: None,
+                registry_state: None,
+            },
+        )
+        .await
+        .unwrap_err();
 
         assert!(
             matches!(error, CtxError::MissingBrokerType),
@@ -6446,9 +6911,16 @@ mod tests {
         let config = broker_identity_config_toml(r#"type = "dry-run""#);
         let secrets = secrets_only_secrets_toml("", API_KEY_ONLY_ISSUANCE);
 
-        let error = Ctx::load_files(config.path(), secrets.path(), None)
-            .await
-            .unwrap_err();
+        let error = Ctx::load_files(
+            config.path(),
+            secrets.path(),
+            TokenSource::Running {
+                registry_file: None,
+                registry_state: None,
+            },
+        )
+        .await
+        .unwrap_err();
 
         assert!(
             matches!(error, CtxError::ConfigToml { .. }),
@@ -6473,9 +6945,16 @@ mod tests {
         );
         let secrets = secrets_only_secrets_toml(CREDENTIALS_ONLY_BROKER, API_KEY_ONLY_ISSUANCE);
 
-        let error = Ctx::load_files(config.path(), secrets.path(), None)
-            .await
-            .unwrap_err();
+        let error = Ctx::load_files(
+            config.path(),
+            secrets.path(),
+            TokenSource::Running {
+                registry_file: None,
+                registry_state: None,
+            },
+        )
+        .await
+        .unwrap_err();
 
         assert!(
             matches!(
@@ -6497,9 +6976,16 @@ mod tests {
         );
         let secrets = secrets_only_secrets_toml("", API_KEY_ONLY_ISSUANCE);
 
-        let error = Ctx::load_files(config.path(), secrets.path(), None)
-            .await
-            .unwrap_err();
+        let error = Ctx::load_files(
+            config.path(),
+            secrets.path(),
+            TokenSource::Running {
+                registry_file: None,
+                registry_state: None,
+            },
+        )
+        .await
+        .unwrap_err();
 
         assert!(
             matches!(error, CtxError::MissingBrokerCredentials),
@@ -6520,9 +7006,16 @@ mod tests {
             api_key = "0xaabbccddeeff00112233445566778899aabbccddeeff00112233445566778899""#,
         );
 
-        let error = Ctx::load_files(config.path(), secrets.path(), None)
-            .await
-            .unwrap_err();
+        let error = Ctx::load_files(
+            config.path(),
+            secrets.path(),
+            TokenSource::Running {
+                registry_file: None,
+                registry_state: None,
+            },
+        )
+        .await
+        .unwrap_err();
 
         assert!(
             matches!(error, CtxError::IssuanceBaseUrlConflict),
@@ -6545,9 +7038,16 @@ mod tests {
             api_key = "0xaabbccddeeff00112233445566778899aabbccddeeff00112233445566778899""#,
         );
 
-        let ctx = Ctx::load_files(config.path(), secrets.path(), None)
-            .await
-            .unwrap();
+        let ctx = Ctx::load_files(
+            config.path(),
+            secrets.path(),
+            TokenSource::Running {
+                registry_file: None,
+                registry_state: None,
+            },
+        )
+        .await
+        .unwrap();
 
         assert_eq!(ctx.issuance.base_url.as_str(), "http://issuance.test:8000/");
     }
@@ -6564,9 +7064,16 @@ mod tests {
             API_KEY_ONLY_ISSUANCE,
         );
 
-        let error = Ctx::load_files(config.path(), secrets.path(), None)
-            .await
-            .unwrap_err();
+        let error = Ctx::load_files(
+            config.path(),
+            secrets.path(),
+            TokenSource::Running {
+                registry_file: None,
+                registry_state: None,
+            },
+        )
+        .await
+        .unwrap_err();
 
         assert!(
             matches!(error, CtxError::MissingIssuanceBaseUrl),
@@ -6730,7 +7237,15 @@ mod tests {
         "#,
         );
 
-        let result = Ctx::load_files(config.path(), secrets.path(), None).await;
+        let result = Ctx::load_files(
+            config.path(),
+            secrets.path(),
+            TokenSource::Running {
+                registry_file: None,
+                registry_state: None,
+            },
+        )
+        .await;
         assert!(
             matches!(result, Err(CtxError::WalletNotConfigured)),
             "Expected WalletNotConfigured error, got {result:?}"
@@ -6858,7 +7373,15 @@ mod tests {
         "#,
         );
 
-        let result = Ctx::load_files(config.path(), secrets.path(), None).await;
+        let result = Ctx::load_files(
+            config.path(),
+            secrets.path(),
+            TokenSource::Running {
+                registry_file: None,
+                registry_state: None,
+            },
+        )
+        .await;
         assert!(
             matches!(result, Err(CtxError::WalletNotConfigured)),
             "Expected WalletNotConfigured error, got {result:?}"
@@ -6990,7 +7513,15 @@ mod tests {
         "#,
         );
 
-        let result = Ctx::load_files(config.path(), secrets.path(), None).await;
+        let result = Ctx::load_files(
+            config.path(),
+            secrets.path(),
+            TokenSource::Running {
+                registry_file: None,
+                registry_state: None,
+            },
+        )
+        .await;
         assert!(
             matches!(result, Err(CtxError::MissingTokenization)),
             "Expected MissingTokenization error, got {result:?}"
@@ -7386,7 +7917,15 @@ mod tests {
         "#,
         );
 
-        let result = Ctx::load_files(config.path(), secrets.path(), None).await;
+        let result = Ctx::load_files(
+            config.path(),
+            secrets.path(),
+            TokenSource::Running {
+                registry_file: None,
+                registry_state: None,
+            },
+        )
+        .await;
         assert!(
             matches!(result, Err(CtxError::WalletSecretsMissing)),
             "Expected WalletSecretsMissing error, got {result:?}"
@@ -7480,7 +8019,15 @@ mod tests {
         "#,
         );
 
-        let result = Ctx::load_files(config.path(), secrets.path(), None).await;
+        let result = Ctx::load_files(
+            config.path(),
+            secrets.path(),
+            TokenSource::Running {
+                registry_file: None,
+                registry_state: None,
+            },
+        )
+        .await;
         assert!(
             !matches!(result, Err(CtxError::WalletSecretsMissing)),
             "KMS-stamped wallet must not require [wallet] secrets, got {result:?}"
@@ -7558,7 +8105,15 @@ mod tests {
         "#,
         );
 
-        let result = Ctx::load_files(config.path(), secrets.path(), None).await;
+        let result = Ctx::load_files(
+            config.path(),
+            secrets.path(),
+            TokenSource::Running {
+                registry_file: None,
+                registry_state: None,
+            },
+        )
+        .await;
         let error = result.unwrap_err();
         let detail = std::error::Error::source(&error)
             .map(std::string::ToString::to_string)
@@ -7650,7 +8205,15 @@ mod tests {
         "#,
         );
 
-        let result = Ctx::load_files(config.path(), secrets.path(), None).await;
+        let result = Ctx::load_files(
+            config.path(),
+            secrets.path(),
+            TokenSource::Running {
+                registry_file: None,
+                registry_state: None,
+            },
+        )
+        .await;
         assert!(
             matches!(
                 result,
@@ -8280,9 +8843,16 @@ mod tests {
         "#,
         );
 
-        let err = Ctx::load_files(config.path(), secrets.path(), None)
-            .await
-            .unwrap_err();
+        let err = Ctx::load_files(
+            config.path(),
+            secrets.path(),
+            TokenSource::Running {
+                registry_file: None,
+                registry_state: None,
+            },
+        )
+        .await
+        .unwrap_err();
 
         assert!(
             matches!(
@@ -8373,9 +8943,16 @@ mod tests {
         "#,
         );
 
-        let err = Ctx::load_files(config.path(), secrets.path(), None)
-            .await
-            .unwrap_err();
+        let err = Ctx::load_files(
+            config.path(),
+            secrets.path(),
+            TokenSource::Running {
+                registry_file: None,
+                registry_state: None,
+            },
+        )
+        .await
+        .unwrap_err();
 
         assert!(
             matches!(
@@ -8695,9 +9272,16 @@ mod tests {
             private_key = "0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
         "#,
         );
-        let error = Ctx::load_files(config.path(), secrets.path(), None)
-            .await
-            .unwrap_err();
+        let error = Ctx::load_files(
+            config.path(),
+            secrets.path(),
+            TokenSource::Running {
+                registry_file: None,
+                registry_state: None,
+            },
+        )
+        .await
+        .unwrap_err();
 
         assert!(
             matches!(error, CtxError::MissingIssuanceConfig),
@@ -8736,9 +9320,16 @@ mod tests {
             base_url = "http://issuance.test:8000"
         "#,
         );
-        let error = Ctx::load_files(config.path(), secrets.path(), None)
-            .await
-            .unwrap_err();
+        let error = Ctx::load_files(
+            config.path(),
+            secrets.path(),
+            TokenSource::Running {
+                registry_file: None,
+                registry_state: None,
+            },
+        )
+        .await
+        .unwrap_err();
 
         assert!(
             matches!(error, CtxError::SecretsToml { .. }),
@@ -8778,9 +9369,16 @@ mod tests {
             api_key = "0xaabbccddeeff00112233445566778899aabbccddeeff00112233445566778899"
         "#,
         );
-        let error = Ctx::load_files(config.path(), secrets.path(), None)
-            .await
-            .unwrap_err();
+        let error = Ctx::load_files(
+            config.path(),
+            secrets.path(),
+            TokenSource::Running {
+                registry_file: None,
+                registry_state: None,
+            },
+        )
+        .await
+        .unwrap_err();
 
         assert!(
             matches!(error, CtxError::SecretsToml { .. }),
@@ -8820,9 +9418,16 @@ mod tests {
             api_key = "0xdeadbeef"
         "#,
         );
-        let error = Ctx::load_files(config.path(), secrets.path(), None)
-            .await
-            .unwrap_err();
+        let error = Ctx::load_files(
+            config.path(),
+            secrets.path(),
+            TokenSource::Running {
+                registry_file: None,
+                registry_state: None,
+            },
+        )
+        .await
+        .unwrap_err();
 
         assert!(
             matches!(error, CtxError::InvalidIssuanceApiKey { .. }),
@@ -8865,9 +9470,16 @@ mod tests {
             api_key = "{raw_key}"
         "#
         ));
-        let error = Ctx::load_files(config.path(), secrets.path(), None)
-            .await
-            .unwrap_err();
+        let error = Ctx::load_files(
+            config.path(),
+            secrets.path(),
+            TokenSource::Running {
+                registry_file: None,
+                registry_state: None,
+            },
+        )
+        .await
+        .unwrap_err();
 
         assert!(
             matches!(error, CtxError::InvalidIssuanceApiKey { .. }),
@@ -9042,9 +9654,16 @@ mod tests {
         "#,
         );
 
-        let err = Ctx::load_files(config.path(), secrets.path(), None)
-            .await
-            .unwrap_err();
+        let err = Ctx::load_files(
+            config.path(),
+            secrets.path(),
+            TokenSource::Running {
+                registry_file: None,
+                registry_state: None,
+            },
+        )
+        .await
+        .unwrap_err();
 
         assert!(
             matches!(err, CtxError::MissingTravelRule),
@@ -9170,15 +9789,40 @@ mod tests {
         "#,
         );
 
-        let error = Ctx::load_files(config.path(), secrets.path(), None)
-            .await
-            .unwrap_err();
+        let error = Ctx::load_files(
+            config.path(),
+            secrets.path(),
+            TokenSource::Running {
+                registry_file: None,
+                registry_state: None,
+            },
+        )
+        .await
+        .unwrap_err();
 
         assert!(
             matches!(error, CtxError::SecretsToml { .. }),
             "expected unsupported Schwab broker secrets to fail during parsing, got: {error:?}"
         );
         assert_eq!(error.kind(), "failed to parse secrets");
+    }
+
+    /// The fallback a failed copy leaves (the last good tables, plus the
+    /// failed copy's own listings switched off) passes every check boot
+    /// runs, on a symbol whose policy enables extended hours.
+    #[test]
+    fn a_fallback_from_the_production_copy_passes_the_boot_checks() {
+        let tokens = registry::fixtures::pinned_production_tokens();
+        let failed = registry::project(&registry::parse(&tokens).unwrap()).unwrap();
+        let mut last_good = failed.clone();
+        for rows in last_good.chain_rows.values_mut() {
+            rows.remove("AAPL");
+        }
+        last_good.policies.remove("AAPL");
+        let fallback = last_good.carry_forward(&failed).projection.to_token_file();
+        let config = toml_file(include_str!("../../../config/prod/st0x-hedge.toml"));
+
+        Ctx::validate_config_file(config.path(), TokenFile::Bytes(fallback.as_bytes())).unwrap();
     }
 
     #[test]
@@ -10427,9 +11071,16 @@ mod tests {
         );
         let secrets = alpaca_secrets_toml();
 
-        let err = Ctx::load_files(config.path(), secrets.path(), None)
-            .await
-            .unwrap_err();
+        let err = Ctx::load_files(
+            config.path(),
+            secrets.path(),
+            TokenSource::Running {
+                registry_file: None,
+                registry_state: None,
+            },
+        )
+        .await
+        .unwrap_err();
         assert!(
             matches!(err, CtxError::ConfigToml { .. }),
             "Expected config parse error for unknown field, got {err:?}"
@@ -10484,9 +11135,16 @@ mod tests {
         );
         let secrets = alpaca_secrets_toml();
 
-        let err = Ctx::load_files(config.path(), secrets.path(), None)
-            .await
-            .unwrap_err();
+        let err = Ctx::load_files(
+            config.path(),
+            secrets.path(),
+            TokenSource::Running {
+                registry_file: None,
+                registry_state: None,
+            },
+        )
+        .await
+        .unwrap_err();
         assert!(
             matches!(err, CtxError::ConfigToml { .. }),
             "Expected config parse error for unknown assets field, got {err:?}"
@@ -10550,9 +11208,16 @@ mod tests {
         );
         let secrets = alpaca_secrets_toml();
 
-        let err = Ctx::load_files(config.path(), secrets.path(), None)
-            .await
-            .unwrap_err();
+        let err = Ctx::load_files(
+            config.path(),
+            secrets.path(),
+            TokenSource::Running {
+                registry_file: None,
+                registry_state: None,
+            },
+        )
+        .await
+        .unwrap_err();
         assert!(
             matches!(err, CtxError::ConfigToml { .. }),
             "Expected config parse error for unknown equity field, got {err:?}"
@@ -10606,9 +11271,16 @@ mod tests {
         );
         let secrets = alpaca_secrets_toml();
 
-        let err = Ctx::load_files(config.path(), secrets.path(), None)
-            .await
-            .unwrap_err();
+        let err = Ctx::load_files(
+            config.path(),
+            secrets.path(),
+            TokenSource::Running {
+                registry_file: None,
+                registry_state: None,
+            },
+        )
+        .await
+        .unwrap_err();
         assert!(
             matches!(err, CtxError::ConfigToml { .. }),
             "Expected config parse error for unknown cash field, got {err:?}"
@@ -10642,9 +11314,16 @@ mod tests {
         "#,
         );
 
-        let err = Ctx::load_files(config.path(), secrets.path(), None)
-            .await
-            .unwrap_err();
+        let err = Ctx::load_files(
+            config.path(),
+            secrets.path(),
+            TokenSource::Running {
+                registry_file: None,
+                registry_state: None,
+            },
+        )
+        .await
+        .unwrap_err();
         assert!(
             matches!(err, CtxError::SecretsToml { .. }),
             "Expected secrets parse error for unknown field, got {err:?}"
@@ -10679,9 +11358,16 @@ mod tests {
         );
 
         let secrets_path = secrets.path().to_path_buf();
-        let err = Ctx::load_files(config.path(), &secrets_path, None)
-            .await
-            .unwrap_err();
+        let err = Ctx::load_files(
+            config.path(),
+            &secrets_path,
+            TokenSource::Running {
+                registry_file: None,
+                registry_state: None,
+            },
+        )
+        .await
+        .unwrap_err();
         let display = err.to_string();
         assert!(
             display.contains(&secrets_path.display().to_string()),
@@ -10742,9 +11428,16 @@ mod tests {
         let secrets = alpaca_secrets_toml();
 
         let config_path = config.path().to_path_buf();
-        let err = Ctx::load_files(&config_path, secrets.path(), None)
-            .await
-            .unwrap_err();
+        let err = Ctx::load_files(
+            &config_path,
+            secrets.path(),
+            TokenSource::Running {
+                registry_file: None,
+                registry_state: None,
+            },
+        )
+        .await
+        .unwrap_err();
         let display = err.to_string();
         assert!(
             display.contains(&config_path.display().to_string()),
@@ -10780,9 +11473,16 @@ mod tests {
         "#,
         );
 
-        let err = Ctx::load_files(config.path(), secrets.path(), None)
-            .await
-            .unwrap_err();
+        let err = Ctx::load_files(
+            config.path(),
+            secrets.path(),
+            TokenSource::Running {
+                registry_file: None,
+                registry_state: None,
+            },
+        )
+        .await
+        .unwrap_err();
         assert!(
             matches!(err, CtxError::SecretsToml { .. }),
             "Expected secrets parse error for unknown broker field, got {err:?}"
@@ -11146,9 +11846,16 @@ mod tests {
         let config = equity_pricing_config_toml(true);
         let secrets = alpaca_pricing_secrets_toml();
 
-        let ctx = Ctx::load_files(config.path(), secrets.path(), None)
-            .await
-            .unwrap();
+        let ctx = Ctx::load_files(
+            config.path(),
+            secrets.path(),
+            TokenSource::Running {
+                registry_file: None,
+                registry_state: None,
+            },
+        )
+        .await
+        .unwrap();
 
         let pricing = ctx.pricing.expect("pricing context should be assembled");
         assert_eq!(pricing.ws_url.as_str(), "wss://pricing.test/ws");
@@ -11160,9 +11867,16 @@ mod tests {
         let config = equity_pricing_config_toml(false);
         let secrets = alpaca_pricing_secrets_toml();
 
-        let error = Ctx::load_files(config.path(), secrets.path(), None)
-            .await
-            .unwrap_err();
+        let error = Ctx::load_files(
+            config.path(),
+            secrets.path(),
+            TokenSource::Running {
+                registry_file: None,
+                registry_state: None,
+            },
+        )
+        .await
+        .unwrap_err();
 
         assert!(matches!(
             error,
@@ -11175,9 +11889,16 @@ mod tests {
         let config = equity_pricing_config_toml(true);
         let secrets = alpaca_secrets_toml();
 
-        let error = Ctx::load_files(config.path(), secrets.path(), None)
-            .await
-            .unwrap_err();
+        let error = Ctx::load_files(
+            config.path(),
+            secrets.path(),
+            TokenSource::Running {
+                registry_file: None,
+                registry_state: None,
+            },
+        )
+        .await
+        .unwrap_err();
 
         assert!(matches!(
             error,
@@ -12509,5 +13230,154 @@ mod tests {
         usdc.corridors.clear();
 
         validate_corridor_chains(&config).unwrap();
+    }
+    fn registry_candidate_fixture() -> (Ctx, Vec<u8>) {
+        let mut config: toml::Table =
+            toml::from_str(include_str!("../../../example.config.toml")).unwrap();
+        let mut file = toml::Table::new();
+        file.insert("schema_version".into(), toml::Value::Integer(1));
+        let mut chains = toml::Table::new();
+        for (name, chain) in config["chains"].as_table_mut().unwrap() {
+            let Some(trading) = chain.get_mut("trading") else {
+                continue;
+            };
+            let equities = trading["assets"]["equities"].as_table_mut().unwrap();
+            let mut rows = toml::Table::new();
+            equities.retain(|name, value| {
+                if value.is_table() {
+                    rows.insert(name.to_string(), value.clone());
+                    false
+                } else {
+                    true
+                }
+            });
+            let mut row = toml::Table::new();
+            row.insert(
+                "assets".into(),
+                toml::Value::Table(toml::Table::from_iter([(
+                    "equities".into(),
+                    toml::Value::Table(rows),
+                )])),
+            );
+            chains.insert(name.clone(), toml::Value::Table(row));
+        }
+        file.insert("chains".into(), toml::Value::Table(chains));
+        let mut policies = toml::Table::new();
+        config["assets"]["equities"]
+            .as_table_mut()
+            .unwrap()
+            .retain(|name, value| {
+                if value.is_table() {
+                    policies.insert(name.to_string(), value.clone());
+                    false
+                } else {
+                    true
+                }
+            });
+        file.insert(
+            "assets".into(),
+            toml::Value::Table(toml::Table::from_iter([(
+                "equities".into(),
+                toml::Value::Table(policies),
+            )])),
+        );
+        config.insert(
+            "registry".into(),
+            toml::Value::Table(toml::Table::from_iter([(
+                "url".into(),
+                toml::Value::String("gs://test/tokens.toml".into()),
+            )])),
+        );
+        let bytes = file.to_string().into_bytes();
+        let mut ctx = create_test_ctx_with_order_owner(Address::ZERO);
+        let projection = registry::project(&file).unwrap();
+        let mut live = RegistryLive::for_test(
+            registry::source_of(&config).unwrap().unwrap(),
+            config.clone(),
+            projection,
+        );
+        live.inputs = Some(std::sync::Arc::new(RegistryInputs {
+            config: config.to_string(),
+            config_path: PathBuf::from("absent-config.toml"),
+            secrets: include_str!("../../../example.secrets.toml").into(),
+            secrets_path: PathBuf::from("absent-secrets.toml"),
+        }));
+        ctx.registry = Some(live);
+        (ctx.registry_candidate(&bytes).unwrap(), bytes)
+    }
+
+    #[test]
+    fn registry_candidate_reuses_boot_inputs_and_keeps_running_config_on_rejection() {
+        let (ctx, bytes) = registry_candidate_fixture();
+        let running = ctx.registry.as_ref().unwrap().live.clone();
+        let mut invalid = registry::parse(&bytes).unwrap();
+        invalid.insert("schema_version".into(), toml::Value::Integer(2));
+        assert!(
+            ctx.registry_candidate(invalid.to_string().as_bytes())
+                .is_err()
+        );
+        assert_eq!(ctx.registry.as_ref().unwrap().live, running);
+        assert_eq!(
+            ctx.registry_candidate(&bytes)
+                .unwrap()
+                .registry
+                .unwrap()
+                .live,
+            running
+        );
+        assert!(!format!("{ctx:?}").contains("test_secret"));
+    }
+
+    #[test]
+    fn registry_candidate_applies_a_valid_switch_without_constructing_a_wallet() {
+        let (ctx, bytes) = registry_candidate_fixture();
+        let mut file = registry::parse(&bytes).unwrap();
+        let chain = ctx.chains.primary();
+        let symbol = chain
+            .assets
+            .equities
+            .symbols
+            .iter()
+            .find(|(_, row)| row.trading == OperationMode::Enabled)
+            .unwrap()
+            .0;
+        file["chains"][chain.chain.to_string()]["assets"]["equities"][symbol.to_string()]["trading"] =
+            toml::Value::String("disabled".into());
+        file["assets"]["equities"][symbol.to_string()]["extended_hours_counter_trading"] =
+            toml::Value::String("disabled".into());
+        let candidate = ctx.registry_candidate(file.to_string().as_bytes()).unwrap();
+        assert!(!candidate.chains.primary().assets.is_trading_enabled(symbol));
+        assert!(ctx.chains.primary().assets.is_trading_enabled(symbol));
+        assert!(candidate.wallet.is_none());
+    }
+
+    /// An explicit state directory replaces the one beside the database,
+    /// even when it has no running record, so the read falls through to
+    /// the bucket instead of another host's state.
+    #[test]
+    fn an_explicit_state_directory_replaces_the_database_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let beside_database =
+            crate::registry_state::RegistryState::open(&dir.path().join("registry")).unwrap();
+        let record = beside_database
+            .write_record(7, b"source", b"database tables")
+            .unwrap();
+        beside_database.mark_running(record).unwrap();
+        let explicit = dir.path().join("explicit");
+        std::fs::create_dir(&explicit).unwrap();
+        let mut table = toml::Table::new();
+        table.insert(
+            "database_url".into(),
+            toml::Value::String(format!(
+                "sqlite://{}",
+                dir.path().join("db.sqlite").display()
+            )),
+        );
+
+        assert_eq!(
+            running_tokens(&table, None).unwrap(),
+            Some(b"database tables".to_vec())
+        );
+        assert_eq!(running_tokens(&table, Some(&explicit)).unwrap(), None);
     }
 }

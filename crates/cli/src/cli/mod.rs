@@ -28,7 +28,7 @@ use std::sync::Arc;
 use tracing::info;
 use uuid::Uuid;
 
-use st0x_config::{Ctx, Env};
+use st0x_config::{Ctx, Env, TokenSource};
 use st0x_evm::{Chain, OpenChainErrorRegistry, PreparedTransaction};
 use st0x_execution::alpaca_broker_api::AlpacaLimitPrice;
 use st0x_execution::{AlpacaAccountId, Direction, FractionalShares, Positive, Symbol, TimeInForce};
@@ -1068,12 +1068,11 @@ impl CliEnv {
 
     /// Load config and secrets from the file paths parsed from CLI arguments.
     pub(crate) async fn load(self) -> anyhow::Result<(Ctx, Commands)> {
-        let ctx = Ctx::load_files(
-            &self.env.config,
-            &self.env.secrets,
-            self.env.registry_file.as_deref(),
-        )
-        .await?;
+        let source = TokenSource::Running {
+            registry_file: self.env.registry_file.as_deref(),
+            registry_state: self.env.registry_state.as_deref(),
+        };
+        let ctx = Ctx::load_files(&self.env.config, &self.env.secrets, source).await?;
         Ok((ctx, self.command))
     }
 }

@@ -265,50 +265,48 @@ chain's signing wallet, orderbook, `redemption_wallet` and
 - `tokenized_equity`: The base token contract address.
 - `tokenized_equity_derivative`: The wrapped token contract address.
 
-### 4b. Publish, then roll the bot
+### 4b. Publish and verify adoption
 
-Merge the `st0x.registry` change; its CI publishes the file. The bot never
-applies a new copy while it runs: its `registry_pending_restart` gauge goes to 1
-when the latest published copy differs from the one it runs, and
-`registry_invalid` goes to 1 when the copy its next start would read (the pinned
-generation in production, the latest copy in staging) would be refused.
-`registry_latest_refused` goes to 1 when the latest copy would be refused, so in
-production a bad copy shows before the pin is bumped to it. In production a
-restart alone changes nothing: it loads the pinned generation again, so the
-gauge stays at 1 until the pin is bumped and released.
+Merge the `st0x.registry` change; its CI publishes the token file. After the
+unpinned reload release, the bot polls every ten seconds and validates each
+observed generation before a graceful restart. No liquidity pin-bump PR or
+config-only release is needed. Start with a disabled listing, verify adoption,
+then enable trading in a second publish. Newly configured contracts are probed
+including disabled rows; newly selected tokenization routes and changed startup
+approval targets are checked too. Missing Turnkey coverage or transient RPC
+failures defer adoption until the dependency is fixed, without a republish.
 
-- **Staging** reads the latest copy on every start, so the next restart picks
-  the asset up. That includes a crash restart, and no deploy gate runs on it:
-  whatever is published is what the next staging start runs.
-- **Production** pins `generation` under `[registry]` in
-  `config/prod/st0x-hedge.toml`. Set it to the new generation
-  (`gcloud storage objects describe gs://t0-artifacts-tokens/production/tokens.toml`)
-  in a liquidity PR and release it. In the same PR copy that object to
-  `tests/fixtures/tokens-production-<generation>.toml`
-  (`gcloud storage cp 'gs://t0-artifacts-tokens/production/tokens.toml#<generation>' tests/fixtures/tokens-production-<generation>.toml`):
-  the tests that describe what production runs read the fixture the pin names,
-  and CI fails without it. `tokens-production-migration.toml` stays as it is; it
-  is the frozen proof of the move from inline tables.
+Check `registry_applied_generation`, the structured generation/hash logs and
+`registry_reloads_total{result}`. A refused copy sets `registry_invalid` and
+leaves the current configuration running. Promotion to last-good requires ten
+minutes of uptime; two failed boots fall back to the previous good set plus new
+listings disabled. Reloads are debounced for two minutes.
 
-Before a release, check the pinned copy against the config offline:
+During rollout production still pins `generation`, and the watcher only reports
+changes. Release the state-seeding code first, verify last-good exists on the
+data disk, then remove the pin in a second release. The t0.devops compose gates
+must pass `--registry-state /mnt/data/registry` and manage the deployment hold
+before that second release. Keep the production fixture aligned with the pin
+until it is removed; `tokens-production-migration.toml` stays frozen.
 
-```bash
-cargo run --bin validate-config -- --config config/prod/st0x-hedge.toml \
-  --registry-file tests/fixtures/tokens-production-<generation>.toml
-```
+Offline checks continue to accept `--registry-file`. Deployment checks accept
+`--registry-state` and judge pending plus fallback, or running. These readers
+never change boot attempts or promote state.
 
 ### Retiring an asset
 
-One config change. List the symbol under `[assets.equities] retired_symbols` in
-the bot's config and release that. From then on the bot ignores the token file's
-rows for that symbol, so the merged config never has it both configured and
-retired, and `verify-migrations` still finds every symbol the database
-references either configured or retired. Remove its rows from `t0/<env>.toml` in
-`st0x.registry` whenever convenient afterwards; for production that lands with
-the next `generation` bump. Never remove the rows first: the database would then
-reference a symbol that is neither configured nor retired. Nothing enforces this
-order. Staging loads the latest copy on any restart without a deploy gate, so
-rows removed too early take effect at the next staging start.
+Removing a listing from the token file carries its previous row forward with
+trading, rebalancing and wrapped-equity recovery disabled. The same applies to a
+listing removed on one chain while the symbol stays on another. Existing
+transfers and recoveries finish; new work stops. Already queued hedges still
+cover fills accepted before the disable.
+
+To remove the retained runtime row, list the symbol in `retired_symbols` of the
+`[assets.equities]` table in the bot's config and release it. The migration gate
+refuses retirement while unfinished work still needs configuration. Durable
+registry and snapshot residue may then remain covered by the retirement
+exception. Token-address changes under an existing listing are refused: retire
+first and add the replacement identity through the reviewed asset process.
 
 **Tip:** Start with `trading = "disabled"` first. Publish, verify the bot sees
 the asset, then enable trading in a follow-up change.
@@ -338,10 +336,10 @@ For adding asset **XYZ**:
       orchestrator mode, the orchestrator entry for that chain (see step 4a) and
       the Turnkey `MintAuth` policy for that chain's id and orchestrator; the
       first orchestrator-mode mint fails at signing without it
-- [ ] Restart staging, verify bot sees the asset
-- [ ] Enable trading in the token file, restart again
-- [ ] Repeat for production when staging looks good, bumping `generation` in
-      `config/prod/st0x-hedge.toml` in a release
+- [ ] Verify staging applied the disabled asset generation
+- [ ] Enable trading in the token file and verify adoption
+- [ ] Repeat for production when staging looks good (during pinned rollout,
+      apply a reviewed generation bump and release)
 
 ---
 

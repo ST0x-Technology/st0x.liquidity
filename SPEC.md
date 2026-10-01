@@ -1986,13 +1986,21 @@ edit that only the deployed service can judge is a config edit whose first check
 is a bot that will not boot, which is what the `validate-config` binary exists
 to prevent.
 
-`validate-config --config <path> [--secrets <path>] [--registry-file <path>]`
+`validate-config --config <path> [--secrets <path>] [--registry-file <path>]
+[--registry-state <dir>]`
 runs the boot path's validation and exits 0 or 1, writing a plain-text report to
-stdout and the failure with its cause chain to stderr. It starts no server,
-opens no database, and reaches no external service in either mode. A config that
-names `[registry]` keeps its per-symbol tables in the token file in the bucket;
-`--registry-file` supplies a local copy so they are checked too. Without it the
-config is judged without them and the report says so.
+stdout and the failure with its cause chain to stderr. It starts no server and
+opens no database. A config that names `[registry]` keeps its per-symbol tables
+in the token file in the bucket; `--registry-file` supplies a local copy so they
+are checked too. Without either registry option the config is judged without
+them and the report says so; config-only validation and `--registry-file` checks
+reach no external service.
+
+`--registry-state` judges the copies a restart would boot: the running record,
+or a pending record together with the fallback that would keep its added
+listings. It reads the state without writing it. It reads the bucket only when
+the config pins a `generation` (the pin is what boots) or the state directory
+holds no record yet (the latest copy is what a first boot records).
 
 The two modes differ only in how much of the input they have:
 
@@ -2074,23 +2082,55 @@ config's TOML table before it is deserialized, so every rule in
 `retired_symbols` is dropped at the merge, so retiring is one config change and
 the file's rows can go afterwards.
 
-Production pins `generation`: every roll of a release runs the same object, and
-a token change ships only with a release that bumps the pin. Staging reads the
-latest copy at every start, a crash restart included, so a staging token change
-takes effect without the deploy gates: `verify-migrations` does not run, and
-nothing refuses a file that drops a symbol the database still references. The
-order in "Retiring an asset" in `docs/how-to-add-new-asset.md` (retire in the
-config first, remove the rows after) is the only guard. A refresh loop reads the
-bucket every 60 s and never applies a change; it reports
-`registry_pending_restart` (the latest published copy differs from the running
-tables), `registry_invalid` (the copy the next start would read, the pin in
-production and the latest in staging, is gone, refused to the service account
-with a 401 or 403, too large, or would be refused), `registry_latest_refused`
-(the latest copy would be refused at boot; with a pin it is the copy a pin bump
-would move to) and `registry_fetch_errors_total` (transient read failures: the
-metadata token, 429, 5xx, the network). `verify-migrations` and
-`verify-approvals` read the same file, from the bucket on the VM or from
-`--registry-file` elsewhere.
+Token-file updates use a validated graceful process restart, so every model,
+poller, cache, subscription and per-asset service is rebuilt from one copy. The
+watcher polls bucket metadata every 10 seconds, downloads the exact observed
+generation and verifies its size and MD5. It runs boot config validation,
+refuses an existing listing's token-address changes, probes newly configured
+contracts and newly selected tokenization routes, and verifies changed startup
+approval targets read-only. Invalid bytes are refused per generation; transient
+RPC failures and missing Turnkey coverage are deferred and retried.
+
+A listing removed from the file is carried forward with trading, rebalancing,
+wrapped-equity recovery and extended-hours counter-trading disabled. Carried
+rows survive subsequent reloads and restarts until a reviewed `retired_symbols`
+config release removes them. New work follows the switches immediately; durable
+transfers and recoveries already admitted retain the services they need to
+finish. Already queued hedges still cover their accepted fills.
+
+The accepted source and effective token files are immutable, hash-verified
+records in `registry/` beside the database, with an atomically replaced
+manifest. The server alone claims boot attempts and writes this state. An
+accepted copy becomes pending before the SIGTERM drain path requests process
+exit 75; the container supervisor restarts it. Boot reads the persisted copy
+rather than the bucket's latest content. After startup and ten minutes of uptime
+it becomes last-good. Two failed pending boots fall back to last-good plus
+disabled listings added by pending, retaining durable references. Clean
+shutdowns during the soak do not consume another attempt. Failed candidates can
+retry after backoff. Effective no-ops advance the generation without restarting,
+and reloads are separated by at least two minutes.
+
+The CLI reads running state without writing it. Deploy gates accept
+`--registry-state /mnt/data/registry`: they validate both pending and its
+fallback when pending exists, and running otherwise. The deployment writes a
+hold containing its id and creation timestamp before gates, preventing a new
+pending copy between validation and shutdown. The activation that wrote the hold
+removes it on exit, after the new service reports readiness or after a failure.
+Server boot leaves it in place, so an old service that restarts during the gates
+cannot accept a publication behind them. Holds expire after fifteen minutes. A
+local `--registry-file` overrides state for offline checks.
+
+Rollout retains the production generation pin while the persisted state and
+reload code are seeded from the reviewed pin; the pinned watcher remains
+report-only. Removing the pin is a separate release after the t0.devops compose
+gates pass the state path and create/clean up holds. The final configuration
+follows latest and refuses the generation key. Until that release, production
+still needs a pin bump to apply new token rows.
+
+Metrics expose applied generation, invalid latest content, reload outcomes and
+last outcome timestamps, carried-forward rows, completion-only services,
+deployment hold age and transient fetch errors. Refused content, failed startup
+and fallback log the generation, hash and reason. See `docs/observability.md`.
 
 #### Tools
 

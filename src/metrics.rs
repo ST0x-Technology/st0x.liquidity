@@ -43,25 +43,40 @@ pub(crate) fn setup() -> Result<PrometheusHandle, BuildError> {
          floor's residual plus any other preflight shortfall"
     );
     metrics::describe_gauge!(
-        "registry_pending_restart",
-        "1 while the latest token file in the bucket differs from the per-symbol tables this \
-         instance runs; without a pinned generation a roll picks it up, with one the pin must \
-         move in a release"
+        "registry_applied_generation",
+        "Bucket generation of the running registry tables"
     );
     metrics::describe_gauge!(
         "registry_invalid",
-        "1 while the copy the next roll reads (the pinned generation, else the latest) would \
-         be refused at boot or is gone"
+        "Latest bucket copy is refused or unusable"
+    );
+    metrics::describe_counter!(
+        "registry_reloads_total",
+        "Registry reload outcomes, by result"
     );
     metrics::describe_gauge!(
-        "registry_latest_refused",
-        "1 while the latest token file in the bucket would be refused at boot or cannot be \
-         read (gone, refused to the service account, too large); with a pinned generation, \
-         the copy a pin bump would move to"
+        "registry_last_reload_timestamp_seconds",
+        "Time of the last registry reload outcome, by result"
+    );
+    metrics::describe_gauge!(
+        "registry_carried_forward_symbols",
+        "Removed listings retained with admission disabled"
+    );
+    metrics::describe_gauge!(
+        "registry_reload_held_seconds",
+        "Age of the deploy registry hold"
+    );
+    metrics::describe_gauge!(
+        "conductor_completion_only_symbols",
+        "Listings with services only to complete durable work"
+    );
+    metrics::describe_counter!(
+        "registry_reload_request_errors_total",
+        "Accepted copies whose coordinated restart channel closed"
     );
     metrics::describe_counter!(
         "registry_fetch_errors_total",
-        "Refresh reads of the token file that failed"
+        "Registry bucket reads that failed"
     );
     metrics::describe_counter!(
         "equity_plan_declined_total",
