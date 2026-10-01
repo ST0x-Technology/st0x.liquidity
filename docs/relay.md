@@ -114,13 +114,13 @@ before it sends anything, then refuses a quote unless:
   amount;
 - the relayer fee is in the origin stable and the gas fee is on the origin
   chain;
-- `details.recipient` is our recipient, and `protocol.v2.orderData.output` has
-  exactly one payment: the destination stable to our recipient, at the quoted
-  `minimumAmount` and expected amount;
+- `details.recipient` is our recipient, and `protocol.v2.orderData.output` is on
+  the destination chain and has exactly one payment: the destination stable to
+  our recipient, at the quoted `minimumAmount` and expected amount;
 - every refund in `protocol.v2.orderData.inputs[].refunds[]` pays our
   `refundTo`;
-- `protocol.v2.paymentDetails` names the pinned depository, the origin stable
-  and the requested amount;
+- `protocol.v2.paymentDetails` is on the origin chain and names the pinned
+  depository, the origin stable and the requested amount;
 - the `approve` step, when present, is on the origin chain, calls the origin
   stable with no value, and approves exactly the amount to the depository
   (`Chain::relay_depository()`, `0x4cd0...bc31` on both chains);
@@ -128,6 +128,9 @@ before it sends anything, then refuses a quote unless:
   and its calldata names our wallet as depositor, the origin stable, and the
   exact amount;
 - there is no other step.
+
+The order's `chainId` fields carry Relay's chain names (`"robinhood"`,
+`"ethereum"`), not numeric ids; `Chain::relay_name()` pins them.
 
 The approve is optional because Relay may leave it out when the allowance
 already covers the amount (not observed; the funded test always had one). With
