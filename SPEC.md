@@ -3101,21 +3101,27 @@ enum TriggerReason {
   A nonzero position whose dollar threshold cannot be valued is rejected
   fail-closed.
 - One exception to the hedge threshold: a redemption is admitted over a due sell
-  hedge that the broker cannot fill. The trigger passes the broker's sell
+  hedge that the broker can place none of. The trigger passes the broker's sell
   capacity, counted as the broker counts it for an asset it trades only in whole
   shares: available shares truncated to whole shares, less the hedge floor
   rounded up to whole shares. That count is never above what the broker would
   sell, so a starved hedge always reads as starved. The aggregate admits the
-  redemption when the count is below the live net. The redemption brings the
-  broker the shares that sell needs, so blocking it would leave both waiting on
-  each other. The hedge still waits for the reservation to release. A mint, a
-  buy hedge, or a sell the broker can fill keeps the strict rule. A redemption
-  that released its reservation to wait for gas restores it under the same
-  exception. With no broker reading the capacity is unknown, not zero: the
-  trigger reserves under the strict rule and a restoring job waits and retries.
-  A job reads the capacity only to recreate a missing reservation, so one that
-  still holds its reservation never depends on that read, and a failed read
-  defers the job instead of failing it.
+  redemption only when the count is zero. While the broker can sell some, that
+  partial hedge goes first; once it fills, the count reads zero and the
+  redemption that brings the rest of the shares is admitted, so neither waits on
+  the other. The hedge still waits for the reservation to release. A mint, a buy
+  hedge, or a sell the broker can place any of keeps the strict rule. A
+  redemption that released its reservation to wait for gas restores it under the
+  same rule: the gas refusal comes before the redemption exists, so it is no
+  active transfer and the position checks still place the partial hedge first.
+  With no broker reading the capacity is unknown, not zero: the trigger reserves
+  under the strict rule and a restoring job waits and retries. A job reads the
+  capacity only to recreate a missing reservation, so one that still holds its
+  reservation never depends on that read, and a failed read defers the job
+  instead of failing it.
+- Each trigger reservation that Position rejects for a needed hedge increments
+  `equity_plan_declined_total{reason="blocked_by_hedge"}`, so a symbol held
+  behind a hedge is visible apart from an idle one.
 - `PlaceOffChainOrder` is rejected while any transfer reservation owns the
   symbol. A newly committed onchain fill invalidates an unconfirmed reservation;
   confirmation of that exact ID must succeed immediately before the transfer job
