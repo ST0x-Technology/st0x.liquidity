@@ -680,6 +680,12 @@ impl RedemptionTracking {
                 self.stage = RedemptionTrackingStage::VaultWithdrawSubmitted;
                 self.last_progress_at = *submitted_at;
             }
+            // The adopted tx is still confirmed in the withdraw stage; the
+            // adoption itself is operator progress on it.
+            EquityRedemptionEvent::VaultWithdrawReplacementAdopted { adopted_at, .. } => {
+                self.stage = RedemptionTrackingStage::VaultWithdrawSubmitted;
+                self.last_progress_at = *adopted_at;
+            }
             EquityRedemptionEvent::WithdrawnFromRaindex { withdrawn_at, .. } => {
                 self.stage = RedemptionTrackingStage::WithdrawnFromRaindex;
                 self.last_progress_at = *withdrawn_at;
@@ -4829,6 +4835,7 @@ impl RebalancingService {
                 Self::cancel_equity_transfer_update(Venue::MarketMaking, quantity),
             ),
             VaultWithdrawSubmitted { .. }
+            | VaultWithdrawReplacementAdopted { .. }
             | WithdrawnFromRaindex { .. }
             | UnwrapPending { .. }
             | UnwrapSubmitted { .. }
@@ -8573,6 +8580,7 @@ impl RebalancingService {
             VaultWithdrawPending { .. }
             | VaultWithdrawSubmitting { .. }
             | VaultWithdrawSubmitted { .. }
+            | VaultWithdrawReplacementAdopted { .. }
             | WithdrawnFromRaindex { .. }
             | UnwrapPending { .. }
             | UnwrapSubmitted { .. }
@@ -14909,6 +14917,72 @@ mod tests {
                 .unwrap()
                 .contains_key(&symbol),
             "In-progress flag should be cleared after terminal Completed"
+        );
+    }
+
+    #[tokio::test]
+    async fn adopted_withdrawal_replacement_holds_the_guard_until_completion() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let inventory = InventoryView::default()
+            .with_equity(symbol.clone(), shares(0), shares(0))
+            .update_equity(
+                &symbol,
+                Inventory::available(Venue::MarketMaking, Operator::Add, shares(100)),
+                Utc::now(),
+            )
+            .unwrap();
+        let trigger = make_trigger_with_inventory(inventory).await;
+        let harness = ReactorHarness::new(Arc::clone(&trigger));
+        let id = redemption_aggregate_id("adopted-replacement");
+        harness
+            .receive::<EquityRedemption>(
+                id.clone(),
+                make_vault_withdraw_submitting(&symbol, float!(10)),
+            )
+            .await
+            .unwrap();
+        {
+            let mut guard = trigger.equity_in_progress.write().unwrap();
+            guard.insert(
+                symbol.clone(),
+                equity::GuardState::ActiveTransfer {
+                    generation: equity::GuardGeneration::default(),
+                },
+            );
+        }
+
+        harness
+            .receive::<EquityRedemption>(
+                id.clone(),
+                EquityRedemptionEvent::VaultWithdrawReplacementAdopted {
+                    replacement_tx: TxHash::repeat_byte(0x5E),
+                    replaced_tx: TxHash::repeat_byte(0x11),
+                    reason: "wallet sped up the withdrawal".to_string(),
+                    adopted_at: Utc::now(),
+                },
+            )
+            .await
+            .unwrap();
+        assert!(
+            trigger
+                .equity_in_progress
+                .read()
+                .unwrap()
+                .contains_key(&symbol),
+            "adopting a replacement continues the redemption, so the guard stays held"
+        );
+
+        harness
+            .receive::<EquityRedemption>(id, make_redemption_completed())
+            .await
+            .unwrap();
+        assert!(
+            !trigger
+                .equity_in_progress
+                .read()
+                .unwrap()
+                .contains_key(&symbol),
+            "the adopted redemption's completion must release the guard"
         );
     }
 

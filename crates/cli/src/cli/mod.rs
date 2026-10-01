@@ -1944,14 +1944,8 @@ async fn run_transfer_command<W: Write>(
                 reason,
                 superseding_tx,
                 pool,
-                async |chain, prepared: &PreparedTransaction, superseding_tx| {
-                    rebalancing::verify_withdrawal_superseded_on_chain(
-                        ctx,
-                        chain,
-                        prepared,
-                        superseding_tx,
-                    )
-                    .await
+                async |chain, check: rebalancing::WithdrawalCheck<'_>| {
+                    rebalancing::verify_withdrawal_on_chain(ctx, chain, check).await
                 },
             )
             .await;

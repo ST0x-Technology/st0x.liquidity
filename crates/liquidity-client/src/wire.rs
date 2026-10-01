@@ -37,6 +37,14 @@ pub(crate) struct ReconcileEquityRequest {
     pub(crate) superseding_tx: Option<String>,
 }
 
+/// Body of `POST /transfers/equity_redemption/{id}/adopt-withdrawal`.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct AdoptWithdrawalRequest {
+    pub(crate) reason: String,
+    pub(crate) replacement_tx: String,
+}
+
 /// Body of `POST /transfers/usdc/{id}/clear-pending-burn`.
 #[derive(Serialize)]
 pub(crate) struct ClearPendingBurnRequest {

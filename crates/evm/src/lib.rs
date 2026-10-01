@@ -741,6 +741,23 @@ impl PreparedTransaction {
             .recover_signer()
             .ok()
     }
+
+    /// The address these bytes call, or `None` when they are not a signed
+    /// envelope or create a contract.
+    pub fn to(&self) -> Option<Address> {
+        TxEnvelope::decode_2718_exact(self.raw.as_ref()).ok()?.to()
+    }
+
+    /// The calldata these bytes carry, or `None` when they are not a signed
+    /// envelope.
+    pub fn input(&self) -> Option<Bytes> {
+        Some(
+            TxEnvelope::decode_2718_exact(self.raw.as_ref())
+                .ok()?
+                .input()
+                .clone(),
+        )
+    }
 }
 
 impl<'de> Deserialize<'de> for PreparedTransaction {
@@ -1348,15 +1365,15 @@ impl ReceiptWaitConfig {
 /// Who sent it, what it called, with what value and calldata, at which nonce,
 /// whether it succeeded and emitted logs, and how deep it is (the inclusion
 /// block counts as confirmation 1).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MinedTx {
     pub from: Address,
     /// `None` for a contract creation.
     pub to: Option<Address>,
     pub nonce: u64,
     pub value: U256,
-    /// Whether it carried calldata (initcode, for a contract creation).
-    pub has_calldata: bool,
+    /// Its calldata (initcode, for a contract creation).
+    pub input: Bytes,
     /// The EIP-2718 type byte. `EIP7702_TX_TYPE_ID` sets code on accounts.
     pub tx_type: u8,
     /// `false` when it reverted. A reverted tx still used its nonce.
@@ -1408,7 +1425,7 @@ pub async fn mined_tx(
         to: tx.to(),
         nonce: tx.nonce(),
         value: tx.value(),
-        has_calldata: !tx.input().is_empty(),
+        input: tx.input().clone(),
         tx_type: tx.ty(),
         succeeded: receipt.status(),
         emitted_logs: !receipt.inner.logs().is_empty(),
@@ -2231,7 +2248,7 @@ mod tests {
             to: Some(recipient),
             nonce: 0,
             value: U256::from(1),
-            has_calldata: false,
+            input: Bytes::new(),
             tx_type: EIP1559_TX_TYPE_ID,
             succeeded: true,
             emitted_logs: false,
@@ -2239,7 +2256,7 @@ mod tests {
         };
         assert_eq!(
             mined_tx(&provider, receipt.transaction_hash).await.unwrap(),
-            Some(included)
+            Some(included.clone())
         );
 
         provider.anvil_mine(Some(2), None).await.unwrap();
@@ -2277,7 +2294,7 @@ mod tests {
                 to: None,
                 nonce: 0,
                 value: U256::ZERO,
-                has_calldata: true,
+                input: Bytes::from_static(&ALWAYS_REVERTS_INIT_CODE),
                 tx_type: EIP1559_TX_TYPE_ID,
                 succeeded: true,
                 emitted_logs: false,
@@ -2325,7 +2342,7 @@ mod tests {
                 to: Some(reverting),
                 nonce: 1,
                 value: U256::ZERO,
-                has_calldata: false,
+                input: Bytes::new(),
                 tx_type: EIP1559_TX_TYPE_ID,
                 succeeded: false,
                 emitted_logs: false,

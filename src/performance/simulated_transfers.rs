@@ -924,6 +924,13 @@ impl Raindex for FixtureRaindex {
         unimplemented!("FixtureRaindex: redemption fixture never reconciles a withdrawal")
     }
 
+    async fn tx_receipt(
+        &self,
+        _tx_hash: TxHash,
+    ) -> Result<Option<TransactionReceipt>, RaindexError> {
+        unimplemented!("FixtureRaindex: redemption fixture never adopts a withdrawal")
+    }
+
     async fn confirm_tx_receipt(
         &self,
         tx_hash: TxHash,

@@ -317,6 +317,32 @@ pub enum EquityRedemptionError {
         proven: Option<TxHash>,
         current: Option<TxHash>,
     },
+    /// The redemption's withdrawal is a replacement the bot proved on chain
+    /// moved the equity, so it is not settled by hand.
+    #[error(
+        "Cannot reconcile: vault withdrawal {tx} is an adopted replacement that moved the \
+         equity; the redrive confirms it (if no job remains, run `stox transfer resume --kind \
+         equity` or restart the bot)"
+    )]
+    AdoptedWithdrawalNotReconcilable { tx: TxHash },
+    /// Attempted to adopt a withdrawal replacement without an operator-supplied
+    /// reason.
+    #[error("Cannot adopt a withdrawal replacement: reason is required")]
+    AdoptionReasonRequired,
+    /// The redemption no longer holds the signed withdrawal the caller checked
+    /// the replacement against (another state, an earlier adoption, or a record
+    /// with no signed bytes), so the check does not cover it.
+    #[error(
+        "Cannot adopt a withdrawal replacement: the redemption's signed withdrawal is now \
+         {current:?}, but the check covered {checked}; check again"
+    )]
+    AdoptedWithdrawalChanged {
+        checked: TxHash,
+        current: Option<TxHash>,
+    },
+    /// The replacement named is the signed withdrawal itself.
+    #[error("Cannot adopt {tx} as the replacement of itself")]
+    ReplacementIsTheWithdrawal { tx: TxHash },
     /// Enqueueing the bot-gas receipt cost recording job failed after a
     /// vault withdraw / unwrap confirmation succeeded (ADR 0017). See
     /// `BotGasEnqueueFailure` for why the payload is a rendered `String`
@@ -465,6 +491,19 @@ pub enum EquityRedemptionCommand {
         /// when the state it checked held none. Refused if the redemption's
         /// signed withdrawal is now a different one.
         proven_withdrawal: Option<TxHash>,
+    },
+    /// Records `replacement_tx` as the redemption's vault withdrawal: a mined tx
+    /// the caller proved took the signed withdrawal's nonce and did the
+    /// withdrawal itself (for example a wallet "speed up" that sent the same
+    /// `withdraw4` again at a higher fee), so `ConfirmWithdraw` confirms it and
+    /// the redemption continues. Valid from `VaultWithdrawSubmitting` and
+    /// `VaultWithdrawSubmitted`. Pure: the chain check runs before it.
+    AdoptWithdrawalReplacement {
+        replacement_tx: TxHash,
+        /// The signed withdrawal the caller checked the replacement against.
+        /// Refused if the redemption's signed withdrawal is now another one.
+        replaced_withdrawal: TxHash,
+        reason: String,
     },
 }
 
@@ -670,6 +709,16 @@ pub enum EquityRedemptionEvent {
         reason: String,
         reconciled_at: DateTime<Utc>,
     },
+    /// An operator adopted `replacement_tx`, a mined tx at the signed
+    /// withdrawal's nonce, as the vault withdrawal. The redemption continues
+    /// from `VaultWithdrawSubmitted` with that hash and no signed bytes: the
+    /// nonce is used, so nothing is left to rebroadcast.
+    VaultWithdrawReplacementAdopted {
+        replacement_tx: TxHash,
+        replaced_tx: TxHash,
+        reason: String,
+        adopted_at: DateTime<Utc>,
+    },
 }
 
 fn resolve_withdrawn_wrapped_amount(
@@ -679,7 +728,7 @@ fn resolve_withdrawn_wrapped_amount(
     actual_wrapped_amount.unwrap_or(wrapped_amount)
 }
 
-fn actual_withdrawn_amount_from_receipt(
+pub(crate) fn actual_withdrawn_amount_from_receipt(
     receipt: &TransactionReceipt,
     token: Address,
     recipient: Address,
@@ -734,7 +783,8 @@ impl PartialEq for EquityRedemptionEvent {
 
 fn eq_vault_events(left: &EquityRedemptionEvent, right: &EquityRedemptionEvent) -> Option<bool> {
     use EquityRedemptionEvent::{
-        VaultWithdrawPending, VaultWithdrawSubmitted, VaultWithdrawSubmitting,
+        VaultWithdrawPending, VaultWithdrawReplacementAdopted, VaultWithdrawSubmitted,
+        VaultWithdrawSubmitting,
     };
 
     match (left, right) {
@@ -818,6 +868,20 @@ fn eq_vault_events(left: &EquityRedemptionEvent, right: &EquityRedemptionEvent) 
                 && p1 == p2
                 && sa1 == sa2,
         ),
+        (
+            VaultWithdrawReplacementAdopted {
+                replacement_tx: r1,
+                replaced_tx: p1,
+                reason: why1,
+                adopted_at: a1,
+            },
+            VaultWithdrawReplacementAdopted {
+                replacement_tx: r2,
+                replaced_tx: p2,
+                reason: why2,
+                adopted_at: a2,
+            },
+        ) => Some(r1 == r2 && p1 == p2 && why1 == why2 && a1 == a2),
         _ => None,
     }
 }
@@ -1014,6 +1078,9 @@ impl DomainEvent for EquityRedemptionEvent {
             VaultWithdrawSubmitted { .. } => {
                 "EquityRedemptionEvent::VaultWithdrawSubmitted".to_string()
             }
+            VaultWithdrawReplacementAdopted { .. } => {
+                "EquityRedemptionEvent::VaultWithdrawReplacementAdopted".to_string()
+            }
             WithdrawnFromRaindex { .. } => {
                 "EquityRedemptionEvent::WithdrawnFromRaindex".to_string()
             }
@@ -1099,6 +1166,11 @@ pub enum EquityRedemption {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         prepared: Option<PreparedTransaction>,
         submitted_at: DateTime<Utc>,
+        /// The signed withdrawal an operator replaced with `tx_hash`, set only
+        /// by `VaultWithdrawReplacementAdopted`. The bot proved that `tx_hash`
+        /// moved the equity, so reconcile refuses it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        adopted_from: Option<TxHash>,
     },
 
     /// Tokens withdrawn from Raindex vault to wallet, not yet sent to Alpaca
@@ -1462,6 +1534,21 @@ impl EquityRedemption {
         }
     }
 
+    /// The withdrawal hash of a legacy `VaultWithdrawSubmitted` that holds no
+    /// signed bytes. An adopted replacement has none either, but it is not
+    /// one: `Reconcile` refuses it outright, so no chain read is needed.
+    pub fn hash_only_withdrawal(&self) -> Option<TxHash> {
+        match self {
+            Self::VaultWithdrawSubmitted {
+                tx_hash,
+                prepared: None,
+                adopted_from: None,
+                ..
+            } => Some(*tx_hash),
+            _ => None,
+        }
+    }
+
     pub(crate) fn to_dto(&self, id: &RedemptionAggregateId) -> TransferOperation {
         let RedemptionAggregateId(id) = id;
 
@@ -1759,6 +1846,7 @@ impl EventSourced for EquityRedemption {
                 tx_hash: *tx_hash,
                 prepared: prepared.clone(),
                 submitted_at: *submitted_at,
+                adopted_from: None,
             }),
             // Legacy: old aggregates start with WithdrawnFromRaindex
             WithdrawnFromRaindex {
@@ -1816,9 +1904,48 @@ impl EventSourced for EquityRedemption {
                         tx_hash: *tx_hash,
                         prepared: prepared.clone(),
                         submitted_at: *submitted_at,
+                        adopted_from: None,
                     })
                 }
                 // Legacy: VaultWithdrawSubmitted is handled as originate
+                _ => None,
+            },
+            VaultWithdrawReplacementAdopted {
+                replacement_tx,
+                replaced_tx,
+                ..
+            } => match entity {
+                Self::VaultWithdrawSubmitting {
+                    symbol,
+                    quantity,
+                    token,
+                    wrapped_amount,
+                    submitting_at: submitted_at,
+                    ..
+                }
+                | Self::VaultWithdrawSubmitted {
+                    symbol,
+                    quantity,
+                    token,
+                    wrapped_amount,
+                    submitted_at,
+                    ..
+                } => Some(Self::VaultWithdrawSubmitted {
+                    symbol: symbol.clone(),
+                    chain,
+                    quantity: *quantity,
+                    token: *token,
+                    wrapped_amount: *wrapped_amount,
+                    tx_hash: *replacement_tx,
+                    // The adopted tx used the nonce, so there are no signed
+                    // bytes left to rebroadcast; a restart restores the nonce
+                    // hold by the adopted hash, which confirming releases.
+                    prepared: None,
+                    // Kept, so the reconciliation deadline still pages if the
+                    // adopted tx cannot be confirmed either.
+                    submitted_at: *submitted_at,
+                    adopted_from: Some(*replaced_tx),
+                }),
                 _ => None,
             },
             WithdrawnFromRaindex {
@@ -2417,6 +2544,7 @@ impl EventSourced for EquityRedemption {
             | RecoverProviderCompletion { .. }
             | SynchronizeProviderCompletionRecovery
             | Reconcile { .. }
+            | AdoptWithdrawalReplacement { .. }
             | FailTransfer { .. } => Err(EquityRedemptionError::NotStarted),
             #[cfg(any(test, feature = "test-support"))]
             RecordWithdrawSubmissionAt { .. } => Err(EquityRedemptionError::NotStarted),
@@ -2622,6 +2750,11 @@ impl EventSourced for EquityRedemption {
                 reason,
                 proven_withdrawal,
             } => match self {
+                Self::VaultWithdrawSubmitted {
+                    tx_hash,
+                    adopted_from: Some(_),
+                    ..
+                } => Err(EquityRedemptionError::AdoptedWithdrawalNotReconcilable { tx: *tx_hash }),
                 Self::Failed { symbol, .. }
                 | Self::VaultWithdrawPending { symbol, .. }
                 | Self::VaultWithdrawSubmitting { symbol, .. }
@@ -2656,11 +2789,66 @@ impl EventSourced for EquityRedemption {
                 Self::Reconciled { .. } => Err(EquityRedemptionError::AlreadyReconciled),
                 _ => Err(EquityRedemptionError::NotFailed),
             },
+            AdoptWithdrawalReplacement {
+                replacement_tx,
+                replaced_withdrawal,
+                reason,
+            } => self.transition_adopt_withdrawal_replacement(
+                replacement_tx,
+                replaced_withdrawal,
+                reason,
+            ),
         }
     }
 }
 
 impl EquityRedemption {
+    /// Adopts `replacement_tx` as the vault withdrawal of a redemption whose
+    /// signed withdrawal is still `replaced_withdrawal`, the one the caller
+    /// checked the replacement against. Only `VaultWithdrawSubmitting` and a
+    /// `VaultWithdrawSubmitted` that retains its signed bytes hold one.
+    fn transition_adopt_withdrawal_replacement(
+        &self,
+        replacement_tx: TxHash,
+        replaced_withdrawal: TxHash,
+        reason: String,
+    ) -> Result<Vec<EquityRedemptionEvent>, EquityRedemptionError> {
+        match self {
+            Self::Completed { .. } => return Err(EquityRedemptionError::AlreadyCompleted),
+            Self::Failed { .. } => return Err(EquityRedemptionError::AlreadyFailed),
+            Self::Reconciled { .. } => return Err(EquityRedemptionError::AlreadyReconciled),
+            _ => {}
+        }
+        if reason.trim().is_empty() {
+            return Err(EquityRedemptionError::AdoptionReasonRequired);
+        }
+
+        let current = self.prepared_withdrawal().map(PreparedTransaction::tx_hash);
+        if current != Some(replaced_withdrawal) {
+            return Err(EquityRedemptionError::AdoptedWithdrawalChanged {
+                checked: replaced_withdrawal,
+                current,
+            });
+        }
+        if replacement_tx == replaced_withdrawal {
+            return Err(EquityRedemptionError::ReplacementIsTheWithdrawal { tx: replacement_tx });
+        }
+
+        warn!(
+            target: "rebalance",
+            symbol = %self.symbol(), %replacement_tx, %replaced_withdrawal, %reason,
+            "Adopting a mined replacement as the redemption's vault withdrawal"
+        );
+        Ok(vec![
+            EquityRedemptionEvent::VaultWithdrawReplacementAdopted {
+                replacement_tx,
+                replaced_tx: replaced_withdrawal,
+                reason,
+                adopted_at: Utc::now(),
+            },
+        ])
+    }
+
     /// Records the hash of the exact persisted transaction after broadcast.
     /// No external call occurs inside the aggregate transition.
     fn transition_record_withdraw_submission(
@@ -3240,12 +3428,57 @@ pub(crate) enum StuckRedemptionRecoveryError {
     InvalidRequestedQuantity { aggregate_id: RedemptionAggregateId },
 }
 
+/// The redemption other than `except` that already records `tx` as its vault
+/// withdrawal (submitted, adopted or withdrawn), if any. A tx at a reused
+/// nonce can be another redemption's withdrawal, which must not be adopted
+/// twice.
+pub(crate) async fn redemption_recording_withdrawal(
+    pool: &SqlitePool,
+    tx: TxHash,
+    except: &RedemptionAggregateId,
+) -> Result<Option<RedemptionAggregateId>, RecordedWithdrawalLookupError> {
+    let row: Option<(String,)> = sqlx::query_as(
+        "SELECT aggregate_id FROM events \
+         WHERE aggregate_type = 'EquityRedemption' \
+           AND aggregate_id <> ?2 \
+           AND ?1 IN ( \
+               json_extract(payload, '$.VaultWithdrawSubmitted.tx_hash'), \
+               json_extract(payload, '$.VaultWithdrawReplacementAdopted.replacement_tx'), \
+               json_extract(payload, '$.WithdrawnFromRaindex.raindex_withdraw_tx') \
+           ) \
+         LIMIT 1",
+    )
+    .bind(tx.to_string())
+    .bind(except.to_string())
+    .fetch_optional(pool)
+    .await?;
+
+    row.map(|(id,)| {
+        id.parse()
+            .map_err(|source| RecordedWithdrawalLookupError::InvalidAggregateId { id, source })
+    })
+    .transpose()
+}
+
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum RecordedWithdrawalLookupError {
+    #[error(transparent)]
+    Persistence(#[from] sqlx::Error),
+    #[error("stored redemption id {id:?} does not parse")]
+    InvalidAggregateId {
+        id: String,
+        #[source]
+        source: uuid::Error,
+    },
+}
+
 /// Static event names interpolated into audited SQL statements below. All
 /// caller-supplied values remain bind parameters.
 const ACTIVE_REDEMPTION_EVENT_TYPES_SQL: &str = "
     'EquityRedemptionEvent::VaultWithdrawPending',
     'EquityRedemptionEvent::VaultWithdrawSubmitting',
     'EquityRedemptionEvent::VaultWithdrawSubmitted',
+    'EquityRedemptionEvent::VaultWithdrawReplacementAdopted',
     'EquityRedemptionEvent::WithdrawnFromRaindex',
     'EquityRedemptionEvent::UnwrapPending',
     'EquityRedemptionEvent::UnwrapSubmitted',
@@ -7415,6 +7648,250 @@ mod tests {
         );
     }
 
+    async fn redemption_at_submitting(
+        store: &TestStore<EquityRedemption>,
+        id: &RedemptionAggregateId,
+    ) {
+        store
+            .send(
+                id,
+                EquityRedemptionCommand::Redeem {
+                    chain: Chain::Base,
+                    symbol: Symbol::new("AAPL").unwrap(),
+                    quantity: float!(50.25),
+                    token: Address::repeat_byte(0x11),
+                    vault_id: RaindexVaultId(B256::repeat_byte(0x42)),
+                    amount: U256::from(50_250_000_000_000_000_000_u128),
+                    from_block: 0,
+                    prepared: prepared_withdrawal_for_test(),
+                },
+            )
+            .await
+            .unwrap();
+    }
+
+    fn adopt(replacement_tx: TxHash) -> EquityRedemptionCommand {
+        EquityRedemptionCommand::AdoptWithdrawalReplacement {
+            replacement_tx,
+            replaced_withdrawal: prepared_withdrawal_for_test().tx_hash(),
+            reason: "wallet sped up the withdrawal".to_string(),
+        }
+    }
+
+    /// The adopted tx becomes the withdrawal the redrive confirms, with no
+    /// signed bytes left to rebroadcast, and the submitted time keeps the
+    /// reconciliation deadline running from the original submission.
+    #[tokio::test]
+    async fn adopting_a_replacement_from_submitting_makes_it_the_submitted_withdrawal() {
+        let store = TestStore::<EquityRedemption>::new(mock_services());
+        let id = redemption_aggregate_id("adopt-from-submitting");
+        redemption_at_submitting(&store, &id).await;
+        let EquityRedemption::VaultWithdrawSubmitting { submitting_at, .. } =
+            store.load(&id).await.unwrap().unwrap()
+        else {
+            panic!("the redemption must be submitting its withdrawal");
+        };
+        let replacement = TxHash::repeat_byte(0x5E);
+
+        store.send(&id, adopt(replacement)).await.unwrap();
+
+        let entity = store.load(&id).await.unwrap().unwrap();
+        let EquityRedemption::VaultWithdrawSubmitted {
+            tx_hash,
+            prepared,
+            submitted_at,
+            ..
+        } = entity
+        else {
+            panic!("an adopted replacement must leave the redemption submitted, got {entity:?}");
+        };
+        assert_eq!(tx_hash, replacement);
+        assert_eq!(prepared, None);
+        assert_eq!(submitted_at, submitting_at);
+    }
+
+    /// An adopted replacement moved the equity, so reconcile is refused even
+    /// with no chain read behind it, as when a lagging node shows no receipt
+    /// for the adopted tx.
+    #[tokio::test]
+    async fn an_adopted_replacement_is_never_reconciled() {
+        let store = TestStore::<EquityRedemption>::new(mock_services());
+        let id = redemption_aggregate_id("adopt-then-reconcile");
+        redemption_at_submitting(&store, &id).await;
+        let replacement = TxHash::repeat_byte(0x5E);
+        store.send(&id, adopt(replacement)).await.unwrap();
+
+        let error = store
+            .send(
+                &id,
+                EquityRedemptionCommand::Reconcile {
+                    reason: "settled by hand".to_string(),
+                    proven_withdrawal: None,
+                },
+            )
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                AggregateError::UserError(LifecycleError::Apply(
+                    EquityRedemptionError::AdoptedWithdrawalNotReconcilable { tx }
+                )) if tx == replacement
+            ),
+            "got {error:?}"
+        );
+        assert!(matches!(
+            store.load(&id).await.unwrap(),
+            Some(EquityRedemption::VaultWithdrawSubmitted {
+                adopted_from: Some(_),
+                ..
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn adopting_a_replacement_from_submitted_makes_it_the_submitted_withdrawal() {
+        let store = TestStore::<EquityRedemption>::new(mock_services());
+        let id = redemption_aggregate_id("adopt-from-submitted");
+        redemption_at_submitting(&store, &id).await;
+        store
+            .send(
+                &id,
+                EquityRedemptionCommand::RecordWithdrawSubmission {
+                    tx_hash: prepared_withdrawal_for_test().tx_hash(),
+                },
+            )
+            .await
+            .unwrap();
+        let EquityRedemption::VaultWithdrawSubmitted {
+            submitted_at: broadcast_at,
+            ..
+        } = store.load(&id).await.unwrap().unwrap()
+        else {
+            panic!("the redemption must have its withdrawal submitted");
+        };
+        let replacement = TxHash::repeat_byte(0x5E);
+
+        store.send(&id, adopt(replacement)).await.unwrap();
+
+        let entity = store.load(&id).await.unwrap().unwrap();
+        let EquityRedemption::VaultWithdrawSubmitted {
+            tx_hash,
+            prepared,
+            submitted_at,
+            ..
+        } = entity
+        else {
+            panic!("an adopted replacement must leave the redemption submitted, got {entity:?}");
+        };
+        assert_eq!(tx_hash, replacement);
+        assert_eq!(prepared, None);
+        assert_eq!(submitted_at, broadcast_at);
+    }
+
+    /// Only the signed withdrawal the caller checked can be replaced: a
+    /// redemption past or before it, or one already adopted, holds none.
+    #[tokio::test]
+    async fn adopting_a_replacement_is_refused_without_the_checked_signed_withdrawal() {
+        let replacement = TxHash::repeat_byte(0x5E);
+        let adopted = EquityRedemptionEvent::VaultWithdrawReplacementAdopted {
+            replacement_tx: replacement,
+            replaced_tx: prepared_withdrawal_for_test().tx_hash(),
+            reason: "adopted once".to_string(),
+            adopted_at: Utc::now(),
+        };
+        for history in [
+            vec![withdrawn_from_raindex_event()],
+            vec![vault_withdraw_submitting_event(), adopted],
+        ] {
+            let error = TestHarness::<EquityRedemption>::with(mock_services())
+                .given(history.clone())
+                .when(adopt(TxHash::repeat_byte(0x6F)))
+                .await
+                .then_expect_error();
+
+            let LifecycleError::Apply(EquityRedemptionError::AdoptedWithdrawalChanged {
+                checked,
+                current: None,
+            }) = error
+            else {
+                panic!("{history:?} holds no signed withdrawal to replace, got {error:?}");
+            };
+            assert_eq!(checked, prepared_withdrawal_for_test().tx_hash());
+        }
+
+        let error = TestHarness::<EquityRedemption>::with(mock_services())
+            .given(failed_redemption_history())
+            .when(adopt(replacement))
+            .await
+            .then_expect_error();
+        assert!(
+            matches!(
+                error,
+                LifecycleError::Apply(EquityRedemptionError::AlreadyFailed)
+            ),
+            "a failed redemption has nothing to adopt into, got {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn adopting_a_replacement_is_refused_for_another_checked_withdrawal() {
+        let other = TxHash::repeat_byte(0x0A);
+        let error = TestHarness::<EquityRedemption>::with(mock_services())
+            .given(vec![vault_withdraw_submitting_event()])
+            .when(EquityRedemptionCommand::AdoptWithdrawalReplacement {
+                replacement_tx: TxHash::repeat_byte(0x5E),
+                replaced_withdrawal: other,
+                reason: "checked a different withdrawal".to_string(),
+            })
+            .await
+            .then_expect_error();
+
+        let LifecycleError::Apply(EquityRedemptionError::AdoptedWithdrawalChanged {
+            checked,
+            current,
+        }) = error
+        else {
+            panic!("a check of another withdrawal must be refused, got {error:?}");
+        };
+        assert_eq!(checked, other);
+        assert_eq!(current, Some(prepared_withdrawal_for_test().tx_hash()));
+    }
+
+    #[tokio::test]
+    async fn adopting_the_withdrawal_itself_or_without_a_reason_is_refused() {
+        let itself = TestHarness::<EquityRedemption>::with(mock_services())
+            .given(vec![vault_withdraw_submitting_event()])
+            .when(adopt(prepared_withdrawal_for_test().tx_hash()))
+            .await
+            .then_expect_error();
+        assert!(
+            matches!(
+                itself,
+                LifecycleError::Apply(EquityRedemptionError::ReplacementIsTheWithdrawal { .. })
+            ),
+            "the withdrawal cannot replace itself, got {itself:?}"
+        );
+
+        let blank = TestHarness::<EquityRedemption>::with(mock_services())
+            .given(vec![vault_withdraw_submitting_event()])
+            .when(EquityRedemptionCommand::AdoptWithdrawalReplacement {
+                replacement_tx: TxHash::repeat_byte(0x5E),
+                replaced_withdrawal: prepared_withdrawal_for_test().tx_hash(),
+                reason: "  ".to_string(),
+            })
+            .await
+            .then_expect_error();
+        assert!(
+            matches!(
+                blank,
+                LifecycleError::Apply(EquityRedemptionError::AdoptionReasonRequired)
+            ),
+            "an adoption needs an audit reason, got {blank:?}"
+        );
+    }
+
     #[tokio::test]
     async fn reconcile_from_reconciled_state_is_rejected() {
         let mut history = failed_redemption_history();
@@ -7514,6 +7991,7 @@ mod tests {
                 tx_hash: TxHash::default(),
                 prepared: None,
                 submitted_at: now,
+                adopted_from: None,
             }
             .is_terminal(),
         );

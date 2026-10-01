@@ -3599,6 +3599,8 @@ Arc<dyn Tokenizer>, wrapper: Arc<dyn Wrapper> }`
 stateDiagram-v2
     [*] --> VaultWithdrawSubmitting: Redeem (persists signed transaction)
     VaultWithdrawSubmitting --> VaultWithdrawSubmitted: RecordWithdrawSubmission
+    VaultWithdrawSubmitting --> VaultWithdrawSubmitted: AdoptWithdrawalReplacement
+    VaultWithdrawSubmitted --> VaultWithdrawSubmitted: AdoptWithdrawalReplacement
     VaultWithdrawSubmitted --> WithdrawnFromRaindex: ConfirmWithdraw
     WithdrawnFromRaindex --> TokensUnwrapped: Unwrap
     WithdrawnFromRaindex --> Failed
@@ -3654,10 +3656,14 @@ enum EquityRedemption {
         wrapped_amount: U256,
         tx_hash: TxHash,
         // Retained so restart can restore nonce ownership before any wallet send.
-        // None only when replaying an event from before version 9; the nonce
-        // restores by transaction hash, but the exact bytes cannot be rebroadcast.
+        // None only when replaying an event from before version 9, or after an
+        // adoption; the nonce restores by transaction hash, but the exact bytes
+        // cannot be rebroadcast.
         prepared: Option<PreparedTransaction>,
         submitted_at: DateTime<Utc>,
+        // The signed withdrawal an adoption replaced with tx_hash; None
+        // otherwise.
+        adopted_from: Option<TxHash>,
     },
     WithdrawnFromRaindex {
         symbol: Symbol,
@@ -3752,6 +3758,14 @@ enum EquityRedemptionCommand {
     RejectRedemption { reason: String },
     // Operator or timeout-driven failure before the tokens leave custody
     FailTransfer { reason: String },
+    // Operator adoption of a mined tx that took the signed withdrawal's nonce
+    // and did the withdrawal itself; the bot checks it on chain first.
+    AdoptWithdrawalReplacement {
+        replacement_tx: TxHash,
+        // The signed withdrawal the caller checked the replacement against.
+        replaced_withdrawal: TxHash,
+        reason: String,
+    },
 }
 ```
 
@@ -3818,6 +3832,14 @@ enum EquityRedemptionEvent {
         tx_hash: Option<TxHash>,
         failed_at: DateTime<Utc>,
     },
+    // Leaves the redemption in VaultWithdrawSubmitted with tx_hash =
+    // replacement_tx, no signed bytes, and the original submitted_at.
+    VaultWithdrawReplacementAdopted {
+        replacement_tx: TxHash,
+        replaced_tx: TxHash,
+        reason: String,
+        adopted_at: DateTime<Utc>,
+    },
 
     Detected {
         tokenization_request_id: TokenizationRequestId,
@@ -3855,8 +3877,10 @@ a redemption with a signed vault withdrawal (`VaultWithdrawSubmitting` or
 `VaultWithdrawSubmitted`), because the withdrawal can still mine. Instead the
 operator checks it on chain: one that mined successfully went through and is not
 reconciled; one that mined and reverted is reconciled with no cancel once
-confirmed; one with no receipt is cancelled first and then reconciled. Reconcile
-requires the chain proof described under operator reconciliation.
+confirmed; one with no receipt, whose nonce another tx from the bot wallet
+already used to do the withdrawal itself, is adopted; one with no receipt and
+nothing at its nonce is cancelled first and then reconciled. Reconcile requires
+the chain proof described under operator reconciliation.
 
 Vault withdrawal submission is an irreversible uncertainty boundary. The
 orchestrator prepares and signs the transaction, then the pure aggregate
@@ -3905,6 +3929,17 @@ redemption polling, and `Wrapper` methods for ERC-4626 wrapping/unwrapping.
   `VaultWithdrawSubmitting` transaction and never broadcasts it
 - `RecordWithdrawSubmission` only from `VaultWithdrawSubmitting`
 - `ConfirmWithdraw` only from `VaultWithdrawSubmitted`
+- `AdoptWithdrawalReplacement` only from `VaultWithdrawSubmitting`, or from a
+  `VaultWithdrawSubmitted` that retains its signed bytes, and only while those
+  signed bytes are the `replaced_withdrawal` the caller checked; refused for the
+  withdrawal's own hash and for a blank reason. It emits
+  `VaultWithdrawReplacementAdopted`, leaving `VaultWithdrawSubmitted` with the
+  adopted hash, no signed bytes, the original submitted time and the replaced
+  hash in `adopted_from`, so resume restores and confirms the adopted hash and
+  never rebroadcasts the replaced withdrawal
+- `Reconcile` is refused for a `VaultWithdrawSubmitted` with `adopted_from` set:
+  the bot proved the adopted tx moved the equity, so only the redrive resolves
+  it
 - a resume from `VaultWithdrawSubmitting` always rebroadcasts the exact
   persisted bytes; retries never sign or submit a different withdrawal
 - if a later transfer step fails after withdrawal, the aggregate retains the
@@ -6205,6 +6240,58 @@ later sends proceed. The release is bookkeeping: it drops the bot's hold on the
 used nonce and does not rewind nonce allocation onto it. A prepared transaction
 discarded before broadcast (a persist-failure rollback) is different: its nonce
 is unused, so allocation is rewound to refill it.
+
+A tx that took the signed withdrawal's nonce but is not a plain cancel may have
+moved the equity, so reconcile refuses it; when it did the withdrawal itself (a
+wallet "speed up" that sent the same `withdraw4` again at a higher fee), the
+redemption adopts it instead. The
+`AdoptWithdrawalReplacement { replacement_tx,
+replaced_withdrawal, reason }`
+command is valid only while the redemption still holds the signed withdrawal the
+caller checked (`VaultWithdrawSubmitting`, or a `VaultWithdrawSubmitted` that
+retains its signed bytes), refuses the withdrawal itself as its own replacement,
+and requires a reason. It emits `VaultWithdrawReplacementAdopted`, which leaves
+the redemption in `VaultWithdrawSubmitted` with the adopted hash, no signed
+bytes and the original submitted time, so the reconciliation deadline keeps
+running. The command is pure: the bot's route
+`POST
+/liquidity-write/transfers/equity_redemption/{id}/adopt-withdrawal`
+(client: `debug adopt-withdrawal`; `stox` has no adopt verb) first checks on the
+redemption's chain, through that chain's raindex and bot wallet, that the tx is
+mined in the canonical chain from the bot wallet, at the withdrawal's nonce, is
+not the withdrawal itself, has the chain's required confirmations, succeeded,
+and is a `withdraw4` to the contract the withdrawal calls, from the same token
+and vault, for at most the signed withdrawal's amount, whose receipt shows a
+transfer of that token to the bot wallet, which `withdraw4` pays as its caller,
+and is not already another redemption's recorded vault withdrawal (`409` naming
+the failed check, `502` on a failed chain read, `503` before the bot is ready,
+`400` for a redemption with no signed withdrawal). The route holds the recovery
+lock and sends the command through the conductor owned store, so the live
+transfer reactor sees the adoption. The redemption's redrive then resumes from
+`VaultWithdrawSubmitted` as for any hash only submission: it restores the
+adopted hash at its nonce, `ConfirmWithdraw` confirms it and records the vault
+transfer its receipt shows (refusing a receipt that paid the withdrawal's token
+nowhere the bot expects), and confirming it releases the whole nonce entry,
+including the signed withdrawal's reservation. Nothing is rebroadcast, since the
+nonce is used. A restart restores the same hash only reservation, so the release
+does not depend on the process that adopted it.
+
+An adopted redemption is never reconciled: `Reconcile` refuses a
+`VaultWithdrawSubmitted` whose `adopted_from` is set, whatever a node shows for
+the adopted tx, since the bot proved it moved the equity. A legacy redemption
+holding only a withdrawal hash (from before the signed bytes were kept) has no
+nonce to prove unused, so it reconciles on the operator's word, except once that
+hash mined and succeeded: then the equity left the vault, and reconcile refuses
+it as it does a signed withdrawal that went through (both the CLI and the bot's
+route read the hash first, the route `503` before the bot is ready).
+
+Rollback floor for withdrawal adoption: a build before it cannot replay
+`VaultWithdrawReplacementAdopted`. The pre deploy `verify-migrations` gate
+replays every persisted aggregate, completed ones included, so once any
+redemption has an adoption event a build before adoption fails that gate and
+cannot be deployed. The first release with adoption is therefore a permanent
+rollback floor from the first adoption on, whether or not the adopted redemption
+has finished.
 
 The `Reconciled` state retains the identifying fields (symbol, quantity,
 original failure reason, request/redemption identifiers) so the dashboard

@@ -96,6 +96,7 @@ pub struct MockRaindex {
     withdrawals_mined: bool,
     mined_txs: HashMap<TxHash, MinedTx>,
     mined_tx_read_errors: HashSet<TxHash>,
+    tx_receipts: HashMap<TxHash, TransactionReceipt>,
 }
 
 fn successful_receipt(tx_hash: TxHash, logs: Vec<Log>) -> TransactionReceipt {
@@ -170,6 +171,7 @@ impl MockRaindex {
             withdrawals_mined: false,
             mined_txs: HashMap::new(),
             mined_tx_read_errors: HashSet::new(),
+            tx_receipts: HashMap::new(),
         }
     }
 
@@ -201,6 +203,41 @@ impl MockRaindex {
     #[cfg(test)]
     pub(crate) fn with_mined_tx_read_error(mut self, tx_hash: TxHash) -> Self {
         self.mined_tx_read_errors.insert(tx_hash);
+        self
+    }
+
+    /// Makes `tx_receipt` return a successful receipt for `tx_hash` holding an
+    /// ERC-20 `Transfer` of `amount` `token` to `to`.
+    #[cfg(test)]
+    pub(crate) fn with_transfer_receipt(
+        mut self,
+        tx_hash: TxHash,
+        token: Address,
+        to: Address,
+        amount: U256,
+    ) -> Self {
+        self.tx_receipts.insert(
+            tx_hash,
+            successful_receipt(tx_hash, vec![transfer_log(token, to, amount)]),
+        );
+        self
+    }
+
+    /// Makes `tx_receipt` return a successful receipt for `tx_hash` holding a
+    /// `token` log with the ERC-20 `Transfer` topic that does not decode.
+    #[cfg(test)]
+    pub(crate) fn with_undecodable_transfer_receipt(
+        mut self,
+        tx_hash: TxHash,
+        token: Address,
+    ) -> Self {
+        let mut log = transfer_log(token, Address::ZERO, U256::from(1));
+        log.inner.data = alloy::primitives::LogData::new_unchecked(
+            vec![IERC20::Transfer::SIGNATURE_HASH],
+            alloy::primitives::Bytes::new(),
+        );
+        self.tx_receipts
+            .insert(tx_hash, successful_receipt(tx_hash, vec![log]));
         self
     }
 
@@ -505,7 +542,14 @@ impl Raindex for MockRaindex {
             ));
         }
 
-        Ok(self.mined_txs.get(&tx_hash).copied())
+        Ok(self.mined_txs.get(&tx_hash).cloned())
+    }
+
+    async fn tx_receipt(
+        &self,
+        tx_hash: TxHash,
+    ) -> Result<Option<TransactionReceipt>, RaindexError> {
+        Ok(self.tx_receipts.get(&tx_hash).cloned())
     }
 
     async fn confirm_tx_receipt(
