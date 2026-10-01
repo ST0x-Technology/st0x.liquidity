@@ -218,10 +218,13 @@ depositor than the signing wallet.
   with a pinned `RELAY_DEPOSIT_GAS_LIMIT` of 57,114, the larger `gasUsed` of the
   funded test's deposits (49,083 on Ethereum), padded by the wallet to 85,671.
 
-`broadcast_deposit` sends the approve and then the deposit, refusing a pair
-whose nonces are not consecutive; a repeat sends the same bytes.
-`confirm_deposit` waits for the origin chain's confirmations and requires a
-`RelayErc20Deposit` from our wallet, in the origin stable, for the order id.
+Another send from the same wallet between the two signs takes the nonce in
+between, so `prepare_deposit` discards a pair whose nonces are not consecutive
+(deposit first, then approve) and refuses it with `PairNonces`.
+`broadcast_deposit` sends the approve and then the deposit, refusing such a pair
+again; a repeat sends the same bytes. `confirm_deposit` waits for the origin
+chain's confirmations and requires a `RelayErc20Deposit` from our wallet, in the
+origin stable, for the order id.
 
 `find_recent_deposits` scans the depository's logs from a captured
 `origin_block` to the head in 10,000-block chunks, decodes each, and returns our
