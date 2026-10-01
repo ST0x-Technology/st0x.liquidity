@@ -117,8 +117,8 @@ before it sends anything, then refuses a quote unless:
 - `details.recipient` is our recipient, and `protocol.v2.orderData.output` is on
   the destination chain and has exactly one payment: the destination stable to
   our recipient, at the quoted `minimumAmount` and expected amount;
-- every refund in `protocol.v2.orderData.inputs[].refunds[]` pays our
-  `refundTo`;
+- `protocol.v2.orderData.inputs[].refunds[]` has at least one refund option, and
+  every option pays our `refundTo` on the origin or the destination chain;
 - `protocol.v2.paymentDetails` is on the origin chain and names the pinned
   depository, the origin stable and the requested amount;
 - the `approve` step, when present, is on the origin chain, calls the origin
