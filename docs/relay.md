@@ -60,13 +60,15 @@ Statuses: `waiting` (no deposit seen; the body is only `status` and
 `quoteCreatedAt`), `depositing`, `pending`, `submitted`, `delayed`, `success`,
 `refund`, `failure`. `inTxHashes[]` are the deposits, `txHashes[]` the fills or
 refunds, `failReason` and `refundFailReason` a code or `"N/A"`. Both hash fields
-are arrays; the client keeps every entry.
+are arrays; the client keeps every entry, as `IntentStatusReport::deposit_txs`
+and `IntentStatusReport::txs`, whatever the status: a `failure` with
+`TRANSACTION_NOT_INCLUDED` may still list a tx that later confirms.
 
 A `refund` counts as a paid refund (`IntentStatus::Refund`) only with at least
 one refund tx and no `refundFailReason`. With no refund tx it is
 `IntentStatus::Refunding` (not terminal); with a `refundFailReason` it is
 `IntentStatus::RefundFailed`, which carries that `refund_fail_reason` (terminal:
-the refund will not be paid).
+the refund will not be paid), even when a refund tx is listed.
 
 A `success` with no tx in `txHashes` is `IntentStatus::Filling` (not terminal):
 settlement needs a fill tx to prove.
