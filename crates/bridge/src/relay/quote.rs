@@ -6,6 +6,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use alloy::primitives::{Address, B256, Bytes, U256};
 use alloy::sol;
 use alloy::sol_types::SolCall;
+use serde::de::IgnoredAny;
 use serde::{Deserialize, Serialize};
 
 use st0x_evm::Chain;
@@ -127,6 +128,11 @@ pub enum QuoteField {
     InputAmount,
     /// `details.recipient`.
     Recipient,
+    /// `protocol.v2.orderData.inputs[0].payment.chainId`: where the order says
+    /// we pay.
+    InputPaymentChain,
+    InputPaymentCurrency,
+    InputPaymentAmount,
     PaymentRecipient,
     PaymentCurrency,
     PaymentMinimum,
@@ -217,6 +223,12 @@ pub enum QuoteMismatch {
         destination: &'static str,
         actual: String,
     },
+    #[error("order has {count} inputs, expected one")]
+    InputCount { count: usize },
+    #[error("order carries {count} fees, expected none")]
+    OrderFees { count: usize },
+    #[error("order output carries {count} calls, expected none")]
+    OutputCalls { count: usize },
     #[error("order has {count} output payments, expected one")]
     PaymentCount { count: usize },
     #[error("quote names order {quoted}, the deposit calldata {calldata}")]
@@ -368,15 +380,30 @@ struct RawProtocolV2 {
     payment_details: RawPaymentDetails,
 }
 
+/// Every live quote carries empty `fees` and `output.calls`; their entries are
+/// only counted, as no shape for them has been seen.
 #[derive(Debug, Deserialize)]
 struct RawOrderData {
     inputs: Vec<RawOrderInput>,
+    fees: Vec<IgnoredAny>,
     output: RawOrderOutput,
 }
 
 #[derive(Debug, Deserialize)]
 struct RawOrderInput {
+    payment: RawInputPayment,
     refunds: Vec<RawRefund>,
+}
+
+/// What the order says we pay in.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawInputPayment {
+    /// Relay's chain name, not the numeric id.
+    chain_id: String,
+    currency: Address,
+    #[serde(with = "decimal")]
+    amount: U256,
 }
 
 #[derive(Debug, Deserialize)]
@@ -394,6 +421,7 @@ struct RawOrderOutput {
     /// Relay's chain name, not the numeric id.
     chain_id: String,
     payments: Vec<RawPayment>,
+    calls: Vec<IgnoredAny>,
     /// Unix seconds.
     deadline: u64,
 }
@@ -459,6 +487,7 @@ impl QuoteResponse {
         )?;
 
         check_fees(&self.fees, origin)?;
+        check_order_input(&self.protocol.v2.order_data, request)?;
         check_output_payment(&self.details, &self.protocol.v2.order_data, request)?;
         check_refunds(&self.protocol.v2.order_data, request)?;
         check_payment_details(&self.protocol.v2.payment_details, request, depository)?;
@@ -551,8 +580,42 @@ fn check_fees(fees: &RawFees, origin: Chain) -> Result<(), QuoteMismatch> {
     Ok(())
 }
 
+/// The order takes exactly one input, the requested amount of the origin
+/// stable on the origin chain, and carries no extra fee.
+fn check_order_input(order: &RawOrderData, request: &QuoteRequest) -> Result<(), QuoteMismatch> {
+    let [input] = order.inputs.as_slice() else {
+        return Err(QuoteMismatch::InputCount {
+            count: order.inputs.len(),
+        });
+    };
+
+    check_chain(
+        QuoteField::InputPaymentChain,
+        request.origin,
+        &input.payment.chain_id,
+    )?;
+    check_address(
+        QuoteField::InputPaymentCurrency,
+        request.origin.settlement_stable().address,
+        input.payment.currency,
+    )?;
+    check_amount(
+        QuoteField::InputPaymentAmount,
+        request.amount,
+        input.payment.amount,
+    )?;
+
+    if !order.fees.is_empty() {
+        return Err(QuoteMismatch::OrderFees {
+            count: order.fees.len(),
+        });
+    }
+
+    Ok(())
+}
+
 /// The solver pays exactly one output: the destination stable to our
-/// recipient, at the amounts `details` quotes.
+/// recipient, at the amounts `details` quotes, with no call attached.
 fn check_output_payment(
     details: &RawDetails,
     order: &RawOrderData,
@@ -564,6 +627,12 @@ fn check_output_payment(
         request.destination,
         &order.output.chain_id,
     )?;
+
+    if !order.output.calls.is_empty() {
+        return Err(QuoteMismatch::OutputCalls {
+            count: order.output.calls.len(),
+        });
+    }
 
     let [payment] = order.output.payments.as_slice() else {
         return Err(QuoteMismatch::PaymentCount {
@@ -1378,6 +1447,106 @@ pub(super) mod tests {
                 }
                     if expected == FUNDED_WALLET && actual == OTHER
             ),
+            "{error:?}"
+        );
+    }
+
+    #[test]
+    fn second_order_input_is_refused() {
+        let error = refusal(|body| {
+            let inputs = &mut body["protocol"]["v2"]["orderData"]["inputs"];
+            let input = inputs[0].clone();
+            inputs.as_array_mut().unwrap().push(input);
+        });
+
+        assert!(
+            matches!(error, QuoteMismatch::InputCount { count: 2 }),
+            "{error:?}"
+        );
+    }
+
+    #[test]
+    fn input_payment_on_another_chain_is_refused() {
+        let error = refusal(|body| {
+            body["protocol"]["v2"]["orderData"]["inputs"][0]["payment"]["chainId"] =
+                json!("ethereum");
+        });
+
+        assert!(
+            matches!(
+                error,
+                QuoteMismatch::ChainMismatch {
+                    field: QuoteField::InputPaymentChain,
+                    expected: "robinhood",
+                    ref actual,
+                } if actual == "ethereum"
+            ),
+            "{error:?}"
+        );
+    }
+
+    #[test]
+    fn input_payment_in_another_currency_is_refused() {
+        let error = refusal(|body| {
+            body["protocol"]["v2"]["orderData"]["inputs"][0]["payment"]["currency"] = json!(OTHER);
+        });
+
+        assert!(
+            matches!(
+                error,
+                QuoteMismatch::AddressMismatch {
+                    field: QuoteField::InputPaymentCurrency,
+                    expected,
+                    actual,
+                }
+                    if expected == ROBINHOOD_USDG && actual == OTHER
+            ),
+            "{error:?}"
+        );
+    }
+
+    #[test]
+    fn input_payment_for_another_amount_is_refused() {
+        let error = refusal(|body| {
+            body["protocol"]["v2"]["orderData"]["inputs"][0]["payment"]["amount"] =
+                json!("3000000");
+        });
+
+        assert!(
+            matches!(
+                error,
+                QuoteMismatch::AmountMismatch {
+                    field: QuoteField::InputPaymentAmount,
+                    expected,
+                    actual,
+                }
+                    if expected == U256::from(5_000_000) && actual == U256::from(3_000_000)
+            ),
+            "{error:?}"
+        );
+    }
+
+    #[test]
+    fn order_fee_is_refused() {
+        let error = refusal(|body| {
+            body["protocol"]["v2"]["orderData"]["fees"] =
+                json!([{"recipient": OTHER, "amount": "1"}]);
+        });
+
+        assert!(
+            matches!(error, QuoteMismatch::OrderFees { count: 1 }),
+            "{error:?}"
+        );
+    }
+
+    #[test]
+    fn output_call_is_refused() {
+        let error = refusal(|body| {
+            body["protocol"]["v2"]["orderData"]["output"]["calls"] = json!(["0xdeadbeef"]);
+        });
+
+        assert!(
+            matches!(error, QuoteMismatch::OutputCalls { count: 1 }),
             "{error:?}"
         );
     }
