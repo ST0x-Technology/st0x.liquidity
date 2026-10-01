@@ -500,7 +500,12 @@ impl DurableSymbolReferences for InventorySnapshot {
             )
             .chain(self.wallet_wrapped_equity.values().flat_map(BTreeMap::keys))
             .chain(self.inflight_mints.keys())
-            .chain(self.inflight_redemptions.keys());
+            .chain(self.inflight_redemptions.keys())
+            .chain(
+                self.chain_inflight_redemptions
+                    .values()
+                    .flat_map(BTreeMap::keys),
+            );
         for symbol in symbols {
             add_reference(references, symbol, SymbolReferenceSource::InventorySnapshot);
         }

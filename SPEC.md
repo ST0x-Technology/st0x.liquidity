@@ -5198,6 +5198,13 @@ transfer.
 - **Total rebalancing time**: Dominated by Alpaca deposit/withdrawal (~minutes)
   rather than bridge time
 
+Provider snapshots saved before redemptions were split by chain cannot identify
+which wallet a redemption belongs to. Startup defers those legacy redemption
+totals to the first provider poll; it still restores stranded exposure from
+aggregate history. New snapshots hydrate their Base and per-chain totals
+separately. Recovering a failed provider snapshot carries other provider events'
+complete venue balances and snapshot watermarks, including available shares.
+
 #### Wrapped Equity Recovery
 
 **Purpose**: Automatically return wrapped equity tokens (wtSTOCK) found in the
@@ -5999,8 +6006,8 @@ transfer dispatch. It does not calculate cross-venue inventory imbalances.
 - `InventorySnapshotEvent::OffchainCash` - Offchain cash balance fetched from
   broker
 - `InventorySnapshotEvent::InflightEquity` - Bot-owned pending tokenization
-  requests polled from Alpaca; sets inflight at Hedging (mints) and MarketMaking
-  (redemptions)
+  requests polled from Alpaca; sets inflight at Hedging for mints on every chain
+  and at Base's MarketMaking slot for Base redemptions only
   - **Ownership**: determined by active rebalancing aggregate IDs --
     `issuer_request_id` / `tokenization_request_id` for mints,
     `tokenization_request_id` / `redemption_tx` for redemptions -- not by
@@ -6012,6 +6019,13 @@ transfer dispatch. It does not calculate cross-venue inventory imbalances.
     logged for operators but do not count as inflight or block rebalancing
   - **Available balances**: unchanged -- set by separate available-balance
     snapshots
+- `InventorySnapshotEvent::ChainInflightRedemptions` - The same poll's bot-owned
+  pending redemptions on one chain other than Base, with the same ownership
+  rules; sets inflight at that chain's MarketMaking slot. It is a separate
+  variant so that an older binary fails on it instead of replaying the chain's
+  redemptions onto Base. That guard does not survive compaction: an older binary
+  reads the compacted snapshot, ignores the per-chain map, and starts normally.
+  Rolling back below the release that added it is unsupported.
 
 ##### Separation of concerns
 
@@ -6379,8 +6393,8 @@ a pure bookkeeping terminal transition. The one exception is the wallet nonce of
 a reconciled redemption's signed vault withdrawal, described below. One nuance
 for redemptions: a redemption that ended in `DetectionFailed` /
 `RedemptionRejected` has its stranded exposure seeded into live inflight at
-startup (see `symbols_with_stuck_redemptions`). Reconcile moves the latest event
-to `OperatorReconciled`, so that redemption is no longer seeded as stuck on the
+startup (see `stuck_redemptions`). Reconcile moves the latest event to
+`OperatorReconciled`, so that redemption is no longer seeded as stuck on the
 **next** restart; the running process's live inflight retains the startup-seeded
 amount until then. Mint failures and pre-send redemption failures settle
 inventory at failure time, so they need no such clearing. A mint's `Reconciled`
