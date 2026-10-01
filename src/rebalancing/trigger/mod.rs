@@ -23184,6 +23184,9 @@ mod tests {
             &id,
             EquityRedemptionCommand::Reconcile {
                 reason: "withdrawal verified dead onchain".to_string(),
+                proven_withdrawal: Some(
+                    crate::equity_redemption::prepared_withdrawal_for_test().tx_hash(),
+                ),
             },
             equity_services,
         )

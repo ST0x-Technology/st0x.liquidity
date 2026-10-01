@@ -24,7 +24,7 @@ use rain_math_float::Float;
 use tracing::{debug, info, warn};
 
 use st0x_evm::{
-    Evm, EvmError, IntoErrorRegistry, OpenChainErrorRegistry, PreparedTransaction, Wallet,
+    Evm, EvmError, IntoErrorRegistry, MinedTx, OpenChainErrorRegistry, PreparedTransaction, Wallet,
 };
 use st0x_execution::FractionalShares;
 use st0x_finance::Usdc;
@@ -754,6 +754,10 @@ impl<W: Wallet> Raindex for RaindexService<W> {
             .get_transaction_receipt(tx_hash)
             .await?
             .is_some())
+    }
+
+    async fn mined_tx(&self, tx_hash: TxHash) -> Result<Option<MinedTx>, RaindexError> {
+        Ok(st0x_evm::mined_tx(self.evm.provider(), tx_hash).await?)
     }
 
     async fn confirm_tx_receipt(

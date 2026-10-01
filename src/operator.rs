@@ -265,8 +265,18 @@ pub mod equity_transfer {
         RedemptionAlreadyReconciled(RedemptionAggregateId),
         #[error(
             "redemption {0} has an unresolved vault withdrawal submission; force-fail is \
-             refused because the withdrawal may already have landed -- verify it on-chain, \
-             then reconcile it (`stox transfer reconcile --kind redemption`) to resolve it"
+             refused because the withdrawal can still mine. Check its receipt on chain. If it \
+             mined successfully, do not reconcile; the redrive confirms it (if no job remains, \
+             run `stox transfer resume --kind equity` or restart the bot). If it mined and \
+             reverted, it moved nothing: once it has the required confirmations, settle the \
+             equity by hand and reconcile without --superseding-tx \
+             (`stox transfer reconcile --kind redemption --id {0} --reason <reason>`). If it \
+             has no receipt, cancel it with a 0-value self-transfer with no calldata (not \
+             EIP-7702) from the bot wallet at its nonce with fees above the withdrawal's, \
+             wait for the required \
+             confirmations, then settle the equity by hand and reconcile \
+             (`stox transfer reconcile --kind redemption --id {0} --reason <reason> \
+             --superseding-tx <cancel tx>`)"
         )]
         RedemptionSubmissionUnresolved(RedemptionAggregateId),
         #[error("mint store operation failed")]
@@ -8500,6 +8510,8 @@ pub mod rebalancing {
     pub mod equity {
         pub use crate::rebalancing::equity::{
             ChainEquityServices, CrossVenueEquityTransfer, EquityTransferServices,
+            WithdrawalNotSuperseded, verify_withdrawal_superseded,
+            withdrawal_required_confirmations,
         };
     }
 

@@ -306,6 +306,17 @@ pub enum EquityRedemptionError {
     /// Attempted to reconcile without an operator-supplied reason.
     #[error("Cannot reconcile: reason is required")]
     ReconcileReasonRequired,
+    /// The signed withdrawal changed between the caller's chain check and the
+    /// command, e.g. the live job signed one while a `VaultWithdrawPending`
+    /// reconcile was in flight: that withdrawal was never proven dead.
+    #[error(
+        "Cannot reconcile: the redemption's signed withdrawal is now {current:?}, but the \
+         reconcile check covered {proven:?}; run reconcile again"
+    )]
+    ReconcileWithdrawalChanged {
+        proven: Option<TxHash>,
+        current: Option<TxHash>,
+    },
     /// Enqueueing the bot-gas receipt cost recording job failed after a
     /// vault withdraw / unwrap confirmation succeeded (ADR 0017). See
     /// `BotGasEnqueueFailure` for why the payload is a rendered `String`
@@ -445,10 +456,16 @@ pub enum EquityRedemptionCommand {
     /// Reconcile a redemption to the terminal `Reconciled` state once its
     /// residual was handled out-of-band (e.g. via wrap-equity/vault-deposit), a
     /// bookkeeping resolution rather than a re-drive. Valid from the `Failed`
-    /// terminal, and from the `VaultWithdrawSubmitting` origin whose broadcast
-    /// fate an operator has verified on-chain -- the one in-flight state with no
-    /// automatic exit (never force-failed, since its withdrawal may have landed).
-    Reconcile { reason: String },
+    /// terminal, and from the vault withdrawal states whose fate an operator
+    /// has verified -- in-flight states with no automatic exit (never
+    /// force-failed, since a withdrawal may have landed).
+    Reconcile {
+        reason: String,
+        /// The signed withdrawal the caller proved can never land, or `None`
+        /// when the state it checked held none. Refused if the redemption's
+        /// signed withdrawal is now a different one.
+        proven_withdrawal: Option<TxHash>,
+    },
 }
 
 /// Why redemption detection failed.
@@ -1409,10 +1426,11 @@ impl EquityRedemption {
     /// Whether an operator may `Reconcile` this redemption to the terminal
     /// `Reconciled` state: the `Failed` terminal, or a withdrawal submission
     /// state (`VaultWithdrawPending`, `VaultWithdrawSubmitting`,
-    /// `VaultWithdrawSubmitted`) whose fate the operator has verified onchain.
-    /// The timeout sweep never fails those submission states, because their
-    /// withdrawal may have landed, so reconcile is their manual escape hatch
-    /// once the operator confirms the withdrawal will never land.
+    /// `VaultWithdrawSubmitted`). The timeout sweep never fails those
+    /// submission states, because their withdrawal may have landed, so
+    /// reconcile is their manual escape hatch. The command is pure, so for one
+    /// holding a [`prepared_withdrawal`](Self::prepared_withdrawal) the caller
+    /// proves on chain that it can never land before sending it.
     pub fn is_operator_reconcilable(&self) -> bool {
         self.is_failed()
             || matches!(
@@ -1421,6 +1439,27 @@ impl EquityRedemption {
                     | Self::VaultWithdrawSubmitting { .. }
                     | Self::VaultWithdrawSubmitted { .. }
             )
+    }
+
+    /// The exact signed vault withdrawal this redemption persisted before its
+    /// first broadcast, while it is unresolved. A legacy hash-only
+    /// `VaultWithdrawSubmitted` carries none.
+    pub fn prepared_withdrawal(&self) -> Option<&PreparedTransaction> {
+        match self {
+            Self::VaultWithdrawSubmitting { prepared, .. } => Some(prepared),
+            Self::VaultWithdrawSubmitted { prepared, .. } => prepared.as_ref(),
+            Self::VaultWithdrawPending { .. }
+            | Self::WithdrawnFromRaindex { .. }
+            | Self::UnwrapPending { .. }
+            | Self::UnwrapSubmitted { .. }
+            | Self::TokensUnwrapped { .. }
+            | Self::SendPending { .. }
+            | Self::TokensSent { .. }
+            | Self::Pending { .. }
+            | Self::Completed { .. }
+            | Self::Failed { .. }
+            | Self::Reconciled { .. } => None,
+        }
     }
 
     pub(crate) fn to_dto(&self, id: &RedemptionAggregateId) -> TransferOperation {
@@ -2579,13 +2618,29 @@ impl EventSourced for EquityRedemption {
                 _ => Err(EquityRedemptionError::AlreadyStarted),
             },
 
-            Reconcile { reason } => match self {
+            Reconcile {
+                reason,
+                proven_withdrawal,
+            } => match self {
                 Self::Failed { symbol, .. }
                 | Self::VaultWithdrawPending { symbol, .. }
                 | Self::VaultWithdrawSubmitting { symbol, .. }
                 | Self::VaultWithdrawSubmitted { symbol, .. } => {
                     if reason.trim().is_empty() {
                         return Err(EquityRedemptionError::ReconcileReasonRequired);
+                    }
+
+                    let current = self.prepared_withdrawal().map(PreparedTransaction::tx_hash);
+                    if current != proven_withdrawal {
+                        warn!(
+                            target: "rebalance",
+                            %symbol, ?current, ?proven_withdrawal,
+                            "Refusing reconcile: signed withdrawal changed since the check"
+                        );
+                        return Err(EquityRedemptionError::ReconcileWithdrawalChanged {
+                            proven: proven_withdrawal,
+                            current,
+                        });
                     }
 
                     warn!(
@@ -7118,6 +7173,7 @@ mod tests {
             .given(history.clone())
             .when(EquityRedemptionCommand::Reconcile {
                 reason: "deposited manually via vault-deposit".to_string(),
+                proven_withdrawal: None,
             })
             .await
             .events();
@@ -7166,6 +7222,7 @@ mod tests {
             .given(history.clone())
             .when(EquityRedemptionCommand::Reconcile {
                 reason: "withdrawal never broadcast; verified on-chain".to_string(),
+                proven_withdrawal: Some(prepared_withdrawal_for_test().tx_hash()),
             })
             .await
             .events();
@@ -7233,6 +7290,7 @@ mod tests {
             }])
             .when(EquityRedemptionCommand::Reconcile {
                 reason: "legacy withdrawal verified dead onchain".to_string(),
+                proven_withdrawal: None,
             })
             .await
             .events();
@@ -7275,6 +7333,7 @@ mod tests {
             .given(vec![withdrawn_from_raindex_event(), tokens_sent_event()])
             .when(EquityRedemptionCommand::Reconcile {
                 reason: "should be rejected".to_string(),
+                proven_withdrawal: None,
             })
             .await
             .then_expect_error();
@@ -7288,12 +7347,61 @@ mod tests {
         );
     }
 
+    /// A reconcile checked while the redemption held no signed withdrawal (e.g.
+    /// `VaultWithdrawPending`) must not land after the live job signed one:
+    /// that withdrawal was never proven dead.
+    #[tokio::test]
+    async fn reconcile_refuses_a_withdrawal_signed_after_the_check() {
+        let error = TestHarness::<EquityRedemption>::with(mock_services())
+            .given(vec![vault_withdraw_submitting_event()])
+            .when(EquityRedemptionCommand::Reconcile {
+                reason: "checked while pending".to_string(),
+                proven_withdrawal: None,
+            })
+            .await
+            .then_expect_error();
+
+        let LifecycleError::Apply(EquityRedemptionError::ReconcileWithdrawalChanged {
+            proven,
+            current,
+        }) = error
+        else {
+            panic!("a withdrawal signed after the check must be refused, got {error:?}");
+        };
+        assert_eq!(proven, None);
+        assert_eq!(current, Some(prepared_withdrawal_for_test().tx_hash()));
+    }
+
+    #[tokio::test]
+    async fn reconcile_refuses_a_proof_of_another_withdrawal() {
+        let other = TxHash::repeat_byte(0x0A);
+        let error = TestHarness::<EquityRedemption>::with(mock_services())
+            .given(vec![vault_withdraw_submitting_event()])
+            .when(EquityRedemptionCommand::Reconcile {
+                reason: "proved a different withdrawal".to_string(),
+                proven_withdrawal: Some(other),
+            })
+            .await
+            .then_expect_error();
+
+        let LifecycleError::Apply(EquityRedemptionError::ReconcileWithdrawalChanged {
+            proven,
+            current,
+        }) = error
+        else {
+            panic!("a proof of another withdrawal must be refused, got {error:?}");
+        };
+        assert_eq!(proven, Some(other));
+        assert_eq!(current, Some(prepared_withdrawal_for_test().tx_hash()));
+    }
+
     #[tokio::test]
     async fn reconcile_with_blank_reason_is_rejected() {
         let error = TestHarness::<EquityRedemption>::with(mock_services())
             .given(failed_redemption_history())
             .when(EquityRedemptionCommand::Reconcile {
                 reason: "   ".to_string(),
+                proven_withdrawal: None,
             })
             .await
             .then_expect_error();
@@ -7319,6 +7427,7 @@ mod tests {
             .given(history)
             .when(EquityRedemptionCommand::Reconcile {
                 reason: "second attempt".to_string(),
+                proven_withdrawal: None,
             })
             .await
             .then_expect_error();
