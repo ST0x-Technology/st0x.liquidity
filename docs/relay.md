@@ -129,7 +129,9 @@ before it sends anything, then refuses a quote unless:
 - there is no other step.
 
 The approve is optional because Relay may leave it out when the allowance
-already covers the amount (not observed; the funded test always had one).
+already covers the amount (not observed; the funded test always had one). With
+no approve step the caller must recheck the allowance before skipping the
+approve: another transfer from the same wallet can consume a standing allowance.
 
 `QuoteAmounts::accept` then checks the amounts against `QuoteBounds`, in checked
 integer basis points rounded up, so a bound never sits below its exact value (an

@@ -792,7 +792,7 @@ pub(super) mod tests {
 
     const DEPOSITORY: Address = address!("0x4cd00e387622c35bddb9b4c962c136462338bc31");
 
-    /// The request behind the RAI-2586 funded quote: 5 USDG Robinhood to
+    /// The request behind the funded test quote: 5 USDG Robinhood to
     /// Ethereum, 30 bps slippage.
     pub(in crate::relay) fn funded_request() -> QuoteRequest {
         QuoteRequest {
@@ -923,27 +923,34 @@ pub(super) mod tests {
         assert_eq!(&quote.deposit.data[..4], &[0xe8, 0x01, 0x79, 0x52]);
     }
 
-    /// Both RAI-2586 directions at 1000 units, quoted for the `0xdead` user.
+    /// Both directions at 1000 units and 50 bps, quoted for the `0xdead` user.
     #[test]
     fn both_directions_validate() {
-        for (fixture, origin, destination) in [
+        for (fixture, origin, destination, order_id, expected_out, minimum_out) in [
             (
                 include_str!("../../relay-fixtures/quote_robinhood_to_ethereum.json"),
                 Chain::Robinhood,
                 Chain::Ethereum,
+                b256!("0xae7a78753d0ba847d89a6bfd50782bd4a5cb632a73fda16ee904ec321cda1b56"),
+                999_303_522_u64,
+                994_307_004_u64,
             ),
             (
                 include_str!("../../relay-fixtures/quote_ethereum_to_robinhood.json"),
                 Chain::Ethereum,
                 Chain::Robinhood,
+                b256!("0xbac7900c347acd50a3adc855c4dff3cae98fef07fb2d4c3a1b32ba34d5389cb4"),
+                999_595_489,
+                994_597_512,
             ),
         ] {
             let request = dead_request(origin, destination, 50);
 
             let quote = validate(&serde_json::from_str(fixture).unwrap(), &request).unwrap();
 
-            assert_eq!(quote.deposit.chain_id, origin.chain_id());
-            assert_eq!(quote.amounts.amount_in, U256::from(1_000_000_000));
+            assert_eq!(quote.order_id, RelayOrderId(order_id));
+            assert_eq!(quote.amounts.expected_out, U256::from(expected_out));
+            assert_eq!(quote.amounts.minimum_out, U256::from(minimum_out));
         }
     }
 

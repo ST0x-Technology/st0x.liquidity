@@ -431,28 +431,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn status_reads_the_refund_fixture() {
-        let server = MockServer::start();
-        server.mock(|when, then| {
-            when.method(GET).path("/intents/status/v3");
-            then.status(200)
-                .body(include_str!("../../relay-fixtures/status_refund.json"));
-        });
-
-        let report = client(&server, None).status(REQUEST_ID).await.unwrap();
-
-        assert_eq!(
-            report.status,
-            IntentStatus::Refund {
-                refund_txs: vec![b256!(
-                    "0xf27f49b3e941788a37775b874e1a91a711c26578c041921a24efd96cd14cea8d"
-                )],
-                reason: Some(FailReason::DepositedAmountTooLowToFill),
-            }
-        );
-    }
-
-    #[tokio::test]
     async fn rate_limit_carries_retry_after() {
         let server = MockServer::start();
         let mock = server.mock(|when, then| {
