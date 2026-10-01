@@ -134,8 +134,11 @@ no approve step the caller must recheck the allowance before skipping the
 approve: another transfer from the same wallet can consume a standing allowance.
 
 `QuoteAmounts::accept` then checks the amounts against `QuoteBounds`, in checked
-integer basis points rounded up, so a bound never sits below its exact value (an
-overflow is `QuoteAcceptanceError::Overflow`, never a panic):
+integer basis points (an overflow is `QuoteAcceptanceError::Overflow`, never a
+panic). The loss bound rounds up, so it never sits below its exact value. The
+slippage floor rounds down: Relay rounds its own `minimumAmount` down (999303522
+at 50 bps is 994307004.39, and Relay quotes 994307004), so a floor rounded up
+would refuse an honest quote.
 
 - `expected_out >= amount_in * (10000 - max_loss) / 10000`, else
   `QuoteLossExceedsBound`;
