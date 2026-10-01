@@ -361,6 +361,9 @@ struct RawProtocol {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct RawProtocolV2 {
+    /// Must equal the deposit calldata's `id`, or the checked order is not the
+    /// one the deposit funds.
+    order_id: B256,
     order_data: RawOrderData,
     payment_details: RawPaymentDetails,
 }
@@ -428,7 +431,8 @@ impl From<&RawCurrency> for QuotedCurrency {
 
 impl QuoteResponse {
     /// Checks the quote against `request` and the origin's pinned `depository`,
-    /// and reads the order id from the deposit calldata.
+    /// and reads the order id from the deposit calldata, which must match
+    /// `protocol.v2.orderId`.
     pub(super) fn validate(
         self,
         request: &QuoteRequest,
@@ -469,6 +473,14 @@ impl QuoteResponse {
             .transpose()?;
 
         let order_id = check_deposit(&deposit, request, origin_stable, depository)?;
+
+        let quoted = RelayOrderId(self.protocol.v2.order_id);
+        if quoted != order_id {
+            return Err(QuoteMismatch::OrderIdMismatch {
+                quoted,
+                calldata: order_id,
+            });
+        }
 
         let seconds = self.protocol.v2.order_data.output.deadline;
         let deadline = UNIX_EPOCH
