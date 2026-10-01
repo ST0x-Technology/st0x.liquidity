@@ -109,7 +109,8 @@ to `RelayError::RateLimited { retry_after }` from the `Retry-After` header
 before it sends anything, then refuses a quote unless:
 
 - the input and output are the two chains' settlement stables on their pinned
-  decimals (which must match each other), and the input amount is the requested
+  decimals (every Relay chain's stable has 6, which a test pins, so input and
+  output amounts compare unit for unit), and the input amount is the requested
   amount;
 - the relayer fee is in the origin stable and the gas fee is on the origin
   chain;
