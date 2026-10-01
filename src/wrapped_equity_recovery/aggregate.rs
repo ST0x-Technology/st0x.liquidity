@@ -97,21 +97,27 @@ pub(crate) struct WrappedEquityRecoveryServices {
 /// handlers. Most service failures (raindex/wrapper/transfer) do NOT flow
 /// through this enum -- they are recorded as `RecoveryFailed` events instead,
 /// so failures remain first-class entries in the audit trail. The
-/// exceptions are `ChainServicesMissing` (see its doc) and
+/// exceptions include `MintResumePending`, which keeps unfinished mints open,
+/// `ChainServicesMissing` (see its doc), and
 /// `BotGasEnqueueFailed`: a bot-gas cost-recording bookkeeping
 /// failure inside `confirm_orphan_deposit_or_fail` is deliberately propagated
 /// as `Err` rather than folded into `RecoveryFailed`, so the job's shared
 /// `redrive_on_bot_gas_failure` mechanism can redrive it instead of
 /// permanently failing the recovery over a best-effort accounting write.
 ///
-/// NOTE: `resume_mint_or_fail`/`resume_redemption_or_fail` (the
-/// `DispatchToMint`/`DispatchToRedemption` handlers) deliberately do NOT
+/// NOTE: `resume_redemption_or_fail` (the
+/// `DispatchToRedemption` handlers) deliberately do NOT
 /// propagate a bot-gas enqueue failure this way -- see the "Known gaps"
 /// entry in SPEC.md's bot-gas section. The job now resumes from `Detected`,
 /// so a redrive would no longer strand the record, but propagating the
 /// failure from these handlers is not wired yet.
 #[derive(Debug, Clone, Serialize, Deserialize, Error, PartialEq, Eq)]
 pub(crate) enum WrappedEquityRecoveryError {
+    #[error("mint {mint_id} resume remains pending: {reason}")]
+    MintResumePending {
+        mint_id: IssuerRequestId,
+        reason: String,
+    },
     #[error("recovery already initialized")]
     AlreadyInitialized,
     #[error("recovery not yet initialized; only Detect is valid")]
@@ -694,10 +700,10 @@ async fn resume_mint_or_fail(
         }
         Err(error) => {
             warn!(target: "rebalance", %mint_id, ?error, "Wrapped equity recovery: resume_mint failed");
-            Ok(vec![WrappedEquityRecoveryEvent::RecoveryFailed {
-                reason: format!("resume_mint failed: {error}"),
-                failed_at: now,
-            }])
+            Err(WrappedEquityRecoveryError::MintResumePending {
+                mint_id: mint_id.clone(),
+                reason: error.to_string(),
+            })
         }
     }
 }
@@ -1358,16 +1364,11 @@ mod tests {
         );
     }
 
-    /// `resume_mint` fails because no mint aggregate exists in the store ->
-    /// the handler records the failure as `RecoveryFailed`. Proves service
-    /// failures flow through events, not aggregate errors.
     #[tokio::test]
-    async fn dispatch_to_mint_records_failure_when_resume_mint_fails() {
+    async fn dispatch_to_mint_keeps_recovery_open_when_resume_fails() {
         let services = test_services().await;
-        let detected = detected_state();
         let mint_id = issuer_request_id("ISS-NONEXISTENT");
-
-        let events = detected
+        let error = detected_state()
             .transition(
                 WrappedEquityRecoveryCommand::DispatchToMint {
                     mint_id: mint_id.clone(),
@@ -1375,16 +1376,9 @@ mod tests {
                 &services,
             )
             .await
-            .expect(
-                "DispatchToMint should return Ok with a RecoveryFailed event on service failure",
-            );
-
-        let [WrappedEquityRecoveryEvent::RecoveryFailed { reason, .. }] = events.as_slice() else {
-            panic!("Expected single RecoveryFailed event, got {events:?}");
-        };
+            .unwrap_err();
         assert!(
-            reason.contains("resume_mint failed"),
-            "RecoveryFailed reason should mention resume_mint; got {reason:?}",
+            matches!(error, WrappedEquityRecoveryError::MintResumePending { mint_id: pending, .. } if pending == mint_id)
         );
     }
 

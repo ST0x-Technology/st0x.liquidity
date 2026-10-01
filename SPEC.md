@@ -181,7 +181,9 @@ Operators pause rebalancing with narrow, explicit controls:
   `paused`. On rollback, restore the token value before downgrading the binary.
   The dashboard currently shows paused and disabled listings with the same red
   rebalancing indicator; verify the registry mode before you set `disabled`. It
-  displays settings for the primary chain only.
+  displays settings for the primary chain only. A listing with rebalancing
+  `enabled` or `paused` also needs `wrapped_equity_recovery = "enabled"` on
+  every chain.
 - **Per-asset `rebalancing = "disabled"`**: removes the asset from the trigger
   whitelist. New equity rebalancing flows do not start for that asset. On a
   secondary chain where no equity is `enabled` or `paused`, the chain's equity
@@ -303,22 +305,27 @@ like any hedged chain's and those hold wrapped vault shares the daily portfolio
 capture values in underlying units. The rebalancing trigger plans across every
 hedged chain's entry and dispatches each operation with its chain (see Equity
 Allocation Planner); the portfolio snapshot still consumes the primary chain's
-entry, and both equity-recovery aggregates resolve the entry of their recorded
-chain. A secondary listing that sets `wrapped_equity_recovery = "enabled"` is
-refused at load, naming the chain and symbol, since no recovery would claim its
-stranded tokens. A mint or redemption transfer resolves the entry of the chain
-its record names (see below). The tokenization preflight (below) runs once per
-hedged chain with that chain's wallet, orderbook and settlement stable, as does
-the stale-allowance revoke on each chain in managed inventory mode. The startup
-MAX approvals run on every hedged chain in either mode, but only the
-settlement-stable grant is unconditional: the equity grants (underlying to
-wrapper vault, wrapped token to the deposit spender) are made only on chains
-that rebalance equity, since a hedge-only secondary has no wrapper to approve.
-Both deposit grants name the spender that chain settles deposits through -- its
-orderbook in legacy inventory mode, its `RaindexInventory` in managed mode -- so
-the same two token identities are approved, and proved by the deploy gate, in
-either inventory mode. A hedged chain for which this build has no pinned
-settlement stable fails startup rather than borrowing another chain's address.
+entry, and the wrapped- and unwrapped-equity recovery aggregates resolve the
+entry of the chain they record. On every hedged chain, a listing with
+rebalancing `enabled` or `paused` must set
+`wrapped_equity_recovery = "enabled"`, so a failed transfer's tokens always have
+a recovery on the chain whose wallet holds them. On a secondary chain, a listing
+that enables recovery must also have rebalancing `enabled` or `paused`, since
+only then are the chain's equity services built. Either violation is refused at
+load, naming the chain and symbol. A mint or redemption transfer resolves the
+entry of the chain its record names (see below). The tokenization preflight
+(below) runs once per hedged chain with that chain's wallet, orderbook and
+settlement stable, as does the stale-allowance revoke on each chain in managed
+inventory mode. The startup MAX approvals run on every hedged chain in either
+mode, but only the settlement-stable grant is unconditional: the equity grants
+(underlying to wrapper vault, wrapped token to the deposit spender) are made
+only on chains that rebalance equity, since a hedge-only secondary has no
+wrapper to approve. Both deposit grants name the spender that chain settles
+deposits through -- its orderbook in legacy inventory mode, its
+`RaindexInventory` in managed mode -- so the same two token identities are
+approved, and proved by the deploy gate, in either inventory mode. A hedged
+chain for which this build has no pinned settlement stable fails startup rather
+than borrowing another chain's address.
 
 The operator CLI selects its chain the same way. Every command that itself
 submits an onchain operation takes `--network` (default `base`) and runs on that
@@ -1522,12 +1529,12 @@ migration files in `migrations/`.
   enqueue failure during wrap confirmation is never misclassified as a
   wrap/deposit failure that would hand a healthy mint off to
   `UnwrappedEquityRecovery`. The wrapped/unwrapped equity-recovery aggregates'
-  `DispatchToMint`/`DispatchToRedemption` handoff to a mint/redemption resume is
-  the remaining swallowing site: a bot-gas enqueue failure there is folded into
-  the aggregate's normal `RecoveryFailed` event rather than redriven. Both
-  recovery jobs now resume from the `Detected` state a redrive would land back
-  on, so redriving would no longer strand the record; the redrive itself is not
-  wired yet (see "Known gaps" below). This differs from a downstream job's own
+  `DispatchToRedemption` handoff to a redemption resume is the remaining
+  swallowing site: a bot-gas enqueue failure there is folded into the
+  aggregate's normal `RecoveryFailed` event rather than redriven. Both recovery
+  jobs now resume from the `Detected` state a redrive would land back on, so
+  redriving would no longer strand the record; the redrive itself is not wired
+  yet (see "Known gaps" below). This differs from a downstream job's own
   execution failures, which dead-letter without blocking the caller
 - Every cross-venue transfer constructor requires an explicit bot-gas enqueuer.
   Production wiring passes the durable queue-backed enqueuer, while CLI and
@@ -1549,6 +1556,11 @@ migration files in `migrations/`.
   approvals and order management never surface a transaction hash to the
   recording call sites, and CLI operations run in a separate binary without the
   server's job queue
+- A wrapped or unwrapped recovery that cannot resume its active mint leaves its
+  recovery record in `Detected`, retains the symbol's recovery hold, and retries
+  the same job with a delay. This includes bot-gas enqueue failures; the hold is
+  released only after the mint resume succeeds. Hold alerts keep their original
+  deadline and can fire while a recovery attempt owns the slot.
 - Known gaps (deliberately deferred, tracked as follow-up work rather than
   blocking this feature): gas paid by reverted non-CCTP-burn transactions is not
   recorded, a mint's vault-deposit crash-recovery path (the narrow window
@@ -5274,11 +5286,27 @@ recovery job logs at debug and exits without writing an aggregate; the next
 polling tick re-evaluates. This keeps recovery dispatch from racing the
 mint/redemption tasks already driven by apalis.
 
-A transfer that hands its received tokens to recovery holds the symbol for the
-chain whose wallet holds them (`HeldForRecovery { chain }`). Only a recovery job
-on that chain claims the hold; a job on another chain reschedules, as it does
-for a live transfer. A failed recovery attempt restores the hold for the same
-chain.
+A mint that fails after its tokens arrive (`TokensReceived` or `WrapSubmitted`)
+on a chain that enables recovery for the symbol hands its tokens to that chain's
+recovery, primary or secondary: the transfer holds the symbol for the chain
+whose wallet holds them (`HeldForRecovery { chain }`). Only a recovery job on
+that chain claims the hold; a job on another chain reschedules, as it does for a
+live transfer. While a recovery attempt runs, the slot records that recovery
+owns it (`Recovering { chain, generation }`), so the transfer timeout sweep
+skips the mint as it does for a hold, and never fails it or releases its guard
+and reservation while recovery still moves the tokens. A failed recovery attempt
+restores the hold for the same chain. For a `WrapSubmitted` mint, wrapped
+recovery does not compare the wallet's vault shares with the mint's underlying
+quantity, which differ whenever the vault ratio is not 1; resuming the mint
+reads the wrap receipt and deposits the share count it reports.
+
+A hold blocks the symbol on every chain. When a hold, or recovery attempts on
+the held chain, keep the symbol unavailable for
+`[rebalancing].recovery_hold_alert_after_secs` (one hour when absent), the bot
+sends one operator alert naming the symbol and the chain, and retries delivery
+on the next sweep if it fails. The alert does not release the hold. The timer
+restarts when the slot becomes free or another owner takes it, and on restart,
+since it is kept in memory.
 
 ##### Idempotency
 
