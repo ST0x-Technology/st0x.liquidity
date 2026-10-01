@@ -375,6 +375,8 @@ impl<W: Wallet> RelayEnd<W> {
 
     /// Signs the approve (the quote's, or our own exact one when the quote has
     /// none and the allowance falls short) and the deposit at the next nonces.
+    /// Another send from this wallet between the two signs takes the nonce in
+    /// between, so a pair that is not consecutive is discarded and refused.
     async fn prepare_deposit(
         &self,
         quote: &RelayQuote,
@@ -435,6 +437,21 @@ impl<W: Wallet> RelayEnd<W> {
                 return Err(error.into());
             }
         };
+
+        if let Some(approve) = &approve
+            && let Err(error) = check_pair_nonces(approve, &deposit)
+        {
+            warn!(
+                target: "bridge",
+                ?error,
+                approve = %approve.tx_hash(),
+                deposit = %deposit.tx_hash(),
+                "Relay deposit pair is not consecutive, discarding both"
+            );
+            self.wallet.discard_prepared(deposit.tx_hash()).await;
+            self.wallet.discard_prepared(approve.tx_hash()).await;
+            return Err(error);
+        }
 
         debug!(
             target: "bridge",
@@ -510,13 +527,7 @@ impl<W: Wallet> RelayEnd<W> {
         prepared: &PreparedSwapDeposit,
     ) -> Result<TxHash, RelayBridgeError> {
         if let Some(approve) = &prepared.approve {
-            let deposit = prepared.deposit.nonce();
-            if approve.nonce().checked_add(1) != Some(deposit) {
-                return Err(RelayBridgeError::PairNonces {
-                    approve: approve.nonce(),
-                    deposit,
-                });
-            }
+            check_pair_nonces(approve, &prepared.deposit)?;
 
             self.wallet
                 .broadcast_prepared(approve, "Relay deposit approve")
@@ -652,6 +663,21 @@ impl<W: Wallet> RelayEnd<W> {
     }
 }
 
+/// The approve must sit at the nonce right before its deposit.
+fn check_pair_nonces(
+    approve: &PreparedTransaction,
+    deposit: &PreparedTransaction,
+) -> Result<(), RelayBridgeError> {
+    if approve.nonce().checked_add(1) == Some(deposit.nonce()) {
+        return Ok(());
+    }
+
+    Err(RelayBridgeError::PairNonces {
+        approve: approve.nonce(),
+        deposit: deposit.nonce(),
+    })
+}
+
 /// A proof that failed: a tx that is not the payment, or a read that did not
 /// finish.
 enum ProofError {
@@ -693,10 +719,11 @@ mod tests {
 
     use alloy::consensus::TxEnvelope;
     use alloy::eips::Decodable2718;
-    use alloy::primitives::B256;
+    use alloy::primitives::{B256, Signature};
     use alloy::providers::{DynProvider, ProviderBuilder};
     use alloy::rpc::types::TransactionReceipt;
 
+    use st0x_evm::Evm;
     use st0x_evm::local::RawPrivateKeyWallet;
 
     use super::super::test_contracts::RelayChain;
@@ -828,6 +855,169 @@ mod tests {
         }
     }
 
+    /// Our corridor-chain wallet, with a hook on the deposit's signing.
+    struct PairWallet {
+        inner: TestWallet,
+        on_deposit: OnDepositSigning,
+        stable: Address,
+    }
+
+    enum OnDepositSigning {
+        /// Another send from this wallet takes the next nonce first.
+        AnotherSendFirst,
+        Fail,
+    }
+
+    #[async_trait]
+    impl Evm for PairWallet {
+        type Provider = DynProvider;
+
+        fn provider(&self) -> &DynProvider {
+            self.inner.provider()
+        }
+    }
+
+    #[async_trait]
+    impl Wallet for PairWallet {
+        fn address(&self) -> Address {
+            self.inner.address()
+        }
+
+        async fn sign_typed_data(
+            &self,
+            payload_json: String,
+            expected_digest: B256,
+        ) -> Result<Signature, EvmError> {
+            self.inner
+                .sign_typed_data(payload_json, expected_digest)
+                .await
+        }
+
+        async fn prepare_pending(
+            &self,
+            contract: Address,
+            calldata: Bytes,
+            note: &str,
+        ) -> Result<PreparedTransaction, EvmError> {
+            self.inner.prepare_pending(contract, calldata, note).await
+        }
+
+        async fn prepare_pending_with_gas_limit(
+            &self,
+            contract: Address,
+            calldata: Bytes,
+            unpadded_gas_limit: u64,
+            note: &str,
+        ) -> Result<PreparedTransaction, EvmError> {
+            match self.on_deposit {
+                OnDepositSigning::AnotherSendFirst => {
+                    self.inner
+                        .prepare_pending(self.stable, probe_calldata(), "another send")
+                        .await?;
+                }
+                OnDepositSigning::Fail => {
+                    return Err(EvmError::Reverted {
+                        tx_hash: TxHash::ZERO,
+                    });
+                }
+            }
+
+            self.inner
+                .prepare_pending_with_gas_limit(contract, calldata, unpadded_gas_limit, note)
+                .await
+        }
+
+        async fn broadcast_prepared(
+            &self,
+            prepared: &PreparedTransaction,
+            note: &str,
+        ) -> Result<TxHash, EvmError> {
+            self.inner.broadcast_prepared(prepared, note).await
+        }
+
+        async fn discard_prepared(&self, tx_hash: TxHash) {
+            self.inner.discard_prepared(tx_hash).await;
+        }
+
+        async fn release_superseded(&self, tx_hash: TxHash) {
+            self.inner.release_superseded(tx_hash).await;
+        }
+
+        async fn restore_prepared(&self, prepared: &PreparedTransaction) {
+            self.inner.restore_prepared(prepared).await;
+        }
+
+        async fn restore_transaction(&self, tx_hash: TxHash) -> Result<(), EvmError> {
+            self.inner.restore_transaction(tx_hash).await
+        }
+
+        async fn send_pending(
+            &self,
+            contract: Address,
+            calldata: Bytes,
+            note: &str,
+        ) -> Result<TxHash, EvmError> {
+            self.inner.send_pending(contract, calldata, note).await
+        }
+
+        async fn await_receipt(&self, tx_hash: TxHash) -> Result<TransactionReceipt, EvmError> {
+            self.inner.await_receipt(tx_hash).await
+        }
+
+        async fn send(
+            &self,
+            contract: Address,
+            calldata: Bytes,
+            note: &str,
+        ) -> Result<TransactionReceipt, EvmError> {
+            self.inner.send(contract, calldata, note).await
+        }
+    }
+
+    /// A bridge whose corridor-chain wallet runs `on_deposit` when it signs
+    /// the deposit.
+    fn pair_bridge(
+        harness: &Harness,
+        on_deposit: OnDepositSigning,
+    ) -> RelayBridge<TestWallet, PairWallet> {
+        RelayBridge::try_from_ctx(RelayCtx {
+            chain: Chain::Robinhood,
+            ethereum_wallet: wallet(&harness.hub),
+            chain_wallet: PairWallet {
+                inner: wallet(&harness.chain),
+                on_deposit,
+                stable: harness.chain.stable,
+            },
+        })
+        .unwrap()
+        .with_local_contracts(contracts(&harness.hub), contracts(&harness.chain))
+    }
+
+    fn probe_calldata() -> Bytes {
+        Bytes::from(
+            IERC20::approveCall {
+                spender: Address::ZERO,
+                amount: U256::ZERO,
+            }
+            .abi_encode(),
+        )
+    }
+
+    /// The nonces the wallet hands the next two sends it signs.
+    async fn next_two_nonces(wallet: &PairWallet) -> [u64; 2] {
+        let mut nonces = [0; 2];
+
+        for nonce in &mut nonces {
+            *nonce = wallet
+                .prepare_pending(wallet.stable, probe_calldata(), "nonce probe")
+                .await
+                .unwrap()
+                .nonce();
+        }
+
+        nonces
+    }
+
     fn gas_limit(prepared: &PreparedTransaction) -> u64 {
         alloy::consensus::Transaction::gas_limit(
             &TxEnvelope::decode_2718_exact(prepared.raw().as_ref()).unwrap(),
@@ -916,6 +1106,52 @@ mod tests {
         );
         assert_eq!(approve.to(), Some(harness.chain.stable));
         assert_eq!(prepared.deposit.to(), Some(harness.chain.depository));
+    }
+
+    #[tokio::test]
+    async fn pair_split_by_another_send_is_refused_and_releases_both_nonces() {
+        let harness = Harness::new().await;
+        let bridge = pair_bridge(&harness, OnDepositSigning::AnotherSendFirst);
+        let quote = quote(&harness.chain, B256::random(), true);
+
+        let error = bridge
+            .prepare_deposit(HopDirection::ToHub, &quote)
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                RelayBridgeError::PairNonces {
+                    approve: 0,
+                    deposit: 2
+                }
+            ),
+            "{error:?}"
+        );
+        assert_eq!(
+            next_two_nonces(&bridge.chain.wallet).await,
+            [0, 2],
+            "the other send still holds nonce 1"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_deposit_signing_releases_its_approve() {
+        let harness = Harness::new().await;
+        let bridge = pair_bridge(&harness, OnDepositSigning::Fail);
+        let quote = quote(&harness.chain, B256::random(), true);
+
+        let error = bridge
+            .prepare_deposit(HopDirection::ToHub, &quote)
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(error, RelayBridgeError::Evm(EvmError::Reverted { .. })),
+            "{error:?}"
+        );
+        assert_eq!(next_two_nonces(&bridge.chain.wallet).await, [0, 1]);
     }
 
     #[tokio::test]
