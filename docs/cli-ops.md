@@ -800,9 +800,9 @@ stox transfer reconcile --kind redemption --id <redemption-aggregate-id> \
     After the reconciliation deadline the redrive runs every 30 minutes, so to
     continue at once, or when the job budget page fired and no job remains, run
     `stox transfer resume --kind equity` or restart the bot. Once adopted,
-    reconcile refuses the redemption ("the withdrawal went through"), and the
-    same holds for a legacy redemption holding only a withdrawal hash that
-    mined successfully; the redrive is the only exit.
+    reconcile always refuses the redemption; the redrive is the only exit. A
+    legacy redemption holding only a withdrawal hash is refused too once that
+    hash mined successfully ("the withdrawal went through").
   - No receipt (pending, or dropped): do **not** settle the equity or reconcile
     yet. Cancel it: from the bot wallet on the redemption's chain, send a
     0-value transfer with no calldata to the wallet itself (any tx type except

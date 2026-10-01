@@ -317,6 +317,14 @@ pub enum EquityRedemptionError {
         proven: Option<TxHash>,
         current: Option<TxHash>,
     },
+    /// The redemption's withdrawal is a replacement the bot proved on chain
+    /// moved the equity, so it is not settled by hand.
+    #[error(
+        "Cannot reconcile: vault withdrawal {tx} is an adopted replacement that moved the \
+         equity; the redrive confirms it (if no job remains, run `stox transfer resume --kind \
+         equity` or restart the bot)"
+    )]
+    AdoptedWithdrawalNotReconcilable { tx: TxHash },
     /// Attempted to adopt a withdrawal replacement without an operator-supplied
     /// reason.
     #[error("Cannot adopt a withdrawal replacement: reason is required")]
@@ -1158,6 +1166,11 @@ pub enum EquityRedemption {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         prepared: Option<PreparedTransaction>,
         submitted_at: DateTime<Utc>,
+        /// The signed withdrawal an operator replaced with `tx_hash`, set only
+        /// by `VaultWithdrawReplacementAdopted`. The bot proved that `tx_hash`
+        /// moved the equity, so reconcile refuses it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        adopted_from: Option<TxHash>,
     },
 
     /// Tokens withdrawn from Raindex vault to wallet, not yet sent to Alpaca
@@ -1831,6 +1844,7 @@ impl EventSourced for EquityRedemption {
                 tx_hash: *tx_hash,
                 prepared: prepared.clone(),
                 submitted_at: *submitted_at,
+                adopted_from: None,
             }),
             // Legacy: old aggregates start with WithdrawnFromRaindex
             WithdrawnFromRaindex {
@@ -1888,12 +1902,17 @@ impl EventSourced for EquityRedemption {
                         tx_hash: *tx_hash,
                         prepared: prepared.clone(),
                         submitted_at: *submitted_at,
+                        adopted_from: None,
                     })
                 }
                 // Legacy: VaultWithdrawSubmitted is handled as originate
                 _ => None,
             },
-            VaultWithdrawReplacementAdopted { replacement_tx, .. } => match entity {
+            VaultWithdrawReplacementAdopted {
+                replacement_tx,
+                replaced_tx,
+                ..
+            } => match entity {
                 Self::VaultWithdrawSubmitting {
                     symbol,
                     quantity,
@@ -1923,6 +1942,7 @@ impl EventSourced for EquityRedemption {
                     // Kept, so the reconciliation deadline still pages if the
                     // adopted tx cannot be confirmed either.
                     submitted_at: *submitted_at,
+                    adopted_from: Some(*replaced_tx),
                 }),
                 _ => None,
             },
@@ -2728,6 +2748,11 @@ impl EventSourced for EquityRedemption {
                 reason,
                 proven_withdrawal,
             } => match self {
+                Self::VaultWithdrawSubmitted {
+                    tx_hash,
+                    adopted_from: Some(_),
+                    ..
+                } => Err(EquityRedemptionError::AdoptedWithdrawalNotReconcilable { tx: *tx_hash }),
                 Self::Failed { symbol, .. }
                 | Self::VaultWithdrawPending { symbol, .. }
                 | Self::VaultWithdrawSubmitting { symbol, .. }
@@ -7639,6 +7664,46 @@ mod tests {
         assert_eq!(submitted_at, submitting_at);
     }
 
+    /// An adopted replacement moved the equity, so reconcile is refused even
+    /// with no chain read behind it, as when a lagging node shows no receipt
+    /// for the adopted tx.
+    #[tokio::test]
+    async fn an_adopted_replacement_is_never_reconciled() {
+        let store = TestStore::<EquityRedemption>::new(mock_services());
+        let id = redemption_aggregate_id("adopt-then-reconcile");
+        redemption_at_submitting(&store, &id).await;
+        let replacement = TxHash::repeat_byte(0x5E);
+        store.send(&id, adopt(replacement)).await.unwrap();
+
+        let error = store
+            .send(
+                &id,
+                EquityRedemptionCommand::Reconcile {
+                    reason: "settled by hand".to_string(),
+                    proven_withdrawal: None,
+                },
+            )
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                AggregateError::UserError(LifecycleError::Apply(
+                    EquityRedemptionError::AdoptedWithdrawalNotReconcilable { tx }
+                )) if tx == replacement
+            ),
+            "got {error:?}"
+        );
+        assert!(matches!(
+            store.load(&id).await.unwrap(),
+            Some(EquityRedemption::VaultWithdrawSubmitted {
+                adopted_from: Some(_),
+                ..
+            })
+        ));
+    }
+
     #[tokio::test]
     async fn adopting_a_replacement_from_submitted_makes_it_the_submitted_withdrawal() {
         let store = TestStore::<EquityRedemption>::new(mock_services());
@@ -7880,6 +7945,7 @@ mod tests {
                 tx_hash: TxHash::default(),
                 prepared: None,
                 submitted_at: now,
+                adopted_from: None,
             }
             .is_terminal(),
         );

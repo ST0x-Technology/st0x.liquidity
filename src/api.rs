@@ -8568,6 +8568,14 @@ mod tests {
         id: &RedemptionAggregateId,
         prepared: PreparedTransaction,
     ) -> AppState {
+        let state = signed_withdrawal_ready_state(bot_wallet, raindex).await;
+        seed_redemption_submitted(&state.pool, id, prepared).await;
+        state
+    }
+
+    /// A ready bot whose Base equity services sign as `bot_wallet` and read the
+    /// chain through `raindex`, holding no redemption yet.
+    async fn signed_withdrawal_ready_state(bot_wallet: Address, raindex: MockRaindex) -> AppState {
         let mut services = EquityTransferServices::panicking();
         let base = services
             .chains
@@ -8577,7 +8585,6 @@ mod tests {
         base.raindex = Arc::new(raindex);
 
         let (state, _gate) = recovery_state_with_driver_pause(services).await;
-        seed_redemption_submitted(&state.pool, id, prepared).await;
         state
     }
 
@@ -10480,6 +10487,55 @@ mod tests {
                 } if tx_hash == speed_up
             ),
             "the adopted tx must become the redemption's withdrawal, got {entity:?}",
+        );
+    }
+
+    /// The adoption goes through the conductor's store, so the redemption view
+    /// folds it: one adopted from `VaultWithdrawSubmitting` shows as submitted
+    /// with the adopted hash, which the next `ConfirmWithdraw` can follow.
+    #[tokio::test]
+    async fn adopting_from_submitting_updates_the_redemption_view() {
+        let signer = PrivateKeySigner::random();
+        let bot_wallet = signer.address();
+        let prepared = sign_vault_withdrawal(&signer);
+        let replaced = prepared.tx_hash();
+        let speed_up = TxHash::repeat_byte(0x5E);
+        let raindex = MockRaindex::new().with_mined_tx(
+            speed_up,
+            mined_at_withdrawal_nonce(
+                bot_wallet,
+                SIGNED_WITHDRAWAL_TARGET,
+                B256::repeat_byte(0x02),
+            ),
+        );
+        let state = signed_withdrawal_ready_state(bot_wallet, raindex).await;
+        let id = redemption_aggregate_id("api-redemption-adopt-view");
+        seed_redemption_submitting(&state.pool, &id, prepared).await;
+        let (_store, view) = StoreBuilder::<EquityRedemption>::new(state.pool.clone())
+            .build(EquityTransferServices::panicking())
+            .await
+            .unwrap();
+        assert!(matches!(
+            view.load(&id).await.unwrap(),
+            Some(EquityRedemption::VaultWithdrawSubmitting { .. })
+        ));
+
+        let Ok(_) = adopt(&state, &id, speed_up).await else {
+            panic!("a confirmed call to the withdrawal target must be adopted");
+        };
+
+        let viewed = view.load(&id).await.unwrap();
+        assert!(
+            matches!(
+                viewed,
+                Some(EquityRedemption::VaultWithdrawSubmitted {
+                    tx_hash,
+                    prepared: None,
+                    adopted_from: Some(adopted_from),
+                    ..
+                }) if tx_hash == speed_up && adopted_from == replaced
+            ),
+            "the view must fold the adoption, got {viewed:?}"
         );
     }
 
