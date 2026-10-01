@@ -1,0 +1,277 @@
+//! `GET /intents/status/v3`: where Relay says an order is.
+
+use alloy::primitives::TxHash;
+use serde::Deserialize;
+
+/// One status read: Relay's status plus every deposit tx it has seen.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IntentStatusReport {
+    pub status: IntentStatus,
+    /// Relay's `inTxHashes`: the origin-chain deposits it attributes to the
+    /// request.
+    pub deposit_txs: Vec<TxHash>,
+}
+
+/// Relay's status of a request. Only `Success`, `Refund` and `Failure` are
+/// terminal; a status this build does not know keeps the transfer waiting.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IntentStatus {
+    /// Quoted, no deposit seen.
+    Waiting,
+    InFlight(InFlightStage),
+    /// Every tx in Relay's `txHashes`; settlement proof checks each.
+    Success {
+        fill_txs: Vec<TxHash>,
+    },
+    /// Paid back on the origin chain in the deposited token.
+    Refund {
+        refund_txs: Vec<TxHash>,
+        reason: Option<FailReason>,
+    },
+    Failure {
+        reason: Option<FailReason>,
+    },
+    /// A status name this build does not know, kept verbatim.
+    Unknown(String),
+}
+
+impl IntentStatus {
+    pub const fn is_terminal(&self) -> bool {
+        match self {
+            Self::Success { .. } | Self::Refund { .. } | Self::Failure { .. } => true,
+            Self::Waiting | Self::InFlight(_) | Self::Unknown(_) => false,
+        }
+    }
+}
+
+/// The non-terminal statuses Relay reports after the deposit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InFlightStage {
+    Depositing,
+    Pending,
+    Submitted,
+    /// Undocumented beyond "still processing".
+    Delayed,
+}
+
+/// Relay's `failReason`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FailReason {
+    Slippage,
+    TooLittleReceived,
+    SolverCapacityExceeded,
+    TtlExpired,
+    DepositConfirmationTimeout,
+    DepositReorged,
+    BlockedWallet,
+    TransactionNotIncluded,
+    /// The deposit was smaller than the quoted amount.
+    DepositedAmountTooLowToFill,
+    /// A code this build does not know, kept verbatim.
+    Unknown(String),
+}
+
+impl FailReason {
+    /// `None` for Relay's `"N/A"`.
+    fn parse(code: &str) -> Option<Self> {
+        Some(match code {
+            "N/A" => return None,
+            "SLIPPAGE" => Self::Slippage,
+            "TOO_LITTLE_RECEIVED" => Self::TooLittleReceived,
+            "SOLVER_CAPACITY_EXCEEDED" => Self::SolverCapacityExceeded,
+            "TTL_EXPIRED" => Self::TtlExpired,
+            "DEPOSIT_CONFIRMATION_TIMEOUT" => Self::DepositConfirmationTimeout,
+            "DEPOSIT_REORGED" => Self::DepositReorged,
+            "BLOCKED_WALLET" => Self::BlockedWallet,
+            "TRANSACTION_NOT_INCLUDED" => Self::TransactionNotIncluded,
+            "DEPOSITED_AMOUNT_TOO_LOW_TO_FILL" => Self::DepositedAmountTooLowToFill,
+            other => Self::Unknown(other.to_owned()),
+        })
+    }
+}
+
+/// Wire shape. A never-deposited request carries only `status` and
+/// `quoteCreatedAt`, so the arrays default to empty.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct StatusResponse {
+    status: String,
+    #[serde(default)]
+    in_tx_hashes: Vec<TxHash>,
+    #[serde(default)]
+    tx_hashes: Vec<TxHash>,
+    fail_reason: Option<String>,
+}
+
+impl From<StatusResponse> for IntentStatusReport {
+    fn from(response: StatusResponse) -> Self {
+        let reason = response.fail_reason.as_deref().and_then(FailReason::parse);
+
+        let status = match response.status.as_str() {
+            "waiting" => IntentStatus::Waiting,
+            "depositing" => IntentStatus::InFlight(InFlightStage::Depositing),
+            "pending" => IntentStatus::InFlight(InFlightStage::Pending),
+            "submitted" => IntentStatus::InFlight(InFlightStage::Submitted),
+            "delayed" => IntentStatus::InFlight(InFlightStage::Delayed),
+            "success" => IntentStatus::Success {
+                fill_txs: response.tx_hashes,
+            },
+            "refund" => IntentStatus::Refund {
+                refund_txs: response.tx_hashes,
+                reason,
+            },
+            "failure" => IntentStatus::Failure { reason },
+            _ => IntentStatus::Unknown(response.status),
+        };
+
+        Self {
+            status,
+            deposit_txs: response.in_tx_hashes,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use alloy::primitives::b256;
+    use serde_json::json;
+
+    use super::*;
+
+    fn report(body: &str) -> IntentStatusReport {
+        serde_json::from_str::<StatusResponse>(body).unwrap().into()
+    }
+
+    #[test]
+    fn waiting_status_has_no_txs() {
+        let report = report(include_str!("../../relay-fixtures/status_waiting.json"));
+
+        assert_eq!(
+            report,
+            IntentStatusReport {
+                status: IntentStatus::Waiting,
+                deposit_txs: vec![],
+            }
+        );
+        assert!(!report.status.is_terminal());
+    }
+
+    #[test]
+    fn pending_status_is_in_flight_with_the_deposit() {
+        let report = report(include_str!("../../relay-fixtures/status_pending.json"));
+
+        assert_eq!(
+            report,
+            IntentStatusReport {
+                status: IntentStatus::InFlight(InFlightStage::Pending),
+                deposit_txs: vec![b256!(
+                    "0xeeee66456ace7aae93e6ed814d32a3748a5fc86d7101a259a4f62a44822c819d"
+                )],
+            }
+        );
+        assert!(!report.status.is_terminal());
+    }
+
+    #[test]
+    fn success_status_names_the_fill_tx() {
+        let report = report(include_str!("../../relay-fixtures/status_success.json"));
+
+        assert_eq!(
+            report.status,
+            IntentStatus::Success {
+                fill_txs: vec![b256!(
+                    "0x4d08b9f1596e351ac0b9ea38702a83c28a53b20fa3fdd9ada60d2a0b556bc40d"
+                )],
+            }
+        );
+        assert_eq!(
+            report.deposit_txs,
+            vec![b256!(
+                "0x8b4dba3c5bc03dd67671c71836b4ab61c2435c7bf2dacc11ab80362225fce961"
+            )]
+        );
+        assert!(report.status.is_terminal());
+    }
+
+    #[test]
+    fn refund_status_names_refund_tx_and_fail_reason() {
+        let report = report(include_str!("../../relay-fixtures/status_refund.json"));
+
+        assert_eq!(
+            report.status,
+            IntentStatus::Refund {
+                refund_txs: vec![b256!(
+                    "0xf27f49b3e941788a37775b874e1a91a711c26578c041921a24efd96cd14cea8d"
+                )],
+                reason: Some(FailReason::DepositedAmountTooLowToFill),
+            }
+        );
+        assert_eq!(
+            report.deposit_txs,
+            vec![b256!(
+                "0x1dd1b32e03951ea87347dd8234b120b50f16443d8085bb161539e212649b8d81"
+            )]
+        );
+        assert!(report.status.is_terminal());
+    }
+
+    #[test]
+    fn unknown_status_is_non_terminal() {
+        let report = report(&json!({"status": "teleporting", "quoteCreatedAt": 1}).to_string());
+
+        assert_eq!(
+            report.status,
+            IntentStatus::Unknown("teleporting".to_owned())
+        );
+        assert!(!report.status.is_terminal());
+    }
+
+    #[test]
+    fn every_tx_hash_is_kept() {
+        let report = report(
+            &json!({
+                "status": "success",
+                "inTxHashes": [
+                    "0x0000000000000000000000000000000000000000000000000000000000000001",
+                    "0x0000000000000000000000000000000000000000000000000000000000000002",
+                ],
+                "txHashes": [
+                    "0x0000000000000000000000000000000000000000000000000000000000000003",
+                    "0x0000000000000000000000000000000000000000000000000000000000000004",
+                ],
+                "failReason": "N/A",
+            })
+            .to_string(),
+        );
+
+        assert_eq!(
+            report,
+            IntentStatusReport {
+                status: IntentStatus::Success {
+                    fill_txs: vec![
+                        b256!("0x0000000000000000000000000000000000000000000000000000000000000003"),
+                        b256!("0x0000000000000000000000000000000000000000000000000000000000000004"),
+                    ],
+                },
+                deposit_txs: vec![
+                    b256!("0x0000000000000000000000000000000000000000000000000000000000000001"),
+                    b256!("0x0000000000000000000000000000000000000000000000000000000000000002"),
+                ],
+            }
+        );
+    }
+
+    #[test]
+    fn failure_keeps_an_unknown_reason_verbatim() {
+        let report =
+            report(&json!({"status": "failure", "failReason": "SOMETHING_NEW"}).to_string());
+
+        assert_eq!(
+            report.status,
+            IntentStatus::Failure {
+                reason: Some(FailReason::Unknown("SOMETHING_NEW".to_owned())),
+            }
+        );
+        assert!(report.status.is_terminal());
+    }
+}
