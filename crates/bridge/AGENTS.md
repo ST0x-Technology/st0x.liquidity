@@ -46,6 +46,10 @@ not the CCTP implementation directly. Implementation details must remain hidden.
 5. **Context type** - `CctpCtx` (behind `cctp` feature)
 6. **Relay client** - `RelayClient`, `RelayApiKey`, the quote, status and
    quote-acceptance types, and `RelayError` (behind `relay` feature)
+7. **Swap bridge** - the `SwapBridge` trait and its domain types
+   (`HopDirection`, `PreparedSwapDeposit`, `SwapDeposit`, `DepositScan`,
+   `SwapSide`, `SwapPayment`), `RelayBridge`, `RelayCtx`, `RelayBridgeError` and
+   `UnverifiedReason` (behind `relay` feature)
 
 **What must remain private:**
 
@@ -67,14 +71,17 @@ not the CCTP implementation directly. Implementation details must remain hidden.
 
 - **HTTP mocking**: Use `httpmock` for Circle API testing
 - **Anvil**: Use `alloy::node_bindings::Anvil` for on-chain integration tests
+- **Relay test contracts**: `relay-test-contracts/` holds the Solidity sources
+  and the solc 0.8.25 artifacts of the Anvil `MockDepository` and `MockStable`;
+  recompile both when a source changes
 - **No test utils bloat**: Only add test utilities that are reused across
   multiple test modules
 
 ## Architecture Constraints
 
 - **Trait-based design**: All functionality goes through the `Bridge` trait
-- **Feature flags**: CCTP implementation behind `cctp`, Relay client behind
-  `relay`
+- **Feature flags**: CCTP implementation behind `cctp`, Relay client and
+  `RelayBridge` behind `relay`
 - **No runtime selection**: Implementation choice happens at compile time
   through generics
 - **Associated types**: Error and Attestation types are associated to enable
