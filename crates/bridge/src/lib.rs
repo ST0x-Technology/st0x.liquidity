@@ -281,7 +281,8 @@ pub struct SwapDeposit<OrderId> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DepositScan<OrderId> {
     pub deposits: Vec<SwapDeposit<OrderId>>,
-    /// The head the scan ran to: a deposit mined later is not covered.
+    /// The last block the scan covered, the origin chain's confirmations
+    /// behind its head: a deposit mined later is not covered.
     pub scanned_to: u64,
 }
 
@@ -351,8 +352,8 @@ pub trait SwapBridge: Send + Sync + 'static {
     /// [`SwapBridge::find_recent_deposits`].
     async fn origin_block(&self, direction: HopDirection) -> Result<u64, Self::Error>;
 
-    /// Scans the origin chain from `from_block` to its head for our deposits
-    /// funding any of `order_ids`.
+    /// Scans the origin chain from `from_block` to its confirmed blocks for
+    /// our deposits funding any of `order_ids`.
     async fn find_recent_deposits(
         &self,
         direction: HopDirection,
