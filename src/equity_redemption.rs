@@ -3428,6 +3428,50 @@ pub(crate) enum StuckRedemptionRecoveryError {
     InvalidRequestedQuantity { aggregate_id: RedemptionAggregateId },
 }
 
+/// The redemption other than `except` that already records `tx` as its vault
+/// withdrawal (submitted, adopted or withdrawn), if any. A tx at a reused
+/// nonce can be another redemption's withdrawal, which must not be adopted
+/// twice.
+pub(crate) async fn redemption_recording_withdrawal(
+    pool: &SqlitePool,
+    tx: TxHash,
+    except: &RedemptionAggregateId,
+) -> Result<Option<RedemptionAggregateId>, RecordedWithdrawalLookupError> {
+    let row: Option<(String,)> = sqlx::query_as(
+        "SELECT aggregate_id FROM events \
+         WHERE aggregate_type = 'EquityRedemption' \
+           AND aggregate_id <> ?2 \
+           AND ?1 IN ( \
+               json_extract(payload, '$.VaultWithdrawSubmitted.tx_hash'), \
+               json_extract(payload, '$.VaultWithdrawReplacementAdopted.replacement_tx'), \
+               json_extract(payload, '$.WithdrawnFromRaindex.raindex_withdraw_tx') \
+           ) \
+         LIMIT 1",
+    )
+    .bind(tx.to_string())
+    .bind(except.to_string())
+    .fetch_optional(pool)
+    .await?;
+
+    row.map(|(id,)| {
+        id.parse()
+            .map_err(|source| RecordedWithdrawalLookupError::InvalidAggregateId { id, source })
+    })
+    .transpose()
+}
+
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum RecordedWithdrawalLookupError {
+    #[error(transparent)]
+    Persistence(#[from] sqlx::Error),
+    #[error("stored redemption id {id:?} does not parse")]
+    InvalidAggregateId {
+        id: String,
+        #[source]
+        source: uuid::Error,
+    },
+}
+
 /// Static event names interpolated into audited SQL statements below. All
 /// caller-supplied values remain bind parameters.
 const ACTIVE_REDEMPTION_EVENT_TYPES_SQL: &str = "

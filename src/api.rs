@@ -3511,6 +3511,25 @@ async fn adopt_withdrawal_replacement(
         }
         None => Err(ReplacementNotAdoptable::NoConfirmationDepth { chain }),
     };
+    let verified = match verified {
+        Ok(()) => match crate::equity_redemption::redemption_recording_withdrawal(
+            &state.pool,
+            request.replacement_tx,
+            &redemption_id,
+        )
+        .await
+        .map_err(ops_store_error)?
+        {
+            Some(redemption) => Err(
+                ReplacementNotAdoptable::ReplacementIsAnotherRedemptionsWithdrawal {
+                    replacement: request.replacement_tx,
+                    redemption,
+                },
+            ),
+            None => Ok(()),
+        },
+        Err(error) => Err(error),
+    };
     verified.map_err(|error| {
         // `Display`, not `Debug`: a read error's `Debug` names the RPC URL, whose
         // path carries the key.
@@ -3562,6 +3581,7 @@ fn replacement_not_adoptable_response(
         | ReplacementNotAdoptable::ReplacementWithdrawsAnotherVault { .. }
         | ReplacementNotAdoptable::ReplacementWithdrewNothing { .. }
         | ReplacementNotAdoptable::ReplacementWithdrawsMore { .. }
+        | ReplacementNotAdoptable::ReplacementIsAnotherRedemptionsWithdrawal { .. }
         | ReplacementNotAdoptable::NoConfirmationDepth { .. }
         | ReplacementNotAdoptable::ChainServicesMissing(_) => (
             StatusCode::CONFLICT,
@@ -10770,6 +10790,52 @@ mod tests {
             "{}",
             body.error
         );
+    }
+
+    /// After a nonce is reused (a lagging RPC served a stale pending nonce),
+    /// the tx at it can be an earlier redemption's withdrawal. It passes every
+    /// chain check, but that redemption already records its vault transfer.
+    #[tokio::test]
+    async fn adopt_withdrawal_replacement_refuses_another_redemptions_withdrawal() {
+        let signer = PrivateKeySigner::random();
+        let bot_wallet = signer.address();
+        let earlier_withdrawal = TxHash::repeat_byte(0x5E);
+        let id = redemption_aggregate_id("api-redemption-adopt-reused-nonce");
+        let state = signed_withdrawal_reconcile_state(
+            bot_wallet,
+            adoptable_speed_up(bot_wallet, earlier_withdrawal),
+            &id,
+            sign_vault_withdrawal(&signer),
+        )
+        .await;
+        let earlier = redemption_aggregate_id("api-redemption-earlier-at-the-nonce");
+        seed_redemption_submitted(
+            &state.pool,
+            &earlier,
+            PreparedTransaction::for_test(earlier_withdrawal, SIGNED_WITHDRAWAL_NONCE),
+        )
+        .await;
+
+        let Err((status, Json(body))) = adopt(&state, &id, earlier_withdrawal).await else {
+            panic!("another redemption's withdrawal must not be adopted");
+        };
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert!(
+            body.error.contains(&format!(
+                "is already the vault withdrawal of redemption {earlier}"
+            )),
+            "{}",
+            body.error
+        );
+        assert!(matches!(
+            load_entity::<EquityRedemption>(&state.pool, &id)
+                .await
+                .unwrap(),
+            Some(EquityRedemption::VaultWithdrawSubmitted {
+                prepared: Some(_),
+                ..
+            })
+        ));
     }
 
     #[tokio::test]

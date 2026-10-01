@@ -6262,18 +6262,19 @@ mined in the canonical chain from the bot wallet, at the withdrawal's nonce, is
 not the withdrawal itself, has the chain's required confirmations, succeeded,
 and is a `withdraw4` to the contract the withdrawal calls, from the same token
 and vault, for at most the signed withdrawal's amount, whose receipt shows a
-transfer of that token to the bot wallet, which `withdraw4` pays as its caller
-(`409` naming the failed check, `502` on a failed chain read, `503` before the
-bot is ready, `400` for a redemption with no signed withdrawal). The route holds
-the recovery lock and sends the command through the conductor owned store, so
-the live transfer reactor sees the adoption. The redemption's redrive then
-resumes from `VaultWithdrawSubmitted` as for any hash only submission: it
-restores the adopted hash at its nonce, `ConfirmWithdraw` confirms it and
-records the vault transfer its receipt shows (refusing a receipt that paid the
-withdrawal's token nowhere the bot expects), and confirming it releases the
-whole nonce entry, including the signed withdrawal's reservation. Nothing is
-rebroadcast, since the nonce is used. A restart restores the same hash only
-reservation, so the release does not depend on the process that adopted it.
+transfer of that token to the bot wallet, which `withdraw4` pays as its caller,
+and is not already another redemption's recorded vault withdrawal (`409` naming
+the failed check, `502` on a failed chain read, `503` before the bot is ready,
+`400` for a redemption with no signed withdrawal). The route holds the recovery
+lock and sends the command through the conductor owned store, so the live
+transfer reactor sees the adoption. The redemption's redrive then resumes from
+`VaultWithdrawSubmitted` as for any hash only submission: it restores the
+adopted hash at its nonce, `ConfirmWithdraw` confirms it and records the vault
+transfer its receipt shows (refusing a receipt that paid the withdrawal's token
+nowhere the bot expects), and confirming it releases the whole nonce entry,
+including the signed withdrawal's reservation. Nothing is rebroadcast, since the
+nonce is used. A restart restores the same hash only reservation, so the release
+does not depend on the process that adopted it.
 
 An adopted redemption is never reconciled: `Reconcile` refuses a
 `VaultWithdrawSubmitted` whose `adopted_from` is set, whatever a node shows for
@@ -6285,10 +6286,12 @@ it as it does a signed withdrawal that went through (both the CLI and the bot's
 route read the hash first, the route `503` before the bot is ready).
 
 Rollback floor for withdrawal adoption: a build before it cannot replay
-`VaultWithdrawReplacementAdopted`, and its active redemption queries skip a
-redemption whose latest event it is, so after rolling back that redemption is
-neither resumed nor holding its symbol guard. Do not roll back below the first
-release with adoption while an adopted redemption is still unfinished.
+`VaultWithdrawReplacementAdopted`. The pre deploy `verify-migrations` gate
+replays every persisted aggregate, completed ones included, so once any
+redemption has an adoption event a build before adoption fails that gate and
+cannot be deployed. The first release with adoption is therefore a permanent
+rollback floor from the first adoption on, whether or not the adopted redemption
+has finished.
 
 The `Reconciled` state retains the identifying fields (symbol, quantity,
 original failure reason, request/redemption identifiers) so the dashboard

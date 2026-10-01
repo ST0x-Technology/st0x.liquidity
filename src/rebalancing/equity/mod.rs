@@ -568,13 +568,25 @@ pub enum ReplacementNotAdoptable {
     /// withdrawal's amount, so adopting a larger one would move shares nothing
     /// reserved. A smaller one is adopted: the receipt records what moved.
     #[error(
-        "replacement {replacement} withdraws {target}, more than the {expected} the vault \
-         withdrawal booked, so it is not adopted"
+        "replacement {replacement} withdraws {}, more than the {} the vault withdrawal booked, \
+         so it is not adopted",
+        st0x_float_serde::format_float_with_fallback(target),
+        st0x_float_serde::format_float_with_fallback(expected)
     )]
     ReplacementWithdrawsMore {
         replacement: TxHash,
-        target: String,
-        expected: String,
+        target: Float,
+        expected: Float,
+    },
+    /// A tx at a reused nonce can be another redemption's withdrawal, whose
+    /// vault transfer that redemption already records.
+    #[error(
+        "replacement {replacement} is already the vault withdrawal of redemption {redemption}, \
+         so it did not do this redemption's withdrawal"
+    )]
+    ReplacementIsAnotherRedemptionsWithdrawal {
+        replacement: TxHash,
+        redemption: RedemptionAggregateId,
     },
     #[error("no [chains.{chain}] required_confirmations: it gates the replacement check")]
     NoConfirmationDepth { chain: Chain },
@@ -709,12 +721,8 @@ pub async fn verify_withdrawal_replacement(
     if target.gt(expected).unwrap_or(true) {
         return Err(ReplacementNotAdoptable::ReplacementWithdrawsMore {
             replacement,
-            target: target
-                .format()
-                .unwrap_or_else(|_| call.targetAmount.to_string()),
-            expected: expected
-                .format()
-                .unwrap_or_else(|_| withdrawal.targetAmount.to_string()),
+            target,
+            expected,
         });
     }
 
