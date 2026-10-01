@@ -202,7 +202,9 @@ impl EquityPriceStore {
     }
 
     /// Stores `price` unless an equal or newer one is held, and tells the mark
-    /// listener when the symbol had no usable mark before.
+    /// listener when the symbol had no usable mark before. A held mark that
+    /// has expired counts as missing, as it does for [`Self::mark`], even
+    /// before the expiry sweep removes it.
     async fn update(&self, symbol: &Symbol, price: AvailablePrice) -> bool {
         let mut prices = self.prices.write().await;
         let Some(value) = prices.get_mut(symbol) else {
@@ -216,10 +218,11 @@ impl EquityPriceStore {
             return false;
         }
 
+        let now = Utc::now();
         let mark_arrives = price.underlying_price_usd.is_some()
-            && value
-                .as_ref()
-                .is_none_or(|current| current.underlying_price_usd.is_none());
+            && value.as_ref().is_none_or(|current| {
+                current.underlying_price_usd.is_none() || current.expires_at <= now
+            });
         *value = Some(price);
         drop(prices);
 
@@ -995,6 +998,38 @@ mod tests {
             vec![symbol.clone(), symbol],
             "a mark that comes back after an outage must notify again"
         );
+    }
+
+    /// A held mark past its expiry already reads as missing to the planner,
+    /// so a fresh quote replacing it before the expiry sweep runs must notify.
+    #[tokio::test]
+    async fn fresh_mark_over_an_expired_unswept_one_notifies_the_listener() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let observed = Utc::now() - TimeDelta::seconds(60);
+        let store = EquityPriceStore {
+            prices: Arc::new(RwLock::new(HashMap::from([(
+                symbol.clone(),
+                Some(AvailablePrice {
+                    expires_at: observed + TimeDelta::seconds(30),
+                    ..price_with_mark(observed, true)
+                }),
+            )]))),
+            mark_listener: Arc::default(),
+        };
+        let listener = Arc::new(RecordingMarkListener::default());
+        store.notify_marks_to(listener.clone());
+        assert!(
+            store.mark(&symbol, Utc::now()).await.is_none(),
+            "the held mark has expired"
+        );
+
+        assert!(
+            store
+                .update(&symbol, price_with_mark(Utc::now(), true))
+                .await
+        );
+
+        assert_eq!(*listener.0.lock().await, vec![symbol]);
     }
 
     #[tokio::test]
