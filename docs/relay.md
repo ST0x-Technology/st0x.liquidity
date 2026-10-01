@@ -117,9 +117,12 @@ before it sends anything, then refuses a quote unless:
   amount;
 - the relayer fee is in the origin stable and the gas fee is on the origin
   chain;
+- `protocol.v2.orderData.inputs[]` has exactly one input, whose `payment` is the
+  requested amount of the origin stable on the origin chain, and
+  `orderData.fees` is empty;
 - `details.recipient` is our recipient, and `protocol.v2.orderData.output` is on
-  the destination chain and has exactly one payment: the destination stable to
-  our recipient, at the quoted `minimumAmount` and expected amount;
+  the destination chain, has no `calls` and exactly one payment: the destination
+  stable to our recipient, at the quoted `minimumAmount` and expected amount;
 - `protocol.v2.orderData.inputs[].refunds[]` has at least one refund option, and
   every option pays our `refundTo` on the origin or the destination chain;
 - `protocol.v2.paymentDetails` is on the origin chain and names the pinned
