@@ -249,6 +249,17 @@ fn aapl_equities(operational_limit: Option<&str>) -> ChainEquities {
     }
 }
 
+/// Production load refuses a rebalancing listing without recovery. Trigger
+/// tests that build a two-chain plan in memory use this so the fixture is a
+/// config the loader would accept. The planner itself does not check recovery.
+fn aapl_equities_with_recovery(operational_limit: Option<&str>) -> ChainEquities {
+    let mut equities = aapl_equities(operational_limit);
+    for asset in equities.symbols.values_mut() {
+        asset.wrapped_equity_recovery = OperationMode::Enabled;
+    }
+    equities
+}
+
 fn chain_config(equities: ChainEquities, cash: Option<ChainCashAsset>) -> ChainRebalancingConfig {
     ChainRebalancingConfig {
         assets: ChainAssets { equities, cash },
@@ -296,9 +307,15 @@ fn two_chain_trigger_config() -> RebalancingServiceConfig {
         chains: BTreeMap::from([
             (
                 Chain::Base,
-                chain_config(aapl_equities(None), Some(rebalancing_enabled_cash())),
+                chain_config(
+                    aapl_equities_with_recovery(None),
+                    Some(rebalancing_enabled_cash()),
+                ),
             ),
-            (Chain::HyperEvm, chain_config(aapl_equities(None), None)),
+            (
+                Chain::HyperEvm,
+                chain_config(aapl_equities_with_recovery(None), None),
+            ),
         ]),
         ..test_trigger_config()
     }
@@ -1521,12 +1538,12 @@ async fn chain_missing_from_its_registry_yields_to_the_next_candidate() {
     assert_eq!(pending_equity_redemption_job_count(&apalis_pool).await, 0);
 }
 
-/// HyperEVM holds 60 of AAPL's 120 shares, 12 over its 40% target, so its
-/// redemption would rank first. Wallet recovery runs on the primary chain
-/// (Base) only, and a failed HyperEVM redemption would strand its tokens,
-/// so the planner skips it and mints Base's 16-share shortfall.
+/// HyperEVM's 12-share excess ranks before Base's 16-share shortfall.
+/// Recovery is enabled on both listings because config load requires it; the
+/// planner itself does not check recovery. The trigger dispatches the
+/// secondary redemption instead of minting more shares on Base.
 #[tokio::test]
-async fn secondary_chain_redemption_yields_to_a_primary_chain_mint() {
+async fn secondary_chain_redemption_ranks_before_a_primary_chain_mint() {
     let EquityTriggerFixture {
         pool,
         apalis_pool,
@@ -1549,10 +1566,10 @@ async fn secondary_chain_redemption_yields_to_a_primary_chain_mint() {
     seed_onchain_slot(&inventory, &symbol, Chain::HyperEvm, float!(60)).await;
     service.check_and_trigger_equity(&symbol).await.unwrap();
 
-    assert_eq!(pending_equity_redemption_job_count(&apalis_pool).await, 0);
-    let mint = fetch_pending_equity_mint_job(&apalis_pool).await;
-    assert_eq!(mint.chain, Chain::Base);
-    assert_eq!(mint.quantity, FractionalShares::new(float!(16)));
+    let redemption = fetch_pending_equity_redemption_job(&apalis_pool).await;
+    assert_eq!(redemption.chain, Chain::HyperEvm);
+    assert_eq!(redemption.quantity, FractionalShares::new(float!(12)));
+    assert_eq!(pending_equity_mint_job_count(&apalis_pool).await, 0);
 }
 
 /// Base's 24-share redemption outranks HyperEVM's 48-share mint, but

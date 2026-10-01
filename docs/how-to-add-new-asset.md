@@ -247,12 +247,23 @@ chain's signing wallet, orderbook, `redemption_wallet` and
   paused chain still counts in the planner's total, so it must stay polled and
   readable: a stale paused chain stops equity rebalancing for the symbol on
   every chain until it is fresh again or set to `"disabled"`. Wallet polling and
-  wallet recovery run where the chain already has them (the primary chain
-  today); pausing does not add them to a secondary.
+  both wrapped and unwrapped wallet recovery keep running on that chain.
+  Recovery retains its symbol hold until the work completes; pausing does not
+  release it. A zero allocation target starts redemptions and must not be used
+  as a pause.
 - `wrapped_equity_recovery`: Explicit opt-in for recovery of wrapped-equity
   positions. Set to `"enabled"` to allow the bot to recover wrapped equity;
   `"disabled"` skips recovery for this asset. Must be specified for every equity
-  entry.
+  entry. On every chain, `rebalancing = "enabled"` or `"paused"` requires
+  recovery enabled, covering mints as well as redemptions. A secondary listing
+  with recovery enabled must keep rebalancing enabled or paused so the chain
+  builds its transfer services. Config errors name both chain and symbol. Enable
+  a secondary listing only after the complete recovery stack ships as release R
+  and its chain capability is available. For rollback, pause first, wait for
+  recovery and provider operations to drain and the wallet to empty, then
+  disable rebalancing and recovery together. Roll back the binary to R; older
+  binaries do not safely execute secondary recovery or signed pending issuer
+  sends. Never delete a compacted inventory snapshot to force replay.
 - `extended_hours_counter_trading`: Explicit opt-in for counter-trading during
   extended hours (pre-market and after-hours). Set to `"enabled"` to allow the
   bot to place offsetting broker trades outside regular market hours;

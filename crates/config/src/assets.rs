@@ -36,8 +36,8 @@ pub enum OperationMode {
 ///
 /// `Paused` retains the chain's equity services and startup approvals, so
 /// existing transfers continue, while no new mint or redemption starts.
-/// Wallet polling and orphan recovery remain active where already wired
-/// (currently the primary chain); this mode does not extend their coverage.
+/// Wallet polling and wrapped and unwrapped recovery continue on the chain.
+/// Pausing does not release a symbol hold still owned by recovery.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum RebalancingMode {
