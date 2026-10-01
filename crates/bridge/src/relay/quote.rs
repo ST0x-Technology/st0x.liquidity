@@ -107,9 +107,13 @@ pub enum QuoteStep {
     Deposit,
 }
 
-/// An address or amount in a quote that must equal what the request implies.
+/// A value in a quote that must equal what the request implies.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QuoteField {
+    /// `protocol.v2.orderData.output.chainId`: where the solver pays.
+    OutputChain,
+    /// `protocol.v2.paymentDetails.chainId`: where we deposit.
+    PaymentDetailsChain,
     /// The contract the approve step calls.
     ApproveTarget,
     ApproveSpender,
@@ -159,6 +163,14 @@ pub enum QuoteMismatch {
         step: QuoteStep,
         #[source]
         source: alloy::sol_types::Error,
+    },
+    #[error("Relay has no chain name pinned for {chain}")]
+    UnnamedChain { chain: Chain },
+    #[error("quote {field:?} is {actual}, expected {expected}")]
+    ChainMismatch {
+        field: QuoteField,
+        expected: &'static str,
+        actual: String,
     },
     #[error("quote {field:?} is {actual}, expected {expected}")]
     AddressMismatch {
@@ -355,7 +367,10 @@ struct RawRefund {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct RawOrderOutput {
+    /// Relay's chain name, not the numeric id.
+    chain_id: String,
     payments: Vec<RawPayment>,
     /// Unix seconds.
     deadline: u64,
@@ -373,7 +388,10 @@ struct RawPayment {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct RawPaymentDetails {
+    /// Relay's chain name, not the numeric id.
+    chain_id: String,
     depository: Address,
     currency: Address,
     #[serde(with = "decimal")]
@@ -510,6 +528,11 @@ fn check_output_payment(
     request: &QuoteRequest,
 ) -> Result<(), QuoteMismatch> {
     check_address(QuoteField::Recipient, request.recipient, details.recipient)?;
+    check_chain(
+        QuoteField::OutputChain,
+        request.destination,
+        &order.output.chain_id,
+    )?;
 
     let [payment] = order.output.payments.as_slice() else {
         return Err(QuoteMismatch::PaymentCount {
@@ -554,6 +577,11 @@ fn check_payment_details(
     request: &QuoteRequest,
     depository: Address,
 ) -> Result<(), QuoteMismatch> {
+    check_chain(
+        QuoteField::PaymentDetailsChain,
+        request.origin,
+        &payment.chain_id,
+    )?;
     check_address(
         QuoteField::PaymentDetailsDepository,
         depository,
@@ -569,6 +597,22 @@ fn check_payment_details(
         request.amount,
         payment.amount,
     )
+}
+
+fn check_chain(field: QuoteField, expected: Chain, actual: &str) -> Result<(), QuoteMismatch> {
+    let name = expected
+        .relay_name()
+        .ok_or(QuoteMismatch::UnnamedChain { chain: expected })?;
+
+    if actual == name {
+        Ok(())
+    } else {
+        Err(QuoteMismatch::ChainMismatch {
+            field,
+            expected: name,
+            actual: actual.to_owned(),
+        })
+    }
 }
 
 fn check_address(
@@ -1233,6 +1277,43 @@ pub(super) mod tests {
                     actual,
                 }
                     if expected == FUNDED_WALLET && actual == OTHER
+            ),
+            "{error:?}"
+        );
+    }
+
+    #[test]
+    fn output_on_another_chain_is_refused() {
+        let error = refusal(|body| {
+            body["protocol"]["v2"]["orderData"]["output"]["chainId"] = json!("robinhood");
+        });
+
+        assert!(
+            matches!(
+                error,
+                QuoteMismatch::ChainMismatch {
+                    field: QuoteField::OutputChain,
+                    expected: "ethereum",
+                    ref actual,
+                } if actual == "robinhood"
+            ),
+            "{error:?}"
+        );
+    }
+
+    #[test]
+    fn payment_details_on_another_chain_are_refused() {
+        let error =
+            refusal(|body| body["protocol"]["v2"]["paymentDetails"]["chainId"] = json!("ethereum"));
+
+        assert!(
+            matches!(
+                error,
+                QuoteMismatch::ChainMismatch {
+                    field: QuoteField::PaymentDetailsChain,
+                    expected: "robinhood",
+                    ref actual,
+                } if actual == "ethereum"
             ),
             "{error:?}"
         );
