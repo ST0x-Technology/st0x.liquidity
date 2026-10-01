@@ -10,8 +10,6 @@ pub struct IntentStatusReport {
     /// Relay's `inTxHashes`: the origin-chain deposits it attributes to the
     /// request.
     pub deposit_txs: Vec<TxHash>,
-    /// Relay's `refundFailReason`: why a refund could not be paid.
-    pub refund_fail_reason: Option<FailReason>,
 }
 
 /// Relay's status of a request. Only `Success`, `Refund`, `RefundFailed` and
@@ -26,8 +24,10 @@ pub enum IntentStatus {
     Success {
         fill_txs: Vec<TxHash>,
     },
-    /// Paid back on the origin chain in the deposited token: `refund_txs` is
-    /// never empty and Relay reports no refund fail reason.
+    /// Paid back to `refund_to`: on the origin chain in the origin stable or
+    /// on the destination chain in the destination stable, as the quote
+    /// offers both. `refund_txs` is never empty and Relay reports no refund
+    /// fail reason.
     Refund {
         refund_txs: Vec<TxHash>,
         reason: Option<FailReason>,
@@ -36,10 +36,12 @@ pub enum IntentStatus {
     Refunding {
         reason: Option<FailReason>,
     },
-    /// Relay says `refund` with a refund fail reason (in
-    /// [`IntentStatusReport::refund_fail_reason`]): the refund will not be paid.
+    /// Relay says `refund` with a refund fail reason: the refund will not be
+    /// paid.
     RefundFailed {
         reason: Option<FailReason>,
+        /// Relay's `refundFailReason`: why the refund could not be paid.
+        refund_fail_reason: FailReason,
     },
     Failure {
         reason: Option<FailReason>,
@@ -137,11 +139,16 @@ impl From<StatusResponse> for IntentStatusReport {
             "success" => IntentStatus::Success {
                 fill_txs: response.tx_hashes,
             },
-            "refund" if refund_fail_reason.is_some() => IntentStatus::RefundFailed { reason },
-            "refund" if response.tx_hashes.is_empty() => IntentStatus::Refunding { reason },
-            "refund" => IntentStatus::Refund {
-                refund_txs: response.tx_hashes,
-                reason,
+            "refund" => match refund_fail_reason {
+                Some(refund_fail_reason) => IntentStatus::RefundFailed {
+                    reason,
+                    refund_fail_reason,
+                },
+                None if response.tx_hashes.is_empty() => IntentStatus::Refunding { reason },
+                None => IntentStatus::Refund {
+                    refund_txs: response.tx_hashes,
+                    reason,
+                },
             },
             "failure" => IntentStatus::Failure { reason },
             _ => IntentStatus::Unknown(response.status),
@@ -150,7 +157,6 @@ impl From<StatusResponse> for IntentStatusReport {
         Self {
             status,
             deposit_txs: response.in_tx_hashes,
-            refund_fail_reason,
         }
     }
 }
@@ -175,7 +181,6 @@ mod tests {
             IntentStatusReport {
                 status: IntentStatus::Waiting,
                 deposit_txs: vec![],
-                refund_fail_reason: None,
             }
         );
         assert!(!report.status.is_terminal());
@@ -192,7 +197,6 @@ mod tests {
                 deposit_txs: vec![b256!(
                     "0xeeee66456ace7aae93e6ed814d32a3748a5fc86d7101a259a4f62a44822c819d"
                 )],
-                refund_fail_reason: None,
             }
         );
         assert!(!report.status.is_terminal());
@@ -238,7 +242,6 @@ mod tests {
                 "0x1dd1b32e03951ea87347dd8234b120b50f16443d8085bb161539e212649b8d81"
             )]
         );
-        assert_eq!(report.refund_fail_reason, None);
         assert!(report.status.is_terminal());
     }
 
@@ -260,7 +263,6 @@ mod tests {
                 reason: Some(FailReason::Slippage),
             }
         );
-        assert_eq!(report.refund_fail_reason, None);
         assert!(!report.status.is_terminal());
     }
 
@@ -282,9 +284,9 @@ mod tests {
             report.status,
             IntentStatus::RefundFailed {
                 reason: Some(FailReason::Slippage),
+                refund_fail_reason: FailReason::BlockedWallet,
             }
         );
-        assert_eq!(report.refund_fail_reason, Some(FailReason::BlockedWallet));
         assert!(report.status.is_terminal());
     }
 
@@ -330,7 +332,6 @@ mod tests {
                     b256!("0x0000000000000000000000000000000000000000000000000000000000000001"),
                     b256!("0x0000000000000000000000000000000000000000000000000000000000000002"),
                 ],
-                refund_fail_reason: None,
             }
         );
     }
