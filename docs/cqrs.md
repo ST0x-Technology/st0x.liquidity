@@ -493,10 +493,14 @@ Snapshots are enabled for all aggregates through `StoreBuilder`. They are used
 as a replay starting point so hot aggregates do not reload their full event
 history on every command.
 
-After changing aggregate struct layout, bump `SCHEMA_VERSION` so startup clears
-stale snapshots through the schema reconciler. Manual snapshot deletion is safe
-only for retained event streams where the full event history remains available
-for replay.
+For aggregates that retain their full event history, changing the state layout
+requires a `SCHEMA_VERSION` bump so the schema reconciler rebuilds snapshots.
+`InventorySnapshot` compacts its observations and its snapshot may be the only
+durable source for older balances. Add chain-qualified wallet and in-flight maps
+with serde defaults while keeping its schema version; normal and forced snapshot
+application must hydrate those maps alike. Never clear or invalidate a compacted
+aggregate's snapshot to force replay. Manual snapshot deletion is safe only when
+the complete retained stream can reconstruct the state.
 
 ```sql
 -- Retained streams only: reset snapshots when full event replay is available.

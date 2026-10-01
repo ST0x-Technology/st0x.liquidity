@@ -4784,10 +4784,7 @@ impl RebalancingService {
         symbol: &Symbol,
         probes: &mut BTreeMap<Chain, ChainReadiness>,
     ) -> Result<EquityPlan, equity::EquityTriggerError> {
-        let (venues, primary_chain) = {
-            let inventory = self.inventory.read().await;
-            (inventory.equity_venues(symbol)?, inventory.primary_chain())
-        };
+        let venues = self.inventory.read().await.equity_venues(symbol)?;
 
         let mut listing_chains = BTreeSet::new();
         let mut onchain = BTreeMap::new();
@@ -4878,7 +4875,6 @@ impl RebalancingService {
                 hedge_floor: self.config.hedge_floor.for_symbol(symbol),
                 cooldowns,
                 last_price,
-                primary_chain,
             },
             probes,
         )
@@ -5028,8 +5024,7 @@ impl RebalancingService {
             (
                 DeclineReason::ChainUnpolled { chain }
                 | DeclineReason::ChainStale { chain }
-                | DeclineReason::NotInRegistry { chain }
-                | DeclineReason::RedemptionUnrecoverable { chain },
+                | DeclineReason::NotInRegistry { chain },
                 _,
             ) => {
                 warn!(
