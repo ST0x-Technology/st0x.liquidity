@@ -18,7 +18,8 @@ use super::proof::{
 use super::quote::depositErc20Call;
 use super::{QuoteStep, RelayOrderId, RelayQuote, StepTransaction};
 use crate::{
-    DepositScan, HopDirection, PreparedSwapDeposit, SwapBridge, SwapDeposit, SwapPayment, SwapSide,
+    DepositScan, HopDirection, PreparedSwap, PreparedSwapDeposit, SwapBridge, SwapDeposit,
+    SwapPayment, SwapSide,
 };
 
 /// The deposit's gas limit before the wallet's pad: the larger `gasUsed` of
@@ -253,7 +254,7 @@ impl<EthWallet: Wallet, ChainWallet: Wallet> SwapBridge for RelayBridge<EthWalle
         &self,
         direction: HopDirection,
         quote: &RelayQuote,
-    ) -> Result<PreparedSwapDeposit, RelayBridgeError> {
+    ) -> Result<PreparedSwap, RelayBridgeError> {
         match direction {
             HopDirection::ToHub => self.chain.prepare_deposit(quote).await,
             HopDirection::FromHub => self.hub.prepare_deposit(quote).await,
@@ -268,6 +269,17 @@ impl<EthWallet: Wallet, ChainWallet: Wallet> SwapBridge for RelayBridge<EthWalle
         match direction {
             HopDirection::ToHub => self.chain.broadcast_deposit(prepared).await,
             HopDirection::FromHub => self.hub.broadcast_deposit(prepared).await,
+        }
+    }
+
+    async fn broadcast_approve(
+        &self,
+        direction: HopDirection,
+        approve: &PreparedTransaction,
+    ) -> Result<TxHash, RelayBridgeError> {
+        match direction {
+            HopDirection::ToHub => self.chain.broadcast_approve(approve).await,
+            HopDirection::FromHub => self.hub.broadcast_approve(approve).await,
         }
     }
 
@@ -397,11 +409,10 @@ impl<W: Wallet> RelayEnd<W> {
     /// Signs the approve (the quote's, or our own exact one when the quote has
     /// none and the allowance falls short) and the deposit at the next nonces.
     /// Another send from this wallet between the two signs takes the nonce in
-    /// between, so a pair that is not consecutive is discarded and refused.
-    async fn prepare_deposit(
-        &self,
-        quote: &RelayQuote,
-    ) -> Result<PreparedSwapDeposit, RelayBridgeError> {
+    /// between. Then only the deposit is discarded: the approve is returned to
+    /// go out alone, so its nonce is not left as a gap the other send waits
+    /// behind.
+    async fn prepare_deposit(&self, quote: &RelayQuote) -> Result<PreparedSwap, RelayBridgeError> {
         let wallet_chain = self.wallet.provider().get_chain_id().await?;
 
         self.check_step(QuoteStep::Deposit, &quote.deposit, wallet_chain)?;
@@ -467,11 +478,13 @@ impl<W: Wallet> RelayEnd<W> {
                 ?error,
                 approve = %approve.tx_hash(),
                 deposit = %deposit.tx_hash(),
-                "Relay deposit pair is not consecutive, discarding both"
+                "Relay deposit pair is not consecutive, discarding the deposit, \
+                 the approve goes alone"
             );
             self.wallet.discard_prepared(deposit.tx_hash()).await;
-            self.wallet.discard_prepared(approve.tx_hash()).await;
-            return Err(error);
+            return Ok(PreparedSwap::ApproveOnly {
+                approve: approve.clone(),
+            });
         }
 
         debug!(
@@ -483,7 +496,10 @@ impl<W: Wallet> RelayEnd<W> {
             "Relay deposit signed"
         );
 
-        Ok(PreparedSwapDeposit { approve, deposit })
+        Ok(PreparedSwap::Deposit(PreparedSwapDeposit {
+            approve,
+            deposit,
+        }))
     }
 
     /// The step must be for this wallet's chain and call this end's contract.
@@ -558,6 +574,16 @@ impl<W: Wallet> RelayEnd<W> {
         Ok(self
             .wallet
             .broadcast_prepared(&prepared.deposit, "Relay deposit")
+            .await?)
+    }
+
+    async fn broadcast_approve(
+        &self,
+        approve: &PreparedTransaction,
+    ) -> Result<TxHash, RelayBridgeError> {
+        Ok(self
+            .wallet
+            .broadcast_prepared(approve, "Relay deposit approve, alone")
             .await?)
     }
 
@@ -804,6 +830,7 @@ mod tests {
                 .bridge
                 .prepare_deposit(HopDirection::ToHub, &quote)
                 .await
+                .map(deposit_pair)
                 .unwrap();
             let tx = self
                 .bridge
@@ -1057,6 +1084,15 @@ mod tests {
         nonces
     }
 
+    fn deposit_pair(prepared: PreparedSwap) -> PreparedSwapDeposit {
+        match prepared {
+            PreparedSwap::Deposit(pair) => pair,
+            PreparedSwap::ApproveOnly { approve } => {
+                panic!("expected a deposit pair, got approve {approve:?} alone")
+            }
+        }
+    }
+
     fn gas_limit(prepared: &PreparedTransaction) -> u64 {
         alloy::consensus::Transaction::gas_limit(
             &TxEnvelope::decode_2718_exact(prepared.raw().as_ref()).unwrap(),
@@ -1175,6 +1211,7 @@ mod tests {
             .bridge
             .prepare_deposit(HopDirection::ToHub, &quote)
             .await
+            .map(deposit_pair)
             .unwrap();
 
         let approve = prepared.approve.unwrap();
@@ -1189,32 +1226,42 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pair_split_by_another_send_leaves_a_retry_a_consecutive_pair() {
+    async fn pair_split_by_another_send_sends_its_approve_alone_and_a_retry_pairs() {
         let harness = Harness::new().await;
         let bridge = pair_bridge(&harness, OnDepositSigning::AnotherSendFirst);
         let quote = quote(&harness.chain, B256::random(), true);
 
-        let error = bridge
-            .prepare_deposit(HopDirection::ToHub, &quote)
-            .await
-            .unwrap_err();
-        let retry = bridge
+        let split = bridge
             .prepare_deposit(HopDirection::ToHub, &quote)
             .await
             .unwrap();
+        let PreparedSwap::ApproveOnly { approve } = split else {
+            panic!("expected ApproveOnly, got {split:?}");
+        };
+        let sent = bridge
+            .broadcast_approve(HopDirection::ToHub, &approve)
+            .await
+            .unwrap();
+        bridge.chain.wallet.await_receipt(sent).await.unwrap();
+        let retry = bridge
+            .prepare_deposit(HopDirection::ToHub, &quote)
+            .await
+            .map(deposit_pair)
+            .unwrap();
 
-        assert!(
-            matches!(
-                error,
-                RelayBridgeError::PairNonces {
-                    approve: 0,
-                    deposit: 2
-                }
-            ),
-            "{error:?}"
-        );
+        assert_eq!(approve.nonce(), 0);
+        assert_eq!(sent, approve.tx_hash());
         assert_eq!(
-            [retry.approve.unwrap().nonce(), retry.deposit.nonce()],
+            harness
+                .chain
+                .allowance(harness.chain.wallet(), harness.chain.depository)
+                .await,
+            AMOUNT
+        );
+        let retry_approve = retry.approve.unwrap();
+        check_pair_nonces(&retry_approve, &retry.deposit).unwrap();
+        assert_eq!(
+            [retry_approve.nonce(), retry.deposit.nonce()],
             [2, 3],
             "the other send still holds nonce 1"
         );
@@ -1249,6 +1296,7 @@ mod tests {
             .bridge
             .prepare_deposit(HopDirection::ToHub, &quote)
             .await
+            .map(deposit_pair)
             .unwrap();
         let first = harness
             .bridge
@@ -1287,6 +1335,7 @@ mod tests {
             .bridge
             .prepare_deposit(HopDirection::ToHub, &quote)
             .await
+            .map(deposit_pair)
             .unwrap();
         let approve = short.approve.unwrap();
         assert_eq!(approve.to(), Some(harness.chain.stable));
@@ -1335,6 +1384,7 @@ mod tests {
             .bridge
             .prepare_deposit(HopDirection::ToHub, &quote)
             .await
+            .map(deposit_pair)
             .unwrap();
         assert_eq!(covered.approve, None);
     }

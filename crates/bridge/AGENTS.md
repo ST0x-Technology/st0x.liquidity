@@ -50,9 +50,9 @@ not the CCTP implementation directly. Implementation details must remain hidden.
 6. **Relay client** - `RelayClient`, `RelayApiKey`, the quote, status and
    quote-acceptance types, and `RelayError` (behind `relay` feature)
 7. **Swap bridge** - the `SwapBridge` trait and its domain types
-   (`HopDirection`, `PreparedSwapDeposit`, `SwapDeposit`, `DepositScan`,
-   `SwapSide`, `SwapPayment`), `RelayBridge`, `RelayCtx`, `RelayBridgeError` and
-   `UnverifiedReason` (behind `relay` feature)
+   (`HopDirection`, `PreparedSwap`, `PreparedSwapDeposit`, `SwapDeposit`,
+   `DepositScan`, `SwapSide`, `SwapPayment`), `RelayBridge`, `RelayCtx`,
+   `RelayBridgeError` and `UnverifiedReason` (behind `relay` feature)
 8. **Test stand-ins** - the CCTP deployers, `deploy_relay_end`,
    `RelayEndContracts` and `RelayBridge::with_local_contracts` (behind `mock`)
 
