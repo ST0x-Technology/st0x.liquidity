@@ -224,6 +224,13 @@ mod tests {
     }
 
     #[test]
+    fn success_without_a_fill_tx_is_not_terminal() {
+        let report = report(&json!({"status": "success", "failReason": "N/A"}).to_string());
+
+        assert!(!report.status.is_terminal(), "{report:?}");
+    }
+
+    #[test]
     fn refund_status_names_refund_tx_and_fail_reason() {
         let report = report(include_str!("../../relay-fixtures/status_refund.json"));
 
