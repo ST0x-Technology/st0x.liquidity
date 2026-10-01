@@ -93,7 +93,8 @@ to `RelayError::RateLimited { retry_after }` from the `Retry-After` header
 
 ## Quote checks
 
-`RelayClient::quote` refuses a quote unless:
+`RelayClient::quote` refuses an origin with no `Chain::relay_depository()`
+before it sends anything, then refuses a quote unless:
 
 - the input and output are the two chains' settlement stables on their pinned
   decimals (which must match each other), and the input amount is the requested
