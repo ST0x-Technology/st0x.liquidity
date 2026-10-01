@@ -252,11 +252,25 @@ pub enum HopDirection {
     FromHub,
 }
 
-/// The approve and deposit of one swap, signed and not broadcast.
+/// What [`SwapBridge::prepare_deposit`] signed, not yet broadcast.
 ///
-/// The caller persists both before [`SwapBridge::broadcast_deposit`], so a
-/// retry sends the same bytes at the same nonces and never signs a second
-/// deposit.
+/// The caller persists it before broadcasting, so a retry sends the same
+/// bytes at the same nonces and never signs a second deposit.
+#[cfg(feature = "relay")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PreparedSwap {
+    Deposit(PreparedSwapDeposit),
+    /// Another send from the wallet took the nonce between the approve and
+    /// the deposit, so the deposit was discarded. The approve, an allowance
+    /// to the pinned depository, goes out alone through
+    /// [`SwapBridge::broadcast_approve`] to fill its nonce; the caller then
+    /// prepares the deposit again.
+    ApproveOnly {
+        approve: PreparedTransaction,
+    },
+}
+
+/// The approve and deposit of one swap, at consecutive nonces.
 #[cfg(feature = "relay")]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PreparedSwapDeposit {
@@ -331,7 +345,7 @@ pub trait SwapBridge: Send + Sync + 'static {
         &self,
         direction: HopDirection,
         quote: &Self::Quote,
-    ) -> Result<PreparedSwapDeposit, Self::Error>;
+    ) -> Result<PreparedSwap, Self::Error>;
 
     /// Broadcasts a prepared pair in nonce order and returns the deposit's
     /// hash. Idempotent: a repeat sends the same bytes.
@@ -339,6 +353,14 @@ pub trait SwapBridge: Send + Sync + 'static {
         &self,
         direction: HopDirection,
         prepared: &PreparedSwapDeposit,
+    ) -> Result<TxHash, Self::Error>;
+
+    /// Broadcasts the approve of a [`PreparedSwap::ApproveOnly`] and returns
+    /// its hash. Idempotent: a repeat sends the same bytes.
+    async fn broadcast_approve(
+        &self,
+        direction: HopDirection,
+        approve: &PreparedTransaction,
     ) -> Result<TxHash, Self::Error>;
 
     /// Waits for the deposit to reach the origin chain's confirmations and
