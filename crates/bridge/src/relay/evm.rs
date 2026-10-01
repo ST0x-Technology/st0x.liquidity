@@ -1898,6 +1898,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn deposit_scan_from_an_unconfirmed_block_keeps_the_caller_cursor() {
+        let harness = Harness::new().await;
+        harness.chain.mine(CONFIRMATIONS).await;
+        let head = harness
+            .bridge
+            .origin_block(HopDirection::ToHub)
+            .await
+            .unwrap();
+
+        let scan = harness
+            .bridge
+            .find_recent_deposits(HopDirection::ToHub, &[], head)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            scan,
+            DepositScan {
+                deposits: vec![],
+                scanned_to: head - 1,
+            }
+        );
+    }
+
+    #[tokio::test]
     async fn deposit_scan_from_beyond_the_head_is_refused() {
         let harness = Harness::new().await;
         let head = harness
