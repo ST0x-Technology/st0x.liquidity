@@ -37,6 +37,7 @@ use alloy::rpc::types::TransactionReceipt;
 use alloy::sol_types::SolCall as _;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use rain_math_float::Float;
 use sqlx::SqlitePool;
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -563,6 +564,18 @@ pub enum ReplacementNotAdoptable {
         token: Address,
         bot_wallet: Address,
     },
+    /// The trigger and the inventory reservation booked the signed
+    /// withdrawal's amount, so adopting a larger one would move shares nothing
+    /// reserved. A smaller one is adopted: the receipt records what moved.
+    #[error(
+        "replacement {replacement} withdraws {target}, more than the {expected} the vault \
+         withdrawal booked, so it is not adopted"
+    )]
+    ReplacementWithdrawsMore {
+        replacement: TxHash,
+        target: String,
+        expected: String,
+    },
     #[error("no [chains.{chain}] required_confirmations: it gates the replacement check")]
     NoConfirmationDepth { chain: Chain },
     #[error(transparent)]
@@ -584,8 +597,9 @@ pub enum ReplacementNotAdoptable {
 /// `replacement` must be a different tx from `bot_wallet` at the withdrawal's
 /// nonce with `required_confirmations`, and a successful `withdraw4` to the
 /// contract the withdrawal calls, from the same token and vault. `withdraw4`
-/// pays its caller, so the recipient is the bot wallet; the amount may differ,
-/// but its receipt must show a transfer of the token to the bot wallet.
+/// pays its caller, so the recipient is the bot wallet; the amount may be
+/// smaller but not larger, and its receipt must show a transfer of the token
+/// to the bot wallet.
 /// Taking the nonce means the signed withdrawal can never land, and that call
 /// is what moved the equity, so the redemption continues from it:
 /// `ConfirmWithdraw` records what its receipt actually transferred, and
@@ -685,6 +699,22 @@ pub async fn verify_withdrawal_replacement(
             vault_id: call.vaultId,
             expected_token: withdrawal.token,
             expected_vault_id: withdrawal.vaultId,
+        });
+    }
+    let (target, expected) = (
+        Float::from_raw(call.targetAmount),
+        Float::from_raw(withdrawal.targetAmount),
+    );
+    // A float the contract accepted always compares; fail closed if not.
+    if target.gt(expected).unwrap_or(true) {
+        return Err(ReplacementNotAdoptable::ReplacementWithdrawsMore {
+            replacement,
+            target: target
+                .format()
+                .unwrap_or_else(|_| call.targetAmount.to_string()),
+            expected: expected
+                .format()
+                .unwrap_or_else(|_| withdrawal.targetAmount.to_string()),
         });
     }
 

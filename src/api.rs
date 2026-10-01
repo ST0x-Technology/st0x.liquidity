@@ -3561,6 +3561,7 @@ fn replacement_not_adoptable_response(
         | ReplacementNotAdoptable::ReplacementNotAWithdrawal { .. }
         | ReplacementNotAdoptable::ReplacementWithdrawsAnotherVault { .. }
         | ReplacementNotAdoptable::ReplacementWithdrewNothing { .. }
+        | ReplacementNotAdoptable::ReplacementWithdrawsMore { .. }
         | ReplacementNotAdoptable::NoConfirmationDepth { .. }
         | ReplacementNotAdoptable::ChainServicesMissing(_) => (
             StatusCode::CONFLICT,
@@ -8552,7 +8553,7 @@ mod tests {
             input: withdraw4_calldata(
                 SIGNED_WITHDRAWAL_TOKEN,
                 SIGNED_WITHDRAWAL_VAULT,
-                B256::repeat_byte(0x01),
+                float!(10).get_inner(),
             ),
         };
         let signature = signer.sign_hash_sync(&unsigned.signature_hash()).unwrap();
@@ -10285,7 +10286,7 @@ mod tests {
                 input: withdraw4_calldata(
                     SIGNED_WITHDRAWAL_TOKEN,
                     SIGNED_WITHDRAWAL_VAULT,
-                    B256::repeat_byte(0x01),
+                    float!(10).get_inner(),
                 ),
                 tx_type: EIP1559_TX_TYPE_ID,
                 succeeded: false,
@@ -10438,7 +10439,7 @@ mod tests {
                 mined_at_withdrawal_nonce(
                     bot_wallet,
                     SIGNED_WITHDRAWAL_TARGET,
-                    B256::repeat_byte(0x02),
+                    float!(5).get_inner(),
                 ),
             )
             .with_transfer_receipt(speed_up, SIGNED_WITHDRAWAL_TOKEN, bot_wallet, U256::from(7))
@@ -10599,12 +10600,9 @@ mod tests {
         let bot_wallet = signer.address();
         let other = Address::repeat_byte(0x0E);
         let candidate = TxHash::repeat_byte(0x5E);
-        let valid = mined_at_withdrawal_nonce(
-            bot_wallet,
-            SIGNED_WITHDRAWAL_TARGET,
-            B256::repeat_byte(0x01),
-        );
-        let cases: [(&str, Option<MinedTx>, &str); 9] = [
+        let valid =
+            mined_at_withdrawal_nonce(bot_wallet, SIGNED_WITHDRAWAL_TARGET, float!(10).get_inner());
+        let cases: [(&str, Option<MinedTx>, &str); 10] = [
             (
                 "another sender",
                 Some(MinedTx {
@@ -10659,7 +10657,7 @@ mod tests {
                     input: withdraw4_calldata(
                         other,
                         SIGNED_WITHDRAWAL_VAULT,
-                        B256::repeat_byte(0x01),
+                        float!(10).get_inner(),
                     ),
                     ..valid.clone()
                 }),
@@ -10671,11 +10669,23 @@ mod tests {
                     input: withdraw4_calldata(
                         SIGNED_WITHDRAWAL_TOKEN,
                         B256::repeat_byte(0x0E),
-                        B256::repeat_byte(0x01),
+                        float!(10).get_inner(),
+                    ),
+                    ..valid.clone()
+                }),
+                "from vault 0x0e0e0e0e",
+            ),
+            (
+                "a larger amount",
+                Some(MinedTx {
+                    input: withdraw4_calldata(
+                        SIGNED_WITHDRAWAL_TOKEN,
+                        SIGNED_WITHDRAWAL_VAULT,
+                        float!(20).get_inner(),
                     ),
                     ..valid
                 }),
-                "from vault 0x0e0e0e0e",
+                "more than the 10 the vault withdrawal booked",
             ),
             ("not mined", None, "is not mined"),
         ];
@@ -10733,7 +10743,7 @@ mod tests {
                 mined_at_withdrawal_nonce(
                     bot_wallet,
                     SIGNED_WITHDRAWAL_TARGET,
-                    B256::repeat_byte(0x02),
+                    float!(5).get_inner(),
                 ),
             )
             .with_transfer_receipt(
