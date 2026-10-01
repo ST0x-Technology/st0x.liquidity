@@ -434,8 +434,9 @@ Not covered by `transfer recheck` yet:
   their own recovery commands. A manual `transfer-usdc` runs on the served
   corridor that `--chain <chain>` names; the flag may be left out only while the
   build serves one corridor, and with several the command refuses and lists
-  them. It prints its transfer id and, if interrupted mid-flight, is resumed
-  with
+  them. Only Base via CCTP can execute in this build: on any other served
+  corridor the command refuses before any transfer starts. It prints its
+  transfer id and, if interrupted mid-flight, is resumed with
   `stox transfer resume --kind usdc --id <id> --direction <to-raindex|to-alpaca>`.
   This covers post-burn interruptions and the resumable pre-burn states (a
   BaseToAlpaca `WithdrawalSubmitting`, an AlpacaToBase `Withdrawing` with a

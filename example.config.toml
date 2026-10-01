@@ -108,11 +108,11 @@ extended_hours_counter_trading = "disabled"
 # a chain with no fill watcher cannot trade, and one whose gas token is not
 # ETH cannot be "active" until a price source for it exists.
 lifecycle = "active"
-# Block-confirmation depth required before a transaction this bot submits is
-# treated as settled (the primary gate for USDC rebalancing withdrawals). This
-# does NOT govern order-fill ingestion: the fill monitor caps the backfill range
-# at the configured ingestion_cutoff block, not this depth. Set explicitly per
-# chain based on observed confirmation behavior.
+# Block-confirmation depth required before a transaction this bot submits on
+# this chain is treated as settled. This does NOT govern order-fill ingestion:
+# the fill monitor caps the backfill range at the configured ingestion_cutoff
+# block, not this depth. Set explicitly per chain based on observed
+# confirmation behavior.
 required_confirmations = 3
 
 [chains.base.trading]
@@ -194,6 +194,8 @@ redemption_wallet = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 # Holds and moves USDC for the corridor; it runs no orderbook, so it has
 # no [trading] table.
 lifecycle = "active"
+# Also the depth the Alpaca withdrawal tx needs before its USDC is used in a
+# USDC rebalancing transfer, whichever chain the corridor serves.
 required_confirmations = 12
 
 # HyperEVM, same shape as Ethereum.
