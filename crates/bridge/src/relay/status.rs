@@ -10,10 +10,13 @@ pub struct IntentStatusReport {
     /// Relay's `inTxHashes`: the origin-chain deposits it attributes to the
     /// request.
     pub deposit_txs: Vec<TxHash>,
+    /// Relay's `refundFailReason`: why a refund could not be paid.
+    pub refund_fail_reason: Option<FailReason>,
 }
 
-/// Relay's status of a request. Only `Success`, `Refund` and `Failure` are
-/// terminal; a status this build does not know keeps the transfer waiting.
+/// Relay's status of a request. Only `Success`, `Refund`, `RefundFailed` and
+/// `Failure` are terminal; a status this build does not know keeps the
+/// transfer waiting.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum IntentStatus {
     /// Quoted, no deposit seen.
@@ -23,9 +26,19 @@ pub enum IntentStatus {
     Success {
         fill_txs: Vec<TxHash>,
     },
-    /// Paid back on the origin chain in the deposited token.
+    /// Paid back on the origin chain in the deposited token: `refund_txs` is
+    /// never empty and Relay reports no refund fail reason.
     Refund {
         refund_txs: Vec<TxHash>,
+        reason: Option<FailReason>,
+    },
+    /// Relay says `refund` but names no refund tx yet.
+    Refunding {
+        reason: Option<FailReason>,
+    },
+    /// Relay says `refund` with a refund fail reason (in
+    /// [`IntentStatusReport::refund_fail_reason`]): the refund will not be paid.
+    RefundFailed {
         reason: Option<FailReason>,
     },
     Failure {
@@ -38,8 +51,11 @@ pub enum IntentStatus {
 impl IntentStatus {
     pub const fn is_terminal(&self) -> bool {
         match self {
-            Self::Success { .. } | Self::Refund { .. } | Self::Failure { .. } => true,
-            Self::Waiting | Self::InFlight(_) | Self::Unknown(_) => false,
+            Self::Success { .. }
+            | Self::Refund { .. }
+            | Self::RefundFailed { .. }
+            | Self::Failure { .. } => true,
+            Self::Waiting | Self::InFlight(_) | Self::Refunding { .. } | Self::Unknown(_) => false,
         }
     }
 }
@@ -101,11 +117,16 @@ pub(super) struct StatusResponse {
     #[serde(default)]
     tx_hashes: Vec<TxHash>,
     fail_reason: Option<String>,
+    refund_fail_reason: Option<String>,
 }
 
 impl From<StatusResponse> for IntentStatusReport {
     fn from(response: StatusResponse) -> Self {
         let reason = response.fail_reason.as_deref().and_then(FailReason::parse);
+        let refund_fail_reason = response
+            .refund_fail_reason
+            .as_deref()
+            .and_then(FailReason::parse);
 
         let status = match response.status.as_str() {
             "waiting" => IntentStatus::Waiting,
@@ -116,6 +137,8 @@ impl From<StatusResponse> for IntentStatusReport {
             "success" => IntentStatus::Success {
                 fill_txs: response.tx_hashes,
             },
+            "refund" if refund_fail_reason.is_some() => IntentStatus::RefundFailed { reason },
+            "refund" if response.tx_hashes.is_empty() => IntentStatus::Refunding { reason },
             "refund" => IntentStatus::Refund {
                 refund_txs: response.tx_hashes,
                 reason,
@@ -127,6 +150,7 @@ impl From<StatusResponse> for IntentStatusReport {
         Self {
             status,
             deposit_txs: response.in_tx_hashes,
+            refund_fail_reason,
         }
     }
 }
@@ -151,6 +175,7 @@ mod tests {
             IntentStatusReport {
                 status: IntentStatus::Waiting,
                 deposit_txs: vec![],
+                refund_fail_reason: None,
             }
         );
         assert!(!report.status.is_terminal());
@@ -167,6 +192,7 @@ mod tests {
                 deposit_txs: vec![b256!(
                     "0xeeee66456ace7aae93e6ed814d32a3748a5fc86d7101a259a4f62a44822c819d"
                 )],
+                refund_fail_reason: None,
             }
         );
         assert!(!report.status.is_terminal());
@@ -212,6 +238,53 @@ mod tests {
                 "0x1dd1b32e03951ea87347dd8234b120b50f16443d8085bb161539e212649b8d81"
             )]
         );
+        assert_eq!(report.refund_fail_reason, None);
+        assert!(report.status.is_terminal());
+    }
+
+    #[test]
+    fn refund_without_a_refund_tx_is_still_refunding() {
+        let report = report(
+            &json!({
+                "status": "refund",
+                "txHashes": [],
+                "failReason": "SLIPPAGE",
+                "refundFailReason": "N/A",
+            })
+            .to_string(),
+        );
+
+        assert_eq!(
+            report.status,
+            IntentStatus::Refunding {
+                reason: Some(FailReason::Slippage),
+            }
+        );
+        assert_eq!(report.refund_fail_reason, None);
+        assert!(!report.status.is_terminal());
+    }
+
+    #[test]
+    fn refund_with_a_refund_fail_reason_is_a_failed_refund() {
+        let report = report(
+            &json!({
+                "status": "refund",
+                "txHashes": [
+                    "0xf27f49b3e941788a37775b874e1a91a711c26578c041921a24efd96cd14cea8d",
+                ],
+                "failReason": "SLIPPAGE",
+                "refundFailReason": "BLOCKED_WALLET",
+            })
+            .to_string(),
+        );
+
+        assert_eq!(
+            report.status,
+            IntentStatus::RefundFailed {
+                reason: Some(FailReason::Slippage),
+            }
+        );
+        assert_eq!(report.refund_fail_reason, Some(FailReason::BlockedWallet));
         assert!(report.status.is_terminal());
     }
 
@@ -257,6 +330,7 @@ mod tests {
                     b256!("0x0000000000000000000000000000000000000000000000000000000000000001"),
                     b256!("0x0000000000000000000000000000000000000000000000000000000000000002"),
                 ],
+                refund_fail_reason: None,
             }
         );
     }
