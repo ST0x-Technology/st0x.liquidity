@@ -106,6 +106,11 @@ pub(crate) struct UnwrappedEquityRecoveryServices {
 /// `ChainServicesMissing` and the `Retryable*Confirmation` variants).
 #[derive(Debug, Clone, Serialize, Deserialize, Error, PartialEq, Eq)]
 pub(crate) enum UnwrappedEquityRecoveryError {
+    #[error("mint {mint_id} resume remains pending: {reason}")]
+    MintResumePending {
+        mint_id: IssuerRequestId,
+        reason: String,
+    },
     #[error("recovery already initialized")]
     AlreadyInitialized,
 
@@ -138,8 +143,8 @@ pub(crate) enum UnwrappedEquityRecoveryError {
     /// yet). See [`BotGasEnqueueFailure`] for why the payload is a rendered
     /// `String` rather than a typed source.
     ///
-    /// NOTE: `resume_mint_or_fail`/`resume_redemption_or_fail` (the
-    /// `DispatchToMint`/`DispatchToRedemption` handlers) deliberately do NOT
+    /// NOTE: `resume_redemption_or_fail` (the
+    /// `DispatchToRedemption` handlers) deliberately do NOT
     /// propagate a bot-gas enqueue failure this way, mirroring
     /// `WrappedEquityRecoveryError` -- see the "Known gaps" entry in
     /// SPEC.md's bot-gas section.
@@ -812,10 +817,10 @@ async fn resume_mint_or_fail(
         }
         Err(error) => {
             warn!(target: "rebalance", %mint_id, ?error, "Unwrapped equity recovery: resume_mint failed");
-            Ok(vec![UnwrappedEquityRecoveryEvent::RecoveryFailed {
-                reason: format!("resume_mint failed: {error}"),
-                failed_at: Utc::now(),
-            }])
+            Err(UnwrappedEquityRecoveryError::MintResumePending {
+                mint_id: mint_id.clone(),
+                reason: error.to_string(),
+            })
         }
     }
 }
@@ -1921,27 +1926,21 @@ mod tests {
         ));
     }
 
-    /// `resume_mint` fails because no mint aggregate exists -> the handler
-    /// records the failure as `RecoveryFailed` rather than erroring.
     #[tokio::test]
-    async fn dispatch_to_mint_records_failure_when_resume_mint_fails() {
+    async fn dispatch_to_mint_keeps_recovery_open_when_resume_fails() {
         let services = test_services().await;
-        let events = detected()
+        let mint_id = issuer_request_id("ISS-NONEXISTENT");
+        let error = detected()
             .transition(
                 UnwrappedEquityRecoveryCommand::DispatchToMint {
-                    mint_id: issuer_request_id("ISS-NONEXISTENT"),
+                    mint_id: mint_id.clone(),
                 },
                 &services,
             )
             .await
-            .expect("DispatchToMint should return Ok with RecoveryFailed on service failure");
-        let [UnwrappedEquityRecoveryEvent::RecoveryFailed { reason, .. }] = events.as_slice()
-        else {
-            panic!("expected single RecoveryFailed event, got {events:?}");
-        };
+            .unwrap_err();
         assert!(
-            reason.contains("resume_mint failed"),
-            "reason should mention resume_mint; got {reason:?}",
+            matches!(error, UnwrappedEquityRecoveryError::MintResumePending { mint_id: pending, .. } if pending == mint_id)
         );
     }
 

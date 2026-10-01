@@ -8369,6 +8369,7 @@ pub mod process_tx {
                     allocation: st0x_config::AllocationCtx::base_test(),
                     usdc: UsdcCorridors::base_cctp_disabled(),
                     transfer_timeout: std::time::Duration::from_secs(60),
+                    recovery_hold_alert_after: std::time::Duration::from_secs(60 * 60),
                     chains: std::collections::BTreeMap::from([(
                         Chain::Base,
                         ChainRebalancingConfig::for_test(ChainAssets {

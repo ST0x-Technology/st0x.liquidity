@@ -668,6 +668,14 @@ async fn finish(
             guard.release();
             Ok(())
         }
+        Err(error) if error.is_mint_resume_pending() => {
+            warn!(%error, "Mint recovery remains pending; retaining ownership and retrying");
+            ctx.queue
+                .clone()
+                .push_with_delay(job.clone(), ctx.reschedule_interval)
+                .await?;
+            Ok(())
+        }
         Err(error) if error.is_chain_services_missing() => {
             error!(
                 target: "operational_alert",
@@ -721,6 +729,15 @@ async fn fail_on_chain_mismatch(
 }
 
 impl WrappedEquityRecoveryJobError {
+    fn is_mint_resume_pending(&self) -> bool {
+        matches!(
+            self,
+            Self::Aggregate(AggregateError::UserError(LifecycleError::Apply(
+                WrappedEquityRecoveryError::MintResumePending { .. }
+            ))) | Self::Domain(WrappedEquityRecoveryError::MintResumePending { .. })
+        )
+    }
+
     /// The active mint or redemption no longer matches the wallet snapshot.
     /// A resumed record closes without queuing another invalid detection.
     fn is_business_validation(&self) -> bool {
@@ -829,6 +846,12 @@ async fn read_recovery_snapshot(
 /// would record `snapshot.shares` for an aggregate that was actually set up
 /// for a different amount, leaving the audit trail and the resumed work
 /// disagreeing on how many shares moved.
+///
+/// A `WrapSubmitted` mint is exempt from the quantity check: its quantity is
+/// in underlying shares, while the landed wrap left vault shares in the
+/// wallet, and the two differ whenever the vault ratio is not 1. Dispatch only
+/// resumes the mint, which reads the wrap receipt and deposits the share count
+/// it reports.
 async fn validate_active_aggregate_quantity(
     ctx: &WrappedEquityRecoveryCtx,
     chain: Chain,
@@ -850,6 +873,9 @@ async fn validate_active_aggregate_quantity(
                     transfer_chain: mint.chain(),
                     recovery_chain: chain,
                 });
+            }
+            if matches!(mint, TokenizedEquityMint::WrapSubmitted { .. }) {
+                return Ok(());
             }
             let aggregate_shares = FractionalShares::new(mint.quantity());
             if aggregate_shares != snapshot.shares {

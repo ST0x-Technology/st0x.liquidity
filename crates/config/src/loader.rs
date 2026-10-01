@@ -3346,6 +3346,7 @@ pub fn default_test_rebalancing_ctx() -> Box<RebalancingCtx> {
         },
         inventory_staleness_bound_secs: 300,
         transfer_timeout_secs: 1800,
+        recovery_hold_alert_after_secs: 3600,
         transfer_attempt_timeout_secs: 3600,
         attestation_retry_deadline_secs: 86_400,
         settlement_retry_deadline_secs: 86_400,
@@ -3570,6 +3571,7 @@ mod tests {
     const REQUIRED_TOPOLOGY_SECTIONS: &str = r#"
             [rebalancing]
             transfer_timeout_secs = 1800
+            recovery_hold_alert_after_secs = 3600
             inventory_staleness_bound_secs = 300
             transfer_attempt_timeout_secs = 3600
             attestation_retry_deadline_secs = 86400
@@ -3667,6 +3669,7 @@ mod tests {
 
             [rebalancing]
             transfer_timeout_secs = 1800
+            recovery_hold_alert_after_secs = 3600
             inventory_staleness_bound_secs = 300
             transfer_attempt_timeout_secs = 3600
             attestation_retry_deadline_secs = 86400
@@ -4272,6 +4275,7 @@ mod tests {
 
             [rebalancing]
             transfer_timeout_secs = 1800
+            recovery_hold_alert_after_secs = 3600
             inventory_staleness_bound_secs = 300
             transfer_attempt_timeout_secs = 3600
             attestation_retry_deadline_secs = 86400
@@ -5792,6 +5796,7 @@ mod tests {
             extended_hours_close_flatten_window_secs = 900
             [rebalancing]
             transfer_timeout_secs = 1800
+            recovery_hold_alert_after_secs = 3600
             inventory_staleness_bound_secs = 300
             transfer_attempt_timeout_secs = 3600
             attestation_retry_deadline_secs = 86400
@@ -5906,6 +5911,7 @@ mod tests {
 
             [rebalancing]
             transfer_timeout_secs = 1800
+            recovery_hold_alert_after_secs = 3600
             inventory_staleness_bound_secs = 300
             transfer_attempt_timeout_secs = 3600
             attestation_retry_deadline_secs = 86400
@@ -6091,6 +6097,7 @@ mod tests {
 
             [rebalancing]
             transfer_timeout_secs = 1800
+            recovery_hold_alert_after_secs = 3600
             inventory_staleness_bound_secs = 300
             transfer_attempt_timeout_secs = 3600
             attestation_retry_deadline_secs = 86400
@@ -6667,6 +6674,7 @@ mod tests {
 
             [rebalancing]
             transfer_timeout_secs = 1800
+            recovery_hold_alert_after_secs = 3600
             inventory_staleness_bound_secs = 300
             transfer_attempt_timeout_secs = 3600
             attestation_retry_deadline_secs = 86400
@@ -6794,6 +6802,7 @@ mod tests {
 
             [rebalancing]
             transfer_timeout_secs = 1800
+            recovery_hold_alert_after_secs = 3600
             inventory_staleness_bound_secs = 300
             transfer_attempt_timeout_secs = 3600
             attestation_retry_deadline_secs = 86400
@@ -6934,6 +6943,7 @@ mod tests {
 
             [rebalancing]
             transfer_timeout_secs = 1800
+            recovery_hold_alert_after_secs = 3600
             inventory_staleness_bound_secs = 300
             transfer_attempt_timeout_secs = 3600
             attestation_retry_deadline_secs = 86400
@@ -7071,6 +7081,7 @@ mod tests {
 
             [rebalancing]
             transfer_timeout_secs = 1800
+            recovery_hold_alert_after_secs = 3600
             inventory_staleness_bound_secs = 300
             transfer_attempt_timeout_secs = 3600
             attestation_retry_deadline_secs = 86400
@@ -8449,6 +8460,7 @@ mod tests {
 
             [rebalancing]
             transfer_timeout_secs = 1800
+            recovery_hold_alert_after_secs = 3600
             inventory_staleness_bound_secs = 300
             transfer_attempt_timeout_secs = 3600
             attestation_retry_deadline_secs = 86400
@@ -9137,6 +9149,7 @@ mod tests {
 
             [rebalancing]
             transfer_timeout_secs = 1800
+            recovery_hold_alert_after_secs = 3600
             inventory_staleness_bound_secs = 300
             transfer_attempt_timeout_secs = 3600
             attestation_retry_deadline_secs = 86400
@@ -9519,8 +9532,8 @@ mod tests {
 
     /// The deployed configs, with the token file in place, carry exactly the
     /// per-symbol tables the inline configs held the day they were replaced,
-    /// and pass every check; judged without the token file they still pass
-    /// and say what was not covered.
+    /// and preserve the migration comparison. The historical production
+    /// copy is refused until RKLB enables recovery; staging passes.
     #[test]
     fn deployed_configs_with_the_token_file_match_the_inline_ones() {
         let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
@@ -9574,13 +9587,19 @@ mod tests {
                 rows
             };
             assert_eq!(rows(&merged), rows(&inline), "{env}: per-symbol tables");
-            validate_config(
+            let validation = validate_config(
                 &merged,
                 &config_path,
                 TokenFile::Bytes(&tokens),
                 &mut notices,
-            )
-            .unwrap();
+            );
+            if env == "production" {
+                assert!(matches!(validation, Err(CtxError::ChainRegistry(
+                    crate::chain::ChainRegistryError::RebalancingRequiresRecovery { chain: Chain::Base, symbol }
+                )) if symbol == Symbol::new("RKLB").unwrap()));
+            } else {
+                validation.unwrap();
+            }
 
             let mut notices = Vec::new();
             let (table, live) =
@@ -9644,9 +9663,9 @@ mod tests {
 
     /// The copy production runs is the fixture the pin names: a pin bump
     /// without that fixture fails here, before a VM boot finds out, and the
-    /// copy must pass every check the deployed config runs.
+    /// historical copy must be refused until RKLB enables wallet recovery.
     #[test]
-    fn the_pinned_production_copy_passes_the_deployed_config() {
+    fn the_pinned_production_copy_requires_rklb_recovery_before_release() {
         let tokens = registry::fixtures::pinned_production_tokens();
         let config_path = Path::new("config/prod/st0x-hedge.toml");
         let mut notices = Vec::new();
@@ -9658,13 +9677,15 @@ mod tests {
         )
         .unwrap();
         assert!(live.is_some());
-        validate_config(
+        let error = validate_config(
             &config,
             config_path,
             TokenFile::Bytes(&tokens),
             &mut notices,
-        )
-        .unwrap();
+        );
+        assert!(matches!(error, Err(CtxError::ChainRegistry(
+            crate::chain::ChainRegistryError::RebalancingRequiresRecovery { chain: Chain::Base, symbol }
+        )) if symbol == Symbol::new("RKLB").unwrap()));
     }
 
     /// Without the token file a schedule is judged on its shape only, and
@@ -11259,6 +11280,7 @@ mod tests {
 
             [rebalancing]
             transfer_timeout_secs = 1800
+            recovery_hold_alert_after_secs = 3600
             inventory_staleness_bound_secs = 300
             transfer_attempt_timeout_secs = 3600
             attestation_retry_deadline_secs = 86400
@@ -11455,6 +11477,7 @@ mod tests {
 
             [rebalancing]
             transfer_timeout_secs = 1800
+            recovery_hold_alert_after_secs = 3600
             inventory_staleness_bound_secs = 300
             transfer_attempt_timeout_secs = 3600
             attestation_retry_deadline_secs = 86400

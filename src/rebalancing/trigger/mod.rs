@@ -307,6 +307,7 @@ pub(crate) struct RebalancingServiceConfig {
     /// A transfer recorded on an unserved one is held, never re-armed.
     pub(crate) usdc: UsdcCorridors,
     pub(crate) transfer_timeout: Duration,
+    pub(crate) recovery_hold_alert_after: Duration,
     /// Every hedged chain's asset table and minimum. The planner slots a
     /// symbol on each chain that rebalances it; the USDC trigger reads the
     /// primary's cash entry.
@@ -920,6 +921,7 @@ pub(crate) struct RebalancingService {
     /// every plan declines.
     last_prices: RwLock<Option<Arc<dyn LastPriceReader>>>,
     pub(crate) equity_in_progress: Arc<std::sync::RwLock<HashMap<Symbol, equity::GuardState>>>,
+    recovery_hold_alerts: RwLock<HashMap<(Symbol, Chain), RecoveryHoldAlert>>,
     /// Symbols the inventory poller flagged with a pending snapshot
     /// divergence. Read here to suppress new equity transfers so a mint or
     /// redemption that would fail at the broker cannot mark the symbol busy
@@ -1225,6 +1227,18 @@ struct RearmCandidate {
     policy: RearmPolicy,
 }
 
+struct RecoveryHoldAlert {
+    first_seen: DateTime<Utc>,
+    delivery: RecoveryHoldAlertDelivery,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum RecoveryHoldAlertDelivery {
+    Pending,
+    InProgress,
+    Delivered,
+}
+
 impl RebalancingService {
     pub(crate) fn new(
         config: RebalancingServiceConfig,
@@ -1257,6 +1271,7 @@ impl RebalancingService {
             equity_cooldowns: RwLock::new(HashMap::new()),
             last_prices: RwLock::new(None),
             equity_in_progress: Arc::new(std::sync::RwLock::new(HashMap::new())),
+            recovery_hold_alerts: RwLock::new(HashMap::new()),
             divergence_gate: Arc::default(),
             usdc_guards: Arc::default(),
             usdc_driver_pause: Arc::new(usdc_driver_pause),
@@ -1677,6 +1692,7 @@ impl RebalancingService {
         self.retry_pending_equity_transfer_reservation_restores()
             .await?;
         self.prune_timeout_markers(now).await;
+        self.alert_stuck_recovery_holds(now).await;
         self.expire_stuck_mints(now).await?;
         self.expire_stuck_redemptions(now).await?;
         self.expire_stuck_usdc_rebalances(now).await?;
@@ -1712,6 +1728,77 @@ impl RebalancingService {
             .write()
             .await
             .retain(|_, timed_out_at| !Self::timeout_marker_expired(*timed_out_at, now));
+    }
+
+    async fn alert_stuck_recovery_holds(&self, now: DateTime<Utc>) {
+        let slots = match self.equity_in_progress.read() {
+            Ok(guard) => guard.clone(),
+            Err(poison) => poison.into_inner().clone(),
+        };
+        let mut alerts = self.recovery_hold_alerts.write().await;
+        // Keep the timer while the hold stands or that chain's recovery
+        // attempt owns the slot, so a recovery that keeps failing still pages
+        // at the original deadline. Drop it once the slot is empty or owned by
+        // anything else, so a later hold pages only after a fresh threshold.
+        alerts.retain(|(symbol, chain), _| match slots.get(symbol) {
+            Some(
+                equity::GuardState::HeldForRecovery { chain: held_chain }
+                | equity::GuardState::Recovering {
+                    chain: held_chain, ..
+                },
+            ) => chain == held_chain,
+            Some(equity::GuardState::ActiveTransfer { .. }) | None => false,
+        });
+        let mut pending = Vec::new();
+        for (symbol, state) in slots {
+            let (equity::GuardState::HeldForRecovery { chain }
+            | equity::GuardState::Recovering { chain, .. }) = state
+            else {
+                continue;
+            };
+            let alert = alerts
+                .entry((symbol.clone(), chain))
+                .or_insert(RecoveryHoldAlert {
+                    first_seen: now,
+                    delivery: RecoveryHoldAlertDelivery::Pending,
+                });
+            if alert.delivery != RecoveryHoldAlertDelivery::Pending
+                || Self::elapsed_since_timeout_start(alert.first_seen, now)
+                    .is_none_or(|elapsed| elapsed < self.config.recovery_hold_alert_after)
+            {
+                continue;
+            }
+            alert.delivery = RecoveryHoldAlertDelivery::InProgress;
+            pending.push((symbol, chain, alert.first_seen));
+        }
+        drop(alerts);
+        for (symbol, chain, first_seen) in pending {
+            let delivery = match self
+                .notifier
+                .notify(&format!(
+                    "Recovery holds {symbol} on {chain}; all chains are blocked for this symbol. \
+                 Pause the listing on {chain} to stop new work while recovery finishes. \
+                 Do not release the hold while tokens remain in recovery."
+                ))
+                .await
+            {
+                Ok(()) => RecoveryHoldAlertDelivery::Delivered,
+                Err(error) => {
+                    warn!(target: "rebalance", %symbol, %chain, ?error,
+                        "Failed to deliver recovery hold alert; retrying next sweep");
+                    RecoveryHoldAlertDelivery::Pending
+                }
+            };
+            if let Some(alert) = self
+                .recovery_hold_alerts
+                .write()
+                .await
+                .get_mut(&(symbol, chain))
+                && alert.first_seen == first_seen
+            {
+                alert.delivery = delivery;
+            }
+        }
     }
 
     async fn expire_stuck_mints(&self, now: DateTime<Utc>) -> Result<(), RebalancingServiceError> {
@@ -1782,23 +1869,26 @@ impl RebalancingService {
 
             let symbol = pending_tracking.symbol;
 
-            // Steady-state skip: if recovery already owns the slot, leave the
-            // mint untouched -- recovery drives it to terminal, and removing its
-            // tracking or failing it would clear the guard and allow a
-            // double-mint while the tokens are still unwrapped in the wallet. A
-            // concurrent flip to `HeldForRecovery` AFTER this read is closed
+            // Steady-state skip: if recovery holds or is running on the slot,
+            // leave the mint untouched -- recovery drives it to terminal, and
+            // removing its tracking or failing it would clear the guard and
+            // allow a double-mint while the tokens are still in the wallet. A
+            // concurrent recovery handoff or claim AFTER this read is closed
             // atomically at the clear below.
-            let held_for_recovery = {
+            let recovery_owned = {
                 let guard = match self.equity_in_progress.read() {
                     Ok(guard) => guard,
                     Err(poison) => poison.into_inner(),
                 };
                 match guard.get(&symbol) {
-                    Some(equity::GuardState::HeldForRecovery { .. }) => true,
+                    Some(
+                        equity::GuardState::HeldForRecovery { .. }
+                        | equity::GuardState::Recovering { .. },
+                    ) => true,
                     Some(equity::GuardState::ActiveTransfer { .. }) | None => false,
                 }
             };
-            if held_for_recovery {
+            if recovery_owned {
                 continue;
             }
 
@@ -1810,17 +1900,18 @@ impl RebalancingService {
             // the async cleanup above. Holding the write lock across the re-check
             // and the clear closes the TOCTOU race: a concurrent
             // `mark_held_for_recovery` can flip `ActiveTransfer` ->
-            // `HeldForRecovery` after the steady-state check, and a non-atomic
+            // `HeldForRecovery` (and a recovery can then claim it as
+            // `Recovering`) after the steady-state check, and a non-atomic
             // clear would then drop a recovery-owned guard and fail a mint whose
             // tokens are still in the wallet -- re-opening the double-mint window
             // this guard exists to close. If recovery now owns the slot, leave
             // the guard and skip the failure event.
-            if !self.clear_equity_in_progress_unless_held_for_recovery(&symbol) {
+            if !self.clear_equity_in_progress_unless_recovery_owned(&symbol) {
                 debug!(
                     target: "rebalance",
                     aggregate_id = %id,
                     %symbol,
-                    "Timed-out mint flipped to HeldForRecovery during cleanup; \
+                    "Timed-out mint handed to recovery during cleanup; \
                      recovery now owns it -- leaving guard and skipping failure event"
                 );
                 continue;
@@ -7298,21 +7389,20 @@ impl RebalancingService {
     ///
     /// Returns `true` after removing an `ActiveTransfer` (or absent) guard so
     /// the caller can fail the mint and free the symbol for a fresh rebalance.
-    /// Returns `false` without touching a `HeldForRecovery` slot: recovery owns
-    /// the mint and will drive it to terminal. Holding the lock across the
-    /// check and the clear closes the TOCTOU race where a concurrent
-    /// `mark_held_for_recovery` flips `ActiveTransfer` -> `HeldForRecovery`
+    /// Returns `false` without touching a `HeldForRecovery` or `Recovering`
+    /// slot: recovery owns the mint and will drive it to terminal. Holding the
+    /// lock across the check and the clear closes the TOCTOU race where a
+    /// concurrent `mark_held_for_recovery` or recovery claim changes the slot
     /// between a separate check and clear.
-    pub(crate) fn clear_equity_in_progress_unless_held_for_recovery(
-        &self,
-        symbol: &Symbol,
-    ) -> bool {
+    pub(crate) fn clear_equity_in_progress_unless_recovery_owned(&self, symbol: &Symbol) -> bool {
         let mut guard = match self.equity_in_progress.write() {
             Ok(guard) => guard,
             Err(poison) => poison.into_inner(),
         };
         match guard.get(symbol) {
-            Some(equity::GuardState::HeldForRecovery { .. }) => false,
+            Some(
+                equity::GuardState::HeldForRecovery { .. } | equity::GuardState::Recovering { .. },
+            ) => false,
             Some(equity::GuardState::ActiveTransfer { .. }) | None => {
                 guard.remove(symbol);
                 true
@@ -8051,8 +8141,7 @@ impl RebalancingService {
                 // claim_guard_for_recovery_or_orphan can claim the slot. When recovery
                 // is disabled, ActiveTransfer is correct — resume_interrupted_transfers
                 // will call resume_mint and the transfer job retries normally. The
-                // recovery jobs run on the primary chain only, so a mint on any other
-                // chain is never held: nothing would ever release it.
+                // recovery jobs run on the chain holding the mint's tokens.
                 //
                 // TokensWrapped and VaultDepositSubmitted are always reconstructed as
                 // ActiveTransfer: the deposit is idempotent and resume_interrupted_transfers
@@ -8060,12 +8149,10 @@ impl RebalancingService {
                 let is_pre_wrap_post_receipt_state =
                     matches!(entity, TokensReceived { .. } | WrapSubmitted { .. });
 
-                let primary_chain = self.inventory.read().await.primary_chain();
                 if is_pre_wrap_post_receipt_state
-                    && entity.chain() == primary_chain
                     && self
                         .config
-                        .wrapped_equity_recovery_enabled(primary_chain, symbol)
+                        .wrapped_equity_recovery_enabled(entity.chain(), symbol)
                 {
                     self.mark_equity_held_for_recovery(symbol, entity.chain());
                 } else {
@@ -9208,6 +9295,7 @@ pub(crate) async fn wire_usdc_reactor_store(
             deviation: float!(0.2),
         }),
         transfer_timeout: Duration::from_secs(30 * 60),
+        recovery_hold_alert_after: Duration::from_secs(60 * 60),
         chains: BTreeMap::from([(
             Chain::Base,
             ChainRebalancingConfig::for_test(ChainAssets {
@@ -9335,7 +9423,6 @@ mod tests {
     use super::*;
     use crate::alerts::{CapturingNotifier, LogNotifier};
     use crate::conductor::job::Job;
-    use crate::conductor::job::TaskIdentity;
     use crate::dashboard::equity_price::EquityPriceStore;
     use crate::equity_redemption::{
         DetectionFailure, EquityRedemptionCommand, UnwrappedProvenance, redemption_aggregate_id,
@@ -9356,7 +9443,6 @@ mod tests {
     use crate::rebalancing::equity::EquityTransferServices;
     use crate::rebalancing::equity::{
         MintError, MintTransferError, ResumeEquityToMarketMaking, TransferEquityToMarketMakingCtx,
-        TransferEquityToMarketMakingJobError,
     };
     use crate::rebalancing::usdc::{
         ResumeBaseToAlpaca, TransferUsdcToHedgingCtx, UsdcTransferError,
@@ -9383,7 +9469,7 @@ mod tests {
             }),
             "the operator hold must name the transfer's chain so its recovery can claim it"
         );
-        assert!(!trigger.clear_equity_in_progress_unless_held_for_recovery(&symbol));
+        assert!(!trigger.clear_equity_in_progress_unless_recovery_owned(&symbol));
     }
 
     #[test]
@@ -9450,6 +9536,7 @@ mod tests {
                 deviation: float!(0.2),
             }),
             transfer_timeout: Duration::from_secs(30 * 60),
+            recovery_hold_alert_after: Duration::from_secs(60 * 60),
             chains: BTreeMap::from([(
                 Chain::Base,
                 ChainRebalancingConfig::for_test(ChainAssets {
@@ -10338,11 +10425,8 @@ mod tests {
         .await;
     }
 
-    /// The recovery jobs run on the primary chain only, so a secondary-chain
-    /// mint held for recovery would block its symbol forever. It reconstructs
-    /// as `ActiveTransfer` even with recovery enabled on the primary.
     #[tokio::test]
-    async fn recover_mint_state_holds_only_a_primary_chain_mint_for_recovery() {
+    async fn recover_mint_state_uses_the_mints_own_chain_recovery_flag() {
         let symbol = Symbol::new("AAPL").unwrap();
         let now = Utc::now();
         let trigger = make_trigger_with_recovery_enabled(&symbol).await;
@@ -10376,8 +10460,233 @@ mod tests {
             .cloned();
         assert!(
             matches!(guard, Some(equity::GuardState::ActiveTransfer { .. })),
-            "a HyperEVM mint must not be held for a primary-chain recovery: {guard:?}"
+            "a HyperEVM mint whose own chain does not enable recovery must not be held: {guard:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn recover_secondary_mint_restores_its_own_chain_hold() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let now = Utc::now();
+        let mut config = test_config();
+        let mut assets = ChainAssets::default();
+        assets.equities.symbols.insert(
+            symbol.clone(),
+            ChainEquityAsset {
+                tokenized_equity: Address::ZERO,
+                tokenized_equity_derivative: Address::ZERO,
+                vault_ids: Vec::new(),
+                trading: OperationMode::Disabled,
+                rebalancing: RebalancingMode::Paused,
+                wrapped_equity_recovery: OperationMode::Enabled,
+                operational_limit: None,
+                target_share: None,
+            },
+        );
+        config
+            .chains
+            .insert(Chain::HyperEvm, ChainRebalancingConfig::for_test(assets));
+        let trigger = make_trigger_with_inventory_config(InventoryView::default(), config).await;
+        let id = issuer_request_id("restart-secondary-held");
+        trigger
+            .recover_mint_state(
+                &id,
+                &TokenizedEquityMint::TokensReceived {
+                    chain: Chain::HyperEvm,
+                    symbol: symbol.clone(),
+                    quantity: float!(5),
+                    wallet: Address::ZERO,
+                    issuer_request_id: id.clone(),
+                    tokenization_request_id: tokenization_request_id("restart-secondary-held"),
+                    tx_hash: TxHash::ZERO,
+                    shares_minted: U256::from(5u64),
+                    fees: None,
+                    requested_at: now,
+                    accepted_at: now,
+                    received_at: now,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            trigger.equity_in_progress.read().unwrap().get(&symbol),
+            Some(&equity::GuardState::HeldForRecovery {
+                chain: Chain::HyperEvm
+            })
+        );
+        let recovery_guard = equity::claim_guard_for_recovery_or_orphan(
+            &trigger.equity_in_progress,
+            &symbol,
+            Chain::HyperEvm,
+        )
+        .unwrap();
+        drop(recovery_guard);
+        assert_eq!(
+            trigger.equity_in_progress.read().unwrap().get(&symbol),
+            Some(&equity::GuardState::HeldForRecovery {
+                chain: Chain::HyperEvm
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn recovery_hold_alert_names_chain_retries_and_preserves_hold() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let now = Utc::now();
+        let notifier = Arc::new(FlakyNotifier {
+            remaining_failures: std::sync::atomic::AtomicUsize::new(1),
+            delivered: std::sync::Mutex::new(Vec::new()),
+        });
+        let trigger = make_trigger_with_inventory_config_and_notifier(
+            InventoryView::default(),
+            test_config(),
+            notifier.clone(),
+        )
+        .await;
+        trigger.mark_equity_held_for_recovery(&symbol, Chain::HyperEvm);
+        trigger.alert_stuck_recovery_holds(now).await;
+        trigger
+            .alert_stuck_recovery_holds(now + ChronoDuration::minutes(59))
+            .await;
+        assert_eq!(notifier.delivered.lock().unwrap().len(), 0);
+        trigger
+            .alert_stuck_recovery_holds(now + ChronoDuration::hours(1))
+            .await;
+        assert_eq!(notifier.delivered.lock().unwrap().len(), 0);
+        trigger
+            .alert_stuck_recovery_holds(now + ChronoDuration::hours(1))
+            .await;
+        trigger
+            .alert_stuck_recovery_holds(now + ChronoDuration::hours(2))
+            .await;
+        let delivered = notifier.delivered.lock().unwrap().clone();
+        assert_eq!(delivered.len(), 1);
+        assert!(delivered[0].contains("AAPL"));
+        assert!(delivered[0].contains("hyperevm"));
+        assert_eq!(
+            trigger.equity_in_progress.read().unwrap().get(&symbol),
+            Some(&equity::GuardState::HeldForRecovery {
+                chain: Chain::HyperEvm
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn recovery_hold_alert_keeps_its_deadline_through_failed_recovery_attempts() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let now = Utc::now();
+        let notifier = Arc::new(FlakyNotifier {
+            remaining_failures: std::sync::atomic::AtomicUsize::new(0),
+            delivered: std::sync::Mutex::new(Vec::new()),
+        });
+        let trigger = make_trigger_with_inventory_config_and_notifier(
+            InventoryView::default(),
+            test_config(),
+            notifier.clone(),
+        )
+        .await;
+        trigger.mark_equity_held_for_recovery(&symbol, Chain::HyperEvm);
+        trigger.alert_stuck_recovery_holds(now).await;
+
+        for minutes in [20, 40] {
+            let attempt = equity::claim_guard_for_recovery_or_orphan(
+                &trigger.equity_in_progress,
+                &symbol,
+                Chain::HyperEvm,
+            )
+            .unwrap();
+            trigger
+                .alert_stuck_recovery_holds(now + ChronoDuration::minutes(minutes))
+                .await;
+            drop(attempt);
+        }
+        assert_eq!(
+            trigger.equity_in_progress.read().unwrap().get(&symbol),
+            Some(&equity::GuardState::HeldForRecovery {
+                chain: Chain::HyperEvm
+            })
+        );
+        assert_eq!(notifier.delivered.lock().unwrap().len(), 0);
+
+        trigger
+            .alert_stuck_recovery_holds(now + ChronoDuration::hours(1))
+            .await;
+        assert_eq!(notifier.delivered.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn recovery_hold_alert_fires_while_recovery_is_still_active() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let now = Utc::now();
+        let notifier = Arc::new(FlakyNotifier {
+            remaining_failures: std::sync::atomic::AtomicUsize::new(0),
+            delivered: std::sync::Mutex::new(Vec::new()),
+        });
+        let trigger = make_trigger_with_inventory_config_and_notifier(
+            InventoryView::default(),
+            test_config(),
+            notifier.clone(),
+        )
+        .await;
+        trigger.mark_equity_held_for_recovery(&symbol, Chain::HyperEvm);
+        let attempt = equity::claim_guard_for_recovery_or_orphan(
+            &trigger.equity_in_progress,
+            &symbol,
+            Chain::HyperEvm,
+        )
+        .unwrap();
+        trigger.alert_stuck_recovery_holds(now).await;
+        trigger
+            .alert_stuck_recovery_holds(now + ChronoDuration::hours(1))
+            .await;
+        trigger
+            .alert_stuck_recovery_holds(now + ChronoDuration::hours(2))
+            .await;
+        assert_eq!(notifier.delivered.lock().unwrap().len(), 1);
+        drop(attempt);
+    }
+
+    #[tokio::test]
+    async fn recovery_hold_alert_restarts_its_deadline_after_recovery_releases_the_slot() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let now = Utc::now();
+        let notifier = Arc::new(FlakyNotifier {
+            remaining_failures: std::sync::atomic::AtomicUsize::new(0),
+            delivered: std::sync::Mutex::new(Vec::new()),
+        });
+        let trigger = make_trigger_with_inventory_config_and_notifier(
+            InventoryView::default(),
+            test_config(),
+            notifier.clone(),
+        )
+        .await;
+        trigger.mark_equity_held_for_recovery(&symbol, Chain::HyperEvm);
+        trigger.alert_stuck_recovery_holds(now).await;
+        trigger
+            .alert_stuck_recovery_holds(now + ChronoDuration::hours(1))
+            .await;
+        assert_eq!(notifier.delivered.lock().unwrap().len(), 1);
+
+        equity::claim_guard_for_recovery_or_orphan(
+            &trigger.equity_in_progress,
+            &symbol,
+            Chain::HyperEvm,
+        )
+        .unwrap()
+        .release();
+        trigger
+            .alert_stuck_recovery_holds(now + ChronoDuration::hours(1))
+            .await;
+
+        trigger.mark_equity_held_for_recovery(&symbol, Chain::HyperEvm);
+        trigger
+            .alert_stuck_recovery_holds(now + ChronoDuration::hours(1))
+            .await;
+        assert_eq!(notifier.delivered.lock().unwrap().len(), 1);
+        trigger
+            .alert_stuck_recovery_holds(now + ChronoDuration::hours(2))
+            .await;
+        assert_eq!(notifier.delivered.lock().unwrap().len(), 2);
     }
 
     #[tokio::test]
@@ -12890,6 +13199,7 @@ mod tests {
                 allocation: test_config().allocation,
                 usdc: UsdcCorridors::base_cctp_disabled(),
                 transfer_timeout: test_config().transfer_timeout,
+                recovery_hold_alert_after: test_config().recovery_hold_alert_after,
                 chains: BTreeMap::from([(
                     Chain::Base,
                     ChainRebalancingConfig::for_test(ChainAssets::default()),
@@ -24327,9 +24637,9 @@ mod tests {
         }
     }
 
-    /// Services for Base and HyperEVM, each listing `symbol` with wrapped
-    /// equity recovery enabled, so the test proves it is the chain and not
-    /// the recovery flag that keeps a secondary-chain mint out of the handoff.
+    /// Services for Base and HyperEVM, each listing `symbol` with rebalancing
+    /// and wrapped equity recovery enabled, the only rebalancing listing the
+    /// config loader accepts.
     fn recovery_enabled_services_on_both_chains(symbol: &Symbol) -> EquityTransferServices {
         let equities = ChainEquities {
             operational_limit: None,
@@ -24370,13 +24680,13 @@ mod tests {
         }
     }
 
-    /// A secondary-chain mint stuck after receipt is never handed to the
-    /// primary-chain recovery jobs, so an exhausted transfer job leaves the
-    /// symbol guard and the Position reservation in place. The transfer
-    /// timeout sweep is the durable owner that unlatches it on any chain: it
-    /// fails the mint, clears the guard and releases the reservation.
+    /// A secondary-chain mint that fails after receipt is held for that
+    /// chain's recovery. The transfer timeout sweep must leave it alone while
+    /// it is held and while a recovery attempt has claimed it, however long
+    /// the recovery takes: failing it would release the guard and the
+    /// reservation while recovery still moves the tokens.
     #[tokio::test]
-    async fn secondary_chain_mint_exhausted_after_receipt_is_unlatched_by_the_transfer_timeout() {
+    async fn secondary_chain_mint_held_after_receipt_survives_the_transfer_timeout() {
         let symbol = Symbol::new("AAPL").unwrap();
         let id = issuer_request_id("exhausted-secondary-mint");
         let service = make_trigger_with_inventory(InventoryView::default().with_equity(
@@ -24453,7 +24763,6 @@ mod tests {
             mint_store: mint_store.clone(),
             position_authority: Some((position_store, ExecutionThreshold::whole_share())),
             transfer_services: services,
-            primary_chain: Chain::Base,
             job_queue: service.transfer_equity_to_market_making_queue.clone(),
         };
         let job = TransferEquityToMarketMaking {
@@ -24466,65 +24775,84 @@ mod tests {
             position_reservation_retry_attempts: 0,
         };
 
-        let error = Job::perform(&job, &ctx).await.unwrap_err();
-        assert!(
-            matches!(
-                error,
-                TransferEquityToMarketMakingJobError::Transfer(MintTransferError::PostReceipt(_))
-            ),
-            "a secondary-chain PostReceipt must propagate for retry, got {error:?}"
-        );
-
-        Job::on_terminal_attempt(
-            &job,
-            &ctx,
-            &TaskIdentity::for_test("exhausted-secondary-mint"),
-        )
-        .await
-        .unwrap();
+        Job::perform(&job, &ctx).await.unwrap();
+        let held = equity::GuardState::HeldForRecovery {
+            chain: Chain::HyperEvm,
+        };
         assert_eq!(
             service.equity_in_progress.read().unwrap().get(&symbol),
-            Some(&equity::GuardState::ActiveTransfer { generation }),
-            "exhaustion keeps the guard while the mint aggregate is live"
+            Some(&held)
         );
-        assert_eq!(
-            position_projection
-                .load(&symbol)
-                .await
-                .unwrap()
-                .unwrap()
-                .equity_transfer_reservation
-                .unwrap()
-                .status,
-            EquityTransferReservationStatus::Confirmed
-        );
+
+        let assert_mint_untouched = async || {
+            assert!(matches!(
+                mint_store.load(&id).await.unwrap().unwrap(),
+                TokenizedEquityMint::TokensReceived { .. }
+            ));
+            assert!(service.mint_tracking.read().await.contains_key(&id));
+            assert_eq!(
+                position_projection
+                    .load(&symbol)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .equity_transfer_reservation
+                    .unwrap()
+                    .status,
+                EquityTransferReservationStatus::Confirmed
+            );
+        };
 
         service
             .expire_stuck_operations(Utc::now() + ChronoDuration::hours(24))
             .await
             .unwrap();
-
         assert_eq!(
             service.equity_in_progress.read().unwrap().get(&symbol),
-            None,
-            "the transfer timeout must release the exhausted secondary-chain mint's guard"
+            Some(&held)
         );
-        let mint = mint_store.load(&id).await.unwrap().unwrap();
-        assert!(
-            matches!(mint, TokenizedEquityMint::Failed { .. }),
-            "the transfer timeout must fail the mint, got {mint:?}"
-        );
+        assert_mint_untouched().await;
+
+        let recovery_guard = equity::claim_guard_for_recovery_or_orphan(
+            &service.equity_in_progress,
+            &symbol,
+            Chain::HyperEvm,
+        )
+        .unwrap();
+        let claimed = service
+            .equity_in_progress
+            .read()
+            .unwrap()
+            .get(&symbol)
+            .cloned();
+        assert!(matches!(
+            claimed,
+            Some(equity::GuardState::Recovering {
+                chain: Chain::HyperEvm,
+                ..
+            })
+        ));
+
+        service
+            .expire_stuck_operations(Utc::now() + ChronoDuration::hours(48))
+            .await
+            .unwrap();
         assert_eq!(
-            position_projection
-                .load(&symbol)
-                .await
+            service
+                .equity_in_progress
+                .read()
                 .unwrap()
-                .unwrap()
-                .equity_transfer_reservation,
-            None,
-            "the transfer timeout must release the Position reservation"
+                .get(&symbol)
+                .cloned(),
+            claimed
         );
-        assert!(!service.mint_tracking.read().await.contains_key(&id));
+        assert_mint_untouched().await;
+
+        drop(recovery_guard);
+        assert_eq!(
+            service.equity_in_progress.read().unwrap().get(&symbol),
+            Some(&held)
+        );
     }
 
     #[tokio::test]
@@ -31125,6 +31453,7 @@ mod tests {
                 allocation: AllocationCtx::base_test(),
                 usdc: UsdcCorridors::base_cctp_disabled(),
                 transfer_timeout: Duration::from_secs(30 * 60),
+                recovery_hold_alert_after: Duration::from_secs(60 * 60),
                 chains: BTreeMap::from([(
                     Chain::Base,
                     ChainRebalancingConfig::for_test(ChainAssets::default()),
@@ -38499,17 +38828,18 @@ mod tests {
         );
     }
 
-    /// `clear_equity_in_progress_unless_held_for_recovery` is the single-lock
+    /// `clear_equity_in_progress_unless_recovery_owned` is the single-lock
     /// check-and-clear that closes the timeout-sweep TOCTOU race: a concurrent
     /// `mark_held_for_recovery` can flip `ActiveTransfer` -> `HeldForRecovery`
     /// after the steady-state check but before the clear, and a non-atomic clear
     /// would drop the recovery-owned guard and fail a mint whose tokens are still
     /// in the wallet -- the double-mint this guard exists to prevent. This
-    /// verifies the invariant the race hinges on: a `HeldForRecovery` slot is
-    /// never cleared (caller skips the failure event), while an `ActiveTransfer`
-    /// or absent slot is cleared so a fresh rebalance can proceed.
+    /// verifies the invariant the race hinges on: a `HeldForRecovery` or
+    /// `Recovering` slot is never cleared (caller skips the failure event),
+    /// while an `ActiveTransfer` or absent slot is cleared so a fresh rebalance
+    /// can proceed.
     #[tokio::test]
-    async fn clear_equity_in_progress_unless_held_for_recovery_preserves_recovery_ownership() {
+    async fn clear_equity_in_progress_unless_recovery_owned_preserves_recovery_ownership() {
         let symbol = Symbol::new("AAPL").unwrap();
 
         let config = test_config_with_timeout(Duration::from_secs(60));
@@ -38544,13 +38874,28 @@ mod tests {
             equity::GuardState::HeldForRecovery { chain: Chain::Base },
         );
         assert!(
-            !trigger.clear_equity_in_progress_unless_held_for_recovery(&symbol),
+            !trigger.clear_equity_in_progress_unless_recovery_owned(&symbol),
             "a HeldForRecovery slot must not be cleared by the timeout path",
         );
         assert_eq!(
             trigger.equity_in_progress.read().unwrap().get(&symbol),
             Some(&equity::GuardState::HeldForRecovery { chain: Chain::Base }),
             "the HeldForRecovery guard must remain after a refused clear",
+        );
+
+        let recovering = equity::GuardState::Recovering {
+            chain: Chain::Base,
+            generation: equity::GuardGeneration::default(),
+        };
+        trigger
+            .equity_in_progress
+            .write()
+            .unwrap()
+            .insert(symbol.clone(), recovering.clone());
+        assert!(!trigger.clear_equity_in_progress_unless_recovery_owned(&symbol));
+        assert_eq!(
+            trigger.equity_in_progress.read().unwrap().get(&symbol),
+            Some(&recovering)
         );
 
         // ActiveTransfer: a live transfer that genuinely timed out -- clear it so
@@ -38562,7 +38907,7 @@ mod tests {
             },
         );
         assert!(
-            trigger.clear_equity_in_progress_unless_held_for_recovery(&symbol),
+            trigger.clear_equity_in_progress_unless_recovery_owned(&symbol),
             "an ActiveTransfer slot must be cleared so a fresh rebalance can proceed",
         );
         assert_eq!(
@@ -38573,7 +38918,7 @@ mod tests {
 
         // Absent: clearing is a no-op that still reports success.
         assert!(
-            trigger.clear_equity_in_progress_unless_held_for_recovery(&symbol),
+            trigger.clear_equity_in_progress_unless_recovery_owned(&symbol),
             "an absent slot must report a successful (no-op) clear",
         );
     }

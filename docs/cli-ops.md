@@ -15,8 +15,8 @@ Every command that itself submits an onchain operation takes `--network`
 (`base`, `ethereum`, `hyperevm`, `robinhood`; default `base`) and runs on that
 chain's signing wallet. The `transfer` recovery verbs (`recheck`, `resume`,
 `reconcile`, `fail`) take no `--network`: they act on the bot's local records or
-hand the work to the running bot, whose recovery runs on the primary chain's
-services. Two contracts apply to the network-aware commands:
+hand the work to the running bot, which resumes each mint or redemption on the
+chain its record names. Two contracts apply to the network-aware commands:
 
 - Orderbook-backed commands (`vault-deposit`, `vault-withdraw`,
   `vault-withdraw-usdc`, `reset-allowance`, `transfer-equity`, `donate-equity`,

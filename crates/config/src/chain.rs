@@ -585,14 +585,15 @@ pub enum ChainRegistryError {
     )]
     MultiplePrimaryChains { chains: Vec<Chain> },
     #[error(
-        "[chains.{chain}.trading.assets.equities.{symbol}] sets wrapped_equity_recovery = \
-         \"enabled\", but wrapped-equity recovery runs only on the primary chain ({primary_chain})"
+        "[chains.{chain}.trading.assets.equities.{symbol}] enables recovery without \
+         equity services; rebalancing must be enabled or paused"
     )]
-    WrappedEquityRecoveryOnSecondary {
-        chain: Chain,
-        symbol: Symbol,
-        primary_chain: Chain,
-    },
+    RecoveryRequiresEquityServices { chain: Chain, symbol: Symbol },
+    #[error(
+        "[chains.{chain}.trading.assets.equities.{symbol}] enables or pauses rebalancing \
+         without wrapped_equity_recovery = \"enabled\""
+    )]
+    RebalancingRequiresRecovery { chain: Chain, symbol: Symbol },
     #[error(transparent)]
     Entry(#[from] ChainConfigError),
     #[error(transparent)]
@@ -684,6 +685,10 @@ fn enabled_chains(
         });
     }
 
+    for (chain, _, trading) in &hedged_chains {
+        validate_equity_recovery(*chain, *chain == primary_chain, &trading.assets)?;
+    }
+
     for (chain, config) in &enabled {
         check_enablement(
             *chain,
@@ -693,29 +698,41 @@ fn enabled_chains(
         )?;
     }
 
-    // Recovery is wired for the primary chain only; a secondary listing that
-    // enables it would strand a failed mint's tokens with no signal.
-    for (chain, _, trading) in &hedged_chains {
-        if *chain == primary_chain {
-            continue;
-        }
-        if let Some(symbol) = first_equity_matching(&trading.assets, |equity| {
-            equity.wrapped_equity_recovery == OperationMode::Enabled
-        }) {
-            return Err(ChainRegistryError::WrappedEquityRecoveryOnSecondary {
-                chain: *chain,
-                symbol: symbol.clone(),
-                primary_chain,
-            });
-        }
-    }
-
     Ok(EnabledChains {
         enabled,
         primary_chain,
         chain_config,
         trading_table,
     })
+}
+
+fn validate_equity_recovery(
+    chain: Chain,
+    primary: bool,
+    assets: &ChainAssets,
+) -> Result<(), ChainRegistryError> {
+    if let Some(symbol) = first_equity_matching(assets, |equity| {
+        equity.rebalancing.keeps_services()
+            && equity.wrapped_equity_recovery == OperationMode::Disabled
+    }) {
+        return Err(ChainRegistryError::RebalancingRequiresRecovery {
+            chain,
+            symbol: symbol.clone(),
+        });
+    }
+    if primary {
+        return Ok(());
+    }
+    if let Some(symbol) = first_equity_matching(assets, |equity| {
+        equity.wrapped_equity_recovery == OperationMode::Enabled
+            && !equity.rebalancing.keeps_services()
+    }) {
+        return Err(ChainRegistryError::RecoveryRequiresEquityServices {
+            chain,
+            symbol: symbol.clone(),
+        });
+    }
+    Ok(())
 }
 
 /// A hedged chain's place in the registry: THE primary, which always carries
@@ -1574,11 +1591,8 @@ mod tests {
         );
     }
 
-    /// Wrapped-equity recovery runs only on the primary chain, so a
-    /// secondary listing that enables it is refused at load rather than
-    /// silently left without recovery.
     #[test]
-    fn registry_rejects_wrapped_equity_recovery_on_a_secondary_chain() {
+    fn registry_rejects_secondary_recovery_without_equity_services() {
         let mut ethereum = primary_trading_config_toml(false);
         ethereum.assets.equities.symbols.insert(
             Symbol::new("AAPL").unwrap(),
@@ -1603,9 +1617,56 @@ mod tests {
 
         assert_eq!(
             error.to_string(),
-            "[chains.ethereum.trading.assets.equities.AAPL] sets wrapped_equity_recovery = \
-             \"enabled\", but wrapped-equity recovery runs only on the primary chain (base)"
+            "[chains.ethereum.trading.assets.equities.AAPL] enables recovery without \
+             equity services; rebalancing must be enabled or paused"
         );
+    }
+
+    #[test]
+    fn enabled_and_paused_rebalancing_require_recovery_on_every_chain() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        for chain in [
+            Chain::Base,
+            Chain::Ethereum,
+            Chain::HyperEvm,
+            Chain::Robinhood,
+        ] {
+            for mode in [RebalancingMode::Enabled, RebalancingMode::Paused] {
+                let mut trading = trading_config_toml();
+                trading.assets.equities.symbols.insert(
+                    symbol.clone(),
+                    ChainEquityAsset {
+                        tokenized_equity: Address::ZERO,
+                        tokenized_equity_derivative: Address::ZERO,
+                        vault_ids: Vec::new(),
+                        trading: OperationMode::Disabled,
+                        rebalancing: mode,
+                        wrapped_equity_recovery: OperationMode::Disabled,
+                        operational_limit: None,
+                        target_share: None,
+                    },
+                );
+                let error = validate_equity_recovery(chain, chain == Chain::Base, &trading.assets)
+                    .unwrap_err();
+                assert!(
+                    matches!(error, ChainRegistryError::RebalancingRequiresRecovery {
+                    chain: error_chain, symbol: ref error_symbol
+                } if error_chain == chain && error_symbol == &symbol)
+                );
+                trading
+                    .assets
+                    .equities
+                    .symbols
+                    .get_mut(&symbol)
+                    .unwrap()
+                    .wrapped_equity_recovery = OperationMode::Enabled;
+                validate_equity_recovery(chain, chain == Chain::Base, &trading.assets).unwrap();
+                let listing = trading.assets.equities.symbols.get_mut(&symbol).unwrap();
+                listing.rebalancing = RebalancingMode::Disabled;
+                listing.wrapped_equity_recovery = OperationMode::Disabled;
+                validate_equity_recovery(chain, chain == Chain::Base, &trading.assets).unwrap();
+            }
+        }
     }
 
     #[test]
