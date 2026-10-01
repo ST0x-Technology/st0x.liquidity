@@ -377,13 +377,14 @@ impl From<&RawCurrency> for QuotedCurrency {
 }
 
 impl QuoteResponse {
-    /// Checks the quote against `request` and reads the order id from the
-    /// deposit calldata.
-    pub(super) fn validate(self, request: &QuoteRequest) -> Result<RelayQuote, QuoteMismatch> {
+    /// Checks the quote against `request` and the origin's pinned `depository`,
+    /// and reads the order id from the deposit calldata.
+    pub(super) fn validate(
+        self,
+        request: &QuoteRequest,
+        depository: Address,
+    ) -> Result<RelayQuote, QuoteMismatch> {
         let origin = request.origin;
-        let depository = origin
-            .relay_depository()
-            .ok_or(QuoteMismatch::NoDepository { chain: origin })?;
         let origin_stable = origin.settlement_stable().address;
 
         check_stable_decimals(
@@ -787,7 +788,7 @@ pub(super) mod tests {
     fn validate(body: &Value, request: &QuoteRequest) -> Result<RelayQuote, QuoteMismatch> {
         serde_json::from_value::<QuoteResponse>(body.clone())
             .unwrap()
-            .validate(request)
+            .validate(request, request.origin.relay_depository().unwrap())
     }
 
     fn funded_body() -> Value {
@@ -1050,21 +1051,6 @@ pub(super) mod tests {
 
         assert!(
             matches!(error, QuoteMismatch::UnexpectedStep { position: 0 }),
-            "{error:?}"
-        );
-    }
-
-    #[test]
-    fn origin_without_a_depository_is_refused() {
-        let request = QuoteRequest {
-            origin: Chain::Base,
-            ..funded_request()
-        };
-
-        let error = validate(&funded_body(), &request).unwrap_err();
-
-        assert!(
-            matches!(error, QuoteMismatch::NoDepository { chain: Chain::Base }),
             "{error:?}"
         );
     }
