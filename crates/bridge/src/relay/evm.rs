@@ -30,12 +30,15 @@ const RELAY_DEPOSIT_GAS_LIMIT: u64 = 57_114;
 /// Blocks per `eth_getLogs` call of a deposit scan.
 const DEPOSIT_LOG_CHUNK: u64 = 10_000;
 
-/// Who builds a [`RelayBridge`]: the corridor chain and a wallet on each end.
+/// Who builds a [`RelayBridge`]: the corridor chain and a wallet on each end,
+/// with the confirmations each end's wallet waits for.
 pub struct RelayCtx<EthWallet, ChainWallet> {
     /// The corridor chain Relay connects to the Ethereum hub.
     pub chain: Chain,
     pub ethereum_wallet: EthWallet,
     pub chain_wallet: ChainWallet,
+    pub ethereum_confirmations: u64,
+    pub chain_confirmations: u64,
 }
 
 /// Locally deployed stand-ins for one end's stable and depository.
@@ -59,6 +62,8 @@ struct RelayEnd<W> {
     stable: Address,
     depository: Address,
     wallet: W,
+    /// A deposit scan stops this many blocks behind the head.
+    confirmations: u64,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -116,8 +121,12 @@ impl<EthWallet: Wallet, ChainWallet: Wallet> RelayBridge<EthWallet, ChainWallet>
         }
 
         Ok(Self {
-            hub: RelayEnd::pinned(Chain::Ethereum, ctx.ethereum_wallet)?,
-            chain: RelayEnd::pinned(ctx.chain, ctx.chain_wallet)?,
+            hub: RelayEnd::pinned(
+                Chain::Ethereum,
+                ctx.ethereum_wallet,
+                ctx.ethereum_confirmations,
+            )?,
+            chain: RelayEnd::pinned(ctx.chain, ctx.chain_wallet, ctx.chain_confirmations)?,
             log_chunk: DEPOSIT_LOG_CHUNK,
         })
     }
@@ -360,7 +369,7 @@ impl<EthWallet: Wallet, ChainWallet: Wallet> SwapBridge for RelayBridge<EthWalle
 }
 
 impl<W: Wallet> RelayEnd<W> {
-    fn pinned(chain: Chain, wallet: W) -> Result<Self, RelayBridgeError> {
+    fn pinned(chain: Chain, wallet: W, confirmations: u64) -> Result<Self, RelayBridgeError> {
         let depository = chain
             .relay_depository()
             .ok_or(RelayBridgeError::NoDepository { chain })?;
@@ -370,6 +379,7 @@ impl<W: Wallet> RelayEnd<W> {
             stable: chain.settlement_stable().address,
             depository,
             wallet,
+            confirmations,
         })
     }
 
@@ -576,7 +586,9 @@ impl<W: Wallet> RelayEnd<W> {
     }
 
     /// `RelayErc20Deposit` has no indexed field, so every deposit log in the
-    /// range is fetched and decoded, chunk by chunk.
+    /// range is fetched and decoded, chunk by chunk. The scan stops
+    /// `confirmations` blocks behind the head: a lagging load-balanced node may
+    /// not have indexed the newest blocks, and a deposit there is unconfirmed.
     async fn find_deposits(
         &self,
         order_ids: &[RelayOrderId],
@@ -589,11 +601,14 @@ impl<W: Wallet> RelayEnd<W> {
             return Err(RelayBridgeError::ScanAheadOfHead { from_block, head });
         }
 
+        let scanned_to = head.saturating_sub(self.confirmations);
         let mut deposits = Vec::new();
         let mut start = from_block;
 
-        while start <= head {
-            let end = start.saturating_add(chunk.saturating_sub(1)).min(head);
+        while start <= scanned_to {
+            let end = start
+                .saturating_add(chunk.saturating_sub(1))
+                .min(scanned_to);
 
             let filter = Filter::new()
                 .address(self.depository)
@@ -633,13 +648,14 @@ impl<W: Wallet> RelayEnd<W> {
             chain = %self.chain,
             from_block,
             head,
+            scanned_to,
             found = deposits.len(),
             "Relay deposit scan done"
         );
 
         Ok(DepositScan {
             deposits,
-            scanned_to: head,
+            scanned_to,
         })
     }
 
@@ -736,6 +752,9 @@ mod tests {
 
     const MINIMUM_OUT: U256 = U256::from_limbs([4_749_464, 0, 0, 0]);
 
+    /// What a deposit scan stays behind the head on either end.
+    const CONFIRMATIONS: u64 = 3;
+
     /// Our wallet's view of the hub and a corridor chain, each an Anvil chain
     /// with a stable and a depository.
     struct Harness {
@@ -753,6 +772,8 @@ mod tests {
                 chain: Chain::Robinhood,
                 ethereum_wallet: wallet(&hub),
                 chain_wallet: wallet(&chain),
+                ethereum_confirmations: CONFIRMATIONS,
+                chain_confirmations: CONFIRMATIONS,
             })
             .unwrap()
             .with_local_contracts(contracts(&hub), contracts(&chain));
@@ -988,6 +1009,8 @@ mod tests {
                 on_deposit,
                 stable: harness.chain.stable,
             },
+            ethereum_confirmations: CONFIRMATIONS,
+            chain_confirmations: CONFIRMATIONS,
         })
         .unwrap()
         .with_local_contracts(contracts(&harness.hub), contracts(&harness.chain))
@@ -1060,6 +1083,8 @@ mod tests {
             chain: Chain::Ethereum,
             ethereum_wallet: offline_wallet(),
             chain_wallet: offline_wallet(),
+            ethereum_confirmations: CONFIRMATIONS,
+            chain_confirmations: CONFIRMATIONS,
         })
         .err()
         .unwrap();
@@ -1076,6 +1101,8 @@ mod tests {
             chain: Chain::Base,
             ethereum_wallet: offline_wallet(),
             chain_wallet: offline_wallet(),
+            ethereum_confirmations: CONFIRMATIONS,
+            chain_confirmations: CONFIRMATIONS,
         })
         .err()
         .unwrap();
@@ -1750,6 +1777,7 @@ mod tests {
 
         let top_up = harness.chain.top_up_depository(AMOUNT).await;
         harness.chain.deposit_from_deployer(AMOUNT, order_id).await;
+        harness.chain.mine(CONFIRMATIONS).await;
 
         let scan = harness
             .bridge
@@ -1812,10 +1840,49 @@ mod tests {
             scan,
             DepositScan {
                 deposits: vec![ours],
-                scanned_to: head,
+                scanned_to: head - CONFIRMATIONS,
             }
         );
         assert_eq!(both.deposits, vec![ours, other]);
+    }
+
+    #[tokio::test]
+    async fn deposit_scan_stops_its_confirmations_behind_the_head() {
+        let harness = Harness::new().await;
+        let from_block = harness
+            .bridge
+            .origin_block(HopDirection::ToHub)
+            .await
+            .unwrap();
+        let deposit = harness.deposit_to_hub(B256::random()).await;
+        harness.chain.mine(CONFIRMATIONS - 1).await;
+
+        let early = harness
+            .bridge
+            .find_recent_deposits(HopDirection::ToHub, &[deposit.order_id], from_block)
+            .await
+            .unwrap();
+        harness.chain.mine(1).await;
+        let confirmed = harness
+            .bridge
+            .find_recent_deposits(HopDirection::ToHub, &[deposit.order_id], from_block)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            early,
+            DepositScan {
+                deposits: vec![],
+                scanned_to: deposit.block - 1,
+            }
+        );
+        assert_eq!(
+            confirmed,
+            DepositScan {
+                deposits: vec![deposit],
+                scanned_to: deposit.block,
+            }
+        );
     }
 
     #[tokio::test]
