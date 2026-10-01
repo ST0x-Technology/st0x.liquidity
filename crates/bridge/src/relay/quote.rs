@@ -321,6 +321,7 @@ impl QuoteResponse {
                 amount_in: request.amount,
                 expected_out: self.details.currency_out.amount,
                 minimum_out: self.details.currency_out.minimum_amount,
+                slippage: request.slippage,
             },
             fees: QuoteFees {
                 relayer: self.fees.relayer.amount,
@@ -594,6 +595,7 @@ pub(super) mod tests {
                 amount_in: U256::from(5_000_000),
                 expected_out: U256::from(4_763_755),
                 minimum_out: U256::from(4_749_464),
+                slippage: BasisPoints::new(30).unwrap(),
             }
         );
         assert_eq!(
