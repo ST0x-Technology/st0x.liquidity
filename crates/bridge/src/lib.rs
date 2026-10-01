@@ -282,7 +282,9 @@ pub struct SwapDeposit<OrderId> {
 pub struct DepositScan<OrderId> {
     pub deposits: Vec<SwapDeposit<OrderId>>,
     /// The last block the scan covered, the newest with the origin chain's
-    /// confirmations: a deposit mined later is not covered.
+    /// confirmations: a deposit mined later is not covered. Never below
+    /// `from_block - 1`, so a scan from an unconfirmed block leaves the
+    /// caller's cursor where it was.
     pub scanned_to: u64,
 }
 
