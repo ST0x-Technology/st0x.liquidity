@@ -1196,6 +1196,13 @@ mod held_receipt {
             self.inner.discard_prepared(tx_hash).await;
         }
 
+        async fn prepare_fee_replacement(
+            &self,
+            prepared: &PreparedTransaction,
+        ) -> Result<Option<PreparedTransaction>, EvmError> {
+            self.inner.prepare_fee_replacement(prepared).await
+        }
+
         async fn release_superseded(&self, tx_hash: TxHash) {
             self.inner.release_superseded(tx_hash).await;
         }

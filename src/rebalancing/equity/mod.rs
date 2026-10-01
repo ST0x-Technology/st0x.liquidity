@@ -39,7 +39,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use rain_math_float::Float;
 use sqlx::SqlitePool;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 use thiserror::Error;
@@ -73,7 +73,7 @@ use crate::bot_gas::{
 use crate::conductor::job::QueuePushError;
 use crate::equity_redemption::{
     DetectionFailure, EquityRedemption, EquityRedemptionCommand, EquityRedemptionError,
-    RedemptionAggregateId,
+    RedemptionAggregateId, UnwrappedProvenance, reattest_legacy_underlying,
 };
 use crate::mint_authorization::{ConfiguredMintAuthorizer, VaultModeCheckError, VaultModeReader};
 use crate::native_gas::{ConfiguredGasReadiness, GasReadinessFailure, TransferGasRoute};
@@ -106,6 +106,105 @@ const WITHDRAWAL_RECONCILIATION_ALERT_DEADLINE: Duration = Duration::from_secs(4
 /// idempotent resume keeps running (or an operator reconciles the withdrawal).
 const WITHDRAWAL_RECONCILIATION_POST_DEADLINE_REDRIVE_DELAY: Duration =
     Duration::from_secs(30 * 60);
+
+/// Time after which the newest candidate of a pending send to the issuer is redriven at
+/// [`ISSUER_SEND_SLOW_REDRIVE_DELAY`] instead of
+/// [`WITHDRAWAL_RECONCILIATION_REDRIVE_DELAY`]. The operator is paged once at
+/// `transfer_timeout` by the rebalancing trigger, so this only slows the
+/// cadence; every redrive still considers a fee replacement.
+const ISSUER_SEND_SLOW_REDRIVE_AFTER: Duration = Duration::from_secs(4 * 60 * 60);
+
+/// Redrive delay of a pending send to the issuer once its newest candidate has been
+/// unmined for [`ISSUER_SEND_SLOW_REDRIVE_AFTER`].
+const ISSUER_SEND_SLOW_REDRIVE_DELAY: Duration = Duration::from_secs(30 * 60);
+
+/// The next drive of a redemption that may hold a persisted signed issuer
+/// send.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct IssuerSendRedrive {
+    /// The newest signed copy, or `None` when the redemption's state could not
+    /// be read.
+    pub(crate) tx_hash: Option<TxHash>,
+    pub(crate) delay: Duration,
+}
+
+/// The redrive of a redemption that holds a persisted signed send to the issuer, with
+/// the delay before the next drive anchored on when its newest copy was
+/// signed. `None` when the redemption holds no signed send.
+///
+/// A signed send reserves its nonce until it resolves, so every failure to
+/// drive it is redriven instead of spending a job's finite retry budget. Once
+/// that budget is spent nothing drives the send until a restart, and every
+/// later send from the wallet queues behind its nonce. A state that cannot be
+/// read may hold such a send, so it is redriven too rather than falling through
+/// to the budget.
+pub(crate) async fn issuer_send_redrive(
+    redemption_store: &Store<EquityRedemption>,
+    aggregate_id: &RedemptionAggregateId,
+) -> Option<IssuerSendRedrive> {
+    let aggregate = match redemption_store.load(aggregate_id).await {
+        Ok(aggregate) => aggregate?,
+        Err(error) => {
+            warn!(target: "rebalance", %aggregate_id, ?error, "Could not read the redemption to check for a signed send to the issuer; redriving it");
+            return Some(IssuerSendRedrive {
+                tx_hash: None,
+                delay: WITHDRAWAL_RECONCILIATION_REDRIVE_DELAY,
+            });
+        }
+    };
+    let EquityRedemption::SendPending {
+        prepared_send: Some(_),
+        last_send_signed_at,
+        ..
+    } = &aggregate
+    else {
+        return None;
+    };
+    let tx_hash = aggregate.reconcilable_signed_tx()?.tx_hash();
+    let unmined_for = last_send_signed_at
+        .and_then(|signed_at| Utc::now().signed_duration_since(signed_at).to_std().ok())
+        .unwrap_or_default();
+    let delay = if unmined_for >= ISSUER_SEND_SLOW_REDRIVE_AFTER {
+        ISSUER_SEND_SLOW_REDRIVE_DELAY
+    } else {
+        WITHDRAWAL_RECONCILIATION_REDRIVE_DELAY
+    };
+    Some(IssuerSendRedrive {
+        tx_hash: Some(tx_hash),
+        delay,
+    })
+}
+
+/// Pages that a legacy redemption's recorded underlying is not the token its
+/// vault attests, so its send to the issuer is never signed. Retrying cannot change
+/// that, so the job stops instead of spending its retry budget.
+pub(crate) async fn page_underlying_mismatch(
+    notifier: &Arc<dyn Notifier>,
+    aggregate_id: &RedemptionAggregateId,
+    error: &RedemptionError,
+) {
+    let RedemptionError::ReattestLegacyUnderlying(
+        EquityRedemptionError::LegacyUnderlyingMismatch {
+            symbol,
+            recorded,
+            attested,
+        },
+    ) = error
+    else {
+        return;
+    };
+    let message = format!(
+        "Equity redemption {aggregate_id} ({symbol}): its legacy record names the underlying \
+         {recorded}, but the vault attests {attested}, so the bot will not sign its send to the \
+         issuer, and retrying cannot change that. The unwrapped tokens stay in the bot wallet, and \
+         the redemption keeps its guard and inflight. Check onchain which token the wallet holds, \
+         then end the redemption with `stox transfer fail --kind redemption --id {aggregate_id} \
+         --reason <reason>` and handle those tokens by hand."
+    );
+    if let Err(alert_error) = notifier.notify(&message).await {
+        warn!(target: "rebalance", %aggregate_id, %alert_error, "Failed to deliver the underlying mismatch alert");
+    }
+}
 
 /// The durable timestamp a stuck withdrawal's reconciliation deadline is
 /// anchored on, or `None` when the aggregate is not in a withdrawal-submitting
@@ -300,6 +399,194 @@ pub enum WithdrawalNotSuperseded {
     },
 }
 
+/// Which signed transaction of a redemption a reconcile must prove can never
+/// land.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SignedRedemptionTx {
+    /// The vault withdrawal that started the redemption.
+    VaultWithdrawal,
+    /// The send to the issuer of the unwrapped tokens, and each fee replacement of it.
+    IssuerSend,
+}
+
+/// A reconcile refused by the chain check, worded for the signed tx it read.
+///
+/// A send to the issuer that went through must be left to recovery to record
+/// `TokensSent`, not treated as a withdrawal.
+#[derive(Debug)]
+pub struct SignedTxNotSuperseded {
+    pub kind: SignedRedemptionTx,
+    pub refusal: WithdrawalNotSuperseded,
+}
+
+impl std::fmt::Display for SignedTxNotSuperseded {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        use WithdrawalNotSuperseded::*;
+
+        if self.kind == SignedRedemptionTx::VaultWithdrawal {
+            return write!(formatter, "{}", self.refusal);
+        }
+        match &self.refusal {
+            UnreadableWithdrawal { tx } => write!(
+                formatter,
+                "send {tx} to the issuer is not a readable signed transaction; its signer is unknown"
+            ),
+            WithdrawalSignedByAnotherWallet {
+                tx,
+                signer,
+                bot_wallet,
+            } => write!(
+                formatter,
+                "send {tx} to the issuer was signed by {signer}, not the bot wallet {bot_wallet} \
+                 (was the key rotated?): only a tx from {signer} at its nonce supersedes it"
+            ),
+            WithdrawalWentThrough { tx } => write!(
+                formatter,
+                "send {tx} to the issuer is mined and succeeded: the tokens reached the issuer's \
+                 redemption wallet, so do not reconcile or settle by hand. Recovery records it \
+                 as TokensSent and then follows the Alpaca redemption; if no job drives it, run \
+                 `stox transfer resume --kind equity` or restart the bot"
+            ),
+            WithdrawalRevertUnconfirmed {
+                tx,
+                confirmations,
+                required,
+            } => write!(
+                formatter,
+                "send {tx} to the issuer reverted, which used its nonce and moved nothing, but has \
+                 {confirmations} of the {required} required confirmations; retry once it has them"
+            ),
+            NoSupersedingTx { tx, nonce } => write!(
+                formatter,
+                "send {tx} to the issuer, signed at nonce {nonce}, has no canonical receipt on \
+                 this node. That does not prove it cannot land: it may be pending below the market \
+                 fee and mine when fees drop, or a lagging node may not show it yet. Cancel it \
+                 with a higher fee 0-value self-transfer with no calldata (not EIP-7702) from the \
+                 bot wallet at nonce {nonce}, then name that tx with --superseding-tx (API: \
+                 supersedingTx) once it has the required confirmations"
+            ),
+            SupersedingTxIsTheWithdrawal { tx } => write!(
+                formatter,
+                "superseding tx {tx} is the send to the issuer itself, which is not mined: name \
+                 the tx that took its nonce"
+            ),
+            SupersedingTxAtAnotherNonce {
+                superseding,
+                superseding_nonce,
+                nonce,
+            } => write!(
+                formatter,
+                "superseding tx {superseding} is at nonce {superseding_nonce}, not the issuer \
+                 send's nonce {nonce}"
+            ),
+            SupersedingTxNotAPlainCancel {
+                superseding,
+                bot_wallet,
+            } => write!(
+                formatter,
+                "superseding tx {superseding} succeeded but is not a plain cancel (a 0-value \
+                 transfer with no calldata from the bot wallet {bot_wallet} to itself, not \
+                 EIP-7702, that emitted no logs), so it may have sent the tokens: do not \
+                 reconcile or settle by hand. If it is one of the redemption's own signed copies \
+                 of the send, recovery records it as TokensSent; otherwise check what it did \
+                 onchain"
+            ),
+            NoConfirmationDepth { chain } => write!(
+                formatter,
+                "no [chains.{chain}] required_confirmations: it gates the check of the send to the issuer"
+            ),
+            SupersedingTxNotMined { .. }
+            | SupersedingTxFromAnotherSender { .. }
+            | SupersedingTxUnconfirmed { .. }
+            | ChainServicesMissing(_)
+            | Read { .. } => write!(formatter, "{}", self.refusal),
+        }
+    }
+}
+
+impl std::error::Error for SignedTxNotSuperseded {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        std::error::Error::source(&self.refusal)
+    }
+}
+
+/// Proves that none of `signed` can ever land.
+///
+/// `signed` is a redemption's signed vault withdrawal, or every signed copy of
+/// its send to the issuer, which share one nonce (see `verify_withdrawal_superseded`
+/// for the proof each must pass). A copy that went through outranks any other
+/// refusal, so the operator is told the send landed rather than to cancel an
+/// older copy. With no `superseding_tx`, a copy that reverted with the required
+/// confirmations used the shared nonce and moved nothing, so it is the proof
+/// for the other copies.
+pub async fn verify_signed_redemption_txs_superseded(
+    raindex: &dyn Raindex,
+    kind: SignedRedemptionTx,
+    signed: &[&PreparedTransaction],
+    superseding_tx: Option<TxHash>,
+    bot_wallet: Address,
+    required_confirmations: u64,
+) -> Result<(), SignedTxNotSuperseded> {
+    let mut first_refusal = None;
+    let mut reverted_copy = None;
+    for prepared in signed {
+        match verify_withdrawal_superseded(
+            raindex,
+            prepared,
+            superseding_tx,
+            bot_wallet,
+            required_confirmations,
+        )
+        .await
+        {
+            Ok(()) => {
+                if superseding_tx.is_none() {
+                    reverted_copy.get_or_insert_with(|| prepared.tx_hash());
+                }
+            }
+            Err(refusal @ WithdrawalNotSuperseded::WithdrawalWentThrough { .. }) => {
+                return Err(SignedTxNotSuperseded { kind, refusal });
+            }
+            // A copy that reverted short of its confirmations is the next step
+            // to report: an older copy's missing receipt would ask for a cancel
+            // at a nonce already used.
+            Err(refusal @ WithdrawalNotSuperseded::WithdrawalRevertUnconfirmed { .. }) => {
+                first_refusal = Some(refusal);
+            }
+            Err(refusal) => {
+                if !matches!(
+                    first_refusal,
+                    Some(WithdrawalNotSuperseded::WithdrawalRevertUnconfirmed { .. })
+                ) {
+                    first_refusal.get_or_insert(refusal);
+                }
+            }
+        }
+    }
+    let Some(refusal) = first_refusal else {
+        return Ok(());
+    };
+    let Some(reverted) = reverted_copy else {
+        return Err(SignedTxNotSuperseded { kind, refusal });
+    };
+
+    for prepared in signed {
+        if prepared.tx_hash() == reverted {
+            continue;
+        }
+        verify_withdrawal_superseded(
+            raindex,
+            prepared,
+            Some(reverted),
+            bot_wallet,
+            required_confirmations,
+        )
+        .await
+        .map_err(|refusal| SignedTxNotSuperseded { kind, refusal })?;
+    }
+    Ok(())
+}
+
 /// Proves that `prepared`, the signed vault withdrawal of a redemption, can
 /// never land, reading its chain through `raindex`.
 ///
@@ -437,6 +724,237 @@ pub async fn verify_hash_only_withdrawal_not_through(
             succeeded: true, ..
         }) => Err(WithdrawalNotSuperseded::WithdrawalWentThrough { tx }),
         Some(_) | None => Ok(()),
+    }
+}
+
+/// How long the newest signed candidate of a send to the issuer may stay unmined
+/// before a fee replacement is considered. A replacement is signed only when
+/// the network's fee estimate has also risen above the candidate's fee.
+pub(crate) const REDEMPTION_SEND_REPLACEMENT_AFTER: std::time::Duration =
+    std::time::Duration::from_secs(3 * 60);
+
+/// Sign once and store before broadcast. A send already persisted is never
+/// signed again with a new nonce: it is only fee-replaced at its own nonce
+/// (see [`replace_stale_redemption_send`]). A legacy `SendPending` (which may
+/// already have moved tokens under an unrecorded hash) is refused.
+async fn prepare_and_persist_redemption_send(
+    services: &EquityTransferServices,
+    store: &Store<EquityRedemption>,
+    aggregate_id: &RedemptionAggregateId,
+    replacement_cutoff: Option<Duration>,
+) -> Result<(), RedemptionError> {
+    let entity =
+        store
+            .load(aggregate_id)
+            .await?
+            .ok_or_else(|| RedemptionError::EntityNotFound {
+                aggregate_id: aggregate_id.clone(),
+            })?;
+    if let EquityRedemption::SendPending { prepared_send, .. } = &entity {
+        if prepared_send.is_none() {
+            return Err(RedemptionError::LegacyIssuerSendPending {
+                aggregate_id: aggregate_id.clone(),
+            });
+        }
+        replace_stale_redemption_send(services, store, aggregate_id, &entity, replacement_cutoff)
+            .await;
+        return Ok(());
+    }
+    let EquityRedemption::TokensUnwrapped {
+        symbol,
+        chain,
+        underlying_token,
+        unwrapped_amount,
+        unwrap_block,
+        ..
+    } = entity
+    else {
+        return Err(RedemptionError::UnexpectedEntity { entity });
+    };
+    let chain_services = services.for_chain(chain)?;
+    // With no redemption wallet the send can never be signed, so nothing can
+    // land: fail the redemption now instead of holding its guard, inflight and
+    // reservation until `transfer_timeout`.
+    let Some(redemption_wallet) = chain_services.tokenizer.redemption_wallet() else {
+        warn!(target: "rebalance", %aggregate_id, %chain, "No issuer redemption wallet is configured; failing the redemption before signing its send");
+        store
+            .send(
+                aggregate_id,
+                EquityRedemptionCommand::FailTransfer {
+                    reason: format!(
+                        "No issuer redemption wallet is configured on {chain}; the send was \
+                         never signed"
+                    ),
+                },
+            )
+            .await?;
+        let entity =
+            store
+                .load(aggregate_id)
+                .await?
+                .ok_or_else(|| RedemptionError::EntityNotFound {
+                    aggregate_id: aggregate_id.clone(),
+                })?;
+        return Err(RedemptionError::SendFailed { entity });
+    };
+    let token = match underlying_token {
+        UnwrappedProvenance::Attested { attested } => attested,
+        UnwrappedProvenance::Legacy(recorded) => {
+            reattest_legacy_underlying(chain_services, &symbol, recorded)
+                .await
+                .map_err(RedemptionError::ReattestLegacyUnderlying)?
+        }
+    };
+    // A load-balanced backend that has not indexed the unwrap block yet sees
+    // a zero balance, so the send would revert. Waiting on the tokenizer's
+    // own provider keeps a caught-up wrapper provider from masking it.
+    if let Some(block) = unwrap_block {
+        chain_services
+            .tokenizer
+            .wait_for_block(block)
+            .await
+            .map_err(TokenizerError::from)?;
+    }
+    let prepared = chain_services
+        .tokenizer
+        .prepare_redemption_send(token, unwrapped_amount)
+        .await?;
+
+    if let Err(error) = store
+        .send(
+            aggregate_id,
+            EquityRedemptionCommand::PrepareSend {
+                prepared: prepared.clone(),
+                redemption_wallet,
+            },
+        )
+        .await
+    {
+        error!(target: "rebalance", %aggregate_id, ?error, "Failed to persist the signed redemption send; not broadcasting");
+        release_unpersisted_redemption_send(
+            store,
+            chain_services.tokenizer.as_ref(),
+            aggregate_id,
+            prepared.tx_hash(),
+            &error,
+        )
+        .await;
+        return Err(error.into());
+    }
+
+    Ok(())
+}
+
+/// Persists a fee replacement of a pending send to the issuer whose newest candidate
+/// has stayed unmined for [`REDEMPTION_SEND_REPLACEMENT_AFTER`], when the
+/// network's fee estimate has risen above that candidate's fee. Without it, a
+/// send priced out by a fee spike never mines and its held nonce blocks every
+/// later send from the wallet.
+///
+/// The replacement carries the same transfer at the same nonce, so at most one
+/// candidate lands, and it is persisted before any broadcast. Nothing is
+/// replaced while a candidate has a receipt or a receipt lookup fails, nor
+/// once `replacement_cutoff` (the transfer timeout) has passed since the send
+/// was first signed: the operator is paged then and may cancel the send at its
+/// nonce, and a later replacement could outbid that cancel. Every failure here
+/// is logged and left to the next redrive: confirming the existing candidates
+/// must not wait on it.
+async fn replace_stale_redemption_send(
+    services: &EquityTransferServices,
+    store: &Store<EquityRedemption>,
+    aggregate_id: &RedemptionAggregateId,
+    entity: &EquityRedemption,
+    replacement_cutoff: Option<Duration>,
+) {
+    let EquityRedemption::SendPending {
+        chain,
+        last_send_signed_at: Some(signed_at),
+        first_send_signed_at,
+        ..
+    } = entity
+    else {
+        return;
+    };
+    if let (Some(cutoff), Some(first_signed_at)) = (replacement_cutoff, first_send_signed_at)
+        && Utc::now()
+            .signed_duration_since(*first_signed_at)
+            .to_std()
+            .is_ok_and(|pending_for| pending_for >= cutoff)
+    {
+        debug!(target: "rebalance", %aggregate_id, ?cutoff, "Redemption send is past its transfer timeout; the operator was paged, so it is no longer fee-replaced");
+        return;
+    }
+    let unmined_for = Utc::now().signed_duration_since(*signed_at);
+    if unmined_for.to_std().unwrap_or_default() < REDEMPTION_SEND_REPLACEMENT_AFTER {
+        return;
+    }
+    let candidates = entity.issuer_send_candidates();
+    let Some(newest) = candidates.last() else {
+        return;
+    };
+    let tokenizer = match services.for_chain(*chain) {
+        Ok(chain_services) => chain_services.tokenizer.as_ref(),
+        Err(error) => {
+            warn!(target: "rebalance", %aggregate_id, %error, "Cannot consider a fee replacement of the redemption send");
+            return;
+        }
+    };
+
+    for candidate in &candidates {
+        let tx_hash = candidate.tx_hash();
+        match tokenizer.redemption_send_mined(tx_hash).await {
+            Ok(false) => {}
+            Ok(true) => return,
+            Err(error) => {
+                warn!(target: "rebalance", %aggregate_id, %tx_hash, %error, "Receipt lookup failed; not fee-replacing the redemption send");
+                return;
+            }
+        }
+    }
+
+    let wallet = tokenizer.signing_wallet();
+    if !newest.signed_by(wallet) {
+        warn!(target: "rebalance", %aggregate_id, tx_hash = %newest.tx_hash(), signer = ?newest.signer(), %wallet, "Redemption send was signed by another wallet; not fee-replacing it");
+        return;
+    }
+    tokenizer.restore_redemption_send(newest).await;
+    let replacement = match tokenizer.prepare_redemption_send_replacement(newest).await {
+        Ok(Some(replacement)) => replacement,
+        Ok(None) => {
+            info!(target: "rebalance", %aggregate_id, tx_hash = %newest.tx_hash(), ?unmined_for, "Redemption send is unmined but priced at the market; not fee-replacing it");
+            return;
+        }
+        Err(error) => {
+            warn!(target: "rebalance", %aggregate_id, tx_hash = %newest.tx_hash(), %error, "Could not sign a fee replacement of the redemption send");
+            return;
+        }
+    };
+
+    let replacement_hash = replacement.tx_hash();
+    match store
+        .send(
+            aggregate_id,
+            EquityRedemptionCommand::ReplaceSend { replacement },
+        )
+        .await
+    {
+        Ok(()) => warn!(
+            target: "rebalance",
+            %aggregate_id,
+            replaced = %newest.tx_hash(),
+            replacement = %replacement_hash,
+            ?unmined_for,
+            "Persisted a fee replacement of the redemption send; broadcasting it next"
+        ),
+        // Nothing reached the wallet: the replacement is recorded at the nonce
+        // only when it is broadcast, so the unpersisted bytes are just dropped.
+        Err(error) => warn!(
+            target: "rebalance",
+            %aggregate_id,
+            replacement = %replacement_hash,
+            ?error,
+            "Failed to persist a fee replacement of the redemption send; not broadcasting it"
+        ),
     }
 }
 
@@ -762,6 +1280,41 @@ pub async fn verify_withdrawal_replacement(
     }
 
     Ok(())
+}
+
+/// After a failed `PrepareSend`, releases the signed send's nonce only when the
+/// send provably never reached storage: the aggregate rejected the command, a
+/// concurrent write made it conflict, or a reload shows a state that cannot
+/// hold this hash. A load error, or a later
+/// state the send may have reached, keeps the reservation: a nonce gap until
+/// restart is recoverable, a rewound nonce under a live send is not.
+async fn release_unpersisted_redemption_send(
+    store: &Store<EquityRedemption>,
+    tokenizer: &dyn Tokenizer,
+    aggregate_id: &RedemptionAggregateId,
+    tx_hash: TxHash,
+    error: &SendError<EquityRedemption>,
+) {
+    // A conflict also proves the event was not written: optimistic concurrency
+    // refused the whole commit.
+    let rejected = matches!(
+        error,
+        AggregateError::UserError(LifecycleError::Apply(_)) | AggregateError::AggregateConflict
+    );
+    let unpersisted = rejected
+        || match store.load(aggregate_id).await {
+            Ok(None | Some(EquityRedemption::TokensUnwrapped { .. })) => true,
+            Ok(Some(EquityRedemption::SendPending { prepared_send, .. })) => prepared_send
+                .as_ref()
+                .is_none_or(|stored| stored.prepared.tx_hash() != tx_hash),
+            Ok(Some(_)) | Err(_) => false,
+        };
+
+    if unpersisted {
+        tokenizer.discard_redemption_send(tx_hash).await;
+    } else {
+        warn!(target: "rebalance", %aggregate_id, %tx_hash, "Signed redemption send may have been persisted; keeping its nonce reserved");
+    }
 }
 
 /// Data extracted from the TokensReceived aggregate state for
@@ -1207,6 +1760,47 @@ impl Tokenizer for PanickingTokenizer {
         unimplemented!("PanickingTokenizer: not available in CLI context")
     }
 
+    async fn prepare_redemption_send(
+        &self,
+        _token: UnwrappedToken,
+        _amount: U256,
+    ) -> Result<st0x_evm::PreparedTransaction, TokenizerError> {
+        unimplemented!("PanickingTokenizer: not available in CLI context")
+    }
+    async fn broadcast_redemption_send(
+        &self,
+        _: &st0x_evm::PreparedTransaction,
+    ) -> Result<TxHash, TokenizerError> {
+        unimplemented!("PanickingTokenizer: not available in CLI context")
+    }
+    fn signing_wallet(&self) -> Address {
+        unimplemented!("PanickingTokenizer: not available in CLI context")
+    }
+    async fn prepare_redemption_send_replacement(
+        &self,
+        _: &st0x_evm::PreparedTransaction,
+    ) -> Result<Option<st0x_evm::PreparedTransaction>, TokenizerError> {
+        unimplemented!("PanickingTokenizer: not available in CLI context")
+    }
+    async fn confirm_redemption_send(
+        &self,
+        _: TxHash,
+    ) -> Result<st0x_tokenization::RedemptionSendReceipt, TokenizerError> {
+        unimplemented!("PanickingTokenizer: not available in CLI context")
+    }
+    async fn restore_redemption_send(&self, _: &st0x_evm::PreparedTransaction) {
+        unimplemented!("PanickingTokenizer: not available in CLI context")
+    }
+    async fn discard_redemption_send(&self, _: TxHash) {
+        unimplemented!("PanickingTokenizer: not available in CLI context")
+    }
+    async fn redemption_send_mined(&self, _: TxHash) -> Result<bool, TokenizerError> {
+        unimplemented!("PanickingTokenizer: not available in CLI context")
+    }
+    async fn release_superseded_redemption_send(&self, _: TxHash) {
+        unimplemented!("PanickingTokenizer: not available in CLI context")
+    }
+
     async fn poll_for_redemption(&self, _: &TxHash) -> Result<TokenizationRequest, TokenizerError> {
         unimplemented!("PanickingTokenizer: not available in CLI context")
     }
@@ -1512,6 +2106,21 @@ pub enum RedemptionError {
         symbol: Symbol,
         mode: st0x_config::RebalancingMode,
     },
+    #[error(
+        "Redemption {aggregate_id} has a legacy send without a persisted transaction; verify its prior issuer transfer before resuming"
+    )]
+    LegacyIssuerSendPending { aggregate_id: RedemptionAggregateId },
+    /// The legacy record's underlying could not be re-attested before its
+    /// send to the issuer was signed. A mismatch is permanent (see
+    /// [`is_permanent_underlying_mismatch`](Self::is_permanent_underlying_mismatch));
+    /// a failed read is not.
+    #[error(
+        "Could not re-attest the legacy redemption's underlying before signing its send to the issuer"
+    )]
+    ReattestLegacyUnderlying(#[source] EquityRedemptionError),
+    #[error("The prepare task of the send to the issuer failed to join")]
+    PrepareTaskJoin(#[from] tokio::task::JoinError),
+
     #[error(transparent)]
     ChainServicesMissing(#[from] ChainServicesMissing),
     #[error(transparent)]
@@ -1559,12 +2168,41 @@ impl RedemptionError {
         }
     }
 
+    /// The vault attests another underlying than the legacy record names, so
+    /// the bot refuses to send the recorded token. Retrying cannot change it.
+    pub(crate) fn is_permanent_underlying_mismatch(&self) -> bool {
+        matches!(
+            self,
+            Self::ReattestLegacyUnderlying(EquityRedemptionError::LegacyUnderlyingMismatch { .. })
+        )
+    }
+
+    /// The redemption is still resolving onchain and its own jobs drive it:
+    /// a pending withdrawal or send to the issuer, a send signed by a rotated key, or a
+    /// legacy send an operator must verify. Not a failure of the caller.
+    pub(crate) fn is_still_in_progress(&self) -> bool {
+        self.is_reconciliation_pending()
+            || matches!(self, Self::LegacyIssuerSendPending { .. })
+            || matches!(
+                self,
+                Self::Send(AggregateError::UserError(LifecycleError::Apply(
+                    EquityRedemptionError::RedemptionSendSignedByAnotherWallet { .. },
+                )))
+            )
+    }
+
     pub(crate) fn is_reconciliation_pending(&self) -> bool {
         matches!(self, Self::Raindex(error) if error.is_reconciliation_pending())
             || matches!(
                 self,
                 Self::Send(AggregateError::UserError(LifecycleError::Apply(
                     EquityRedemptionError::RaindexWithdrawReconciliationPending { .. },
+                )))
+            )
+            || matches!(
+                self,
+                Self::Send(AggregateError::UserError(LifecycleError::Apply(
+                    EquityRedemptionError::RedemptionSendUnresolved { .. },
                 )))
             )
     }
@@ -1578,6 +2216,9 @@ impl BotGasFailureClassifier for RedemptionError {
             )))
             | Self::BotGasEnqueue(_) => true,
             Self::RebalancingNotEnabled { .. }
+            | Self::LegacyIssuerSendPending { .. }
+            | Self::ReattestLegacyUnderlying(_)
+            | Self::PrepareTaskJoin(_)
             | Self::ChainServicesMissing(_)
             | Self::GasReadiness(_)
             | Self::Send(_)
@@ -1617,6 +2258,9 @@ struct WrappedMintResult {
 /// vault operations and tokenization. External code drives transfers only
 /// through [`Self::resume_equity_to_market_making`] and
 /// [`Self::resume_equity_to_hedging`].
+type RedemptionPrepareLocks =
+    std::sync::Mutex<HashMap<RedemptionAggregateId, Weak<tokio::sync::Mutex<()>>>>;
+
 pub struct CrossVenueEquityTransfer {
     /// The per-chain entries every step resolves through -- the same map the
     /// two aggregates' command handlers read. The chain comes from the
@@ -1625,6 +2269,7 @@ pub struct CrossVenueEquityTransfer {
     services: EquityTransferServices,
     mint_store: Arc<Store<TokenizedEquityMint>>,
     redemption_store: Arc<Store<EquityRedemption>>,
+    redemption_send_prepare: RedemptionPrepareLocks,
     /// Mint-authorization capability for orchestrator-mode assets
     /// (RAI-1243). Defaults to [`ConfiguredMintAuthorization::VaultDirectOnly`]
     /// (an explicit assertion, mirroring `BotGasReceiptCostEnqueuer`'s
@@ -1674,6 +2319,7 @@ impl CrossVenueEquityTransfer {
             services,
             mint_store,
             redemption_store,
+            redemption_send_prepare: std::sync::Mutex::new(HashMap::new()),
             mint_authorization: ConfiguredMintAuthorization::VaultDirectOnly,
             rebalancing: None,
         }
@@ -1704,21 +2350,30 @@ impl CrossVenueEquityTransfer {
         &self.redemption_store
     }
 
-    /// Proves through `chain`'s own raindex and bot wallet that `prepared`,
-    /// the signed vault withdrawal of a redemption on that chain, can never
-    /// land; see [`verify_withdrawal_superseded`].
-    pub(crate) async fn verify_withdrawal_superseded(
+    /// Proves through `chain`'s own raindex and bot wallet that none of
+    /// `signed`, the signed vault withdrawal or every signed copy of the issuer
+    /// send of a redemption on that chain, can ever land; see
+    /// [`verify_signed_redemption_txs_superseded`].
+    pub(crate) async fn verify_signed_txs_superseded(
         &self,
         chain: Chain,
-        prepared: &PreparedTransaction,
+        kind: SignedRedemptionTx,
+        signed: &[&PreparedTransaction],
         superseding_tx: Option<TxHash>,
         required_confirmations: u64,
-    ) -> Result<(), WithdrawalNotSuperseded> {
-        let services = self.services.for_chain(chain)?;
+    ) -> Result<(), SignedTxNotSuperseded> {
+        let services = self
+            .services
+            .for_chain(chain)
+            .map_err(|error| SignedTxNotSuperseded {
+                kind,
+                refusal: error.into(),
+            })?;
 
-        verify_withdrawal_superseded(
+        verify_signed_redemption_txs_superseded(
             services.raindex.as_ref(),
-            prepared,
+            kind,
+            signed,
             superseding_tx,
             services.wallet,
             required_confirmations,
@@ -2452,6 +3107,19 @@ impl CrossVenueEquityTransfer {
         Ok(())
     }
 
+    pub(crate) async fn discard_reconciled_issuer_send(
+        &self,
+        chain: Chain,
+        tx_hash: TxHash,
+    ) -> Result<(), RedemptionError> {
+        self.services
+            .for_chain(chain)?
+            .tokenizer
+            .release_superseded_redemption_send(tx_hash)
+            .await;
+        Ok(())
+    }
+
     async fn broadcast_and_record_vault_withdrawal(
         &self,
         aggregate_id: &RedemptionAggregateId,
@@ -2496,6 +3164,55 @@ impl CrossVenueEquityTransfer {
         Ok(())
     }
 
+    /// Signs the send to the issuer once and persists it (`PrepareSend`) before any
+    /// broadcast, on a detached task so a cancelled caller (a dropped API
+    /// request or job future) cannot stop between the two: a signed send that
+    /// was never persisted keeps its nonce reserved and stalls every later
+    /// send from the wallet. A failed write goes through
+    /// [`release_unpersisted_redemption_send`].
+    async fn prepare_redemption_send(
+        &self,
+        aggregate_id: &RedemptionAggregateId,
+    ) -> Result<(), RedemptionError> {
+        let prepare_lock = {
+            let mut locks = self
+                .redemption_send_prepare
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            locks.retain(|_, lock| lock.strong_count() > 0);
+            let lock = locks
+                .get(aggregate_id)
+                .and_then(Weak::upgrade)
+                .unwrap_or_else(|| Arc::new(tokio::sync::Mutex::new(())));
+            locks.insert(aggregate_id.clone(), Arc::downgrade(&lock));
+            drop(locks);
+            lock
+        };
+        let services = self.services.clone();
+        let store = Arc::clone(&self.redemption_store);
+        let task_id = aggregate_id.clone();
+        let replacement_cutoff = self
+            .rebalancing
+            .as_ref()
+            .and_then(Weak::upgrade)
+            .map(|service| service.transfer_timeout());
+        // `PrepareSend` can outlive a cancelled caller, so the task continues
+        // the caller's projection slot.
+        let projection_slot =
+            crate::conductor::projection_pause::projection_slot_for_detached_work().await;
+
+        tokio::spawn(async move {
+            let _projection_slot = projection_slot;
+            let _prepare_guard = prepare_lock.lock().await;
+            prepare_and_persist_redemption_send(&services, &store, &task_id, replacement_cutoff)
+                .await
+        })
+        .await
+        .inspect_err(|join_error| {
+            error!(target: "rebalance", %aggregate_id, %join_error, "Redemption send prepare-and-persist task failed to join (panicked)");
+        })?
+    }
+
     /// Unwraps ERC-4626 tokens and sends to Alpaca, returning the
     /// redemption tx hash.
     async fn unwrap_and_send(
@@ -2516,10 +3233,7 @@ impl CrossVenueEquityTransfer {
 
         info!(target: "rebalance", %aggregate_id, "Tokens unwrapped, sending to Alpaca");
 
-        self.redemption_store
-            .send(aggregate_id, EquityRedemptionCommand::PrepareSend)
-            .await?;
-
+        self.prepare_redemption_send(aggregate_id).await?;
         self.redemption_store
             .send(aggregate_id, EquityRedemptionCommand::SendTokens)
             .await?;
@@ -2769,6 +3483,7 @@ impl CrossVenueEquityTransfer {
                 }
                 EquityRedemption::SendPending { .. } => {
                     info!(%aggregate_id, "Resuming pending send");
+                    self.prepare_redemption_send(aggregate_id).await?;
                     self.redemption_store
                         .send(aggregate_id, EquityRedemptionCommand::SendTokens)
                         .await?;
@@ -2816,9 +3531,7 @@ impl CrossVenueEquityTransfer {
         aggregate_id: &RedemptionAggregateId,
     ) -> Result<(), RedemptionError> {
         info!(%aggregate_id, "Resuming unwrapped redemption");
-        self.redemption_store
-            .send(aggregate_id, EquityRedemptionCommand::PrepareSend)
-            .await?;
+        self.prepare_redemption_send(aggregate_id).await?;
         Ok(())
     }
 
@@ -3791,7 +4504,7 @@ mod tests {
         );
         assert_eq!(
             ethereum.tokenizer.call_count(),
-            5,
+            8,
             "the redemption must be sent through Ethereum's issuer"
         );
         base.assert_untouched(Chain::Base);
@@ -7705,6 +8418,981 @@ mod tests {
              recovery must still recognize the insufficient-balance revert"
         );
     }
+
+    /// Seeds a redemption at `TokensUnwrapped` from history, so a test picks
+    /// the unwrapped token's provenance and the unwrap block.
+    async fn seed_unwrapped_redemption(
+        pool: &SqlitePool,
+        id: &RedemptionAggregateId,
+        underlying_token: UnwrappedProvenance,
+        unwrap_block: Option<u64>,
+    ) {
+        let events = [
+            EquityRedemptionEvent::WithdrawnFromRaindex {
+                symbol: Symbol::new("AAPL").unwrap(),
+                quantity: float!(1),
+                token: Address::repeat_byte(0x11),
+                wrapped_amount: U256::from(1_000_000_000_000_000_000_u128),
+                actual_wrapped_amount: None,
+                raindex_withdraw_tx: TxHash::repeat_byte(0x12),
+                raindex_withdraw_block: None,
+                withdrawn_at: Utc::now(),
+            },
+            EquityRedemptionEvent::TokensUnwrapped {
+                quantity: Some(float!(1)),
+                underlying_token,
+                unwrap_tx_hash: TxHash::repeat_byte(0x13),
+                unwrapped_amount: U256::from(1_000_000_000_000_000_000_u128),
+                unwrap_block,
+                unwrapped_at: Utc::now(),
+            },
+        ];
+        for (sequence, event) in (1_i64..).zip(events) {
+            sqlx::query(
+                "INSERT INTO events \
+                 (aggregate_type, aggregate_id, sequence, event_type, event_version, payload, \
+                  metadata) \
+                 VALUES ('EquityRedemption', ?1, ?2, ?3, '1', ?4, '{}')",
+            )
+            .bind(id.to_string())
+            .bind(sequence)
+            .bind(st0x_event_sorcery::DomainEvent::event_type(&event))
+            .bind(serde_json::to_string(&event).unwrap())
+            .execute(pool)
+            .await
+            .unwrap();
+        }
+    }
+
+    async fn transfer_at_tokens_unwrapped(
+        tokenizer: Arc<MockTokenizer>,
+        wrapper: Arc<dyn Wrapper>,
+        label: &str,
+        underlying_token: UnwrappedProvenance,
+        unwrap_block: Option<u64>,
+    ) -> (CrossVenueEquityTransfer, SqlitePool, RedemptionAggregateId) {
+        let (transfer, pool) =
+            create_equity_transfer_with_pool(tokenizer, Arc::new(MockRaindex::new()), wrapper)
+                .await;
+        let id = redemption_aggregate_id(label);
+        seed_unwrapped_redemption(&pool, &id, underlying_token, unwrap_block).await;
+        assert!(matches!(
+            transfer.redemption_store.load(&id).await.unwrap(),
+            Some(EquityRedemption::TokensUnwrapped { .. })
+        ));
+        (transfer, pool, id)
+    }
+
+    fn attested_underlying() -> UnwrappedProvenance {
+        UnwrappedProvenance::Attested {
+            attested: UnwrappedToken::unchecked(Address::repeat_byte(0x21)),
+        }
+    }
+
+    /// A redemption interrupted before the vault attestation existed carries
+    /// an address copied from config. Preparing its send must re-attest
+    /// through the wrapper and refuse when the vault's asset() is not that
+    /// address, even after the config has been corrected.
+    #[tokio::test]
+    async fn prepare_redemption_send_refuses_a_legacy_underlying_the_vault_does_not_attest() {
+        let configured = Address::random();
+        let recorded = Address::random();
+        let tokenizer = Arc::new(MockTokenizer::new());
+        let (transfer, _pool, id) = transfer_at_tokens_unwrapped(
+            tokenizer.clone(),
+            Arc::new(
+                MockWrapper::new()
+                    .with_tokenized_shares(configured)
+                    .attesting_unwrapped_token(configured),
+            ),
+            "legacy-underlying-mismatch",
+            UnwrappedProvenance::Legacy(recorded),
+            None,
+        )
+        .await;
+
+        let error = transfer.prepare_redemption_send(&id).await.unwrap_err();
+
+        assert!(
+            matches!(
+                &error,
+                RedemptionError::ReattestLegacyUnderlying(
+                    EquityRedemptionError::LegacyUnderlyingMismatch {
+                        recorded: mismatched,
+                        attested,
+                        ..
+                    }
+                ) if *mismatched == recorded && *attested == configured
+            ),
+            "got: {error:?}"
+        );
+        assert!(error.is_permanent_underlying_mismatch());
+        assert!(
+            tokenizer.send_for_redemption_calls().is_empty(),
+            "nothing may be signed"
+        );
+        assert!(matches!(
+            transfer.redemption_store.load(&id).await.unwrap(),
+            Some(EquityRedemption::TokensUnwrapped { .. })
+        ));
+    }
+
+    /// With no issuer redemption wallet configured the send can never be
+    /// signed, so the redemption fails at once instead of holding its guard,
+    /// inflight and reservation until `transfer_timeout`.
+    #[tokio::test]
+    async fn a_redemption_with_no_redemption_wallet_fails_without_signing() {
+        let tokenizer = Arc::new(MockTokenizer::new().with_no_redemption_wallet());
+        let (transfer, _pool, id) = transfer_at_tokens_unwrapped(
+            tokenizer.clone(),
+            Arc::new(MockWrapper::new()),
+            "no-redemption-wallet",
+            attested_underlying(),
+            None,
+        )
+        .await;
+
+        let error = transfer.resume_redemption(&id).await.unwrap_err();
+
+        assert!(
+            matches!(
+                &error,
+                RedemptionError::SendFailed {
+                    entity: EquityRedemption::Failed { .. }
+                }
+            ),
+            "got: {error:?}"
+        );
+        assert!(matches!(
+            transfer.redemption_store.load(&id).await.unwrap(),
+            Some(EquityRedemption::Failed { reason: Some(reason), .. })
+                if reason.contains("never signed")
+        ));
+        assert!(
+            tokenizer.send_for_redemption_calls().is_empty(),
+            "nothing may be signed"
+        );
+        transfer
+            .resume_redemption(&id)
+            .await
+            .expect("a resume of the failed redemption is a clean no-op");
+    }
+
+    /// A signed send whose `PrepareSend` write fails never reached storage, so
+    /// its nonce is released for the next send instead of stalling the wallet.
+    #[tokio::test]
+    async fn a_store_failure_while_persisting_a_signed_send_releases_its_nonce() {
+        let signed = TxHash::repeat_byte(0x5E);
+        let tokenizer = Arc::new(MockTokenizer::new().with_redemption_tx(signed));
+        let (transfer, pool, id) = transfer_at_tokens_unwrapped(
+            tokenizer.clone(),
+            Arc::new(MockWrapper::new()),
+            "prepare-store-failure",
+            attested_underlying(),
+            None,
+        )
+        .await;
+        sqlx::query(
+            "CREATE TRIGGER reject_send_prepared BEFORE INSERT ON events \
+             WHEN NEW.event_type = 'EquityRedemptionEvent::SendPrepared' \
+             BEGIN SELECT RAISE(ABORT, 'injected store failure'); END",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let error = transfer.resume_redemption(&id).await.unwrap_err();
+
+        assert!(matches!(error, RedemptionError::Send(_)), "got: {error:?}");
+        assert_eq!(tokenizer.send_for_redemption_calls().len(), 1);
+        assert_eq!(tokenizer.redemption_send_discards(), vec![signed]);
+        assert!(tokenizer.redemption_send_broadcasts().is_empty());
+        assert!(matches!(
+            transfer.redemption_store.load(&id).await.unwrap(),
+            Some(EquityRedemption::TokensUnwrapped { .. })
+        ));
+    }
+
+    /// Persists `original` as the redemption's signed send, signed
+    /// `signed_ago` before now.
+    async fn sign_send_at(
+        transfer: &CrossVenueEquityTransfer,
+        id: &RedemptionAggregateId,
+        original: TxHash,
+        signed_ago: chrono::Duration,
+    ) {
+        transfer
+            .redemption_store
+            .send(
+                id,
+                EquityRedemptionCommand::PrepareSendAt {
+                    prepared: PreparedTransaction::for_test(original, 7),
+                    redemption_wallet: Address::repeat_byte(0xAB),
+                    pending_at: Utc::now() - signed_ago,
+                },
+            )
+            .await
+            .unwrap();
+    }
+
+    /// A send that has stayed unmined past the bound while the market fee rose
+    /// above its own is re-signed at its nonce and persisted before its
+    /// broadcast; the transfer then confirms through the replacement's hash.
+    #[tokio::test]
+    async fn a_stale_send_confirms_through_its_fee_replacement() {
+        let original = TxHash::repeat_byte(0x51);
+        let replacement = TxHash::repeat_byte(0x52);
+        let tokenizer = Arc::new(
+            MockTokenizer::new()
+                .with_redemption_send_replacement(replacement)
+                .with_mined_redemption_sends(vec![replacement]),
+        );
+        let (transfer, _pool, id) = transfer_at_tokens_unwrapped(
+            tokenizer.clone(),
+            Arc::new(MockWrapper::new()),
+            "fee-replaced-send",
+            attested_underlying(),
+            None,
+        )
+        .await;
+        sign_send_at(&transfer, &id, original, chrono::Duration::minutes(10)).await;
+
+        transfer.prepare_redemption_send(&id).await.unwrap();
+        let replaced = transfer.redemption_store.load(&id).await.unwrap().unwrap();
+        assert_eq!(
+            replaced
+                .issuer_send_candidates()
+                .iter()
+                .map(|candidate| candidate.tx_hash())
+                .collect::<Vec<_>>(),
+            vec![original, replacement],
+            "the replacement is persisted before any broadcast"
+        );
+        assert!(tokenizer.redemption_send_broadcasts().is_empty());
+
+        transfer
+            .redemption_store
+            .send(&id, EquityRedemptionCommand::SendTokens)
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            transfer.redemption_store.load(&id).await.unwrap(),
+            Some(EquityRedemption::TokensSent { redemption_tx, .. }) if redemption_tx == replacement
+        ));
+        assert_eq!(tokenizer.redemption_send_replacements(), vec![original]);
+        assert_eq!(tokenizer.redemption_send_broadcasts(), vec![replacement]);
+        assert_eq!(tokenizer.redemption_send_confirms(), vec![replacement]);
+    }
+
+    /// A replaced send can still mine in place of its replacement: it is
+    /// confirmed, and the replacement is never broadcast.
+    #[tokio::test]
+    async fn a_replaced_send_that_mines_is_confirmed_in_place_of_its_replacement() {
+        let original = TxHash::repeat_byte(0x53);
+        let replacement = TxHash::repeat_byte(0x54);
+        let tokenizer = Arc::new(
+            MockTokenizer::new()
+                .with_redemption_send_replacement(replacement)
+                .with_mined_redemption_sends(vec![original]),
+        );
+        let (transfer, _pool, id) = transfer_at_tokens_unwrapped(
+            tokenizer.clone(),
+            Arc::new(MockWrapper::new()),
+            "replaced-send-mines",
+            attested_underlying(),
+            None,
+        )
+        .await;
+        sign_send_at(&transfer, &id, original, chrono::Duration::minutes(10)).await;
+        transfer
+            .redemption_store
+            .send(
+                &id,
+                EquityRedemptionCommand::ReplaceSend {
+                    replacement: PreparedTransaction::for_test(replacement, 7),
+                },
+            )
+            .await
+            .unwrap();
+
+        transfer
+            .redemption_store
+            .send(&id, EquityRedemptionCommand::SendTokens)
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            transfer.redemption_store.load(&id).await.unwrap(),
+            Some(EquityRedemption::TokensSent { redemption_tx, .. }) if redemption_tx == original
+        ));
+        assert!(tokenizer.redemption_send_broadcasts().is_empty());
+        assert_eq!(tokenizer.redemption_send_confirms(), vec![original]);
+    }
+
+    /// An unresolved send to the issuer redrives on its own clock, anchored on when
+    /// its newest copy was signed: every 30s at first, then slower once it has
+    /// stayed unmined for hours.
+    #[tokio::test]
+    async fn an_issuer_send_redrive_slows_once_its_newest_copy_is_hours_old() {
+        let tokenizer = Arc::new(MockTokenizer::new());
+        for (label, signed_ago, expected) in [
+            (
+                "fresh-send-redrive",
+                chrono::Duration::minutes(1),
+                WITHDRAWAL_RECONCILIATION_REDRIVE_DELAY,
+            ),
+            (
+                "old-send-redrive",
+                chrono::Duration::hours(5),
+                ISSUER_SEND_SLOW_REDRIVE_DELAY,
+            ),
+        ] {
+            let (transfer, _pool, id) = transfer_at_tokens_unwrapped(
+                tokenizer.clone(),
+                Arc::new(MockWrapper::new()),
+                label,
+                attested_underlying(),
+                None,
+            )
+            .await;
+            assert_eq!(
+                issuer_send_redrive(&transfer.redemption_store, &id).await,
+                None
+            );
+            let send = TxHash::repeat_byte(0x57);
+            sign_send_at(&transfer, &id, send, signed_ago).await;
+
+            assert_eq!(
+                issuer_send_redrive(&transfer.redemption_store, &id).await,
+                Some(IssuerSendRedrive {
+                    tx_hash: Some(send),
+                    delay: expected,
+                }),
+                "{label}"
+            );
+        }
+    }
+
+    /// Once the transfer timeout has passed since the send was first signed,
+    /// the operator has been paged and may cancel at its nonce, so the send is
+    /// no longer fee-replaced: a replacement could outbid that cancel.
+    #[tokio::test]
+    async fn a_send_past_its_transfer_timeout_is_not_re_signed() {
+        let original = TxHash::repeat_byte(0x58);
+        let tokenizer = Arc::new(
+            MockTokenizer::new()
+                .with_redemption_send_replacement(TxHash::repeat_byte(0x59))
+                .with_redemption_receipt_missing(),
+        );
+        let (transfer, _pool, id) = transfer_at_tokens_unwrapped(
+            tokenizer.clone(),
+            Arc::new(MockWrapper::new()),
+            "send-past-timeout",
+            attested_underlying(),
+            None,
+        )
+        .await;
+        sign_send_at(&transfer, &id, original, chrono::Duration::minutes(10)).await;
+
+        prepare_and_persist_redemption_send(
+            &transfer.services,
+            &transfer.redemption_store,
+            &id,
+            Some(Duration::from_secs(5 * 60)),
+        )
+        .await
+        .unwrap();
+        assert!(tokenizer.redemption_send_replacements().is_empty());
+
+        prepare_and_persist_redemption_send(
+            &transfer.services,
+            &transfer.redemption_store,
+            &id,
+            Some(Duration::from_secs(30 * 60)),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            tokenizer.redemption_send_replacements(),
+            vec![original],
+            "within the timeout the same send is re-signed"
+        );
+    }
+
+    /// No replacement is signed before the bound, nor once a wallet reports
+    /// the send priced at the market.
+    #[tokio::test]
+    async fn a_send_is_not_re_signed_before_the_bound_or_at_the_market_fee() {
+        let original = TxHash::repeat_byte(0x55);
+        let fresh_tokenizer = Arc::new(
+            MockTokenizer::new()
+                .with_redemption_send_replacement(TxHash::repeat_byte(0x56))
+                .with_redemption_receipt_missing(),
+        );
+        let (fresh, _pool, fresh_id) = transfer_at_tokens_unwrapped(
+            fresh_tokenizer.clone(),
+            Arc::new(MockWrapper::new()),
+            "fresh-send",
+            attested_underlying(),
+            None,
+        )
+        .await;
+        sign_send_at(&fresh, &fresh_id, original, chrono::Duration::seconds(30)).await;
+        fresh.prepare_redemption_send(&fresh_id).await.unwrap();
+        assert!(fresh_tokenizer.redemption_send_replacements().is_empty());
+
+        let market_tokenizer = Arc::new(MockTokenizer::new().with_redemption_receipt_missing());
+        let (market, _pool, market_id) = transfer_at_tokens_unwrapped(
+            market_tokenizer.clone(),
+            Arc::new(MockWrapper::new()),
+            "market-priced-send",
+            attested_underlying(),
+            None,
+        )
+        .await;
+        sign_send_at(&market, &market_id, original, chrono::Duration::minutes(10)).await;
+        market.prepare_redemption_send(&market_id).await.unwrap();
+        assert_eq!(
+            market_tokenizer.redemption_send_replacements(),
+            vec![original]
+        );
+        assert_eq!(
+            market
+                .redemption_store
+                .load(&market_id)
+                .await
+                .unwrap()
+                .unwrap()
+                .issuer_send_candidates()
+                .len(),
+            1,
+            "a wallet that signs no replacement leaves the send as it is"
+        );
+    }
+
+    /// The same legacy record whose address the vault does attest is signed
+    /// with the attested token.
+    #[tokio::test]
+    async fn prepare_redemption_send_signs_the_attested_token_of_a_legacy_record() {
+        let configured = Address::random();
+        let tokenizer = Arc::new(MockTokenizer::new());
+        let (transfer, _pool, id) = transfer_at_tokens_unwrapped(
+            tokenizer.clone(),
+            Arc::new(
+                MockWrapper::new()
+                    .with_tokenized_shares(configured)
+                    .attesting_unwrapped_token(configured),
+            ),
+            "legacy-underlying-attested",
+            UnwrappedProvenance::Legacy(configured),
+            None,
+        )
+        .await;
+
+        transfer.prepare_redemption_send(&id).await.unwrap();
+
+        assert_eq!(
+            tokenizer
+                .send_for_redemption_calls()
+                .into_iter()
+                .map(UnwrappedToken::address)
+                .collect::<Vec<_>>(),
+            vec![configured]
+        );
+    }
+
+    /// A load-balanced backend that has not indexed the unwrap block sees a
+    /// zero balance, so preparation waits for that block before signing.
+    #[tokio::test]
+    async fn prepare_redemption_send_waits_for_the_unwrap_block_before_signing() {
+        let tokenizer = Arc::new(MockTokenizer::new());
+        let (transfer, _pool, id) = transfer_at_tokens_unwrapped(
+            tokenizer.clone(),
+            Arc::new(MockWrapper::new()),
+            "prepare-waits-for-block",
+            attested_underlying(),
+            Some(1234),
+        )
+        .await;
+
+        transfer.prepare_redemption_send(&id).await.unwrap();
+
+        assert_eq!(tokenizer.wait_for_block_calls(), vec![1234]);
+        assert_eq!(tokenizer.send_for_redemption_calls().len(), 1);
+    }
+
+    /// Records persisted before the unwrap block was recorded skip the wait.
+    #[tokio::test]
+    async fn prepare_redemption_send_skips_the_wait_without_an_unwrap_block() {
+        let tokenizer = Arc::new(MockTokenizer::new());
+        let (transfer, _pool, id) = transfer_at_tokens_unwrapped(
+            tokenizer.clone(),
+            Arc::new(MockWrapper::new()),
+            "prepare-skips-wait",
+            attested_underlying(),
+            None,
+        )
+        .await;
+
+        transfer.prepare_redemption_send(&id).await.unwrap();
+
+        assert!(tokenizer.wait_for_block_calls().is_empty());
+        assert_eq!(tokenizer.send_for_redemption_calls().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn prepare_redemption_send_signs_nothing_while_the_node_lags() {
+        let tokenizer = Arc::new(MockTokenizer::new().failing_wait_for_block());
+        let (transfer, _pool, id) = transfer_at_tokens_unwrapped(
+            tokenizer.clone(),
+            Arc::new(MockWrapper::new()),
+            "prepare-node-lags",
+            attested_underlying(),
+            Some(42),
+        )
+        .await;
+
+        let error = transfer.prepare_redemption_send(&id).await.unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                RedemptionError::Tokenizer(TokenizerError::Evm(
+                    EvmError::NodeBehindRequiredBlock { .. }
+                ))
+            ),
+            "got: {error:?}"
+        );
+        assert!(tokenizer.send_for_redemption_calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn prepare_redemption_send_signs_once_and_persists_before_any_broadcast() {
+        let tokenizer = Arc::new(MockTokenizer::new());
+        let (transfer, _pool, id) = transfer_at_tokens_unwrapped(
+            tokenizer.clone(),
+            Arc::new(MockWrapper::new()),
+            "prepare-send-once",
+            attested_underlying(),
+            None,
+        )
+        .await;
+
+        transfer.prepare_redemption_send(&id).await.unwrap();
+        let persisted = match transfer.redemption_store.load(&id).await.unwrap() {
+            Some(EquityRedemption::SendPending {
+                prepared_send: Some(send),
+                ..
+            }) => send.prepared.tx_hash(),
+            state => panic!("expected a persisted signed send, got {state:?}"),
+        };
+        assert!(
+            tokenizer.redemption_send_broadcasts().is_empty(),
+            "preparation must not broadcast"
+        );
+
+        // A resume of the already prepared send must reuse it, not sign again.
+        transfer.prepare_redemption_send(&id).await.unwrap();
+        assert_eq!(tokenizer.send_for_redemption_calls().len(), 1);
+        assert!(matches!(
+            transfer.redemption_store.load(&id).await.unwrap(),
+            Some(EquityRedemption::SendPending { prepared_send: Some(send), .. })
+                if send.prepared.tx_hash() == persisted
+        ));
+        assert!(tokenizer.redemption_send_discards().is_empty());
+    }
+
+    #[tokio::test]
+    async fn concurrent_redemption_send_prepares_sign_only_one_nonce() {
+        let tokenizer = Arc::new(MockTokenizer::new());
+        let (transfer, _pool, id) = transfer_at_tokens_unwrapped(
+            tokenizer.clone(),
+            Arc::new(MockWrapper::new()),
+            "concurrent-send-prepare",
+            attested_underlying(),
+            None,
+        )
+        .await;
+        let (first, second) = tokio::join!(
+            transfer.prepare_redemption_send(&id),
+            transfer.prepare_redemption_send(&id)
+        );
+        first.unwrap();
+        second.unwrap();
+        assert_eq!(tokenizer.send_for_redemption_calls().len(), 1);
+        assert!(tokenizer.redemption_send_discards().is_empty());
+        assert!(matches!(
+            transfer.redemption_store.load(&id).await.unwrap(),
+            Some(EquityRedemption::SendPending {
+                prepared_send: Some(_),
+                ..
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_legacy_send_pending_is_never_signed_or_resumed() {
+        let tokenizer = Arc::new(MockTokenizer::new());
+        let (transfer, pool, id) = transfer_at_tokens_unwrapped(
+            tokenizer.clone(),
+            Arc::new(MockWrapper::new()),
+            "legacy-send-pending",
+            attested_underlying(),
+            None,
+        )
+        .await;
+        let next_sequence: i64 =
+            sqlx::query_scalar("SELECT MAX(sequence) + 1 FROM events WHERE aggregate_id = ?1")
+                .bind(id.to_string())
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        sqlx::query(
+            "INSERT INTO events \
+             (aggregate_type, aggregate_id, sequence, event_type, event_version, payload, metadata) \
+             VALUES ('EquityRedemption', ?1, ?2, 'EquityRedemptionEvent::SendPending', '1', \
+             '{\"SendPending\":{\"pending_at\":\"2026-01-01T00:00:00Z\"}}', '{}')",
+        )
+        .bind(id.to_string())
+        .bind(next_sequence)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let restarted = restarted_transfer(&transfer, pool);
+
+        assert!(matches!(
+            restarted.prepare_redemption_send(&id).await,
+            Err(RedemptionError::LegacyIssuerSendPending { .. })
+        ));
+        assert!(matches!(
+            restarted.resume_redemption(&id).await,
+            Err(RedemptionError::LegacyIssuerSendPending { .. })
+        ));
+        assert!(tokenizer.send_for_redemption_calls().is_empty());
+        assert!(tokenizer.redemption_send_broadcasts().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_caller_still_persists_the_signed_send() {
+        let tokenizer = Arc::new(MockTokenizer::new());
+        let (transfer, _pool, id) = transfer_at_tokens_unwrapped(
+            tokenizer.clone(),
+            Arc::new(MockWrapper::new()),
+            "prepare-send-cancelled",
+            attested_underlying(),
+            None,
+        )
+        .await;
+
+        // A zero deadline drops the caller at its first suspension point, as a
+        // disconnected API request would.
+        tokio::time::timeout(Duration::ZERO, transfer.prepare_redemption_send(&id))
+            .await
+            .unwrap_err();
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !matches!(
+                transfer.redemption_store.load(&id).await.unwrap(),
+                Some(EquityRedemption::SendPending {
+                    prepared_send: Some(_),
+                    ..
+                })
+            ) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the signed send must reach storage after its caller is cancelled");
+        assert_eq!(tokenizer.send_for_redemption_calls().len(), 1);
+        assert!(tokenizer.redemption_send_discards().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_prepare_send_rejected_by_a_concurrent_failure_releases_the_signed_nonce() {
+        let tokenizer = Arc::new(MockTokenizer::new());
+        let (transfer, _pool, id) = transfer_at_tokens_unwrapped(
+            tokenizer.clone(),
+            Arc::new(MockWrapper::new()),
+            "prepare-send-concurrent-fail",
+            attested_underlying(),
+            None,
+        )
+        .await;
+        // The operator or timeout sweep fails the transfer while it is signing.
+        transfer
+            .redemption_store
+            .send(
+                &id,
+                EquityRedemptionCommand::FailTransfer {
+                    reason: "operator".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+        let signed = PreparedTransaction::for_test(TxHash::repeat_byte(5), 9);
+        let error = transfer
+            .redemption_store
+            .send(
+                &id,
+                EquityRedemptionCommand::PrepareSend {
+                    prepared: signed.clone(),
+                    redemption_wallet: Address::ZERO,
+                },
+            )
+            .await
+            .unwrap_err();
+
+        release_unpersisted_redemption_send(
+            &transfer.redemption_store,
+            tokenizer.as_ref(),
+            &id,
+            signed.tx_hash(),
+            &error,
+        )
+        .await;
+
+        assert_eq!(tokenizer.redemption_send_discards(), vec![signed.tx_hash()]);
+    }
+
+    /// A conflict means a concurrent write (here the timeout sweep's failure)
+    /// won and the `PrepareSend` commit was refused whole, so the signed send
+    /// never reached storage even though the reload shows `Failed`.
+    #[tokio::test]
+    async fn a_prepare_send_conflict_releases_the_signed_nonce() {
+        let tokenizer = Arc::new(MockTokenizer::new());
+        let (transfer, _pool, id) = transfer_at_tokens_unwrapped(
+            tokenizer.clone(),
+            Arc::new(MockWrapper::new()),
+            "prepare-send-conflict",
+            attested_underlying(),
+            None,
+        )
+        .await;
+        transfer
+            .redemption_store
+            .send(
+                &id,
+                EquityRedemptionCommand::FailTransfer {
+                    reason: "timeout sweep".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+        let signed = PreparedTransaction::for_test(TxHash::repeat_byte(7), 9);
+
+        release_unpersisted_redemption_send(
+            &transfer.redemption_store,
+            tokenizer.as_ref(),
+            &id,
+            signed.tx_hash(),
+            &AggregateError::AggregateConflict,
+        )
+        .await;
+
+        assert_eq!(tokenizer.redemption_send_discards(), vec![signed.tx_hash()]);
+    }
+
+    /// A send to the issuer signed with `signer`'s key at nonce 41.
+    fn send_signed_by(signer: &alloy::signers::local::PrivateKeySigner) -> PreparedTransaction {
+        use alloy::consensus::{SignableTransaction as _, TxEip1559, TxEnvelope};
+        use alloy::eips::eip2718::Encodable2718 as _;
+        use alloy::signers::SignerSync as _;
+
+        let unsigned = TxEip1559 {
+            chain_id: 8453,
+            nonce: 41,
+            gas_limit: 80_000,
+            max_fee_per_gas: 1_000_000_000,
+            max_priority_fee_per_gas: 1_000_000,
+            to: alloy::primitives::TxKind::Call(Address::repeat_byte(0x21)),
+            value: U256::ZERO,
+            access_list: alloy::eips::eip2930::AccessList::default(),
+            input: alloy::primitives::Bytes::from_static(&[0xa9, 0x05, 0x9c, 0xbb]),
+        };
+        let signature = signer.sign_hash_sync(&unsigned.signature_hash()).unwrap();
+        PreparedTransaction::from_raw(alloy::primitives::Bytes::from(
+            TxEnvelope::from(unsigned.into_signed(signature)).encoded_2718(),
+        ))
+        .unwrap()
+    }
+
+    /// A send another key signed (a rotated wallet) never enters this wallet's
+    /// nonce bookkeeping: it is not restored, rebroadcast or fee-replaced, only
+    /// confirmed once a copy has a receipt.
+    #[tokio::test]
+    async fn a_send_signed_by_another_wallet_is_watched_but_never_restored() {
+        let old_key = alloy::signers::local::PrivateKeySigner::random();
+        let send = send_signed_by(&old_key);
+        let tokenizer = Arc::new(
+            MockTokenizer::new()
+                .with_signing_wallet(Address::repeat_byte(0x4E))
+                .with_redemption_send_replacement(TxHash::repeat_byte(0x4F))
+                .with_mined_redemption_sends(vec![]),
+        );
+        let (transfer, _pool, id) = transfer_at_tokens_unwrapped(
+            tokenizer.clone(),
+            Arc::new(MockWrapper::new()),
+            "send-from-rotated-key",
+            attested_underlying(),
+            None,
+        )
+        .await;
+        transfer
+            .redemption_store
+            .send(
+                &id,
+                EquityRedemptionCommand::PrepareSendAt {
+                    prepared: send.clone(),
+                    redemption_wallet: Address::repeat_byte(0xAB),
+                    pending_at: Utc::now() - chrono::Duration::minutes(10),
+                },
+            )
+            .await
+            .unwrap();
+
+        transfer.prepare_redemption_send(&id).await.unwrap();
+        let error = transfer
+            .redemption_store
+            .send(&id, EquityRedemptionCommand::SendTokens)
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                &error,
+                AggregateError::UserError(LifecycleError::Apply(
+                    EquityRedemptionError::RedemptionSendSignedByAnotherWallet { tx_hash, signer, .. }
+                )) if *tx_hash == send.tx_hash() && *signer == Some(old_key.address())
+            ),
+            "got: {error:?}"
+        );
+        assert!(RedemptionError::from(error).is_still_in_progress());
+        assert!(tokenizer.redemption_send_restores().is_empty());
+        assert!(tokenizer.redemption_send_broadcasts().is_empty());
+        assert!(tokenizer.redemption_send_replacements().is_empty());
+
+        let mined = Arc::new(
+            MockTokenizer::new()
+                .with_signing_wallet(Address::repeat_byte(0x4E))
+                .with_mined_redemption_sends(vec![send.tx_hash()]),
+        );
+        let (watched, _pool, watched_id) = transfer_at_tokens_unwrapped(
+            mined.clone(),
+            Arc::new(MockWrapper::new()),
+            "mined-send-from-rotated-key",
+            attested_underlying(),
+            None,
+        )
+        .await;
+        watched
+            .redemption_store
+            .send(
+                &watched_id,
+                EquityRedemptionCommand::PrepareSend {
+                    prepared: send.clone(),
+                    redemption_wallet: Address::repeat_byte(0xAB),
+                },
+            )
+            .await
+            .unwrap();
+        watched
+            .redemption_store
+            .send(&watched_id, EquityRedemptionCommand::SendTokens)
+            .await
+            .unwrap();
+        assert!(matches!(
+            watched.redemption_store.load(&watched_id).await.unwrap(),
+            Some(EquityRedemption::TokensSent { redemption_tx, .. }) if redemption_tx == send.tx_hash()
+        ));
+        assert!(mined.redemption_send_restores().is_empty());
+    }
+
+    /// A redemption whose state cannot be read may hold a signed send, so it is
+    /// redriven rather than left to the job's finite retry budget.
+    #[tokio::test]
+    async fn an_unreadable_redemption_is_redriven_as_a_possible_signed_send() {
+        let (transfer, pool, id) = transfer_at_tokens_unwrapped(
+            Arc::new(MockTokenizer::new()),
+            Arc::new(MockWrapper::new()),
+            "unreadable-redemption",
+            attested_underlying(),
+            None,
+        )
+        .await;
+        sqlx::query("ALTER TABLE events RENAME TO events_unreadable")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            issuer_send_redrive(&transfer.redemption_store, &id).await,
+            Some(IssuerSendRedrive {
+                tx_hash: None,
+                delay: WITHDRAWAL_RECONCILIATION_REDRIVE_DELAY,
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn an_ambiguous_prepare_send_failure_keeps_a_send_that_may_be_stored() {
+        let tokenizer = Arc::new(MockTokenizer::new());
+        let (transfer, _pool, id) = transfer_at_tokens_unwrapped(
+            tokenizer.clone(),
+            Arc::new(MockWrapper::new()),
+            "prepare-send-ambiguous",
+            attested_underlying(),
+            None,
+        )
+        .await;
+        let stored = PreparedTransaction::for_test(TxHash::repeat_byte(5), 9);
+        let other = PreparedTransaction::for_test(TxHash::repeat_byte(6), 10);
+        transfer
+            .redemption_store
+            .send(
+                &id,
+                EquityRedemptionCommand::PrepareSend {
+                    prepared: stored.clone(),
+                    redemption_wallet: Address::ZERO,
+                },
+            )
+            .await
+            .unwrap();
+        // A reactor error after the commit: the store cannot say whether the
+        // event was written.
+        let ambiguous = || {
+            AggregateError::UnexpectedError(Box::new(std::io::Error::other(
+                "reactor failed after commit",
+            )))
+        };
+
+        release_unpersisted_redemption_send(
+            &transfer.redemption_store,
+            tokenizer.as_ref(),
+            &id,
+            stored.tx_hash(),
+            &ambiguous(),
+        )
+        .await;
+        assert!(
+            tokenizer.redemption_send_discards().is_empty(),
+            "the stored send must keep its nonce"
+        );
+
+        release_unpersisted_redemption_send(
+            &transfer.redemption_store,
+            tokenizer.as_ref(),
+            &id,
+            other.tx_hash(),
+            &ambiguous(),
+        )
+        .await;
+        assert_eq!(
+            tokenizer.redemption_send_discards(),
+            vec![other.tx_hash()],
+            "a send another attempt replaced never reached storage"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -7719,7 +9407,10 @@ mod withdrawal_superseded_tests {
     use st0x_evm::{MinedTx, PreparedTransaction};
     use st0x_raindex::RaindexError;
 
-    use super::{WithdrawalNotSuperseded, verify_withdrawal_superseded};
+    use super::{
+        SignedRedemptionTx, SignedTxNotSuperseded, WithdrawalNotSuperseded,
+        verify_signed_redemption_txs_superseded, verify_withdrawal_superseded,
+    };
     use crate::onchain::mock::MockRaindex;
 
     /// The contract the signed withdrawal calls (the shared inventory).
@@ -7728,11 +9419,17 @@ mod withdrawal_superseded_tests {
     const REQUIRED: u64 = 3;
 
     fn sign_withdrawal(signer: &PrivateKeySigner) -> PreparedTransaction {
+        sign_at_fee(signer, 1_000_000_000)
+    }
+
+    /// The same call at the same nonce, signed with `max_fee_per_gas`: a fee
+    /// replacement when the fee differs.
+    fn sign_at_fee(signer: &PrivateKeySigner, max_fee_per_gas: u128) -> PreparedTransaction {
         let unsigned = TxEip1559 {
             chain_id: 8453,
             nonce: NONCE,
             gas_limit: 300_000,
-            max_fee_per_gas: 1_000_000_000,
+            max_fee_per_gas,
             max_priority_fee_per_gas: 1_000_000,
             to: TxKind::Call(INVENTORY),
             value: U256::ZERO,
@@ -7801,6 +9498,108 @@ mod withdrawal_superseded_tests {
             REQUIRED,
         )
         .await
+    }
+
+    /// Every signed copy of a send to the issuer shares one nonce, so a reconcile
+    /// checks them all. A copy that went through outranks an older copy with no
+    /// receipt, and the refusal names the send to the issuer and leaves it to recovery.
+    #[tokio::test]
+    async fn an_issuer_send_copy_that_went_through_refuses_the_reconcile_by_name() {
+        let signer = PrivateKeySigner::random();
+        let bot = signer.address();
+        let original = sign_withdrawal(&signer);
+        let replacement = sign_at_fee(&signer, 2_000_000_000);
+        assert!(replacement.replaces(&original));
+        let raindex = MockRaindex::new()
+            .with_mined_tx(replacement.tx_hash(), mined_withdrawal(bot, true, REQUIRED));
+
+        let error = verify_signed_redemption_txs_superseded(
+            &raindex,
+            SignedRedemptionTx::IssuerSend,
+            &[&original, &replacement],
+            None,
+            bot,
+            REQUIRED,
+        )
+        .await
+        .unwrap_err();
+
+        let SignedTxNotSuperseded {
+            kind: SignedRedemptionTx::IssuerSend,
+            refusal: WithdrawalNotSuperseded::WithdrawalWentThrough { tx },
+        } = &error
+        else {
+            panic!("the mined copy went through: {error:?}");
+        };
+        assert_eq!(*tx, replacement.tx_hash());
+        let message = error.to_string();
+        assert!(
+            message.starts_with(&format!("send {tx} to the issuer is mined and succeeded"))
+                && message.contains("TokensSent")
+                && !message.contains("withdrawal"),
+            "the refusal must name the send to the issuer and its next step: {message}"
+        );
+    }
+
+    /// The timeout page quotes the newest copy's fees, read from its bytes.
+    #[test]
+    fn a_signed_copy_reports_the_fees_it_was_signed_with() {
+        let copy = sign_at_fee(&PrivateKeySigner::random(), 2_000_000_000);
+
+        assert_eq!(copy.fees_per_gas(), Some((2_000_000_000, 1_000_000)));
+        assert_eq!(
+            PreparedTransaction::for_test(TxHash::repeat_byte(1), NONCE).fees_per_gas(),
+            None
+        );
+    }
+
+    /// A send whose newest copy reverted with the required confirmations used
+    /// the shared nonce and moved nothing, so it proves the older copies dead
+    /// too and the reconcile needs no `--superseding-tx`.
+    #[tokio::test]
+    async fn a_reverted_copy_proves_every_other_copy_of_the_send_dead() {
+        let signer = PrivateKeySigner::random();
+        let bot = signer.address();
+        let original = sign_withdrawal(&signer);
+        let replacement = sign_at_fee(&signer, 2_000_000_000);
+        let raindex = MockRaindex::new().with_mined_tx(
+            replacement.tx_hash(),
+            mined_withdrawal(bot, false, REQUIRED),
+        );
+
+        verify_signed_redemption_txs_superseded(
+            &raindex,
+            SignedRedemptionTx::IssuerSend,
+            &[&original, &replacement],
+            None,
+            bot,
+            REQUIRED,
+        )
+        .await
+        .expect("the reverted replacement took the shared nonce");
+
+        let unconfirmed = MockRaindex::new().with_mined_tx(
+            replacement.tx_hash(),
+            mined_withdrawal(bot, false, REQUIRED - 1),
+        );
+        let error = verify_signed_redemption_txs_superseded(
+            &unconfirmed,
+            SignedRedemptionTx::IssuerSend,
+            &[&original, &replacement],
+            None,
+            bot,
+            REQUIRED,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(
+                error.refusal,
+                WithdrawalNotSuperseded::WithdrawalRevertUnconfirmed { tx, .. }
+                    if tx == replacement.tx_hash()
+            ),
+            "a revert short of its confirmations is reported, not a cancel: {error:?}"
+        );
     }
 
     /// Every chain read here fails, so only a refusal that reads nothing

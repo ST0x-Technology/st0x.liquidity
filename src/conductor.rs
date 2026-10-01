@@ -53,7 +53,9 @@ use st0x_event_sorcery::{
     AggregateError, EventSourced, LifecycleError, Projection, ProjectionError, RetryOnBusy,
     SendError, Store, StoreBuilder, compact_events, incremental_vacuum, load_all_ids, load_entity,
 };
-use st0x_evm::{Chain, Evm, IERC20, OpenChainErrorRegistry, ReadOnlyEvm, Wallet};
+use st0x_evm::{
+    Chain, Evm, IERC20, OpenChainErrorRegistry, PreparedTransaction, ReadOnlyEvm, Wallet,
+};
 use st0x_execution::{
     AlpacaBrokerApi, AlpacaBrokerApiCtx, AlpacaWalletService, BuyingPowerReservationCents,
     ClientOrderId, CounterTradePreflight, CounterTradeReservation, CounterTradeSkipReason,
@@ -4526,6 +4528,110 @@ async fn rebroadcast_restored_withdrawal(
     false
 }
 
+/// Restores the nonce of a persisted send to the issuer, every candidate of it (the
+/// send and its fee replacements), and rebroadcasts the newest's exact bytes
+/// as a best effort. Then it makes one non-blocking receipt lookup per
+/// candidate whatever the rebroadcast returned: some nodes reject an already
+/// mined transaction before their nonce check, and a replaced candidate can
+/// still mine. Returns whether a candidate is known to be mined; otherwise it
+/// pages, and the resume job confirms it. A legacy `SendPending` (no
+/// persisted send, so no candidates) always pages and counts as unmined: an
+/// older binary may have broadcast a transfer whose hash and nonce were never
+/// recorded. A send another key signed (a rotated wallet) is not restored or
+/// rebroadcast: its nonce is that key's, and reserving it would raise this
+/// wallet's next nonce past its own. It pages and gates its chain, as a CCTP
+/// burn signed by another wallet does.
+async fn restore_redemption_send(
+    tokenizer: &dyn Tokenizer,
+    notifier: &dyn Notifier,
+    redemption_id: &RedemptionAggregateId,
+    chain: Chain,
+    candidates: &[&PreparedTransaction],
+) -> bool {
+    let Some(newest) = candidates.last() else {
+        notify_or_warn(
+            notifier,
+            redemption_id,
+            &format!(
+                "Equity redemption {redemption_id} on {chain} has a legacy pending send to the \
+                 issuer with no recorded transaction. Recovery refuses to sign again and startup \
+                 approvals on {chain} are paused. Find the previous binary's transfer onchain and \
+                 follow \"Legacy pending send to the issuer\" in docs/cli-ops.md before closing it \
+                 with `stox transfer reconcile --kind redemption --id {redemption_id}`."
+            ),
+        )
+        .await;
+        return false;
+    };
+
+    let wallet = tokenizer.signing_wallet();
+    if !newest.signed_by(wallet) {
+        let tx_hash = newest.tx_hash();
+        let signer = newest.signer().map_or_else(
+            || "an unreadable signer".to_string(),
+            |signer| signer.to_string(),
+        );
+        notify_or_warn(
+            notifier,
+            redemption_id,
+            &format!(
+                "Equity redemption {redemption_id} on {chain} has a signed send {tx_hash} to the \
+                 issuer (nonce {nonce}) signed by {signer}, not the wallet that sends to the \
+                 issuer, {wallet}: was the \
+                 key rotated? It is not restored or rebroadcast from this wallet, and startup \
+                 approvals on {chain} are paused. Recovery only watches its receipt. If it \
+                 never mines, cancel it from its own key at nonce {nonce}, then reconcile with \
+                 a CLI configured with that key (`stox transfer reconcile --kind redemption \
+                 --id {redemption_id} --superseding-tx <cancel>`).",
+                nonce = newest.nonce(),
+            ),
+        )
+        .await;
+        return false;
+    }
+
+    for candidate in candidates {
+        tokenizer.restore_redemption_send(candidate).await;
+    }
+    let tx_hash = newest.tx_hash();
+    if let Err(error) = tokenizer.broadcast_redemption_send(newest).await {
+        warn!(target: "rebalance", %redemption_id, %chain, %tx_hash, %error, "Could not rebroadcast a restored send to the issuer at startup; checking its receipt");
+    }
+
+    for candidate in candidates.iter().rev() {
+        let candidate_hash = candidate.tx_hash();
+        match tokenizer.redemption_send_mined(candidate_hash).await {
+            Ok(true) => return true,
+            Ok(false) => {}
+            Err(error) => {
+                warn!(target: "rebalance", %redemption_id, tx_hash = %candidate_hash, %error, "Could not read the receipt of a restored send to the issuer at startup; treating it as not mined");
+            }
+        }
+    }
+
+    notify_or_warn(
+        notifier,
+        redemption_id,
+        &format!(
+            "Equity redemption {redemption_id} on {chain} has an unresolved signed send {tx_hash} to \
+             the issuer; startup approvals on {chain} are paused and recovery will \
+             rebroadcast the same transaction"
+        ),
+    )
+    .await;
+    false
+}
+
+async fn notify_or_warn(
+    notifier: &dyn Notifier,
+    redemption_id: &RedemptionAggregateId,
+    message: &str,
+) {
+    if let Err(error) = notifier.notify(message).await {
+        warn!(target: "rebalance", %redemption_id, %error, "Could not deliver a startup alert about a send to the issuer");
+    }
+}
+
 /// Queues one resume job per interrupted mint and redemption. A transfer
 /// whose recorded chain lost its equity services refuses startup instead:
 /// queueing a resume that can only fail would strand it silently.
@@ -4670,6 +4776,22 @@ async fn recover_interrupted_tokenization_aggregates(
             .into());
         }
 
+        if matches!(&redemption, EquityRedemption::SendPending { .. })
+            && !restore_redemption_send(
+                equity_services
+                    .for_chain(redemption.chain())?
+                    .tokenizer
+                    .as_ref(),
+                rebalancing_service.notifier().as_ref(),
+                redemption_id,
+                redemption.chain(),
+                &redemption.issuer_send_candidates(),
+            )
+            .await
+        {
+            unmined_restore_chains.insert(redemption.chain());
+        }
+
         if restore_redemption_withdrawal(
             equity_services
                 .for_chain(redemption.chain())?
@@ -4688,9 +4810,19 @@ async fn recover_interrupted_tokenization_aggregates(
             .recover_redemption_state(redemption_id, &redemption)
             .await?;
 
-        let owned_by_transfer_job = transfer_redemptions
-            .iter()
-            .any(|row| row.task.aggregate_id == *redemption_id);
+        // A signed send is always driven to its receipt: a rebroadcast reuses
+        // the same bytes, and an exhausted transfer job would otherwise leave
+        // the send's nonce and reservation held with nothing driving them.
+        let signed_send = matches!(
+            &redemption,
+            EquityRedemption::SendPending {
+                prepared_send: Some(_),
+                ..
+            }
+        );
+        let owned_by_transfer_job = transfer_redemptions.iter().any(|row| {
+            row.task.aggregate_id == *redemption_id && !(signed_send && row.is_terminal())
+        });
         if !owned_by_transfer_job {
             // If cancel_all_pending silently failed above, a stale Pending row for
             // this aggregate may still exist. The duplicate Pending row is tolerated
@@ -8557,6 +8689,51 @@ mod tests {
         ))))
     }
 
+    /// A send another key signed (a rotated wallet) is not restored into the
+    /// current wallet at startup: reserving that key's nonce would raise this
+    /// wallet's next nonce past its own. It pages and gates its chain.
+    #[tokio::test]
+    async fn a_startup_restore_skips_a_send_signed_by_another_wallet() {
+        use alloy::consensus::{SignableTransaction as _, TxEip1559, TxEnvelope};
+        use alloy::eips::eip2718::Encodable2718 as _;
+        use alloy::signers::SignerSync as _;
+
+        let old_key = alloy::signers::local::PrivateKeySigner::random();
+        let unsigned = TxEip1559 {
+            chain_id: 8453,
+            nonce: 900,
+            gas_limit: 80_000,
+            max_fee_per_gas: 1_000_000_000,
+            max_priority_fee_per_gas: 1_000_000,
+            to: alloy::primitives::TxKind::Call(Address::repeat_byte(0x21)),
+            value: U256::ZERO,
+            access_list: alloy::eips::eip2930::AccessList::default(),
+            input: alloy::primitives::Bytes::from_static(&[0xa9, 0x05, 0x9c, 0xbb]),
+        };
+        let signature = old_key.sign_hash_sync(&unsigned.signature_hash()).unwrap();
+        let send = PreparedTransaction::from_raw(alloy::primitives::Bytes::from(
+            TxEnvelope::from(unsigned.into_signed(signature)).encoded_2718(),
+        ))
+        .unwrap();
+        let tokenizer = MockTokenizer::new().with_signing_wallet(Address::repeat_byte(0x4E));
+        let notifier = CapturingNotifier::default();
+        let id = redemption_aggregate_id("startup-rotated-key-send");
+
+        let restored =
+            restore_redemption_send(&tokenizer, &notifier, &id, Chain::Base, &[&send]).await;
+
+        assert!(!restored, "the send gates its chain's startup approvals");
+        assert!(tokenizer.redemption_send_restores().is_empty());
+        assert!(tokenizer.redemption_send_broadcasts().is_empty());
+        let alerts = notifier.messages();
+        assert_eq!(alerts.len(), 1, "{alerts:?}");
+        assert!(
+            alerts[0].contains(&format!("signed by {}", old_key.address()))
+                && alerts[0].contains("nonce 900"),
+            "{alerts:?}"
+        );
+    }
+
     /// A ledger that cannot catch up must not keep the bot from starting:
     /// startup continues with the reactor wired and pages the operator with
     /// the underlying cause, not only the ledger's top level message.
@@ -9521,6 +9698,23 @@ mod tests {
         redemption_label: &str,
         raindex: MockRaindex,
     ) -> InterruptedAggregateFixture {
+        seed_interrupted_aggregates_and_build_service_with_mocks(
+            wallet_byte,
+            mint_label,
+            redemption_label,
+            raindex,
+            MockTokenizer::new(),
+        )
+        .await
+    }
+
+    async fn seed_interrupted_aggregates_and_build_service_with_mocks(
+        wallet_byte: u8,
+        mint_label: &str,
+        redemption_label: &str,
+        raindex: MockRaindex,
+        tokenizer: MockTokenizer,
+    ) -> InterruptedAggregateFixture {
         let (pool, apalis_pool) = setup_test_pools().await;
 
         let mint_id = issuer_request_id(mint_label);
@@ -9528,7 +9722,7 @@ mod tests {
 
         let raindex = Arc::new(raindex);
         let wrapper: Arc<dyn Wrapper> = Arc::new(MockWrapper::new());
-        let tokenizer = Arc::new(MockTokenizer::new());
+        let tokenizer = Arc::new(tokenizer);
 
         let services = recovery_services(raindex.clone(), tokenizer.clone(), wrapper.clone());
 
@@ -9904,6 +10098,247 @@ mod tests {
                     && message.contains("could not be rebroadcast at startup")
             }),
             "a failed rebroadcast must page about redemption {redemption_id}, got {messages:?}"
+        );
+    }
+
+    /// Advances the fixture's redemption from `VaultWithdrawSubmitting` to a
+    /// signed `SendPending` and returns the persisted send's hash.
+    async fn advance_fixture_redemption_to_signed_send(
+        pool: &SqlitePool,
+        services: &EquityTransferServices,
+        redemption_id: &RedemptionAggregateId,
+    ) -> TxHash {
+        let store = test_store::<EquityRedemption>(pool.clone(), services.clone());
+        let prepared = st0x_evm::PreparedTransaction::for_test(TxHash::repeat_byte(0x5e), 7);
+        for command in [
+            EquityRedemptionCommand::RecordWithdrawSubmission {
+                tx_hash: crate::equity_redemption::prepared_withdrawal_for_test().tx_hash(),
+            },
+            EquityRedemptionCommand::ConfirmWithdraw,
+            EquityRedemptionCommand::UnwrapTokens,
+            EquityRedemptionCommand::SubmitUnwrap,
+            EquityRedemptionCommand::ConfirmUnwrap,
+            EquityRedemptionCommand::PrepareSend {
+                prepared: prepared.clone(),
+                redemption_wallet: Address::repeat_byte(0x77),
+            },
+        ] {
+            store.send(redemption_id, command).await.unwrap();
+        }
+        prepared.tx_hash()
+    }
+
+    /// A raindex mock that confirms the fixture redemption's withdrawal, so it
+    /// can advance past `VaultWithdrawSubmitting`.
+    fn confirming_raindex(wallet_byte: u8) -> MockRaindex {
+        MockRaindex::new().with_withdraw_transfer(
+            Address::from([wallet_byte; 20]),
+            alloy::primitives::U256::from(5_000_000_000_000_000_000_u128),
+        )
+    }
+
+    async fn recover_fixture(fixture: &mut InterruptedAggregateFixture) -> BTreeSet<Chain> {
+        recover_interrupted_tokenization_aggregates(
+            &fixture.pool,
+            &fixture.rebalancing_service,
+            fixture.inventory.as_ref(),
+            Arc::new(test_store::<TokenizedEquityMint>(
+                fixture.pool.clone(),
+                fixture.services.clone(),
+            )),
+            Arc::new(test_store::<EquityRedemption>(
+                fixture.pool.clone(),
+                fixture.services.clone(),
+            )),
+            &fixture.services,
+            &mut fixture.resume_queue,
+        )
+        .await
+        .unwrap()
+    }
+
+    /// A node can reject the rebroadcast of an already mined send (Nitro checks
+    /// the fee cap before the nonce). Startup still looks up the receipt, so a
+    /// send that landed does not pause the chain's approvals.
+    #[tokio::test]
+    async fn startup_confirms_a_mined_issuer_send_even_when_its_rebroadcast_fails() {
+        let mut fixture = seed_interrupted_aggregates_and_build_service_with_mocks(
+            7,
+            "mined-send-mint",
+            "mined-send-redemption",
+            confirming_raindex(7),
+            MockTokenizer::new().with_redemption_broadcast_failure(),
+        )
+        .await;
+        let tx_hash = advance_fixture_redemption_to_signed_send(
+            &fixture.pool,
+            &fixture.services,
+            &fixture.redemption_id,
+        )
+        .await;
+
+        let unmined = recover_fixture(&mut fixture).await;
+
+        assert!(unmined.is_empty(), "got {unmined:?}");
+        assert_eq!(fixture.tokenizer.redemption_send_restores(), vec![tx_hash]);
+        assert_eq!(
+            fixture.tokenizer.redemption_send_broadcasts(),
+            vec![tx_hash]
+        );
+        let messages = fixture.notifier.messages();
+        assert!(
+            !messages
+                .iter()
+                .any(|message| message.contains("unresolved signed send")),
+            "a mined send must not page, got {messages:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn startup_pages_an_unmined_issuer_send_and_returns_its_chain() {
+        let mut fixture = seed_interrupted_aggregates_and_build_service_with_mocks(
+            8,
+            "unmined-send-mint",
+            "unmined-send-redemption",
+            confirming_raindex(8),
+            MockTokenizer::new().with_redemption_receipt_missing(),
+        )
+        .await;
+        let tx_hash = advance_fixture_redemption_to_signed_send(
+            &fixture.pool,
+            &fixture.services,
+            &fixture.redemption_id,
+        )
+        .await;
+
+        let unmined = recover_fixture(&mut fixture).await;
+
+        assert_eq!(unmined, BTreeSet::from([Chain::Base]));
+        assert_eq!(fixture.tokenizer.redemption_send_restores(), vec![tx_hash]);
+        let messages = fixture.notifier.messages();
+        assert!(
+            messages.iter().any(|message| {
+                message.contains(&fixture.redemption_id.to_string())
+                    && message.contains("unresolved signed send")
+                    && message.contains(&tx_hash.to_string())
+            }),
+            "got {messages:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn startup_pages_a_legacy_send_pending_with_its_reconcile_command() {
+        let mut fixture = seed_interrupted_aggregates_and_build_service_with(
+            9,
+            "legacy-send-mint",
+            "legacy-send-redemption",
+            confirming_raindex(9),
+        )
+        .await;
+        let store = test_store::<EquityRedemption>(fixture.pool.clone(), fixture.services.clone());
+        for command in [
+            EquityRedemptionCommand::RecordWithdrawSubmission {
+                tx_hash: crate::equity_redemption::prepared_withdrawal_for_test().tx_hash(),
+            },
+            EquityRedemptionCommand::ConfirmWithdraw,
+            EquityRedemptionCommand::UnwrapTokens,
+            EquityRedemptionCommand::SubmitUnwrap,
+            EquityRedemptionCommand::ConfirmUnwrap,
+        ] {
+            store.send(&fixture.redemption_id, command).await.unwrap();
+        }
+        sqlx::query(
+            "INSERT INTO events \
+             (aggregate_type, aggregate_id, sequence, event_type, event_version, payload, metadata) \
+             SELECT 'EquityRedemption', ?1, MAX(sequence) + 1, \
+             'EquityRedemptionEvent::SendPending', '1', \
+             '{\"SendPending\":{\"pending_at\":\"2026-01-01T00:00:00Z\"}}', '{}' \
+             FROM events WHERE aggregate_id = ?1",
+        )
+        .bind(fixture.redemption_id.to_string())
+        .execute(&fixture.pool)
+        .await
+        .unwrap();
+
+        let unmined = recover_fixture(&mut fixture).await;
+
+        assert_eq!(unmined, BTreeSet::from([Chain::Base]));
+        assert!(fixture.tokenizer.redemption_send_broadcasts().is_empty());
+        let messages = fixture.notifier.messages();
+        assert!(
+            messages.iter().any(|message| {
+                message.contains("legacy pending send to the issuer")
+                    && message.contains(&format!(
+                        "stox transfer reconcile --kind redemption --id {}",
+                        fixture.redemption_id
+                    ))
+            }),
+            "got {messages:?}"
+        );
+    }
+
+    /// An exhausted transfer job must not keep a signed send from being driven
+    /// to its receipt: startup queues a resume for it.
+    #[tokio::test]
+    async fn startup_resumes_a_signed_send_whose_transfer_job_is_terminal() {
+        let mut fixture = seed_interrupted_aggregates_and_build_service_with(
+            10,
+            "terminal-job-mint",
+            "terminal-job-redemption",
+            confirming_raindex(10),
+        )
+        .await;
+        advance_fixture_redemption_to_signed_send(
+            &fixture.pool,
+            &fixture.services,
+            &fixture.redemption_id,
+        )
+        .await;
+        let mut redemption_queue =
+            crate::rebalancing::equity::TransferEquityToHedgingJobQueue::new(&fixture.apalis_pool);
+        redemption_queue
+            .push(TransferEquityToHedging {
+                aggregate_id: fixture.redemption_id.clone(),
+                symbol: Symbol::new("TSLA").unwrap(),
+                quantity: FractionalShares::new(float!(5)),
+                chain: Chain::Base,
+                generation: GuardGeneration::from_parts(NonZeroU32::new(1).unwrap(), 1),
+                backpressure_streak: BackpressureStreak::default(),
+                position_reservation_retry_attempts: 0,
+            })
+            .await
+            .unwrap();
+        sqlx_apalis::query(
+            "UPDATE Jobs SET status = ?, attempts = max_attempts WHERE job_type = ?",
+        )
+        .bind(Status::Failed.to_string())
+        .bind(std::any::type_name::<TransferEquityToHedging>())
+        .execute(&fixture.apalis_pool)
+        .await
+        .unwrap();
+
+        recover_fixture(&mut fixture).await;
+
+        let payloads: Vec<Vec<u8>> = sqlx_apalis::query_scalar(
+            "SELECT job FROM Jobs WHERE status = 'Pending' AND job_type = ?",
+        )
+        .bind(std::any::type_name::<ResumeTokenizationAggregate>())
+        .fetch_all(&fixture.apalis_pool)
+        .await
+        .unwrap();
+        let targets = payloads
+            .iter()
+            .map(|job| {
+                serde_json::from_slice::<ResumeTokenizationAggregate>(job)
+                    .unwrap()
+                    .target
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            targets.contains(&ResumeTokenizationTarget::Redemption(
+                fixture.redemption_id.clone()
+            )),
+            "the signed send must be resumed despite its terminal transfer job, got {targets:?}"
         );
     }
 

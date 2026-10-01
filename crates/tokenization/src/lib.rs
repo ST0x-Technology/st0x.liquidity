@@ -19,7 +19,7 @@ pub mod mock;
 use alloy::primitives::{Address, TxHash, U256};
 use async_trait::async_trait;
 
-use st0x_evm::EvmError;
+use st0x_evm::{EvmError, PreparedTransaction};
 use st0x_execution::{Backpressure, FractionalShares, Symbol};
 use st0x_wrapper::UnwrappedToken;
 
@@ -111,6 +111,18 @@ pub enum MintVerificationError {
     Provider(#[from] alloy::transports::RpcError<alloy::transports::TransportErrorKind>),
 }
 
+/// How a mined redemption send ended.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RedemptionSendReceipt {
+    Succeeded,
+    /// It reverted, so no tokens moved. `cause` is the decoded revert reason,
+    /// or why it could not be read, for the operator deciding what to do with
+    /// the unwrapped tokens.
+    Reverted {
+        cause: String,
+    },
+}
+
 /// Abstraction for equity tokenization operations.
 ///
 /// Implementations handle tokenization API calls for:
@@ -165,6 +177,43 @@ pub trait Tokenizer: Send + Sync {
         token: UnwrappedToken,
         amount: U256,
     ) -> Result<TxHash, TokenizerError>;
+
+    /// The wallet that signs this tokenizer's sends to the issuer.
+    fn signing_wallet(&self) -> Address;
+    /// Sign and reserve an issuer transfer without broadcasting it.
+    async fn prepare_redemption_send(
+        &self,
+        token: UnwrappedToken,
+        amount: U256,
+    ) -> Result<PreparedTransaction, TokenizerError>;
+    /// Broadcast the exact durable envelope; never allocate another nonce.
+    async fn broadcast_redemption_send(
+        &self,
+        prepared: &PreparedTransaction,
+    ) -> Result<TxHash, TokenizerError>;
+    /// Re-sign the send at its nonce with higher fees once the network's fee
+    /// estimate has risen above its own; `None` while it has not. Only signs:
+    /// persist the replacement before broadcasting it.
+    async fn prepare_redemption_send_replacement(
+        &self,
+        prepared: &PreparedTransaction,
+    ) -> Result<Option<PreparedTransaction>, TokenizerError>;
+    /// Confirm the send. A revert proves that no tokens moved.
+    async fn confirm_redemption_send(
+        &self,
+        tx_hash: TxHash,
+    ) -> Result<RedemptionSendReceipt, TokenizerError>;
+    /// One non-blocking receipt lookup. `true` means a receipt exists; `false`
+    /// means the node has none yet; a failed lookup is an error. Does not wait
+    /// for inclusion or depth.
+    async fn redemption_send_mined(&self, tx_hash: TxHash) -> Result<bool, TokenizerError>;
+    /// Reserve a restored send's nonce before other wallet operations start.
+    async fn restore_redemption_send(&self, prepared: &PreparedTransaction);
+    /// Release bytes proved not to have reached durable storage.
+    async fn discard_redemption_send(&self, tx_hash: TxHash);
+    /// Release a signed send whose nonce another transaction already used.
+    /// Ownership-checked and idempotent; leaves nonce allocation untouched.
+    async fn release_superseded_redemption_send(&self, tx_hash: TxHash);
 
     /// Poll until the tokenization provider detects the redemption transfer.
     async fn poll_for_redemption(

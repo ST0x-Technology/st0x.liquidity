@@ -44,8 +44,9 @@ use crate::gcp_kms_stamper::{GcpKmsStamper, GcpKmsStamperError};
 use crate::inflight_nonces::{DiscardedNonce, InFlightNonces};
 use crate::nonce::ResettableNonceManager;
 use crate::submit::{
-    GasLimitSource, broadcast_prepared, discard_prepared, pad_gas_estimate, prepare_with_nonce,
-    release_in_flight_after_wait, restore_prepared, restore_transaction, send_with_recovery,
+    GasLimitSource, broadcast_prepared, discard_prepared, pad_gas_estimate,
+    prepare_fee_replacement, prepare_with_nonce, release_in_flight_after_wait, restore_prepared,
+    restore_transaction, send_with_recovery,
 };
 use crate::{Evm, EvmError, PreparedTransaction, TryIntoWallet, Wallet, WalletCtx};
 
@@ -1212,6 +1213,19 @@ where
             self.address,
             prepared,
             note,
+        )
+        .await
+    }
+
+    async fn prepare_fee_replacement(
+        &self,
+        prepared: &PreparedTransaction,
+    ) -> Result<Option<PreparedTransaction>, EvmError> {
+        prepare_fee_replacement(
+            &self.signing_provider,
+            &self.send_lock,
+            self.address,
+            prepared,
         )
         .await
     }

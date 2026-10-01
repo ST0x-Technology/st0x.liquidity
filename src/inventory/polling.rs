@@ -2304,6 +2304,13 @@ mod tests {
             panic!("MockEthereumWallet::discard_prepared should not be called in polling tests");
         }
 
+        async fn prepare_fee_replacement(
+            &self,
+            _prepared: &PreparedTransaction,
+        ) -> Result<Option<PreparedTransaction>, EvmError> {
+            panic!("MockEthereumWallet::prepare_fee_replacement should not be called here")
+        }
+
         async fn release_superseded(&self, _tx_hash: TxHash) {
             panic!("MockEthereumWallet::release_superseded should not be called in polling tests");
         }
@@ -2393,6 +2400,13 @@ mod tests {
 
         async fn discard_prepared(&self, _tx_hash: TxHash) {
             panic!("MockBaseWallet::discard_prepared should not be called in polling tests");
+        }
+
+        async fn prepare_fee_replacement(
+            &self,
+            _prepared: &PreparedTransaction,
+        ) -> Result<Option<PreparedTransaction>, EvmError> {
+            panic!("MockBaseWallet::prepare_fee_replacement should not be called here")
         }
 
         async fn release_superseded(&self, _tx_hash: TxHash) {

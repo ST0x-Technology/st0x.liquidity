@@ -32,8 +32,8 @@ use st0x_hedge::operator::mint_authorization::{ConfiguredMintAuthorizer, VaultMo
 use st0x_hedge::operator::native_gas::{ConfiguredGasReadiness, GasReadiness};
 use st0x_hedge::operator::position::{EquityTransferReservationId, Position, PositionCommand};
 use st0x_hedge::operator::rebalancing::equity::{
-    ChainEquityServices, CrossVenueEquityTransfer, EquityTransferServices,
-    verify_hash_only_withdrawal_not_through, verify_withdrawal_superseded,
+    ChainEquityServices, CrossVenueEquityTransfer, EquityTransferServices, SignedRedemptionTx,
+    verify_hash_only_withdrawal_not_through, verify_signed_redemption_txs_superseded,
     withdrawal_required_confirmations,
 };
 use st0x_hedge::operator::rebalancing::to_wrapped_equities;
@@ -1624,13 +1624,15 @@ pub(super) async fn verify_deposit_send_superseded_on_chain(
     .await?)
 }
 
-/// The vault withdrawal a redemption reconcile checks on chain first.
+/// The vault withdrawal or send to the issuer a redemption reconcile checks on chain
+/// first.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum WithdrawalCheck<'a> {
-    /// A signed withdrawal, and the tx the operator names as having taken its
-    /// nonce.
+    /// A signed withdrawal, or every signed copy of a send to the issuer (they share
+    /// one nonce), and the tx the operator names as having taken that nonce.
     Signed {
-        prepared: &'a PreparedTransaction,
+        kind: SignedRedemptionTx,
+        signed: &'a [&'a PreparedTransaction],
         superseding_tx: Option<TxHash>,
     },
     /// A legacy withdrawal known only by its hash. An adopted replacement is
@@ -1659,11 +1661,13 @@ pub(super) async fn verify_withdrawal_on_chain(
 
     match check {
         WithdrawalCheck::Signed {
-            prepared,
+            kind,
+            signed,
             superseding_tx,
-        } => Ok(verify_withdrawal_superseded(
+        } => Ok(verify_signed_redemption_txs_superseded(
             &raindex,
-            prepared,
+            kind,
+            signed,
             superseding_tx,
             bot_wallet,
             withdrawal_required_confirmations(&ctx.chains, chain)?,
@@ -2171,27 +2175,30 @@ pub(crate) async fn reconcile_equity_transfer_command<W: Write>(
 
             if !entity.is_operator_reconcilable() {
                 anyhow::bail!(
-                    "transfer reconcile: redemption {id} is not reconcilable (must be Failed \
-                     or an unresolved vault-withdrawal submission). Refusing to act -- check \
-                     its current state on the dashboard."
+                    "transfer reconcile: redemption {id} is not reconcilable (must be Failed, \
+                     an unresolved vault-withdrawal submission, or a pending send to the issuer). \
+                     Refusing to act -- check its current state on the dashboard."
                 );
             }
 
             // The aggregate command is pure, so the chain check is read here,
             // before it, and the command refuses if the redemption holds
-            // another signed withdrawal by then.
+            // another signed withdrawal or send to the issuer by then.
+            let (kind, signed) = entity.reconcilable_signed_txs();
             let check = match (
-                entity.prepared_withdrawal(),
+                entity.reconcilable_signed_tx(),
                 entity.hash_only_withdrawal(),
                 superseding_tx,
             ) {
-                (Some(prepared), _, _) => Some(WithdrawalCheck::Signed {
-                    prepared,
+                (Some(_), _, _) => Some(WithdrawalCheck::Signed {
+                    kind,
+                    signed: &signed,
                     superseding_tx,
                 }),
                 (None, _, Some(_)) => anyhow::bail!(
                     "transfer reconcile: --superseding-tx applies only to a redemption with a \
-                     signed vault withdrawal; redemption {id} has none. Refusing to act."
+                     signed vault withdrawal or send to the issuer; redemption {id} has none. \
+                     Refusing to act."
                 ),
                 (None, Some(tx), None) => Some(WithdrawalCheck::HashOnly(tx)),
                 (None, None, None) => None,
@@ -2204,7 +2211,7 @@ pub(crate) async fn reconcile_equity_transfer_command<W: Write>(
                     })?;
             }
             let proven_withdrawal = entity
-                .prepared_withdrawal()
+                .reconcilable_signed_tx()
                 .map(PreparedTransaction::tx_hash);
 
             st0x_event_sorcery::send_command::<EquityRedemption>(
@@ -6187,7 +6194,10 @@ mod tests {
             UnwrapTokens,
             SubmitUnwrap,
             ConfirmUnwrap,
-            PrepareSend,
+            PrepareSend {
+                prepared: st0x_hedge::operator::equity_redemption::prepared_withdrawal_for_test(),
+                redemption_wallet: Address::ZERO,
+            },
             SendTokens,
         ] {
             store.send(id, command).await.unwrap();
@@ -6814,7 +6824,10 @@ mod tests {
             None,
             &pool,
             async |_, check: WithdrawalCheck<'_>| {
-                let WithdrawalCheck::Signed { prepared, .. } = check else {
+                let WithdrawalCheck::Signed {
+                    signed: [prepared], ..
+                } = check
+                else {
                     panic!("a signed withdrawal is checked as signed, got {check:?}");
                 };
                 Err(WithdrawalNotSuperseded::NoSupersedingTx {
@@ -6866,7 +6879,8 @@ mod tests {
                 assert_eq!(
                     check,
                     WithdrawalCheck::Signed {
-                        prepared: &PreparedTransaction::for_test(TxHash::ZERO, 0),
+                        kind: SignedRedemptionTx::VaultWithdrawal,
+                        signed: &[&PreparedTransaction::for_test(TxHash::ZERO, 0)],
                         superseding_tx: Some(cancel),
                     },
                     "the check reads the persisted withdrawal and the operator's tx"
@@ -6973,6 +6987,203 @@ mod tests {
         assert!(
             matches!(entity, EquityRedemption::Failed { .. }),
             "a refused reconcile must not reconcile, got: {entity:?}"
+        );
+    }
+
+    /// Drives a redemption to `SendPending` holding a signed send to the issuer, and
+    /// returns that send.
+    async fn seed_redemption_to_signed_send(
+        pool: &SqlitePool,
+        id: &RedemptionAggregateId,
+    ) -> PreparedTransaction {
+        use EquityRedemptionCommand::*;
+
+        seed_redemption_to_withdrawn(pool, id).await;
+        let prepared = PreparedTransaction::for_test(TxHash::repeat_byte(9), 4);
+        let (store, _projection) = StoreBuilder::<EquityRedemption>::new(pool.clone())
+            .build(redemption_services())
+            .await
+            .unwrap();
+        for command in [
+            UnwrapTokens,
+            SubmitUnwrap,
+            ConfirmUnwrap,
+            PrepareSend {
+                prepared: prepared.clone(),
+                redemption_wallet: Address::ZERO,
+            },
+        ] {
+            store.send(id, command).await.unwrap();
+        }
+        prepared
+    }
+
+    /// A signed send to the issuer can still mine until its nonce is proven taken, so
+    /// it is not reconciled on the operator's word: the chain check runs on
+    /// the send itself and its refusal leaves the redemption unresolved.
+    #[tokio::test]
+    async fn reconcile_equity_redemption_refuses_a_signed_send_that_can_still_mine() {
+        use st0x_hedge::operator::rebalancing::equity::WithdrawalNotSuperseded;
+
+        let pool = setup_test_db().await;
+        let id = redemption_aggregate_id("cli-reconcile-unproven-send");
+        let prepared = seed_redemption_to_signed_send(&pool, &id).await;
+
+        let mut stdout = Vec::new();
+        let error = reconcile_equity_transfer_command(
+            &mut stdout,
+            TransferType::Redemption,
+            &id.to_string(),
+            "send stuck below the market fee".parse().unwrap(),
+            None,
+            &pool,
+            async |_, check: WithdrawalCheck<'_>| {
+                assert_eq!(
+                    check,
+                    WithdrawalCheck::Signed {
+                        kind: SignedRedemptionTx::IssuerSend,
+                        signed: &[&prepared],
+                        superseding_tx: None,
+                    },
+                    "the check reads the persisted send to the issuer"
+                );
+                Err(WithdrawalNotSuperseded::NoSupersedingTx {
+                    tx: prepared.tx_hash(),
+                    nonce: prepared.nonce(),
+                }
+                .into())
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            format!("{error:#}").starts_with(&format!(
+                "transfer reconcile: refusing to reconcile redemption {id}:"
+            )),
+            "the refusal names the redemption, got: {error:#}"
+        );
+        let entity = st0x_event_sorcery::load_entity::<EquityRedemption>(&pool, &id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(entity, EquityRedemption::SendPending { .. }),
+            "a refused reconcile leaves the send unresolved, got: {entity:?}"
+        );
+    }
+
+    /// A signed send to the issuer proven never to land (its nonce taken by the
+    /// operator's confirmed cancel) is closed through the CLI, and the
+    /// reconciled state names the send whose nonce the bot must release.
+    #[tokio::test]
+    async fn reconcile_equity_redemption_succeeds_from_a_signed_send_proven_superseded() {
+        let pool = setup_test_db().await;
+        let id = redemption_aggregate_id("cli-reconcile-signed-send");
+        let prepared = seed_redemption_to_signed_send(&pool, &id).await;
+        let cancel = TxHash::repeat_byte(0xCA);
+
+        let mut stdout = Vec::new();
+        reconcile_equity_transfer_command(
+            &mut stdout,
+            TransferType::Redemption,
+            &id.to_string(),
+            "nonce 4 consumed by a 0-value self-transfer"
+                .parse()
+                .unwrap(),
+            Some(cancel),
+            &pool,
+            async |_, check: WithdrawalCheck<'_>| {
+                assert_eq!(
+                    check,
+                    WithdrawalCheck::Signed {
+                        kind: SignedRedemptionTx::IssuerSend,
+                        signed: &[&prepared],
+                        superseding_tx: Some(cancel),
+                    },
+                    "the check reads the persisted send to the issuer and the operator's tx"
+                );
+                Ok(())
+            },
+        )
+        .await
+        .unwrap();
+
+        let entity = st0x_event_sorcery::load_entity::<EquityRedemption>(&pool, &id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(
+                entity,
+                EquityRedemption::Reconciled {
+                    issuer_send_nonce_hash: Some(hash),
+                    ..
+                } if hash == prepared.tx_hash()
+            ),
+            "a dead signed send must reconcile and name its nonce, got: {entity:?}"
+        );
+    }
+
+    /// A fee-replaced send to the issuer is checked on every signed candidate, since
+    /// any of them can take the nonce, and the reconciled state names the
+    /// newest one, the candidate the reconcile proved.
+    #[tokio::test]
+    async fn reconcile_equity_redemption_checks_every_fee_replacement_of_a_send() {
+        let pool = setup_test_db().await;
+        let id = redemption_aggregate_id("cli-reconcile-replaced-send");
+        let prepared = seed_redemption_to_signed_send(&pool, &id).await;
+        let replacement =
+            PreparedTransaction::for_test(TxHash::repeat_byte(0x0A), prepared.nonce());
+        send_redemption_command(
+            &pool,
+            &id,
+            EquityRedemptionCommand::ReplaceSend {
+                replacement: replacement.clone(),
+            },
+        )
+        .await;
+        let cancel = TxHash::repeat_byte(0xCA);
+
+        let mut stdout = Vec::new();
+        reconcile_equity_transfer_command(
+            &mut stdout,
+            TransferType::Redemption,
+            &id.to_string(),
+            "nonce 4 consumed by a 0-value self-transfer"
+                .parse()
+                .unwrap(),
+            Some(cancel),
+            &pool,
+            async |_, check: WithdrawalCheck<'_>| {
+                assert_eq!(
+                    check,
+                    WithdrawalCheck::Signed {
+                        kind: SignedRedemptionTx::IssuerSend,
+                        signed: &[&prepared, &replacement],
+                        superseding_tx: Some(cancel),
+                    },
+                    "the check reads the send and its fee replacement"
+                );
+                Ok(())
+            },
+        )
+        .await
+        .unwrap();
+
+        let entity = st0x_event_sorcery::load_entity::<EquityRedemption>(&pool, &id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(
+                entity,
+                EquityRedemption::Reconciled {
+                    issuer_send_nonce_hash: Some(hash),
+                    ..
+                } if hash == replacement.tx_hash()
+            ),
+            "the reconcile must name the newest candidate, got: {entity:?}"
         );
     }
 

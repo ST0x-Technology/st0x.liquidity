@@ -832,6 +832,16 @@ async fn resume_redemption_or_fail(
                 dispatched_at: Utc::now(),
             }])
         }
+        // A redemption still resolving onchain (a pending withdrawal or issuer
+        // send, or a legacy send an operator must verify) has its own jobs
+        // driving it, so the recovery has handed it over rather than failed.
+        Err(error) if error.is_still_in_progress() => {
+            info!(target: "rebalance", %redemption_id, %error, "Unwrapped equity recovery: the redemption is still resolving and drives itself");
+            Ok(vec![UnwrappedEquityRecoveryEvent::DispatchedToRedemption {
+                redemption_id: redemption_id.clone(),
+                dispatched_at: Utc::now(),
+            }])
+        }
         Err(error) => {
             warn!(target: "rebalance", %redemption_id, ?error, "Unwrapped equity recovery: resume_redemption failed");
             Ok(vec![UnwrappedEquityRecoveryEvent::RecoveryFailed {

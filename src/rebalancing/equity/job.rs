@@ -38,13 +38,13 @@ use st0x_execution::{FractionalShares, Symbol};
 use st0x_tokenization::IssuerRequestId;
 
 use super::{
-    CrossVenueEquityTransfer, EquityTransferServices, MintError, MintTransferError,
-    RedemptionError, withdrawal_reconciliation_redrive_delay,
+    CrossVenueEquityTransfer, EquityTransferServices, IssuerSendRedrive, MintError,
+    MintTransferError, RedemptionError, WITHDRAWAL_RECONCILIATION_REDRIVE_DELAY,
+    issuer_send_redrive, page_underlying_mismatch, withdrawal_reconciliation_redrive_delay,
 };
 #[cfg(test)]
 use super::{
-    WITHDRAWAL_RECONCILIATION_ALERT_DEADLINE,
-    WITHDRAWAL_RECONCILIATION_POST_DEADLINE_REDRIVE_DELAY, WITHDRAWAL_RECONCILIATION_REDRIVE_DELAY,
+    WITHDRAWAL_RECONCILIATION_ALERT_DEADLINE, WITHDRAWAL_RECONCILIATION_POST_DEADLINE_REDRIVE_DELAY,
 };
 use crate::alerts::Notifier;
 #[cfg(test)]
@@ -834,6 +834,14 @@ pub(crate) trait ResumeEquityToHedging: Send + Sync + 'static {
     ) -> Result<(), RedemptionError> {
         Ok(())
     }
+
+    async fn discard_reconciled_issuer_send(
+        &self,
+        _chain: Chain,
+        _tx_hash: TxHash,
+    ) -> Result<(), RedemptionError> {
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -858,6 +866,14 @@ impl ResumeEquityToHedging for CrossVenueEquityTransfer {
         tx_hash: TxHash,
     ) -> Result<(), RedemptionError> {
         Self::discard_reconciled_withdrawal(self, chain, tx_hash).await
+    }
+
+    async fn discard_reconciled_issuer_send(
+        &self,
+        chain: Chain,
+        tx_hash: TxHash,
+    ) -> Result<(), RedemptionError> {
+        Self::discard_reconciled_issuer_send(self, chain, tx_hash).await
     }
 }
 
@@ -1079,7 +1095,8 @@ impl TransferEquityToHedging {
         aggregate: &EquityRedemption,
     ) {
         let EquityRedemption::Reconciled {
-            withdrawal_nonce_hash: Some(tx_hash),
+            withdrawal_nonce_hash,
+            issuer_send_nonce_hash,
             chain,
             ..
         } = aggregate
@@ -1087,24 +1104,48 @@ impl TransferEquityToHedging {
             return;
         };
 
-        match ctx
-            .transfer
-            .discard_reconciled_withdrawal(*chain, *tx_hash)
-            .await
-        {
-            Ok(()) => info!(
-                target: "rebalance",
-                symbol = %self.symbol,
-                aggregate_id = %self.aggregate_id,
-                "Requested release of the reconciled withdrawal's nonce reservation"
-            ),
-            Err(error) => warn!(
-                target: "rebalance",
-                symbol = %self.symbol,
-                aggregate_id = %self.aggregate_id,
-                %error,
-                "Failed to release a reconciled withdrawal's nonce reservation"
-            ),
+        if let Some(tx_hash) = withdrawal_nonce_hash {
+            match ctx
+                .transfer
+                .discard_reconciled_withdrawal(*chain, *tx_hash)
+                .await
+            {
+                Ok(()) => info!(
+                    target: "rebalance",
+                    symbol = %self.symbol,
+                    aggregate_id = %self.aggregate_id,
+                    "Requested release of the reconciled withdrawal's nonce reservation"
+                ),
+                Err(error) => warn!(
+                    target: "rebalance",
+                    symbol = %self.symbol,
+                    aggregate_id = %self.aggregate_id,
+                    %error,
+                    "Failed to release a reconciled withdrawal's nonce reservation"
+                ),
+            }
+        }
+
+        if let Some(tx_hash) = issuer_send_nonce_hash {
+            match ctx
+                .transfer
+                .discard_reconciled_issuer_send(*chain, *tx_hash)
+                .await
+            {
+                Ok(()) => info!(
+                    target: "rebalance",
+                    symbol = %self.symbol,
+                    aggregate_id = %self.aggregate_id,
+                    "Requested release of the nonce reservation of the reconciled send to the issuer"
+                ),
+                Err(error) => warn!(
+                    target: "rebalance",
+                    symbol = %self.symbol,
+                    aggregate_id = %self.aggregate_id,
+                    %error,
+                    "Failed to release the nonce reservation of a reconciled send to the issuer"
+                ),
+            }
         }
     }
 }
@@ -1215,6 +1256,37 @@ impl Job<TransferEquityToHedgingCtx> for TransferEquityToHedging {
             return self.abandon_stopped_fresh_transfer(ctx, error).await;
         }
 
+        if error.is_permanent_underlying_mismatch() {
+            // The redemption keeps its guard and reservation: its tokens sit
+            // unwrapped in the wallet until an operator ends it.
+            page_underlying_mismatch(&ctx.notifier, &self.aggregate_id, &error).await;
+            warn!(
+                target: "rebalance",
+                symbol = %self.symbol,
+                aggregate_id = %self.aggregate_id,
+                %error,
+                "Legacy redemption underlying does not match its vault; stopping without retries"
+            );
+            return Ok(());
+        }
+
+        if let Some(IssuerSendRedrive { tx_hash, delay }) =
+            issuer_send_redrive(&ctx.redemption_store, &self.aggregate_id).await
+        {
+            warn!(
+                target: "rebalance",
+                symbol = %self.symbol,
+                aggregate_id = %self.aggregate_id,
+                ?tx_hash,
+                ?delay,
+                %error,
+                "Signed send to the issuer is unresolved; scheduling a durable fresh-transfer redrive"
+            );
+            let mut job_queue = ctx.job_queue.clone();
+            job_queue.push_with_delay(self.clone(), delay).await?;
+            return Ok(());
+        }
+
         if error.is_reconciliation_pending() {
             let delay = withdrawal_reconciliation_redrive_delay(
                 &ctx.redemption_store,
@@ -1280,7 +1352,36 @@ impl Job<TransferEquityToHedgingCtx> for TransferEquityToHedging {
         ctx: &TransferEquityToHedgingCtx,
         task_identity: &TaskIdentity,
     ) -> Result<(), BoxDynError> {
-        let aggregate = ctx.redemption_store.load(&self.aggregate_id).await?;
+        let aggregate = match ctx.redemption_store.load(&self.aggregate_id).await {
+            Ok(aggregate) => aggregate,
+            Err(error) => {
+                // An unreadable redemption may hold a signed send to the issuer, whose
+                // nonce must keep a driver, so the last attempt queues a fresh
+                // row instead of leaving it to a restart, unless a live sibling
+                // row already drives it. The sibling check reads the job queue,
+                // not the event store, so it can succeed when this load failed.
+                if has_live_sibling_job::<Self>(ctx.job_queue.pool(), task_identity, |sibling| {
+                    sibling.aggregate_id == self.aggregate_id
+                        && sibling.generation == self.generation
+                })
+                .await?
+                {
+                    return Ok(());
+                }
+                warn!(
+                    target: "rebalance",
+                    aggregate_id = %self.aggregate_id,
+                    ?error,
+                    %task_identity,
+                    "Terminal redemption attempt could not read its redemption; scheduling a fresh row"
+                );
+                let mut job_queue = ctx.job_queue.clone();
+                job_queue
+                    .push_with_delay(self.clone(), WITHDRAWAL_RECONCILIATION_REDRIVE_DELAY)
+                    .await?;
+                return Ok(());
+            }
+        };
         if let Some(aggregate) = &aggregate {
             // A live row that loaded a submission state just before the reconcile
             // can re-reserve the withdrawal's nonce after the release, then fail
@@ -1292,6 +1393,31 @@ impl Job<TransferEquityToHedgingCtx> for TransferEquityToHedging {
         if let Some(aggregate) = aggregate
             && !aggregate.is_terminal()
         {
+            // A signed send to the issuer holds its nonce until it resolves, so it must
+            // keep a driver: `perform` redrives its failures, and a budget spent
+            // anyway (its state read failed too) queues a fresh row here.
+            if let Some(IssuerSendRedrive { tx_hash, delay }) =
+                issuer_send_redrive(&ctx.redemption_store, &self.aggregate_id).await
+                && !has_live_sibling_job::<Self>(ctx.job_queue.pool(), task_identity, |sibling| {
+                    sibling.aggregate_id == self.aggregate_id
+                        && sibling.generation == self.generation
+                })
+                .await?
+            {
+                warn!(
+                    target: "rebalance",
+                    symbol = %self.symbol,
+                    aggregate_id = %self.aggregate_id,
+                    ?tx_hash,
+                    ?delay,
+                    %task_identity,
+                    "Transfer job budget spent on an unresolved signed send to the issuer; scheduling a fresh row"
+                );
+                let mut job_queue = ctx.job_queue.clone();
+                job_queue.push_with_delay(self.clone(), delay).await?;
+                return Ok(());
+            }
+
             // A submission-state redemption whose transfer job budget is now
             // exhausted has an unresolved onchain withdrawal. With no live sibling
             // to drive it, nothing exits it automatically: the sweep never
@@ -4348,6 +4474,227 @@ mod tests {
             )
             .await
             .unwrap();
+    }
+
+    /// Services whose withdrawal confirms, with `tokenizer` signing the send.
+    fn signed_send_services(tokenizer: Arc<MockTokenizer>) -> EquityTransferServices {
+        let mut services = EquityTransferServices::confirming_withdrawal(
+            Address::ZERO,
+            U256::from(1_000_000_000_000_000_000_u128),
+        );
+        if let Some(base) = services.chains.get_mut(&Chain::Base) {
+            base.tokenizer = tokenizer;
+        }
+        services
+    }
+
+    /// Drives a redemption through the aggregate command path to `SendPending`
+    /// holding `send`, its signed and persisted but unconfirmed send to the issuer.
+    async fn seed_redemption_signed_send(
+        store: &Store<EquityRedemption>,
+        id: &RedemptionAggregateId,
+        send: &PreparedTransaction,
+    ) {
+        use EquityRedemptionCommand::*;
+
+        store
+            .send(
+                id,
+                Redeem {
+                    chain: Chain::Base,
+                    symbol: Symbol::new("AAPL").unwrap(),
+                    quantity: float!(1),
+                    token: Address::ZERO,
+                    vault_id: st0x_raindex::RaindexVaultId(alloy::primitives::B256::ZERO),
+                    amount: U256::from(1_000_000_000_000_000_000_u128),
+                    from_block: 0,
+                    prepared: crate::equity_redemption::prepared_withdrawal_for_test(),
+                },
+            )
+            .await
+            .unwrap();
+        for command in [
+            RecordWithdrawSubmission {
+                tx_hash: TxHash::ZERO,
+            },
+            ConfirmWithdraw,
+            UnwrapTokens,
+            SubmitUnwrap,
+            ConfirmUnwrap,
+            PrepareSend {
+                prepared: send.clone(),
+                redemption_wallet: Address::repeat_byte(0xAB),
+            },
+        ] {
+            store.send(id, command).await.unwrap();
+        }
+    }
+
+    /// A transfer job for a redemption seeded at a signed `SendPending`, driven
+    /// by `transfer`, with its own apalis pool to inspect.
+    async fn signed_send_job(
+        transfer: Option<Arc<dyn ResumeEquityToHedging>>,
+        tokenizer: Arc<MockTokenizer>,
+        label: &str,
+    ) -> (
+        TransferEquityToHedgingCtx,
+        TransferEquityToHedging,
+        sqlx_apalis::SqlitePool,
+        PreparedTransaction,
+    ) {
+        let (pool, apalis_pool) = crate::test_utils::setup_test_pools().await;
+        let services = signed_send_services(tokenizer);
+        let redemption_store = Arc::new(test_store::<EquityRedemption>(
+            pool.clone(),
+            services.clone(),
+        ));
+        let id = redemption_aggregate_id(label);
+        let send = PreparedTransaction::for_test(TxHash::repeat_byte(0x5D), 9);
+        seed_redemption_signed_send(&redemption_store, &id, &send).await;
+        let transfer = transfer.unwrap_or_else(|| {
+            Arc::new(CrossVenueEquityTransfer::new(
+                services.clone(),
+                Arc::new(test_store::<TokenizedEquityMint>(
+                    pool.clone(),
+                    services.clone(),
+                )),
+                redemption_store.clone(),
+            ))
+        });
+
+        let ctx = TransferEquityToHedgingCtx {
+            transfer,
+            equity_in_progress: Arc::new(RwLock::new(HashMap::new())),
+            redemption_store,
+            transfer_services: services,
+            position_authority: None,
+            hedge_capacity: None,
+            job_queue: TransferEquityToHedgingJobQueue::new(&apalis_pool),
+            notifier: Arc::new(crate::alerts::LogNotifier),
+        };
+        let job = TransferEquityToHedging {
+            chain: Chain::Base,
+            aggregate_id: id,
+            symbol: Symbol::new("AAPL").unwrap(),
+            quantity: FractionalShares::new(float!(1)),
+            generation: GuardGeneration::default(),
+            backpressure_streak: BackpressureStreak::default(),
+            position_reservation_retry_attempts: 0,
+        };
+
+        (ctx, job, apalis_pool, send)
+    }
+
+    /// Fails every drive with an error that is not reconciliation-pending, as a
+    /// `SendTokens` hitting `SQLITE_BUSY` before any broadcast does.
+    struct UnclassifiedFailureRedemptionResume;
+
+    #[async_trait]
+    impl ResumeEquityToHedging for UnclassifiedFailureRedemptionResume {
+        async fn resume_equity_to_hedging(
+            &self,
+            _aggregate_id: &RedemptionAggregateId,
+            _symbol: &Symbol,
+            _chain: Chain,
+            _quantity: FractionalShares,
+        ) -> Result<(), RedemptionError> {
+            Err(RedemptionError::UnexpectedPendingStatus)
+        }
+    }
+
+    async fn pending_transfer_rows(
+        apalis_pool: &sqlx_apalis::SqlitePool,
+    ) -> Vec<(TransferEquityToHedging, i64)> {
+        let rows: Vec<(Vec<u8>, i64)> = sqlx_apalis::query_as(
+            "SELECT job, run_at FROM Jobs WHERE job_type = ? AND status = 'Pending'",
+        )
+        .bind(std::any::type_name::<TransferEquityToHedging>())
+        .fetch_all(apalis_pool)
+        .await
+        .unwrap();
+        rows.into_iter()
+            .map(|(payload, run_at)| (serde_json::from_slice(&payload).unwrap(), run_at))
+            .collect()
+    }
+
+    /// A signed send to the issuer holds its nonce until it resolves, so any failure to
+    /// drive it is redriven instead of spending the job's retry budget: once
+    /// spent, nothing would broadcast the send until a restart.
+    #[tokio::test]
+    async fn a_signed_send_redrives_any_failure_instead_of_spending_the_budget() {
+        let (ctx, job, apalis_pool, _send) = signed_send_job(
+            Some(Arc::new(UnclassifiedFailureRedemptionResume)),
+            Arc::new(MockTokenizer::new()),
+            "signed-send-unclassified-failure",
+        )
+        .await;
+
+        let before = chrono::Utc::now().timestamp();
+        Job::perform(&job, &ctx)
+            .await
+            .expect("a failure on a signed send must redrive, not fail the attempt");
+
+        let rows = pending_transfer_rows(&apalis_pool).await;
+        let [(rescheduled, run_at)] = rows.as_slice() else {
+            panic!("expected one redrive row, got {rows:?}");
+        };
+        assert_eq!(rescheduled.aggregate_id, job.aggregate_id);
+        let delay = i64::try_from(WITHDRAWAL_RECONCILIATION_REDRIVE_DELAY.as_secs()).unwrap();
+        assert!(
+            *run_at >= before + delay - 5,
+            "run_at={run_at} before={before}"
+        );
+    }
+
+    /// A budget spent anyway (the state read in `perform` failed too) still
+    /// leaves the signed send a driver: the terminal attempt queues a fresh row.
+    #[tokio::test]
+    async fn a_terminal_attempt_on_a_signed_send_queues_a_fresh_row() {
+        let (ctx, job, apalis_pool, _send) = signed_send_job(
+            Some(Arc::new(UnclassifiedFailureRedemptionResume)),
+            Arc::new(MockTokenizer::new()),
+            "signed-send-terminal-attempt",
+        )
+        .await;
+
+        Job::on_terminal_attempt(&job, &ctx, &TaskIdentity::for_test("signed-send-last"))
+            .await
+            .unwrap();
+
+        let rows = pending_transfer_rows(&apalis_pool).await;
+        let [(rescheduled, _)] = rows.as_slice() else {
+            panic!("expected one fresh row, got {rows:?}");
+        };
+        assert_eq!(rescheduled.aggregate_id, job.aggregate_id);
+    }
+
+    /// Reconciling a signed send (its nonce proven taken) is bookkeeping only;
+    /// the transfer job that next observes `Reconciled` releases the send's
+    /// nonce so later sends from the wallet stop queueing behind it.
+    #[tokio::test]
+    async fn a_reconciled_issuer_send_job_releases_its_nonce() {
+        let tokenizer = Arc::new(MockTokenizer::new());
+        let (ctx, job, _apalis_pool, send) =
+            signed_send_job(None, tokenizer.clone(), "reconciled-issuer-send").await;
+        ctx.redemption_store
+            .send(
+                &job.aggregate_id,
+                EquityRedemptionCommand::Reconcile {
+                    reason: "nonce 9 taken by a 0-value self-transfer".to_string(),
+                    proven_withdrawal: Some(send.tx_hash()),
+                },
+            )
+            .await
+            .unwrap();
+
+        Job::perform(&job, &ctx)
+            .await
+            .expect("a reconciled redemption must terminate cleanly");
+
+        assert_eq!(
+            tokenizer.redemption_send_superseded_releases(),
+            vec![send.tx_hash()]
+        );
     }
 
     /// A resume that observes a redemption reconciled while its vault withdrawal
