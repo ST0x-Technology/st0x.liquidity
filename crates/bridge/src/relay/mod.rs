@@ -14,8 +14,8 @@ pub use acceptance::{
     BasisPoints, BasisPointsOutOfRange, QuoteAcceptanceError, QuoteAmounts, QuoteBounds,
 };
 pub use quote::{
-    QuoteFees, QuoteMismatch, QuoteRequest, QuoteStep, QuotedCurrency, RelayOrderId, RelayQuote,
-    RelayRequestId, StepTransaction,
+    QuoteFees, QuoteField, QuoteMismatch, QuoteRequest, QuoteStep, QuotedCurrency, RelayOrderId,
+    RelayQuote, RelayRequestId, StepTransaction,
 };
 pub use status::{FailReason, InFlightStage, IntentStatus, IntentStatusReport};
 
