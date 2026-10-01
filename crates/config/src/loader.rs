@@ -3022,6 +3022,11 @@ pub enum CtxError {
     #[error(transparent)]
     ChainRegistry(#[from] crate::chain::ChainRegistryError),
     #[error(
+        "[chains.{primary}] is the primary chain, but the primary must be Base: equity \
+         wallet polling and recovery read the Base wallet with the primary's token addresses"
+    )]
+    PrimaryChainNotBase { primary: Chain },
+    #[error(
         "the [rebalancing] config section is required; there is no global \
          rebalancing off-switch. To pause rebalancing work use the narrow \
          controls: per-asset `rebalancing = \"disabled\"`, issuance freeze, \
@@ -3185,6 +3190,7 @@ impl CtxError {
             Self::Alerts(_) => "alerts assembly error",
             Self::Chain(_) => "chain configuration error",
             Self::ChainRegistry(_) => "chain registry error",
+            Self::PrimaryChainNotBase { .. } => "primary chain not Base",
             Self::CashOperationalLimitBelowMinimumTransfer { .. } => {
                 "cash operational limit below minimum transfer"
             }
@@ -12386,6 +12392,45 @@ mod tests {
                 error,
                 CtxError::NoServedUsdcCorridor {
                     chain: Chain::Ethereum
+                }
+            ),
+            "got {error:?}"
+        );
+    }
+
+    /// Equity wallet polling and recovery read the Base wallet with the
+    /// primary's token addresses, so a non-Base primary is refused at load.
+    #[test]
+    fn full_validation_refuses_a_non_base_primary() {
+        let mut deployed: toml::Table =
+            toml::from_str(include_str!("../../../config/prod/st0x-hedge.toml")).unwrap();
+        let chains = deployed["chains"].as_table_mut().unwrap();
+        let mut ethereum_trading = chains["base"]["trading"].clone();
+        ethereum_trading
+            .as_table_mut()
+            .unwrap()
+            .insert("primary".to_string(), toml::Value::Boolean(true));
+        chains["base"]["trading"]
+            .as_table_mut()
+            .unwrap()
+            .insert("primary".to_string(), toml::Value::Boolean(false));
+        ethereum_trading["assets"]
+            .as_table_mut()
+            .unwrap()
+            .remove("cash");
+        chains["ethereum"]
+            .as_table_mut()
+            .unwrap()
+            .insert("trading".to_string(), ethereum_trading);
+        let config = toml_file(&toml::to_string(&deployed).unwrap());
+
+        let error = Ctx::validate_config_file(config.path(), TokenFile::Skipped).unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                CtxError::PrimaryChainNotBase {
+                    primary: Chain::Ethereum
                 }
             ),
             "got {error:?}"
