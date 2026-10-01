@@ -79,9 +79,10 @@ not the CCTP implementation directly. Implementation details must remain hidden.
 - **Relay test contracts**: `relay-test-contracts/` holds the Solidity sources
   and the solc 0.8.25 artifacts of the Anvil `MockDepository` and `MockStable`.
   When a source changes, rebuild both flat `{abi, bytecode}` artifacts from that
-  directory:
+  directory, in a shell that provides `solc-0.8.25` (`nix develop` does not):
 
   ```bash
+  nix shell --inputs-from . 'rainix#pkgs.x86_64-linux.solc_0_8_25'
   for contract in MockStable MockDepository; do
     solc-0.8.25 --optimize --combined-json abi,bin "$contract.sol" \
       | jq --arg key "$contract.sol:$contract" \
