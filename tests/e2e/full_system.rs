@@ -35,7 +35,7 @@ use st0x_float_macro::float;
 use tokio::sync::broadcast;
 use tracing::{debug, info};
 
-use st0x_config::{BrokerCtx, Ctx, FileLogging, LogLevel, configure_sqlite_pool};
+use st0x_config::{BrokerCtx, ChainCtx, Ctx, FileLogging, LogLevel, configure_sqlite_pool};
 use st0x_config::{CashHedgePolicy, EquityHedgePolicy, HedgedEquities, HedgingAssets};
 use st0x_dto::Statement;
 use st0x_event_sorcery::Projection;
@@ -152,7 +152,7 @@ pub(crate) fn build_full_system_ctx<P: Provider + Clone>(
         ethereum_wallet,
     );
 
-    Ctx::for_test()
+    let mut ctx = Ctx::for_test()
         .database_url(db_path.display().to_string())
         .rpc_url(chain.endpoint().parse()?)
         .orderbook(chain.orderbook)
@@ -202,8 +202,15 @@ pub(crate) fn build_full_system_ctx<P: Provider + Clone>(
             chainlink_feed: chain.mock_chainlink_feed,
         })
         .alerts(test_alerts())
-        .call()
-        .map_err(Into::into)
+        .call()?;
+    // The USDC withdrawal tx lands on Ethereum and is checked at its depth.
+    ctx.chains.insert_transport(ChainCtx {
+        chain: Chain::Ethereum,
+        rpc_url: ethereum_endpoint.parse()?,
+        required_confirmations: 0,
+    });
+
+    Ok(ctx)
 }
 
 #[derive(Debug, PartialEq, Eq)]

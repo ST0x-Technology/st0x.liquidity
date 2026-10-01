@@ -836,8 +836,8 @@ impl ChainRegistry {
     }
 
     /// Runs every `[chains.<name>]` check that reads the config file alone,
-    /// and hands back the primary chain's table so the caller can keep
-    /// validating against it.
+    /// and hands back the primary chain and its table so the caller can keep
+    /// validating against them.
     ///
     /// [`Self::new`] performs these same checks plus the config/secrets
     /// pairing (each chain's `rpc_url`), which is why the secrets-free
@@ -845,9 +845,10 @@ impl ChainRegistry {
     /// fails here fails startup too, whatever the secrets file holds.
     pub fn validate_configs(
         configs: &BTreeMap<Chain, ChainConfig>,
-    ) -> Result<&TradingConfig, ChainRegistryError> {
+    ) -> Result<(Chain, &TradingConfig), ChainRegistryError> {
         let EnabledChains {
             enabled,
+            primary_chain,
             trading_table,
             ..
         } = enabled_chains(configs)?;
@@ -860,7 +861,7 @@ impl ChainRegistry {
             }
         }
 
-        Ok(trading_table)
+        Ok((primary_chain, trading_table))
     }
 
     /// THE primary chain: the one the bot rebalances automatically. Every
@@ -912,6 +913,13 @@ impl ChainRegistry {
     #[cfg(any(test, feature = "test-support"))]
     pub fn insert_secondary(&mut self, chain: HedgedChain) {
         self.secondary.insert(chain.chain, chain);
+    }
+
+    /// Adds a transport chain (RPC and depth only), so a fixture can give
+    /// Ethereum its own confirmation depth.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn insert_transport(&mut self, chain: ChainCtx) {
+        self.transport.insert(chain.chain, chain);
     }
 
     /// A registry holding one primary chain and nothing else.

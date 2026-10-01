@@ -7,6 +7,7 @@ use axum::response::IntoResponse;
 use axum::routing::get;
 use futures_util::sink::SinkExt;
 use futures_util::stream::{SplitSink, StreamExt};
+use itertools::Itertools;
 use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
 use tokio::sync::broadcast;
@@ -327,8 +328,22 @@ pub(crate) fn routes() -> Router<AppState> {
 pub(crate) fn settings_from_ctx(ctx: &st0x_config::Ctx) -> st0x_dto::Settings {
     let (equity_target, equity_deviation, usdc_target, usdc_deviation) = {
         let rebalancing = &ctx.rebalancing;
-        let (usdc_target, usdc_deviation) =
-            rebalancing.usdc.as_ref().map_or((None, None), |usdc| {
+        // The one active corridor's band whatever its chain; with several,
+        // the primary chain's, until the dashboard shows one cash band per
+        // chain.
+        let primary = ctx.chains.primary().chain;
+        let (usdc_target, usdc_deviation) = rebalancing
+            .usdc
+            .active()
+            .exactly_one()
+            .ok()
+            .or_else(|| {
+                rebalancing
+                    .usdc
+                    .active()
+                    .find(|usdc| usdc.corridor.chain() == primary)
+            })
+            .map_or((None, None), |usdc| {
                 (
                     Some(float_to_f64(usdc.threshold.target, 0.5)),
                     Some(float_to_f64(usdc.threshold.deviation, 0.3)),
@@ -339,7 +354,7 @@ pub(crate) fn settings_from_ctx(ctx: &st0x_config::Ctx) -> st0x_dto::Settings {
         let primary_target = rebalancing
             .allocation
             .targets
-            .get(&ctx.chains.primary().chain)
+            .get(&primary)
             .map(|target| float_to_f64(target.inner(), 0.5));
 
         (
@@ -497,9 +512,14 @@ mod tests {
     use tokio::net::TcpListener;
     use tokio_tungstenite::{WebSocketStream, connect_async};
 
-    use st0x_config::{ChainAssets, ChainEquityAsset, create_test_ctx_with_order_owner};
+    use st0x_bridge::corridor::{HopKind, UsdcCorridor};
+    use st0x_config::{
+        ChainAssets, ChainEquityAsset, ImbalanceThreshold, UsdcCorridorCtx, UsdcCorridors,
+        create_test_ctx_with_order_owner,
+    };
     use st0x_dto::{Direction, Trade, TradingVenue};
     use st0x_event_sorcery::StoreBuilder;
+    use st0x_evm::Chain;
     use st0x_execution::{
         ClientOrderId, ExecutorOrderId, FractionalShares, MarketSession, Positive,
         SupportedExecutor, Symbol, Usd,
@@ -671,6 +691,33 @@ mod tests {
 
         assert_eq!(settings["equityTarget"], json!(null));
         assert_eq!(settings["equityDeviation"], json!(0.1));
+    }
+
+    /// A single active corridor off the primary chain still shows its band.
+    #[test]
+    fn settings_from_ctx_shows_a_single_active_corridor_off_the_primary_chain() {
+        let mut ctx = create_test_ctx_with_order_owner(address!(
+            "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        ));
+        assert_ne!(ctx.chains.primary().chain, Chain::HyperEvm);
+        ctx.rebalancing.usdc = UsdcCorridors::for_test(
+            OperationMode::Enabled,
+            [UsdcCorridorCtx {
+                corridor: UsdcCorridor::HubRouted {
+                    chain: Chain::HyperEvm,
+                    hop: HopKind::Relay,
+                },
+                threshold: ImbalanceThreshold {
+                    target: float!(0.25),
+                    deviation: float!(0.125),
+                },
+            }],
+        );
+
+        let settings = serde_json::to_value(settings_from_ctx(&ctx)).unwrap();
+
+        assert_eq!(settings["usdcTarget"], json!(0.25));
+        assert_eq!(settings["usdcDeviation"], json!(0.125));
     }
 
     #[test]

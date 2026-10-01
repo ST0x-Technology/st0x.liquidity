@@ -16,6 +16,7 @@ pub(crate) use equity::{
 use alloy::primitives::{Address, TxHash};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use itertools::Itertools;
 use metrics::counter;
 use sqlx::SqlitePool;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
@@ -31,7 +32,7 @@ use rain_math_float::Float;
 use st0x_bridge::corridor::{UsdcCorridor, legacy_base_cctp};
 use st0x_config::{
     AllocationCtx, ChainAssets, ChainEquityAsset, ExecutionThreshold, OperationMode, TargetShare,
-    UsdcCorridorCtx,
+    UsdcCorridorCtx, UsdcCorridors,
 };
 #[cfg(test)]
 use st0x_config::{ChainCashAsset, ChainEquities};
@@ -231,12 +232,13 @@ pub(crate) enum UsdcResumeError {
     NotReady,
     #[error(
         "USDC transfer corridor mismatch: transfer {id} runs on the {recorded} corridor, \
-         this build serves {served}; nothing was enqueued"
+         this build serves {}; nothing was enqueued",
+        .served.iter().join(", ")
     )]
     CorridorNotServed {
         id: UsdcRebalanceId,
         recorded: UsdcCorridor,
-        served: UsdcCorridor,
+        served: BTreeSet<UsdcCorridor>,
     },
     #[error("aggregate error: {0}")]
     Aggregate(#[source] Box<st0x_event_sorcery::SendError<UsdcRebalance>>),
@@ -299,12 +301,10 @@ pub(crate) struct RebalancingServiceConfig {
     /// Bound on the age of a chain's inventory snapshot before that chain's
     /// imbalance evaluations are skipped as stale.
     pub(crate) inventory_staleness_bound: Duration,
-    /// The corridor new cash transfers run on and its band; `None` while
-    /// USDC mode is disabled.
-    pub(crate) usdc: Option<UsdcCorridorCtx>,
-    /// The corridor this build's cash transfer service carries, whatever the
-    /// USDC mode. A transfer recorded on another one is held, never re-armed.
-    pub(crate) served_usdc_corridor: UsdcCorridor,
+    /// The corridors new cash transfers run on, each with its band, and the
+    /// ones this build's cash transfer services carry whatever the USDC mode.
+    /// A transfer recorded on an unserved one is held, never re-armed.
+    pub(crate) usdc: UsdcCorridors,
     pub(crate) transfer_timeout: Duration,
     /// Every hedged chain's asset table and minimum. The planner slots a
     /// symbol on each chain that rebalances it; the USDC trigger reads the
@@ -1037,10 +1037,10 @@ enum UsdcTimeoutCleanup {
 /// guard: `Reconciled`, or a state holding no guard on a corridor this build
 /// does not serve (an operator failed it before its burn, say), which no
 /// other path would ever release.
-fn releases_tracked_guard(state: &UsdcRebalance, served_corridor: UsdcCorridor) -> bool {
+fn releases_tracked_guard(state: &UsdcRebalance, corridors: &UsdcCorridors) -> bool {
     match state {
         UsdcRebalance::Reconciled { .. } => true,
-        held => held.corridor() != served_corridor && !held.holds_rebalance_guard(),
+        held => !corridors.serves(held.corridor()) && !held.holds_rebalance_guard(),
     }
 }
 
@@ -2230,7 +2230,7 @@ impl RebalancingService {
             return;
         }
 
-        let served = self.config.served_usdc_corridor;
+        let served = self.config.usdc.served().iter().join(", ");
         let outbound = match direction {
             RebalanceDirection::AlpacaToBase => {
                 " Alpaca-outbound transfers are blocked on every corridor until it clears."
@@ -2240,7 +2240,7 @@ impl RebalancingService {
         let message = format!(
             "USDC transfer corridor mismatch: transfer {id} runs on the {corridor} corridor, \
              which this build does not serve (it serves {served}). It holds the {corridor} \
-             guard and is not re-armed; deploy a build that serves {corridor} \
+             guard and is not re-armed; deploy a build and config that serve {corridor} \
              (docs/cli-ops.md).{outbound}"
         );
 
@@ -2592,7 +2592,6 @@ impl RebalancingService {
         };
 
         if tracking.is_post_burn() {
-            let served_corridor = self.config.served_usdc_corridor;
             // Post-burn: check durable state FIRST, regardless of elapsed time.
             // The Reconciled check is always safe: it only fires when the
             // aggregate is actually Reconciled and clearing the guard at that
@@ -2603,7 +2602,7 @@ impl RebalancingService {
             let usdc_store = self.usdc_store.read().await.as_ref().map(Arc::clone);
             if let Some(store) = usdc_store {
                 match store.load(id).await {
-                    Ok(Some(state)) if releases_tracked_guard(&state, served_corridor) => {
+                    Ok(Some(state)) if releases_tracked_guard(&state, &self.config.usdc) => {
                         // Durable state is Reconciled (or, on a corridor this
                         // build does not serve, any state that holds no guard):
                         // the CLI's separate-process
@@ -2674,7 +2673,8 @@ impl RebalancingService {
                         return Ok(Some(UsdcTimeoutCleanup::Cleared { tracking, elapsed }));
                     }
                     Ok(Some(state))
-                        if state.corridor() != served_corridor && state.holds_rebalance_guard() =>
+                        if !self.config.usdc.serves(state.corridor())
+                            && state.holds_rebalance_guard() =>
                     {
                         return Ok(Some(UsdcTimeoutCleanup::HeldForUnservedCorridor {
                             corridor: state.corridor(),
@@ -4426,8 +4426,8 @@ impl RebalancingService {
     /// chain: a fill on a chain whose listing rebalances the symbol moves
     /// that chain's slot, so it schedules the symbol's check, while a
     /// hedge-only listing is prefunded and outside the planner's total. USDC
-    /// rebalances on the configured corridor's chain, so only a fill there
-    /// schedules its check. A clamped leg waits for the next pinned snapshot
+    /// rebalances on each active corridor's chain, so only a fill on one of
+    /// them schedules its check. A clamped leg waits for the next pinned snapshot
     /// instead of sizing a transfer from an acknowledged intermediate balance.
     async fn schedule_fill_checks(
         &self,
@@ -4447,8 +4447,8 @@ impl RebalancingService {
         let on_corridor_chain = self
             .config
             .usdc
-            .as_ref()
-            .is_some_and(|usdc| usdc.corridor.chain() == fill_chain);
+            .active()
+            .any(|usdc| usdc.corridor.chain() == fill_chain);
         if on_corridor_chain && usdc_reconciled {
             self.usdc_scheduler.enqueue_check().await;
         }
@@ -5165,11 +5165,12 @@ impl RebalancingService {
         Ok(registry.token_by_symbol(symbol))
     }
 
-    /// Returns USDC rebalancing parameters if rebalancing is enabled in
-    /// config, reading the cash asset of the corridor's chain.
-    fn usdc_rebalancing_params(&self) -> Option<(UsdcCorridorCtx, Option<Usdc>, Option<Usd>)> {
-        let usdc = self.config.usdc?;
-
+    /// Returns `usdc`'s rebalancing parameters if its chain's cash asset
+    /// rebalances: that chain's per-transfer limit and the broker reserve.
+    fn usdc_rebalancing_params(
+        &self,
+        usdc: &UsdcCorridorCtx,
+    ) -> Option<(Option<Usdc>, Option<Usd>)> {
         let cash = self
             .config
             .chains
@@ -5184,7 +5185,7 @@ impl RebalancingService {
         let usdc_limit = cash.operational_limit.map(Positive::inner);
         let reserved = self.config.cash_reserved.map(Positive::inner);
 
-        Some((usdc, usdc_limit, reserved))
+        Some((usdc_limit, reserved))
     }
 
     /// Sizes the transfer the corridor's imbalance calls for, if any.
@@ -5206,7 +5207,8 @@ impl RebalancingService {
         .ok()
     }
 
-    /// Checks inventory for USDC imbalance and triggers operation if needed.
+    /// Checks every active corridor, in chain order, for a USDC imbalance
+    /// and triggers the operation each one needs.
     pub(crate) async fn check_and_trigger_usdc(&self) {
         // Hold a claim on the driver for the whole check so an operator
         // operation's pause waits for an active check. A check already queued
@@ -5217,10 +5219,15 @@ impl RebalancingService {
 
         self.expire_stuck_operations_with_logging().await;
 
-        let Some((usdc, usdc_limit, reserved)) = self.usdc_rebalancing_params() else {
+        let corridors: Vec<_> = self
+            .config
+            .usdc
+            .active()
+            .filter_map(|usdc| Some((usdc, self.usdc_rebalancing_params(usdc)?)))
+            .collect();
+        if corridors.is_empty() {
             return;
-        };
-        let chain = usdc.corridor.chain();
+        }
 
         // A pending cash divergence means the Hedging USDC balance the
         // imbalance math reads is suspect: a bridge sized off it moves the
@@ -5246,6 +5253,22 @@ impl RebalancingService {
             return;
         }
 
+        for (usdc, (usdc_limit, reserved)) in corridors {
+            self.check_and_trigger_usdc_corridor(usdc, usdc_limit, reserved)
+                .await;
+        }
+    }
+
+    /// Checks one corridor for a USDC imbalance and dispatches the transfer
+    /// it needs under that corridor's guard.
+    async fn check_and_trigger_usdc_corridor(
+        &self,
+        usdc: &UsdcCorridorCtx,
+        usdc_limit: Option<Usdc>,
+        reserved: Option<Usd>,
+    ) {
+        let chain = usdc.corridor.chain();
+
         // Cross-chain staleness rule, mirroring the equity trigger: the
         // bridge must not be sized off a chain with no recent successful
         // USDC poll (PollFreshness, not snapshot stamps: a static USDC
@@ -5268,7 +5291,7 @@ impl RebalancingService {
             return;
         }
 
-        let Some(sized) = self.size_usdc_operation(&usdc, usdc_limit, reserved).await else {
+        let Some(sized) = self.size_usdc_operation(usdc, usdc_limit, reserved).await else {
             return;
         };
 
@@ -5291,7 +5314,7 @@ impl RebalancingService {
         // Size again under the claim: a holder released between the read
         // above and the claim may have settled funds that read did not see.
         // A dropped claim releases on return.
-        let Some(operation) = self.size_usdc_operation(&usdc, usdc_limit, reserved).await else {
+        let Some(operation) = self.size_usdc_operation(usdc, usdc_limit, reserved).await else {
             return;
         };
         if operation.direction() != sized.direction() {
@@ -5794,11 +5817,11 @@ impl RebalancingService {
             });
         }
 
-        if state.corridor() != self.config.served_usdc_corridor {
+        if !self.config.usdc.serves(state.corridor()) {
             return Err(UsdcResumeError::CorridorNotServed {
                 id: id.clone(),
                 recorded: state.corridor(),
-                served: self.config.served_usdc_corridor,
+                served: self.config.usdc.served().clone(),
             });
         }
 
@@ -6963,7 +6986,7 @@ impl RebalancingService {
                 // it retries the page and releases the guard once reconciled.
                 Ok(Some(entity))
                     if entity.holds_rebalance_guard()
-                        && entity.corridor() != self.config.served_usdc_corridor =>
+                        && !self.config.usdc.serves(entity.corridor()) =>
                 {
                     self.page_unserved_corridor_once(&id, entity.corridor(), entity.direction())
                         .await;
@@ -8656,12 +8679,9 @@ pub(crate) async fn wire_usdc_reactor_store(
         poll_freshness: PollFreshness::always_fresh(),
         inventory_staleness_bound: Duration::from_secs(300),
         allocation: AllocationCtx::base_test(),
-        usdc: Some(UsdcCorridorCtx {
-            corridor: UsdcCorridor::BASE_CCTP,
-            threshold: st0x_config::ImbalanceThreshold {
-                target: float!(0.5),
-                deviation: float!(0.2),
-            },
+        usdc: UsdcCorridors::base_cctp(st0x_config::ImbalanceThreshold {
+            target: float!(0.5),
+            deviation: float!(0.2),
         }),
         transfer_timeout: Duration::from_secs(30 * 60),
         chains: BTreeMap::from([(
@@ -8677,7 +8697,6 @@ pub(crate) async fn wire_usdc_reactor_store(
         )]),
         cash_reserved: None,
         hedge_floor: HedgeFloor::default(),
-        served_usdc_corridor: UsdcCorridor::BASE_CCTP,
     };
     let service = Arc::new(RebalancingService::new(
         config,
@@ -8892,18 +8911,14 @@ mod tests {
 
     fn test_config() -> RebalancingServiceConfig {
         RebalancingServiceConfig {
-            served_usdc_corridor: UsdcCorridor::BASE_CCTP,
             poll_freshness: PollFreshness::always_fresh(),
             inventory_staleness_bound: Duration::from_secs(300),
             cash_reserved: None,
             hedge_floor: HedgeFloor::default(),
             allocation: AllocationCtx::base_test(),
-            usdc: Some(UsdcCorridorCtx {
-                corridor: UsdcCorridor::BASE_CCTP,
-                threshold: ImbalanceThreshold {
-                    target: float!(0.5),
-                    deviation: float!(0.2),
-                },
+            usdc: UsdcCorridors::base_cctp(ImbalanceThreshold {
+                target: float!(0.5),
+                deviation: float!(0.2),
             }),
             transfer_timeout: Duration::from_secs(30 * 60),
             chains: BTreeMap::from([(
@@ -12018,13 +12033,12 @@ mod tests {
 
         let trigger = RebalancingService::new(
             RebalancingServiceConfig {
-                served_usdc_corridor: UsdcCorridor::BASE_CCTP,
                 poll_freshness: PollFreshness::always_fresh(),
                 inventory_staleness_bound: Duration::from_secs(300),
                 cash_reserved: None,
                 hedge_floor: HedgeFloor::default(),
                 allocation: test_config().allocation,
-                usdc: None,
+                usdc: UsdcCorridors::base_cctp_disabled(),
                 transfer_timeout: test_config().transfer_timeout,
                 chains: BTreeMap::from([(
                     Chain::Base,
@@ -13007,6 +13021,21 @@ mod tests {
         .fetch_one(service.transfer_usdc_to_market_making_queue.pool())
         .await
         .expect("count pending TransferUsdcToMarketMaking jobs")
+    }
+
+    async fn pending_transfer_usdc_to_hedging_job(
+        service: &RebalancingService,
+    ) -> TransferUsdcToHedging {
+        let job_type = std::any::type_name::<TransferUsdcToHedging>();
+        let payload: Vec<u8> = sqlx_apalis::query_scalar(
+            "SELECT job FROM Jobs WHERE status = 'Pending' AND job_type = ?",
+        )
+        .bind(job_type)
+        .fetch_one(service.transfer_usdc_to_hedging_queue.pool())
+        .await
+        .expect("fetch pending TransferUsdcToHedging job");
+
+        serde_json::from_slice(&payload).expect("deserialize TransferUsdcToHedging")
     }
 
     async fn pending_transfer_usdc_to_market_making_job(
@@ -15830,16 +15859,40 @@ mod tests {
     async fn corridor_chain_fill_schedules_the_usdc_check() {
         let symbol = Symbol::new("AAPL").unwrap();
         let config = RebalancingServiceConfig {
-            usdc: Some(UsdcCorridorCtx {
-                corridor: UsdcCorridor::HubRouted {
-                    chain: Chain::HyperEvm,
-                    hop: HopKind::Relay,
-                },
-                threshold: ImbalanceThreshold {
-                    target: float!(0.5),
-                    deviation: float!(0.2),
-                },
-            }),
+            usdc: UsdcCorridors::for_test(
+                OperationMode::Enabled,
+                [UsdcCorridorCtx {
+                    corridor: UsdcCorridor::HubRouted {
+                        chain: Chain::HyperEvm,
+                        hop: HopKind::Relay,
+                    },
+                    threshold: ImbalanceThreshold {
+                        target: float!(0.5),
+                        deviation: float!(0.2),
+                    },
+                }],
+            ),
+            ..test_config()
+        };
+
+        let trigger = hyperevm_fill_trigger(&symbol, config).await;
+
+        assert_eq!(count_pending_usdc_check_jobs(&trigger).await, 1);
+    }
+
+    /// With several active corridors, a fill on any of their chains, not
+    /// just the first, schedules the USDC check.
+    #[tokio::test]
+    async fn fill_on_an_active_corridor_chain_schedules_the_usdc_check() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let config = RebalancingServiceConfig {
+            usdc: UsdcCorridors::for_test(
+                OperationMode::Enabled,
+                [
+                    active_corridor(Chain::Base, HopKind::Cctp),
+                    active_corridor(Chain::HyperEvm, HopKind::Relay),
+                ],
+            ),
             ..test_config()
         };
 
@@ -29016,21 +29069,20 @@ mod tests {
 
     #[tokio::test]
     async fn usdc_rebalancing_disabled_when_cash_ratio_absent() {
-        // Regression: when usdc is None, startup must not require assets.cash.vault_id.
-        // The trigger returns no USDC rebalancing params, so no USDC vault lookup occurs.
+        // No cash table on the corridor's chain returns no params, so startup needs no
+        // cash vault_id.
         let (pool, apalis_pool) = crate::test_utils::setup_test_pools().await;
         let wrapper = Arc::new(MockWrapper::new());
 
         let schedulers = RebalancingSchedulers::new(&apalis_pool);
         let trigger = RebalancingService::new(
             RebalancingServiceConfig {
-                served_usdc_corridor: UsdcCorridor::BASE_CCTP,
                 poll_freshness: PollFreshness::always_fresh(),
                 inventory_staleness_bound: Duration::from_secs(300),
                 cash_reserved: None,
                 hedge_floor: HedgeFloor::default(),
                 allocation: AllocationCtx::base_test(),
-                usdc: None,
+                usdc: UsdcCorridors::base_cctp_disabled(),
                 transfer_timeout: Duration::from_secs(30 * 60),
                 chains: BTreeMap::from([(
                     Chain::Base,
@@ -29058,8 +29110,16 @@ mod tests {
             Arc::new(crate::alerts::LogNotifier),
         );
 
+        let base_cctp = UsdcCorridorCtx {
+            corridor: UsdcCorridor::BASE_CCTP,
+            threshold: ImbalanceThreshold {
+                target: float!(0.5),
+                deviation: float!(0.2),
+            },
+        };
+        assert_eq!(trigger.config.usdc.active().count(), 0);
         assert!(
-            trigger.usdc_rebalancing_params().is_none(),
+            trigger.usdc_rebalancing_params(&base_cctp).is_none(),
             "Expected usdc_rebalancing_params to be None when cash ratio is absent"
         );
     }
@@ -29078,8 +29138,9 @@ mod tests {
             .as_mut()
             .unwrap()
             .rebalancing = OperationMode::Disabled;
+        let base_cctp = *trigger.config.usdc.active().next().unwrap();
 
-        assert!(trigger.usdc_rebalancing_params().is_none());
+        assert!(trigger.usdc_rebalancing_params(&base_cctp).is_none());
     }
 
     /// Spy reactor that records all dispatched events for verification.
@@ -36866,25 +36927,225 @@ mod tests {
         };
         let base = test_config();
         let config = RebalancingServiceConfig {
-            usdc: Some(UsdcCorridorCtx {
-                corridor,
-                threshold: ImbalanceThreshold {
-                    target: float!(0.5),
-                    deviation: float!(0.2),
-                },
-            }),
+            usdc: UsdcCorridors::for_test(
+                OperationMode::Enabled,
+                [UsdcCorridorCtx {
+                    corridor,
+                    threshold: ImbalanceThreshold {
+                        target: float!(0.5),
+                        deviation: float!(0.2),
+                    },
+                }],
+            ),
             chains: BTreeMap::from([(Chain::Robinhood, base.chains[&Chain::Base].clone())]),
             ..base
         };
-        let inventory = InventoryView::for_primary_chain(Chain::Robinhood)
-            .with_usdc(usdc(100), usdc(900))
+        // Base, the primary, sits on target: only Robinhood's own USDC is
+        // under its band.
+        let inventory = InventoryView::default()
+            .with_usdc(usdc(900), usdc(900))
             .with_withdrawable_cash_cents(90_000);
+        let inventory = with_onchain_usdc(inventory, Chain::Robinhood, usdc(100));
         let trigger = make_trigger_with_inventory_config(inventory, config).await;
 
         trigger.check_and_trigger_usdc().await;
 
         let job = pending_transfer_usdc_to_market_making_job(&trigger).await;
         assert_eq!(job.corridor, corridor);
+    }
+
+    fn active_corridor(chain: Chain, hop: HopKind) -> UsdcCorridorCtx {
+        UsdcCorridorCtx {
+            corridor: UsdcCorridor::HubRouted { chain, hop },
+            threshold: ImbalanceThreshold {
+                target: float!(0.5),
+                deviation: float!(0.2),
+            },
+        }
+    }
+
+    /// `base`'s cash table on each of `chains` besides Base.
+    fn with_cash_on(
+        mut config: RebalancingServiceConfig,
+        chains: &[Chain],
+    ) -> RebalancingServiceConfig {
+        let base = config.chains[&Chain::Base].clone();
+        for chain in chains {
+            config.chains.insert(*chain, base.clone());
+        }
+
+        config
+    }
+
+    fn with_onchain_usdc(inventory: InventoryView, chain: Chain, balance: Usdc) -> InventoryView {
+        let now = Utc::now();
+
+        inventory
+            .apply_snapshot_event(
+                &InventorySnapshotEvent::OnchainUsdc {
+                    chain,
+                    usdc_balance: balance,
+                    fetched_at: now,
+                    block_number: None,
+                },
+                now,
+            )
+            .unwrap()
+    }
+
+    /// One check runs every active corridor in chain order, each against its
+    /// own band: Base over its band sends to Alpaca, HyperEVM under its band
+    /// takes the one Alpaca-outbound slot, and Robinhood, also under its
+    /// band, is refused by the guard until that transfer ends.
+    #[tokio::test]
+    async fn usdc_check_runs_every_active_corridor() {
+        let config = RebalancingServiceConfig {
+            usdc: UsdcCorridors::for_test(
+                OperationMode::Enabled,
+                [
+                    active_corridor(Chain::Base, HopKind::Cctp),
+                    active_corridor(Chain::HyperEvm, HopKind::Relay),
+                    active_corridor(Chain::Robinhood, HopKind::Relay),
+                ],
+            ),
+            ..with_cash_on(test_config(), &[Chain::HyperEvm, Chain::Robinhood])
+        };
+        let inventory = InventoryView::default()
+            .with_usdc(usdc(9000), usdc(1000))
+            .with_withdrawable_cash_cents(100_000);
+        let inventory = with_onchain_usdc(inventory, Chain::HyperEvm, usdc(100));
+        let inventory = with_onchain_usdc(inventory, Chain::Robinhood, usdc(100));
+        let trigger = make_trigger_with_inventory_config(inventory, config).await;
+
+        trigger.check_and_trigger_usdc().await;
+
+        let to_hedging = pending_transfer_usdc_to_hedging_job(&trigger).await;
+        assert_eq!(to_hedging.corridor.chain(), Chain::Base);
+        assert_eq!(
+            count_pending_transfer_usdc_to_hedging_jobs(&trigger).await,
+            1
+        );
+        let to_market_making = pending_transfer_usdc_to_market_making_job(&trigger).await;
+        assert_eq!(to_market_making.corridor.chain(), Chain::HyperEvm);
+        assert_eq!(
+            count_pending_transfer_usdc_to_market_making_jobs(&trigger).await,
+            1
+        );
+        assert!(trigger.usdc_guards.is_held(Chain::Base));
+        assert!(trigger.usdc_guards.is_held(Chain::HyperEvm));
+        assert!(
+            !trigger.usdc_guards.is_held(Chain::Robinhood),
+            "a second Alpaca-outbound corridor must be refused while one runs"
+        );
+    }
+
+    /// A corridor table on a chain other than Base is looked up by its own
+    /// chain: its gas check gates its transfers, not Base's.
+    #[tokio::test]
+    async fn non_base_corridor_table_checks_its_own_chains_gas() {
+        let config = RebalancingServiceConfig {
+            usdc: UsdcCorridors::for_test(
+                OperationMode::Enabled,
+                [active_corridor(Chain::Robinhood, HopKind::Relay)],
+            ),
+            ..with_cash_on(test_config(), &[Chain::Robinhood])
+        };
+        let inventory = InventoryView::default()
+            .with_usdc(usdc(900), usdc(900))
+            .with_withdrawable_cash_cents(90_000);
+        let inventory = with_onchain_usdc(inventory, Chain::Robinhood, usdc(100));
+        let trigger = make_trigger_with_inventory_config(inventory, config).await;
+        let low_gas = || {
+            ConfiguredGasReadiness::Wired(crate::native_gas::GasReadiness::for_test(
+                U256::ZERO,
+                U256::from(1_u64),
+                U256::MAX,
+                U256::from(1_u64),
+            ))
+        };
+        let ready = || {
+            ConfiguredGasReadiness::Wired(crate::native_gas::GasReadiness::always_ready_for_test())
+        };
+
+        trigger
+            .set_usdc_gas_readiness(BTreeMap::from([
+                (Chain::Base, ready()),
+                (Chain::Robinhood, low_gas()),
+            ]))
+            .await;
+        trigger.check_and_trigger_usdc().await;
+
+        assert_eq!(
+            count_pending_transfer_usdc_to_market_making_jobs(&trigger).await,
+            0
+        );
+
+        trigger
+            .set_usdc_gas_readiness(BTreeMap::from([
+                (Chain::Base, low_gas()),
+                (Chain::Robinhood, ready()),
+            ]))
+            .await;
+        trigger.check_and_trigger_usdc().await;
+
+        let job = pending_transfer_usdc_to_market_making_job(&trigger).await;
+        assert_eq!(job.corridor, ROBINHOOD_RELAY);
+    }
+
+    /// A transfer on a non-Base corridor table is served: a manual resume
+    /// enqueues its job and latches that chain's guard.
+    #[tokio::test]
+    async fn non_base_corridor_table_is_served_on_manual_resume() {
+        let config = RebalancingServiceConfig {
+            usdc: UsdcCorridors::for_test(
+                OperationMode::Enabled,
+                [active_corridor(Chain::Robinhood, HopKind::Relay)],
+            ),
+            ..with_cash_on(test_config(), &[Chain::Robinhood])
+        };
+        let pool = crate::test_utils::setup_test_db().await;
+        let store = Arc::new(test_store::<UsdcRebalance>(pool.clone(), ()));
+        let inventory = with_onchain_usdc(
+            InventoryView::default().with_usdc(usdc(900), usdc(900)),
+            Chain::Robinhood,
+            usdc(500),
+        );
+        let trigger = make_trigger_with_inventory_config(inventory, config).await;
+        trigger
+            .set_stores(
+                Arc::new(test_store::<TokenizedEquityMint>(
+                    pool.clone(),
+                    crate::rebalancing::equity::EquityTransferServices::panicking(),
+                )),
+                Arc::new(test_store::<EquityRedemption>(
+                    pool.clone(),
+                    crate::rebalancing::equity::EquityTransferServices::panicking(),
+                )),
+                store.clone(),
+            )
+            .await;
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        store
+            .send(
+                &id,
+                UsdcRebalanceCommand::InitiateConversion {
+                    corridor: ROBINHOOD_RELAY,
+                    direction: RebalanceDirection::AlpacaToBase,
+                    amount: usdc(400),
+                    order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
+                },
+            )
+            .await
+            .unwrap();
+
+        trigger
+            .resume_usdc_transfer(&pool, &id, RebalanceDirection::AlpacaToBase)
+            .await
+            .unwrap();
+
+        assert!(trigger.usdc_guards.is_held(Chain::Robinhood));
+        let job = pending_transfer_usdc_to_market_making_job(&trigger).await;
+        assert_eq!(job.corridor, ROBINHOOD_RELAY);
     }
 
     const ROBINHOOD_RELAY: UsdcCorridor = UsdcCorridor::HubRouted {
@@ -36925,6 +37186,11 @@ mod tests {
         let pages = corridor_pages(&notifier);
         assert_eq!(pages.len(), 1, "got {pages:?}");
         assert!(pages[0].contains(&id.to_string()), "{}", pages[0]);
+        assert!(
+            pages[0].contains("deploy a build and config that serve"),
+            "{}",
+            pages[0]
+        );
         assert!(
             pages[0].contains("Alpaca-outbound transfers are blocked on every corridor"),
             "a held Alpaca-outbound transfer blocks every corridor's outbound claims: {}",
@@ -37060,7 +37326,16 @@ mod tests {
         let serving = make_trigger_with_inventory_config_and_notifier(
             InventoryView::default(),
             RebalancingServiceConfig {
-                served_usdc_corridor: ROBINHOOD_RELAY,
+                usdc: UsdcCorridors::for_test(
+                    OperationMode::Disabled,
+                    [UsdcCorridorCtx {
+                        corridor: ROBINHOOD_RELAY,
+                        threshold: ImbalanceThreshold {
+                            target: float!(0.5),
+                            deviation: float!(0.2),
+                        },
+                    }],
+                ),
                 ..test_config()
             },
             notifier.clone(),
