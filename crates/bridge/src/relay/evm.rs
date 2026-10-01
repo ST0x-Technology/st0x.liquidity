@@ -744,6 +744,7 @@ impl ProofError {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Mutex;
     use std::time::{Duration, SystemTime};
 
     use alloy::consensus::TxEnvelope;
@@ -889,10 +890,10 @@ mod tests {
         }
     }
 
-    /// Our corridor-chain wallet, with a hook on the deposit's signing.
+    /// Our corridor-chain wallet, with a hook on its first deposit signing.
     struct PairWallet {
         inner: TestWallet,
-        on_deposit: OnDepositSigning,
+        on_deposit: Mutex<Option<OnDepositSigning>>,
         stable: Address,
     }
 
@@ -943,17 +944,19 @@ mod tests {
             unpadded_gas_limit: u64,
             note: &str,
         ) -> Result<PreparedTransaction, EvmError> {
-            match self.on_deposit {
-                OnDepositSigning::AnotherSendFirst => {
+            let hook = self.on_deposit.lock().unwrap().take();
+            match hook {
+                Some(OnDepositSigning::AnotherSendFirst) => {
                     self.inner
                         .prepare_pending(self.stable, probe_calldata(), "another send")
                         .await?;
                 }
-                OnDepositSigning::Fail => {
+                Some(OnDepositSigning::Fail) => {
                     return Err(EvmError::Reverted {
                         tx_hash: TxHash::ZERO,
                     });
                 }
+                None => {}
             }
 
             self.inner
@@ -1008,8 +1011,8 @@ mod tests {
         }
     }
 
-    /// A bridge whose corridor-chain wallet runs `on_deposit` when it signs
-    /// the deposit.
+    /// A bridge whose corridor-chain wallet runs `on_deposit` when it first
+    /// signs a deposit.
     fn pair_bridge(
         harness: &Harness,
         on_deposit: OnDepositSigning,
@@ -1019,7 +1022,7 @@ mod tests {
             ethereum_wallet: wallet(&harness.hub),
             chain_wallet: PairWallet {
                 inner: wallet(&harness.chain),
-                on_deposit,
+                on_deposit: Mutex::new(Some(on_deposit)),
                 stable: harness.chain.stable,
             },
             ethereum_confirmations: CONFIRMATIONS,
@@ -1186,7 +1189,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn pair_split_by_another_send_is_refused_and_releases_both_nonces() {
+    async fn pair_split_by_another_send_leaves_a_retry_a_consecutive_pair() {
         let harness = Harness::new().await;
         let bridge = pair_bridge(&harness, OnDepositSigning::AnotherSendFirst);
         let quote = quote(&harness.chain, B256::random(), true);
@@ -1195,6 +1198,10 @@ mod tests {
             .prepare_deposit(HopDirection::ToHub, &quote)
             .await
             .unwrap_err();
+        let retry = bridge
+            .prepare_deposit(HopDirection::ToHub, &quote)
+            .await
+            .unwrap();
 
         assert!(
             matches!(
@@ -1207,8 +1214,8 @@ mod tests {
             "{error:?}"
         );
         assert_eq!(
-            next_two_nonces(&bridge.chain.wallet).await,
-            [0, 2],
+            [retry.approve.unwrap().nonce(), retry.deposit.nonce()],
+            [2, 3],
             "the other send still holds nonce 1"
         );
     }
