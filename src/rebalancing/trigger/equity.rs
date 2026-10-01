@@ -72,12 +72,13 @@ impl LastPriceReader for Projection<Position> {
 /// The broker shares of a symbol that a sell hedge could take now. A
 /// redemption is admitted over a due sell hedge only when this is below the
 /// live net, so the reading must never be above what the broker would sell.
+/// `None` when no broker reading exists, which admits nothing.
 #[async_trait]
 pub(crate) trait HedgeCapacity: Send + Sync {
     async fn hedgeable_shares(
         &self,
         symbol: &Symbol,
-    ) -> Result<FractionalShares, EquityTriggerError>;
+    ) -> Result<Option<FractionalShares>, EquityTriggerError>;
 }
 
 /// Prices a symbol by its last onchain fill, else by the pricing service's

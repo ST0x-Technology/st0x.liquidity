@@ -71,7 +71,7 @@ use crate::bot_gas::{
 use crate::conductor::exit::{ConductorExit, ConductorExitError, MonitorTaskError};
 use crate::conductor::job::{BACKPRESSURE_RESCHEDULE_LIMIT, BackpressureStreak};
 use crate::conductor::monitor::order_fills::{CutoffProbe, probe_cutoff_block_support};
-use crate::dashboard::equity_price::EquityPriceStore;
+use crate::dashboard::equity_price::{EquityPriceStore, MarkListener};
 use crate::dashboard::pnl::{LedgerHead, PnlLedger, PnlLedgerReactor};
 use crate::dashboard::{Broadcaster, DashboardTradeDelivery};
 use crate::database_file_lock::{DatabaseFileLock, acquire_database_file_lock};
@@ -3528,6 +3528,10 @@ fn spawn_rebalancing_infrastructure<Signer: Wallet + Clone>(
         )
         .await?;
 
+        // A symbol that declined for want of a price is checked again once its
+        // mark arrives; nothing else wakes it while balances are unchanged.
+        deps.equity_prices
+            .notify_marks_to(rebalancing_service.clone() as Arc<dyn MarkListener>);
         attach_manifest_handles(
             &rebalancing_service,
             &built,

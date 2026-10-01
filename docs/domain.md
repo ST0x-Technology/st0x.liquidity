@@ -338,14 +338,16 @@ The type is `DeviationBand`.
 ### Minimum Operation Size
 
 The smallest equity transfer worth its gas, in dollars, valued at the last
-onchain fill price the `Position` recorded for the symbol. A candidate below it
-is dropped as `BelowMinimum` and the next candidate is evaluated. The price's
-age does not matter, since it only values this dust bound. A missing price
-declines the symbol (`PriceMissing`) before any candidate is tried, so no
-per-chain drop masks it. A symbol-wide floor decline (`FloorCapped`) reports the
-per-chain reason (`NoGas`, `CoolingDown`, `BelowMinimum`) a higher-ranked
-candidate was dropped for, when there is one. Configured as
-`[rebalancing.allocation].min_operation_usd` with a per-chain
+onchain fill price the `Position` recorded for the symbol. A symbol that has
+never filled is valued at the pricing service's live mark instead: the mid price
+of one underlying share. A candidate below it is dropped as `BelowMinimum` and
+the next candidate is evaluated. The price's age does not matter, since it only
+values this dust bound. With neither price the symbol declines (`PriceMissing`)
+before any candidate is tried, so no per-chain drop masks it; a mark that
+arrives later checks the symbol again. A symbol-wide floor decline
+(`FloorCapped`) reports the per-chain reason (`NoGas`, `CoolingDown`,
+`BelowMinimum`) a higher-ranked candidate was dropped for, when there is one.
+Configured as `[rebalancing.allocation].min_operation_usd` with a per-chain
 `min_operation_usd` override on the trading table.
 
 ### Reservation

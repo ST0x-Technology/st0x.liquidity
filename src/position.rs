@@ -625,12 +625,12 @@ impl EventSourced for Position {
                 threshold,
                 reservation_id,
             }
-            | ReserveHedgeFundingRedemption {
+            | ReserveHedgeFundingRedemption(HedgeFundingRedemption {
                 symbol,
                 threshold,
                 reservation_id,
                 ..
-            } => {
+            }) => {
                 let now = Utc::now();
                 Ok(vec![
                     PositionEvent::Initialized {
@@ -650,12 +650,12 @@ impl EventSourced for Position {
                 threshold,
                 reservation_id,
             }
-            | RestoreHedgeFundingRedemption {
+            | RestoreHedgeFundingRedemption(HedgeFundingRedemption {
                 symbol,
                 threshold,
                 reservation_id,
                 ..
-            } => {
+            }) => {
                 let now = Utc::now();
                 Ok(vec![
                     PositionEvent::Initialized {
@@ -792,11 +792,11 @@ impl EventSourced for Position {
                 Utc::now(),
             ),
 
-            ReserveHedgeFundingRedemption {
+            ReserveHedgeFundingRedemption(HedgeFundingRedemption {
                 reservation_id,
                 hedgeable,
                 ..
-            } => self.reserve_equity_transfer_events(
+            }) => self.reserve_equity_transfer_events(
                 reservation_id,
                 TransferAdmission::FundsSellHedge { hedgeable },
                 Utc::now(),
@@ -817,11 +817,11 @@ impl EventSourced for Position {
                     Utc::now(),
                 ),
 
-            RestoreHedgeFundingRedemption {
+            RestoreHedgeFundingRedemption(HedgeFundingRedemption {
                 reservation_id,
                 hedgeable,
                 ..
-            } => self.restore_equity_transfer_reservation_events(
+            }) => self.restore_equity_transfer_reservation_events(
                 reservation_id,
                 TransferAdmission::FundsSellHedge { hedgeable },
                 Utc::now(),
@@ -1307,13 +1307,21 @@ impl Position {
             });
         }
 
-        if self.create_trigger_reason(&self.threshold)?.is_some()
-            && !self.admission_funds_sell_hedge(admission)?
-        {
-            return Err(PositionError::EquityTransferBlockedByHedge {
-                net_position: self.net,
-                threshold: self.threshold,
-            });
+        if self.create_trigger_reason(&self.threshold)?.is_some() {
+            if !self.admission_funds_sell_hedge(admission)? {
+                return Err(PositionError::EquityTransferBlockedByHedge {
+                    net_position: self.net,
+                    threshold: self.threshold,
+                });
+            }
+            info!(
+                target: "rebalance",
+                symbol = %self.symbol,
+                net_position = %self.net,
+                ?admission,
+                %reservation_id,
+                "Admitting a redemption over a sell hedge the broker cannot fill"
+            );
         }
 
         if matches!(self.threshold, ExecutionThreshold::DollarValue(_))
@@ -1900,6 +1908,17 @@ impl std::fmt::Debug for NormalizedOnChainFillCommand {
     }
 }
 
+/// A redemption's claim on a symbol whose sell hedge it funds. `hedgeable` is
+/// the broker's available shares above the hedge floor; the Position admits
+/// the redemption over a due sell hedge only while that is below the live net.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct HedgeFundingRedemption {
+    pub symbol: Symbol,
+    pub threshold: ExecutionThreshold,
+    pub reservation_id: EquityTransferReservationId,
+    pub hedgeable: FractionalShares,
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 pub enum PositionCommand {
     /// Test/fixture-only legacy fill command. It takes the amount as given
@@ -1965,16 +1984,10 @@ pub enum PositionCommand {
     },
     /// Claims this symbol for a redemption, which delivers shares to the
     /// broker. Unlike `ReserveEquityTransfer`, a due sell hedge does not block
-    /// it when the broker cannot fill that sell: `hedgeable` is the broker's
-    /// available shares above the hedge floor, and the sell needs the live net.
+    /// it when the broker cannot fill that sell; see `HedgeFundingRedemption`.
     /// Without this, the hedge waits for broker shares and the redemption that
     /// would supply them waits for the hedge.
-    ReserveHedgeFundingRedemption {
-        symbol: Symbol,
-        threshold: ExecutionThreshold,
-        reservation_id: EquityTransferReservationId,
-        hedgeable: FractionalShares,
-    },
+    ReserveHedgeFundingRedemption(HedgeFundingRedemption),
     /// Commits the exact reservation immediately before durable job enqueue.
     ConfirmEquityTransfer {
         reservation_id: EquityTransferReservationId,
@@ -1994,12 +2007,7 @@ pub enum PositionCommand {
     /// `ReserveHedgeFundingRedemption`. A redemption that released its
     /// reservation to wait for gas must get it back over the sell hedge it
     /// funds, or the two wait on each other again.
-    RestoreHedgeFundingRedemption {
-        symbol: Symbol,
-        threshold: ExecutionThreshold,
-        reservation_id: EquityTransferReservationId,
-        hedgeable: FractionalShares,
-    },
+    RestoreHedgeFundingRedemption(HedgeFundingRedemption),
     PlaceOffChainOrder {
         offchain_order_id: OffchainOrderId,
         shares: Positive<FractionalShares>,
@@ -2582,8 +2590,6 @@ impl PartialEq for TriggerReason {
 impl Eq for TriggerReason {}
 
 impl std::fmt::Debug for PositionCommand {
-    // One flat arm per command; splitting it would only scatter the variants.
-    #[allow(clippy::too_many_lines)]
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             #[cfg(any(test, feature = "test-support"))]
@@ -2651,18 +2657,7 @@ impl std::fmt::Debug for PositionCommand {
                 .field("threshold", threshold)
                 .field("reservation_id", reservation_id)
                 .finish(),
-            Self::ReserveHedgeFundingRedemption {
-                symbol,
-                threshold,
-                reservation_id,
-                hedgeable,
-            } => f
-                .debug_struct("ReserveHedgeFundingRedemption")
-                .field("symbol", symbol)
-                .field("threshold", threshold)
-                .field("reservation_id", reservation_id)
-                .field("hedgeable", hedgeable)
-                .finish(),
+            Self::ReserveHedgeFundingRedemption(command) => command.fmt(f),
             Self::ConfirmEquityTransfer { reservation_id } => f
                 .debug_struct("ConfirmEquityTransfer")
                 .field("reservation_id", reservation_id)
@@ -2681,18 +2676,7 @@ impl std::fmt::Debug for PositionCommand {
                 .field("threshold", threshold)
                 .field("reservation_id", reservation_id)
                 .finish(),
-            Self::RestoreHedgeFundingRedemption {
-                symbol,
-                threshold,
-                reservation_id,
-                hedgeable,
-            } => f
-                .debug_struct("RestoreHedgeFundingRedemption")
-                .field("symbol", symbol)
-                .field("threshold", threshold)
-                .field("reservation_id", reservation_id)
-                .field("hedgeable", hedgeable)
-                .finish(),
+            Self::RestoreHedgeFundingRedemption(command) => command.fmt(f),
             Self::PlaceOffChainOrder {
                 offchain_order_id,
                 shares,
@@ -3997,12 +3981,12 @@ mod tests {
         reservation_id: EquityTransferReservationId,
         hedgeable: &str,
     ) -> PositionCommand {
-        PositionCommand::ReserveHedgeFundingRedemption {
+        PositionCommand::ReserveHedgeFundingRedemption(HedgeFundingRedemption {
             symbol: Symbol::new("FGI").unwrap(),
             threshold: one_share_threshold(),
             reservation_id,
             hedgeable: FractionalShares::new(Float::parse(hedgeable.to_owned()).unwrap()),
-        }
+        })
     }
 
     /// The production deadlock: 585 shares long, a sell hedge due, and the

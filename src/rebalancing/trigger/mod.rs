@@ -6,13 +6,12 @@ mod freeze;
 mod usdc;
 mod usdc_guard;
 
-pub(crate) use equity::{
-    EquityTriggerError, FillPriceOrMark, GUARD_GENERATION, GuardGeneration, GuardState,
-    HedgeCapacity, LastPriceReader, RecoveryGuard, claim_guard_for_recovery_or_orphan,
-    remove_active_transfer,
-};
 #[cfg(test)]
-pub(crate) use equity::{InProgressGuard, StubLastPrice};
+pub(crate) use equity::{EquityTriggerError, InProgressGuard, StubLastPrice};
+pub(crate) use equity::{
+    FillPriceOrMark, GUARD_GENERATION, GuardGeneration, GuardState, HedgeCapacity, LastPriceReader,
+    RecoveryGuard, claim_guard_for_recovery_or_orphan, remove_active_transfer,
+};
 
 use alloy::primitives::{Address, TxHash};
 use async_trait::async_trait;
@@ -62,6 +61,7 @@ use crate::alerts::LogNotifier;
 #[cfg(test)]
 use crate::bot_gas::BotGasReceiptCostEnqueuer;
 use crate::conductor::job::{BackpressureStreak, QueuePushError};
+use crate::dashboard::equity_price::MarkListener;
 use crate::equity_redemption::{
     EquityRedemption, EquityRedemptionCommand, EquityRedemptionEvent, RedemptionAggregateId,
 };
@@ -77,8 +77,8 @@ use crate::inventory::{
 use crate::native_gas::{ConfiguredGasReadiness, GasReadiness, TransferGasRoute};
 use crate::offchain::order::OffchainOrderId;
 use crate::position::{
-    EquityTransferReservationId, EquityTransferReservationStatus, Position, PositionCommand,
-    PositionError, PositionEvent,
+    EquityTransferReservationId, EquityTransferReservationStatus, HedgeFundingRedemption, Position,
+    PositionCommand, PositionError, PositionEvent,
 };
 #[cfg(test)]
 use crate::rebalancing::equity::EquityTransferServices;
@@ -4129,6 +4129,8 @@ impl RebalancingService {
     /// broker shares, so it also carries how many shares the broker can sell
     /// today: the Position then admits it over a due sell hedge that the
     /// broker cannot fill, which otherwise waits for this very redemption.
+    /// With no broker reading the capacity is unknown, so the redemption keeps
+    /// the strict rule.
     async fn try_reserve_equity_transfer(
         &self,
         symbol: &Symbol,
@@ -4136,19 +4138,33 @@ impl RebalancingService {
         direction: PlannedDirection,
     ) -> Result<bool, equity::EquityTriggerError> {
         let (store, threshold) = self.position_authority().await?;
-        let command = match direction {
-            PlannedDirection::Mint => PositionCommand::ReserveEquityTransfer {
-                symbol: symbol.clone(),
-                threshold,
-                reservation_id,
-            },
-            PlannedDirection::Redemption => PositionCommand::ReserveHedgeFundingRedemption {
-                symbol: symbol.clone(),
-                threshold,
-                reservation_id,
-                hedgeable: self.hedgeable_shares(symbol).await?,
-            },
+        let hedgeable = match direction {
+            PlannedDirection::Mint => None,
+            PlannedDirection::Redemption => self.hedgeable_shares(symbol).await?,
         };
+        if hedgeable.is_none() && direction == PlannedDirection::Redemption {
+            warn!(
+                target: "rebalance",
+                %symbol,
+                "No broker balance for the redemption's hedge funding check; \
+                 reserving under the strict rule"
+            );
+        }
+        let command = hedgeable.map_or_else(
+            || PositionCommand::ReserveEquityTransfer {
+                symbol: symbol.clone(),
+                threshold,
+                reservation_id,
+            },
+            |hedgeable| {
+                PositionCommand::ReserveHedgeFundingRedemption(HedgeFundingRedemption {
+                    symbol: symbol.clone(),
+                    threshold,
+                    reservation_id,
+                    hedgeable,
+                })
+            },
+        );
         match store.send(symbol, command).await {
             Ok(()) => Ok(true),
             Err(AggregateError::UserError(LifecycleError::Apply(error)))
@@ -8679,29 +8695,37 @@ pub(crate) async fn wire_usdc_reactor_store(
 }
 
 #[async_trait]
+impl MarkListener for RebalancingService {
+    async fn mark_available(&self, symbol: &Symbol) {
+        debug!(target: "rebalance", %symbol, "Mark available; checking equity again");
+        self.equity_scheduler.enqueue_check(symbol.clone()).await;
+    }
+}
+
+#[async_trait]
 impl HedgeCapacity for RebalancingService {
     /// Matches the broker's sell preflight for a whole-share asset: available
     /// shares truncated to whole shares, less the floor rounded up to whole
     /// shares. That is never above what the broker would sell, so a starved
     /// hedge always reads as starved. For a fractional asset it can read low,
     /// which only lets a redemption go ahead of a partial hedge. An unpolled
-    /// broker has none.
+    /// broker is unknown, not empty.
     async fn hedgeable_shares(
         &self,
         symbol: &Symbol,
-    ) -> Result<FractionalShares, equity::EquityTriggerError> {
+    ) -> Result<Option<FractionalShares>, equity::EquityTriggerError> {
         let offchain = self.inventory.read().await.equity_venues(symbol)?.offchain;
         let Some(balance) = offchain else {
-            return Ok(FractionalShares::ZERO);
+            return Ok(None);
         };
 
         let (available, _) = balance.available().truncate_to_decimals(0)?;
         let floor = self.config.hedge_floor.whole_share_floor_for(symbol)?;
         if available.inner().lte(floor.inner())? {
-            return Ok(FractionalShares::ZERO);
+            return Ok(Some(FractionalShares::ZERO));
         }
 
-        Ok((available - floor)?)
+        Ok(Some((available - floor)?))
     }
 }
 
@@ -33263,6 +33287,75 @@ mod tests {
         .unwrap();
 
         assert_eq!(count_pending_equity_mint_jobs(&trigger).await, 0);
+    }
+
+    /// Prices every symbol at 100 and, on its first read, which falls between
+    /// the two plans of one check, replaces the inventory with `moved_to`, as
+    /// onchain activity can between them.
+    struct InventoryMovingPrice {
+        inventory: Arc<BroadcastingInventory>,
+        moved_to: tokio::sync::Mutex<Option<InventoryView>>,
+    }
+
+    #[async_trait]
+    impl LastPriceReader for InventoryMovingPrice {
+        async fn last_price(
+            &self,
+            _symbol: &Symbol,
+        ) -> Result<Option<crate::position::PriceObservation>, ProjectionError<Position>> {
+            let moved_to = self.moved_to.lock().await.take();
+            if let Some(moved_to) = moved_to {
+                *self.inventory.write().await = moved_to;
+            }
+            Ok(Some(crate::position::PriceObservation {
+                price: float!(100),
+                observed_at: Utc::now(),
+            }))
+        }
+    }
+
+    /// The reservation was admitted for a redemption over a due sell hedge
+    /// the broker cannot fill. When the plan after the reservation is a mint,
+    /// nothing is dispatched and the reservation is released: a mint would
+    /// take the shares that hedge needs.
+    #[tokio::test]
+    async fn equity_check_does_not_mint_on_a_reservation_admitted_for_a_redemption() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let redemption_inventory = InventoryView::default()
+            .with_equity(symbol.clone(), shares(80), shares(1))
+            .with_usdc(usdc(1_000_000), usdc(1_000_000));
+        let mint_inventory = InventoryView::default()
+            .with_equity(symbol.clone(), shares(20), shares(80))
+            .with_usdc(usdc(1_000_000), usdc(1_000_000));
+        let trigger = make_trigger_with_inventory_and_registry(redemption_inventory, &symbol).await;
+        acknowledge_onchain_buy(&trigger, &symbol, 500).await;
+        trigger
+            .set_last_price_reader(Arc::new(InventoryMovingPrice {
+                inventory: Arc::clone(&trigger.inventory),
+                moved_to: tokio::sync::Mutex::new(Some(mint_inventory)),
+            }))
+            .await;
+
+        EquityRebalancingCheck {
+            symbol: symbol.clone(),
+        }
+        .perform(&trigger)
+        .await
+        .unwrap();
+
+        assert_eq!(count_pending_equity_mint_jobs(&trigger).await, 0);
+        assert_eq!(count_pending_equity_redemption_jobs(&trigger).await, 0);
+        let (store, _) = trigger.position_authority().await.unwrap();
+        assert_eq!(
+            store
+                .load(&symbol)
+                .await
+                .unwrap()
+                .unwrap()
+                .equity_transfer_reservation,
+            None,
+            "the reservation admitted for the redemption must be released"
+        );
     }
 
     #[tokio::test]
