@@ -13,12 +13,14 @@ mod proof;
 mod quote;
 mod status;
 #[cfg(test)]
+mod test_chain;
+#[cfg(any(test, feature = "mock"))]
 mod test_contracts;
 
 pub use acceptance::{
     BasisPoints, BasisPointsOutOfRange, QuoteAcceptanceError, QuoteAmounts, QuoteBounds,
 };
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(any(test, feature = "mock"))]
 pub use evm::RelayEndContracts;
 pub use evm::{RelayBridge, RelayBridgeError, RelayCtx};
 pub use proof::UnverifiedReason;
@@ -27,6 +29,8 @@ pub use quote::{
     RelayQuote, RelayRequestId, StepTransaction,
 };
 pub use status::{FailReason, InFlightStage, IntentStatus, IntentStatusReport};
+#[cfg(feature = "mock")]
+pub use test_contracts::deploy_relay_end;
 
 use std::time::Duration;
 
