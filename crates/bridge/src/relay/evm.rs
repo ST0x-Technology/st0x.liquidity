@@ -607,7 +607,8 @@ impl<W: Wallet> RelayEnd<W> {
             return Err(RelayBridgeError::ScanAheadOfHead { from_block, head });
         }
 
-        let scanned_to = head.saturating_sub(self.confirmations.saturating_sub(1));
+        let confirmed = head.saturating_sub(self.confirmations.saturating_sub(1));
+        let scanned_to = confirmed.max(from_block.saturating_sub(1));
         let mut deposits = Vec::new();
         let mut start = from_block;
 
