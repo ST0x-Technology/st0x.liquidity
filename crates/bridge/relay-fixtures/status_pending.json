@@ -1,0 +1,14 @@
+{
+  "status": "pending",
+  "details": "Generating solution",
+  "inTxHashes": [
+    "0xeeee66456ace7aae93e6ed814d32a3748a5fc86d7101a259a4f62a44822c819d"
+  ],
+  "txHashes": [],
+  "updatedAt": 1790875513702,
+  "originChainId": 1,
+  "destinationChainId": 4663,
+  "quoteCreatedAt": 1790875481812,
+  "failReason": "N/A",
+  "refundFailReason": "N/A"
+}
