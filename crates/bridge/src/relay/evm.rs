@@ -66,7 +66,8 @@ struct RelayEnd<W> {
     stable: Address,
     depository: Address,
     wallet: W,
-    /// A deposit scan stops this many blocks behind the head.
+    /// A deposit scan covers only blocks with this many confirmations,
+    /// counting the inclusion block as the wallet does.
     confirmations: u64,
 }
 
@@ -590,9 +591,10 @@ impl<W: Wallet> RelayEnd<W> {
     }
 
     /// `RelayErc20Deposit` has no indexed field, so every deposit log in the
-    /// range is fetched and decoded, chunk by chunk. The scan stops
-    /// `confirmations` blocks behind the head: a lagging load-balanced node may
-    /// not have indexed the newest blocks, and a deposit there is unconfirmed.
+    /// range is fetched and decoded, chunk by chunk. The scan stops at the
+    /// newest block with `confirmations` (counting the inclusion block, as the
+    /// wallet does): a lagging load-balanced node may not have indexed the
+    /// newest blocks, and a deposit there is unconfirmed.
     async fn find_deposits(
         &self,
         order_ids: &[RelayOrderId],
@@ -605,7 +607,7 @@ impl<W: Wallet> RelayEnd<W> {
             return Err(RelayBridgeError::ScanAheadOfHead { from_block, head });
         }
 
-        let scanned_to = head.saturating_sub(self.confirmations);
+        let scanned_to = head.saturating_sub(self.confirmations.saturating_sub(1));
         let mut deposits = Vec::new();
         let mut start = from_block;
 
@@ -756,7 +758,7 @@ mod tests {
 
     const MINIMUM_OUT: U256 = U256::from_limbs([4_749_464, 0, 0, 0]);
 
-    /// What a deposit scan stays behind the head on either end.
+    /// The confirmations a deposit scan requires on either end.
     const CONFIRMATIONS: u64 = 3;
 
     /// Our wallet's view of the hub and a corridor chain, each an Anvil chain
@@ -1850,14 +1852,14 @@ mod tests {
             scan,
             DepositScan {
                 deposits: vec![ours],
-                scanned_to: head - CONFIRMATIONS,
+                scanned_to: head - (CONFIRMATIONS - 1),
             }
         );
         assert_eq!(both.deposits, vec![ours, other]);
     }
 
     #[tokio::test]
-    async fn deposit_scan_stops_its_confirmations_behind_the_head() {
+    async fn deposit_scan_covers_only_blocks_with_its_confirmations() {
         let harness = Harness::new().await;
         let from_block = harness
             .bridge
@@ -1865,7 +1867,7 @@ mod tests {
             .await
             .unwrap();
         let deposit = harness.deposit_to_hub(B256::random()).await;
-        harness.chain.mine(CONFIRMATIONS - 1).await;
+        harness.chain.mine(CONFIRMATIONS - 2).await;
 
         let early = harness
             .bridge

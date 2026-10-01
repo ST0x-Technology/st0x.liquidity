@@ -281,8 +281,8 @@ pub struct SwapDeposit<OrderId> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DepositScan<OrderId> {
     pub deposits: Vec<SwapDeposit<OrderId>>,
-    /// The last block the scan covered, the origin chain's confirmations
-    /// behind its head: a deposit mined later is not covered.
+    /// The last block the scan covered, the newest with the origin chain's
+    /// confirmations: a deposit mined later is not covered.
     pub scanned_to: u64,
 }
 
