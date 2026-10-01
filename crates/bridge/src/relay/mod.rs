@@ -367,6 +367,7 @@ mod tests {
                     "amount": "5000000",
                     "tradeType": "EXACT_INPUT",
                     "slippageTolerance": "30",
+                    "ttl": 1800,
                 })
                 .to_string(),
             );

@@ -31,7 +31,8 @@ Body (amounts are base-10 strings in the token's smallest unit):
   "tradeType": "EXACT_INPUT",
   "recipient": "0x...",
   "refundTo": "0x...",
-  "slippageTolerance": "30"
+  "slippageTolerance": "30",
+  "ttl": 1800
 }
 ```
 
@@ -87,6 +88,12 @@ to `RelayError::RateLimited { retry_after }` from the `Retry-After` header
   `depositErc20(address depositor, address token, uint256 amount, bytes32 id)`
   (selector `0xe8017952`). The client reads `RelayQuote::order_id` from that
   calldata.
+- **`ttl` does not bound the deadline.** The order's
+  `protocol.v2.orderData.output.deadline` (and each refund's `deadline`) lands a
+  week after the quote with `ttl` unset, `1800` or `60` (live, 2026-10-01; the
+  `ttl: 1800` body is `quote_ttl_robinhood_to_ethereum.json`). The solver may
+  fill until then, long after the caller gave up. `QuoteRequest` still sends
+  `ttl`; `RelayQuote::deadline` exposes the real deadline.
 - **`refundTo` is always sent.** The quote docs say an unset `refundTo` falls
   back to the recipient or user; the refunds page says it disables automatic
   refunds.
