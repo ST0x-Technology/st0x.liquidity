@@ -1138,6 +1138,7 @@ fn stuck_redemption_info(rows: &[(String, String, i64)]) -> Option<StuckTransfer
             | UnwrapPending { .. }
             | UnwrapSubmitted { .. }
             | SendPending { .. }
+            | SendPrepared { .. }
             | Detected { .. }
             | VaultWithdrawReplacementAdopted { .. } => {}
         }
@@ -3279,7 +3280,8 @@ async fn reconcile_equity_transfer(
                     Json(ErrorResponse {
                         error: format!(
                             "Redemption {id} is not reconcilable; reconcile resolves a \
-                             Failed terminal or an unresolved vault-withdrawal submission."
+                             Failed terminal, an unresolved vault-withdrawal submission, or a \
+                             pending issuer send."
                         ),
                     }),
                 ));

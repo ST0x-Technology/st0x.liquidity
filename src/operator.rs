@@ -192,7 +192,8 @@ pub mod equity_redemption {
 
     #[cfg(feature = "test-support")]
     pub use crate::equity_redemption::{
-        DetectionFailure, EquityRedemptionError, redemption_aggregate_id,
+        DetectionFailure, EquityRedemptionError, prepared_withdrawal_for_test,
+        redemption_aggregate_id,
     };
 }
 

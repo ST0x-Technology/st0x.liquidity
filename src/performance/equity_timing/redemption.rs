@@ -125,7 +125,7 @@ impl StoredOperation {
                     StoredStageOutcome::Succeeded,
                 );
             }
-            SendPending { pending_at } => {
+            SendPending { pending_at } | SendPrepared { pending_at, .. } => {
                 self.open_once(RedemptionSend, *pending_at);
             }
             // Terminal failures: whichever stage is currently open (varies by
@@ -319,6 +319,7 @@ pub(super) fn redemption_observed_at(event: &EquityRedemptionEvent) -> DateTime<
             unwrapped_at: at, ..
         }
         | SendPending { pending_at: at }
+        | SendPrepared { pending_at: at, .. }
         | TransferFailed { failed_at: at, .. }
         | TokensSent { sent_at: at, .. }
         | DetectionFailed { failed_at: at, .. }

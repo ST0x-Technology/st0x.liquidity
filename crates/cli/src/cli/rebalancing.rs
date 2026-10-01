@@ -2149,9 +2149,9 @@ pub(crate) async fn reconcile_equity_transfer_command<W: Write>(
 
             if !entity.is_operator_reconcilable() {
                 anyhow::bail!(
-                    "transfer reconcile: redemption {id} is not reconcilable (must be Failed \
-                     or an unresolved vault-withdrawal submission). Refusing to act -- check \
-                     its current state on the dashboard."
+                    "transfer reconcile: redemption {id} is not reconcilable (must be Failed, \
+                     an unresolved vault-withdrawal submission, or a pending issuer send). \
+                     Refusing to act -- check its current state on the dashboard."
                 );
             }
 
@@ -6103,7 +6103,10 @@ mod tests {
             UnwrapTokens,
             SubmitUnwrap,
             ConfirmUnwrap,
-            PrepareSend,
+            PrepareSend {
+                prepared: st0x_hedge::operator::equity_redemption::prepared_withdrawal_for_test(),
+                redemption_wallet: Address::ZERO,
+            },
             SendTokens,
         ] {
             store.send(id, command).await.unwrap();
@@ -6889,6 +6892,64 @@ mod tests {
         assert!(
             matches!(entity, EquityRedemption::Failed { .. }),
             "a refused reconcile must not reconcile, got: {entity:?}"
+        );
+    }
+
+    /// A signed issuer send the operator verified will never land (its nonce
+    /// consumed by a 0-value self-transfer) is closed through the CLI, and the
+    /// reconciled state names the send whose nonce the bot must release.
+    #[tokio::test]
+    async fn reconcile_equity_redemption_succeeds_from_a_signed_send() {
+        use EquityRedemptionCommand::*;
+
+        let pool = setup_test_db().await;
+        let id = redemption_aggregate_id("cli-reconcile-signed-send");
+        seed_redemption_to_withdrawn(&pool, &id).await;
+        let prepared = PreparedTransaction::for_test(alloy::primitives::TxHash::repeat_byte(9), 4);
+        let (store, _projection) = StoreBuilder::<EquityRedemption>::new(pool.clone())
+            .build(redemption_services())
+            .await
+            .unwrap();
+        for command in [
+            UnwrapTokens,
+            SubmitUnwrap,
+            ConfirmUnwrap,
+            PrepareSend {
+                prepared: prepared.clone(),
+                redemption_wallet: Address::ZERO,
+            },
+        ] {
+            store.send(&id, command).await.unwrap();
+        }
+
+        let mut stdout = Vec::new();
+        reconcile_equity_transfer_command(
+            &mut stdout,
+            TransferType::Redemption,
+            &id.to_string(),
+            "nonce 4 consumed by a 0-value self-transfer"
+                .parse()
+                .unwrap(),
+            None,
+            &pool,
+            no_withdrawal_to_verify,
+        )
+        .await
+        .unwrap();
+
+        let entity = st0x_event_sorcery::load_entity::<EquityRedemption>(&pool, &id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(
+                entity,
+                EquityRedemption::Reconciled {
+                    issuer_send_nonce_hash: Some(hash),
+                    ..
+                } if hash == prepared.tx_hash()
+            ),
+            "a dead signed send must reconcile and name its nonce, got: {entity:?}"
         );
     }
 

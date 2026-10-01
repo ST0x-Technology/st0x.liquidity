@@ -626,7 +626,7 @@ async fn assert_equity_redeem_rebalancing<P: Provider>(
             "EquityRedemptionEvent::UnwrapPending",
             "EquityRedemptionEvent::UnwrapSubmitted",
             "EquityRedemptionEvent::TokensUnwrapped",
-            "EquityRedemptionEvent::SendPending",
+            "EquityRedemptionEvent::SendPrepared",
             "EquityRedemptionEvent::TokensSent",
             "EquityRedemptionEvent::Detected",
             "EquityRedemptionEvent::Completed",

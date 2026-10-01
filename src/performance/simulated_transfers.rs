@@ -193,6 +193,30 @@ impl Tokenizer for FixtureTokenizer {
         ))
     }
 
+    async fn prepare_redemption_send(
+        &self,
+        token: UnwrappedToken,
+        amount: U256,
+    ) -> Result<st0x_evm::PreparedTransaction, TokenizerError> {
+        let tx_hash = self.send_for_redemption(token, amount).await?;
+        Ok(st0x_evm::PreparedTransaction::for_test(tx_hash, 0))
+    }
+    async fn broadcast_redemption_send(
+        &self,
+        prepared: &st0x_evm::PreparedTransaction,
+    ) -> Result<TxHash, TokenizerError> {
+        Ok(prepared.tx_hash())
+    }
+    async fn confirm_redemption_send(&self, _tx_hash: TxHash) -> Result<bool, TokenizerError> {
+        Ok(true)
+    }
+    async fn restore_redemption_send(&self, _prepared: &st0x_evm::PreparedTransaction) {}
+    async fn discard_redemption_send(&self, _tx_hash: TxHash) {}
+    async fn redemption_send_mined(&self, _tx_hash: TxHash) -> Result<bool, TokenizerError> {
+        Ok(true)
+    }
+    async fn release_superseded_redemption_send(&self, _tx_hash: TxHash) {}
+
     async fn poll_for_redemption(
         &self,
         _tx_hash: &TxHash,
@@ -1264,6 +1288,13 @@ pub async fn seed_simulated_equity_redemption_history(
             .send(
                 &id,
                 EquityRedemptionCommand::PrepareSendAt {
+                    prepared: st0x_evm::PreparedTransaction::for_test(
+                        TxHash::left_padding_from(
+                            simulated_transfer_uuid("redeem-send-tx", day).as_bytes(),
+                        ),
+                        0,
+                    ),
+                    redemption_wallet: Address::ZERO,
                     pending_at: send_pending_at,
                 },
             )
