@@ -42,7 +42,7 @@ pub struct RelayCtx<EthWallet, ChainWallet> {
 }
 
 /// Locally deployed stand-ins for one end's stable and depository.
-#[cfg(any(test, feature = "test-support"))]
+#[cfg(any(test, feature = "mock"))]
 #[derive(Debug, Clone, Copy)]
 pub struct RelayEndContracts {
     pub stable: Address,
@@ -132,7 +132,7 @@ impl<EthWallet: Wallet, ChainWallet: Wallet> RelayBridge<EthWallet, ChainWallet>
     }
 
     /// Points each end at locally deployed contracts.
-    #[cfg(any(test, feature = "test-support"))]
+    #[cfg(any(test, feature = "mock"))]
     #[must_use]
     pub fn with_local_contracts(
         mut self,
@@ -742,7 +742,7 @@ mod tests {
     use st0x_evm::Evm;
     use st0x_evm::local::RawPrivateKeyWallet;
 
-    use super::super::test_contracts::RelayChain;
+    use super::super::test_chain::RelayChain;
     use super::super::{BasisPoints, QuoteAmounts, QuoteFees, RelayRequestId};
     use super::*;
 
