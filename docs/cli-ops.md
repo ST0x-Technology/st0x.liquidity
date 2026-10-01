@@ -846,8 +846,15 @@ stox transfer reconcile --kind redemption --id <redemption-aggregate-id> \
   be signed by the chain's configured bot wallet, since nonces are per sender:
   one signed by a key rotated out since is refused; cancel it from that key and
   run the CLI reconcile configured with that key. `--superseding-tx` is refused
-  for a mint and for a redemption with no signed withdrawal (the API with
-  `400`).
+  for a mint and for a redemption with no signed withdrawal or issuer send (the
+  API with `400`).
+- A redemption on `SendPending` with a signed issuer send follows the same rule:
+  reconcile refuses until the chain proves the send can never land, with the
+  same checks as for a withdrawal. If the send mined successfully, do not
+  reconcile: recovery records it. If it reverted with the required
+  confirmations, reconcile with no `--superseding-tx`. Otherwise cancel it with
+  the same plain 0-value self-transfer at the send's nonce, wait for its
+  required confirmations, and reconcile with `--superseding-tx <cancel>`.
 
 ### Base->Alpaca deposit send pages
 

@@ -1198,7 +1198,7 @@ async fn equity_onchain_imbalance_triggers_redemption() {
             ExpectedEvent::new(
                 "EquityRedemption",
                 &redemption_agg_id,
-                "EquityRedemptionEvent::SendPending",
+                "EquityRedemptionEvent::SendPrepared",
             ),
             ExpectedEvent::new(
                 "EquityRedemption",
@@ -1351,7 +1351,10 @@ async fn complete_redemption_through_the_reactor(
         EquityRedemptionCommand::UnwrapTokens,
         EquityRedemptionCommand::SubmitUnwrap,
         EquityRedemptionCommand::ConfirmUnwrap,
-        EquityRedemptionCommand::PrepareSend,
+        EquityRedemptionCommand::PrepareSend {
+            prepared: crate::equity_redemption::prepared_withdrawal_for_test(),
+            redemption_wallet: Address::ZERO,
+        },
         EquityRedemptionCommand::SendTokens,
         EquityRedemptionCommand::Detect {
             tokenization_request_id: tokenization_request_id("planned-redemption"),
@@ -3373,11 +3376,16 @@ async fn transfer_failed_cancels_redemption_inflight() {
 
     // PrepareSend -> SendPending
     redemption_store
-        .send(&redemption_id, EquityRedemptionCommand::PrepareSend)
+        .send(
+            &redemption_id,
+            EquityRedemptionCommand::PrepareSend {
+                prepared: crate::equity_redemption::prepared_withdrawal_for_test(),
+                redemption_wallet: Address::ZERO,
+            },
+        )
         .await
         .unwrap();
-
-    // SendTokens: mock tokenizer fails -> TransferFailed event
+    // SendTokens: mock tokenizer confirms a revert -> TransferFailed event
     // The aggregate emits TransferFailed, trigger cancels inflight
     redemption_store
         .send(&redemption_id, EquityRedemptionCommand::SendTokens)

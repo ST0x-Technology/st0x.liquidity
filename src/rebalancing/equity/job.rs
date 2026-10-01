@@ -869,6 +869,14 @@ pub(crate) trait ResumeEquityToHedging: Send + Sync + 'static {
     ) -> Result<(), RedemptionError> {
         Ok(())
     }
+
+    async fn discard_reconciled_issuer_send(
+        &self,
+        _chain: Chain,
+        _tx_hash: TxHash,
+    ) -> Result<(), RedemptionError> {
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -893,6 +901,14 @@ impl ResumeEquityToHedging for CrossVenueEquityTransfer {
         tx_hash: TxHash,
     ) -> Result<(), RedemptionError> {
         Self::discard_reconciled_withdrawal(self, chain, tx_hash).await
+    }
+
+    async fn discard_reconciled_issuer_send(
+        &self,
+        chain: Chain,
+        tx_hash: TxHash,
+    ) -> Result<(), RedemptionError> {
+        Self::discard_reconciled_issuer_send(self, chain, tx_hash).await
     }
 }
 
@@ -1114,7 +1130,8 @@ impl TransferEquityToHedging {
         aggregate: &EquityRedemption,
     ) {
         let EquityRedemption::Reconciled {
-            withdrawal_nonce_hash: Some(tx_hash),
+            withdrawal_nonce_hash,
+            issuer_send_nonce_hash,
             chain,
             ..
         } = aggregate
@@ -1122,24 +1139,48 @@ impl TransferEquityToHedging {
             return;
         };
 
-        match ctx
-            .transfer
-            .discard_reconciled_withdrawal(*chain, *tx_hash)
-            .await
-        {
-            Ok(()) => info!(
-                target: "rebalance",
-                symbol = %self.symbol,
-                aggregate_id = %self.aggregate_id,
-                "Requested release of the reconciled withdrawal's nonce reservation"
-            ),
-            Err(error) => warn!(
-                target: "rebalance",
-                symbol = %self.symbol,
-                aggregate_id = %self.aggregate_id,
-                %error,
-                "Failed to release a reconciled withdrawal's nonce reservation"
-            ),
+        if let Some(tx_hash) = withdrawal_nonce_hash {
+            match ctx
+                .transfer
+                .discard_reconciled_withdrawal(*chain, *tx_hash)
+                .await
+            {
+                Ok(()) => info!(
+                    target: "rebalance",
+                    symbol = %self.symbol,
+                    aggregate_id = %self.aggregate_id,
+                    "Requested release of the reconciled withdrawal's nonce reservation"
+                ),
+                Err(error) => warn!(
+                    target: "rebalance",
+                    symbol = %self.symbol,
+                    aggregate_id = %self.aggregate_id,
+                    %error,
+                    "Failed to release a reconciled withdrawal's nonce reservation"
+                ),
+            }
+        }
+
+        if let Some(tx_hash) = issuer_send_nonce_hash {
+            match ctx
+                .transfer
+                .discard_reconciled_issuer_send(*chain, *tx_hash)
+                .await
+            {
+                Ok(()) => info!(
+                    target: "rebalance",
+                    symbol = %self.symbol,
+                    aggregate_id = %self.aggregate_id,
+                    "Requested release of the reconciled issuer send's nonce reservation"
+                ),
+                Err(error) => warn!(
+                    target: "rebalance",
+                    symbol = %self.symbol,
+                    aggregate_id = %self.aggregate_id,
+                    %error,
+                    "Failed to release a reconciled issuer send's nonce reservation"
+                ),
+            }
         }
     }
 }

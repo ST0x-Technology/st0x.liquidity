@@ -64,7 +64,8 @@ use crate::bot_gas::BotGasReceiptCostEnqueuer;
 use crate::conductor::job::{BackpressureStreak, QueuePushError};
 use crate::dashboard::equity_price::MarkListener;
 use crate::equity_redemption::{
-    EquityRedemption, EquityRedemptionCommand, EquityRedemptionEvent, RedemptionAggregateId,
+    EquityRedemption, EquityRedemptionCommand, EquityRedemptionEvent, PreparedRedemptionSend,
+    RedemptionAggregateId,
 };
 use crate::inventory::divergence::ReconciliationGeneration;
 use crate::inventory::projection::InventoryProjectionError;
@@ -770,7 +771,8 @@ impl RedemptionTracking {
                 self.stage = RedemptionTrackingStage::TokensUnwrapped;
                 self.last_progress_at = *unwrapped_at;
             }
-            EquityRedemptionEvent::SendPending { pending_at, .. } => {
+            EquityRedemptionEvent::SendPending { pending_at }
+            | EquityRedemptionEvent::SendPrepared { pending_at, .. } => {
                 self.stage = RedemptionTrackingStage::SendPending;
                 self.last_progress_at = *pending_at;
             }
@@ -1007,6 +1009,12 @@ pub(crate) struct RebalancingService {
     /// silence the page about stranded funds: the alert is re-attempted on every
     /// sweep until one delivery succeeds, while the error log stays one-shot.
     post_burn_timeout_alerted: Arc<RwLock<HashSet<UsdcRebalanceId>>>,
+    /// Redemption ids whose pending issuer-send timeout page was delivered.
+    issuer_send_timeout_alerted: Arc<RwLock<HashSet<RedemptionAggregateId>>>,
+    /// Timed-out `TokensUnwrapped` redemptions whose `FailTransfer` the sweep
+    /// is committing before it tears tracking and inventory down. The reactor
+    /// skips their `TransferFailed`, which the sweep's teardown replaces.
+    redemption_timeout_failing: Arc<RwLock<HashSet<RedemptionAggregateId>>>,
     /// Ids of AlpacaToBase transfers the sweep holds before their burn that are
     /// already logged; the same one shot log as `post_burn_timeout_logged`.
     unconfirmed_burn_hold_logged: Arc<RwLock<HashSet<UsdcRebalanceId>>>,
@@ -1149,6 +1157,10 @@ fn alpaca_to_base_hold_without_confirmed_burn(state: &UsdcRebalance) -> Option<&
 /// Outcome of examining a tracked redemption during the timeout sweep.
 #[derive(Debug)]
 enum RedemptionTimeoutCleanup {
+    PageIssuerSend {
+        tracking: RedemptionTracking,
+        prepared_send: Option<PreparedRedemptionSend>,
+    },
     /// The durable aggregate is `Reconciled`: an operator's `transfer reconcile`
     /// (a separate-process CLI, or the in-process API via bare `send_command`)
     /// wrote `OperatorReconciled` to the store, but the live reactor never
@@ -1157,12 +1169,21 @@ enum RedemptionTimeoutCleanup {
     Reconciled {
         tracking: RedemptionTracking,
         /// Whether the reconciled redemption still held a signed vault
-        /// withdrawal whose wallet nonce reservation must be released.
+        /// withdrawal or issuer send whose wallet nonce reservation must be
+        /// released.
         held_prepared: bool,
     },
     /// The transfer genuinely timed out at a non-submission stage and must be
     /// force-resolved.
     TimedOut {
+        tracking: RedemptionTracking,
+        elapsed: Duration,
+    },
+    /// A transfer timed out at a pre-send stage (`WithdrawnFromRaindex`
+    /// through `TokensUnwrapped`). Its tracking and inventory stay in place
+    /// until `FailTransfer` commits, because a send signed meanwhile makes the
+    /// failure invalid and the teardown unsafe.
+    FailBeforeTeardown {
         tracking: RedemptionTracking,
         elapsed: Duration,
     },
@@ -1269,6 +1290,8 @@ impl RebalancingService {
             requested_stage_timeout_alerted: Arc::new(RwLock::new(HashSet::new())),
             post_burn_timeout_logged: Arc::new(RwLock::new(HashSet::new())),
             post_burn_timeout_alerted: Arc::new(RwLock::new(HashSet::new())),
+            issuer_send_timeout_alerted: Arc::new(RwLock::new(HashSet::new())),
+            redemption_timeout_failing: Arc::new(RwLock::new(HashSet::new())),
             unconfirmed_burn_hold_logged: Arc::new(RwLock::new(HashSet::new())),
             unconfirmed_burn_hold_alerted: Arc::new(RwLock::new(HashSet::new())),
             corridor_not_served_alerted: Arc::new(RwLock::new(HashSet::new())),
@@ -1862,16 +1885,18 @@ impl RebalancingService {
             tracking
                 .iter()
                 .filter_map(|(id, tracking)| {
-                    // Withdrawal-submission stages are ALWAYS selected so the
-                    // durable `Reconciled` check runs every tick regardless of
-                    // elapsed time; they are never force-failed on timeout
-                    // because their withdrawal may have landed. Every other stage
-                    // is selected only once it exceeds `transfer_timeout`.
+                    // Withdrawal-submission and issuer-send stages are ALWAYS
+                    // selected so the durable `Reconciled` check runs every tick
+                    // regardless of elapsed time; they are never force-failed on
+                    // timeout because their transaction may have landed. Every
+                    // other stage is selected only once it exceeds
+                    // `transfer_timeout`.
                     if matches!(
                         tracking.stage,
                         RedemptionTrackingStage::VaultWithdrawPending
                             | RedemptionTrackingStage::VaultWithdrawSubmitting
                             | RedemptionTrackingStage::VaultWithdrawSubmitted
+                            | RedemptionTrackingStage::SendPending
                     ) {
                         return Some(id.clone());
                     }
@@ -1889,6 +1914,13 @@ impl RebalancingService {
             };
 
             match cleanup {
+                RedemptionTimeoutCleanup::PageIssuerSend {
+                    tracking,
+                    prepared_send,
+                } => {
+                    self.page_timed_out_issuer_send(&id, &tracking, prepared_send.as_ref(), now)
+                        .await;
+                }
                 RedemptionTimeoutCleanup::Reconciled {
                     tracking,
                     held_prepared,
@@ -1907,7 +1939,8 @@ impl RebalancingService {
                         .await;
                     if held_prepared {
                         // The reconciled redemption still held a signed vault
-                        // withdrawal, so its wallet nonce is still reserved. The
+                        // withdrawal or issuer send, so its wallet nonce is still
+                        // reserved. The
                         // sweep holds no wallet, so it enqueues a resume job whose
                         // terminal branch discards the reservation. Always enqueue:
                         // the release is ownership checked and idempotent, so a
@@ -1928,6 +1961,10 @@ impl RebalancingService {
                         })
                         .await;
                     }
+                }
+                RedemptionTimeoutCleanup::FailBeforeTeardown { tracking, elapsed } => {
+                    self.fail_then_tear_down_timed_out_redemption(&id, &tracking, elapsed, now)
+                        .await?;
                 }
                 RedemptionTimeoutCleanup::TimedOut { tracking, elapsed } => {
                     let elapsed_secs = elapsed.as_secs();
@@ -1993,6 +2030,64 @@ impl RebalancingService {
             }
         }
 
+        Ok(())
+    }
+
+    async fn fail_then_tear_down_timed_out_redemption(
+        &self,
+        id: &RedemptionAggregateId,
+        tracking: &RedemptionTracking,
+        elapsed: Duration,
+        now: DateTime<Utc>,
+    ) -> Result<(), RebalancingServiceError> {
+        let elapsed_secs = elapsed.as_secs();
+        let store = self.redemption_store.read().await.as_ref().map(Arc::clone);
+        let fail_succeeded = match store {
+            Some(store) => {
+                let reason = format!(
+                    "Transfer timed out after {elapsed_secs}s at stage {}",
+                    tracking.stage
+                );
+                match store
+                    .send(id, EquityRedemptionCommand::FailTransfer { reason })
+                    .await
+                {
+                    Ok(()) => true,
+                    Err(error) => {
+                        warn!(
+                            target: "rebalance",
+                            %id, %error,
+                            "Failed to emit timeout failure event for redemption"
+                        );
+                        false
+                    }
+                }
+            }
+            None => false,
+        };
+
+        if !self
+            .finish_deferred_redemption_timeout(id, tracking, fail_succeeded, now)
+            .await?
+        {
+            return Ok(());
+        }
+
+        error!(
+            target: "rebalance",
+            aggregate_id = %id,
+            symbol = %tracking.symbol,
+            stage = %tracking.stage,
+            elapsed_secs,
+            outcome = "timeout",
+            "Redemption transfer timed out; clearing trigger guard and inventory inflight"
+        );
+        self.clear_equity_in_progress(&tracking.symbol);
+        // The teardown runs only once the failure is durable, whichever writer
+        // committed it. The reactor skipped that `TransferFailed`, so this path
+        // owns the release.
+        self.release_timed_out_redemption_reservation(id, &tracking.symbol)
+            .await;
         Ok(())
     }
 
@@ -2546,86 +2641,47 @@ impl RebalancingService {
             return Ok(None);
         };
 
-        // Withdrawal-submission stages are never force-failed on timeout, but
-        // they are checked for a durable `Reconciled` on every tick. An
-        // operator's reconcile writes `OperatorReconciled` through bare
-        // `send_command`, which dispatches no reactor, so the live bot would
-        // otherwise never clear the guard, inflight, and reservation until a
-        // restart. Mirror `on_redemption`'s terminal reconcile cleanup here.
-        if matches!(
+        // Withdrawal-submission and issuer-send stages are never force-failed
+        // on timeout, because their transaction may have landed, but they are
+        // checked for a durable `Reconciled` on every tick. An operator's
+        // reconcile writes `OperatorReconciled` through bare `send_command`,
+        // which dispatches no reactor, so the live bot would otherwise never
+        // clear the guard, inflight, and reservation until a restart.
+        let submission_stage = matches!(
             tracking.stage,
             RedemptionTrackingStage::VaultWithdrawPending
                 | RedemptionTrackingStage::VaultWithdrawSubmitting
                 | RedemptionTrackingStage::VaultWithdrawSubmitted
-        ) {
-            let store = self.redemption_store.read().await.as_ref().map(Arc::clone);
-            let Some(store) = store else {
+                | RedemptionTrackingStage::SendPending
+        );
+        if submission_stage || tracking.stage == RedemptionTrackingStage::TokensUnwrapped {
+            let Some(durable) = self.load_redemption_for_sweep(id).await else {
                 return Ok(None);
             };
-            match store.load(id).await {
-                Ok(Some(EquityRedemption::Reconciled {
+            match durable {
+                EquityRedemption::Reconciled {
                     withdrawal_nonce_hash,
+                    issuer_send_nonce_hash,
                     ..
-                })) => {
-                    // Cancel the MarketMaking inflight (the shares never left the
-                    // vault, per the operator's verified-dead reconcile) and clear
-                    // the active redemption, exactly like `on_redemption`'s
-                    // `OperatorReconciled` terminal path. Drop tracking first, then
-                    // apply; re-insert on error so the next tick retries rather
-                    // than latching the guard with no entry to re-select.
+                } => {
                     tracking_guard.remove(id);
                     drop(tracking_guard);
-
-                    if let Err(error) = self
-                        .apply_equity_update_or_defer(
-                            &tracking.symbol,
-                            tracking.chain,
-                            Venue::MarketMaking,
-                            Self::cancel_equity_transfer_update(
-                                Venue::MarketMaking,
-                                tracking.quantity,
-                            ),
-                        )
+                    let held_prepared =
+                        withdrawal_nonce_hash.is_some() || issuer_send_nonce_hash.is_some();
+                    return self
+                        .apply_swept_redemption_reconcile(id, tracking, held_prepared, now)
                         .await
-                    {
-                        self.redemption_tracking
-                            .write()
-                            .await
-                            .insert(id.clone(), tracking);
-                        return Err(error);
-                    }
-                    {
-                        let mut inventory = self.inventory.write().await;
-                        *inventory = inventory.clone().clear_active_redemption(&tracking.symbol);
-                    }
-
-                    // Tombstone so a late reactor `OperatorReconciled` (should the
-                    // in-process path ever route through the store) is ignored
-                    // instead of cancelling the inflight a second time.
-                    self.timed_out_redemptions.write().await.insert(
-                        id.clone(),
-                        TimeoutTombstone {
-                            symbol: tracking.symbol.clone(),
-                            chain: tracking.chain,
-                            timed_out_at: now,
-                        },
-                    );
-                    return Ok(Some(RedemptionTimeoutCleanup::Reconciled {
+                        .map(Some);
+                }
+                EquityRedemption::SendPending { prepared_send, .. } => {
+                    drop(tracking_guard);
+                    return Ok(Some(RedemptionTimeoutCleanup::PageIssuerSend {
                         tracking,
-                        held_prepared: withdrawal_nonce_hash.is_some(),
+                        prepared_send,
                     }));
                 }
-                Ok(Some(_) | None) => return Ok(None),
-                Err(load_error) => {
-                    warn!(
-                        target: "rebalance",
-                        id = %id,
-                        ?load_error,
-                        "Failed to load EquityRedemption during reconcile sweep; \
-                         preserving guard"
-                    );
-                    return Ok(None);
-                }
+                _ if submission_stage => return Ok(None),
+                _ => {}
             }
         }
 
@@ -2638,6 +2694,204 @@ impl RebalancingService {
             return Ok(None);
         }
 
+        // The driver commits without the event gate, so while this sweep holds
+        // it the tracked stage can lag the durable one: a redemption tracked at
+        // any pre-send stage may already be `TokensUnwrapped`, or past
+        // `PrepareSend` with `FailTransfer` refused. Tearing down first would
+        // release the guard and inflight while a signed send can still move
+        // the tokens, so the failure is committed first and the teardown
+        // follows it.
+        let fails_before_teardown = match tracking.stage {
+            RedemptionTrackingStage::WithdrawnFromRaindex
+            | RedemptionTrackingStage::UnwrapPending
+            | RedemptionTrackingStage::UnwrapSubmitted
+            | RedemptionTrackingStage::TokensUnwrapped => true,
+            RedemptionTrackingStage::VaultWithdrawPending
+            | RedemptionTrackingStage::VaultWithdrawSubmitting
+            | RedemptionTrackingStage::VaultWithdrawSubmitted
+            | RedemptionTrackingStage::SendPending
+            | RedemptionTrackingStage::TokensSent
+            | RedemptionTrackingStage::Detected => false,
+        };
+        if fails_before_teardown {
+            // Another sweep that already claimed this failure owns it: a
+            // second `FailTransfer` could commit after that sweep released the
+            // marker, and the reactor would then credit the shares back.
+            if !self
+                .redemption_timeout_failing
+                .write()
+                .await
+                .insert(id.clone())
+            {
+                debug!(
+                    target: "rebalance",
+                    %id,
+                    "Another timeout sweep is failing this redemption; skipping"
+                );
+                return Ok(None);
+            }
+            return Ok(Some(RedemptionTimeoutCleanup::FailBeforeTeardown {
+                tracking,
+                elapsed,
+            }));
+        }
+
+        self.tear_down_timed_out_redemption(id, &tracking, &mut tracking_guard, now)
+            .await?;
+        drop(tracking_guard);
+
+        Ok(Some(RedemptionTimeoutCleanup::TimedOut {
+            tracking,
+            elapsed,
+        }))
+    }
+
+    /// Loads the durable redemption for the timeout sweep. A load error keeps
+    /// the guard: the sweep retries on its next tick.
+    async fn load_redemption_for_sweep(
+        &self,
+        id: &RedemptionAggregateId,
+    ) -> Option<EquityRedemption> {
+        let store = self
+            .redemption_store
+            .read()
+            .await
+            .as_ref()
+            .map(Arc::clone)?;
+        match store.load(id).await {
+            Ok(durable) => durable,
+            Err(load_error) => {
+                warn!(
+                    target: "rebalance",
+                    id = %id,
+                    ?load_error,
+                    "Failed to load EquityRedemption during the timeout sweep; preserving guard"
+                );
+                None
+            }
+        }
+    }
+
+    /// Clears reconciled inflight and the active redemption. A pending issuer
+    /// send has already left the vault, so its shares are not credited back.
+    /// The caller re-inserts tracking on error so the next tick retries.
+    async fn apply_swept_redemption_reconcile(
+        &self,
+        id: &RedemptionAggregateId,
+        tracking: RedemptionTracking,
+        held_prepared: bool,
+        now: DateTime<Utc>,
+    ) -> Result<RedemptionTimeoutCleanup, RebalancingServiceError> {
+        if let Err(error) = self
+            .reconcile_redemption_inventory(
+                &tracking.symbol,
+                tracking.chain,
+                tracking.quantity,
+                tracking.stage,
+            )
+            .await
+        {
+            self.redemption_tracking
+                .write()
+                .await
+                .insert(id.clone(), tracking);
+            return Err(error);
+        }
+        {
+            let mut inventory = self.inventory.write().await;
+            *inventory = inventory.clone().clear_active_redemption(&tracking.symbol);
+        }
+
+        // Tombstone so a late reactor `OperatorReconciled` (should the
+        // in-process path ever route through the store) is ignored instead of
+        // cancelling the inflight a second time.
+        self.timed_out_redemptions.write().await.insert(
+            id.clone(),
+            TimeoutTombstone {
+                symbol: tracking.symbol.clone(),
+                chain: tracking.chain,
+                timed_out_at: now,
+            },
+        );
+        Ok(RedemptionTimeoutCleanup::Reconciled {
+            tracking,
+            held_prepared,
+        })
+    }
+
+    /// Pages once when a pending issuer send outlives `transfer_timeout`. The
+    /// redemption keeps its guard, inflight, and reservation: a signed send can
+    /// still land, and a legacy one may already have landed unrecorded.
+    async fn page_timed_out_issuer_send(
+        &self,
+        id: &RedemptionAggregateId,
+        tracking: &RedemptionTracking,
+        prepared_send: Option<&PreparedRedemptionSend>,
+        now: DateTime<Utc>,
+    ) {
+        let Some(elapsed) = Self::elapsed_since_timeout_start(tracking.last_progress_at, now)
+        else {
+            return;
+        };
+        if elapsed < self.config.transfer_timeout
+            || self.issuer_send_timeout_alerted.read().await.contains(id)
+        {
+            return;
+        }
+
+        let chain = tracking.chain;
+        let elapsed_secs = elapsed.as_secs();
+        let message = prepared_send.map_or_else(
+            || {
+                format!(
+                    "Equity redemption {id} on {chain} has a legacy pending issuer send with no \
+                     recorded transaction after {elapsed_secs}s. The transfer keeps its guard and \
+                     inflight, and recovery will not sign again. Check onchain whether the \
+                     previous binary's transfer landed, then close it with `stox transfer \
+                     reconcile --kind redemption --id {id}`."
+                )
+            },
+            |send| {
+                let tx_hash = send.prepared.tx_hash();
+                let nonce = send.prepared.nonce();
+                format!(
+                    "Equity redemption {id} on {chain} has a signed issuer send {tx_hash} (nonce \
+                     {nonce}) that has not confirmed after {elapsed_secs}s. The transfer keeps \
+                     its guard, inflight, and reservation, and recovery keeps rebroadcasting the \
+                     same bytes. Verify the send onchain; if it mined, leave it, because recovery \
+                     records the outcome. To abandon it, send a 0-value self-transfer at nonce \
+                     {nonce} from the issuer-send wallet and wait for that to confirm; only then \
+                     reconcile the redemption naming that self-transfer (`stox transfer \
+                     reconcile --kind redemption --id {id} --superseding-tx <cancel>`), which \
+                     releases its reservation and the wallet's hold on its nonce."
+                )
+            },
+        );
+
+        if let Err(error) = self.notifier().notify(&message).await {
+            warn!(
+                target: "rebalance",
+                %id,
+                %error,
+                "Failed to notify about a timed-out issuer send"
+            );
+        } else {
+            self.issuer_send_timeout_alerted
+                .write()
+                .await
+                .insert(id.clone());
+        }
+    }
+
+    /// Clears a timed-out redemption's MarketMaking inflight and active entry,
+    /// tombstones it so late reactor events are ignored, and drops tracking.
+    async fn tear_down_timed_out_redemption(
+        &self,
+        id: &RedemptionAggregateId,
+        tracking: &RedemptionTracking,
+        tracking_guard: &mut HashMap<RedemptionAggregateId, RedemptionTracking>,
+        now: DateTime<Utc>,
+    ) -> Result<(), RebalancingServiceError> {
         let mut inventory = self.inventory.write().await;
         *inventory = inventory
             .clone()
@@ -2658,12 +2912,47 @@ impl RebalancingService {
             .await
             .insert((tracking.symbol.clone(), tracking.chain), now);
         tracking_guard.remove(id);
-        drop(tracking_guard);
+        Ok(())
+    }
 
-        Ok(Some(RedemptionTimeoutCleanup::TimedOut {
-            tracking,
-            elapsed,
-        }))
+    /// Completes a pre-send timeout after its `FailTransfer` attempt.
+    /// When the attempt failed because a send was signed meanwhile, the
+    /// redemption keeps its tracking, guard, and inflight. The same rule holds
+    /// for a failed or missing reload: teardown needs a confirmed `Failed`.
+    /// Returns whether the teardown ran.
+    async fn finish_deferred_redemption_timeout(
+        &self,
+        id: &RedemptionAggregateId,
+        tracking: &RedemptionTracking,
+        fail_succeeded: bool,
+        now: DateTime<Utc>,
+    ) -> Result<bool, RebalancingServiceError> {
+        let _event_sync_guard = self.redemption_event_sync.lock().await;
+        self.redemption_timeout_failing.write().await.remove(id);
+
+        if !fail_succeeded
+            && !matches!(
+                self.load_redemption_for_sweep(id).await,
+                Some(EquityRedemption::Failed { .. })
+            )
+        {
+            warn!(
+                target: "rebalance",
+                %id,
+                symbol = %tracking.symbol,
+                "Timed-out redemption failure is not durably confirmed; keeping ownership"
+            );
+            return Ok(false);
+        }
+
+        let mut tracking_guard = self.redemption_tracking.write().await;
+        if !tracking_guard.contains_key(id) {
+            return Ok(false);
+        }
+        self.tear_down_timed_out_redemption(id, tracking, &mut tracking_guard, now)
+            .await?;
+        drop(tracking_guard);
+        Ok(true)
     }
 
     async fn cleanup_timed_out_usdc_rebalance(
@@ -4924,6 +5213,41 @@ impl RebalancingService {
         Ok(outcome)
     }
 
+    async fn reconcile_redemption_inventory(
+        &self,
+        symbol: &Symbol,
+        chain: Chain,
+        quantity: FractionalShares,
+        stage: RedemptionTrackingStage,
+    ) -> Result<EquitySettlementOutcome, RebalancingServiceError> {
+        if matches!(
+            stage,
+            RedemptionTrackingStage::VaultWithdrawPending
+                | RedemptionTrackingStage::VaultWithdrawSubmitting
+                | RedemptionTrackingStage::VaultWithdrawSubmitted
+        ) {
+            return self
+                .apply_equity_update_or_defer(
+                    symbol,
+                    chain,
+                    Venue::MarketMaking,
+                    Self::cancel_equity_transfer_update(Venue::MarketMaking, quantity),
+                )
+                .await;
+        }
+        let mut inventory = self.inventory.write().await;
+        *inventory = inventory.clone().clear_equity_inflight_at(
+            symbol,
+            chain,
+            Venue::MarketMaking,
+            Utc::now(),
+        )?;
+        drop(inventory);
+        self.divergence_gate
+            .request_onchain_equity_reconcile(chain, symbol, None);
+        Ok(EquitySettlementOutcome::DeferredToSnapshot)
+    }
+
     /// Sets `active_mints[symbol] = id` while the aggregate is alive,
     /// clears it on terminal events. Mirrors the lifecycle of
     /// `mint_tracking` so `InventoryView` reflects which aggregate
@@ -4989,23 +5313,21 @@ impl RebalancingService {
             Completed { .. } | ProviderCompletionRecovered { .. } => Some(
                 Self::complete_equity_transfer_update(Venue::MarketMaking, quantity),
             ),
-            // `TransferFailed` cancels the inflight the withdraw opened, returning
-            // the shares to available. A redemption reconciled directly from
-            // `VaultWithdrawSubmitting` never withdrew from the vault either, so it
-            // cancels identically. `OperatorReconciled` only reaches this fold for
-            // the submitting origin: reconcile from `Failed` has its tracking removed
-            // by `TransferFailed`, so `on_redemption` early-returns before calling
-            // `redemption_inventory_update`.
-            TransferFailed { .. } | OperatorReconciled { .. } => Some(
-                Self::cancel_equity_transfer_update(Venue::MarketMaking, quantity),
-            ),
-            VaultWithdrawSubmitted { .. }
+            // A transfer failure cancels the inflight opened by withdrawal.
+            // Operator reconciliation is handled separately using its origin stage.
+            TransferFailed { .. } => Some(Self::cancel_equity_transfer_update(
+                Venue::MarketMaking,
+                quantity,
+            )),
+            OperatorReconciled { .. }
+            | VaultWithdrawSubmitted { .. }
             | VaultWithdrawReplacementAdopted { .. }
             | WithdrawnFromRaindex { .. }
             | UnwrapPending { .. }
             | UnwrapSubmitted { .. }
             | TokensUnwrapped { .. }
             | SendPending { .. }
+            | SendPrepared { .. }
             | TokensSent { .. }
             | DetectionFailed { .. }
             | Detected { .. }
@@ -8602,6 +8924,13 @@ impl RebalancingService {
     ) -> Result<(), RebalancingServiceError> {
         let event_sync_guard = self.redemption_event_sync.lock().await;
 
+        if matches!(event, EquityRedemptionEvent::TransferFailed { .. })
+            && self.redemption_timeout_failing.read().await.contains(&id)
+        {
+            debug!(target: "rebalance", id = %id, "Timeout sweep owns this TransferFailed; skipping");
+            return Ok(());
+        }
+
         // Bind before the `if let` so the map's read guard drops here -- the
         // escalation arm below re-locks the same map for writing.
         let tombstone = self.timed_out_redemptions.read().await.get(&id).cloned();
@@ -8687,17 +9016,27 @@ impl RebalancingService {
         };
         let symbol = tracking.symbol;
 
-        let settlement = match Self::redemption_inventory_update(&event, tracking.quantity) {
-            Some(update) => {
-                self.apply_equity_update_or_defer(
-                    &symbol,
-                    tracking.chain,
-                    Venue::MarketMaking,
-                    update,
-                )
-                .await?
+        let settlement = if matches!(event, EquityRedemptionEvent::OperatorReconciled { .. }) {
+            self.reconcile_redemption_inventory(
+                &symbol,
+                tracking.chain,
+                tracking.quantity,
+                tracking.stage,
+            )
+            .await?
+        } else {
+            match Self::redemption_inventory_update(&event, tracking.quantity) {
+                Some(update) => {
+                    self.apply_equity_update_or_defer(
+                        &symbol,
+                        tracking.chain,
+                        Venue::MarketMaking,
+                        update,
+                    )
+                    .await?
+                }
+                None => EquitySettlementOutcome::Reconciled,
             }
-            None => EquitySettlementOutcome::Reconciled,
         };
 
         // When a new redemption transfer starts, clear the previous poll
@@ -8837,6 +9176,7 @@ impl RebalancingService {
             | UnwrapSubmitted { .. }
             | TokensUnwrapped { .. }
             | SendPending { .. }
+            | SendPrepared { .. }
             | TokensSent { .. }
             | Detected { .. } => false,
         }
@@ -20845,10 +21185,15 @@ mod tests {
             .cleanup_timed_out_redemption(&active, Utc::now())
             .await
             .unwrap();
-        assert!(matches!(
-            cleanup,
-            Some(RedemptionTimeoutCleanup::TimedOut { .. })
-        ));
+        let Some(RedemptionTimeoutCleanup::FailBeforeTeardown { tracking, .. }) = cleanup else {
+            panic!("a pre-send timeout fails before its teardown, got {cleanup:?}");
+        };
+        assert!(
+            trigger
+                .finish_deferred_redemption_timeout(&active, &tracking, true, Utc::now())
+                .await
+                .unwrap()
+        );
         let view = trigger.inventory.read().await;
         assert_eq!(
             view.equity_inflight_at(&symbol, Venue::MarketMaking, Chain::HyperEvm),
@@ -24637,6 +24982,693 @@ mod tests {
         .unwrap();
 
         (service, id, symbol)
+    }
+
+    struct LiveRedemption {
+        service: Arc<RebalancingService>,
+        store: Arc<Store<EquityRedemption>>,
+        pool: SqlitePool,
+        services: EquityTransferServices,
+        id: RedemptionAggregateId,
+        symbol: Symbol,
+        notifier: Arc<CapturingNotifier>,
+    }
+
+    /// Drives a redemption to `TokensUnwrapped` through a store with the
+    /// trigger wired as its reactor, so tracking, inflight, and the symbol
+    /// guard are what the live bot would hold.
+    async fn live_redemption_at_tokens_unwrapped(label: &str) -> LiveRedemption {
+        let symbol = Symbol::new("tAAPL").unwrap();
+        let id = redemption_aggregate_id(label);
+        let inventory = InventoryView::default()
+            .with_equity(symbol.clone(), shares(0), shares(0))
+            .update_equity(
+                &symbol,
+                Inventory::available(Venue::MarketMaking, Operator::Add, shares(100)),
+                Utc::now(),
+            )
+            .unwrap();
+        let notifier = Arc::new(CapturingNotifier::default());
+        let service = make_trigger_with_inventory_config_and_notifier(
+            inventory,
+            test_config_with_timeout(Duration::from_secs(60)),
+            notifier.clone(),
+        )
+        .await;
+        let ten_shares = U256::from(10_000_000_000_000_000_000_u128);
+        let services = EquityTransferServices {
+            chains: BTreeMap::from([(
+                Chain::Base,
+                ChainEquityServices {
+                    wallet: Address::ZERO,
+                    raindex: Arc::new(
+                        MockRaindex::new().with_withdraw_transfer(Address::ZERO, ten_shares),
+                    ),
+                    vault_lookup: Arc::new(MockVaultLookup::new()),
+                    tokenizer: Arc::new(MockTokenizer::new()),
+                    wrapper: Arc::new(MockWrapper::new()),
+                    mint_authorizer: ConfiguredMintAuthorizer::Disabled,
+                    gas_readiness: ConfiguredGasReadiness::Unwired,
+                    equities: ChainEquities::default(),
+                },
+            )]),
+            bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
+        };
+        let pool = crate::test_utils::setup_test_db().await;
+        let (mint_store, _) = StoreBuilder::<TokenizedEquityMint>::new(pool.clone())
+            .with(service.clone())
+            .build(services.clone())
+            .await
+            .unwrap();
+        let (store, _) = StoreBuilder::<EquityRedemption>::new(pool.clone())
+            .with(service.clone())
+            .build(services.clone())
+            .await
+            .unwrap();
+        service
+            .set_stores(
+                mint_store,
+                store.clone(),
+                Arc::new(test_store::<UsdcRebalance>(pool.clone(), ())),
+            )
+            .await;
+
+        store
+            .send(
+                &id,
+                EquityRedemptionCommand::Redeem {
+                    chain: Chain::Base,
+                    symbol: symbol.clone(),
+                    quantity: float!(10),
+                    token: Address::ZERO,
+                    vault_id: st0x_raindex::RaindexVaultId(alloy::primitives::B256::ZERO),
+                    amount: ten_shares,
+                    from_block: 0,
+                    prepared: crate::equity_redemption::prepared_withdrawal_for_test(),
+                },
+            )
+            .await
+            .unwrap();
+        for command in [
+            EquityRedemptionCommand::RecordWithdrawSubmission {
+                tx_hash: crate::equity_redemption::prepared_withdrawal_for_test().tx_hash(),
+            },
+            EquityRedemptionCommand::ConfirmWithdraw,
+            EquityRedemptionCommand::UnwrapTokens,
+            EquityRedemptionCommand::SubmitUnwrap,
+            EquityRedemptionCommand::ConfirmUnwrap,
+        ] {
+            store.send(&id, command).await.unwrap();
+        }
+        service.equity_in_progress.write().unwrap().insert(
+            symbol.clone(),
+            equity::GuardState::ActiveTransfer {
+                generation: equity::GuardGeneration::default(),
+            },
+        );
+
+        LiveRedemption {
+            service,
+            store,
+            pool,
+            services,
+            id,
+            symbol,
+            notifier,
+        }
+    }
+
+    fn prepare_send_command() -> EquityRedemptionCommand {
+        EquityRedemptionCommand::PrepareSend {
+            prepared: st0x_evm::PreparedTransaction::for_test(TxHash::repeat_byte(0x5e), 7),
+            redemption_wallet: Address::repeat_byte(0x77),
+        }
+    }
+
+    async fn market_making_equity(
+        service: &RebalancingService,
+        symbol: &Symbol,
+    ) -> (Option<FractionalShares>, Option<FractionalShares>) {
+        let inventory = service.inventory.read().await;
+        (
+            inventory.equity_inflight(symbol, Venue::MarketMaking),
+            inventory.equity_available(symbol, Venue::MarketMaking),
+        )
+    }
+
+    async fn assert_redemption_still_owned(live: &LiveRedemption) {
+        assert!(
+            live.service
+                .redemption_tracking
+                .read()
+                .await
+                .contains_key(&live.id),
+            "the redemption must stay tracked"
+        );
+        assert!(
+            !live
+                .service
+                .timed_out_redemptions
+                .read()
+                .await
+                .contains_key(&live.id),
+            "the redemption must not be tombstoned"
+        );
+        assert!(
+            live.service
+                .equity_in_progress
+                .read()
+                .unwrap()
+                .contains_key(&live.symbol),
+            "the symbol guard must stay held"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_timed_out_signed_send_keeps_ownership_and_pages_until_its_receipt_confirms() {
+        let live = live_redemption_at_tokens_unwrapped("signed-send-timeout").await;
+        live.store
+            .send(&live.id, prepare_send_command())
+            .await
+            .unwrap();
+        let before = market_making_equity(&live.service, &live.symbol).await;
+        let past_timeout = Utc::now() + ChronoDuration::minutes(2);
+
+        live.service
+            .expire_stuck_redemptions(past_timeout)
+            .await
+            .unwrap();
+        live.service
+            .expire_stuck_redemptions(past_timeout)
+            .await
+            .unwrap();
+
+        assert_redemption_still_owned(&live).await;
+        assert_eq!(
+            market_making_equity(&live.service, &live.symbol).await,
+            before
+        );
+        let pages = live.notifier.messages();
+        assert_eq!(
+            pages.len(),
+            1,
+            "the timeout must page exactly once, got {pages:?}"
+        );
+        assert!(
+            pages[0].contains("0-value self-transfer at nonce 7")
+                && pages[0].contains(&format!(
+                    "stox transfer reconcile --kind redemption --id {}",
+                    live.id
+                )),
+            "the page must give the nonce-consume step before reconcile, got {}",
+            pages[0]
+        );
+
+        // The send lands after the timeout: the normal path records it.
+        live.store
+            .send(&live.id, EquityRedemptionCommand::SendTokens)
+            .await
+            .unwrap();
+        assert!(matches!(
+            live.store.load(&live.id).await.unwrap(),
+            Some(EquityRedemption::TokensSent { .. })
+        ));
+        assert_eq!(
+            live.service
+                .redemption_tracking
+                .read()
+                .await
+                .get(&live.id)
+                .map(|tracking| tracking.stage),
+            Some(RedemptionTrackingStage::TokensSent)
+        );
+        assert_redemption_still_owned(&live).await;
+    }
+
+    #[tokio::test]
+    async fn a_timed_out_legacy_send_pending_keeps_ownership_and_pages() {
+        let live = live_redemption_at_tokens_unwrapped("legacy-send-timeout").await;
+        // A legacy row is only ever loaded from history, so no reactor saw it.
+        sqlx::query(
+            "INSERT INTO events \
+             (aggregate_type, aggregate_id, sequence, event_type, event_version, payload, metadata) \
+             SELECT 'EquityRedemption', ?1, MAX(sequence) + 1, \
+             'EquityRedemptionEvent::SendPending', '1', \
+             '{\"SendPending\":{\"pending_at\":\"2026-01-01T00:00:00Z\"}}', '{}' \
+             FROM events WHERE aggregate_id = ?1",
+        )
+        .bind(live.id.to_string())
+        .execute(&live.pool)
+        .await
+        .unwrap();
+        live.service
+            .redemption_tracking
+            .write()
+            .await
+            .get_mut(&live.id)
+            .unwrap()
+            .stage = RedemptionTrackingStage::SendPending;
+        let before = market_making_equity(&live.service, &live.symbol).await;
+
+        live.service
+            .expire_stuck_redemptions(Utc::now() + ChronoDuration::minutes(2))
+            .await
+            .unwrap();
+
+        assert_redemption_still_owned(&live).await;
+        assert_eq!(
+            market_making_equity(&live.service, &live.symbol).await,
+            before
+        );
+        let pages = live.notifier.messages();
+        assert!(
+            pages
+                .iter()
+                .any(|page| page.contains("legacy pending issuer send")
+                    && page.contains(&format!(
+                        "stox transfer reconcile --kind redemption --id {}",
+                        live.id
+                    ))),
+            "got {pages:?}"
+        );
+    }
+
+    /// The driver commits `PrepareSend` while its `SendPending` reactor waits
+    /// behind the sweep, so tracking still says `TokensUnwrapped`. The commit
+    /// is made through a store with no reactor to hold that state. The sweep's
+    /// `FailTransfer` is refused and the redemption must stay owned.
+    #[tokio::test]
+    async fn a_send_signed_behind_a_stale_tracked_stage_keeps_ownership() {
+        let live = live_redemption_at_tokens_unwrapped("signed-behind-stale-stage").await;
+        st0x_event_sorcery::send_command::<EquityRedemption>(
+            &live.pool,
+            &live.id,
+            prepare_send_command(),
+            live.services.clone(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            live.service
+                .redemption_tracking
+                .read()
+                .await
+                .get(&live.id)
+                .map(|tracking| tracking.stage),
+            Some(RedemptionTrackingStage::TokensUnwrapped)
+        );
+        let before = market_making_equity(&live.service, &live.symbol).await;
+
+        live.service
+            .expire_stuck_redemptions(Utc::now() + ChronoDuration::minutes(2))
+            .await
+            .unwrap();
+
+        assert_redemption_still_owned(&live).await;
+        assert_eq!(
+            market_making_equity(&live.service, &live.symbol).await,
+            before
+        );
+        assert!(matches!(
+            live.store.load(&live.id).await.unwrap(),
+            Some(EquityRedemption::SendPending {
+                prepared_send: Some(_),
+                ..
+            })
+        ));
+        assert!(
+            live.service
+                .redemption_timeout_failing
+                .read()
+                .await
+                .is_empty()
+        );
+    }
+
+    /// The tracked stage can lag several driver commits behind the durable
+    /// one: here tracking still says `UnwrapSubmitted` while the driver has
+    /// confirmed the unwrap and signed the send. The sweep must not tear down
+    /// before its `FailTransfer`, which the signed send refuses.
+    #[tokio::test]
+    async fn a_send_signed_behind_a_tracked_unwrap_keeps_ownership() {
+        let live = live_redemption_at_tokens_unwrapped("signed-behind-tracked-unwrap").await;
+        st0x_event_sorcery::send_command::<EquityRedemption>(
+            &live.pool,
+            &live.id,
+            prepare_send_command(),
+            live.services.clone(),
+        )
+        .await
+        .unwrap();
+        live.service
+            .redemption_tracking
+            .write()
+            .await
+            .get_mut(&live.id)
+            .unwrap()
+            .stage = RedemptionTrackingStage::UnwrapSubmitted;
+        let before = market_making_equity(&live.service, &live.symbol).await;
+
+        live.service
+            .expire_stuck_redemptions(Utc::now() + ChronoDuration::minutes(2))
+            .await
+            .unwrap();
+
+        assert_redemption_still_owned(&live).await;
+        assert_eq!(
+            market_making_equity(&live.service, &live.symbol).await,
+            before
+        );
+        assert!(matches!(
+            live.store.load(&live.id).await.unwrap(),
+            Some(EquityRedemption::SendPending {
+                prepared_send: Some(_),
+                ..
+            })
+        ));
+        assert!(
+            live.service
+                .redemption_timeout_failing
+                .read()
+                .await
+                .is_empty()
+        );
+    }
+
+    /// Two sweeps can time out the same redemption. Only the one that claims
+    /// the failure marker fails it; the other skips, so it can never commit a
+    /// `FailTransfer` after the owner released the marker.
+    #[tokio::test]
+    async fn a_second_sweep_skips_a_redemption_another_sweep_is_failing() {
+        let live = live_redemption_at_tokens_unwrapped("concurrent-timeout-sweeps").await;
+        live.service
+            .redemption_timeout_failing
+            .write()
+            .await
+            .insert(live.id.clone());
+
+        let cleanup = live
+            .service
+            .cleanup_timed_out_redemption(&live.id, Utc::now() + ChronoDuration::minutes(2))
+            .await
+            .unwrap();
+
+        assert!(cleanup.is_none(), "got {cleanup:?}");
+        assert_redemption_still_owned(&live).await;
+        assert!(
+            live.service
+                .redemption_timeout_failing
+                .read()
+                .await
+                .contains(&live.id),
+            "the owning sweep's marker must stay in place"
+        );
+        assert!(matches!(
+            live.store.load(&live.id).await.unwrap(),
+            Some(EquityRedemption::TokensUnwrapped { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_failed_timeout_write_keeps_ownership_when_live_or_unreadable() {
+        let live = live_redemption_at_tokens_unwrapped("failed-timeout-write").await;
+        let tracking = live.service.redemption_tracking.read().await[&live.id].clone();
+        let before = market_making_equity(&live.service, &live.symbol).await;
+        assert!(
+            !live
+                .service
+                .finish_deferred_redemption_timeout(&live.id, &tracking, false, Utc::now())
+                .await
+                .unwrap()
+        );
+        assert_redemption_still_owned(&live).await;
+        live.pool.close().await;
+        assert!(
+            !live
+                .service
+                .finish_deferred_redemption_timeout(&live.id, &tracking, false, Utc::now())
+                .await
+                .unwrap()
+        );
+        assert_redemption_still_owned(&live).await;
+        assert_eq!(
+            market_making_equity(&live.service, &live.symbol).await,
+            before
+        );
+    }
+
+    /// Another writer fails the redemption while the sweep owns its
+    /// `TransferFailed`, so the reactor skips the event and the sweep's own
+    /// `FailTransfer` is refused. The teardown must still release the Position
+    /// reservation, or the symbol's next equity transfer cannot reserve.
+    #[tokio::test]
+    async fn a_timeout_failed_by_another_writer_still_releases_the_reservation() {
+        let live = live_redemption_at_tokens_unwrapped("failed-by-another-writer").await;
+        let reservation_id = EquityTransferReservationId::from_uuid(live.id.0);
+        seed_confirmed_transfer_reservation(&live.service, &live.symbol, reservation_id).await;
+        let tracking = live.service.redemption_tracking.read().await[&live.id].clone();
+        live.service
+            .redemption_timeout_failing
+            .write()
+            .await
+            .insert(live.id.clone());
+        live.store
+            .send(
+                &live.id,
+                EquityRedemptionCommand::FailTransfer {
+                    reason: "operator failed the transfer".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+
+        live.service
+            .fail_then_tear_down_timed_out_redemption(
+                &live.id,
+                &tracking,
+                Duration::from_secs(120),
+                Utc::now(),
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            !live
+                .service
+                .equity_in_progress
+                .read()
+                .unwrap()
+                .contains_key(&live.symbol)
+        );
+        let position = live
+            .service
+            .position_projection
+            .read()
+            .await
+            .as_ref()
+            .cloned()
+            .unwrap()
+            .load(&live.symbol)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(position.equity_transfer_reservation, None);
+    }
+
+    #[tokio::test]
+    async fn issuer_timeout_notification_is_deferred_outside_the_reactor_gate() {
+        let live = live_redemption_at_tokens_unwrapped("deferred-send-page").await;
+        live.store
+            .send(&live.id, prepare_send_command())
+            .await
+            .unwrap();
+        let now = Utc::now() + ChronoDuration::minutes(2);
+        let cleanup = live
+            .service
+            .cleanup_timed_out_redemption(&live.id, now)
+            .await
+            .unwrap()
+            .unwrap();
+        let RedemptionTimeoutCleanup::PageIssuerSend {
+            tracking,
+            prepared_send,
+        } = cleanup
+        else {
+            panic!("expected a deferred page");
+        };
+        assert!(live.notifier.messages().is_empty());
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            live.store
+                .send(&live.id, EquityRedemptionCommand::SendTokens),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        live.service
+            .page_timed_out_issuer_send(&live.id, &tracking, prepared_send.as_ref(), now)
+            .await;
+        assert_eq!(live.notifier.messages().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_timed_out_unwrapped_redemption_fails_before_its_teardown() {
+        let live = live_redemption_at_tokens_unwrapped("unwrapped-timeout").await;
+        let (_, available_before) = market_making_equity(&live.service, &live.symbol).await;
+
+        live.service
+            .expire_stuck_redemptions(Utc::now() + ChronoDuration::minutes(2))
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            live.store.load(&live.id).await.unwrap(),
+            Some(EquityRedemption::Failed { .. })
+        ));
+        assert!(
+            !live
+                .service
+                .redemption_tracking
+                .read()
+                .await
+                .contains_key(&live.id)
+        );
+        assert!(
+            live.service
+                .timed_out_redemptions
+                .read()
+                .await
+                .contains_key(&live.id)
+        );
+        assert!(
+            !live
+                .service
+                .equity_in_progress
+                .read()
+                .unwrap()
+                .contains_key(&live.symbol)
+        );
+        // The timeout teardown clears the inflight for snapshots to heal; the
+        // reactor's `TransferFailed` cancel would have returned it to available.
+        assert_eq!(
+            market_making_equity(&live.service, &live.symbol).await,
+            (Some(shares(0)), available_before)
+        );
+        assert!(
+            live.service
+                .redemption_timeout_failing
+                .read()
+                .await
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn signed_and_legacy_send_reconciliation_does_not_credit_vault_availability() {
+        for signed in [false, true] {
+            let live = live_redemption_at_tokens_unwrapped(if signed {
+                "signed-reactor-reconcile"
+            } else {
+                "legacy-reactor-reconcile"
+            })
+            .await;
+            if signed {
+                live.store
+                    .send(&live.id, prepare_send_command())
+                    .await
+                    .unwrap();
+            } else {
+                sqlx::query("INSERT INTO events (aggregate_type, aggregate_id, sequence, event_type, event_version, payload, metadata) SELECT 'EquityRedemption', ?1, MAX(sequence) + 1, 'EquityRedemptionEvent::SendPending', '1', '{\"SendPending\":{\"pending_at\":\"2026-01-01T00:00:00Z\"}}', '{}' FROM events WHERE aggregate_id = ?1")
+                    .bind(live.id.to_string()).execute(&live.pool).await.unwrap();
+                live.service
+                    .redemption_tracking
+                    .write()
+                    .await
+                    .get_mut(&live.id)
+                    .unwrap()
+                    .stage = RedemptionTrackingStage::SendPending;
+            }
+            let (_, available_before) = market_making_equity(&live.service, &live.symbol).await;
+            live.store
+                .send(
+                    &live.id,
+                    EquityRedemptionCommand::Reconcile {
+                        reason: "verified issuer send outcome onchain".to_string(),
+                        proven_withdrawal: signed.then(|| TxHash::repeat_byte(0x5e)),
+                    },
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                market_making_equity(&live.service, &live.symbol).await,
+                (Some(FractionalShares::new(float!(0))), available_before)
+            );
+            assert!(
+                live.service
+                    .divergence_gate
+                    .claim_pending_onchain_equity_reconciles(Chain::Base)
+                    .contains_key(&live.symbol)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn the_sweep_observes_an_operator_reconcile_of_a_signed_send() {
+        let live = live_redemption_at_tokens_unwrapped("signed-send-reconcile").await;
+        live.store
+            .send(&live.id, prepare_send_command())
+            .await
+            .unwrap();
+        let (_, available_before) = market_making_equity(&live.service, &live.symbol).await;
+        st0x_event_sorcery::send_command::<EquityRedemption>(
+            &live.pool,
+            &live.id,
+            EquityRedemptionCommand::Reconcile {
+                reason: "nonce 7 consumed by a 0-value self-transfer".to_string(),
+                proven_withdrawal: Some(TxHash::repeat_byte(0x5e)),
+            },
+            live.services.clone(),
+        )
+        .await
+        .unwrap();
+
+        live.service
+            .expire_stuck_redemptions(Utc::now())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            market_making_equity(&live.service, &live.symbol).await,
+            (Some(FractionalShares::new(float!(0))), available_before)
+        );
+        assert!(
+            !live
+                .service
+                .redemption_tracking
+                .read()
+                .await
+                .contains_key(&live.id)
+        );
+        assert!(
+            !live
+                .service
+                .equity_in_progress
+                .read()
+                .unwrap()
+                .contains_key(&live.symbol)
+        );
+        let payloads: Vec<Vec<u8>> = sqlx_apalis::query_scalar(
+            "SELECT job FROM Jobs WHERE status = 'Pending' AND job_type = ?",
+        )
+        .bind(std::any::type_name::<TransferEquityToHedging>())
+        .fetch_all(live.service.transfer_equity_to_hedging_queue.pool())
+        .await
+        .unwrap();
+        assert_eq!(
+            payloads.len(),
+            1,
+            "the reconciled send's nonce must be released through a resume job"
+        );
     }
 
     #[tokio::test]
