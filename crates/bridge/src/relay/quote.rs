@@ -783,6 +783,7 @@ pub(super) mod tests {
     use serde_json::{Value, json};
 
     use super::*;
+    use crate::relay::acceptance::QuoteBounds;
 
     pub(in crate::relay) const FUNDED_QUOTE: &str =
         include_str!("../../relay-fixtures/quote_funded_robinhood_to_ethereum.json");
@@ -951,6 +952,36 @@ pub(super) mod tests {
             assert_eq!(quote.order_id, RelayOrderId(order_id));
             assert_eq!(quote.amounts.expected_out, U256::from(expected_out));
             assert_eq!(quote.amounts.minimum_out, U256::from(minimum_out));
+        }
+    }
+
+    /// Relay rounds its `minimumAmount` down, so each live quote must clear
+    /// the slippage floor it was requested at.
+    #[test]
+    fn every_live_quote_is_accepted_at_its_own_slippage() {
+        let bounds = QuoteBounds {
+            max_loss: BasisPoints::new(500).unwrap(),
+            downstream_minimum: U256::ZERO,
+        };
+
+        for (fixture, request) in [
+            (FUNDED_QUOTE, funded_request()),
+            (
+                include_str!("../../relay-fixtures/quote_robinhood_to_ethereum.json"),
+                dead_request(Chain::Robinhood, Chain::Ethereum, 50),
+            ),
+            (
+                include_str!("../../relay-fixtures/quote_ethereum_to_robinhood.json"),
+                dead_request(Chain::Ethereum, Chain::Robinhood, 50),
+            ),
+            (
+                include_str!("../../relay-fixtures/quote_ttl_robinhood_to_ethereum.json"),
+                dead_request(Chain::Robinhood, Chain::Ethereum, 30),
+            ),
+        ] {
+            let quote = validate(&serde_json::from_str(fixture).unwrap(), &request).unwrap();
+
+            assert_eq!(quote.amounts.accept(&bounds), Ok(()), "{:?}", quote.amounts);
         }
     }
 
