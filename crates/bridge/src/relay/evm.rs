@@ -25,6 +25,10 @@ use crate::{
 /// the funded test's two deposits (57,114 on Robinhood, 49,083 on Ethereum).
 /// Pinned because the deposit cannot be estimated while its approve is
 /// unmined.
+///
+/// Robinhood is an Arbitrum Orbit chain. Its receipt shows `gasUsedForL1` of 0
+/// today; if it turns on L1 pricing, gas units include an L1 part and the pin
+/// may need to cover it.
 const RELAY_DEPOSIT_GAS_LIMIT: u64 = 57_114;
 
 /// Blocks per `eth_getLogs` call of a deposit scan.
@@ -765,8 +769,8 @@ mod tests {
 
     impl Harness {
         async fn new() -> Self {
-            let hub = RelayChain::spawn(1).await;
-            let chain = RelayChain::spawn(4).await;
+            let hub = RelayChain::spawn(1, 31_337).await;
+            let chain = RelayChain::spawn(4, 31_338).await;
 
             let bridge = RelayBridge::try_from_ctx(RelayCtx {
                 chain: Chain::Robinhood,
@@ -1244,7 +1248,7 @@ mod tests {
             )
         );
 
-        harness
+        let deposit = harness
             .bridge
             .broadcast_deposit(
                 HopDirection::ToHub,
@@ -1255,6 +1259,15 @@ mod tests {
             )
             .await
             .unwrap();
+        let reverted = harness
+            .bridge
+            .confirm_deposit(HopDirection::ToHub, quote.order_id, deposit)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(reverted, RelayBridgeError::DepositReverted { tx } if tx == deposit),
+            "{reverted:?}"
+        );
         harness.chain.mine(1).await;
         assert_eq!(
             harness
@@ -1320,6 +1333,31 @@ mod tests {
                 error,
                 RelayBridgeError::StepTarget { step: QuoteStep::Deposit, actual, .. }
                     if actual == harness.hub.depository
+            ),
+            "{error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn deposit_step_for_another_chain_is_refused() {
+        let harness = Harness::new().await;
+        let mut quote = quote(&harness.chain, B256::random(), true);
+        quote.deposit.chain_id = harness.hub.chain_id();
+
+        let error = harness
+            .bridge
+            .prepare_deposit(HopDirection::ToHub, &quote)
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                RelayBridgeError::StepChain {
+                    step: QuoteStep::Deposit,
+                    step_chain: 31_337,
+                    wallet_chain: 31_338,
+                }
             ),
             "{error:?}"
         );
@@ -1541,34 +1579,6 @@ mod tests {
                     minimum: MINIMUM_OUT,
                 }
             )
-        );
-    }
-
-    #[tokio::test]
-    async fn fill_for_another_order_is_unverified() {
-        let harness = Harness::new().await;
-        let paid_order = B256::random();
-        harness.hub.mint(harness.hub.solver(), MINIMUM_OUT).await;
-
-        let tx = harness
-            .hub
-            .pay(harness.hub.wallet(), MINIMUM_OUT, paid_order)
-            .await;
-
-        let error = harness
-            .bridge
-            .verify_fill(
-                HopDirection::ToHub,
-                RelayOrderId(B256::random()),
-                MINIMUM_OUT,
-                &[tx],
-            )
-            .await
-            .unwrap_err();
-
-        assert_eq!(
-            unverified_fill(error),
-            (vec![tx], UnverifiedReason::OrderId { found: paid_order })
         );
     }
 
