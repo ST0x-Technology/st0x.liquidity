@@ -68,8 +68,11 @@ one refund tx and no `refundFailReason`. With no refund tx it is
 `IntentStatus::RefundFailed`, which carries that `refund_fail_reason` (terminal:
 the refund will not be paid).
 
+A `success` with no tx in `txHashes` is `IntentStatus::Filling` (not terminal):
+settlement needs a fill tx to prove.
+
 Terminal statuses are `Success`, a paid `Refund`, `RefundFailed` and `Failure`;
-`Refunding` is not. A status name the client does not know is
+`Filling` and `Refunding` are not. A status name the client does not know is
 `IntentStatus::Unknown` and stays non-terminal, so the transfer keeps waiting
 rather than settling on a guess. Known fail reasons are `SLIPPAGE`,
 `TOO_LITTLE_RECEIVED`, `SOLVER_CAPACITY_EXCEEDED`, `TTL_EXPIRED`,
