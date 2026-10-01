@@ -8723,7 +8723,8 @@ impl HedgeCapacity for RebalancingService {
     /// shares truncated to whole shares, less the floor rounded up to whole
     /// shares. That is never above what the broker would sell, so a starved
     /// hedge always reads as starved. For a fractional asset it can read low,
-    /// which only lets a redemption go ahead of a partial hedge. An unpolled
+    /// down to zero under one whole share, which lets a redemption go ahead of
+    /// a sell of that fraction. An unpolled
     /// broker is unknown, not empty.
     async fn hedgeable_shares(
         &self,
@@ -33317,23 +33318,38 @@ mod tests {
         assert_eq!(count_pending_equity_mint_jobs(&trigger).await, 0);
     }
 
-    /// Prices every symbol at 100 and, on its first read, which falls between
-    /// the two plans of one check, replaces the inventory with `moved_to`, as
-    /// onchain activity can between them.
+    /// Prices every symbol at 100. On its first read, in the first plan of a
+    /// check, it replaces the inventory with `moved_to`, as onchain activity
+    /// can between the two plans. On its second read, in the plan after the
+    /// reservation, it records whether the Position held a reservation then.
     struct InventoryMovingPrice {
         inventory: Arc<BroadcastingInventory>,
+        position: Arc<Store<Position>>,
         moved_to: tokio::sync::Mutex<Option<InventoryView>>,
+        reads: std::sync::atomic::AtomicU32,
+        reserved_during_replan: tokio::sync::Mutex<Option<bool>>,
     }
 
     #[async_trait]
     impl LastPriceReader for InventoryMovingPrice {
         async fn last_price(
             &self,
-            _symbol: &Symbol,
+            symbol: &Symbol,
         ) -> Result<Option<crate::position::PriceObservation>, ProjectionError<Position>> {
-            let moved_to = self.moved_to.lock().await.take();
-            if let Some(moved_to) = moved_to {
-                *self.inventory.write().await = moved_to;
+            let read = self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if read == 0 {
+                let moved_to = self.moved_to.lock().await.take();
+                if let Some(moved_to) = moved_to {
+                    *self.inventory.write().await = moved_to;
+                }
+            } else if read == 1 {
+                let reserved = self
+                    .position
+                    .load(symbol)
+                    .await
+                    .unwrap()
+                    .is_some_and(|position| position.equity_transfer_reservation.is_some());
+                *self.reserved_during_replan.lock().await = Some(reserved);
             }
             Ok(Some(crate::position::PriceObservation {
                 price: float!(100),
@@ -33343,26 +33359,32 @@ mod tests {
     }
 
     /// The reservation was admitted for a redemption over a due sell hedge
-    /// the broker cannot fill. When the plan after the reservation is a mint,
-    /// nothing is dispatched and the reservation is released: a mint would
-    /// take the shares that hedge needs.
+    /// the broker can place none of. When the plan after the reservation is a
+    /// mint, nothing is dispatched and the reservation is released: a mint
+    /// would take the shares that hedge needs. The broker holds 0.9 shares,
+    /// which its whole share count reads as none, so the reservation is
+    /// admitted, yet the fraction is enough for the second plan to mint.
     #[tokio::test]
     async fn equity_check_does_not_mint_on_a_reservation_admitted_for_a_redemption() {
         let symbol = Symbol::new("AAPL").unwrap();
+        let broker = FractionalShares::new(float!(0.9));
         let redemption_inventory = InventoryView::default()
-            .with_equity(symbol.clone(), shares(80), shares(1))
+            .with_equity(symbol.clone(), shares(80), broker)
             .with_usdc(usdc(1_000_000), usdc(1_000_000));
         let mint_inventory = InventoryView::default()
-            .with_equity(symbol.clone(), shares(20), shares(80))
+            .with_equity(symbol.clone(), FractionalShares::ZERO, broker)
             .with_usdc(usdc(1_000_000), usdc(1_000_000));
         let trigger = make_trigger_with_inventory_and_registry(redemption_inventory, &symbol).await;
         acknowledge_onchain_buy(&trigger, &symbol, 500).await;
-        trigger
-            .set_last_price_reader(Arc::new(InventoryMovingPrice {
-                inventory: Arc::clone(&trigger.inventory),
-                moved_to: tokio::sync::Mutex::new(Some(mint_inventory)),
-            }))
-            .await;
+        let (store, _) = trigger.position_authority().await.unwrap();
+        let price = Arc::new(InventoryMovingPrice {
+            inventory: Arc::clone(&trigger.inventory),
+            position: Arc::clone(&store),
+            moved_to: tokio::sync::Mutex::new(Some(mint_inventory)),
+            reads: std::sync::atomic::AtomicU32::new(0),
+            reserved_during_replan: tokio::sync::Mutex::new(None),
+        });
+        trigger.set_last_price_reader(price.clone()).await;
 
         EquityRebalancingCheck {
             symbol: symbol.clone(),
@@ -33371,9 +33393,13 @@ mod tests {
         .await
         .unwrap();
 
+        assert_eq!(
+            *price.reserved_during_replan.lock().await,
+            Some(true),
+            "the redemption must have been admitted before the plan turned into a mint"
+        );
         assert_eq!(count_pending_equity_mint_jobs(&trigger).await, 0);
         assert_eq!(count_pending_equity_redemption_jobs(&trigger).await, 0);
-        let (store, _) = trigger.position_authority().await.unwrap();
         assert_eq!(
             store
                 .load(&symbol)

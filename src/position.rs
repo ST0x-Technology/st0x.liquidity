@@ -128,6 +128,11 @@ enum TransferAdmission {
     /// A redemption that is admitted over a due sell hedge when the broker can
     /// sell none of its `hedgeable` shares.
     FundsSellHedge { hedgeable: FractionalShares },
+    /// A running redemption restoring its released reservation, admitted over
+    /// a due sell hedge while the broker's `hedgeable` shares are below the
+    /// net. Its active transfer already keeps the position checks from placing
+    /// the partial hedge, so requiring zero would stall both.
+    RestoresSellHedgeFunding { hedgeable: FractionalShares },
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -823,7 +828,7 @@ impl EventSourced for Position {
                 ..
             }) => self.restore_equity_transfer_reservation_events(
                 reservation_id,
-                TransferAdmission::FundsSellHedge { hedgeable },
+                TransferAdmission::RestoresSellHedgeFunding { hedgeable },
                 Utc::now(),
             ),
 
@@ -1320,7 +1325,7 @@ impl Position {
                 net_position = %self.net,
                 ?admission,
                 %reservation_id,
-                "Admitting a redemption over a sell hedge the broker cannot fill"
+                "Admitting a redemption over a sell hedge the broker cannot place"
             );
         }
 
@@ -1343,13 +1348,18 @@ impl Position {
     /// Whether a due hedge is a sell the broker can place none of, and
     /// `admission` is the redemption that brings it the shares. While the
     /// broker can sell some, the partial hedge goes first; once it fills, the
-    /// count reads zero and the redemption is admitted. A buy hedge spends
+    /// count reads zero and the redemption is admitted. A restore of a running
+    /// redemption only needs the broker short of the net. A buy hedge spends
     /// cash, which a redemption does not supply, so it keeps blocking.
     fn admission_funds_sell_hedge(&self, admission: TransferAdmission) -> Result<bool, FloatError> {
+        let net = self.net.inner();
         match admission {
             TransferAdmission::HedgeClear => Ok(false),
             TransferAdmission::FundsSellHedge { hedgeable } => {
-                Ok(self.net.inner().gt(Float::zero()?)? && hedgeable.inner().is_zero()?)
+                Ok(net.gt(Float::zero()?)? && hedgeable.inner().is_zero()?)
+            }
+            TransferAdmission::RestoresSellHedgeFunding { hedgeable } => {
+                Ok(net.gt(Float::zero()?)? && hedgeable.inner().lt(net)?)
             }
         }
     }
@@ -1911,7 +1921,8 @@ impl std::fmt::Debug for NormalizedOnChainFillCommand {
 
 /// A redemption's claim on a symbol whose sell hedge it funds. `hedgeable` is
 /// the broker's available shares above the hedge floor; the Position admits
-/// the redemption over a due sell hedge only while that is zero.
+/// the redemption over a due sell hedge only while that is zero, or, to restore
+/// a running redemption's released reservation, below the live net.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct HedgeFundingRedemption {
     pub symbol: Symbol,
@@ -1985,7 +1996,8 @@ pub enum PositionCommand {
     },
     /// Claims this symbol for a redemption, which delivers shares to the
     /// broker. Unlike `ReserveEquityTransfer`, a due sell hedge does not block
-    /// it when the broker cannot fill that sell; see `HedgeFundingRedemption`.
+    /// it when the broker can place none of that sell; see
+    /// `HedgeFundingRedemption`.
     /// Without this, the hedge waits for broker shares and the redemption that
     /// would supply them waits for the hedge.
     ReserveHedgeFundingRedemption(HedgeFundingRedemption),
@@ -4034,6 +4046,54 @@ mod tests {
                 "hedgeable {hedgeable}: {error:?}"
             );
         }
+    }
+
+    /// A running redemption that released its reservation to wait for gas
+    /// restores it while the broker is still short of the net, even if it can
+    /// sell some: its active transfer keeps the position checks from placing
+    /// that partial hedge, so requiring zero would stall both. A broker that
+    /// can sell the whole net still keeps the hedge first.
+    #[tokio::test]
+    async fn running_redemption_restores_while_the_broker_is_short_of_the_net() {
+        let restore = |hedgeable: &str| {
+            PositionCommand::RestoreHedgeFundingRedemption(HedgeFundingRedemption {
+                symbol: Symbol::new("FGI").unwrap(),
+                threshold: one_share_threshold(),
+                reservation_id: EquityTransferReservationId::generate(),
+                hedgeable: FractionalShares::new(Float::parse(hedgeable.to_owned()).unwrap()),
+            })
+        };
+
+        for hedgeable in ["0", "1", "584"] {
+            let events = TestHarness::<Position>::with(())
+                .given(hedge_ready_history(Direction::Buy, float!(585)))
+                .when(restore(hedgeable))
+                .await
+                .events();
+            assert!(
+                matches!(
+                    events.as_slice(),
+                    [
+                        PositionEvent::EquityTransferReserved { .. },
+                        PositionEvent::EquityTransferReservationConfirmed { .. }
+                    ]
+                ),
+                "hedgeable {hedgeable}: {events:?}"
+            );
+        }
+
+        let error = TestHarness::<Position>::with(())
+            .given(hedge_ready_history(Direction::Buy, float!(585)))
+            .when(restore("585"))
+            .await
+            .then_expect_error();
+        assert!(
+            matches!(
+                error,
+                LifecycleError::Apply(PositionError::EquityTransferBlockedByHedge { .. })
+            ),
+            "{error:?}"
+        );
     }
 
     /// A buy hedge spends broker cash, which a redemption does not bring, so

@@ -3098,8 +3098,10 @@ enum TriggerReason {
   redemption that brings the rest of the shares is admitted, so neither waits on
   the other. The hedge still waits for the reservation to release. A mint, a buy
   hedge, or a sell the broker can place any of keeps the strict rule. A
-  redemption that released its reservation to wait for gas restores it under the
-  same exception. With no broker reading the capacity is unknown, not zero: the
+  redemption that released its reservation to wait for gas restores it while the
+  count is below the live net, not only at zero: its active transfer keeps the
+  position checks from placing the partial hedge, so requiring zero would leave
+  both waiting. With no broker reading the capacity is unknown, not zero: the
   trigger reserves under the strict rule and a restoring job waits and retries.
   A job reads the capacity only to recreate a missing reservation, so one that
   still holds its reservation never depends on that read, and a failed read
