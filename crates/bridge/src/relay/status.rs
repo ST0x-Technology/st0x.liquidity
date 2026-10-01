@@ -3,13 +3,17 @@
 use alloy::primitives::TxHash;
 use serde::Deserialize;
 
-/// One status read: Relay's status plus every deposit tx it has seen.
+/// One status read: Relay's status plus every tx it has seen.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IntentStatusReport {
     pub status: IntentStatus,
     /// Relay's `inTxHashes`: the origin-chain deposits it attributes to the
     /// request.
     pub deposit_txs: Vec<TxHash>,
+    /// Relay's `txHashes`, kept whatever the status: the fills on `Success`,
+    /// the refunds on `Refund`, and any tx Relay lists on the others (one may
+    /// still confirm after `TRANSACTION_NOT_INCLUDED`).
+    pub txs: Vec<TxHash>,
 }
 
 /// Relay's status of a request. Only `Success`, `Refund`, `RefundFailed` and
@@ -20,19 +24,16 @@ pub enum IntentStatus {
     /// Quoted, no deposit seen.
     Waiting,
     InFlight(InFlightStage),
-    /// Every tx in Relay's `txHashes`, never empty; settlement proof checks
-    /// each.
-    Success {
-        fill_txs: Vec<TxHash>,
-    },
+    /// Filled: [`IntentStatusReport::txs`] is never empty and settlement
+    /// proof checks each.
+    Success,
     /// Relay says `success` but names no fill tx yet.
     Filling,
     /// Paid back to `refund_to`: on the origin chain in the origin stable or
     /// on the destination chain in the destination stable, as the quote
-    /// offers both. `refund_txs` is never empty and Relay reports no refund
-    /// fail reason.
+    /// offers both. [`IntentStatusReport::txs`] is never empty and Relay
+    /// reports no refund fail reason.
     Refund {
-        refund_txs: Vec<TxHash>,
         reason: Option<FailReason>,
     },
     /// Relay says `refund` but names no refund tx yet.
@@ -40,7 +41,7 @@ pub enum IntentStatus {
         reason: Option<FailReason>,
     },
     /// Relay says `refund` with a refund fail reason: the refund will not be
-    /// paid.
+    /// paid. The fail reason wins over any refund tx Relay still lists.
     RefundFailed {
         reason: Option<FailReason>,
         /// Relay's `refundFailReason`: why the refund could not be paid.
@@ -56,7 +57,7 @@ pub enum IntentStatus {
 impl IntentStatus {
     pub const fn is_terminal(&self) -> bool {
         match self {
-            Self::Success { .. }
+            Self::Success
             | Self::Refund { .. }
             | Self::RefundFailed { .. }
             | Self::Failure { .. } => true,
@@ -144,19 +145,14 @@ impl From<StatusResponse> for IntentStatusReport {
             "submitted" => IntentStatus::InFlight(InFlightStage::Submitted),
             "delayed" => IntentStatus::InFlight(InFlightStage::Delayed),
             "success" if response.tx_hashes.is_empty() => IntentStatus::Filling,
-            "success" => IntentStatus::Success {
-                fill_txs: response.tx_hashes,
-            },
+            "success" => IntentStatus::Success,
             "refund" => match refund_fail_reason {
                 Some(refund_fail_reason) => IntentStatus::RefundFailed {
                     reason,
                     refund_fail_reason,
                 },
                 None if response.tx_hashes.is_empty() => IntentStatus::Refunding { reason },
-                None => IntentStatus::Refund {
-                    refund_txs: response.tx_hashes,
-                    reason,
-                },
+                None => IntentStatus::Refund { reason },
             },
             "failure" => IntentStatus::Failure { reason },
             _ => IntentStatus::Unknown(response.status),
@@ -165,6 +161,7 @@ impl From<StatusResponse> for IntentStatusReport {
         Self {
             status,
             deposit_txs: response.in_tx_hashes,
+            txs: response.tx_hashes,
         }
     }
 }
@@ -189,6 +186,7 @@ mod tests {
             IntentStatusReport {
                 status: IntentStatus::Waiting,
                 deposit_txs: vec![],
+                txs: vec![],
             }
         );
         assert!(!report.status.is_terminal());
@@ -205,6 +203,7 @@ mod tests {
                 deposit_txs: vec![b256!(
                     "0xeeee66456ace7aae93e6ed814d32a3748a5fc86d7101a259a4f62a44822c819d"
                 )],
+                txs: vec![],
             }
         );
         assert!(!report.status.is_terminal());
@@ -214,13 +213,12 @@ mod tests {
     fn success_status_names_the_fill_tx() {
         let report = report(include_str!("../../relay-fixtures/status_success.json"));
 
+        assert_eq!(report.status, IntentStatus::Success);
         assert_eq!(
-            report.status,
-            IntentStatus::Success {
-                fill_txs: vec![b256!(
-                    "0x4d08b9f1596e351ac0b9ea38702a83c28a53b20fa3fdd9ada60d2a0b556bc40d"
-                )],
-            }
+            report.txs,
+            vec![b256!(
+                "0x4d08b9f1596e351ac0b9ea38702a83c28a53b20fa3fdd9ada60d2a0b556bc40d"
+            )]
         );
         assert_eq!(
             report.deposit_txs,
@@ -246,11 +244,14 @@ mod tests {
         assert_eq!(
             report.status,
             IntentStatus::Refund {
-                refund_txs: vec![b256!(
-                    "0xf27f49b3e941788a37775b874e1a91a711c26578c041921a24efd96cd14cea8d"
-                )],
                 reason: Some(FailReason::DepositedAmountTooLowToFill),
             }
+        );
+        assert_eq!(
+            report.txs,
+            vec![b256!(
+                "0xf27f49b3e941788a37775b874e1a91a711c26578c041921a24efd96cd14cea8d"
+            )]
         );
         assert_eq!(
             report.deposit_txs,
@@ -303,6 +304,12 @@ mod tests {
                 refund_fail_reason: FailReason::BlockedWallet,
             }
         );
+        assert_eq!(
+            report.txs,
+            vec![b256!(
+                "0xf27f49b3e941788a37775b874e1a91a711c26578c041921a24efd96cd14cea8d"
+            )]
+        );
         assert!(report.status.is_terminal());
     }
 
@@ -338,15 +345,14 @@ mod tests {
         assert_eq!(
             report,
             IntentStatusReport {
-                status: IntentStatus::Success {
-                    fill_txs: vec![
-                        b256!("0x0000000000000000000000000000000000000000000000000000000000000003"),
-                        b256!("0x0000000000000000000000000000000000000000000000000000000000000004"),
-                    ],
-                },
+                status: IntentStatus::Success,
                 deposit_txs: vec![
                     b256!("0x0000000000000000000000000000000000000000000000000000000000000001"),
                     b256!("0x0000000000000000000000000000000000000000000000000000000000000002"),
+                ],
+                txs: vec![
+                    b256!("0x0000000000000000000000000000000000000000000000000000000000000003"),
+                    b256!("0x0000000000000000000000000000000000000000000000000000000000000004"),
                 ],
             }
         );
@@ -364,5 +370,64 @@ mod tests {
             }
         );
         assert!(report.status.is_terminal());
+    }
+
+    #[test]
+    fn failure_keeps_the_listed_tx() {
+        let report = report(
+            &json!({
+                "status": "failure",
+                "txHashes": [
+                    "0x0000000000000000000000000000000000000000000000000000000000000005",
+                ],
+                "failReason": "TRANSACTION_NOT_INCLUDED",
+            })
+            .to_string(),
+        );
+
+        assert_eq!(
+            report,
+            IntentStatusReport {
+                status: IntentStatus::Failure {
+                    reason: Some(FailReason::TransactionNotIncluded),
+                },
+                deposit_txs: vec![],
+                txs: vec![b256!(
+                    "0x0000000000000000000000000000000000000000000000000000000000000005"
+                )],
+            }
+        );
+    }
+
+    #[test]
+    fn in_flight_and_unknown_statuses_keep_the_listed_tx() {
+        for (status, expected) in [
+            (
+                "submitted",
+                IntentStatus::InFlight(InFlightStage::Submitted),
+            ),
+            (
+                "teleporting",
+                IntentStatus::Unknown("teleporting".to_owned()),
+            ),
+        ] {
+            let report = report(
+                &json!({
+                    "status": status,
+                    "txHashes": [
+                        "0x0000000000000000000000000000000000000000000000000000000000000006",
+                    ],
+                })
+                .to_string(),
+            );
+
+            assert_eq!(report.status, expected);
+            assert_eq!(
+                report.txs,
+                vec![b256!(
+                    "0x0000000000000000000000000000000000000000000000000000000000000006"
+                )]
+            );
+        }
     }
 }
