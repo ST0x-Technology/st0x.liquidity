@@ -219,6 +219,11 @@ pub enum QuoteMismatch {
     },
     #[error("order has {count} output payments, expected one")]
     PaymentCount { count: usize },
+    #[error("quote names order {quoted}, the deposit calldata {calldata}")]
+    OrderIdMismatch {
+        quoted: RelayOrderId,
+        calldata: RelayOrderId,
+    },
     #[error("order deadline {seconds} is not a representable time")]
     Deadline { seconds: u64 },
 }
@@ -940,6 +945,31 @@ pub(super) mod tests {
             RelayRequestId(b256!(
                 "0x1790875063e29a43c3a2201049fa8f6e6542e940fe2060ed03ea9107630b5a49"
             ))
+        );
+    }
+
+    #[test]
+    fn deposit_calldata_for_another_order_is_refused() {
+        let error = refusal(|body| {
+            let calldata = body["steps"][1]["items"][0]["data"]["data"]
+                .as_str()
+                .unwrap()
+                .to_owned();
+            let (head, _) = calldata.split_at(calldata.len() - 64);
+            body["steps"][1]["items"][0]["data"]["data"] =
+                json!(format!("{head}{}", "11".repeat(32)));
+        });
+
+        assert!(
+            matches!(
+                error,
+                QuoteMismatch::OrderIdMismatch { quoted, calldata }
+                    if quoted == RelayOrderId(b256!(
+                        "0x266b12442f9b86ef731fae285c34f489217acdfcedd755422ce47db429992d85"
+                    ))
+                        && calldata == RelayOrderId(B256::repeat_byte(0x11))
+            ),
+            "{error:?}"
         );
     }
 
