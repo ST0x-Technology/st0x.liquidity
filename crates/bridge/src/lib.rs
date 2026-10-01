@@ -2,15 +2,18 @@
 //!
 //! This crate provides a generic `Bridge` trait for bridging USDC between chains.
 //! The default (no features) build ships only the trait and shared domain types.
-//! Enable the `cctp` feature for the Circle CCTP V2 implementation.
+//! Enable the `cctp` feature for the Circle CCTP V2 implementation and the
+//! `relay` feature for the Relay API client.
 
 use alloy::primitives::{Address, B256, TxHash, U256};
 use async_trait::async_trait;
 
 #[cfg(feature = "cctp")]
 pub mod cctp;
-#[cfg(feature = "cctp")]
+#[cfg(any(feature = "cctp", feature = "relay"))]
 pub mod corridor;
+#[cfg(feature = "relay")]
+pub mod relay;
 
 /// Direction of a bridge transfer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
