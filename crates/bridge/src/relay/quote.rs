@@ -107,6 +107,32 @@ pub enum QuoteStep {
     Deposit,
 }
 
+/// An address or amount in a quote that must equal what the request implies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QuoteField {
+    /// The contract the approve step calls.
+    ApproveTarget,
+    ApproveSpender,
+    ApproveAmount,
+    /// The contract the deposit step calls.
+    DepositTarget,
+    Depositor,
+    DepositToken,
+    DepositAmount,
+    /// `details.currencyIn.amount`.
+    InputAmount,
+    /// `details.recipient`.
+    Recipient,
+    PaymentRecipient,
+    PaymentCurrency,
+    PaymentMinimum,
+    PaymentExpected,
+    RefundRecipient,
+    PaymentDetailsDepository,
+    PaymentDetailsCurrency,
+    PaymentDetailsAmount,
+}
+
 /// How a quote differs from the transfer it was requested for.
 #[derive(Debug, thiserror::Error)]
 pub enum QuoteMismatch {
@@ -126,12 +152,6 @@ pub enum QuoteMismatch {
         expected: u64,
         actual: u64,
     },
-    #[error("{step:?} step calls {actual}, expected {expected}")]
-    StepTarget {
-        step: QuoteStep,
-        expected: Address,
-        actual: Address,
-    },
     #[error("{step:?} step sends {value} native value, expected none")]
     StepValue { step: QuoteStep, value: U256 },
     #[error("{step:?} step calldata does not decode: {source}")]
@@ -140,25 +160,23 @@ pub enum QuoteMismatch {
         #[source]
         source: alloy::sol_types::Error,
     },
-    #[error("approve names spender {actual}, expected the depository {expected}")]
-    ApproveSpender { expected: Address, actual: Address },
-    #[error("{step:?} step moves {actual}, expected exactly {expected}")]
-    StepAmount {
-        step: QuoteStep,
+    #[error("quote {field:?} is {actual}, expected {expected}")]
+    AddressMismatch {
+        field: QuoteField,
+        expected: Address,
+        actual: Address,
+    },
+    #[error("quote {field:?} is {actual}, expected {expected}")]
+    AmountMismatch {
+        field: QuoteField,
         expected: U256,
         actual: U256,
     },
-    #[error("deposit credits depositor {actual}, expected {expected}")]
-    Depositor { expected: Address, actual: Address },
-    #[error("deposit pays token {actual}, expected {expected}")]
-    DepositToken { expected: Address, actual: Address },
     #[error("quote input is {actual}, expected {expected}")]
     InputCurrency {
         expected: QuotedCurrency,
         actual: QuotedCurrency,
     },
-    #[error("quote input amount is {actual}, expected {expected}")]
-    InputAmount { expected: U256, actual: U256 },
     #[error("quote output is {actual}, expected {expected}")]
     OutputCurrency {
         expected: QuotedCurrency,
@@ -177,26 +195,8 @@ pub enum QuoteMismatch {
     },
     #[error("gas fee is on chain {actual}, expected {expected}")]
     GasFeeChain { expected: u64, actual: u64 },
-    #[error("quote names recipient {actual}, expected {expected}")]
-    Recipient { expected: Address, actual: Address },
     #[error("order has {count} output payments, expected one")]
     PaymentCount { count: usize },
-    #[error("output payment goes to {actual}, expected {expected}")]
-    PaymentRecipient { expected: Address, actual: Address },
-    #[error("output payment is in {actual}, expected {expected}")]
-    PaymentCurrency { expected: Address, actual: Address },
-    #[error("output payment minimum is {actual}, the quote's minimum is {expected}")]
-    PaymentMinimum { expected: U256, actual: U256 },
-    #[error("output payment expects {actual}, the quote expects {expected}")]
-    PaymentExpected { expected: U256, actual: U256 },
-    #[error("refund goes to {actual}, expected {expected}")]
-    RefundRecipient { expected: Address, actual: Address },
-    #[error("payment details name depository {actual}, expected {expected}")]
-    PaymentDetailsDepository { expected: Address, actual: Address },
-    #[error("payment details pay in {actual}, expected {expected}")]
-    PaymentDetailsCurrency { expected: Address, actual: Address },
-    #[error("payment details pay {actual}, expected {expected}")]
-    PaymentDetailsAmount { expected: U256, actual: U256 },
     #[error("order deadline {seconds} is not a representable time")]
     Deadline { seconds: u64 },
 }
@@ -411,12 +411,11 @@ impl QuoteResponse {
             |expected, actual| QuoteMismatch::OutputCurrency { expected, actual },
         )?;
 
-        if self.details.currency_in.amount != request.amount {
-            return Err(QuoteMismatch::InputAmount {
-                expected: request.amount,
-                actual: self.details.currency_in.amount,
-            });
-        }
+        check_amount(
+            QuoteField::InputAmount,
+            request.amount,
+            self.details.currency_in.amount,
+        )?;
 
         check_fees(&self.fees, origin)?;
         check_output_payment(&self.details, &self.protocol.v2.order_data, request)?;
@@ -510,12 +509,7 @@ fn check_output_payment(
     order: &RawOrderData,
     request: &QuoteRequest,
 ) -> Result<(), QuoteMismatch> {
-    if details.recipient != request.recipient {
-        return Err(QuoteMismatch::Recipient {
-            expected: request.recipient,
-            actual: details.recipient,
-        });
-    }
+    check_address(QuoteField::Recipient, request.recipient, details.recipient)?;
 
     let [payment] = order.output.payments.as_slice() else {
         return Err(QuoteMismatch::PaymentCount {
@@ -523,36 +517,26 @@ fn check_output_payment(
         });
     };
 
-    if payment.recipient != request.recipient {
-        return Err(QuoteMismatch::PaymentRecipient {
-            expected: request.recipient,
-            actual: payment.recipient,
-        });
-    }
-
-    let destination_stable = request.destination.settlement_stable().address;
-    if payment.currency != destination_stable {
-        return Err(QuoteMismatch::PaymentCurrency {
-            expected: destination_stable,
-            actual: payment.currency,
-        });
-    }
-
-    if payment.minimum_amount != details.currency_out.minimum_amount {
-        return Err(QuoteMismatch::PaymentMinimum {
-            expected: details.currency_out.minimum_amount,
-            actual: payment.minimum_amount,
-        });
-    }
-
-    if payment.expected_amount != details.currency_out.amount {
-        return Err(QuoteMismatch::PaymentExpected {
-            expected: details.currency_out.amount,
-            actual: payment.expected_amount,
-        });
-    }
-
-    Ok(())
+    check_address(
+        QuoteField::PaymentRecipient,
+        request.recipient,
+        payment.recipient,
+    )?;
+    check_address(
+        QuoteField::PaymentCurrency,
+        request.destination.settlement_stable().address,
+        payment.currency,
+    )?;
+    check_amount(
+        QuoteField::PaymentMinimum,
+        details.currency_out.minimum_amount,
+        payment.minimum_amount,
+    )?;
+    check_amount(
+        QuoteField::PaymentExpected,
+        details.currency_out.amount,
+        payment.expected_amount,
+    )
 }
 
 fn check_refunds(order: &RawOrderData, refund_to: Address) -> Result<(), QuoteMismatch> {
@@ -560,12 +544,8 @@ fn check_refunds(order: &RawOrderData, refund_to: Address) -> Result<(), QuoteMi
         .inputs
         .iter()
         .flat_map(|input| &input.refunds)
-        .find(|refund| refund.recipient != refund_to)
-        .map_or(Ok(()), |refund| {
-            Err(QuoteMismatch::RefundRecipient {
-                expected: refund_to,
-                actual: refund.recipient,
-            })
+        .try_for_each(|refund| {
+            check_address(QuoteField::RefundRecipient, refund_to, refund.recipient)
         })
 }
 
@@ -574,29 +554,49 @@ fn check_payment_details(
     request: &QuoteRequest,
     depository: Address,
 ) -> Result<(), QuoteMismatch> {
-    if payment.depository != depository {
-        return Err(QuoteMismatch::PaymentDetailsDepository {
-            expected: depository,
-            actual: payment.depository,
-        });
-    }
+    check_address(
+        QuoteField::PaymentDetailsDepository,
+        depository,
+        payment.depository,
+    )?;
+    check_address(
+        QuoteField::PaymentDetailsCurrency,
+        request.origin.settlement_stable().address,
+        payment.currency,
+    )?;
+    check_amount(
+        QuoteField::PaymentDetailsAmount,
+        request.amount,
+        payment.amount,
+    )
+}
 
-    let origin_stable = request.origin.settlement_stable().address;
-    if payment.currency != origin_stable {
-        return Err(QuoteMismatch::PaymentDetailsCurrency {
-            expected: origin_stable,
-            actual: payment.currency,
-        });
+fn check_address(
+    field: QuoteField,
+    expected: Address,
+    actual: Address,
+) -> Result<(), QuoteMismatch> {
+    if actual == expected {
+        Ok(())
+    } else {
+        Err(QuoteMismatch::AddressMismatch {
+            field,
+            expected,
+            actual,
+        })
     }
+}
 
-    if payment.amount != request.amount {
-        return Err(QuoteMismatch::PaymentDetailsAmount {
-            expected: request.amount,
-            actual: payment.amount,
-        });
+fn check_amount(field: QuoteField, expected: U256, actual: U256) -> Result<(), QuoteMismatch> {
+    if actual == expected {
+        Ok(())
+    } else {
+        Err(QuoteMismatch::AmountMismatch {
+            field,
+            expected,
+            actual,
+        })
     }
-
-    Ok(())
 }
 
 /// Splits the steps into the optional approve and the required deposit,
@@ -641,6 +641,7 @@ fn check_step_envelope(
     step: QuoteStep,
     transaction: &StepTransaction,
     origin: Chain,
+    target_field: QuoteField,
     expected_target: Address,
 ) -> Result<(), QuoteMismatch> {
     if transaction.chain_id != origin.chain_id() {
@@ -651,13 +652,7 @@ fn check_step_envelope(
         });
     }
 
-    if transaction.to != expected_target {
-        return Err(QuoteMismatch::StepTarget {
-            step,
-            expected: expected_target,
-            actual: transaction.to,
-        });
-    }
+    check_address(target_field, expected_target, transaction.to)?;
 
     if !transaction.value.is_zero() {
         return Err(QuoteMismatch::StepValue {
@@ -676,7 +671,13 @@ fn check_approve(
     depository: Address,
     amount: U256,
 ) -> Result<(), QuoteMismatch> {
-    check_step_envelope(QuoteStep::Approve, approve, origin, origin_stable)?;
+    check_step_envelope(
+        QuoteStep::Approve,
+        approve,
+        origin,
+        QuoteField::ApproveTarget,
+        origin_stable,
+    )?;
 
     let call =
         approveCall::abi_decode(&approve.data).map_err(|source| QuoteMismatch::StepCalldata {
@@ -684,22 +685,8 @@ fn check_approve(
             source,
         })?;
 
-    if call.spender != depository {
-        return Err(QuoteMismatch::ApproveSpender {
-            expected: depository,
-            actual: call.spender,
-        });
-    }
-
-    if call.amount != amount {
-        return Err(QuoteMismatch::StepAmount {
-            step: QuoteStep::Approve,
-            expected: amount,
-            actual: call.amount,
-        });
-    }
-
-    Ok(())
+    check_address(QuoteField::ApproveSpender, depository, call.spender)?;
+    check_amount(QuoteField::ApproveAmount, amount, call.amount)
 }
 
 fn check_deposit(
@@ -708,7 +695,13 @@ fn check_deposit(
     origin_stable: Address,
     depository: Address,
 ) -> Result<RelayOrderId, QuoteMismatch> {
-    check_step_envelope(QuoteStep::Deposit, deposit, request.origin, depository)?;
+    check_step_envelope(
+        QuoteStep::Deposit,
+        deposit,
+        request.origin,
+        QuoteField::DepositTarget,
+        depository,
+    )?;
 
     let call = depositErc20Call::abi_decode(&deposit.data).map_err(|source| {
         QuoteMismatch::StepCalldata {
@@ -717,27 +710,9 @@ fn check_deposit(
         }
     })?;
 
-    if call.depositor != request.user {
-        return Err(QuoteMismatch::Depositor {
-            expected: request.user,
-            actual: call.depositor,
-        });
-    }
-
-    if call.token != origin_stable {
-        return Err(QuoteMismatch::DepositToken {
-            expected: origin_stable,
-            actual: call.token,
-        });
-    }
-
-    if call.amount != request.amount {
-        return Err(QuoteMismatch::StepAmount {
-            step: QuoteStep::Deposit,
-            expected: request.amount,
-            actual: call.amount,
-        });
-    }
+    check_address(QuoteField::Depositor, request.user, call.depositor)?;
+    check_address(QuoteField::DepositToken, origin_stable, call.token)?;
+    check_amount(QuoteField::DepositAmount, request.amount, call.amount)?;
 
     Ok(RelayOrderId(call.id))
 }
@@ -976,7 +951,11 @@ pub(super) mod tests {
         assert!(
             matches!(
                 error,
-                QuoteMismatch::ApproveSpender { expected, actual }
+                QuoteMismatch::AddressMismatch {
+                    field: QuoteField::ApproveSpender,
+                    expected,
+                    actual,
+                }
                     if expected == DEPOSITORY
                         && actual == address!("0x1111111111111111111111111111111111111111")
             ),
@@ -997,7 +976,11 @@ pub(super) mod tests {
         assert!(
             matches!(
                 error,
-                QuoteMismatch::StepAmount { step: QuoteStep::Approve, expected, actual }
+                QuoteMismatch::AmountMismatch {
+                    field: QuoteField::ApproveAmount,
+                    expected,
+                    actual,
+                }
                     if expected == U256::from(5_000_000) && actual == U256::MAX
             ),
             "{error:?}"
@@ -1015,8 +998,13 @@ pub(super) mod tests {
         assert!(
             matches!(
                 error,
-                QuoteMismatch::StepTarget { step: QuoteStep::Deposit, expected, .. }
+                QuoteMismatch::AddressMismatch {
+                    field: QuoteField::DepositTarget,
+                    expected,
+                    actual,
+                }
                     if expected == DEPOSITORY
+                        && actual == address!("0x2222222222222222222222222222222222222222")
             ),
             "{error:?}"
         );
@@ -1034,7 +1022,11 @@ pub(super) mod tests {
         assert!(
             matches!(
                 error,
-                QuoteMismatch::InputAmount { expected, actual }
+                QuoteMismatch::AmountMismatch {
+                    field: QuoteField::InputAmount,
+                    expected,
+                    actual,
+                }
                     if expected == U256::from(4_000_000) && actual == U256::from(5_000_000)
             ),
             "{error:?}"
@@ -1051,7 +1043,16 @@ pub(super) mod tests {
         let error = validate(&funded_body(), &request).unwrap_err();
 
         assert!(
-            matches!(error, QuoteMismatch::Depositor { actual, .. } if actual == FUNDED_WALLET),
+            matches!(
+                error,
+                QuoteMismatch::AddressMismatch {
+                    field: QuoteField::Depositor,
+                    expected,
+                    actual,
+                }
+                    if expected == address!("0x3333333333333333333333333333333333333333")
+                        && actual == FUNDED_WALLET
+            ),
             "{error:?}"
         );
     }
@@ -1108,7 +1109,11 @@ pub(super) mod tests {
         assert!(
             matches!(
                 error,
-                QuoteMismatch::Recipient { expected, actual }
+                QuoteMismatch::AddressMismatch {
+                    field: QuoteField::Recipient,
+                    expected,
+                    actual,
+                }
                     if expected == FUNDED_WALLET && actual == OTHER
             ),
             "{error:?}"
@@ -1139,7 +1144,11 @@ pub(super) mod tests {
         assert!(
             matches!(
                 error,
-                QuoteMismatch::PaymentRecipient { expected, actual }
+                QuoteMismatch::AddressMismatch {
+                    field: QuoteField::PaymentRecipient,
+                    expected,
+                    actual,
+                }
                     if expected == FUNDED_WALLET && actual == OTHER
             ),
             "{error:?}"
@@ -1155,7 +1164,11 @@ pub(super) mod tests {
         assert!(
             matches!(
                 error,
-                QuoteMismatch::PaymentCurrency { expected, actual }
+                QuoteMismatch::AddressMismatch {
+                    field: QuoteField::PaymentCurrency,
+                    expected,
+                    actual,
+                }
                     if expected == ETHEREUM_USDC && actual == OTHER
             ),
             "{error:?}"
@@ -1172,7 +1185,11 @@ pub(super) mod tests {
         assert!(
             matches!(
                 error,
-                QuoteMismatch::PaymentMinimum { expected, actual }
+                QuoteMismatch::AmountMismatch {
+                    field: QuoteField::PaymentMinimum,
+                    expected,
+                    actual,
+                }
                     if expected == U256::from(4_749_464) && actual == U256::from(1)
             ),
             "{error:?}"
@@ -1189,7 +1206,11 @@ pub(super) mod tests {
         assert!(
             matches!(
                 error,
-                QuoteMismatch::PaymentExpected { expected, actual }
+                QuoteMismatch::AmountMismatch {
+                    field: QuoteField::PaymentExpected,
+                    expected,
+                    actual,
+                }
                     if expected == U256::from(4_763_755) && actual == U256::from(4_749_464)
             ),
             "{error:?}"
@@ -1206,7 +1227,11 @@ pub(super) mod tests {
         assert!(
             matches!(
                 error,
-                QuoteMismatch::RefundRecipient { expected, actual }
+                QuoteMismatch::AddressMismatch {
+                    field: QuoteField::RefundRecipient,
+                    expected,
+                    actual,
+                }
                     if expected == FUNDED_WALLET && actual == OTHER
             ),
             "{error:?}"
@@ -1221,7 +1246,11 @@ pub(super) mod tests {
         assert!(
             matches!(
                 error,
-                QuoteMismatch::PaymentDetailsDepository { expected, actual }
+                QuoteMismatch::AddressMismatch {
+                    field: QuoteField::PaymentDetailsDepository,
+                    expected,
+                    actual,
+                }
                     if expected == DEPOSITORY && actual == OTHER
             ),
             "{error:?}"
@@ -1236,7 +1265,11 @@ pub(super) mod tests {
         assert!(
             matches!(
                 error,
-                QuoteMismatch::PaymentDetailsCurrency { expected, actual }
+                QuoteMismatch::AddressMismatch {
+                    field: QuoteField::PaymentDetailsCurrency,
+                    expected,
+                    actual,
+                }
                     if expected == ROBINHOOD_USDG && actual == OTHER
             ),
             "{error:?}"
@@ -1251,7 +1284,11 @@ pub(super) mod tests {
         assert!(
             matches!(
                 error,
-                QuoteMismatch::PaymentDetailsAmount { expected, actual }
+                QuoteMismatch::AmountMismatch {
+                    field: QuoteField::PaymentDetailsAmount,
+                    expected,
+                    actual,
+                }
                     if expected == U256::from(5_000_000) && actual == U256::from(3_000_000)
             ),
             "{error:?}"
