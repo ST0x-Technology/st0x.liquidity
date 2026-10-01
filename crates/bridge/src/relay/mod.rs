@@ -95,7 +95,15 @@ impl RelayClient {
 
     /// Fetches an exact-input quote and checks its steps against `request`.
     /// Bound checks on the amounts are the caller's ([`QuoteAmounts::accept`]).
+    /// An origin with no pinned depository is refused before any request.
     pub async fn quote(&self, request: &QuoteRequest) -> Result<RelayQuote, RelayError> {
+        let depository = request
+            .origin
+            .relay_depository()
+            .ok_or(QuoteMismatch::NoDepository {
+                chain: request.origin,
+            })?;
+
         let url = format!("{}/quote/v2", self.api_base);
         let body = QuoteRequestBody::from(request);
 
@@ -111,7 +119,7 @@ impl RelayClient {
         };
 
         let response = self.with_retries(send).await?;
-        let quote = response.validate(request)?;
+        let quote = response.validate(request, depository)?;
 
         debug!(
             target: "bridge",
@@ -332,6 +340,8 @@ mod tests {
     use httpmock::prelude::*;
     use serde_json::json;
 
+    use st0x_evm::Chain;
+
     use super::quote::tests::{FUNDED_QUOTE, FUNDED_WALLET, funded_request};
     use super::*;
 
@@ -371,6 +381,31 @@ mod tests {
         assert_eq!(quote.request_id, REQUEST_ID);
         assert_eq!(quote.amounts.expected_out, U256::from(4_763_755));
         mock.assert();
+    }
+
+    #[tokio::test]
+    async fn origin_without_a_depository_is_refused_before_any_request() {
+        let server = MockServer::start();
+        let mock = server.mock(|when, then| {
+            when.method(POST).path("/quote/v2");
+            then.status(200).body(FUNDED_QUOTE);
+        });
+
+        let request = QuoteRequest {
+            origin: Chain::Base,
+            ..funded_request()
+        };
+
+        let error = client(&server, None).quote(&request).await.unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                RelayError::QuoteMismatch(QuoteMismatch::NoDepository { chain: Chain::Base })
+            ),
+            "{error:?}"
+        );
+        assert_eq!(mock.calls(), 0);
     }
 
     #[tokio::test]
