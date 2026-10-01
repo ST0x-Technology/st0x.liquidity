@@ -69,10 +69,10 @@ impl LastPriceReader for Projection<Position> {
     }
 }
 
-/// The broker shares of a symbol that a sell hedge could take now. A fresh
-/// redemption is admitted over a due sell hedge only when this is zero, and a
-/// running one restores its reservation only while this is below the live net,
-/// so the reading must never be above what the broker would sell.
+/// The broker shares of a symbol that a sell hedge could take now. A
+/// redemption is admitted over a due sell hedge, or restores its reservation
+/// after a gas refusal, only when this is zero, so the reading must never be
+/// above what the broker would sell.
 /// `None` when no broker reading exists, which admits nothing.
 #[async_trait]
 pub(crate) trait HedgeCapacity: Send + Sync {
