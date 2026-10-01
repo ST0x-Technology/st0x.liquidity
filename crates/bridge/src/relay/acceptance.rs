@@ -19,19 +19,30 @@ impl BasisPoints {
         Ok(Self(bps))
     }
 
-    /// `amount * (10_000 - self) / 10_000`, rounded up: every bound built
-    /// from it errs towards refusing the quote.
-    fn keep(self, amount: U256) -> Result<U256, QuoteAcceptanceError> {
+    /// `amount * (10_000 - self) / 10_000`, rounded as `rounding` says.
+    fn keep(self, amount: U256, rounding: Rounding) -> Result<U256, QuoteAcceptanceError> {
         let Self(bps) = self;
-        let kept = U256::from(Self::SCALE - bps);
-        let round_up = U256::from(Self::SCALE - 1);
+        let scale = U256::from(Self::SCALE);
 
-        amount
-            .checked_mul(kept)
-            .and_then(|scaled| scaled.checked_add(round_up))
-            .map(|scaled| scaled / U256::from(Self::SCALE))
-            .ok_or(QuoteAcceptanceError::Overflow { amount, bps: self })
+        let scaled = amount
+            .checked_mul(U256::from(Self::SCALE - bps))
+            .ok_or(QuoteAcceptanceError::Overflow { amount, bps: self })?;
+
+        Ok(match rounding {
+            Rounding::Down => scaled / scale,
+            Rounding::Up => scaled.div_ceil(scale),
+        })
     }
+}
+
+/// Which way a bound rounds off the exact basis-point value.
+#[derive(Debug, Clone, Copy)]
+enum Rounding {
+    /// The loss bound: errs towards refusing the quote.
+    Up,
+    /// The slippage floor: Relay rounds its own `minimumAmount` down, so a
+    /// floor rounded up would refuse Relay's honest minimum.
+    Down,
 }
 
 impl std::fmt::Display for BasisPoints {
@@ -87,7 +98,7 @@ impl QuoteAmounts {
             });
         }
 
-        let loss_bound = bounds.max_loss.keep(amount_in)?;
+        let loss_bound = bounds.max_loss.keep(amount_in, Rounding::Up)?;
         if expected_out < loss_bound {
             return Err(QuoteAcceptanceError::QuoteLossExceedsBound {
                 expected: expected_out,
@@ -95,7 +106,7 @@ impl QuoteAmounts {
             });
         }
 
-        let floor = slippage.keep(expected_out)?;
+        let floor = slippage.keep(expected_out, Rounding::Down)?;
         if minimum_out < floor {
             return Err(QuoteAcceptanceError::QuoteFloorBelowBound {
                 minimum: minimum_out,
@@ -200,29 +211,38 @@ mod tests {
             amounts.accept(&bounds(500, 1_000_000)).unwrap_err(),
             QuoteAcceptanceError::QuoteFloorBelowBound {
                 minimum: U256::from(4_749_464),
-                floor: U256::from(4_758_992),
+                floor: U256::from(4_758_991),
             }
         );
     }
 
-    /// 30 bps off 4,763,755 is 4,749,463.735: the floor rounds up to Relay's
-    /// own minimum, so one unit less is refused. 475 bps off 5,001,318 is
-    /// 4,763,755.395: the loss bound rounds up past the expected output.
+    /// 30 bps off 4,763,755 is 4,749,463.735: the floor rounds down, so
+    /// 4,749,463 is accepted and one unit less is refused.
     #[test]
-    fn bounds_round_up() {
-        let amounts = QuoteAmounts {
+    fn slippage_floor_rounds_down() {
+        let at_floor = QuoteAmounts {
             minimum_out: U256::from(4_749_463),
             ..funded_amounts()
         };
+        at_floor.accept(&bounds(500, 0)).unwrap();
 
+        let below_floor = QuoteAmounts {
+            minimum_out: U256::from(4_749_462),
+            ..funded_amounts()
+        };
         assert_eq!(
-            amounts.accept(&bounds(500, 0)).unwrap_err(),
+            below_floor.accept(&bounds(500, 0)).unwrap_err(),
             QuoteAcceptanceError::QuoteFloorBelowBound {
-                minimum: U256::from(4_749_463),
-                floor: U256::from(4_749_464),
+                minimum: U256::from(4_749_462),
+                floor: U256::from(4_749_463),
             }
         );
+    }
 
+    /// 475 bps off 5,001,318 is 4,763,755.395: the loss bound rounds up past
+    /// the expected output.
+    #[test]
+    fn loss_bound_rounds_up() {
         let amounts = QuoteAmounts {
             amount_in: U256::from(5_001_318),
             ..funded_amounts()
@@ -293,8 +313,8 @@ mod tests {
         ]
     }
 
-    fn widened_keep(amount: U256, bps: u16) -> U512 {
-        (U512::from(amount) * U512::from(10_000 - bps)).div_ceil(U512::from(10_000))
+    fn widened_product(amount: U256, bps: u16) -> U512 {
+        U512::from(amount) * U512::from(10_000 - bps)
     }
 
     proptest! {
@@ -313,8 +333,7 @@ mod tests {
 
             if let Err(QuoteAcceptanceError::Overflow { amount, bps }) = amounts.accept(&bounds) {
                 let BasisPoints(bps) = bps;
-                let rounded = U512::from(amount) * U512::from(10_000 - bps) + U512::from(9_999);
-                prop_assert!(rounded > U512::from(U256::MAX));
+                prop_assert!(widened_product(amount, bps) > U512::from(U256::MAX));
             }
         }
 
@@ -333,8 +352,13 @@ mod tests {
 
             if amounts.accept(&bounds).is_ok() {
                 prop_assert!(minimum_out <= expected_out);
-                prop_assert!(U512::from(expected_out) >= widened_keep(amount_in, max_loss));
-                prop_assert!(U512::from(minimum_out) >= widened_keep(expected_out, slippage));
+                let scale = U512::from(10_000);
+                prop_assert!(
+                    U512::from(expected_out) >= widened_product(amount_in, max_loss).div_ceil(scale)
+                );
+                prop_assert!(
+                    U512::from(minimum_out) >= widened_product(expected_out, slippage) / scale
+                );
                 prop_assert!(minimum_out >= downstream_minimum);
             }
         }
@@ -350,8 +374,8 @@ mod tests {
             let loss = u16::try_from(u32::from(max_loss) * u32::from(loss_share) / 10_000).unwrap();
             let slip =
                 u16::try_from(u32::from(slippage) * u32::from(slippage_share) / 10_000).unwrap();
-            let expected_out = bps(loss).keep(U256::from(amount_in)).unwrap();
-            let minimum_out = bps(slip).keep(expected_out).unwrap();
+            let expected_out = bps(loss).keep(U256::from(amount_in), Rounding::Up).unwrap();
+            let minimum_out = bps(slip).keep(expected_out, Rounding::Down).unwrap();
 
             let amounts = QuoteAmounts {
                 amount_in: U256::from(amount_in),
