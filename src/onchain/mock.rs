@@ -223,6 +223,24 @@ impl MockRaindex {
         self
     }
 
+    /// Makes `tx_receipt` return a successful receipt for `tx_hash` holding a
+    /// `token` log with the ERC-20 `Transfer` topic that does not decode.
+    #[cfg(test)]
+    pub(crate) fn with_undecodable_transfer_receipt(
+        mut self,
+        tx_hash: TxHash,
+        token: Address,
+    ) -> Self {
+        let mut log = transfer_log(token, Address::ZERO, U256::from(1));
+        log.inner.data = alloy::primitives::LogData::new_unchecked(
+            vec![IERC20::Transfer::SIGNATURE_HASH],
+            alloy::primitives::Bytes::new(),
+        );
+        self.tx_receipts
+            .insert(tx_hash, successful_receipt(tx_hash, vec![log]));
+        self
+    }
+
     /// Configures how `submit_deposit` behaves; combinable with the
     /// confirm-behaviour knob, unlike the former one-knob-per-constructor
     /// design.

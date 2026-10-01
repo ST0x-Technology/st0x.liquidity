@@ -3580,6 +3580,7 @@ fn replacement_not_adoptable_response(
         | ReplacementNotAdoptable::ReplacementNotAWithdrawal { .. }
         | ReplacementNotAdoptable::ReplacementWithdrawsAnotherVault { .. }
         | ReplacementNotAdoptable::ReplacementWithdrewNothing { .. }
+        | ReplacementNotAdoptable::ReplacementReceiptUnreadable { .. }
         | ReplacementNotAdoptable::ReplacementWithdrawsMore { .. }
         | ReplacementNotAdoptable::ReplacementIsAnotherRedemptionsWithdrawal { .. }
         | ReplacementNotAdoptable::NoConfirmationDepth { .. }

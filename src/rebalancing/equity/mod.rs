@@ -564,6 +564,14 @@ pub enum ReplacementNotAdoptable {
         token: Address,
         bot_wallet: Address,
     },
+    /// The receipt's transfer logs could not be summed (a `Transfer` that does
+    /// not decode, or a sum that overflows), so what it paid is unknown.
+    #[error("could not read what replacement {replacement} paid the bot wallet: {source}")]
+    ReplacementReceiptUnreadable {
+        replacement: TxHash,
+        #[source]
+        source: Box<EquityRedemptionError>,
+    },
     /// The trigger and the inventory reservation booked the signed
     /// withdrawal's amount, so adopting a larger one would move shares nothing
     /// reserved. A smaller one is adopted: the receipt records what moved.
@@ -734,16 +742,23 @@ pub async fn verify_withdrawal_replacement(
             source: Box::new(source),
         })?
         .ok_or(ReplacementNotAdoptable::ReplacementNotMined { replacement })?;
-    if crate::equity_redemption::actual_withdrawn_amount_from_receipt(
+    match crate::equity_redemption::actual_withdrawn_amount_from_receipt(
         &receipt, call.token, bot_wallet,
-    )
-    .is_err()
-    {
-        return Err(ReplacementNotAdoptable::ReplacementWithdrewNothing {
-            replacement,
-            token: call.token,
-            bot_wallet,
-        });
+    ) {
+        Ok(_) => {}
+        Err(EquityRedemptionError::RaindexWithdrawTransferNotFound { .. }) => {
+            return Err(ReplacementNotAdoptable::ReplacementWithdrewNothing {
+                replacement,
+                token: call.token,
+                bot_wallet,
+            });
+        }
+        Err(source) => {
+            return Err(ReplacementNotAdoptable::ReplacementReceiptUnreadable {
+                replacement,
+                source: Box::new(source),
+            });
+        }
     }
 
     Ok(())
@@ -8045,6 +8060,59 @@ mod withdrawal_replacement_tests {
         assert!(
             matches!(error, WithdrawalNotSuperseded::Read { tx, .. } if tx == withdrawal),
             "a failed read is not proof either way: {error:?}"
+        );
+    }
+
+    /// A receipt that pays the bot wallet none of the token means the
+    /// replacement withdrew nothing; one whose transfer logs cannot be read
+    /// says so, with the cause, instead of claiming nothing was paid.
+    #[tokio::test]
+    async fn a_replacement_receipt_is_refused_with_its_real_cause() {
+        let signer = PrivateKeySigner::random();
+        let bot = signer.address();
+        let prepared = sign(&signer, TxKind::Call(INVENTORY), withdraw4(TOKEN, VAULT));
+        let mined =
+            MockRaindex::new().with_mined_tx(REPLACEMENT, speed_up(bot, withdraw4(TOKEN, VAULT)));
+
+        let paid_elsewhere = mined.with_transfer_receipt(
+            REPLACEMENT,
+            TOKEN,
+            Address::repeat_byte(0x0E),
+            U256::from(7),
+        );
+        let error =
+            verify_withdrawal_replacement(&paid_elsewhere, &prepared, REPLACEMENT, bot, REQUIRED)
+                .await
+                .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                ReplacementNotAdoptable::ReplacementWithdrewNothing { .. }
+            ),
+            "{error:?}"
+        );
+
+        let undecodable = MockRaindex::new()
+            .with_mined_tx(REPLACEMENT, speed_up(bot, withdraw4(TOKEN, VAULT)))
+            .with_undecodable_transfer_receipt(REPLACEMENT, TOKEN);
+        let error =
+            verify_withdrawal_replacement(&undecodable, &prepared, REPLACEMENT, bot, REQUIRED)
+                .await
+                .unwrap_err();
+        let ReplacementNotAdoptable::ReplacementReceiptUnreadable {
+            replacement,
+            source,
+        } = error
+        else {
+            panic!("an unreadable receipt must name its cause: {error:?}");
+        };
+        assert_eq!(replacement, REPLACEMENT);
+        assert!(
+            matches!(
+                *source,
+                crate::equity_redemption::EquityRedemptionError::RaindexWithdrawTransferDecodeFailed { .. }
+            ),
+            "{source:?}"
         );
     }
 }
