@@ -1,6 +1,8 @@
 //! `POST /quote/v2`: the request we send, the quote we accept, and the checks
 //! that bind Relay's approve and deposit steps to the transfer we asked for.
 
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
 use alloy::primitives::{Address, B256, Bytes, U256};
 use alloy::sol;
 use alloy::sol_types::SolCall;
@@ -34,6 +36,10 @@ pub struct QuoteRequest {
     /// Always explicit: an unset slippage makes Relay floor the fill 2% below
     /// the expected amount.
     pub slippage: BasisPoints,
+    /// How long the fill may take, sent as Relay's `ttl` in whole seconds.
+    /// Relay does not shorten the order deadline to it (see
+    /// [`RelayQuote::deadline`]).
+    pub ttl: Duration,
 }
 
 /// Relay's handle for a quote, used only to read its status.
@@ -67,6 +73,9 @@ pub struct RelayQuote {
     /// Decoded from the deposit step's calldata.
     pub order_id: RelayOrderId,
     pub amounts: QuoteAmounts,
+    /// The order's `output.deadline`: until then the solver may still fill.
+    /// Relay sets it a week after the quote whatever `ttl` asks for.
+    pub deadline: SystemTime,
     pub fees: QuoteFees,
     /// `None` when Relay sends no approve step.
     pub approve: Option<StepTransaction>,
@@ -190,6 +199,8 @@ pub enum QuoteMismatch {
     PaymentDetailsCurrency { expected: Address, actual: Address },
     #[error("payment details pay {actual}, expected {expected}")]
     PaymentDetailsAmount { expected: U256, actual: U256 },
+    #[error("order deadline {seconds} is not a representable time")]
+    Deadline { seconds: u64 },
 }
 
 /// A token on a chain, as a quote names it.
@@ -229,6 +240,7 @@ pub(super) struct QuoteRequestBody {
     recipient: Address,
     refund_to: Address,
     slippage_tolerance: String,
+    ttl: u64,
 }
 
 impl From<&QuoteRequest> for QuoteRequestBody {
@@ -246,6 +258,7 @@ impl From<&QuoteRequest> for QuoteRequestBody {
             recipient: request.recipient,
             refund_to: request.refund_to,
             slippage_tolerance: slippage.to_string(),
+            ttl: request.ttl.as_secs(),
         }
     }
 }
@@ -346,6 +359,8 @@ struct RawRefund {
 #[derive(Debug, Deserialize)]
 struct RawOrderOutput {
     payments: Vec<RawPayment>,
+    /// Unix seconds.
+    deadline: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -425,6 +440,11 @@ impl QuoteResponse {
 
         let order_id = check_deposit(&deposit, request, origin_stable, depository)?;
 
+        let seconds = self.protocol.v2.order_data.output.deadline;
+        let deadline = UNIX_EPOCH
+            .checked_add(Duration::from_secs(seconds))
+            .ok_or(QuoteMismatch::Deadline { seconds })?;
+
         Ok(RelayQuote {
             request_id: self.request_id,
             order_id,
@@ -434,6 +454,7 @@ impl QuoteResponse {
                 minimum_out: self.details.currency_out.minimum_amount,
                 slippage: request.slippage,
             },
+            deadline,
             fees: QuoteFees {
                 relayer: self.fees.relayer.amount,
                 gas: self.fees.gas.amount,
@@ -782,6 +803,24 @@ pub(super) mod tests {
             recipient: FUNDED_WALLET,
             refund_to: FUNDED_WALLET,
             slippage: BasisPoints::new(30).unwrap(),
+            ttl: Duration::from_secs(1800),
+        }
+    }
+
+    /// A 1000-unit request for the `0xdead` user, as the unfunded fixtures
+    /// were quoted.
+    fn dead_request(origin: Chain, destination: Chain, slippage: u16) -> QuoteRequest {
+        let dead = address!("0x000000000000000000000000000000000000dEaD");
+
+        QuoteRequest {
+            origin,
+            destination,
+            amount: U256::from(1_000_000_000),
+            user: dead,
+            recipient: dead,
+            refund_to: dead,
+            slippage: BasisPoints::new(slippage).unwrap(),
+            ttl: Duration::from_secs(1800),
         }
     }
 
@@ -825,6 +864,7 @@ pub(super) mod tests {
                 "recipient": "0xe385c5ee42d7b81a6a51e759faafca6159fd04b6",
                 "refundTo": "0xe385c5ee42d7b81a6a51e759faafca6159fd04b6",
                 "slippageTolerance": "30",
+                "ttl": 1800,
             })
         );
     }
@@ -886,8 +926,6 @@ pub(super) mod tests {
     /// Both RAI-2586 directions at 1000 units, quoted for the `0xdead` user.
     #[test]
     fn both_directions_validate() {
-        let dead = address!("0x000000000000000000000000000000000000dEaD");
-
         for (fixture, origin, destination) in [
             (
                 include_str!("../../relay-fixtures/quote_robinhood_to_ethereum.json"),
@@ -900,15 +938,7 @@ pub(super) mod tests {
                 Chain::Robinhood,
             ),
         ] {
-            let request = QuoteRequest {
-                origin,
-                destination,
-                amount: U256::from(1_000_000_000),
-                user: dead,
-                recipient: dead,
-                refund_to: dead,
-                slippage: BasisPoints::new(30).unwrap(),
-            };
+            let request = dead_request(origin, destination, 50);
 
             let quote = validate(&serde_json::from_str(fixture).unwrap(), &request).unwrap();
 
@@ -1276,6 +1306,37 @@ pub(super) mod tests {
                     destination: 18
                 }
             ),
+            "{error:?}"
+        );
+    }
+
+    /// Quoted live at Unix 1,790,882,607 with `ttl: 1800`: the deadline still
+    /// lands 604,801 s later, as with no `ttl` at all.
+    #[test]
+    fn deadline_is_read_from_the_order_and_ignores_the_ttl() {
+        let quote = validate(
+            &serde_json::from_str(include_str!(
+                "../../relay-fixtures/quote_ttl_robinhood_to_ethereum.json"
+            ))
+            .unwrap(),
+            &dead_request(Chain::Robinhood, Chain::Ethereum, 30),
+        )
+        .unwrap();
+
+        assert_eq!(
+            quote.deadline,
+            UNIX_EPOCH + Duration::from_secs(1_791_487_408)
+        );
+    }
+
+    #[test]
+    fn unrepresentable_deadline_is_refused() {
+        let error = refusal(|body| {
+            body["protocol"]["v2"]["orderData"]["output"]["deadline"] = json!(u64::MAX);
+        });
+
+        assert!(
+            matches!(error, QuoteMismatch::Deadline { seconds: u64::MAX }),
             "{error:?}"
         );
     }
