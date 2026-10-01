@@ -207,6 +207,14 @@ pub enum QuoteMismatch {
     },
     #[error("gas fee is on chain {actual}, expected {expected}")]
     GasFeeChain { expected: u64, actual: u64 },
+    #[error("order has no refund option")]
+    MissingRefund,
+    #[error("refund is on {actual}, expected {origin} or {destination}")]
+    RefundChain {
+        origin: &'static str,
+        destination: &'static str,
+        actual: String,
+    },
     #[error("order has {count} output payments, expected one")]
     PaymentCount { count: usize },
     #[error("order deadline {seconds} is not a representable time")]
@@ -362,7 +370,10 @@ struct RawOrderInput {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct RawRefund {
+    /// Relay's chain name, not the numeric id.
+    chain_id: String,
     recipient: Address,
 }
 
@@ -437,7 +448,7 @@ impl QuoteResponse {
 
         check_fees(&self.fees, origin)?;
         check_output_payment(&self.details, &self.protocol.v2.order_data, request)?;
-        check_refunds(&self.protocol.v2.order_data, request.refund_to)?;
+        check_refunds(&self.protocol.v2.order_data, request)?;
         check_payment_details(&self.protocol.v2.payment_details, request, depository)?;
 
         let (approve, deposit) = split_steps(self.steps)?;
@@ -562,14 +573,50 @@ fn check_output_payment(
     )
 }
 
-fn check_refunds(order: &RawOrderData, refund_to: Address) -> Result<(), QuoteMismatch> {
-    order
+/// Relay offers a refund on either end: in the origin stable on the origin
+/// chain or in the destination stable on the destination chain. Every option
+/// must pay our `refundTo`, and there must be at least one.
+fn check_refunds(order: &RawOrderData, request: &QuoteRequest) -> Result<(), QuoteMismatch> {
+    let origin = request
+        .origin
+        .relay_name()
+        .ok_or(QuoteMismatch::UnnamedChain {
+            chain: request.origin,
+        })?;
+    let destination = request
+        .destination
+        .relay_name()
+        .ok_or(QuoteMismatch::UnnamedChain {
+            chain: request.destination,
+        })?;
+
+    let mut refunds = order
         .inputs
         .iter()
         .flat_map(|input| &input.refunds)
-        .try_for_each(|refund| {
-            check_address(QuoteField::RefundRecipient, refund_to, refund.recipient)
-        })
+        .peekable();
+
+    if refunds.peek().is_none() {
+        return Err(QuoteMismatch::MissingRefund);
+    }
+
+    refunds.try_for_each(|refund| {
+        check_address(
+            QuoteField::RefundRecipient,
+            request.refund_to,
+            refund.recipient,
+        )?;
+
+        if refund.chain_id == origin || refund.chain_id == destination {
+            Ok(())
+        } else {
+            Err(QuoteMismatch::RefundChain {
+                origin,
+                destination,
+                actual: refund.chain_id.clone(),
+            })
+        }
+    })
 }
 
 fn check_payment_details(
@@ -1314,6 +1361,35 @@ pub(super) mod tests {
                     expected: "robinhood",
                     ref actual,
                 } if actual == "ethereum"
+            ),
+            "{error:?}"
+        );
+    }
+
+    #[test]
+    fn order_without_a_refund_option_is_refused() {
+        let error = refusal(|body| {
+            body["protocol"]["v2"]["orderData"]["inputs"][0]["refunds"] = json!([]);
+        });
+
+        assert!(matches!(error, QuoteMismatch::MissingRefund), "{error:?}");
+    }
+
+    #[test]
+    fn refund_on_a_third_chain_is_refused() {
+        let error = refusal(|body| {
+            body["protocol"]["v2"]["orderData"]["inputs"][0]["refunds"][1]["chainId"] =
+                json!("base");
+        });
+
+        assert!(
+            matches!(
+                error,
+                QuoteMismatch::RefundChain {
+                    origin: "robinhood",
+                    destination: "ethereum",
+                    ref actual,
+                } if actual == "base"
             ),
             "{error:?}"
         );
