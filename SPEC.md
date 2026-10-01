@@ -129,6 +129,11 @@ and the system proves market fit.
     either direction, and at most one Alpaca-outbound transfer across all
     corridors, because Alpaca's withdrawable cash and its USDC inflight are
     shared. Releasing a transfer frees only the guard that transfer held.
+  - Each corridor's band is computed against the full Alpaca balance, and
+    chain-to-Alpaca transfers on different corridors are not yet sized against
+    each other, so two corridors in one tick can both move cash to Alpaca and
+    overshoot. A second corridor needs that sizing before it loads (part 3 of
+    the Robinhood corridor work).
 - **Complete Audit Trail**: All rebalancing operations tracked as events
   (CrossVenueEquityTransfer, CrossVenueCashTransfer)
 - **Integration**: Uses Alpaca for share/USDC management, Circle CCTP for
