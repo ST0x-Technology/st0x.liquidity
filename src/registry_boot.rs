@@ -65,7 +65,8 @@ pub fn report_boot(outcome: &BootOutcome) {
             %failed,
             ?carried,
             "token file: the accepted copy failed to start twice; booting the last good tables \
-             with the listings it added switched off"
+             with the listings it added kept for unfinished work and recovery, trading and \
+             rebalancing off"
         ),
         BootOutcome::FallbackAgain {
             record,

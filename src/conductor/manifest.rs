@@ -218,6 +218,7 @@ mod tests {
                 deviation: float!(0.15),
             }),
             transfer_timeout: Duration::from_secs(30 * 60),
+            recovery_hold_alert_after: Duration::from_secs(60 * 60),
             chains: BTreeMap::from([(
                 Chain::Base,
                 ChainRebalancingConfig::for_test(ChainAssets {

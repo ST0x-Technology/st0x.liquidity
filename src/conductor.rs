@@ -46,7 +46,7 @@ use st0x_bridge::corridor::UsdcCorridor;
 use st0x_config::{
     AlertsCtx, BrokerCtx, ChainAssets, ChainRegistry, ChainRole, Ctx, CtxError, ExecutionThreshold,
     HedgedChain, HedgingAssets, InventoryMode, IssuanceStatusCtx, OnchainWalletCtx, OperationMode,
-    OrchestratorAddresses, RebalancingCtx,
+    OrchestratorAddresses, RebalancingCtx, RebalancingMode,
 };
 use st0x_dto::Statement;
 use st0x_event_sorcery::{
@@ -2348,6 +2348,32 @@ fn build_equity_tokenization_services(
     })
 }
 
+/// Secondary listings with recovery enabled, rebalancing disabled and no
+/// unfinished work: the recovery-only state a listing keeps while it drains,
+/// left in place after the work finished.
+fn idle_recovery_only_secondary_listings(
+    chains: &ChainRegistry,
+    unfinished: &completion::UnfinishedListings,
+) -> BTreeSet<(Chain, Symbol)> {
+    chains
+        .hedged_with_roles()
+        .filter(|(role, _)| *role == ChainRole::Secondary)
+        .flat_map(|(_, hedged)| {
+            hedged
+                .assets
+                .equities
+                .symbols
+                .iter()
+                .filter(|(_, equity)| {
+                    equity.wrapped_equity_recovery == OperationMode::Enabled
+                        && equity.rebalancing == RebalancingMode::Disabled
+                })
+                .map(|(symbol, _)| (hedged.chain, symbol.clone()))
+        })
+        .filter(|listing| !unfinished.contains(listing))
+        .collect()
+}
+
 impl PositionAndRebalancing {
     async fn setup(rebalancing_ctx: RebalancingCtx, deps: RebalancingDeps) -> anyhow::Result<Self> {
         // Built exactly once: the Single-Framework-Instance rule
@@ -2365,6 +2391,17 @@ impl PositionAndRebalancing {
         let wallet_ctx = deps.ctx.wallet()?;
         let wallets = ChainWallets::from_wallet_ctx(wallet_ctx);
         let unfinished = completion::unfinished_listings(&deps.pool).await?;
+        for (chain, symbol) in idle_recovery_only_secondary_listings(&deps.ctx.chains, &unfinished)
+        {
+            warn!(
+                %chain,
+                %symbol,
+                "Secondary listing keeps wrapped equity recovery enabled with rebalancing \
+                 disabled and has no open work; disable its recovery too. If no listing on \
+                 the chain rebalances, the chain gets no equity services and tokens stranded \
+                 there later are not recovered",
+            );
+        }
         let completion_only = unfinished
             .iter()
             .filter(|(chain, symbol)| {
@@ -3447,6 +3484,7 @@ fn build_rebalancing_service(
             inventory_staleness_bound: rebalancing_ctx.inventory_staleness_bound,
             usdc: rebalancing_ctx.usdc.clone(),
             transfer_timeout: rebalancing_ctx.transfer_timeout,
+            recovery_hold_alert_after: rebalancing_ctx.recovery_hold_alert_after,
             chains,
             allocation,
             cash_reserved: deps.ctx.assets.cash.as_ref().map(|cash| cash.reserved),
@@ -3618,7 +3656,6 @@ fn build_hedged_equity_services<Signer: Wallet + Clone + 'static>(
 /// of the rebalancing wiring hangs off, once the startup preflights have
 /// passed.
 struct PrimaryRebalancingServices {
-    primary_chain: Chain,
     bot_gas_enqueuer: BotGasReceiptCostEnqueuer,
     tokenizer: Arc<dyn Tokenizer>,
     mint_authorization: MintAuthorizationInfra,
@@ -3681,7 +3718,6 @@ async fn build_primary_rebalancing_services<Signer: Wallet + Clone>(
         build_mint_authorization_infra(issuance_client, &deps.apalis_pool).await?;
 
     Ok(PrimaryRebalancingServices {
-        primary_chain,
         bot_gas_enqueuer,
         tokenizer,
         mint_authorization,
@@ -3710,7 +3746,6 @@ fn spawn_rebalancing_infrastructure<Signer: Wallet + Clone>(
         let BrokerCtx::AlpacaBrokerApi(alpaca_auth) = &deps.ctx.broker;
 
         let PrimaryRebalancingServices {
-            primary_chain,
             bot_gas_enqueuer,
             tokenizer,
             mint_authorization,
@@ -3934,7 +3969,6 @@ fn spawn_rebalancing_infrastructure<Signer: Wallet + Clone>(
             mint_store: built.mint.clone(),
             position_authority: Some((built.position.clone(), deps.ctx.execution_threshold)),
             transfer_services: equity_transfer_services.clone(),
-            primary_chain,
             job_queue: deps.schedulers.transfer_equity_to_market_making.clone(),
         });
 
@@ -4204,7 +4238,9 @@ async fn refuse_recoveries_stranded_by_chain_services(
             {
                 Some((*chain, symbol.clone()))
             }
-            GuardState::HeldForRecovery { .. } | GuardState::ActiveTransfer { .. } => None,
+            GuardState::HeldForRecovery { .. }
+            | GuardState::ActiveTransfer { .. }
+            | GuardState::Recovering { .. } => None,
         });
 
     if let Some((chain, symbol)) = held {
@@ -5247,10 +5283,10 @@ fn unique_transfer_reservations(
 
 /// Returns `true` when `mint` is a pre-wrap post-receipt state
 /// (`TokensReceived` or `WrapSubmitted`) AND its symbol's guard is
-/// `HeldForRecovery` for the mint's chain. These mints are excluded from
-/// direct `resume_mints` because `UnwrappedEquityRecovery` owns the slot and
-/// will re-wrap and deposit the tokens; calling `resume_mint` concurrently
-/// would race. A hold for another chain belongs to that chain's recovery,
+/// `HeldForRecovery` or `Recovering` for the mint's chain. These mints are
+/// excluded from direct `resume_mints` because `UnwrappedEquityRecovery` owns
+/// the slot and will re-wrap and deposit the tokens; calling `resume_mint`
+/// concurrently would race. A hold for another chain belongs to that chain's recovery,
 /// which cannot reach this mint's tokens.
 fn is_pre_wrap_held_for_recovery(
     mint: &TokenizedEquityMint,
@@ -5264,7 +5300,9 @@ fn is_pre_wrap_held_for_recovery(
             Err(poison) => poison.into_inner(),
         };
         match guard.get(symbol) {
-            Some(GuardState::HeldForRecovery { chain }) => *chain == mint.chain(),
+            Some(GuardState::HeldForRecovery { chain } | GuardState::Recovering { chain, .. }) => {
+                *chain == mint.chain()
+            }
             Some(GuardState::ActiveTransfer { .. }) | None => false,
         }
     } else {
@@ -8610,6 +8648,7 @@ mod tests {
                 allocation: AllocationCtx::base_test(),
                 usdc: UsdcCorridors::base_cctp_disabled(),
                 transfer_timeout: Duration::from_secs(60),
+                recovery_hold_alert_after: Duration::from_secs(60 * 60),
                 chains: BTreeMap::from([(
                     Chain::Base,
                     ChainRebalancingConfig::for_test(ChainAssets {
@@ -9782,6 +9821,7 @@ mod tests {
                 allocation: AllocationCtx::base_test(),
                 usdc: UsdcCorridors::base_cctp_disabled(),
                 transfer_timeout: Duration::from_secs(60),
+                recovery_hold_alert_after: Duration::from_secs(60 * 60),
                 chains: BTreeMap::from([(
                     Chain::Base,
                     ChainRebalancingConfig::for_test(ChainAssets {
@@ -12267,6 +12307,7 @@ mod tests {
                 allocation: AllocationCtx::base_test(),
                 usdc: UsdcCorridors::base_cctp_disabled(),
                 transfer_timeout: Duration::from_secs(60),
+                recovery_hold_alert_after: Duration::from_secs(60 * 60),
                 chains: BTreeMap::from([(
                     Chain::Base,
                     ChainRebalancingConfig::for_test(ChainAssets {
@@ -12379,6 +12420,7 @@ mod tests {
                 allocation: AllocationCtx::base_test(),
                 usdc: UsdcCorridors::base_cctp_disabled(),
                 transfer_timeout: Duration::from_secs(60),
+                recovery_hold_alert_after: Duration::from_secs(60 * 60),
                 chains: BTreeMap::from([(
                     Chain::Base,
                     ChainRebalancingConfig::for_test(ChainAssets {
@@ -17065,6 +17107,7 @@ mod tests {
                     deviation: float!(0.2),
                 }),
                 transfer_timeout: Duration::from_secs(30 * 60),
+                recovery_hold_alert_after: Duration::from_secs(60 * 60),
                 chains: BTreeMap::from([(
                     Chain::Base,
                     ChainRebalancingConfig::for_test(ChainAssets {
@@ -17202,6 +17245,7 @@ mod tests {
                 allocation: AllocationCtx::base_test(),
                 usdc: UsdcCorridors::base_cctp(threshold),
                 transfer_timeout: Duration::from_secs(30 * 60),
+                recovery_hold_alert_after: Duration::from_secs(60 * 60),
                 chains: BTreeMap::from([(
                     Chain::Base,
                     ChainRebalancingConfig::for_test(ChainAssets {
@@ -17367,6 +17411,7 @@ mod tests {
                     deviation: float!(0.2),
                 }),
                 transfer_timeout: Duration::from_secs(30 * 60),
+                recovery_hold_alert_after: Duration::from_secs(60 * 60),
                 chains: BTreeMap::from([(
                     Chain::Base,
                     ChainRebalancingConfig::for_test(ChainAssets {
@@ -17530,6 +17575,7 @@ mod tests {
                     deviation: float!(0.2),
                 }),
                 transfer_timeout: Duration::from_secs(30 * 60),
+                recovery_hold_alert_after: Duration::from_secs(60 * 60),
                 chains: BTreeMap::from([(
                     Chain::Base,
                     ChainRebalancingConfig::for_test(ChainAssets {
@@ -21764,6 +21810,35 @@ mod tests {
         assert_eq!(derivatives[&symbol], wrapped);
         assert!(!wallet_equity_polled(&base.assets, &symbol));
         assert!(!wallet_unwrapped_equity_token_addresses(&base.assets).contains_key(&symbol));
+    }
+
+    #[test]
+    fn startup_flags_only_idle_recovery_only_secondary_listings() {
+        let mut ctx = create_test_ctx_with_order_owner(Address::ZERO);
+        let mut secondary =
+            ethereum_hedged_chain(None, RebalancingMode::Disabled, ETHEREUM_INVENTORY);
+        let tsla = Symbol::new("TSLA").unwrap();
+        let aapl = Symbol::new("AAPL").unwrap();
+        let mut recovery_only = secondary.assets.equities.symbols[&tsla].clone();
+        recovery_only.wrapped_equity_recovery = OperationMode::Enabled;
+        secondary
+            .assets
+            .equities
+            .symbols
+            .insert(tsla.clone(), recovery_only.clone());
+        secondary
+            .assets
+            .equities
+            .symbols
+            .insert(aapl.clone(), recovery_only);
+        ctx.chains.insert_secondary(secondary);
+
+        let unfinished = BTreeSet::from([(Chain::Ethereum, aapl)]);
+
+        assert_eq!(
+            idle_recovery_only_secondary_listings(&ctx.chains, &unfinished),
+            BTreeSet::from([(Chain::Ethereum, tsla)]),
+        );
     }
 
     #[test]

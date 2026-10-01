@@ -2041,6 +2041,81 @@ impl BotGasFailureClassifier for MintError {
     }
 }
 
+/// Whether a failed `resume_mint` or `resume_redemption` can succeed on a
+/// later attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) enum ResumeFailureKind {
+    /// RPC, confirmation, gas, node sync or local persistence: the same call
+    /// can succeed once the condition clears.
+    Retryable,
+    /// A missing or terminal mint, a broken invariant, a revert or a config
+    /// gap: every retry fails the same way.
+    Permanent,
+}
+
+/// A `resume_mint` failure as the wallet-recovery aggregates record it.
+///
+/// `MintError` can't be carried as a typed `#[source]` here:
+/// `EventSourced::Error` must be `Clone + Serialize + DeserializeOwned`,
+/// which the RPC, sqlx and aggregate errors it wraps are not (see
+/// [`BotGasEnqueueFailure`]). `kind` gives callers a matchable
+/// classification; `message` is the rendered `MintError`, for diagnostics.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, Error)]
+#[error("{message}")]
+pub(crate) struct MintResumeFailure {
+    pub(crate) kind: ResumeFailureKind,
+    pub(crate) message: String,
+}
+
+impl MintResumeFailure {
+    pub(crate) fn from_mint_error(error: &MintError) -> Self {
+        Self {
+            kind: error.resume_failure_kind(),
+            message: error.to_string(),
+        }
+    }
+}
+
+impl MintError {
+    fn resume_failure_kind(&self) -> ResumeFailureKind {
+        use ResumeFailureKind::{Permanent, Retryable};
+
+        match self {
+            Self::Aggregate(error) => match error.as_ref() {
+                AggregateError::UserError(_) => Permanent,
+                _ => Retryable,
+            },
+            Self::Wrapper(error) => match error {
+                WrapperError::Evm(evm) if evm.is_revert() => Permanent,
+                WrapperError::SymbolNotConfigured(_)
+                | WrapperError::MissingDepositEvent
+                | WrapperError::MissingWithdrawEvent
+                | WrapperError::MissingUnderlyingTransfer { .. }
+                | WrapperError::RedeemExceedsMax { .. }
+                | WrapperError::VaultAssetMismatch { .. } => Permanent,
+                WrapperError::Evm(_)
+                | WrapperError::Contract(_)
+                | WrapperError::Ratio(_)
+                | WrapperError::MissingBlockNumber { .. } => Retryable,
+            },
+            Self::Raindex(RaindexError::Evm(evm)) if evm.is_revert() => Permanent,
+            Self::Verification(error) => verification_resume_failure_kind(error),
+            Self::Raindex(RaindexError::ZeroAmount)
+            | Self::EntityNotFound { .. }
+            | Self::UnexpectedState { .. }
+            | Self::UnknownTokenizedEquity { .. } => Permanent,
+            Self::RebalancingNotEnabled { .. }
+            | Self::ChainServicesMissing(_)
+            | Self::GasReadiness(_)
+            | Self::Raindex(_)
+            | Self::VaultLookup(_)
+            | Self::BotGasEnqueue(_)
+            | Self::VaultModeCheck(_)
+            | Self::AuthorizationEnqueue(_) => Retryable,
+        }
+    }
+}
+
 /// Distinguishes mint failures before vs after tokens were received from
 /// Alpaca. Post-receipt failures must NOT clear the in-progress guard
 /// because real tokens exist in the wallet and startup recovery will
@@ -2160,7 +2235,114 @@ pub enum RedemptionError {
     PreparedWithdrawalHashMismatch { expected: TxHash, actual: TxHash },
 }
 
+/// A `resume_redemption` failure as the wallet-recovery aggregates record it.
+/// Carries a rendered message for the same reason as [`MintResumeFailure`].
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize, Error)]
+#[error("{message}")]
+pub(crate) struct RedemptionResumeFailure {
+    pub(crate) kind: ResumeFailureKind,
+    pub(crate) message: String,
+}
+
+impl RedemptionResumeFailure {
+    pub(crate) fn from_redemption_error(error: &RedemptionError) -> Self {
+        Self {
+            kind: error.resume_failure_kind(),
+            message: error.to_string(),
+        }
+    }
+}
+
+fn alpaca_resume_failure_kind(error: &AlpacaTokenizationError) -> ResumeFailureKind {
+    use ResumeFailureKind::{Permanent, Retryable};
+
+    match error {
+        AlpacaTokenizationError::ApiError { status, .. }
+            if status.is_server_error() || *status == reqwest::StatusCode::TOO_MANY_REQUESTS =>
+        {
+            Retryable
+        }
+        AlpacaTokenizationError::Reqwest(_)
+        | AlpacaTokenizationError::Auth(_)
+        | AlpacaTokenizationError::PollTimeout { .. } => Retryable,
+        AlpacaTokenizationError::ApiError { .. }
+        | AlpacaTokenizationError::PrivateKeyJwtUnsupported
+        | AlpacaTokenizationError::JsonParse(_)
+        | AlpacaTokenizationError::Utf8(_)
+        | AlpacaTokenizationError::InsufficientPosition { .. }
+        | AlpacaTokenizationError::UnsupportedAccount
+        | AlpacaTokenizationError::InvalidParameters { .. }
+        | AlpacaTokenizationError::RequestNotFound { .. }
+        | AlpacaTokenizationError::DuplicateMintIssuerRequestId { .. }
+        | AlpacaTokenizationError::InvalidBaseUrl(_)
+        | AlpacaTokenizationError::WrongNetwork { .. }
+        | AlpacaTokenizationError::NetworkMissing { .. } => Permanent,
+    }
+}
+
+/// A provider error or a receipt a lagging node has not indexed yet can clear
+/// on a later read; a revert or a wrong transfer cannot.
+fn verification_resume_failure_kind(error: &MintVerificationError) -> ResumeFailureKind {
+    match error {
+        MintVerificationError::Provider(_) | MintVerificationError::ReceiptNotFound { .. } => {
+            ResumeFailureKind::Retryable
+        }
+        MintVerificationError::TransactionReverted { .. }
+        | MintVerificationError::NoMatchingTransfer { .. }
+        | MintVerificationError::InsufficientTransferAmount { .. }
+        | MintVerificationError::TransferOverflow { .. } => ResumeFailureKind::Permanent,
+    }
+}
+
 impl RedemptionError {
+    fn resume_failure_kind(&self) -> ResumeFailureKind {
+        use ResumeFailureKind::{Permanent, Retryable};
+
+        match self {
+            Self::ReattestLegacyUnderlying(_) if self.is_permanent_underlying_mismatch() => {
+                Permanent
+            }
+            Self::Raindex(RaindexError::Evm(evm)) | Self::Tokenizer(TokenizerError::Evm(evm))
+                if evm.is_revert() =>
+            {
+                Permanent
+            }
+            Self::Alpaca(error) | Self::Tokenizer(TokenizerError::Alpaca(error)) => {
+                alpaca_resume_failure_kind(error)
+            }
+            Self::Tokenizer(TokenizerError::MintVerification(error)) => {
+                verification_resume_failure_kind(error)
+            }
+            // The onchain step already landed; only recording its gas cost
+            // failed, and a later enqueue can succeed.
+            Self::Send(AggregateError::UserError(LifecycleError::Apply(
+                EquityRedemptionError::BotGasEnqueueFailed(_),
+            ))) => Retryable,
+            Self::Send(AggregateError::UserError(_))
+            | Self::Raindex(RaindexError::ZeroAmount)
+            | Self::Tokenizer(TokenizerError::MissingRedemptionWallet)
+            | Self::SharesConversion(_)
+            | Self::EntityNotFound { .. }
+            | Self::SendFailed { .. }
+            | Self::UnexpectedEntity { .. }
+            | Self::Rejected
+            | Self::LegacyVaultWithdrawPending { .. }
+            | Self::PreparedWithdrawalHashMismatch { .. } => Permanent,
+            Self::Send(_)
+            | Self::RebalancingNotEnabled { .. }
+            | Self::LegacyIssuerSendPending { .. }
+            | Self::ReattestLegacyUnderlying(_)
+            | Self::PrepareTaskJoin(_)
+            | Self::ChainServicesMissing(_)
+            | Self::GasReadiness(_)
+            | Self::Raindex(_)
+            | Self::VaultLookup(_)
+            | Self::Tokenizer(TokenizerError::Evm(_))
+            | Self::BotGasEnqueue(_)
+            | Self::UnexpectedPendingStatus => Retryable,
+        }
+    }
+
     pub(crate) fn gas_readiness_retry_interval(&self) -> Option<std::time::Duration> {
         match self {
             Self::GasReadiness(failure) => failure.retry_interval(),
@@ -4846,6 +5028,7 @@ mod tests {
                 allocation: AllocationCtx::base_test(),
                 usdc: UsdcCorridors::base_cctp_disabled(),
                 transfer_timeout: Duration::from_secs(1800),
+                recovery_hold_alert_after: Duration::from_secs(60 * 60),
                 chains: BTreeMap::from([(
                     Chain::Base,
                     ChainRebalancingConfig::for_test(ChainAssets::default()),
@@ -5003,6 +5186,7 @@ mod tests {
                 allocation: AllocationCtx::base_test(),
                 usdc: UsdcCorridors::base_cctp_disabled(),
                 transfer_timeout: Duration::from_secs(1800),
+                recovery_hold_alert_after: Duration::from_secs(60 * 60),
                 chains: BTreeMap::from([(
                     Chain::Base,
                     ChainRebalancingConfig::for_test(ChainAssets::default()),
@@ -5508,6 +5692,7 @@ mod tests {
                 allocation: AllocationCtx::base_test(),
                 usdc: UsdcCorridors::base_cctp_disabled(),
                 transfer_timeout: Duration::from_secs(1800),
+                recovery_hold_alert_after: Duration::from_secs(60 * 60),
                 chains: BTreeMap::from([(
                     Chain::Base,
                     ChainRebalancingConfig::for_test(ChainAssets::default()),
@@ -5659,6 +5844,7 @@ mod tests {
                 allocation: AllocationCtx::base_test(),
                 usdc: UsdcCorridors::base_cctp_disabled(),
                 transfer_timeout: Duration::from_secs(1800),
+                recovery_hold_alert_after: Duration::from_secs(60 * 60),
                 chains: BTreeMap::from([(
                     Chain::Base,
                     ChainRebalancingConfig::for_test(ChainAssets::default()),
@@ -7285,6 +7471,21 @@ mod tests {
             ),
             "expected BotGasEnqueueFailed, got: {error:?}"
         );
+    }
+
+    /// A redemption whose withdrawal landed but whose gas-cost enqueue failed
+    /// is retried by recovery, not recorded as a permanent recovery failure.
+    #[test]
+    fn a_bot_gas_enqueue_failure_after_a_landed_step_is_retryable() {
+        let error = RedemptionError::Send(AggregateError::UserError(LifecycleError::Apply(
+            EquityRedemptionError::BotGasEnqueueFailed(crate::bot_gas::BotGasEnqueueFailure {
+                tx_hash: alloy::primitives::TxHash::ZERO,
+                kind: crate::bot_gas::QueuePushFailureKind::Push,
+                message: "pool closed".to_string(),
+            }),
+        )));
+
+        assert_eq!(error.resume_failure_kind(), ResumeFailureKind::Retryable);
     }
 
     /// Re-running the job entry point with an id whose aggregate already

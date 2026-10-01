@@ -11,6 +11,7 @@ use alloy::providers::{Provider, ProviderBuilder};
 use alloy::signers::local::PrivateKeySigner;
 use chrono::Utc;
 use httpmock::prelude::*;
+use serde::de::DeserializeOwned;
 use serde_json::json;
 use sqlx::SqlitePool;
 use std::collections::{BTreeMap, HashMap};
@@ -49,6 +50,9 @@ use crate::conductor::job::{BackpressureStreak, Job};
 use crate::equity_redemption::{
     EquityRedemption, EquityRedemptionCommand, RedemptionAggregateId, redemption_aggregate_id,
 };
+use crate::inventory::snapshot::{
+    InventorySnapshot, InventorySnapshotCommand, InventorySnapshotId,
+};
 use crate::inventory::view::InFlightEquityLocation;
 use crate::inventory::{
     BroadcastingInventory, ImbalanceThreshold, Inventory, InventoryView, Operator, PollFreshness,
@@ -60,11 +64,11 @@ use crate::onchain::mock::MockRaindex;
 use crate::position::{Position, PositionCommand, TradeId};
 use crate::rebalancing::equity::{
     ChainEquityServices, CrossVenueEquityTransfer, EquityTransferServices, MintTransferError,
-    TransferEquityToHedging, TransferEquityToHedgingCtx, TransferEquityToHedgingJobQueue,
-    TransferEquityToMarketMaking, TransferEquityToMarketMakingCtx,
+    ResumeFailureKind, TransferEquityToHedging, TransferEquityToHedgingCtx,
+    TransferEquityToHedgingJobQueue, TransferEquityToMarketMaking, TransferEquityToMarketMakingCtx,
     TransferEquityToMarketMakingJobError, TransferEquityToMarketMakingJobQueue,
 };
-use crate::rebalancing::trigger::GuardState;
+use crate::rebalancing::trigger::{GuardState, HeldRecovery, PendingMintResumes};
 use crate::rebalancing::usdc::{TransferUsdcToHedging, TransferUsdcToMarketMaking};
 use crate::rebalancing::{
     ChainRebalancingConfig, RebalancingSchedulers, RebalancingService, RebalancingServiceConfig,
@@ -162,6 +166,36 @@ async fn pending_equity_redemption_job_count(apalis_pool: &apalis_sqlite::Sqlite
         .unwrap()
 }
 
+/// Takes the single pending `JobPayload` row from the apalis Jobs table and
+/// marks it Done, as the registered worker would on picking it up.
+async fn take_pending_job<JobPayload: DeserializeOwned>(
+    apalis_pool: &apalis_sqlite::SqlitePool,
+) -> JobPayload {
+    let job_type = std::any::type_name::<JobPayload>();
+    let (row_id, payload): (String, Vec<u8>) =
+        sqlx_apalis::query_as("SELECT id, job FROM Jobs WHERE status = 'Pending' AND job_type = ?")
+            .bind(job_type)
+            .fetch_one(apalis_pool)
+            .await
+            .unwrap_or_else(|error| panic!("expected exactly one pending {job_type} job: {error}"));
+
+    sqlx_apalis::query("UPDATE Jobs SET status = 'Done' WHERE id = ?")
+        .bind(&row_id)
+        .execute(apalis_pool)
+        .await
+        .unwrap();
+
+    serde_json::from_slice(&payload).unwrap()
+}
+
+async fn pending_job_count<JobPayload>(apalis_pool: &apalis_sqlite::SqlitePool) -> i64 {
+    sqlx_apalis::query_scalar("SELECT COUNT(*) FROM Jobs WHERE status = 'Pending' AND job_type = ?")
+        .bind(std::any::type_name::<JobPayload>())
+        .fetch_one(apalis_pool)
+        .await
+        .unwrap()
+}
+
 fn mock_vault_lookup_for_symbol(symbol: &Symbol, token: Address) -> Arc<dyn VaultLookup> {
     Arc::new(
         MockVaultLookup::new()
@@ -249,6 +283,19 @@ fn aapl_equities(operational_limit: Option<&str>) -> ChainEquities {
     }
 }
 
+/// Production load refuses a rebalancing listing without recovery. Trigger
+/// tests that build a two-chain plan in memory use this so the fixture meets
+/// that recovery rule. It ignores the chain capability gates, so it is not a
+/// config the loader would accept on every chain the tests use. The planner
+/// itself does not check recovery.
+fn aapl_equities_with_recovery(operational_limit: Option<&str>) -> ChainEquities {
+    let mut equities = aapl_equities(operational_limit);
+    for asset in equities.symbols.values_mut() {
+        asset.wrapped_equity_recovery = OperationMode::Enabled;
+    }
+    equities
+}
+
 fn chain_config(equities: ChainEquities, cash: Option<ChainCashAsset>) -> ChainRebalancingConfig {
     ChainRebalancingConfig {
         assets: ChainAssets { equities, cash },
@@ -276,6 +323,7 @@ fn test_trigger_config() -> RebalancingServiceConfig {
             deviation: float!(0.2),
         }),
         transfer_timeout: Duration::from_secs(30 * 60),
+        recovery_hold_alert_after: Duration::from_secs(60 * 60),
         chains: BTreeMap::from([(
             Chain::Base,
             chain_config(aapl_equities(None), Some(rebalancing_enabled_cash())),
@@ -286,18 +334,25 @@ fn test_trigger_config() -> RebalancingServiceConfig {
 /// Base targets 30% of AAPL and HyperEVM 40%, both inside a 5% band, so
 /// the planner has two chains to rank against each other.
 fn two_chain_trigger_config() -> RebalancingServiceConfig {
+    base_and_secondary_trigger_config(Chain::HyperEvm)
+}
+
+/// Base targets 30% of AAPL and `secondary` 40%, both inside a 5% band.
+fn base_and_secondary_trigger_config(secondary: Chain) -> RebalancingServiceConfig {
     RebalancingServiceConfig {
-        allocation: allocation(
-            &[(Chain::Base, "0.3"), (Chain::HyperEvm, "0.4")],
-            "0",
-            "0.05",
-        ),
+        allocation: allocation(&[(Chain::Base, "0.3"), (secondary, "0.4")], "0", "0.05"),
         chains: BTreeMap::from([
             (
                 Chain::Base,
-                chain_config(aapl_equities(None), Some(rebalancing_enabled_cash())),
+                chain_config(
+                    aapl_equities_with_recovery(None),
+                    Some(rebalancing_enabled_cash()),
+                ),
             ),
-            (Chain::HyperEvm, chain_config(aapl_equities(None), None)),
+            (
+                secondary,
+                chain_config(aapl_equities_with_recovery(None), None),
+            ),
         ]),
         ..test_trigger_config()
     }
@@ -836,7 +891,6 @@ async fn equity_offchain_imbalance_triggers_mint() {
             ExecutionThreshold::whole_share(),
         )),
         transfer_services: enabled_equity_job_services(),
-        primary_chain: Chain::Base,
         job_queue: TransferEquityToMarketMakingJobQueue::new(&apalis_pool),
     };
     Job::perform(&job, &ctx).await.unwrap();
@@ -1521,12 +1575,12 @@ async fn chain_missing_from_its_registry_yields_to_the_next_candidate() {
     assert_eq!(pending_equity_redemption_job_count(&apalis_pool).await, 0);
 }
 
-/// HyperEVM holds 60 of AAPL's 120 shares, 12 over its 40% target, so its
-/// redemption would rank first. Wallet recovery runs on the primary chain
-/// (Base) only, and a failed HyperEVM redemption would strand its tokens,
-/// so the planner skips it and mints Base's 16-share shortfall.
+/// HyperEVM's 12-share excess ranks before Base's 16-share shortfall.
+/// Recovery is enabled on both listings because config load requires it; the
+/// planner itself does not check recovery. The trigger dispatches the
+/// secondary redemption instead of minting more shares on Base.
 #[tokio::test]
-async fn secondary_chain_redemption_yields_to_a_primary_chain_mint() {
+async fn secondary_chain_redemption_ranks_before_a_primary_chain_mint() {
     let EquityTriggerFixture {
         pool,
         apalis_pool,
@@ -1549,10 +1603,10 @@ async fn secondary_chain_redemption_yields_to_a_primary_chain_mint() {
     seed_onchain_slot(&inventory, &symbol, Chain::HyperEvm, float!(60)).await;
     service.check_and_trigger_equity(&symbol).await.unwrap();
 
-    assert_eq!(pending_equity_redemption_job_count(&apalis_pool).await, 0);
-    let mint = fetch_pending_equity_mint_job(&apalis_pool).await;
-    assert_eq!(mint.chain, Chain::Base);
-    assert_eq!(mint.quantity, FractionalShares::new(float!(16)));
+    let redemption = fetch_pending_equity_redemption_job(&apalis_pool).await;
+    assert_eq!(redemption.chain, Chain::HyperEvm);
+    assert_eq!(redemption.quantity, FractionalShares::new(float!(12)));
+    assert_eq!(pending_equity_mint_job_count(&apalis_pool).await, 0);
 }
 
 /// Base's 24-share redemption outranks HyperEVM's 48-share mint, but
@@ -1922,7 +1976,6 @@ async fn cash_reserve_does_not_shift_rebalancing_ratio() {
     use st0x_finance::Usd;
     use st0x_raindex::{RaindexContracts, RaindexService};
 
-    use crate::inventory::snapshot::{InventorySnapshotCommand, InventorySnapshotId};
     use crate::inventory::{ChainVaultPolling, InventoryPollingService};
 
     let (pool, apalis_pool) = setup_test_pools().await;
@@ -2348,7 +2401,6 @@ async fn mint_api_failure_preserves_requested_intent() {
             ExecutionThreshold::whole_share(),
         )),
         transfer_services: enabled_equity_job_services(),
-        primary_chain: Chain::Base,
         job_queue: TransferEquityToMarketMakingJobQueue::new(&apalis_pool),
     };
     let error = Job::perform(&job, &ctx).await.unwrap_err();
@@ -2468,6 +2520,7 @@ async fn usdc_operational_limits_cap_across_trigger_cycles() {
             deviation: float!(0.2),
         }),
         transfer_timeout: Duration::from_secs(30 * 60),
+        recovery_hold_alert_after: Duration::from_secs(60 * 60),
         chains: BTreeMap::from([(Chain::Base, ChainRebalancingConfig::for_test(assets))]),
     };
 
@@ -2602,6 +2655,7 @@ async fn usdc_guard_blocks_concurrent_triggers() {
             deviation: float!(0.2),
         }),
         transfer_timeout: Duration::from_secs(30 * 60),
+        recovery_hold_alert_after: Duration::from_secs(60 * 60),
         chains: BTreeMap::from([(Chain::Base, ChainRebalancingConfig::for_test(assets))]),
     };
 
@@ -2700,6 +2754,7 @@ async fn threshold_config_controls_trigger_sensitivity() {
                 deviation: float!(0.4),
             }),
             transfer_timeout: Duration::from_secs(30 * 60),
+            recovery_hold_alert_after: Duration::from_secs(60 * 60),
             chains: BTreeMap::from([(
                 Chain::Base,
                 ChainRebalancingConfig::for_test(ChainAssets {
@@ -2768,6 +2823,7 @@ async fn threshold_config_controls_trigger_sensitivity() {
                 deviation: float!(0.1),
             }),
             transfer_timeout: Duration::from_secs(30 * 60),
+            recovery_hold_alert_after: Duration::from_secs(60 * 60),
             chains: BTreeMap::from([(
                 Chain::Base,
                 ChainRebalancingConfig::for_test(ChainAssets {
@@ -2985,7 +3041,6 @@ async fn mint_accepted_sets_offchain_inflight() {
                     ExecutionThreshold::whole_share(),
                 )),
                 transfer_services: enabled_equity_job_services(),
-                primary_chain: Chain::Base,
                 job_queue: TransferEquityToMarketMakingJobQueue::new(&apalis_pool),
             };
             let _ = Job::perform(&job, &ctx).await;
@@ -3218,7 +3273,6 @@ async fn completed_mint_clears_inflight_and_updates_inventory() {
             ExecutionThreshold::whole_share(),
         )),
         transfer_services: enabled_equity_job_services(),
-        primary_chain: Chain::Base,
         job_queue: TransferEquityToMarketMakingJobQueue::new(&apalis_pool),
     };
     Job::perform(&job, &ctx).await.unwrap();
@@ -3484,6 +3538,7 @@ async fn wrapped_recovery_reschedules_when_held_for_recovery_but_no_balance() {
         mint_store,
         redemption_store,
         equity_in_progress: Arc::clone(&equity_in_progress),
+        pending_mint_resumes: Arc::default(),
         queue: WrappedEquityRecoveryJobQueue::new(&apalis_pool),
         reschedule_interval: Duration::from_secs(1),
     };
@@ -3542,13 +3597,28 @@ async fn wrapped_recovery_reschedules_when_held_for_recovery_but_no_balance() {
 /// 3. Release the guard (map empty after completion).
 #[tokio::test]
 async fn recovery_job_breaks_deadlock_when_wrap_landed_wrapped_equity_recovery() {
+    recovery_job_breaks_deadlock_when_wrap_landed_wrapped_equity_recovery_on_chain(Chain::Base)
+        .await;
+}
+
+#[tokio::test]
+async fn recovery_job_breaks_deadlock_when_wrap_landed_wrapped_equity_recovery_on_secondary() {
+    recovery_job_breaks_deadlock_when_wrap_landed_wrapped_equity_recovery_on_chain(
+        Chain::Robinhood,
+    )
+    .await;
+}
+
+async fn recovery_job_breaks_deadlock_when_wrap_landed_wrapped_equity_recovery_on_chain(
+    chain: Chain,
+) {
     let symbol = Symbol::new("AAPL").unwrap();
 
     // Guard is HeldForRecovery: set by the transfer job after a PostReceipt
     // error in WrapSubmitted. The wrap tx landed, so tokens are WRAPPED.
     let equity_in_progress = Arc::new(RwLock::new(HashMap::from([(
         symbol.clone(),
-        GuardState::HeldForRecovery { chain: Chain::Base },
+        GuardState::HeldForRecovery { chain },
     )])));
 
     let (pool, apalis_pool) = setup_test_pools().await;
@@ -3572,10 +3642,8 @@ async fn recovery_job_breaks_deadlock_when_wrap_landed_wrapped_equity_recovery()
         gas_readiness: ConfiguredGasReadiness::Unwired,
         equities: ChainEquities::default(),
     };
-    let equity_services = EquityTransferServices {
-        chains: BTreeMap::from([(Chain::Base, chain_services.clone())]),
-        bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
-    };
+    let mut equity_services = EquityTransferServices::panicking();
+    equity_services.chains.insert(chain, chain_services.clone());
     let mint_store = Arc::new(test_store::<TokenizedEquityMint>(
         pool.clone(),
         equity_services.clone(),
@@ -3592,23 +3660,20 @@ async fn recovery_job_breaks_deadlock_when_wrap_landed_wrapped_equity_recovery()
     let store = Arc::new(test_store(
         pool.clone(),
         WrappedEquityRecoveryServices {
-            equity: EquityTransferServices {
-                chains: BTreeMap::from([(Chain::Base, chain_services)]),
-                bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
-            },
+            equity: equity_services,
             transfer,
             bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
         },
     ));
 
     // Inventory reports WRAPPED balance: the wrap landed, tokens are wtSTOCK
-    // in the base wallet outside Raindex.
+    // in the chain's wallet outside Raindex.
     let shares = FractionalShares::new(float!(5));
     let mut balances = BTreeMap::new();
     balances.insert(symbol.clone(), shares);
     let now = Utc::now();
     let view = InventoryView::default().set_inflight_equity_at_location(
-        InFlightEquityLocation::WalletWrapped(Chain::Base),
+        InFlightEquityLocation::WalletWrapped(chain),
         &balances,
         now,
         now,
@@ -3623,13 +3688,14 @@ async fn recovery_job_breaks_deadlock_when_wrap_landed_wrapped_equity_recovery()
         mint_store,
         redemption_store,
         equity_in_progress: Arc::clone(&equity_in_progress),
+        pending_mint_resumes: Arc::default(),
         queue: WrappedEquityRecoveryJobQueue::new(&apalis_pool),
         reschedule_interval: Duration::from_secs(1),
     };
 
     let recovery_id = WrappedEquityRecoveryId(Uuid::new_v4());
     let job = WrappedEquityRecoveryJob {
-        chain: Chain::Base,
+        chain,
         symbol: symbol.clone(),
         recovery_id: recovery_id.clone(),
         backpressure_streak: BackpressureStreak::default(),
@@ -3669,6 +3735,281 @@ async fn recovery_job_breaks_deadlock_when_wrap_landed_wrapped_equity_recovery()
     );
 }
 
+/// After a NAV bump the landed wrap of a `WrapSubmitted` mint leaves fewer
+/// vault shares in the wallet than the mint's underlying quantity. Wrapped
+/// recovery must still dispatch to the mint, whose resume reads the wrap
+/// receipt and deposits the real share count, instead of refusing every
+/// attempt on the unit mismatch and leaving the symbol held.
+#[tokio::test]
+async fn wrapped_recovery_dispatches_a_wrap_submitted_mint_after_a_nav_bump() {
+    let chain = Chain::Robinhood;
+    let symbol = Symbol::new("AAPL").unwrap();
+    let mint_id = issuer_request_id("wrap-submitted-nav-bump");
+    let equity_in_progress = Arc::new(RwLock::new(HashMap::from([(
+        symbol.clone(),
+        GuardState::HeldForRecovery { chain },
+    )])));
+    let (pool, apalis_pool) = setup_test_pools().await;
+
+    let wrapper: Arc<dyn Wrapper> = Arc::new(MockWrapper::with_ratio(U256::from(
+        1_250_000_000_000_000_000_u128,
+    )));
+    let chain_services = ChainEquityServices {
+        wallet: Address::random(),
+        raindex: Arc::new(MockRaindex::new()),
+        vault_lookup: Arc::new(
+            MockVaultLookup::new()
+                .with_vault(Address::ZERO, RaindexVaultId(B256::ZERO))
+                .with_default_vault(RaindexVaultId(B256::ZERO)),
+        ),
+        tokenizer: Arc::new(MockTokenizer::new()),
+        wrapper: Arc::clone(&wrapper),
+        mint_authorizer: ConfiguredMintAuthorizer::Disabled,
+        gas_readiness: ConfiguredGasReadiness::Unwired,
+        equities: ChainEquities::default(),
+    };
+    let mut equity_services = EquityTransferServices::panicking();
+    equity_services.chains.insert(chain, chain_services);
+    let mint_store = Arc::new(test_store::<TokenizedEquityMint>(
+        pool.clone(),
+        equity_services.clone(),
+    ));
+    let redemption_store = Arc::new(test_store::<EquityRedemption>(
+        pool.clone(),
+        equity_services.clone(),
+    ));
+    let transfer = Arc::new(CrossVenueEquityTransfer::new(
+        equity_services.clone(),
+        Arc::clone(&mint_store),
+        Arc::clone(&redemption_store),
+    ));
+    let store = Arc::new(test_store(
+        pool.clone(),
+        WrappedEquityRecoveryServices {
+            equity: equity_services,
+            transfer,
+            bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
+        },
+    ));
+
+    for command in [
+        TokenizedEquityMintCommand::RequestMint {
+            chain,
+            issuer_request_id: mint_id.clone(),
+            symbol: symbol.clone(),
+            quantity: float!(5),
+            wallet: Address::ZERO,
+        },
+        TokenizedEquityMintCommand::SubmitMintRequest {
+            issuer_request_id: mint_id.clone(),
+        },
+        TokenizedEquityMintCommand::Poll,
+    ] {
+        mint_store.send(&mint_id, command).await.unwrap();
+    }
+    let wrapped_shares = U256::from(4_000_000_000_000_000_000_u128);
+    let wrap_tx_hash = wrapper
+        .submit_wrap(Address::ZERO, wrapped_shares, Address::ZERO)
+        .await
+        .unwrap();
+    mint_store
+        .send(
+            &mint_id,
+            TokenizedEquityMintCommand::SubmitWrap { wrap_tx_hash },
+        )
+        .await
+        .unwrap();
+
+    let now = Utc::now();
+    let view = InventoryView::default()
+        .set_inflight_equity_at_location(
+            InFlightEquityLocation::WalletWrapped(chain),
+            &BTreeMap::from([(symbol.clone(), FractionalShares::new(float!(4)))]),
+            now,
+            now,
+        )
+        .set_active_mint(symbol.clone(), chain, mint_id.clone());
+    let (sender, _receiver) = broadcast::channel(16);
+    let ctx = WrappedEquityRecoveryCtx {
+        inventory: Arc::new(BroadcastingInventory::new(view, sender)),
+        store: Arc::clone(&store),
+        mint_store: Arc::clone(&mint_store),
+        redemption_store,
+        equity_in_progress: Arc::clone(&equity_in_progress),
+        pending_mint_resumes: Arc::default(),
+        queue: WrappedEquityRecoveryJobQueue::new(&apalis_pool),
+        reschedule_interval: Duration::from_secs(1),
+    };
+    let recovery_id = WrappedEquityRecoveryId(Uuid::new_v4());
+    let job = WrappedEquityRecoveryJob {
+        chain,
+        symbol: symbol.clone(),
+        recovery_id: recovery_id.clone(),
+        backpressure_streak: BackpressureStreak::default(),
+    };
+
+    job.perform(&ctx).await.unwrap();
+
+    assert!(matches!(
+        store.load(&recovery_id).await.unwrap(),
+        Some(WrappedEquityRecovery::DispatchedToMint { .. })
+    ));
+    assert!(matches!(
+        mint_store.load(&mint_id).await.unwrap(),
+        Some(TokenizedEquityMint::DepositedIntoRaindex { .. })
+    ));
+    assert_eq!(equity_in_progress.read().unwrap().get(&symbol), None);
+}
+
+/// A wrap-submitted Robinhood mint whose wrapped shares sit in the wallet
+/// sends wrapped recovery to resume the mint. A transient RPC failure reading
+/// the wrap confirmation must leave the recovery `Detected`, requeue it, hold
+/// the symbol for Robinhood and name the mint for the stuck-hold alert,
+/// instead of failing the recovery while the mint is unfinished.
+#[tokio::test]
+async fn wrapped_recovery_retries_a_mint_resume_that_fails_transiently() {
+    let chain = Chain::Robinhood;
+    let symbol = Symbol::new("AAPL").unwrap();
+    let mint_id = issuer_request_id("wrap-submitted-transient-confirm-failure");
+    // The slot starts empty, so only the recovery's hold can leave it
+    // HeldForRecovery: an orphan claim that is not held drops to empty.
+    let equity_in_progress = Arc::new(RwLock::new(HashMap::new()));
+    let pending_mint_resumes = Arc::new(PendingMintResumes::default());
+    let (pool, apalis_pool) = setup_test_pools().await;
+
+    let wrapper: Arc<dyn Wrapper> = Arc::new(MockWrapper::retryable_confirm_wrap());
+    let chain_services = ChainEquityServices {
+        wallet: Address::random(),
+        raindex: Arc::new(MockRaindex::new()),
+        vault_lookup: Arc::new(
+            MockVaultLookup::new()
+                .with_vault(Address::ZERO, RaindexVaultId(B256::ZERO))
+                .with_default_vault(RaindexVaultId(B256::ZERO)),
+        ),
+        tokenizer: Arc::new(MockTokenizer::new()),
+        wrapper: Arc::clone(&wrapper),
+        mint_authorizer: ConfiguredMintAuthorizer::Disabled,
+        gas_readiness: ConfiguredGasReadiness::Unwired,
+        equities: ChainEquities::default(),
+    };
+    let mut equity_services = EquityTransferServices::panicking();
+    equity_services.chains.insert(chain, chain_services);
+    let mint_store = Arc::new(test_store::<TokenizedEquityMint>(
+        pool.clone(),
+        equity_services.clone(),
+    ));
+    let redemption_store = Arc::new(test_store::<EquityRedemption>(
+        pool.clone(),
+        equity_services.clone(),
+    ));
+    let transfer = Arc::new(CrossVenueEquityTransfer::new(
+        equity_services.clone(),
+        Arc::clone(&mint_store),
+        Arc::clone(&redemption_store),
+    ));
+    let store = Arc::new(test_store(
+        pool.clone(),
+        WrappedEquityRecoveryServices {
+            equity: equity_services,
+            transfer,
+            bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
+        },
+    ));
+
+    for command in [
+        TokenizedEquityMintCommand::RequestMint {
+            chain,
+            issuer_request_id: mint_id.clone(),
+            symbol: symbol.clone(),
+            quantity: float!(5),
+            wallet: Address::ZERO,
+        },
+        TokenizedEquityMintCommand::SubmitMintRequest {
+            issuer_request_id: mint_id.clone(),
+        },
+        TokenizedEquityMintCommand::Poll,
+    ] {
+        mint_store.send(&mint_id, command).await.unwrap();
+    }
+    let wrap_tx_hash = wrapper
+        .submit_wrap(
+            Address::ZERO,
+            U256::from(5_000_000_000_000_000_000_u128),
+            Address::ZERO,
+        )
+        .await
+        .unwrap();
+    mint_store
+        .send(
+            &mint_id,
+            TokenizedEquityMintCommand::SubmitWrap { wrap_tx_hash },
+        )
+        .await
+        .unwrap();
+
+    let now = Utc::now();
+    let view = InventoryView::default()
+        .set_inflight_equity_at_location(
+            InFlightEquityLocation::WalletWrapped(chain),
+            &BTreeMap::from([(symbol.clone(), FractionalShares::new(float!(5)))]),
+            now,
+            now,
+        )
+        .set_active_mint(symbol.clone(), chain, mint_id.clone());
+    let (sender, _receiver) = broadcast::channel(16);
+    let ctx = WrappedEquityRecoveryCtx {
+        inventory: Arc::new(BroadcastingInventory::new(view, sender)),
+        store: Arc::clone(&store),
+        mint_store: Arc::clone(&mint_store),
+        redemption_store,
+        equity_in_progress: Arc::clone(&equity_in_progress),
+        pending_mint_resumes: Arc::clone(&pending_mint_resumes),
+        queue: WrappedEquityRecoveryJobQueue::new(&apalis_pool),
+        reschedule_interval: Duration::from_secs(1),
+    };
+    let recovery_id = WrappedEquityRecoveryId(Uuid::new_v4());
+    let job = WrappedEquityRecoveryJob {
+        chain,
+        symbol: symbol.clone(),
+        recovery_id: recovery_id.clone(),
+        backpressure_streak: BackpressureStreak::default(),
+    };
+
+    job.perform(&ctx).await.unwrap();
+
+    let recovery = store.load(&recovery_id).await.unwrap();
+    assert!(
+        matches!(
+            recovery,
+            Some(WrappedEquityRecovery::Detected {
+                chain: detected_chain,
+                ..
+            }) if detected_chain == chain
+        ),
+        "a retryable resume failure must not record a terminal recovery, got {recovery:?}",
+    );
+    assert!(matches!(
+        mint_store.load(&mint_id).await.unwrap(),
+        Some(TokenizedEquityMint::WrapSubmitted { .. })
+    ));
+    assert_eq!(
+        pending_job_count::<WrappedEquityRecoveryJob>(&apalis_pool).await,
+        1,
+        "the recovery must requeue itself to retry the mint",
+    );
+    assert_eq!(
+        equity_in_progress.read().unwrap().get(&symbol),
+        Some(&GuardState::HeldForRecovery { chain }),
+    );
+    let pending = ctx
+        .pending_mint_resumes
+        .get(&symbol, chain)
+        .expect("the retried mint must be recorded for the stuck-hold alert");
+    assert_eq!(pending.mint_id, mint_id);
+    assert_eq!(pending.recovery, HeldRecovery::Wrapped(recovery_id));
+    assert_eq!(pending.failure.kind, ResumeFailureKind::Retryable);
+}
+
 /// ORPHAN-DISPATCH VARIANT (RAI-1070): the ERC-4626 wrap reverted, so tokens
 /// are still UNWRAPPED in the base wallet (inventory: `BaseWalletUnwrapped`),
 /// and there is NO active mint in the inventory view, so `decide_dispatch`
@@ -3687,18 +4028,36 @@ async fn recovery_job_breaks_deadlock_when_wrap_landed_wrapped_equity_recovery()
 /// apalis retry exhaustion, deadlocking all future mints for the symbol.
 #[tokio::test]
 async fn recovery_job_breaks_deadlock_when_wrap_failed_unwrapped_equity_recovery() {
+    recovery_job_breaks_deadlock_when_wrap_failed_unwrapped_equity_recovery_on_chain(Chain::Base)
+        .await;
+}
+
+#[tokio::test]
+async fn recovery_job_breaks_deadlock_when_wrap_failed_unwrapped_equity_recovery_on_secondary() {
+    recovery_job_breaks_deadlock_when_wrap_failed_unwrapped_equity_recovery_on_chain(
+        Chain::Robinhood,
+    )
+    .await;
+}
+
+async fn recovery_job_breaks_deadlock_when_wrap_failed_unwrapped_equity_recovery_on_chain(
+    chain: Chain,
+) {
     let symbol = Symbol::new("AAPL").unwrap();
 
     // Guard is HeldForRecovery: set by the transfer job when it got a
     // PostReceipt error with the aggregate in TokensReceived/WrapSubmitted.
     let equity_in_progress = Arc::new(RwLock::new(HashMap::from([(
         symbol.clone(),
-        GuardState::HeldForRecovery { chain: Chain::Base },
+        GuardState::HeldForRecovery { chain },
     )])));
 
     let (pool, apalis_pool) = setup_test_pools().await;
 
-    let raindex: Arc<dyn Raindex> = Arc::new(MockRaindex::new());
+    let raindex: Arc<dyn Raindex> = Arc::new(
+        MockRaindex::new()
+            .with_withdraw_transfer(Address::ZERO, U256::from(5_000_000_000_000_000_000_u64)),
+    );
     let wrapper: Arc<dyn Wrapper> = Arc::new(MockWrapper::new());
     let vault_lookup: Arc<dyn VaultLookup> = Arc::new(
         MockVaultLookup::new()
@@ -3717,10 +4076,8 @@ async fn recovery_job_breaks_deadlock_when_wrap_failed_unwrapped_equity_recovery
         gas_readiness: ConfiguredGasReadiness::Unwired,
         equities: ChainEquities::default(),
     };
-    let equity_services = EquityTransferServices {
-        chains: BTreeMap::from([(Chain::Base, chain_services.clone())]),
-        bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
-    };
+    let mut equity_services = EquityTransferServices::panicking();
+    equity_services.chains.insert(chain, chain_services.clone());
     let mint_store = Arc::new(test_store::<TokenizedEquityMint>(
         pool.clone(),
         equity_services.clone(),
@@ -3737,23 +4094,20 @@ async fn recovery_job_breaks_deadlock_when_wrap_failed_unwrapped_equity_recovery
     let store = Arc::new(test_store(
         pool.clone(),
         UnwrappedEquityRecoveryServices {
-            equity: EquityTransferServices {
-                chains: BTreeMap::from([(Chain::Base, chain_services)]),
-                bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
-            },
+            equity: equity_services,
             transfer,
             bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
         },
     ));
 
     // Inventory reports UNWRAPPED balance: wrap failed, tokens are raw tSTOCK
-    // in the base wallet.
+    // in the chain's wallet.
     let shares = FractionalShares::new(float!(5));
     let mut balances = BTreeMap::new();
     balances.insert(symbol.clone(), shares);
     let now = Utc::now();
     let view = InventoryView::default().set_inflight_equity_at_location(
-        InFlightEquityLocation::WalletUnwrapped(Chain::Base),
+        InFlightEquityLocation::WalletUnwrapped(chain),
         &balances,
         now,
         now,
@@ -3768,13 +4122,14 @@ async fn recovery_job_breaks_deadlock_when_wrap_failed_unwrapped_equity_recovery
         mint_store,
         redemption_store,
         equity_in_progress: Arc::clone(&equity_in_progress),
+        pending_mint_resumes: Arc::default(),
         queue: UnwrappedEquityRecoveryJobQueue::new(&apalis_pool),
         reschedule_interval: Duration::from_secs(1),
     };
 
     let recovery_id = UnwrappedEquityRecoveryId(Uuid::new_v4());
     let job = UnwrappedEquityRecoveryJob {
-        chain: Chain::Base,
+        chain,
         symbol: symbol.clone(),
         recovery_id: recovery_id.clone(),
         backpressure_streak: BackpressureStreak::default(),
@@ -3814,6 +4169,185 @@ async fn recovery_job_breaks_deadlock_when_wrap_failed_unwrapped_equity_recovery
     );
 }
 
+/// Robinhood holds 60 of AAPL's 120 shares against a 40% target, so the
+/// trigger redeems its 12-share excess there. The issuer send reverts after
+/// the vault withdrawal and unwrap, stranding 12 unwrapped shares in the
+/// Robinhood wallet. The redemption's terminal event must free the symbol,
+/// and the next Robinhood wallet poll must start an unwrapped recovery on
+/// Robinhood that wraps the shares back into its vault.
+#[tokio::test]
+async fn failed_secondary_redemption_recovers_unwrapped_tokens_on_its_chain() {
+    let chain = Chain::Robinhood;
+    let EquityTriggerFixture {
+        pool,
+        apalis_pool,
+        symbol,
+        aggregate_id: _,
+        service,
+        inventory,
+        position_cqrs,
+    } = setup_equity_trigger_with_config(base_and_secondary_trigger_config(chain)).await;
+    let token = Address::random();
+    seed_vault_registry(&pool, Chain::Base, &symbol, Address::random()).await;
+    seed_vault_registry(&pool, chain, &symbol, token).await;
+    build_imbalanced_inventory(Imbalance::Equity {
+        inventory: &inventory,
+        position_cqrs: &position_cqrs,
+        symbol: &symbol,
+        onchain: float!(20),
+        offchain: float!(40),
+    })
+    .await;
+    seed_onchain_slot(&inventory, &symbol, chain, float!(60)).await;
+    service.check_and_trigger_equity(&symbol).await.unwrap();
+
+    let redemption = take_pending_job::<TransferEquityToHedging>(&apalis_pool).await;
+    assert_eq!(redemption.chain, chain);
+    assert_eq!(redemption.quantity, FractionalShares::new(float!(12)));
+    assert_eq!(
+        service.equity_in_progress.read().unwrap().get(&symbol),
+        Some(&GuardState::ActiveTransfer {
+            generation: redemption.generation,
+        }),
+        "the trigger must claim the symbol for the redemption it enqueued",
+    );
+
+    let services = EquityTransferServices {
+        chains: BTreeMap::from([(
+            chain,
+            ChainEquityServices {
+                wallet: Address::ZERO,
+                raindex: Arc::new(MockRaindex::new()),
+                vault_lookup: mock_vault_lookup_for_symbol(&symbol, token),
+                tokenizer: Arc::new(MockTokenizer::new().with_send_failure()),
+                wrapper: Arc::new(
+                    MockWrapper::new()
+                        .with_tokenized_shares(token)
+                        .with_wrapped_token(token),
+                ),
+                mint_authorizer: ConfiguredMintAuthorizer::Disabled,
+                gas_readiness: ConfiguredGasReadiness::Unwired,
+                equities: aapl_equities(None),
+            },
+        )]),
+        bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
+    };
+    let (redemption_store, _redemption_projection) =
+        StoreBuilder::<EquityRedemption>::new(pool.clone())
+            .with(Arc::clone(&service))
+            .build(services.clone())
+            .await
+            .unwrap();
+    let mint_store = Arc::new(test_store::<TokenizedEquityMint>(
+        pool.clone(),
+        services.clone(),
+    ));
+    let transfer = Arc::new(CrossVenueEquityTransfer::new(
+        services.clone(),
+        Arc::clone(&mint_store),
+        Arc::clone(&redemption_store),
+    ));
+    let redemption_ctx = TransferEquityToHedgingCtx {
+        transfer: transfer.clone(),
+        equity_in_progress: service.equity_in_progress.clone(),
+        redemption_store: Arc::clone(&redemption_store),
+        transfer_services: services.clone(),
+        position_authority: Some((
+            Arc::clone(&position_cqrs),
+            ExecutionThreshold::whole_share(),
+        )),
+        hedge_capacity: None,
+        job_queue: TransferEquityToHedgingJobQueue::new(&apalis_pool),
+        notifier: Arc::new(crate::alerts::LogNotifier),
+    };
+    Job::perform(&redemption, &redemption_ctx)
+        .await
+        .unwrap_err();
+
+    let failed = redemption_store
+        .load(&redemption.aggregate_id)
+        .await
+        .unwrap();
+    assert!(
+        matches!(
+            failed,
+            Some(EquityRedemption::Failed {
+                chain: failed_chain,
+                ..
+            }) if failed_chain == chain
+        ),
+        "the reverted issuer send must fail the Robinhood redemption, got {failed:?}",
+    );
+    assert_eq!(
+        service.equity_in_progress.read().unwrap().get(&symbol),
+        None,
+        "the failed redemption's terminal event must release its transfer guard",
+    );
+
+    let snapshot_store = StoreBuilder::<InventorySnapshot>::new(pool.clone())
+        .with(Arc::clone(&service))
+        .build(())
+        .await
+        .unwrap();
+    snapshot_store
+        .send(
+            &InventorySnapshotId {
+                orderbook: TEST_ORDERBOOK,
+                owner: TEST_ORDER_OWNER,
+            },
+            InventorySnapshotCommand::ChainWalletUnwrappedEquity {
+                chain,
+                balances: BTreeMap::from([(symbol.clone(), FractionalShares::new(float!(12)))]),
+            },
+        )
+        .await
+        .unwrap();
+
+    let recovery = take_pending_job::<UnwrappedEquityRecoveryJob>(&apalis_pool).await;
+    assert_eq!(recovery.chain, chain);
+    assert_eq!(recovery.symbol, symbol);
+
+    let recovery_store = Arc::new(test_store(
+        pool.clone(),
+        UnwrappedEquityRecoveryServices {
+            equity: services,
+            transfer,
+            bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
+        },
+    ));
+    let recovery_ctx = UnwrappedEquityRecoveryCtx {
+        inventory: Arc::clone(&inventory),
+        store: Arc::clone(&recovery_store),
+        mint_store,
+        redemption_store,
+        equity_in_progress: service.equity_in_progress.clone(),
+        pending_mint_resumes: service.pending_mint_resumes.clone(),
+        queue: UnwrappedEquityRecoveryJobQueue::new(&apalis_pool),
+        reschedule_interval: Duration::from_secs(1),
+    };
+    recovery.perform(&recovery_ctx).await.unwrap();
+
+    let recovered = recovery_store.load(&recovery.recovery_id).await.unwrap();
+    assert!(
+        matches!(
+            recovered,
+            Some(UnwrappedEquityRecovery::OrphanDeposited {
+                chain: recovered_chain,
+                ..
+            }) if recovered_chain == chain
+        ),
+        "the stranded Robinhood shares must be wrapped back into its vault, got {recovered:?}",
+    );
+    assert_eq!(
+        service.equity_in_progress.read().unwrap().get(&symbol),
+        None
+    );
+    assert_eq!(
+        pending_job_count::<UnwrappedEquityRecoveryJob>(&apalis_pool).await,
+        0
+    );
+}
+
 /// ACTIVE-MINT VARIANT (RAI-1070): the path prod actually takes. A wrap-failed
 /// mint is in `TokensReceived`/`WrapSubmitted`, and the snapshot reactor's
 /// `update_active_mint` has populated `active_mint`, so `decide_dispatch`
@@ -3823,13 +4357,26 @@ async fn recovery_job_breaks_deadlock_when_wrap_failed_unwrapped_equity_recovery
 /// no-active-mint branch, which is not what prod hits for a wrap-failed mint.
 #[tokio::test]
 async fn recovery_job_breaks_deadlock_when_wrap_failed_dispatches_active_mint() {
+    recovery_job_breaks_deadlock_when_wrap_failed_dispatches_active_mint_on_chain(Chain::Base)
+        .await;
+}
+
+#[tokio::test]
+async fn recovery_job_breaks_deadlock_when_wrap_failed_dispatches_active_mint_on_secondary() {
+    recovery_job_breaks_deadlock_when_wrap_failed_dispatches_active_mint_on_chain(Chain::Robinhood)
+        .await;
+}
+
+async fn recovery_job_breaks_deadlock_when_wrap_failed_dispatches_active_mint_on_chain(
+    chain: Chain,
+) {
     let symbol = Symbol::new("AAPL").unwrap();
     let mint_id = issuer_request_id("active-mint-deadlock");
 
     // Guard is HeldForRecovery: handed off by the transfer job after PostReceipt.
     let equity_in_progress = Arc::new(RwLock::new(HashMap::from([(
         symbol.clone(),
-        GuardState::HeldForRecovery { chain: Chain::Base },
+        GuardState::HeldForRecovery { chain },
     )])));
 
     let (pool, apalis_pool) = setup_test_pools().await;
@@ -3853,10 +4400,8 @@ async fn recovery_job_breaks_deadlock_when_wrap_failed_dispatches_active_mint() 
         gas_readiness: ConfiguredGasReadiness::Unwired,
         equities: ChainEquities::default(),
     };
-    let equity_services = EquityTransferServices {
-        chains: BTreeMap::from([(Chain::Base, chain_services.clone())]),
-        bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
-    };
+    let mut equity_services = EquityTransferServices::panicking();
+    equity_services.chains.insert(chain, chain_services.clone());
     let mint_store = Arc::new(test_store::<TokenizedEquityMint>(
         pool.clone(),
         equity_services.clone(),
@@ -3873,10 +4418,7 @@ async fn recovery_job_breaks_deadlock_when_wrap_failed_dispatches_active_mint() 
     let store = Arc::new(test_store(
         pool.clone(),
         UnwrappedEquityRecoveryServices {
-            equity: EquityTransferServices {
-                chains: BTreeMap::from([(Chain::Base, chain_services)]),
-                bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
-            },
+            equity: equity_services,
             transfer,
             bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
         },
@@ -3889,7 +4431,7 @@ async fn recovery_job_breaks_deadlock_when_wrap_failed_dispatches_active_mint() 
         .send(
             &mint_id,
             TokenizedEquityMintCommand::RequestMint {
-                chain: Chain::Base,
+                chain,
                 issuer_request_id: mint_id.clone(),
                 symbol: symbol.clone(),
                 quantity: float!(5),
@@ -3920,12 +4462,12 @@ async fn recovery_job_breaks_deadlock_when_wrap_failed_dispatches_active_mint() 
     let now = Utc::now();
     let view = InventoryView::default()
         .set_inflight_equity_at_location(
-            InFlightEquityLocation::WalletUnwrapped(Chain::Base),
+            InFlightEquityLocation::WalletUnwrapped(chain),
             &balances,
             now,
             now,
         )
-        .set_active_mint(symbol.clone(), Chain::Base, mint_id.clone());
+        .set_active_mint(symbol.clone(), chain, mint_id.clone());
 
     let (sender, _receiver) = broadcast::channel(16);
     let inventory = Arc::new(BroadcastingInventory::new(view, sender));
@@ -3936,13 +4478,14 @@ async fn recovery_job_breaks_deadlock_when_wrap_failed_dispatches_active_mint() 
         mint_store,
         redemption_store,
         equity_in_progress: Arc::clone(&equity_in_progress),
+        pending_mint_resumes: Arc::default(),
         queue: UnwrappedEquityRecoveryJobQueue::new(&apalis_pool),
         reschedule_interval: Duration::from_secs(1),
     };
 
     let recovery_id = UnwrappedEquityRecoveryId(Uuid::new_v4());
     let job = UnwrappedEquityRecoveryJob {
-        chain: Chain::Base,
+        chain,
         symbol: symbol.clone(),
         recovery_id: recovery_id.clone(),
         backpressure_streak: BackpressureStreak::default(),
