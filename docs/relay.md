@@ -95,8 +95,18 @@ to `RelayError::RateLimited { retry_after }` from the `Retry-After` header
 
 `RelayClient::quote` refuses a quote unless:
 
-- the input and output are the two chains' settlement stables, and the input
-  amount is the requested amount;
+- the input and output are the two chains' settlement stables on their pinned
+  decimals (which must match each other), and the input amount is the requested
+  amount;
+- the relayer fee is in the origin stable and the gas fee is on the origin
+  chain;
+- `details.recipient` is our recipient, and `protocol.v2.orderData.output` has
+  exactly one payment: the destination stable to our recipient, at the quoted
+  `minimumAmount` and expected amount;
+- every refund in `protocol.v2.orderData.inputs[].refunds[]` pays our
+  `refundTo`;
+- `protocol.v2.paymentDetails` names the pinned depository, the origin stable
+  and the requested amount;
 - the `approve` step, when present, is on the origin chain, calls the origin
   stable with no value, and approves exactly the amount to the depository
   (`Chain::relay_depository()`, `0x4cd0...bc31` on both chains);

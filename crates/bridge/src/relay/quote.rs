@@ -6,7 +6,7 @@ use alloy::sol;
 use alloy::sol_types::SolCall;
 use serde::{Deserialize, Serialize};
 
-use st0x_evm::Chain;
+use st0x_evm::{Chain, SettlementStable};
 
 use super::acceptance::{BasisPoints, QuoteAmounts};
 
@@ -155,6 +155,41 @@ pub enum QuoteMismatch {
         expected: QuotedCurrency,
         actual: QuotedCurrency,
     },
+    #[error("quote gives {currency} {actual} decimals, expected {expected}")]
+    CurrencyDecimals {
+        currency: QuotedCurrency,
+        expected: u8,
+        actual: u8,
+    },
+    #[error("origin stable has {origin} decimals and destination stable {destination}")]
+    StableDecimals { origin: u8, destination: u8 },
+    #[error("relayer fee is in {actual}, expected {expected}")]
+    RelayerFeeCurrency {
+        expected: QuotedCurrency,
+        actual: QuotedCurrency,
+    },
+    #[error("gas fee is on chain {actual}, expected {expected}")]
+    GasFeeChain { expected: u64, actual: u64 },
+    #[error("quote names recipient {actual}, expected {expected}")]
+    Recipient { expected: Address, actual: Address },
+    #[error("order has {count} output payments, expected one")]
+    PaymentCount { count: usize },
+    #[error("output payment goes to {actual}, expected {expected}")]
+    PaymentRecipient { expected: Address, actual: Address },
+    #[error("output payment is in {actual}, expected {expected}")]
+    PaymentCurrency { expected: Address, actual: Address },
+    #[error("output payment minimum is {actual}, the quote's minimum is {expected}")]
+    PaymentMinimum { expected: U256, actual: U256 },
+    #[error("output payment expects {actual}, the quote expects {expected}")]
+    PaymentExpected { expected: U256, actual: U256 },
+    #[error("refund goes to {actual}, expected {expected}")]
+    RefundRecipient { expected: Address, actual: Address },
+    #[error("payment details name depository {actual}, expected {expected}")]
+    PaymentDetailsDepository { expected: Address, actual: Address },
+    #[error("payment details pay in {actual}, expected {expected}")]
+    PaymentDetailsCurrency { expected: Address, actual: Address },
+    #[error("payment details pay {actual}, expected {expected}")]
+    PaymentDetailsAmount { expected: U256, actual: U256 },
 }
 
 /// A token on a chain, as a quote names it.
@@ -162,6 +197,15 @@ pub enum QuoteMismatch {
 pub struct QuotedCurrency {
     pub chain_id: u64,
     pub address: Address,
+}
+
+impl QuotedCurrency {
+    fn settlement_stable(chain: Chain) -> Self {
+        Self {
+            chain_id: chain.chain_id(),
+            address: chain.settlement_stable().address,
+        }
+    }
 }
 
 impl std::fmt::Display for QuotedCurrency {
@@ -213,6 +257,7 @@ pub(super) struct QuoteResponse {
     steps: Vec<RawStep>,
     fees: RawFees,
     details: RawDetails,
+    protocol: RawProtocol,
 }
 
 #[derive(Debug, Deserialize)]
@@ -245,6 +290,7 @@ struct RawFees {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct RawDetails {
+    recipient: Address,
     currency_in: RawAmount,
     currency_out: RawAmount,
 }
@@ -264,6 +310,61 @@ struct RawAmount {
 struct RawCurrency {
     chain_id: u64,
     address: Address,
+    decimals: u8,
+}
+
+/// The order the deposit commits to: who the solver pays, who a refund pays,
+/// and what the depository is told to expect.
+#[derive(Debug, Deserialize)]
+struct RawProtocol {
+    v2: RawProtocolV2,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawProtocolV2 {
+    order_data: RawOrderData,
+    payment_details: RawPaymentDetails,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawOrderData {
+    inputs: Vec<RawOrderInput>,
+    output: RawOrderOutput,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawOrderInput {
+    refunds: Vec<RawRefund>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawRefund {
+    recipient: Address,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawOrderOutput {
+    payments: Vec<RawPayment>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawPayment {
+    recipient: Address,
+    currency: Address,
+    #[serde(with = "decimal")]
+    minimum_amount: U256,
+    #[serde(with = "decimal")]
+    expected_amount: U256,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawPaymentDetails {
+    depository: Address,
+    currency: Address,
+    #[serde(with = "decimal")]
+    amount: U256,
 }
 
 impl From<&RawCurrency> for QuotedCurrency {
@@ -285,6 +386,10 @@ impl QuoteResponse {
             .ok_or(QuoteMismatch::NoDepository { chain: origin })?;
         let origin_stable = origin.settlement_stable().address;
 
+        check_stable_decimals(
+            origin.settlement_stable(),
+            request.destination.settlement_stable(),
+        )?;
         check_currency(
             &self.details.currency_in.currency,
             origin,
@@ -302,6 +407,11 @@ impl QuoteResponse {
                 actual: self.details.currency_in.amount,
             });
         }
+
+        check_fees(&self.fees, origin)?;
+        check_output_payment(&self.details, &self.protocol.v2.order_data, request)?;
+        check_refunds(&self.protocol.v2.order_data, request.refund_to)?;
+        check_payment_details(&self.protocol.v2.payment_details, request, depository)?;
 
         let (approve, deposit) = split_steps(self.steps)?;
 
@@ -333,22 +443,160 @@ impl QuoteResponse {
     }
 }
 
+/// The acceptance math compares input and output units, so both stables
+/// must sit on the same decimal grid.
+fn check_stable_decimals(
+    origin: SettlementStable,
+    destination: SettlementStable,
+) -> Result<(), QuoteMismatch> {
+    if origin.decimals == destination.decimals {
+        Ok(())
+    } else {
+        Err(QuoteMismatch::StableDecimals {
+            origin: origin.decimals,
+            destination: destination.decimals,
+        })
+    }
+}
+
 fn check_currency(
     currency: &RawCurrency,
     chain: Chain,
     mismatch: impl FnOnce(QuotedCurrency, QuotedCurrency) -> QuoteMismatch,
 ) -> Result<(), QuoteMismatch> {
-    let expected = QuotedCurrency {
-        chain_id: chain.chain_id(),
-        address: chain.settlement_stable().address,
-    };
+    let expected = QuotedCurrency::settlement_stable(chain);
     let actual = QuotedCurrency::from(currency);
 
-    if actual == expected {
-        Ok(())
-    } else {
-        Err(mismatch(expected, actual))
+    if actual != expected {
+        return Err(mismatch(expected, actual));
     }
+
+    let decimals = chain.settlement_stable().decimals;
+    if currency.decimals != decimals {
+        return Err(QuoteMismatch::CurrencyDecimals {
+            currency: actual,
+            expected: decimals,
+            actual: currency.decimals,
+        });
+    }
+
+    Ok(())
+}
+
+/// Both fees are paid on the origin chain: the relayer fee in the origin
+/// stable, the gas in its native token.
+fn check_fees(fees: &RawFees, origin: Chain) -> Result<(), QuoteMismatch> {
+    let expected = QuotedCurrency::settlement_stable(origin);
+    let actual = QuotedCurrency::from(&fees.relayer.currency);
+
+    if actual != expected {
+        return Err(QuoteMismatch::RelayerFeeCurrency { expected, actual });
+    }
+
+    if fees.gas.currency.chain_id != origin.chain_id() {
+        return Err(QuoteMismatch::GasFeeChain {
+            expected: origin.chain_id(),
+            actual: fees.gas.currency.chain_id,
+        });
+    }
+
+    Ok(())
+}
+
+/// The solver pays exactly one output: the destination stable to our
+/// recipient, at the amounts `details` quotes.
+fn check_output_payment(
+    details: &RawDetails,
+    order: &RawOrderData,
+    request: &QuoteRequest,
+) -> Result<(), QuoteMismatch> {
+    if details.recipient != request.recipient {
+        return Err(QuoteMismatch::Recipient {
+            expected: request.recipient,
+            actual: details.recipient,
+        });
+    }
+
+    let [payment] = order.output.payments.as_slice() else {
+        return Err(QuoteMismatch::PaymentCount {
+            count: order.output.payments.len(),
+        });
+    };
+
+    if payment.recipient != request.recipient {
+        return Err(QuoteMismatch::PaymentRecipient {
+            expected: request.recipient,
+            actual: payment.recipient,
+        });
+    }
+
+    let destination_stable = request.destination.settlement_stable().address;
+    if payment.currency != destination_stable {
+        return Err(QuoteMismatch::PaymentCurrency {
+            expected: destination_stable,
+            actual: payment.currency,
+        });
+    }
+
+    if payment.minimum_amount != details.currency_out.minimum_amount {
+        return Err(QuoteMismatch::PaymentMinimum {
+            expected: details.currency_out.minimum_amount,
+            actual: payment.minimum_amount,
+        });
+    }
+
+    if payment.expected_amount != details.currency_out.amount {
+        return Err(QuoteMismatch::PaymentExpected {
+            expected: details.currency_out.amount,
+            actual: payment.expected_amount,
+        });
+    }
+
+    Ok(())
+}
+
+fn check_refunds(order: &RawOrderData, refund_to: Address) -> Result<(), QuoteMismatch> {
+    order
+        .inputs
+        .iter()
+        .flat_map(|input| &input.refunds)
+        .find(|refund| refund.recipient != refund_to)
+        .map_or(Ok(()), |refund| {
+            Err(QuoteMismatch::RefundRecipient {
+                expected: refund_to,
+                actual: refund.recipient,
+            })
+        })
+}
+
+fn check_payment_details(
+    payment: &RawPaymentDetails,
+    request: &QuoteRequest,
+    depository: Address,
+) -> Result<(), QuoteMismatch> {
+    if payment.depository != depository {
+        return Err(QuoteMismatch::PaymentDetailsDepository {
+            expected: depository,
+            actual: payment.depository,
+        });
+    }
+
+    let origin_stable = request.origin.settlement_stable().address;
+    if payment.currency != origin_stable {
+        return Err(QuoteMismatch::PaymentDetailsCurrency {
+            expected: origin_stable,
+            actual: payment.currency,
+        });
+    }
+
+    if payment.amount != request.amount {
+        return Err(QuoteMismatch::PaymentDetailsAmount {
+            expected: request.amount,
+            actual: payment.amount,
+        });
+    }
+
+    Ok(())
 }
 
 /// Splits the steps into the optional approve and the required deposit,
@@ -545,6 +793,19 @@ pub(super) mod tests {
     fn funded_body() -> Value {
         serde_json::from_str(FUNDED_QUOTE).unwrap()
     }
+
+    /// Validates the funded quote against its request after `mutate` edits it.
+    fn refusal(mutate: impl FnOnce(&mut Value)) -> QuoteMismatch {
+        let mut body = funded_body();
+        mutate(&mut body);
+        validate(&body, &funded_request()).unwrap_err()
+    }
+
+    const OTHER: Address = address!("0x1111111111111111111111111111111111111111");
+
+    const ROBINHOOD_USDG: Address = address!("0x5fc5360d0400a0fd4f2af552add042d716f1d168");
+
+    const ETHEREUM_USDC: Address = address!("0xa0b86991c6218b36c1d19d4a2e9eb0ce3606eb48");
 
     #[test]
     fn request_body_sends_decimal_amount_and_explicit_slippage() {
@@ -804,6 +1065,231 @@ pub(super) mod tests {
 
         assert!(
             matches!(error, QuoteMismatch::NoDepository { chain: Chain::Base }),
+            "{error:?}"
+        );
+    }
+
+    #[test]
+    fn quote_naming_another_recipient_is_refused() {
+        let error = refusal(|body| body["details"]["recipient"] = json!(OTHER));
+
+        assert!(
+            matches!(
+                error,
+                QuoteMismatch::Recipient { expected, actual }
+                    if expected == FUNDED_WALLET && actual == OTHER
+            ),
+            "{error:?}"
+        );
+    }
+
+    #[test]
+    fn second_output_payment_is_refused() {
+        let error = refusal(|body| {
+            let payments = &mut body["protocol"]["v2"]["orderData"]["output"]["payments"];
+            let payment = payments[0].clone();
+            payments.as_array_mut().unwrap().push(payment);
+        });
+
+        assert!(
+            matches!(error, QuoteMismatch::PaymentCount { count: 2 }),
+            "{error:?}"
+        );
+    }
+
+    #[test]
+    fn output_payment_to_another_recipient_is_refused() {
+        let error = refusal(|body| {
+            body["protocol"]["v2"]["orderData"]["output"]["payments"][0]["recipient"] =
+                json!(OTHER);
+        });
+
+        assert!(
+            matches!(
+                error,
+                QuoteMismatch::PaymentRecipient { expected, actual }
+                    if expected == FUNDED_WALLET && actual == OTHER
+            ),
+            "{error:?}"
+        );
+    }
+
+    #[test]
+    fn output_payment_in_another_currency_is_refused() {
+        let error = refusal(|body| {
+            body["protocol"]["v2"]["orderData"]["output"]["payments"][0]["currency"] = json!(OTHER);
+        });
+
+        assert!(
+            matches!(
+                error,
+                QuoteMismatch::PaymentCurrency { expected, actual }
+                    if expected == ETHEREUM_USDC && actual == OTHER
+            ),
+            "{error:?}"
+        );
+    }
+
+    #[test]
+    fn output_payment_minimum_below_the_quote_is_refused() {
+        let error = refusal(|body| {
+            body["protocol"]["v2"]["orderData"]["output"]["payments"][0]["minimumAmount"] =
+                json!("1");
+        });
+
+        assert!(
+            matches!(
+                error,
+                QuoteMismatch::PaymentMinimum { expected, actual }
+                    if expected == U256::from(4_749_464) && actual == U256::from(1)
+            ),
+            "{error:?}"
+        );
+    }
+
+    #[test]
+    fn output_payment_expected_below_the_quote_is_refused() {
+        let error = refusal(|body| {
+            body["protocol"]["v2"]["orderData"]["output"]["payments"][0]["expectedAmount"] =
+                json!("4749464");
+        });
+
+        assert!(
+            matches!(
+                error,
+                QuoteMismatch::PaymentExpected { expected, actual }
+                    if expected == U256::from(4_763_755) && actual == U256::from(4_749_464)
+            ),
+            "{error:?}"
+        );
+    }
+
+    #[test]
+    fn refund_to_another_recipient_is_refused() {
+        let error = refusal(|body| {
+            body["protocol"]["v2"]["orderData"]["inputs"][0]["refunds"][1]["recipient"] =
+                json!(OTHER);
+        });
+
+        assert!(
+            matches!(
+                error,
+                QuoteMismatch::RefundRecipient { expected, actual }
+                    if expected == FUNDED_WALLET && actual == OTHER
+            ),
+            "{error:?}"
+        );
+    }
+
+    #[test]
+    fn payment_details_naming_another_depository_is_refused() {
+        let error =
+            refusal(|body| body["protocol"]["v2"]["paymentDetails"]["depository"] = json!(OTHER));
+
+        assert!(
+            matches!(
+                error,
+                QuoteMismatch::PaymentDetailsDepository { expected, actual }
+                    if expected == DEPOSITORY && actual == OTHER
+            ),
+            "{error:?}"
+        );
+    }
+
+    #[test]
+    fn payment_details_in_another_currency_are_refused() {
+        let error =
+            refusal(|body| body["protocol"]["v2"]["paymentDetails"]["currency"] = json!(OTHER));
+
+        assert!(
+            matches!(
+                error,
+                QuoteMismatch::PaymentDetailsCurrency { expected, actual }
+                    if expected == ROBINHOOD_USDG && actual == OTHER
+            ),
+            "{error:?}"
+        );
+    }
+
+    #[test]
+    fn payment_details_for_another_amount_are_refused() {
+        let error =
+            refusal(|body| body["protocol"]["v2"]["paymentDetails"]["amount"] = json!("3000000"));
+
+        assert!(
+            matches!(
+                error,
+                QuoteMismatch::PaymentDetailsAmount { expected, actual }
+                    if expected == U256::from(5_000_000) && actual == U256::from(3_000_000)
+            ),
+            "{error:?}"
+        );
+    }
+
+    #[test]
+    fn relayer_fee_in_another_currency_is_refused() {
+        let error = refusal(|body| body["fees"]["relayer"]["currency"]["address"] = json!(OTHER));
+
+        assert!(
+            matches!(
+                error,
+                QuoteMismatch::RelayerFeeCurrency { expected, actual }
+                    if expected == QuotedCurrency { chain_id: 4663, address: ROBINHOOD_USDG }
+                        && actual == QuotedCurrency { chain_id: 4663, address: OTHER }
+            ),
+            "{error:?}"
+        );
+    }
+
+    #[test]
+    fn gas_fee_on_another_chain_is_refused() {
+        let error = refusal(|body| body["fees"]["gas"]["currency"]["chainId"] = json!(1));
+
+        assert!(
+            matches!(
+                error,
+                QuoteMismatch::GasFeeChain {
+                    expected: 4663,
+                    actual: 1
+                }
+            ),
+            "{error:?}"
+        );
+    }
+
+    #[test]
+    fn currency_on_another_decimal_grid_is_refused() {
+        let error =
+            refusal(|body| body["details"]["currencyOut"]["currency"]["decimals"] = json!(18));
+
+        assert!(
+            matches!(
+                error,
+                QuoteMismatch::CurrencyDecimals { currency, expected: 6, actual: 18 }
+                    if currency == QuotedCurrency { chain_id: 1, address: ETHEREUM_USDC }
+            ),
+            "{error:?}"
+        );
+    }
+
+    #[test]
+    fn stables_on_different_decimal_grids_are_refused() {
+        let origin = Chain::Robinhood.settlement_stable();
+        let destination = SettlementStable {
+            decimals: 18,
+            ..Chain::Ethereum.settlement_stable()
+        };
+
+        let error = check_stable_decimals(origin, destination).unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                QuoteMismatch::StableDecimals {
+                    origin: 6,
+                    destination: 18
+                }
+            ),
             "{error:?}"
         );
     }
