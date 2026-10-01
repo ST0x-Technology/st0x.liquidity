@@ -163,27 +163,27 @@ Operators pause rebalancing with narrow, explicit controls:
   with its reservation, the resume job errors until its retries run out and
   pages, and the operator confirms with the issuer before
   `transfer fail --kind mint`. Wallet polling and both wrapped and unwrapped
-  wallet recovery continue on that chain. Switching between `enabled` and
-  `paused` needs only a restart. This is the switch to stop a chain's equity
-  operations without stranding anything. Because a paused chain's inventory
-  still counts, the chain must stay polled and readable: a stale or unpolled
-  paused slot declines the whole symbol (`chain_stale`/`chain_unpolled`), and a
-  failed ratio read on it fails that symbol's check. To take a chain with a
-  degraded RPC or indexer out of the total, pause it, wait until its in-flight
-  transfers finish, and then set it to `disabled`. Pausing does not move the
-  chain's equity: the planner skips paused chains and `transfer-equity` refuses
-  a new transfer on them. To move that equity elsewhere first, use the manual
-  vault, unwrap, and redeem commands (`vault-withdraw`, `unwrap-equity`, then
-  `alpaca-redeem` with the unwrapped quantity, see docs/cli-ops.md). The Raindex
-  vault holds the wrapped derivative; redeeming without unwrap sends the wrong
-  token. Publish `rebalancing = "paused"` only after this order: deploy the bot
-  that reads `paused`, merge the `t0/check.jq` validator change, then publish
-  `paused`. On rollback, restore the token value before downgrading the binary.
-  The dashboard currently shows paused and disabled listings with the same red
-  rebalancing indicator; verify the registry mode before you set `disabled`. It
-  displays settings for the primary chain only. A listing with rebalancing
-  `enabled` or `paused` also needs `wrapped_equity_recovery = "enabled"` on
-  every chain.
+  wallet recovery continue on that chain. Pausing does not release a symbol hold
+  that a recovery still owns. Switching between `enabled` and `paused` needs
+  only a restart. This is the switch to stop a chain's equity operations without
+  stranding anything. Because a paused chain's inventory still counts, the chain
+  must stay polled and readable: a stale or unpolled paused slot declines the
+  whole symbol (`chain_stale`/`chain_unpolled`), and a failed ratio read on it
+  fails that symbol's check. To take a chain with a degraded RPC or indexer out
+  of the total, pause it, wait until its in-flight transfers finish, and then
+  set it to `disabled`. Pausing does not move the chain's equity: the planner
+  skips paused chains and `transfer-equity` refuses a new transfer on them. To
+  move that equity elsewhere first, use the manual vault, unwrap, and redeem
+  commands (`vault-withdraw`, `unwrap-equity`, then `alpaca-redeem` with the
+  unwrapped quantity, see docs/cli-ops.md). The Raindex vault holds the wrapped
+  derivative; redeeming without unwrap sends the wrong token. Publish
+  `rebalancing = "paused"` only after this order: deploy the bot that reads
+  `paused`, merge the `t0/check.jq` validator change, then publish `paused`. On
+  rollback, restore the token value before downgrading the binary. The dashboard
+  currently shows paused and disabled listings with the same red rebalancing
+  indicator; verify the registry mode before you set `disabled`. It displays
+  settings for the primary chain only. A listing with rebalancing `enabled` or
+  `paused` also needs `wrapped_equity_recovery = "enabled"` on every chain.
 - **Per-asset `rebalancing = "disabled"`**: removes the asset from the trigger
   whitelist. New equity rebalancing flows do not start for that asset. On a
   secondary chain where no equity is `enabled` or `paused`, the chain's equity
@@ -304,22 +304,24 @@ over its own asset table, because vault polling reads its market-making vaults
 like any hedged chain's and those hold wrapped vault shares the daily portfolio
 capture values in underlying units. The rebalancing trigger plans across every
 hedged chain's entry and dispatches each operation with its chain (see Equity
-Allocation Planner); the portfolio snapshot still consumes the primary chain's
-entry, and the wrapped- and unwrapped-equity recovery aggregates resolve the
-entry of the chain they record. On every hedged chain, a listing with
-rebalancing `enabled` or `paused` must set
-`wrapped_equity_recovery = "enabled"`, so a failed transfer's tokens always have
-a recovery on the chain whose wallet holds them. On a secondary chain, a listing
-that enables recovery must also have rebalancing `enabled` or `paused`, since
-only then are the chain's equity services built. Either violation is refused at
-load, naming the chain and symbol. A mint or redemption transfer resolves the
-entry of the chain its record names (see below). The tokenization preflight
-(below) runs once per hedged chain with that chain's wallet, orderbook and
-settlement stable, as does the stale-allowance revoke on each chain in managed
-inventory mode. The startup MAX approvals run on every hedged chain in either
-mode, but only the settlement-stable grant is unconditional: the equity grants
-(underlying to wrapper vault, wrapped token to the deposit spender) are made
-only on chains that rebalance equity, since a hedge-only secondary has no
+Allocation Planner). The daily portfolio snapshot still values only the Base
+wallet, so equity waiting for recovery in a secondary wallet is not in that
+capture. Wallet polling and wrapped and unwrapped equity recovery cover each
+chain whose equity services are built. Recovery reads that chain's wallet
+balances and resumes only a mint or redemption recorded on that chain, using its
+own wallet, wrapper, issuer, and orderbook. On every chain, an equity whose
+rebalancing is `enabled` or `paused` must also have
+`wrapped_equity_recovery = "enabled"`, or config loading refuses it by chain and
+symbol. On a secondary, recovery also requires that listing's rebalancing to be
+`enabled` or `paused`, so its transfer services and approvals exist. A primary
+recovery-only listing remains supported. A mint or redemption transfer resolves
+the entry of the chain its record names (see below). The tokenization
+preflight(below) runs once per hedged chain with that chain's wallet, orderbook
+and settlement stable, as does the stale-allowance revoke on each chain in
+managed inventory mode. The startup MAX approvals run on every hedged chain in
+either mode, but only the settlement-stable grant is unconditional: the equity
+grants (underlying to wrapper vault, wrapped token to the deposit spender) are
+made only on chains that rebalance equity, since a hedge-only secondary has no
 wrapper to approve. Both deposit grants name the spender that chain settles
 deposits through -- its orderbook in legacy inventory mode, its
 `RaindexInventory` in managed mode -- so the same two token identities are
@@ -2579,7 +2581,12 @@ An aggregate may opt into event compaction only when all of these are true:
 
 Eligible aggregate types:
 
-- `InventorySnapshot`: enabled for compaction.
+- `InventorySnapshot`: enabled for compaction. Its snapshots are the durable
+  source for pruned observations, so adding chain wallet and in-flight maps uses
+  defaulted optional fields and retains its existing schema version. Do not
+  invalidate those snapshots or prune them to force event replay: older events
+  may already be gone. Both normal and forced snapshot application restore the
+  chain maps; legacy Base observations retain their compatibility path.
 - `VaultRegistry`: eligible only if a future PR also provides a snapshot-aware
   projection rebuild path.
 
@@ -5205,16 +5212,57 @@ aggregate history. New snapshots hydrate their Base and per-chain totals
 separately. Recovering a failed provider snapshot carries other provider events'
 complete venue balances and snapshot watermarks, including available shares.
 
+#### Multichain Equity Recovery Rollout and Rollback
+
+Ship the complete recovery reader and writer stack as release R before enabling
+any secondary-chain equity operation. R is the minimum safe rollback target for
+later chain activation, including
+[RAI-2780](https://linear.app/makeitrain/issue/RAI-2780). This release does not
+change chain capability gates, listing modes, wallet funding, or allocation
+targets. R refuses `enabled` and `paused` listings without recovery, and the
+production token file pinned before R has Base RKLB with rebalancing enabled and
+recovery disabled, so R refuses that pin at boot. Roll out in this order:
+
+1. Publish a registry generation that enables RKLB's Base recovery (or disables
+   its rebalancing).
+2. Pin that generation in `config/prod/st0x-hedge.toml`, and add its copy as
+   `tests/fixtures/tokens-production-<generation>.toml` in the same PR.
+3. Release that config on the current binary.
+4. Only then deploy R.
+
+The production release gate runs `validate-config` without `--registry-file`, so
+it does not check the token file and passes a pin that R refuses. Check the pin
+offline with `--registry-file` (see
+[How to add a new asset](docs/how-to-add-new-asset.md)) before deploying R.
+
+For a chain activation rollback, set the secondary listings to
+`rebalancing = "paused"`, keep recovery enabled, and let every transfer,
+provider request, resume job, recovery and wallet balance drain. Then disable
+rebalancing and recovery together. Rolling back the binary to R preserves every
+chain-qualified event and snapshot reader; it does not require deleting data.
+
+A pre-R binary is not a safe rollback while a secondary has outstanding equity
+state, or while any chain, including Base, has a signed pending issuer send: an
+older resume ignores its optional envelope and can sign a second transfer.
+Before even considering a pre-R rollback, drain those sends and all secondary
+operations, terminalize or reconcile secondary redemptions, verify wallets hold
+no equity, disable both secondary flags, and let `InventorySnapshot` compact
+past its last chain-qualified wallet and in-flight observations. Never delete
+its snapshot to accelerate that compaction. Inventory compaction alone is not
+proof that older binaries interpret retained recovery and transfer history
+correctly; a rollback below R needs a separately verified reader/data migration
+review. Use R for routine rollback.
+
 #### Wrapped Equity Recovery
 
 **Purpose**: Automatically return wrapped equity tokens (wtSTOCK) found in the
-bot wallet on the recovery's source chain to a venue that participates in market
-making, without operator intervention. Wallet wtSTOCK arises whenever the normal
-transfer flow fails to deliver to its destination -- a `TokenizedEquityMint`
-stalled after wrapping but before depositing into Raindex, an `EquityRedemption`
-stalled after withdrawing from Raindex but before unwrapping, or tokens arrived
-at the wallet without any matching in-flight transfer (external deposit,
-prior-process crash after compaction).
+bot wallet on the recovery's source chain to a venue that participates in
+marketmaking, without operator intervention. Wallet wtSTOCK arises whenever the
+normal transfer flow fails to deliver to its destination -- a
+`TokenizedEquityMint` stalled after wrapping but before depositing into Raindex,
+an `EquityRedemption` stalled after withdrawing from Raindex but before
+unwrapping, or tokens arrived at the wallet without any matching in-flight
+transfer (external deposit, prior-process crash after compaction).
 
 The mechanism has three components:
 
@@ -5246,9 +5294,9 @@ recovery, because that chain is no longer polled and cannot drive the job.
 ```mermaid
 flowchart TD
     Detect[BaseWalletWrappedEquity or ChainWalletWrappedEquity observed on source chain]
-    Detect --> CheckMint{InventoryView.active_mints<br/>has symbol?}
+    Detect --> CheckMint{Active mint for symbol<br/>on this chain?}
     CheckMint -- yes --> ResumeMint[resume_mint mint_id]
-    CheckMint -- no --> CheckRedemption{InventoryView.active_redemptions<br/>has symbol?}
+    CheckMint -- no --> CheckRedemption{Active redemption for symbol<br/>on this chain?}
     CheckRedemption -- yes --> ResumeRedemption[resume_redemption id]
     CheckRedemption -- no --> Orphan[Raindex submit_deposit]
     ResumeMint --> Done[wtSTOCK back in Raindex vault]
@@ -5259,13 +5307,13 @@ flowchart TD
 
 - **Active mint** -- the wtSTOCK belongs to a `TokenizedEquityMint` that reached
   `TokensWrapped` but never deposited. The dispatcher loads the aggregate via
-  the ID stored in `InventoryView.active_mints[symbol]` and calls
-  `CrossVenueEquityTransfer::resume_mint`; the existing mint flow drives it to
-  `DepositedIntoRaindex`.
+  the ID stored in `InventoryView.active_mints[symbol]`, verifies its chain, and
+  calls `CrossVenueEquityTransfer::resume_mint`; the existing mint flow drives
+  it to `DepositedIntoRaindex`.
 - **Active redemption** -- the wtSTOCK belongs to an `EquityRedemption` that
   reached `WithdrawnFromRaindex` but never unwrapped. The dispatcher loads it
-  via `InventoryView.active_redemptions[symbol]` and calls `resume_redemption`;
-  the redemption flow continues through unwrap and send.
+  via `InventoryView.active_redemptions[symbol]`, verifies its chain, and calls
+  `resume_redemption`; the redemption flow continues through unwrap and send.
 - **Orphan deposit** -- no aggregate owns the symbol's in-flight slot, so the
   wallet wtSTOCK is unused liquidity. The market-making venue is the closest
   place to redeploy it (no broker round-trip), so the dispatcher resolves the
@@ -5327,6 +5375,15 @@ redemption validation closes the detection with `InvalidDetectionFailed`, raises
 an operational alert, and retains any existing recovery hold without queuing
 another invalid detection. Redelivery preserves that hold. A vanished wrapped
 balance without a recovery hold fails the record without replacement.
+
+A `HeldForRecovery` slot names the chain that received the tokens. Startup and
+runtime handoffs enqueue recovery on that chain, including failed post-receipt
+mints on secondary chains. Another chain's recovery cannot claim or release the
+hold, and the symbol remains excluded from new transfers on every chain while it
+is held. A hold older than `recovery_hold_alert_after` alerts with its symbol,
+chain and age; pausing keeps the recovery running and does not force-release
+that ownership. A Base transfer that waits behind a secondary hold is not
+allowed to claim the other chain's tokens.
 
 ##### WrappedEquityRecovery Aggregate
 
@@ -5509,9 +5566,9 @@ for a side effect that didn't actually succeed.
 #### Unwrapped Equity Recovery
 
 **Purpose**: Automatically return unwrapped equity tokens (tSTOCK) found in the
-bot wallet on the recovery's source chain to a venue that participates in market
-making, without operator intervention. Wallet tSTOCK arises whenever the normal
-transfer flow fails to deliver the wrapped form to its destination -- a
+bot wallet on the recovery's source chain to a venue that participates in
+marketmaking, without operator intervention. Wallet tSTOCK arises whenever the
+normal transfer flow fails to deliver the wrapped form to its destination -- a
 `TokenizedEquityMint` stalled after `TokensReceived` but before wrapping, an
 `EquityRedemption` stalled after `TokensUnwrapped` but before sending to the
 broker, or tokens arrived at the wallet without any matching in-flight transfer
@@ -5521,11 +5578,10 @@ from a laggy RPC backend that left the bot believing a wrap attempt failed).
 Base observations emit `BaseWalletUnwrappedEquity`; other source chains emit
 `ChainWalletUnwrappedEquity { chain, balances }`. Both enqueue
 `UnwrappedEquityRecoveryJob { chain, symbol }` and read that chain's wallet
-snapshot.
-
-The mechanism mirrors [Wrapped Equity Recovery](#wrapped-equity-recovery):
-detection from the inventory poll, dispatch by `InventoryView`, audit via a
-dedicated aggregate. It differs in two places:
+snapshot. The mechanism mirrors
+[Wrapped Equity Recovery](#wrapped-equity-recovery): detection from the
+inventory poll, dispatch by `InventoryView`, audit via a dedicated aggregate. It
+differs in two places:
 
 - **Orphan path also wraps**. Wrapped recovery deposits the existing wtSTOCK
   straight into the Raindex vault. Unwrapped recovery first wraps the tSTOCK
@@ -5541,9 +5597,9 @@ dedicated aggregate. It differs in two places:
 ```mermaid
 flowchart TD
     Detect[BaseWalletUnwrappedEquity or ChainWalletUnwrappedEquity observed on source chain]
-    Detect --> CheckMint{InventoryView.active_mints<br/>has symbol?}
+    Detect --> CheckMint{Active mint for symbol<br/>on this chain?}
     CheckMint -- yes --> ResumeMint[resume_mint mint_id]
-    CheckMint -- no --> CheckRedemption{InventoryView.active_redemptions<br/>has symbol?}
+    CheckMint -- no --> CheckRedemption{Active redemption for symbol<br/>on this chain?}
     CheckRedemption -- yes --> ResumeRedemption[resume_redemption id]
     CheckRedemption -- no --> OrphanWrap[Wrapper wrap]
     ResumeMint --> Done[tSTOCK wrapped + back in Raindex vault]
@@ -5556,13 +5612,13 @@ flowchart TD
 
 - **Active mint** -- the tSTOCK belongs to a `TokenizedEquityMint` that reached
   `TokensReceived` but never wrapped. The dispatcher loads the aggregate via the
-  ID stored in `InventoryView.active_mints[symbol]` and calls
-  `CrossVenueEquityTransfer::resume_mint`; the existing mint flow drives it
-  through wrap and deposit to `DepositedIntoRaindex`.
+  ID stored in `InventoryView.active_mints[symbol]`, verifies its chain, and
+  calls `CrossVenueEquityTransfer::resume_mint`; the existing mint flow drives
+  it through wrap and deposit to `DepositedIntoRaindex`.
 - **Active redemption** -- the tSTOCK belongs to an `EquityRedemption` that
   reached `TokensUnwrapped` but never sent. The dispatcher loads it via
-  `InventoryView.active_redemptions[symbol]` and calls `resume_redemption`; the
-  redemption flow finishes the broker-side transfer.
+  `InventoryView.active_redemptions[symbol]`, verifies its chain, and calls
+  `resume_redemption`; the redemption flow finishes the broker-side transfer.
 - **Orphan deposit** -- no aggregate owns the symbol's in-flight slot, so the
   wallet tSTOCK is unused liquidity. The market-making venue is the closest
   redeploy target, so the dispatcher resolves the token + wrapper-vault pair via
@@ -5794,10 +5850,10 @@ is skipped and recorded as `paused`.
 - Ranking: redemptions (over target) before mints, larger deviation first, ties
   by chain order. A candidate whose vault registry does not know the token
   (`not_in_registry`), whose wallet is not gas-ready, or whose chain is cooling
-  down, is skipped and the next one evaluated. So is a redemption on any chain
-  but the primary (`redemption_unrecoverable`): wallet recovery runs on the
-  primary chain only, so a failed redemption elsewhere would strand its tokens.
-  The trigger reads a chain's registry and probes its wallet's gas only once the
+  down, is skipped and the next one evaluated. Redemptions on any rebalancing
+  chain rank before mints: recovery is required at config load for both mint and
+  redemption operations, rather than relying on a primary-chain exception. The
+  trigger reads a chain's registry and probes its wallet's gas only once the
   planner picks the chain, and re-plans without that chain when either fails, so
   a symbol within its band reads neither. Each chain is read at most once per
   check: the re-plan after the Position reservation reuses the first plan's

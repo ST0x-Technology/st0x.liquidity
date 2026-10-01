@@ -247,12 +247,23 @@ chain's signing wallet, orderbook, `redemption_wallet` and
   paused chain still counts in the planner's total, so it must stay polled and
   readable: a stale paused chain stops equity rebalancing for the symbol on
   every chain until it is fresh again or set to `"disabled"`. Wallet polling and
-  wallet recovery run where the chain already has them (the primary chain
-  today); pausing does not add them to a secondary.
+  both wrapped and unwrapped wallet recovery keep running on that chain.
+  Recovery retains its symbol hold until the work completes; pausing does not
+  release it. A zero allocation target starts redemptions and must not be used
+  as a pause.
 - `wrapped_equity_recovery`: Explicit opt-in for recovery of wrapped-equity
   positions. Set to `"enabled"` to allow the bot to recover wrapped equity;
   `"disabled"` skips recovery for this asset. Must be specified for every equity
-  entry.
+  entry. On every chain, `rebalancing = "enabled"` or `"paused"` requires
+  recovery enabled, covering mints as well as redemptions. A secondary listing
+  with recovery enabled must keep rebalancing enabled or paused so the chain
+  builds its transfer services. Config errors name both chain and symbol. Enable
+  a secondary listing only after the complete recovery stack ships as release R
+  and its chain capability is available. For rollback, pause first, wait for
+  recovery and provider operations to drain and the wallet to empty, then
+  disable rebalancing and recovery together. Roll back the binary to R; older
+  binaries do not safely execute secondary recovery or signed pending issuer
+  sends. Never delete a compacted inventory snapshot to force replay.
 - `extended_hours_counter_trading`: Explicit opt-in for counter-trading during
   extended hours (pre-market and after-hours). Set to `"enabled"` to allow the
   bot to place offsetting broker trades outside regular market hours;
@@ -296,6 +307,20 @@ Before a release, check the pinned copy against the config offline:
 cargo run --bin validate-config -- --config config/prod/st0x-hedge.toml \
   --registry-file tests/fixtures/tokens-production-<generation>.toml
 ```
+
+The production release gate runs `validate-config` without `--registry-file`, so
+it does not check the token file: a pin that the new binary refuses passes the
+gate and fails only when the bot starts. Run this check yourself.
+
+**Recovery stack release (RAI-2596):** that release refuses an `enabled` or
+`paused` equity listing without recovery. The production pin from before it has
+Base RKLB with rebalancing enabled and recovery disabled. Before you deploy it:
+
+1. Publish a token file generation that enables RKLB's Base recovery (or
+   disables its rebalancing).
+2. Pin that generation and add its fixture copy, as above, in one PR.
+3. Release that config on the current binary.
+4. Deploy the new binary only after that.
 
 ### Retiring an asset
 
