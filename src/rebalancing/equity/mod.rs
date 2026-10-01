@@ -39,7 +39,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use rain_math_float::Float;
 use sqlx::SqlitePool;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
 use thiserror::Error;
@@ -73,7 +73,7 @@ use crate::bot_gas::{
 use crate::conductor::job::QueuePushError;
 use crate::equity_redemption::{
     DetectionFailure, EquityRedemption, EquityRedemptionCommand, EquityRedemptionError,
-    RedemptionAggregateId,
+    RedemptionAggregateId, UnwrappedProvenance, reattest_legacy_underlying,
 };
 use crate::mint_authorization::{ConfiguredMintAuthorizer, VaultModeCheckError, VaultModeReader};
 use crate::native_gas::{ConfiguredGasReadiness, GasReadinessFailure, TransferGasRoute};
@@ -440,6 +440,96 @@ pub async fn verify_hash_only_withdrawal_not_through(
     }
 }
 
+/// Sign once and store before broadcast. A send already persisted is never
+/// signed again, and a legacy `SendPending` (which may already have moved
+/// tokens under an unrecorded hash) is refused.
+async fn prepare_and_persist_redemption_send(
+    services: &EquityTransferServices,
+    store: &Store<EquityRedemption>,
+    aggregate_id: &RedemptionAggregateId,
+) -> Result<(), RedemptionError> {
+    let entity =
+        store
+            .load(aggregate_id)
+            .await?
+            .ok_or_else(|| RedemptionError::EntityNotFound {
+                aggregate_id: aggregate_id.clone(),
+            })?;
+    if let EquityRedemption::SendPending { prepared_send, .. } = &entity {
+        return if prepared_send.is_some() {
+            Ok(())
+        } else {
+            Err(RedemptionError::LegacyIssuerSendPending {
+                aggregate_id: aggregate_id.clone(),
+            })
+        };
+    }
+    let EquityRedemption::TokensUnwrapped {
+        symbol,
+        chain,
+        underlying_token,
+        unwrapped_amount,
+        unwrap_block,
+        ..
+    } = entity
+    else {
+        return Err(RedemptionError::UnexpectedEntity { entity });
+    };
+    let chain_services = services.for_chain(chain)?;
+    let token = match underlying_token {
+        UnwrappedProvenance::Attested { attested } => attested,
+        UnwrappedProvenance::Legacy(recorded) => {
+            reattest_legacy_underlying(chain_services, &symbol, recorded)
+                .await
+                .map_err(|error| RedemptionError::PrepareSend {
+                    error_message: error.to_string(),
+                })?
+        }
+    };
+    // A load-balanced backend that has not indexed the unwrap block yet sees
+    // a zero balance, so the send would revert. Waiting on the tokenizer's
+    // own provider keeps a caught-up wrapper provider from masking it.
+    if let Some(block) = unwrap_block {
+        chain_services
+            .tokenizer
+            .wait_for_block(block)
+            .await
+            .map_err(TokenizerError::from)?;
+    }
+    let redemption_wallet = chain_services
+        .tokenizer
+        .redemption_wallet()
+        .ok_or(TokenizerError::MissingRedemptionWallet)?;
+    let prepared = chain_services
+        .tokenizer
+        .prepare_redemption_send(token, unwrapped_amount)
+        .await?;
+
+    if let Err(error) = store
+        .send(
+            aggregate_id,
+            EquityRedemptionCommand::PrepareSend {
+                prepared: prepared.clone(),
+                redemption_wallet,
+            },
+        )
+        .await
+    {
+        error!(target: "rebalance", %aggregate_id, ?error, "Failed to persist the signed redemption send; not broadcasting");
+        release_unpersisted_redemption_send(
+            store,
+            chain_services.tokenizer.as_ref(),
+            aggregate_id,
+            prepared.tx_hash(),
+            &error,
+        )
+        .await;
+        return Err(error.into());
+    }
+
+    Ok(())
+}
+
 async fn read_mined_tx(
     raindex: &dyn Raindex,
     tx: TxHash,
@@ -762,6 +852,35 @@ pub async fn verify_withdrawal_replacement(
     }
 
     Ok(())
+}
+
+/// After a failed `PrepareSend`, releases the signed send's nonce only when the
+/// send provably never reached storage: the aggregate rejected the command, or
+/// a reload shows a state that cannot hold this hash. A load error, or a later
+/// state the send may have reached, keeps the reservation: a nonce gap until
+/// restart is recoverable, a rewound nonce under a live send is not.
+async fn release_unpersisted_redemption_send(
+    store: &Store<EquityRedemption>,
+    tokenizer: &dyn Tokenizer,
+    aggregate_id: &RedemptionAggregateId,
+    tx_hash: TxHash,
+    error: &SendError<EquityRedemption>,
+) {
+    let rejected = matches!(error, AggregateError::UserError(LifecycleError::Apply(_)));
+    let unpersisted = rejected
+        || match store.load(aggregate_id).await {
+            Ok(None | Some(EquityRedemption::TokensUnwrapped { .. })) => true,
+            Ok(Some(EquityRedemption::SendPending { prepared_send, .. })) => prepared_send
+                .as_ref()
+                .is_none_or(|stored| stored.prepared.tx_hash() != tx_hash),
+            Ok(Some(_)) | Err(_) => false,
+        };
+
+    if unpersisted {
+        tokenizer.discard_redemption_send(tx_hash).await;
+    } else {
+        warn!(target: "rebalance", %aggregate_id, %tx_hash, "Signed redemption send may have been persisted; keeping its nonce reserved");
+    }
 }
 
 /// Data extracted from the TokensReceived aggregate state for
@@ -1207,6 +1326,35 @@ impl Tokenizer for PanickingTokenizer {
         unimplemented!("PanickingTokenizer: not available in CLI context")
     }
 
+    async fn prepare_redemption_send(
+        &self,
+        _token: UnwrappedToken,
+        _amount: U256,
+    ) -> Result<st0x_evm::PreparedTransaction, TokenizerError> {
+        unimplemented!("PanickingTokenizer: not available in CLI context")
+    }
+    async fn broadcast_redemption_send(
+        &self,
+        _: &st0x_evm::PreparedTransaction,
+    ) -> Result<TxHash, TokenizerError> {
+        unimplemented!("PanickingTokenizer: not available in CLI context")
+    }
+    async fn confirm_redemption_send(&self, _: TxHash) -> Result<bool, TokenizerError> {
+        unimplemented!("PanickingTokenizer: not available in CLI context")
+    }
+    async fn restore_redemption_send(&self, _: &st0x_evm::PreparedTransaction) {
+        unimplemented!("PanickingTokenizer: not available in CLI context")
+    }
+    async fn discard_redemption_send(&self, _: TxHash) {
+        unimplemented!("PanickingTokenizer: not available in CLI context")
+    }
+    async fn redemption_send_mined(&self, _: TxHash) -> Result<bool, TokenizerError> {
+        unimplemented!("PanickingTokenizer: not available in CLI context")
+    }
+    async fn release_superseded_redemption_send(&self, _: TxHash) {
+        unimplemented!("PanickingTokenizer: not available in CLI context")
+    }
+
     async fn poll_for_redemption(&self, _: &TxHash) -> Result<TokenizationRequest, TokenizerError> {
         unimplemented!("PanickingTokenizer: not available in CLI context")
     }
@@ -1508,6 +1656,13 @@ pub enum RedemptionError {
         symbol: Symbol,
         mode: st0x_config::RebalancingMode,
     },
+    #[error(
+        "Redemption {aggregate_id} has a legacy send without a persisted transaction; verify its prior issuer transfer before resuming"
+    )]
+    LegacyIssuerSendPending { aggregate_id: RedemptionAggregateId },
+    #[error("Could not prepare issuer send: {error_message}")]
+    PrepareSend { error_message: String },
+
     #[error(transparent)]
     ChainServicesMissing(#[from] ChainServicesMissing),
     #[error(transparent)]
@@ -1563,6 +1718,12 @@ impl RedemptionError {
                     EquityRedemptionError::RaindexWithdrawReconciliationPending { .. },
                 )))
             )
+            || matches!(
+                self,
+                Self::Send(AggregateError::UserError(LifecycleError::Apply(
+                    EquityRedemptionError::RedemptionSendUnresolved { .. },
+                )))
+            )
     }
 }
 
@@ -1574,6 +1735,8 @@ impl BotGasFailureClassifier for RedemptionError {
             )))
             | Self::BotGasEnqueue(_) => true,
             Self::RebalancingNotEnabled { .. }
+            | Self::LegacyIssuerSendPending { .. }
+            | Self::PrepareSend { .. }
             | Self::ChainServicesMissing(_)
             | Self::GasReadiness(_)
             | Self::Send(_)
@@ -1613,6 +1776,9 @@ struct WrappedMintResult {
 /// vault operations and tokenization. External code drives transfers only
 /// through [`Self::resume_equity_to_market_making`] and
 /// [`Self::resume_equity_to_hedging`].
+type RedemptionPrepareLocks =
+    std::sync::Mutex<HashMap<RedemptionAggregateId, Weak<tokio::sync::Mutex<()>>>>;
+
 pub struct CrossVenueEquityTransfer {
     /// The per-chain entries every step resolves through -- the same map the
     /// two aggregates' command handlers read. The chain comes from the
@@ -1621,6 +1787,7 @@ pub struct CrossVenueEquityTransfer {
     services: EquityTransferServices,
     mint_store: Arc<Store<TokenizedEquityMint>>,
     redemption_store: Arc<Store<EquityRedemption>>,
+    redemption_send_prepare: RedemptionPrepareLocks,
     /// Mint-authorization capability for orchestrator-mode assets
     /// (RAI-1243). Defaults to [`ConfiguredMintAuthorization::VaultDirectOnly`]
     /// (an explicit assertion, mirroring `BotGasReceiptCostEnqueuer`'s
@@ -1670,6 +1837,7 @@ impl CrossVenueEquityTransfer {
             services,
             mint_store,
             redemption_store,
+            redemption_send_prepare: std::sync::Mutex::new(HashMap::new()),
             mint_authorization: ConfiguredMintAuthorization::VaultDirectOnly,
             rebalancing: None,
         }
@@ -2448,6 +2616,19 @@ impl CrossVenueEquityTransfer {
         Ok(())
     }
 
+    pub(crate) async fn discard_reconciled_issuer_send(
+        &self,
+        chain: Chain,
+        tx_hash: TxHash,
+    ) -> Result<(), RedemptionError> {
+        self.services
+            .for_chain(chain)?
+            .tokenizer
+            .release_superseded_redemption_send(tx_hash)
+            .await;
+        Ok(())
+    }
+
     async fn broadcast_and_record_vault_withdrawal(
         &self,
         aggregate_id: &RedemptionAggregateId,
@@ -2492,6 +2673,52 @@ impl CrossVenueEquityTransfer {
         Ok(())
     }
 
+    /// Signs the issuer send once and persists it (`PrepareSend`) before any
+    /// broadcast, on a detached task so a cancelled caller (a dropped API
+    /// request or job future) cannot stop between the two: a signed send that
+    /// was never persisted keeps its nonce reserved and stalls every later
+    /// send from the wallet. A failed write goes through
+    /// [`release_unpersisted_redemption_send`].
+    async fn prepare_redemption_send(
+        &self,
+        aggregate_id: &RedemptionAggregateId,
+    ) -> Result<(), RedemptionError> {
+        let prepare_lock = {
+            let mut locks = self
+                .redemption_send_prepare
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            locks.retain(|_, lock| lock.strong_count() > 0);
+            let lock = locks
+                .get(aggregate_id)
+                .and_then(Weak::upgrade)
+                .unwrap_or_else(|| Arc::new(tokio::sync::Mutex::new(())));
+            locks.insert(aggregate_id.clone(), Arc::downgrade(&lock));
+            drop(locks);
+            lock
+        };
+        let services = self.services.clone();
+        let store = Arc::clone(&self.redemption_store);
+        let task_id = aggregate_id.clone();
+        // `PrepareSend` can outlive a cancelled caller, so the task continues
+        // the caller's projection slot.
+        let projection_slot =
+            crate::conductor::projection_pause::projection_slot_for_detached_work().await;
+
+        tokio::spawn(async move {
+            let _projection_slot = projection_slot;
+            let _prepare_guard = prepare_lock.lock().await;
+            prepare_and_persist_redemption_send(&services, &store, &task_id).await
+        })
+        .await
+        .map_err(|join_error| {
+            error!(target: "rebalance", %aggregate_id, %join_error, "Redemption send prepare-and-persist task failed to join (panicked)");
+            RedemptionError::PrepareSend {
+                error_message: format!("prepare task failed to join: {join_error}"),
+            }
+        })?
+    }
+
     /// Unwraps ERC-4626 tokens and sends to Alpaca, returning the
     /// redemption tx hash.
     async fn unwrap_and_send(
@@ -2512,10 +2739,7 @@ impl CrossVenueEquityTransfer {
 
         info!(target: "rebalance", %aggregate_id, "Tokens unwrapped, sending to Alpaca");
 
-        self.redemption_store
-            .send(aggregate_id, EquityRedemptionCommand::PrepareSend)
-            .await?;
-
+        self.prepare_redemption_send(aggregate_id).await?;
         self.redemption_store
             .send(aggregate_id, EquityRedemptionCommand::SendTokens)
             .await?;
@@ -2765,6 +2989,7 @@ impl CrossVenueEquityTransfer {
                 }
                 EquityRedemption::SendPending { .. } => {
                     info!(%aggregate_id, "Resuming pending send");
+                    self.prepare_redemption_send(aggregate_id).await?;
                     self.redemption_store
                         .send(aggregate_id, EquityRedemptionCommand::SendTokens)
                         .await?;
@@ -2812,9 +3037,7 @@ impl CrossVenueEquityTransfer {
         aggregate_id: &RedemptionAggregateId,
     ) -> Result<(), RedemptionError> {
         info!(%aggregate_id, "Resuming unwrapped redemption");
-        self.redemption_store
-            .send(aggregate_id, EquityRedemptionCommand::PrepareSend)
-            .await?;
+        self.prepare_redemption_send(aggregate_id).await?;
         Ok(())
     }
 
@@ -3787,7 +4010,7 @@ mod tests {
         );
         assert_eq!(
             ethereum.tokenizer.call_count(),
-            5,
+            8,
             "the redemption must be sent through Ethereum's issuer"
         );
         base.assert_untouched(Chain::Base);
@@ -7671,6 +7894,458 @@ mod tests {
                 )))
             ),
             "expected PostReceipt(Wrapper(NodeBehindRequiredBlock)), got: {error:?}"
+        );
+    }
+
+    /// Seeds a redemption at `TokensUnwrapped` from history, so a test picks
+    /// the unwrapped token's provenance and the unwrap block.
+    async fn seed_unwrapped_redemption(
+        pool: &SqlitePool,
+        id: &RedemptionAggregateId,
+        underlying_token: UnwrappedProvenance,
+        unwrap_block: Option<u64>,
+    ) {
+        let events = [
+            EquityRedemptionEvent::WithdrawnFromRaindex {
+                symbol: Symbol::new("AAPL").unwrap(),
+                quantity: float!(1),
+                token: Address::repeat_byte(0x11),
+                wrapped_amount: U256::from(1_000_000_000_000_000_000_u128),
+                actual_wrapped_amount: None,
+                raindex_withdraw_tx: TxHash::repeat_byte(0x12),
+                raindex_withdraw_block: None,
+                withdrawn_at: Utc::now(),
+            },
+            EquityRedemptionEvent::TokensUnwrapped {
+                quantity: Some(float!(1)),
+                underlying_token,
+                unwrap_tx_hash: TxHash::repeat_byte(0x13),
+                unwrapped_amount: U256::from(1_000_000_000_000_000_000_u128),
+                unwrap_block,
+                unwrapped_at: Utc::now(),
+            },
+        ];
+        for (sequence, event) in (1_i64..).zip(events) {
+            sqlx::query(
+                "INSERT INTO events \
+                 (aggregate_type, aggregate_id, sequence, event_type, event_version, payload, \
+                  metadata) \
+                 VALUES ('EquityRedemption', ?1, ?2, ?3, '1', ?4, '{}')",
+            )
+            .bind(id.to_string())
+            .bind(sequence)
+            .bind(st0x_event_sorcery::DomainEvent::event_type(&event))
+            .bind(serde_json::to_string(&event).unwrap())
+            .execute(pool)
+            .await
+            .unwrap();
+        }
+    }
+
+    async fn transfer_at_tokens_unwrapped(
+        tokenizer: Arc<MockTokenizer>,
+        wrapper: Arc<dyn Wrapper>,
+        label: &str,
+        underlying_token: UnwrappedProvenance,
+        unwrap_block: Option<u64>,
+    ) -> (CrossVenueEquityTransfer, SqlitePool, RedemptionAggregateId) {
+        let (transfer, pool) =
+            create_equity_transfer_with_pool(tokenizer, Arc::new(MockRaindex::new()), wrapper)
+                .await;
+        let id = redemption_aggregate_id(label);
+        seed_unwrapped_redemption(&pool, &id, underlying_token, unwrap_block).await;
+        assert!(matches!(
+            transfer.redemption_store.load(&id).await.unwrap(),
+            Some(EquityRedemption::TokensUnwrapped { .. })
+        ));
+        (transfer, pool, id)
+    }
+
+    fn attested_underlying() -> UnwrappedProvenance {
+        UnwrappedProvenance::Attested {
+            attested: UnwrappedToken::unchecked(Address::repeat_byte(0x21)),
+        }
+    }
+
+    /// A redemption interrupted before the vault attestation existed carries
+    /// an address copied from config. Preparing its send must re-attest
+    /// through the wrapper and refuse when the vault's asset() is not that
+    /// address, even after the config has been corrected.
+    #[tokio::test]
+    async fn prepare_redemption_send_refuses_a_legacy_underlying_the_vault_does_not_attest() {
+        let configured = Address::random();
+        let recorded = Address::random();
+        let tokenizer = Arc::new(MockTokenizer::new());
+        let (transfer, _pool, id) = transfer_at_tokens_unwrapped(
+            tokenizer.clone(),
+            Arc::new(
+                MockWrapper::new()
+                    .with_tokenized_shares(configured)
+                    .attesting_unwrapped_token(configured),
+            ),
+            "legacy-underlying-mismatch",
+            UnwrappedProvenance::Legacy(recorded),
+            None,
+        )
+        .await;
+
+        let error = transfer.prepare_redemption_send(&id).await.unwrap_err();
+
+        assert!(
+            matches!(&error, RedemptionError::PrepareSend { error_message } if error_message.contains(&recorded.to_string())),
+            "got: {error:?}"
+        );
+        assert!(
+            tokenizer.send_for_redemption_calls().is_empty(),
+            "nothing may be signed"
+        );
+        assert!(matches!(
+            transfer.redemption_store.load(&id).await.unwrap(),
+            Some(EquityRedemption::TokensUnwrapped { .. })
+        ));
+    }
+
+    /// The same legacy record whose address the vault does attest is signed
+    /// with the attested token.
+    #[tokio::test]
+    async fn prepare_redemption_send_signs_the_attested_token_of_a_legacy_record() {
+        let configured = Address::random();
+        let tokenizer = Arc::new(MockTokenizer::new());
+        let (transfer, _pool, id) = transfer_at_tokens_unwrapped(
+            tokenizer.clone(),
+            Arc::new(
+                MockWrapper::new()
+                    .with_tokenized_shares(configured)
+                    .attesting_unwrapped_token(configured),
+            ),
+            "legacy-underlying-attested",
+            UnwrappedProvenance::Legacy(configured),
+            None,
+        )
+        .await;
+
+        transfer.prepare_redemption_send(&id).await.unwrap();
+
+        assert_eq!(
+            tokenizer
+                .send_for_redemption_calls()
+                .into_iter()
+                .map(UnwrappedToken::address)
+                .collect::<Vec<_>>(),
+            vec![configured]
+        );
+    }
+
+    /// A load-balanced backend that has not indexed the unwrap block sees a
+    /// zero balance, so preparation waits for that block before signing.
+    #[tokio::test]
+    async fn prepare_redemption_send_waits_for_the_unwrap_block_before_signing() {
+        let tokenizer = Arc::new(MockTokenizer::new());
+        let (transfer, _pool, id) = transfer_at_tokens_unwrapped(
+            tokenizer.clone(),
+            Arc::new(MockWrapper::new()),
+            "prepare-waits-for-block",
+            attested_underlying(),
+            Some(1234),
+        )
+        .await;
+
+        transfer.prepare_redemption_send(&id).await.unwrap();
+
+        assert_eq!(tokenizer.wait_for_block_calls(), vec![1234]);
+        assert_eq!(tokenizer.send_for_redemption_calls().len(), 1);
+    }
+
+    /// Records persisted before the unwrap block was recorded skip the wait.
+    #[tokio::test]
+    async fn prepare_redemption_send_skips_the_wait_without_an_unwrap_block() {
+        let tokenizer = Arc::new(MockTokenizer::new());
+        let (transfer, _pool, id) = transfer_at_tokens_unwrapped(
+            tokenizer.clone(),
+            Arc::new(MockWrapper::new()),
+            "prepare-skips-wait",
+            attested_underlying(),
+            None,
+        )
+        .await;
+
+        transfer.prepare_redemption_send(&id).await.unwrap();
+
+        assert!(tokenizer.wait_for_block_calls().is_empty());
+        assert_eq!(tokenizer.send_for_redemption_calls().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn prepare_redemption_send_signs_nothing_while_the_node_lags() {
+        let tokenizer = Arc::new(MockTokenizer::new().failing_wait_for_block());
+        let (transfer, _pool, id) = transfer_at_tokens_unwrapped(
+            tokenizer.clone(),
+            Arc::new(MockWrapper::new()),
+            "prepare-node-lags",
+            attested_underlying(),
+            Some(42),
+        )
+        .await;
+
+        let error = transfer.prepare_redemption_send(&id).await.unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                RedemptionError::Tokenizer(TokenizerError::Evm(
+                    EvmError::NodeBehindRequiredBlock { .. }
+                ))
+            ),
+            "got: {error:?}"
+        );
+        assert!(tokenizer.send_for_redemption_calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn prepare_redemption_send_signs_once_and_persists_before_any_broadcast() {
+        let tokenizer = Arc::new(MockTokenizer::new());
+        let (transfer, _pool, id) = transfer_at_tokens_unwrapped(
+            tokenizer.clone(),
+            Arc::new(MockWrapper::new()),
+            "prepare-send-once",
+            attested_underlying(),
+            None,
+        )
+        .await;
+
+        transfer.prepare_redemption_send(&id).await.unwrap();
+        let persisted = match transfer.redemption_store.load(&id).await.unwrap() {
+            Some(EquityRedemption::SendPending {
+                prepared_send: Some(send),
+                ..
+            }) => send.prepared.tx_hash(),
+            state => panic!("expected a persisted signed send, got {state:?}"),
+        };
+        assert!(
+            tokenizer.redemption_send_broadcasts().is_empty(),
+            "preparation must not broadcast"
+        );
+
+        // A resume of the already prepared send must reuse it, not sign again.
+        transfer.prepare_redemption_send(&id).await.unwrap();
+        assert_eq!(tokenizer.send_for_redemption_calls().len(), 1);
+        assert!(matches!(
+            transfer.redemption_store.load(&id).await.unwrap(),
+            Some(EquityRedemption::SendPending { prepared_send: Some(send), .. })
+                if send.prepared.tx_hash() == persisted
+        ));
+        assert!(tokenizer.redemption_send_discards().is_empty());
+    }
+
+    #[tokio::test]
+    async fn concurrent_redemption_send_prepares_sign_only_one_nonce() {
+        let tokenizer = Arc::new(MockTokenizer::new());
+        let (transfer, _pool, id) = transfer_at_tokens_unwrapped(
+            tokenizer.clone(),
+            Arc::new(MockWrapper::new()),
+            "concurrent-send-prepare",
+            attested_underlying(),
+            None,
+        )
+        .await;
+        let (first, second) = tokio::join!(
+            transfer.prepare_redemption_send(&id),
+            transfer.prepare_redemption_send(&id)
+        );
+        first.unwrap();
+        second.unwrap();
+        assert_eq!(tokenizer.send_for_redemption_calls().len(), 1);
+        assert!(tokenizer.redemption_send_discards().is_empty());
+        assert!(matches!(
+            transfer.redemption_store.load(&id).await.unwrap(),
+            Some(EquityRedemption::SendPending {
+                prepared_send: Some(_),
+                ..
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_legacy_send_pending_is_never_signed_or_resumed() {
+        let tokenizer = Arc::new(MockTokenizer::new());
+        let (transfer, pool, id) = transfer_at_tokens_unwrapped(
+            tokenizer.clone(),
+            Arc::new(MockWrapper::new()),
+            "legacy-send-pending",
+            attested_underlying(),
+            None,
+        )
+        .await;
+        let next_sequence: i64 =
+            sqlx::query_scalar("SELECT MAX(sequence) + 1 FROM events WHERE aggregate_id = ?1")
+                .bind(id.to_string())
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        sqlx::query(
+            "INSERT INTO events \
+             (aggregate_type, aggregate_id, sequence, event_type, event_version, payload, metadata) \
+             VALUES ('EquityRedemption', ?1, ?2, 'EquityRedemptionEvent::SendPending', '1', \
+             '{\"SendPending\":{\"pending_at\":\"2026-01-01T00:00:00Z\"}}', '{}')",
+        )
+        .bind(id.to_string())
+        .bind(next_sequence)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let restarted = restarted_transfer(&transfer, pool);
+
+        assert!(matches!(
+            restarted.prepare_redemption_send(&id).await,
+            Err(RedemptionError::LegacyIssuerSendPending { .. })
+        ));
+        assert!(matches!(
+            restarted.resume_redemption(&id).await,
+            Err(RedemptionError::LegacyIssuerSendPending { .. })
+        ));
+        assert!(tokenizer.send_for_redemption_calls().is_empty());
+        assert!(tokenizer.redemption_send_broadcasts().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_caller_still_persists_the_signed_send() {
+        let tokenizer = Arc::new(MockTokenizer::new());
+        let (transfer, _pool, id) = transfer_at_tokens_unwrapped(
+            tokenizer.clone(),
+            Arc::new(MockWrapper::new()),
+            "prepare-send-cancelled",
+            attested_underlying(),
+            None,
+        )
+        .await;
+
+        // A zero deadline drops the caller at its first suspension point, as a
+        // disconnected API request would.
+        tokio::time::timeout(Duration::ZERO, transfer.prepare_redemption_send(&id))
+            .await
+            .unwrap_err();
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !matches!(
+                transfer.redemption_store.load(&id).await.unwrap(),
+                Some(EquityRedemption::SendPending {
+                    prepared_send: Some(_),
+                    ..
+                })
+            ) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the signed send must reach storage after its caller is cancelled");
+        assert_eq!(tokenizer.send_for_redemption_calls().len(), 1);
+        assert!(tokenizer.redemption_send_discards().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_prepare_send_rejected_by_a_concurrent_failure_releases_the_signed_nonce() {
+        let tokenizer = Arc::new(MockTokenizer::new());
+        let (transfer, _pool, id) = transfer_at_tokens_unwrapped(
+            tokenizer.clone(),
+            Arc::new(MockWrapper::new()),
+            "prepare-send-concurrent-fail",
+            attested_underlying(),
+            None,
+        )
+        .await;
+        // The operator or timeout sweep fails the transfer while it is signing.
+        transfer
+            .redemption_store
+            .send(
+                &id,
+                EquityRedemptionCommand::FailTransfer {
+                    reason: "operator".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+        let signed = PreparedTransaction::for_test(TxHash::repeat_byte(5), 9);
+        let error = transfer
+            .redemption_store
+            .send(
+                &id,
+                EquityRedemptionCommand::PrepareSend {
+                    prepared: signed.clone(),
+                    redemption_wallet: Address::ZERO,
+                },
+            )
+            .await
+            .unwrap_err();
+
+        release_unpersisted_redemption_send(
+            &transfer.redemption_store,
+            tokenizer.as_ref(),
+            &id,
+            signed.tx_hash(),
+            &error,
+        )
+        .await;
+
+        assert_eq!(tokenizer.redemption_send_discards(), vec![signed.tx_hash()]);
+    }
+
+    #[tokio::test]
+    async fn an_ambiguous_prepare_send_failure_keeps_a_send_that_may_be_stored() {
+        let tokenizer = Arc::new(MockTokenizer::new());
+        let (transfer, _pool, id) = transfer_at_tokens_unwrapped(
+            tokenizer.clone(),
+            Arc::new(MockWrapper::new()),
+            "prepare-send-ambiguous",
+            attested_underlying(),
+            None,
+        )
+        .await;
+        let stored = PreparedTransaction::for_test(TxHash::repeat_byte(5), 9);
+        let other = PreparedTransaction::for_test(TxHash::repeat_byte(6), 10);
+        transfer
+            .redemption_store
+            .send(
+                &id,
+                EquityRedemptionCommand::PrepareSend {
+                    prepared: stored.clone(),
+                    redemption_wallet: Address::ZERO,
+                },
+            )
+            .await
+            .unwrap();
+        // A reactor error after the commit: the store cannot say whether the
+        // event was written.
+        let ambiguous = || {
+            AggregateError::UnexpectedError(Box::new(std::io::Error::other(
+                "reactor failed after commit",
+            )))
+        };
+
+        release_unpersisted_redemption_send(
+            &transfer.redemption_store,
+            tokenizer.as_ref(),
+            &id,
+            stored.tx_hash(),
+            &ambiguous(),
+        )
+        .await;
+        assert!(
+            tokenizer.redemption_send_discards().is_empty(),
+            "the stored send must keep its nonce"
+        );
+
+        release_unpersisted_redemption_send(
+            &transfer.redemption_store,
+            tokenizer.as_ref(),
+            &id,
+            other.tx_hash(),
+            &ambiguous(),
+        )
+        .await;
+        assert_eq!(
+            tokenizer.redemption_send_discards(),
+            vec![other.tx_hash()],
+            "a send another attempt replaced never reached storage"
         );
     }
 }

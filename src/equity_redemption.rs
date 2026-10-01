@@ -54,12 +54,11 @@ use uuid::Uuid;
 
 use st0x_dto::{EquityRedemptionOperation, EquityRedemptionStatus, TransferOperation};
 use st0x_event_sorcery::{DomainEvent, EventSourced, Table};
-use st0x_evm::{Chain, EvmError, IERC20, NODE_SYNC_MAX_ATTEMPTS, PreparedTransaction};
+use st0x_evm::{Chain, IERC20, PreparedTransaction};
 use st0x_execution::Symbol;
 use st0x_finance::FractionalShares;
 use st0x_raindex::RaindexVaultId;
-use st0x_tokenization::TokenizationRequestId;
-use st0x_tokenization::Tokenizer;
+use st0x_tokenization::{TokenizationRequestId, Tokenizer};
 use st0x_wrapper::{UnwrappedToken, WrapperError};
 
 use crate::bot_gas::{
@@ -126,6 +125,15 @@ pub enum EquityRedemptionError {
     /// The record names a chain no services were wired for.
     #[error(transparent)]
     ChainServicesMissing(#[from] ChainServicesMissing),
+    #[error("Redemption send has no persisted signed transaction")]
+    RedemptionSendNotPrepared,
+    #[error("Redemption send {tx_hash} is unresolved: {error_message}")]
+    RedemptionSendUnresolved {
+        tx_hash: TxHash,
+        error_message: String,
+    },
+    #[error("Prepared redemption send identity cannot be changed")]
+    RedemptionSendIdentityChanged,
     /// Raindex vault lookup failed for the given token
     #[error("Token {0} not found in Raindex vault registry")]
     RaindexVaultNotFound(Address),
@@ -409,7 +417,7 @@ pub enum EquityRedemptionCommand {
     /// fixture seeding can backdate synthetic history.
     #[cfg(any(test, feature = "test-support"))]
     ConfirmUnwrapAt { unwrapped_at: DateTime<Utc> },
-    /// Send unwrapped tokens to Alpaca's redemption wallet.
+    /// Broadcast and confirm the exact persisted send.
     SendTokens,
     /// Test/fixture-only: identical to `SendTokens` but takes `sent_at`
     /// explicitly instead of stamping `Utc::now()`, so fixture seeding can
@@ -473,23 +481,32 @@ pub enum EquityRedemptionCommand {
     SubmitUnwrapAt { submitted_at: DateTime<Utc> },
     /// Prepares sending tokens (pure, no side effects).
     /// Valid from `TokensUnwrapped`.
-    PrepareSend,
+    PrepareSend {
+        prepared: PreparedTransaction,
+        redemption_wallet: Address,
+    },
     /// Test/fixture-only: identical to `PrepareSend` but takes `pending_at`
     /// explicitly instead of stamping `Utc::now()`, so fixture seeding can
     /// backdate synthetic history.
     #[cfg(any(test, feature = "test-support"))]
-    PrepareSendAt { pending_at: DateTime<Utc> },
+    PrepareSendAt {
+        prepared: PreparedTransaction,
+        redemption_wallet: Address,
+        pending_at: DateTime<Utc>,
+    },
     /// Reconcile a redemption to the terminal `Reconciled` state once its
     /// residual was handled out-of-band (e.g. via wrap-equity/vault-deposit), a
     /// bookkeeping resolution rather than a re-drive. Valid from the `Failed`
-    /// terminal, and from the vault withdrawal states whose fate an operator
-    /// has verified -- in-flight states with no automatic exit (never
-    /// force-failed, since a withdrawal may have landed).
+    /// terminal, and from the withdrawal submission states and `SendPending`
+    /// whose broadcast fate an operator has verified -- the in-flight states
+    /// with no automatic exit (never force-failed, since their transaction may
+    /// have landed).
     Reconcile {
         reason: String,
-        /// The signed withdrawal the caller proved can never land, or `None`
-        /// when the state it checked held none. Refused if the redemption's
-        /// signed withdrawal is now a different one.
+        /// The signed withdrawal or issuer send (see
+        /// [`EquityRedemption::reconcilable_signed_tx`]) the caller proved can
+        /// never land, or `None` when the state it checked held none. Refused
+        /// if the redemption's signed tx is now a different one.
         proven_withdrawal: Option<TxHash>,
     },
     /// Records `replacement_tx` as the redemption's vault withdrawal: a mined tx
@@ -657,9 +674,19 @@ pub enum EquityRedemptionEvent {
         unwrap_tx_hash: TxHash,
         submitted_at: DateTime<Utc>,
     },
-    /// Send requested, awaiting submission.
+    /// Send requested by a binary that broadcast before recording the send's
+    /// hash. No longer emitted: such a row may already have moved tokens, so it
+    /// is never signed again and only an operator reconcile closes it.
     SendPending {
         pending_at: DateTime<Utc>,
+    },
+    /// Issuer send signed and persisted before any broadcast. A distinct
+    /// variant, so a binary that predates durable sends fails to load the
+    /// stream instead of reading a plain `SendPending` and signing a second
+    /// transfer with a fresh nonce.
+    SendPrepared {
+        pending_at: DateTime<Utc>,
+        prepared_send: PreparedRedemptionSend,
     },
     /// Raindex withdraw succeeded but transfer to redemption wallet failed.
     TransferFailed {
@@ -891,7 +918,8 @@ fn eq_processing_events(
     right: &EquityRedemptionEvent,
 ) -> Option<bool> {
     use EquityRedemptionEvent::{
-        SendPending, TokensUnwrapped, UnwrapPending, UnwrapSubmitted, WithdrawnFromRaindex,
+        SendPending, SendPrepared, TokensUnwrapped, UnwrapPending, UnwrapSubmitted,
+        WithdrawnFromRaindex,
     };
 
     match (left, right) {
@@ -907,6 +935,16 @@ fn eq_processing_events(
         ) => Some(h1 == h2 && sa1 == sa2),
         (UnwrapPending { pending_at: pa1 }, UnwrapPending { pending_at: pa2 })
         | (SendPending { pending_at: pa1 }, SendPending { pending_at: pa2 }) => Some(pa1 == pa2),
+        (
+            SendPrepared {
+                pending_at: pa1,
+                prepared_send: prepared_a,
+            },
+            SendPrepared {
+                pending_at: pa2,
+                prepared_send: prepared_b,
+            },
+        ) => Some(pa1 == pa2 && prepared_a == prepared_b),
         (
             WithdrawnFromRaindex {
                 symbol: s1,
@@ -1087,6 +1125,7 @@ impl DomainEvent for EquityRedemptionEvent {
             UnwrapPending { .. } => "EquityRedemptionEvent::UnwrapPending".to_string(),
             UnwrapSubmitted { .. } => "EquityRedemptionEvent::UnwrapSubmitted".to_string(),
             SendPending { .. } => "EquityRedemptionEvent::SendPending".to_string(),
+            SendPrepared { .. } => "EquityRedemptionEvent::SendPrepared".to_string(),
             TokensUnwrapped { .. } => "EquityRedemptionEvent::TokensUnwrapped".to_string(),
             TransferFailed { .. } => "EquityRedemptionEvent::TransferFailed".to_string(),
             TokensSent { .. } => "EquityRedemptionEvent::TokensSent".to_string(),
@@ -1104,6 +1143,13 @@ impl DomainEvent for EquityRedemptionEvent {
     fn event_version(&self) -> String {
         "1.0".to_string()
     }
+}
+
+/// Exact issuer transfer identity persisted before any network submission.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PreparedRedemptionSend {
+    pub prepared: PreparedTransaction,
+    pub redemption_wallet: Address,
 }
 
 /// Equity redemption aggregate state machine.
@@ -1269,14 +1315,16 @@ pub enum EquityRedemption {
         unwrap_tx_hash: TxHash,
         unwrapped_amount: U256,
         /// Block in which the unwrap tx confirmed; `None` for pre-fix aggregates.
-        ///
-        /// `None` disables the RPC node-sync wait in `SendTokens` for
-        /// backward-compatibility with in-flight aggregates that were
-        /// persisted before this field was added.
+        /// The node-sync wait on it runs before signing, not on rebroadcast.
         #[serde(default)]
         unwrap_block: Option<u64>,
         withdrawn_at: DateTime<Utc>,
         unwrapped_at: DateTime<Utc>,
+        /// The signed send, persisted before its first broadcast. `None` only
+        /// for a legacy `SendPending` whose earlier binary may already have
+        /// broadcast an unrecorded transfer.
+        #[serde(default)]
+        prepared_send: Option<PreparedRedemptionSend>,
     },
 
     /// Tokens sent to Alpaca's redemption wallet
@@ -1380,6 +1428,10 @@ pub enum EquityRedemption {
         /// that never signed or broadcast one.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         withdrawal_nonce_hash: Option<TxHash>,
+        /// The issuer-wallet send whose nonce this redemption still reserved
+        /// when reconciled after the operator verified it will never land.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        issuer_send_nonce_hash: Option<TxHash>,
         redemption_tx: Option<TxHash>,
         tokenization_request_id: Option<TokenizationRequestId>,
         /// The failure reason carried over from the `Failed` state.
@@ -1496,13 +1548,15 @@ impl EquityRedemption {
     }
 
     /// Whether an operator may `Reconcile` this redemption to the terminal
-    /// `Reconciled` state: the `Failed` terminal, or a withdrawal submission
+    /// `Reconciled` state: the `Failed` terminal, a withdrawal submission
     /// state (`VaultWithdrawPending`, `VaultWithdrawSubmitting`,
-    /// `VaultWithdrawSubmitted`). The timeout sweep never fails those
-    /// submission states, because their withdrawal may have landed, so
-    /// reconcile is their manual escape hatch. The command is pure, so for one
-    /// holding a [`prepared_withdrawal`](Self::prepared_withdrawal) the caller
-    /// proves on chain that it can never land before sending it.
+    /// `VaultWithdrawSubmitted`), or a pending issuer send (`SendPending`,
+    /// signed or legacy) whose fate the operator has verified onchain. The
+    /// timeout sweep never fails those states, because their transaction may
+    /// have landed, so reconcile is their manual escape hatch. The command is
+    /// pure, so for one holding a
+    /// [`prepared_withdrawal`](Self::prepared_withdrawal) the caller proves on
+    /// chain that it can never land before sending it.
     pub fn is_operator_reconcilable(&self) -> bool {
         self.is_failed()
             || matches!(
@@ -1510,6 +1564,7 @@ impl EquityRedemption {
                 Self::VaultWithdrawPending { .. }
                     | Self::VaultWithdrawSubmitting { .. }
                     | Self::VaultWithdrawSubmitted { .. }
+                    | Self::SendPending { .. }
             )
     }
 
@@ -1531,6 +1586,20 @@ impl EquityRedemption {
             | Self::Completed { .. }
             | Self::Failed { .. }
             | Self::Reconciled { .. } => None,
+        }
+    }
+
+    /// The exact signed transaction a reconcile must first prove can never
+    /// land: the [`prepared_withdrawal`](Self::prepared_withdrawal), or the
+    /// signed issuer send of a `SendPending`. Both are signed by the bot
+    /// wallet, so the same nonce proof covers either.
+    pub fn reconcilable_signed_tx(&self) -> Option<&PreparedTransaction> {
+        match self {
+            Self::SendPending {
+                prepared_send: Some(send),
+                ..
+            } => Some(&send.prepared),
+            _ => self.prepared_withdrawal(),
         }
     }
 
@@ -1773,7 +1842,8 @@ impl EventSourced for EquityRedemption {
     // release its wallet nonce reservation on operator reconcile, including a
     // legacy hash-only submission with no persisted prepared transaction.
     // Additive; bumped to clear stale snapshots so they rebuild from events.
-    const SCHEMA_VERSION: u64 = 10;
+    // v11: SendPending retains the issuer send's signed envelope and destination.
+    const SCHEMA_VERSION: u64 = 11;
 
     fn originate(event: &Self::Event) -> Option<Self> {
         use EquityRedemptionEvent::*;
@@ -2170,7 +2240,7 @@ impl EventSourced for EquityRedemption {
                 _ => None,
             },
 
-            SendPending { pending_at: _ } => match entity {
+            SendPending { .. } | SendPrepared { .. } => match entity {
                 Self::TokensUnwrapped {
                     symbol,
                     quantity,
@@ -2195,6 +2265,10 @@ impl EventSourced for EquityRedemption {
                     unwrap_block: *unwrap_block,
                     withdrawn_at: *withdrawn_at,
                     unwrapped_at: *unwrapped_at,
+                    prepared_send: match event {
+                        SendPrepared { prepared_send, .. } => Some(prepared_send.clone()),
+                        _ => None,
+                    },
                 }),
                 _ => None,
             },
@@ -2411,6 +2485,7 @@ impl EventSourced for EquityRedemption {
                     started_at: *started_at,
                     reconciled_at: *reconciled_at,
                     withdrawal_nonce_hash: None,
+                    issuer_send_nonce_hash: None,
                 }),
                 // Reconciled straight from the submitting origin: nothing was
                 // withdrawn, sent, or failed, so the tx/failure fields are absent
@@ -2433,6 +2508,7 @@ impl EventSourced for EquityRedemption {
                     started_at: *submitting_at,
                     reconciled_at: *reconciled_at,
                     withdrawal_nonce_hash: Some(prepared.tx_hash()),
+                    issuer_send_nonce_hash: None,
                 }),
                 // A broadcast withdrawal (`VaultWithdrawSubmitted`) or a legacy
                 // `VaultWithdrawPending`, reconciled after the operator verified
@@ -2457,6 +2533,7 @@ impl EventSourced for EquityRedemption {
                     started_at: *submitted_at,
                     reconciled_at: *reconciled_at,
                     withdrawal_nonce_hash: Some(*tx_hash),
+                    issuer_send_nonce_hash: None,
                 }),
                 Self::VaultWithdrawPending {
                     symbol,
@@ -2475,6 +2552,30 @@ impl EventSourced for EquityRedemption {
                     started_at: *pending_at,
                     reconciled_at: *reconciled_at,
                     withdrawal_nonce_hash: None,
+                    issuer_send_nonce_hash: None,
+                }),
+                Self::SendPending {
+                    symbol,
+                    quantity,
+                    raindex_withdraw_tx,
+                    withdrawn_at,
+                    prepared_send,
+                    ..
+                } => Some(Self::Reconciled {
+                    symbol: symbol.clone(),
+                    chain,
+                    quantity: *quantity,
+                    raindex_withdraw_tx: Some(*raindex_withdraw_tx),
+                    redemption_tx: None,
+                    tokenization_request_id: None,
+                    failure_reason: None,
+                    reconcile_reason: reason.clone(),
+                    started_at: *withdrawn_at,
+                    reconciled_at: *reconciled_at,
+                    withdrawal_nonce_hash: None,
+                    issuer_send_nonce_hash: prepared_send
+                        .as_ref()
+                        .map(|send| send.prepared.tx_hash()),
                 }),
                 _ => return Ok(None),
             },
@@ -2532,7 +2633,7 @@ impl EventSourced for EquityRedemption {
             }]),
             RecordWithdrawSubmission { .. }
             | SubmitUnwrap
-            | PrepareSend
+            | PrepareSend { .. }
             | ConfirmWithdraw
             | ConfirmUnwrap
             | UnwrapTokens
@@ -2624,9 +2725,16 @@ impl EventSourced for EquityRedemption {
                     .await
             }
 
-            PrepareSend => self.transition_prepare_send(Utc::now()),
+            PrepareSend {
+                prepared,
+                redemption_wallet,
+            } => self.transition_prepare_send(Utc::now(), prepared, redemption_wallet),
             #[cfg(any(test, feature = "test-support"))]
-            PrepareSendAt { pending_at } => self.transition_prepare_send(pending_at),
+            PrepareSendAt {
+                prepared,
+                redemption_wallet,
+                pending_at,
+            } => self.transition_prepare_send(pending_at, prepared, redemption_wallet),
 
             SendTokens => self.transition_send_tokens(services, None).await,
             #[cfg(any(test, feature = "test-support"))]
@@ -2723,12 +2831,24 @@ impl EventSourced for EquityRedemption {
             },
 
             FailTransfer { reason } => match self {
+                Self::SendPending {
+                    prepared_send: Some(send),
+                    ..
+                } => Err(EquityRedemptionError::RedemptionSendUnresolved {
+                    tx_hash: send.prepared.tx_hash(),
+                    error_message:
+                        "A persisted signed send must be confirmed before the transfer can fail"
+                            .to_string(),
+                }),
+                Self::SendPending {
+                    prepared_send: None,
+                    ..
+                } => Err(EquityRedemptionError::RedemptionSendNotPrepared),
                 Self::VaultWithdrawPending { symbol, .. }
                 | Self::WithdrawnFromRaindex { symbol, .. }
                 | Self::UnwrapPending { symbol, .. }
                 | Self::UnwrapSubmitted { symbol, .. }
-                | Self::TokensUnwrapped { symbol, .. }
-                | Self::SendPending { symbol, .. } => {
+                | Self::TokensUnwrapped { symbol, .. } => {
                     warn!(
                         target: "rebalance",
                         %symbol, %reason,
@@ -2758,12 +2878,15 @@ impl EventSourced for EquityRedemption {
                 Self::Failed { symbol, .. }
                 | Self::VaultWithdrawPending { symbol, .. }
                 | Self::VaultWithdrawSubmitting { symbol, .. }
-                | Self::VaultWithdrawSubmitted { symbol, .. } => {
+                | Self::VaultWithdrawSubmitted { symbol, .. }
+                | Self::SendPending { symbol, .. } => {
                     if reason.trim().is_empty() {
                         return Err(EquityRedemptionError::ReconcileReasonRequired);
                     }
 
-                    let current = self.prepared_withdrawal().map(PreparedTransaction::tx_hash);
+                    let current = self
+                        .reconcilable_signed_tx()
+                        .map(PreparedTransaction::tx_hash);
                     if current != proven_withdrawal {
                         warn!(
                             target: "rebalance",
@@ -3133,11 +3256,28 @@ impl EquityRedemption {
     fn transition_prepare_send(
         &self,
         pending_at: DateTime<Utc>,
+        prepared: PreparedTransaction,
+        redemption_wallet: Address,
     ) -> Result<Vec<EquityRedemptionEvent>, EquityRedemptionError> {
         use EquityRedemptionEvent::*;
 
         match self {
-            Self::TokensUnwrapped { .. } => Ok(vec![SendPending { pending_at }]),
+            Self::TokensUnwrapped { .. } => Ok(vec![SendPrepared {
+                pending_at,
+                prepared_send: PreparedRedemptionSend {
+                    prepared,
+                    redemption_wallet,
+                },
+            }]),
+            Self::SendPending {
+                prepared_send: Some(existing),
+                ..
+            } if existing.prepared == prepared
+                && existing.redemption_wallet == redemption_wallet =>
+            {
+                Ok(vec![])
+            }
+            Self::SendPending { .. } => Err(EquityRedemptionError::RedemptionSendIdentityChanged),
             Self::Completed { .. } => Err(EquityRedemptionError::AlreadyCompleted),
             Self::Failed { .. } => Err(EquityRedemptionError::AlreadyFailed),
             Self::Reconciled { .. } => Err(EquityRedemptionError::AlreadyReconciled),
@@ -3159,77 +3299,44 @@ impl EquityRedemption {
         match self {
             Self::SendPending {
                 symbol,
-                underlying_token,
                 unwrapped_amount,
-                unwrap_block,
+                prepared_send,
                 ..
             } => {
                 let chain_services = services.for_chain(self.chain())?;
-                let token = match underlying_token {
-                    UnwrappedProvenance::Attested { attested } => *attested,
-                    UnwrappedProvenance::Legacy(recorded) => {
-                        reattest_legacy_underlying(chain_services, symbol, *recorded).await?
-                    }
-                };
-                let amount = *unwrapped_amount;
+                let send = prepared_send
+                    .as_ref()
+                    .ok_or(EquityRedemptionError::RedemptionSendNotPrepared)?;
+                // Token, amount, and destination are fixed in the signed bytes,
+                // and preparation already attested the underlying and waited
+                // for the unwrap block. Neither check runs again here: a
+                // failing read must not keep a send that may have landed from
+                // being confirmed.
+                let expected = send.prepared.tx_hash();
+                info!(
+                    target: "rebalance",
+                    %symbol,
+                    amount = %unwrapped_amount,
+                    tx_hash = %expected,
+                    "Broadcasting the persisted redemption send"
+                );
 
-                let Some(redemption_wallet) =
-                    Tokenizer::redemption_wallet(chain_services.tokenizer.as_ref())
-                else {
-                    warn!(target: "rebalance", %symbol, "Redemption wallet not configured");
-                    return Ok(vec![TransferFailed {
-                        tx_hash: None,
-                        reason: None,
-                        failed_at: Utc::now(),
-                    }]);
-                };
-
-                // Wait for the RPC node to catch up to the block where the
-                // unwrap tx confirmed before sending the transfer. Without
-                // this, a load-balanced backend that hasn't indexed the
-                // unwrap block yet sees the wallet balance as zero and the
-                // send_for_redemption call reverts with
-                // ERC20InsufficientBalance. The wait runs on the tokenizer's
-                // provider -- the same one that performs the transfer -- so
-                // a caught-up wrapper provider can't mask a lagging
-                // tokenizer provider. `unwrap_block` is None for aggregates
-                // persisted before this field was added; in that case the
-                // wait is skipped for backward-compatibility.
-                if let Some(block) = unwrap_block {
-                    chain_services
-                        .tokenizer
-                        .wait_for_block(*block)
-                        .await
-                        .map_err(|error| node_sync_failed_from_evm(*block, &error))?;
-                }
-
-                info!(target: "rebalance", %token, %amount, "Sending unwrapped tokens for redemption");
-
-                match Tokenizer::send_for_redemption(
-                    chain_services.tokenizer.as_ref(),
-                    token,
-                    amount,
-                )
-                .await
+                if confirm_persisted_redemption_send(chain_services.tokenizer.as_ref(), send)
+                    .await?
                 {
-                    Ok(redemption_tx) => {
-                        // Persist the non-idempotent transfer hash first. The transfer
-                        // manager enqueues its gas fact after this event is stored, so a
-                        // queue failure resumes from `TokensSent` without sending again.
-                        Ok(vec![TokensSent {
-                            redemption_wallet,
-                            redemption_tx,
-                            sent_at: override_at.unwrap_or_else(Utc::now),
-                        }])
-                    }
-                    Err(error) => {
-                        warn!(target: "rebalance", %error, %token, %amount, "Send for redemption failed");
-                        Ok(vec![TransferFailed {
-                            tx_hash: None,
-                            reason: None,
-                            failed_at: Utc::now(),
-                        }])
-                    }
+                    Ok(vec![TokensSent {
+                        redemption_wallet: send.redemption_wallet,
+                        redemption_tx: expected,
+                        sent_at: override_at.unwrap_or_else(Utc::now),
+                    }])
+                } else {
+                    Ok(vec![TransferFailed {
+                        // Failed.redemption_tx is evidence of tokens reaching
+                        // the issuer, which a reverted send cannot provide.
+                        tx_hash: None,
+                        reason: Some(format!("Issuer transfer {expected} reverted")),
+                        failed_at: Utc::now(),
+                    }])
                 }
             }
             Self::Completed { .. } => Err(EquityRedemptionError::AlreadyCompleted),
@@ -3527,6 +3634,7 @@ const ACTIVE_REDEMPTION_EVENT_TYPES_SQL: &str = "
     'EquityRedemptionEvent::UnwrapSubmitted',
     'EquityRedemptionEvent::TokensUnwrapped',
     'EquityRedemptionEvent::SendPending',
+    'EquityRedemptionEvent::SendPrepared',
     'EquityRedemptionEvent::TokensSent',
     'EquityRedemptionEvent::Detected'
 ";
@@ -3770,13 +3878,10 @@ fn node_sync_failed(required_block: u64, error: &WrapperError) -> EquityRedempti
     }
 }
 
-/// Constructs a [`EquityRedemptionError::NodeSyncFailed`] from a node-sync
-/// [`EvmError`] raised by [`Tokenizer::wait_for_block`].
-///
 /// Re-attests a legacy record's underlying through the wrapper before the
-/// send: the vault's `asset()` must be the recorded address, otherwise the
-/// record predates the check and its token is not trusted.
-async fn reattest_legacy_underlying(
+/// send is signed: the vault's `asset()` must be the recorded address,
+/// otherwise the record predates the check and its token is not trusted.
+pub(crate) async fn reattest_legacy_underlying(
     services: &ChainEquityServices,
     symbol: &Symbol,
     recorded: Address,
@@ -3810,21 +3915,48 @@ async fn reattest_legacy_underlying(
     Ok(attested)
 }
 
-/// Returns the recorded attempt count for `NodeBehindRequiredBlock`; every
-/// other variant signals the full polling budget was consumed without a
-/// recorded count, so it falls back to [`NODE_SYNC_MAX_ATTEMPTS`]. The match is
-/// non-exhaustive because `EvmError` has feature-gated variants that cannot be
-/// enumerated here.
-fn node_sync_failed_from_evm(required_block: u64, error: &EvmError) -> EquityRedemptionError {
-    let attempts = match error {
-        EvmError::NodeBehindRequiredBlock { attempts, .. } => *attempts,
-        _ => NODE_SYNC_MAX_ATTEMPTS,
+/// Rebroadcasts a persisted issuer send as a best effort, then confirms it and
+/// returns the receipt status. A failed rebroadcast is not conclusive: some
+/// nodes reject an already mined transaction before their nonce check (Nitro
+/// checks the fee cap first), so the stored hash's receipt is looked up before
+/// the send is reported unresolved.
+async fn confirm_persisted_redemption_send(
+    tokenizer: &dyn Tokenizer,
+    send: &PreparedRedemptionSend,
+) -> Result<bool, EquityRedemptionError> {
+    let expected = send.prepared.tx_hash();
+    let unresolved = |error_message: String| EquityRedemptionError::RedemptionSendUnresolved {
+        tx_hash: expected,
+        error_message,
     };
 
-    EquityRedemptionError::NodeSyncFailed {
-        required_block,
-        attempts,
+    tokenizer.restore_redemption_send(&send.prepared).await;
+    match tokenizer.broadcast_redemption_send(&send.prepared).await {
+        Ok(actual) if actual == expected => {}
+        Ok(_) => return Err(EquityRedemptionError::RedemptionSendIdentityChanged),
+        Err(broadcast_error) => match tokenizer.redemption_send_mined(expected).await {
+            Ok(true) => {
+                warn!(
+                    target: "rebalance",
+                    tx_hash = %expected,
+                    %broadcast_error,
+                    "Rebroadcast of the persisted redemption send failed, but it already has \
+                     a receipt; confirming it"
+                );
+            }
+            Ok(false) => return Err(unresolved(broadcast_error.to_string())),
+            Err(lookup_error) => {
+                return Err(unresolved(format!(
+                    "{broadcast_error}; receipt lookup failed: {lookup_error}"
+                )));
+            }
+        },
     }
+
+    tokenizer
+        .confirm_redemption_send(expected)
+        .await
+        .map_err(|error| unresolved(error.to_string()))
 }
 
 /// Enqueues bot-gas cost recording for a confirmed redemption tx (vault
@@ -4192,7 +4324,8 @@ mod tests {
 
     #[tokio::test]
     async fn complete_redemption_flow_end_to_end() {
-        let (store, raindex) = redemption_test_store(mock_services());
+        let services = mock_services();
+        let (store, raindex) = redemption_test_store(services.clone());
         let id = redemption_aggregate_id("end-to-end");
 
         store
@@ -4234,11 +4367,7 @@ mod tests {
             .await
             .unwrap();
 
-        store
-            .send(&id, EquityRedemptionCommand::PrepareSend)
-            .await
-            .unwrap();
-
+        prepare_send_for_test(&store, &id, &services).await;
         store
             .send(&id, EquityRedemptionCommand::SendTokens)
             .await
@@ -4305,7 +4434,8 @@ mod tests {
     async fn confirm_withdraw_at_uses_supplied_timestamp() {
         let withdrawn_at = Utc::now() - chrono::Duration::hours(2);
 
-        let (store, raindex) = redemption_test_store(mock_services());
+        let services = mock_services();
+        let (store, raindex) = redemption_test_store(services.clone());
         let id = redemption_aggregate_id("confirm-withdraw-at");
 
         store
@@ -4370,7 +4500,8 @@ mod tests {
     async fn confirm_unwrap_at_uses_supplied_timestamp() {
         let unwrapped_at = Utc::now() - chrono::Duration::minutes(30);
 
-        let (store, raindex) = redemption_test_store(mock_services());
+        let services = mock_services();
+        let (store, raindex) = redemption_test_store(services.clone());
         let id = redemption_aggregate_id("confirm-unwrap-at");
 
         store
@@ -4430,8 +4561,12 @@ mod tests {
             .given(vec![
                 withdrawn_from_raindex_event(),
                 tokens_unwrapped_event(),
-                EquityRedemptionEvent::SendPending {
+                EquityRedemptionEvent::SendPrepared {
                     pending_at: Utc::now(),
+                    prepared_send: PreparedRedemptionSend {
+                        prepared: prepared_withdrawal_for_test(),
+                        redemption_wallet: Address::ZERO,
+                    },
                 },
             ])
             .when(EquityRedemptionCommand::SendTokensAt { sent_at })
@@ -4509,16 +4644,21 @@ mod tests {
                 withdrawn_from_raindex_event(),
                 tokens_unwrapped_event(),
             ])
-            .when(EquityRedemptionCommand::PrepareSendAt { pending_at })
+            .when(EquityRedemptionCommand::PrepareSendAt {
+                pending_at,
+                prepared: prepared_withdrawal_for_test(),
+                redemption_wallet: Address::ZERO,
+            })
             .await
             .events();
 
         assert_eq!(events.len(), 1);
-        let EquityRedemptionEvent::SendPending {
+        let EquityRedemptionEvent::SendPrepared {
             pending_at: event_pending_at,
+            ..
         } = &events[0]
         else {
-            panic!("Expected SendPending, got: {:?}", events[0]);
+            panic!("Expected SendPrepared, got: {:?}", events[0]);
         };
         assert_eq!(*event_pending_at, pending_at);
     }
@@ -4594,7 +4734,7 @@ mod tests {
             bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
         };
 
-        let (store, raindex) = redemption_test_store(services);
+        let (store, raindex) = redemption_test_store(services.clone());
         let id = redemption_aggregate_id("underlying-token-fix");
 
         store
@@ -4636,11 +4776,7 @@ mod tests {
             .await
             .unwrap();
 
-        store
-            .send(&id, EquityRedemptionCommand::PrepareSend)
-            .await
-            .unwrap();
-
+        prepare_send_for_test(&store, &id, &services).await;
         store
             .send(&id, EquityRedemptionCommand::SendTokens)
             .await
@@ -4667,10 +4803,465 @@ mod tests {
         );
     }
 
-    fn send_pending_event() -> EquityRedemptionEvent {
-        EquityRedemptionEvent::SendPending {
-            pending_at: Utc::now(),
+    async fn prepare_send_for_test(
+        store: &TestStore<EquityRedemption>,
+        id: &RedemptionAggregateId,
+        services: &EquityTransferServices,
+    ) {
+        let state = store.load(id).await.unwrap().unwrap();
+        let EquityRedemption::TokensUnwrapped {
+            underlying_token: UnwrappedProvenance::Attested { attested },
+            unwrapped_amount,
+            ..
+        } = state
+        else {
+            panic!("expected attested send pending")
+        };
+        let chain = services.for_chain(state.chain()).unwrap();
+        let prepared = chain
+            .tokenizer
+            .prepare_redemption_send(attested, unwrapped_amount)
+            .await
+            .unwrap();
+        let redemption_wallet = chain.tokenizer.redemption_wallet().unwrap();
+        store
+            .send(
+                id,
+                EquityRedemptionCommand::PrepareSend {
+                    prepared,
+                    redemption_wallet,
+                },
+            )
+            .await
+            .unwrap();
+    }
+
+    fn prepared_send_state(chain: Chain, prepared: PreparedTransaction) -> EquityRedemption {
+        EquityRedemption::SendPending {
+            symbol: Symbol::new("AAPL").unwrap(),
+            chain,
+            quantity: float!(1),
+            token: Address::ZERO,
+            underlying_token: UnwrappedProvenance::Attested {
+                attested: UnwrappedToken::unchecked(Address::ZERO),
+            },
+            raindex_withdraw_tx: TxHash::ZERO,
+            unwrap_tx_hash: TxHash::ZERO,
+            unwrapped_amount: U256::from(1),
+            unwrap_block: None,
+            withdrawn_at: Utc::now(),
+            unwrapped_at: Utc::now(),
+            prepared_send: Some(PreparedRedemptionSend {
+                prepared,
+                redemption_wallet: Address::repeat_byte(7),
+            }),
         }
+    }
+
+    fn legacy_send_pending_state() -> EquityRedemption {
+        let mut state = prepared_send_state(Chain::Base, prepared_withdrawal_for_test());
+        let EquityRedemption::SendPending { prepared_send, .. } = &mut state else {
+            unreachable!()
+        };
+        *prepared_send = None;
+        state
+    }
+
+    fn services_with_tokenizer(
+        chain: Chain,
+        tokenizer: Arc<MockTokenizer>,
+    ) -> EquityTransferServices {
+        let mut services = mock_services();
+        let mut chain_services = services.chains.remove(&Chain::Base).unwrap();
+        chain_services.tokenizer = tokenizer;
+        services.chains.insert(chain, chain_services);
+        services
+    }
+
+    #[tokio::test]
+    async fn receipt_failure_after_send_broadcast_resumes_the_same_nonce_on_its_chain() {
+        for chain in [Chain::Base, Chain::Robinhood] {
+            let tokenizer =
+                Arc::new(MockTokenizer::new().with_redemption_confirmation_failure_once());
+            let services = services_with_tokenizer(chain, tokenizer.clone());
+            let prepared = PreparedTransaction::for_test(TxHash::repeat_byte(8), 41);
+            let state = prepared_send_state(chain, prepared.clone());
+            let error = state
+                .transition(EquityRedemptionCommand::SendTokens, &services)
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(error, EquityRedemptionError::RedemptionSendUnresolved { tx_hash, .. } if tx_hash == prepared.tx_hash())
+            );
+            // No event is recorded on the failed RPC read; a restarted process
+            // loads the exact durable envelope and resends those bytes.
+            let restored: EquityRedemption =
+                serde_json::from_value(serde_json::to_value(&state).unwrap()).unwrap();
+            let events = restored
+                .transition(EquityRedemptionCommand::SendTokens, &services)
+                .await
+                .unwrap();
+            assert!(
+                matches!(&events[..], [EquityRedemptionEvent::TokensSent { redemption_tx, redemption_wallet, .. }] if *redemption_tx == prepared.tx_hash() && *redemption_wallet == Address::repeat_byte(7))
+            );
+            assert_eq!(
+                tokenizer.redemption_send_restores(),
+                vec![prepared.tx_hash(), prepared.tx_hash()],
+                "each attempt must reserve the persisted nonce before broadcasting"
+            );
+            assert_eq!(
+                tokenizer.redemption_send_broadcasts(),
+                vec![prepared.tx_hash(), prepared.tx_hash()]
+            );
+            assert_eq!(restored.chain(), chain);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failed_rebroadcast_still_confirms_a_send_that_already_mined() {
+        let tokenizer = Arc::new(MockTokenizer::new().with_redemption_broadcast_failure());
+        let services = services_with_tokenizer(Chain::Robinhood, tokenizer.clone());
+        let prepared = PreparedTransaction::for_test(TxHash::repeat_byte(8), 41);
+        let state = prepared_send_state(Chain::Robinhood, prepared.clone());
+
+        let events = state
+            .transition(EquityRedemptionCommand::SendTokens, &services)
+            .await
+            .unwrap();
+
+        assert!(
+            matches!(&events[..], [EquityRedemptionEvent::TokensSent { redemption_tx, .. }] if *redemption_tx == prepared.tx_hash()),
+            "a send with a receipt must be recorded even when the node rejects its rebroadcast, \
+             got {events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_rebroadcast_without_a_receipt_stays_unresolved() {
+        let tokenizer = Arc::new(
+            MockTokenizer::new()
+                .with_redemption_broadcast_failure()
+                .with_redemption_receipt_missing(),
+        );
+        let services = services_with_tokenizer(Chain::Base, tokenizer);
+        let prepared = PreparedTransaction::for_test(TxHash::repeat_byte(8), 41);
+        let state = prepared_send_state(Chain::Base, prepared.clone());
+
+        let error = state
+            .transition(EquityRedemptionCommand::SendTokens, &services)
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(error, EquityRedemptionError::RedemptionSendUnresolved { tx_hash, .. } if tx_hash == prepared.tx_hash()),
+            "got {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_signed_send_rebroadcasts_without_node_sync_or_reattestation() {
+        let tokenizer = Arc::new(MockTokenizer::new().failing_wait_for_block());
+        let mut services = services_with_tokenizer(Chain::Robinhood, tokenizer.clone());
+        services.chains.get_mut(&Chain::Robinhood).unwrap().wrapper =
+            Arc::new(MockWrapper::failing_lookup());
+        let prepared = PreparedTransaction::for_test(TxHash::repeat_byte(8), 41);
+        let mut state = prepared_send_state(Chain::Robinhood, prepared.clone());
+        let EquityRedemption::SendPending {
+            underlying_token,
+            unwrap_block,
+            ..
+        } = &mut state
+        else {
+            unreachable!()
+        };
+        *underlying_token = UnwrappedProvenance::Legacy(Address::repeat_byte(3));
+        *unwrap_block = Some(5);
+
+        let events = state
+            .transition(EquityRedemptionCommand::SendTokens, &services)
+            .await
+            .unwrap();
+
+        assert!(
+            matches!(&events[..], [EquityRedemptionEvent::TokensSent { redemption_tx, .. }] if *redemption_tx == prepared.tx_hash()),
+            "a lagging node or failing attestation must not block confirming a signed send, \
+             got {events:?}"
+        );
+        assert!(tokenizer.wait_for_block_calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_confirmed_reverted_send_does_not_claim_tokens_reached_the_issuer() {
+        let tokenizer = Arc::new(MockTokenizer::new().with_send_failure());
+        let mut services = mock_services();
+        services.chains.get_mut(&Chain::Base).unwrap().tokenizer = tokenizer;
+        let state = prepared_send_state(Chain::Base, prepared_withdrawal_for_test());
+        let events = state
+            .transition(EquityRedemptionCommand::SendTokens, &services)
+            .await
+            .unwrap();
+        assert!(matches!(
+            &events[..],
+            [EquityRedemptionEvent::TransferFailed { tx_hash: None, .. }]
+        ));
+        let failed = EquityRedemption::evolve(&state, &events[0])
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            failed,
+            EquityRedemption::Failed {
+                redemption_tx: None,
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_signed_send_cannot_be_failed_or_replaced_while_its_outcome_is_unknown() {
+        let state = prepared_send_state(
+            Chain::Robinhood,
+            PreparedTransaction::for_test(TxHash::repeat_byte(8), 41),
+        );
+        assert!(matches!(
+            state
+                .transition(
+                    EquityRedemptionCommand::FailTransfer {
+                        reason: "deadline".to_string()
+                    },
+                    &mock_services()
+                )
+                .await,
+            Err(EquityRedemptionError::RedemptionSendUnresolved { .. })
+        ));
+        assert!(matches!(
+            state
+                .transition(
+                    EquityRedemptionCommand::PrepareSend {
+                        prepared: PreparedTransaction::for_test(TxHash::repeat_byte(9), 42),
+                        redemption_wallet: Address::ZERO
+                    },
+                    &mock_services()
+                )
+                .await,
+            Err(EquityRedemptionError::RedemptionSendIdentityChanged)
+        ));
+    }
+
+    #[tokio::test]
+    async fn fail_transfer_refuses_a_legacy_send_pending_with_no_prepared_send() {
+        assert!(matches!(
+            legacy_send_pending_state()
+                .transition(
+                    EquityRedemptionCommand::FailTransfer {
+                        reason: "deadline".to_string()
+                    },
+                    &mock_services()
+                )
+                .await,
+            Err(EquityRedemptionError::RedemptionSendNotPrepared)
+        ));
+    }
+
+    #[tokio::test]
+    async fn an_operator_reconcile_closes_a_signed_send_and_names_its_nonce() {
+        let prepared = PreparedTransaction::for_test(TxHash::repeat_byte(8), 41);
+        let state = prepared_send_state(Chain::Robinhood, prepared.clone());
+        assert!(state.is_operator_reconcilable());
+
+        let unproven = state
+            .transition(
+                EquityRedemptionCommand::Reconcile {
+                    reason: "nonce 41 consumed by a 0-value self-transfer".to_string(),
+                    proven_withdrawal: None,
+                },
+                &mock_services(),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(
+            unproven,
+            EquityRedemptionError::ReconcileWithdrawalChanged {
+                proven: None,
+                current: Some(prepared.tx_hash()),
+            },
+            "a signed send must be proven dead on chain before it reconciles"
+        );
+
+        let events = state
+            .transition(
+                EquityRedemptionCommand::Reconcile {
+                    reason: "nonce 41 consumed by a 0-value self-transfer".to_string(),
+                    proven_withdrawal: Some(prepared.tx_hash()),
+                },
+                &mock_services(),
+            )
+            .await
+            .unwrap();
+        let reconciled = EquityRedemption::evolve(&state, &events[0])
+            .unwrap()
+            .unwrap();
+
+        assert!(
+            matches!(
+                reconciled,
+                EquityRedemption::Reconciled {
+                    issuer_send_nonce_hash: Some(hash),
+                    withdrawal_nonce_hash: None,
+                    chain: Chain::Robinhood,
+                    ..
+                } if hash == prepared.tx_hash()
+            ),
+            "got {reconciled:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_operator_reconcile_closes_a_legacy_send_pending() {
+        let state = legacy_send_pending_state();
+        assert!(state.is_operator_reconcilable());
+        assert!(matches!(
+            state
+                .transition(
+                    EquityRedemptionCommand::Reconcile {
+                        reason: "  ".to_string(),
+                        proven_withdrawal: None,
+                    },
+                    &mock_services()
+                )
+                .await,
+            Err(EquityRedemptionError::ReconcileReasonRequired)
+        ));
+
+        let events = state
+            .transition(
+                EquityRedemptionCommand::Reconcile {
+                    reason: "verified the old transfer never landed".to_string(),
+                    proven_withdrawal: None,
+                },
+                &mock_services(),
+            )
+            .await
+            .unwrap();
+        let reconciled = EquityRedemption::evolve(&state, &events[0])
+            .unwrap()
+            .unwrap();
+
+        assert!(
+            matches!(
+                reconciled,
+                EquityRedemption::Reconciled {
+                    issuer_send_nonce_hash: None,
+                    withdrawal_nonce_hash: None,
+                    ..
+                }
+            ),
+            "a legacy send holds no nonce to release, got {reconciled:?}"
+        );
+    }
+
+    #[test]
+    fn an_older_event_reader_rejects_a_prepared_send() {
+        // The event enum of a binary that predates durable sends.
+        #[derive(Debug, Deserialize)]
+        enum OldSendEvent {
+            SendPending {},
+        }
+        let legacy = EquityRedemptionEvent::SendPending {
+            pending_at: Utc::now(),
+        };
+        let prepared = EquityRedemptionEvent::SendPrepared {
+            pending_at: Utc::now(),
+            prepared_send: PreparedRedemptionSend {
+                prepared: prepared_withdrawal_for_test(),
+                redemption_wallet: Address::ZERO,
+            },
+        };
+
+        serde_json::from_value::<OldSendEvent>(serde_json::to_value(legacy).unwrap()).unwrap();
+        let error = serde_json::from_value::<OldSendEvent>(serde_json::to_value(prepared).unwrap())
+            .unwrap_err();
+
+        assert!(
+            error.to_string().contains("unknown variant `SendPrepared`"),
+            "an older binary must refuse a prepared send instead of signing again, got {error}"
+        );
+    }
+
+    #[test]
+    fn a_legacy_send_pending_event_replays_as_unprepared() {
+        let event: EquityRedemptionEvent = serde_json::from_value(
+            serde_json::json!({ "SendPending": { "pending_at": "2026-01-01T00:00:00Z" } }),
+        )
+        .unwrap();
+        let EquityRedemption::SendPending {
+            symbol,
+            chain,
+            quantity,
+            token,
+            underlying_token,
+            raindex_withdraw_tx,
+            unwrap_tx_hash,
+            unwrapped_amount,
+            unwrap_block,
+            withdrawn_at,
+            unwrapped_at,
+            ..
+        } = prepared_send_state(Chain::Base, prepared_withdrawal_for_test())
+        else {
+            unreachable!()
+        };
+        let unwrapped = EquityRedemption::TokensUnwrapped {
+            symbol,
+            chain,
+            quantity,
+            token,
+            underlying_token,
+            raindex_withdraw_tx,
+            unwrap_tx_hash,
+            unwrapped_amount,
+            unwrap_block,
+            withdrawn_at,
+            unwrapped_at,
+        };
+
+        let replayed = EquityRedemption::evolve(&unwrapped, &event)
+            .unwrap()
+            .unwrap();
+
+        assert!(
+            matches!(
+                replayed,
+                EquityRedemption::SendPending {
+                    prepared_send: None,
+                    ..
+                }
+            ),
+            "got {replayed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_legacy_send_pending_requires_durable_bytes_before_broadcast() {
+        let state = legacy_send_pending_state();
+        let services = mock_services();
+        assert!(matches!(
+            state
+                .transition(EquityRedemptionCommand::SendTokens, &services)
+                .await,
+            Err(EquityRedemptionError::RedemptionSendNotPrepared)
+        ));
+        assert!(matches!(
+            state
+                .transition(
+                    EquityRedemptionCommand::PrepareSend {
+                        prepared: prepared_withdrawal_for_test(),
+                        redemption_wallet: Address::ZERO
+                    },
+                    &services
+                )
+                .await,
+            Err(EquityRedemptionError::RedemptionSendIdentityChanged)
+        ));
     }
 
     /// A `TokensUnwrapped` payload as builds before the vault attestation
@@ -4719,103 +5310,6 @@ mod tests {
         assert_eq!(underlying_token, UnwrappedProvenance::Legacy(recorded));
     }
 
-    /// A redemption interrupted before the vault attestation existed carries
-    /// an address copied from config. Resuming it must re-attest through the
-    /// wrapper and refuse when the vault's asset() is not that address, even
-    /// after the config has been corrected.
-    #[tokio::test]
-    async fn send_tokens_refuses_a_legacy_underlying_the_vault_does_not_attest() {
-        let configured = Address::random();
-        let recorded = Address::random();
-        let tokenizer = Arc::new(MockTokenizer::new());
-        let services = EquityTransferServices {
-            chains: BTreeMap::from([(
-                Chain::Base,
-                ChainEquityServices {
-                    wallet: Address::ZERO,
-                    raindex: Arc::new(MockRaindex::new()),
-                    vault_lookup: Arc::new(mock_vault_lookup()),
-                    tokenizer: tokenizer.clone(),
-                    wrapper: Arc::new(
-                        MockWrapper::new()
-                            .with_tokenized_shares(configured)
-                            .attesting_unwrapped_token(configured),
-                    ),
-                    mint_authorizer: ConfiguredMintAuthorizer::Disabled,
-                    gas_readiness: ConfiguredGasReadiness::Unwired,
-                    equities: ChainEquities::default(),
-                },
-            )]),
-            bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
-        };
-
-        let error = TestHarness::<EquityRedemption>::with(services)
-            .given(vec![
-                withdrawn_from_raindex_event(),
-                legacy_tokens_unwrapped_event(recorded),
-                send_pending_event(),
-            ])
-            .when(EquityRedemptionCommand::SendTokens)
-            .await
-            .then_expect_error();
-
-        assert!(
-            matches!(
-                error,
-                LifecycleError::Apply(EquityRedemptionError::LegacyUnderlyingMismatch {
-                    recorded: ref r,
-                    attested: ref a,
-                    ..
-                }) if *r == recorded && *a == configured
-            ),
-            "got: {error:?}"
-        );
-        assert_eq!(tokenizer.call_count(), 0, "nothing may be sent");
-    }
-
-    /// The same legacy record whose address the vault does attest is sent,
-    /// with the attested token rather than the recorded one.
-    #[tokio::test]
-    async fn send_tokens_reattests_a_legacy_underlying_before_sending() {
-        let configured = Address::random();
-        let services = EquityTransferServices {
-            chains: BTreeMap::from([(
-                Chain::Base,
-                ChainEquityServices {
-                    wallet: Address::ZERO,
-                    raindex: Arc::new(MockRaindex::new()),
-                    vault_lookup: Arc::new(mock_vault_lookup()),
-                    tokenizer: Arc::new(MockTokenizer::new()),
-                    wrapper: Arc::new(
-                        MockWrapper::new()
-                            .with_tokenized_shares(configured)
-                            .attesting_unwrapped_token(configured),
-                    ),
-                    mint_authorizer: ConfiguredMintAuthorizer::Disabled,
-                    gas_readiness: ConfiguredGasReadiness::Unwired,
-                    equities: ChainEquities::default(),
-                },
-            )]),
-            bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
-        };
-
-        let events = TestHarness::<EquityRedemption>::with(services)
-            .given(vec![
-                withdrawn_from_raindex_event(),
-                legacy_tokens_unwrapped_event(configured),
-                send_pending_event(),
-            ])
-            .when(EquityRedemptionCommand::SendTokens)
-            .await
-            .events();
-
-        assert_eq!(events.len(), 1);
-        assert!(matches!(
-            events[0],
-            EquityRedemptionEvent::TokensSent { .. }
-        ));
-    }
-
     /// `SendTokens` must persist the non-idempotent transfer hash without
     /// attempting gas accounting inside the aggregate. The transfer manager
     /// performs that accounting only after `TokensSent` is durable.
@@ -4853,6 +5347,10 @@ mod tests {
             unwrap_block: Some(1),
             withdrawn_at: Utc::now(),
             unwrapped_at: Utc::now(),
+            prepared_send: Some(PreparedRedemptionSend {
+                prepared: prepared_withdrawal_for_test(),
+                redemption_wallet: Address::ZERO,
+            }),
         };
 
         let events = send_pending
@@ -4891,7 +5389,7 @@ mod tests {
             )]),
             bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
         };
-        let (store, raindex) = redemption_test_store(services);
+        let (store, raindex) = redemption_test_store(services.clone());
         let id = redemption_aggregate_id("partial-withdraw");
 
         store
@@ -4952,7 +5450,7 @@ mod tests {
             )]),
             bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
         };
-        let (store, raindex) = redemption_test_store(services);
+        let (store, raindex) = redemption_test_store(services.clone());
         let id = redemption_aggregate_id("unwrap-partial-withdraw");
 
         store
@@ -5644,7 +6142,7 @@ mod tests {
             bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
         };
 
-        let (store, raindex) = redemption_test_store(services);
+        let (store, raindex) = redemption_test_store(services.clone());
         let id = redemption_aggregate_id("send-fail");
 
         store
@@ -5686,11 +6184,7 @@ mod tests {
             .await
             .unwrap();
 
-        store
-            .send(&id, EquityRedemptionCommand::PrepareSend)
-            .await
-            .unwrap();
-
+        prepare_send_for_test(&store, &id, &services).await;
         store
             .send(&id, EquityRedemptionCommand::SendTokens)
             .await
@@ -5704,7 +6198,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn send_tokens_without_redemption_wallet_emits_transfer_failed() {
+    async fn send_without_redemption_wallet_refuses_preparation() {
         let services = EquityTransferServices {
             chains: BTreeMap::from([(
                 Chain::Base,
@@ -5722,7 +6216,7 @@ mod tests {
             bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
         };
 
-        let (store, raindex) = redemption_test_store(services);
+        let (store, raindex) = redemption_test_store(services.clone());
         let id = redemption_aggregate_id("no-wallet");
 
         store
@@ -5764,21 +6258,26 @@ mod tests {
             .await
             .unwrap();
 
-        store
-            .send(&id, EquityRedemptionCommand::PrepareSend)
+        let state = store.load(&id).await.unwrap().unwrap();
+        let EquityRedemption::TokensUnwrapped {
+            underlying_token: UnwrappedProvenance::Attested { attested },
+            unwrapped_amount,
+            ..
+        } = state
+        else {
+            panic!("expected send pending")
+        };
+        let error = services
+            .for_chain(Chain::Base)
+            .unwrap()
+            .tokenizer
+            .prepare_redemption_send(attested, unwrapped_amount)
             .await
-            .unwrap();
-
-        store
-            .send(&id, EquityRedemptionCommand::SendTokens)
-            .await
-            .unwrap();
-
-        let entity = store.load(&id).await.unwrap().unwrap();
-        assert!(
-            matches!(entity, EquityRedemption::Failed { .. }),
-            "Expected Failed state when redemption wallet is None, got: {entity:?}"
-        );
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            st0x_tokenization::TokenizerError::MissingRedemptionWallet
+        ));
     }
 
     #[tokio::test]
@@ -5846,7 +6345,7 @@ mod tests {
             bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
         };
 
-        let (store, raindex) = redemption_test_store(services);
+        let (store, raindex) = redemption_test_store(services.clone());
         let id = redemption_aggregate_id("unwrap-delivered-another-token");
 
         store
@@ -5991,7 +6490,8 @@ mod tests {
 
     #[tokio::test]
     async fn redeem_when_pending_returns_already_started() {
-        let (store, raindex) = redemption_test_store(mock_services());
+        let services = mock_services();
+        let (store, raindex) = redemption_test_store(services.clone());
         let id = redemption_aggregate_id("redemption-1");
 
         store
@@ -6033,11 +6533,7 @@ mod tests {
             .await
             .unwrap();
 
-        store
-            .send(&id, EquityRedemptionCommand::PrepareSend)
-            .await
-            .unwrap();
-
+        prepare_send_for_test(&store, &id, &services).await;
         store
             .send(&id, EquityRedemptionCommand::SendTokens)
             .await
@@ -7168,191 +7664,6 @@ mod tests {
         ));
     }
 
-    /// Verifies that `SendTokens` calls `wait_for_block` with the unwrap
-    /// block number before submitting the transfer, ensuring the RPC node
-    /// has indexed the unwrap tx's effects before the send is attempted.
-    #[tokio::test]
-    async fn send_tokens_waits_for_block_before_sending() {
-        let unwrap_block = 1234u64;
-        let mock_tokenizer = Arc::new(MockTokenizer::new());
-
-        let services = EquityTransferServices {
-            chains: BTreeMap::from([(
-                Chain::Base,
-                ChainEquityServices {
-                    wallet: Address::ZERO,
-                    raindex: Arc::new(MockRaindex::new()),
-                    vault_lookup: Arc::new(mock_vault_lookup()),
-                    tokenizer: mock_tokenizer.clone(),
-                    wrapper: Arc::new(MockWrapper::new()),
-                    mint_authorizer: ConfiguredMintAuthorizer::Disabled,
-                    gas_readiness: ConfiguredGasReadiness::Unwired,
-                    equities: ChainEquities::default(),
-                },
-            )]),
-            bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
-        };
-
-        let events = TestHarness::<EquityRedemption>::with(services)
-            .given(vec![
-                withdrawn_from_raindex_event(),
-                EquityRedemptionEvent::TokensUnwrapped {
-                    quantity: Some(float!(1.0)),
-                    underlying_token: UnwrappedProvenance::Attested {
-                        attested: UnwrappedToken::unchecked(Address::ZERO),
-                    },
-                    unwrap_tx_hash: TxHash::random(),
-                    unwrapped_amount: U256::from(1_000_000_000_000_000_000_u64),
-                    unwrap_block: Some(unwrap_block),
-                    unwrapped_at: Utc::now(),
-                },
-                EquityRedemptionEvent::SendPending {
-                    pending_at: Utc::now(),
-                },
-            ])
-            .when(EquityRedemptionCommand::SendTokens)
-            .await
-            .events();
-
-        assert_eq!(
-            events.len(),
-            1,
-            "expected exactly one event from SendTokens"
-        );
-        assert!(
-            matches!(events[0], EquityRedemptionEvent::TokensSent { .. }),
-            "expected TokensSent, got {:?}",
-            events[0]
-        );
-
-        let calls = mock_tokenizer.wait_for_block_calls();
-
-        assert_eq!(
-            calls,
-            vec![unwrap_block],
-            "wait_for_block must be called once with the unwrap block number"
-        );
-    }
-
-    /// Verifies the backward-compat path: when `unwrap_block` is `None`
-    /// (aggregates persisted before this field was added), `SendTokens`
-    /// skips `wait_for_block` entirely and proceeds to `send_for_redemption`.
-    #[tokio::test]
-    async fn send_tokens_skips_wait_for_block_when_unwrap_block_is_none() {
-        let mock_tokenizer = Arc::new(MockTokenizer::new());
-
-        let services = EquityTransferServices {
-            chains: BTreeMap::from([(
-                Chain::Base,
-                ChainEquityServices {
-                    wallet: Address::ZERO,
-                    raindex: Arc::new(MockRaindex::new()),
-                    vault_lookup: Arc::new(mock_vault_lookup()),
-                    tokenizer: mock_tokenizer.clone(),
-                    wrapper: Arc::new(MockWrapper::new()),
-                    mint_authorizer: ConfiguredMintAuthorizer::Disabled,
-                    gas_readiness: ConfiguredGasReadiness::Unwired,
-                    equities: ChainEquities::default(),
-                },
-            )]),
-            bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
-        };
-
-        let events = TestHarness::<EquityRedemption>::with(services)
-            .given(vec![
-                withdrawn_from_raindex_event(),
-                EquityRedemptionEvent::TokensUnwrapped {
-                    quantity: Some(float!(1.0)),
-                    underlying_token: UnwrappedProvenance::Attested {
-                        attested: UnwrappedToken::unchecked(Address::ZERO),
-                    },
-                    unwrap_tx_hash: TxHash::random(),
-                    unwrapped_amount: U256::from(1_000_000_000_000_000_000_u64),
-                    unwrap_block: None,
-                    unwrapped_at: Utc::now(),
-                },
-                EquityRedemptionEvent::SendPending {
-                    pending_at: Utc::now(),
-                },
-            ])
-            .when(EquityRedemptionCommand::SendTokens)
-            .await
-            .events();
-
-        assert_eq!(
-            events.len(),
-            1,
-            "expected exactly one event from SendTokens"
-        );
-        assert!(
-            matches!(events[0], EquityRedemptionEvent::TokensSent { .. }),
-            "expected TokensSent to succeed without wait_for_block, got {:?}",
-            events[0]
-        );
-
-        let calls = mock_tokenizer.wait_for_block_calls();
-
-        assert_eq!(
-            calls,
-            Vec::<u64>::new(),
-            "wait_for_block must NOT be called when unwrap_block is None, got calls: {calls:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn send_tokens_fails_with_node_sync_failed_when_wait_for_block_fails() {
-        let required_block = 42u64;
-
-        let services = EquityTransferServices {
-            chains: BTreeMap::from([(
-                Chain::Base,
-                ChainEquityServices {
-                    wallet: Address::ZERO,
-                    raindex: Arc::new(MockRaindex::new()),
-                    vault_lookup: Arc::new(mock_vault_lookup()),
-                    tokenizer: Arc::new(MockTokenizer::new().failing_wait_for_block()),
-                    wrapper: Arc::new(MockWrapper::new()),
-                    mint_authorizer: ConfiguredMintAuthorizer::Disabled,
-                    gas_readiness: ConfiguredGasReadiness::Unwired,
-                    equities: ChainEquities::default(),
-                },
-            )]),
-            bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
-        };
-
-        let error = TestHarness::<EquityRedemption>::with(services)
-            .given(vec![
-                withdrawn_from_raindex_event(),
-                EquityRedemptionEvent::TokensUnwrapped {
-                    quantity: Some(float!(1.0)),
-                    underlying_token: UnwrappedProvenance::Attested {
-                        attested: UnwrappedToken::unchecked(Address::ZERO),
-                    },
-                    unwrap_tx_hash: TxHash::random(),
-                    unwrapped_amount: U256::from(1_000_000_000_000_000_000_u64),
-                    unwrap_block: Some(required_block),
-                    unwrapped_at: Utc::now(),
-                },
-                EquityRedemptionEvent::SendPending {
-                    pending_at: Utc::now(),
-                },
-            ])
-            .when(EquityRedemptionCommand::SendTokens)
-            .await
-            .then_expect_error();
-
-        assert!(
-            matches!(
-                error,
-                LifecycleError::Apply(EquityRedemptionError::NodeSyncFailed {
-                    required_block: 42,
-                    attempts: NODE_SYNC_MAX_ATTEMPTS,
-                })
-            ),
-            "expected NodeSyncFailed {{ required_block: 42, attempts: {NODE_SYNC_MAX_ATTEMPTS} }}, got: {error:?}",
-        );
-    }
-
     /// Verifies SubmitUnwrap waits for the Raindex withdrawal block before submitting.
     #[tokio::test]
     async fn submit_unwrap_waits_for_block_before_submitting() {
@@ -8079,6 +8390,7 @@ mod tests {
             started_at,
             reconciled_at,
             withdrawal_nonce_hash: None,
+            issuer_send_nonce_hash: None,
         };
 
         let TransferOperation::EquityRedemption(operation) =
@@ -8218,6 +8530,10 @@ mod tests {
                 unwrap_block: None,
                 withdrawn_at: now,
                 unwrapped_at: now,
+                prepared_send: Some(PreparedRedemptionSend {
+                    prepared: prepared_withdrawal_for_test(),
+                    redemption_wallet: Address::ZERO
+                }),
             }
             .is_terminal(),
         );
@@ -8276,6 +8592,7 @@ mod tests {
                 started_at: now,
                 reconciled_at: now,
                 withdrawal_nonce_hash: None,
+                issuer_send_nonce_hash: None,
             }
             .is_terminal(),
         );
@@ -8317,6 +8634,7 @@ mod tests {
             started_at,
             reconciled_at,
             withdrawal_nonce_hash: None,
+            issuer_send_nonce_hash: None,
         };
 
         let TransferOperation::EquityRedemption(operation) =

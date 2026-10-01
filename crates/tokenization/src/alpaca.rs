@@ -3,7 +3,7 @@
 
 use alloy::primitives::{Address, TxHash, U256};
 use alloy::providers::Provider;
-use alloy::sol_types::SolEvent;
+use alloy::sol_types::{SolCall, SolEvent};
 use async_trait::async_trait;
 use tracing::info;
 
@@ -11,7 +11,7 @@ use st0x_alpaca::core::Network as AlpacaChain;
 use st0x_alpaca::tokenization::AlpacaTokenizationService as SharedService;
 use st0x_evm::{
     Chain, EvmError, IERC20, IntoErrorRegistry, NODE_SYNC_MAX_ATTEMPTS, NODE_SYNC_POLL_INTERVAL,
-    OpenChainErrorRegistry, Wallet, wait_for_node_sync,
+    OpenChainErrorRegistry, PreparedTransaction, Wallet, wait_for_node_sync,
 };
 use st0x_execution::{AlpacaAccountId, AlpacaBrokerAuth, FractionalShares, PollingConfig, Symbol};
 use st0x_wrapper::UnwrappedToken;
@@ -211,6 +211,61 @@ impl<W: Wallet> Tokenizer for AlpacaTokenizationService<W> {
         amount: U256,
     ) -> Result<TxHash, TokenizerError> {
         Self::send_for_redemption::<OpenChainErrorRegistry>(self, token, amount).await
+    }
+
+    async fn prepare_redemption_send(
+        &self,
+        token: UnwrappedToken,
+        amount: U256,
+    ) -> Result<PreparedTransaction, TokenizerError> {
+        let to = self
+            .redemption_wallet
+            .ok_or(TokenizerError::MissingRedemptionWallet)?;
+        Ok(self
+            .wallet
+            .prepare_pending(
+                token.address(),
+                IERC20::transferCall { to, amount }.abi_encode().into(),
+                "ERC20 transfer for redemption",
+            )
+            .await?)
+    }
+
+    async fn broadcast_redemption_send(
+        &self,
+        prepared: &PreparedTransaction,
+    ) -> Result<TxHash, TokenizerError> {
+        self.wallet.restore_prepared(prepared).await;
+        Ok(self
+            .wallet
+            .broadcast_prepared(prepared, "ERC20 transfer for redemption")
+            .await?)
+    }
+
+    async fn confirm_redemption_send(&self, tx_hash: TxHash) -> Result<bool, TokenizerError> {
+        Ok(self.wallet.await_receipt(tx_hash).await?.status())
+    }
+
+    async fn redemption_send_mined(&self, tx_hash: TxHash) -> Result<bool, TokenizerError> {
+        Ok(self
+            .wallet
+            .provider()
+            .get_transaction_receipt(tx_hash)
+            .await
+            .map_err(EvmError::from)?
+            .is_some())
+    }
+
+    async fn restore_redemption_send(&self, prepared: &PreparedTransaction) {
+        self.wallet.restore_prepared(prepared).await;
+    }
+
+    async fn discard_redemption_send(&self, tx_hash: TxHash) {
+        self.wallet.discard_prepared(tx_hash).await;
+    }
+
+    async fn release_superseded_redemption_send(&self, tx_hash: TxHash) {
+        self.wallet.release_superseded(tx_hash).await;
     }
 
     async fn poll_for_redemption(

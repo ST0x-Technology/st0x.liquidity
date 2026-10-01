@@ -943,10 +943,10 @@ pub enum TransferCommand {
         #[arg(short = 'r', long = "reason")]
         reason: AuditReason,
         /// usdc and redemption only. Required for a USDC transfer with a signed
-        /// deposit send, and for a redemption whose signed vault withdrawal has
-        /// no canonical receipt (a confirmed reverted withdrawal reconciles
-        /// without it); refused for a mint and for a USDC transfer or redemption
-        /// with no signed tx. It is the tx that took that signed tx's nonce (the
+        /// deposit send, and for a redemption whose signed vault withdrawal or
+        /// issuer send has no canonical receipt (a confirmed reverted one
+        /// reconciles without it); refused for a mint and for a USDC transfer
+        /// or redemption with no signed tx. It is the tx that took that signed tx's nonce (the
         /// 0-value self-transfer cancel). The bot checks that it is from the bot
         /// wallet on that chain, at the nonce, not the signed tx itself, has the
         /// required confirmations, and did not do what the signed tx does: for

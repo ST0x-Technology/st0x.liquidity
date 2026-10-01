@@ -3928,19 +3928,58 @@ enum DetectionFailure {
 }
 ```
 
+Equity redemption issuer sends reserve a wallet nonce and persist the signed
+transaction and destination in a `SendPrepared` event before broadcasting. The
+state stays `SendPending` and retains this identity: a crash after broadcast,
+receipt polling failure, or storage error resumes by rebroadcasting the same
+envelope rather than signing a second transfer. `SendPrepared` is a distinct
+event so a binary that predates durable sends fails to load the redemption
+instead of signing again. Signing and its write run on a detached task, so a
+cancelled caller cannot leave a reserved nonce with no stored send; a failed
+write releases the nonce only when the send provably never reached storage.
+Preparation attests a legacy underlying and waits for the unwrap block before
+signing; neither runs again before a rebroadcast. A rebroadcast is best effort:
+whatever it returns, the stored hash's receipt is looked up, because some nodes
+reject an already mined transaction before their nonce check. Only a confirmed
+reverted receipt produces a transfer failure; an uncertain outcome remains
+pending and the resume job redrives it without spending its retry budget. A
+pending send cannot be force-failed while its network outcome is unknown. At
+startup every persisted send restores its nonce on its own chain, is
+rebroadcast, and gets one non-blocking receipt lookup before approvals or
+workers can send. A send with no receipt pages and suppresses startup approvals
+on that chain, and startup queues its resume even when its transfer job is
+exhausted. Older `SendPending` rows that predate the prepared send fail closed:
+an old binary may already have broadcast a send whose hash was never recorded.
+Recovery never signs them again; startup and the timeout sweep page, and the
+operator checks onchain whether the old transfer landed, then closes the row
+with `transfer reconcile`. Drain or verify such legacy transfers before
+upgrading.
+
+The timeout sweep never fails a pending issuer send. After `transfer_timeout` it
+pages once and keeps the redemption's guard, inflight, and reservation. To
+abandon a signed send that will never land, the operator sends a 0-value
+self-transfer at its nonce from the issuer-send wallet, waits for it to confirm,
+and then reconciles the redemption; the bot releases its hold on the nonce. A
+redemption that times out in `TokensUnwrapped` commits `FailTransfer` before the
+sweep clears tracking and inventory: if the driver persisted a signed send in
+the meantime, the failure is refused and the redemption stays owned.
+
 The operator `fail` verb (`transfer fail --kind redemption`) dispatches per
 state: a redemption stuck before tokens leave custody takes `FailTransfer`, a
 `TokensSent` redemption takes `FailDetection { failure: Operator { reason } }`,
 and a `Pending` redemption takes `RejectRedemption { reason }`. In every case
 the replayed `Failed` state materializes the operator's reason. The verb refuses
-a redemption with a signed vault withdrawal (`VaultWithdrawSubmitting` or
-`VaultWithdrawSubmitted`), because the withdrawal can still mine. Instead the
-operator checks it on chain: one that mined successfully went through and is not
-reconciled; one that mined and reverted is reconciled with no cancel once
-confirmed; one with no receipt, whose nonce another tx from the bot wallet
-already used to do the withdrawal itself, is adopted; one with no receipt and
-nothing at its nonce is cancelled first and then reconciled. Reconcile requires
-the chain proof described under operator reconciliation.
+a redemption with a pending issuer send (`SendPending`), because the send can
+still mine: the operator verifies it onchain and reconciles the redemption
+instead. It also refuses a redemption with a signed vault withdrawal
+(`VaultWithdrawSubmitting` or `VaultWithdrawSubmitted`), because the withdrawal
+can still mine. Instead the operator checks it on chain: one that mined
+successfully went through and is not reconciled; one that mined and reverted is
+reconciled with no cancel once confirmed; one with no receipt, whose nonce
+another tx from the bot wallet already used to do the withdrawal itself, is
+adopted; one with no receipt and nothing at its nonce is cancelled first and
+then reconciled. Reconcile requires the chain proof described under operator
+reconciliation.
 
 Vault withdrawal submission is an irreversible uncertainty boundary. The
 orchestrator prepares and signs the transaction, then the pure aggregate
@@ -6323,32 +6362,38 @@ declared resolved by sending the `Reconcile { reason }` command, which emits
 Unlike USDC, the equity aggregates hold no in-progress guard, so the `Reconcile`
 command emits **no reactor effect and dispatches no inventory update** -- it is
 a pure bookkeeping terminal transition. The one exception is the wallet nonce of
-a reconciled redemption's signed vault withdrawal, described below. One nuance
-for redemptions: a redemption that ended in `DetectionFailed` /
-`RedemptionRejected` has its stranded exposure seeded into live inflight at
+a reconciled redemption's signed vault withdrawal or issuer send, described
+below. One nuance for redemptions: a redemption that ended in `DetectionFailed`
+/ `RedemptionRejected` has its stranded exposure seeded into live inflight at
 startup (see `stuck_redemptions`). Reconcile moves the latest event to
 `OperatorReconciled`, so that redemption is no longer seeded as stuck on the
 **next** restart; the running process's live inflight retains the startup-seeded
 amount until then. Mint failures and pre-send redemption failures settle
 inventory at failure time, so they need no such clearing. A mint's `Reconciled`
-is valid ONLY from `Failed`. A redemption's `Reconciled` is valid from `Failed`
-and from the withdrawal submission states (`VaultWithdrawPending`,
-`VaultWithdrawSubmitting`, `VaultWithdrawSubmitted`); every other state is
-rejected.
+is valid ONLY from `Failed`. A redemption's `Reconciled` is valid from `Failed`,
+from the withdrawal submission states (`VaultWithdrawPending`,
+`VaultWithdrawSubmitting`, `VaultWithdrawSubmitted`), and from `SendPending` (a
+signed issuer send, or a legacy one with no recorded transaction); every other
+state is rejected.
 
 A redemption reconciled from a submission state can still hold a wallet nonce
-reservation for its signed withdrawal. `Reconciled` retains that withdrawal's tx
-hash (`withdrawal_nonce_hash`), and the running bot releases the reservation by
-hash without a restart: the redemption's resume job releases it when it loads
-`Reconciled`, in `perform` and in its terminal attempt, and the timeout sweep
-enqueues a resume job for a reconcile it observes (a failed enqueue is kept and
-retried on later sweep ticks). The release is ownership-checked and idempotent.
-It does not cancel the signed withdrawal, so reconcile of a redemption holding
-one is refused unless the chain proves the withdrawal can never land. A signed
-withdrawal stuck below the market fee will not confirm at that fee but can still
-mine when fees drop. If the withdrawal mined and reverted, the operator waits
-for its required confirmations, settles the equity by hand and reconciles with
-no `--superseding-tx`. If it has no receipt, the operator first cancels it: a
+reservation for its signed withdrawal, and one reconciled from a signed
+`SendPending` for its issuer send. `Reconciled` retains that transaction's hash
+(`withdrawal_nonce_hash` or `issuer_send_nonce_hash`; a legacy `SendPending`
+holds no nonce), and the running bot releases the reservation by hash without a
+restart: the redemption's resume job releases it when it loads `Reconciled`, in
+`perform` and in its terminal attempt, and the timeout sweep enqueues a resume
+job for a reconcile it observes (a failed enqueue is kept and retried on later
+sweep ticks). The release is ownership-checked and idempotent. It does not
+cancel the signed transaction. The operator reconciles a `SendPending` only
+after verifying onchain that its issuer send can never land (another transaction
+from the bot wallet mined at its nonce, or the send itself mined and reverted).
+Reconcile of a redemption holding a signed withdrawal is refused unless the
+chain proves the withdrawal can never land. A signed withdrawal stuck below the
+market fee will not confirm at that fee but can still mine when fees drop. If
+the withdrawal mined and reverted, the operator waits for its required
+confirmations, settles the equity by hand and reconciles with no
+`--superseding-tx`. If it has no receipt, the operator first cancels it: a
 higher fee 0-value self-transfer from the bot wallet at its nonce, mined. Only
 then does the operator settle the equity by hand and reconcile, naming the
 cancel (`--superseding-tx`, the API's `supersedingTx`). The bot reads the chain
