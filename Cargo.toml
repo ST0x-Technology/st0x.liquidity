@@ -220,6 +220,10 @@ rain-error-decoding.workspace = true
 rain-math-float.workspace = true
 rand.workspace = true
 reqwest.workspace = true
+rustls = { version = "0.23.40", default-features = false, features = [
+  "ring",
+  "std",
+] }
 serde.workspace = true
 serde_json.workspace = true
 sqlx.workspace = true

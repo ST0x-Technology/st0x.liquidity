@@ -2,11 +2,14 @@ use clap::Parser;
 
 use st0x_config::{Ctx, Env, TokenSource, claim_boot_tokens};
 use st0x_hedge::{
-    apalis_board_tracing_layer, report_registry_boot, run_server_bot_session, setup_tracing,
+    apalis_board_tracing_layer, install_tls_crypto_provider, report_registry_boot,
+    run_server_bot_session, setup_tracing,
 };
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    install_tls_crypto_provider();
+
     let Env {
         config,
         secrets,

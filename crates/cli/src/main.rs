@@ -3,9 +3,12 @@
 mod cli;
 
 use st0x_config::setup_tracing;
+use st0x_hedge::install_tls_crypto_provider;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    install_tls_crypto_provider();
+
     let (ctx, command) = cli::CliEnv::parse_and_convert().await?;
     let _file_log_guard = setup_tracing(
         &ctx.log_level,
