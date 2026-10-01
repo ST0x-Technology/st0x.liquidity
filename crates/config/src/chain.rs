@@ -836,8 +836,8 @@ impl ChainRegistry {
     }
 
     /// Runs every `[chains.<name>]` check that reads the config file alone,
-    /// and hands back the primary chain's table so the caller can keep
-    /// validating against it.
+    /// and hands back the primary chain and its table so the caller can keep
+    /// validating against them.
     ///
     /// [`Self::new`] performs these same checks plus the config/secrets
     /// pairing (each chain's `rpc_url`), which is why the secrets-free
@@ -845,9 +845,10 @@ impl ChainRegistry {
     /// fails here fails startup too, whatever the secrets file holds.
     pub fn validate_configs(
         configs: &BTreeMap<Chain, ChainConfig>,
-    ) -> Result<&TradingConfig, ChainRegistryError> {
+    ) -> Result<(Chain, &TradingConfig), ChainRegistryError> {
         let EnabledChains {
             enabled,
+            primary_chain,
             trading_table,
             ..
         } = enabled_chains(configs)?;
@@ -860,7 +861,7 @@ impl ChainRegistry {
             }
         }
 
-        Ok(trading_table)
+        Ok((primary_chain, trading_table))
     }
 
     /// THE primary chain: the one the bot rebalances automatically. Every

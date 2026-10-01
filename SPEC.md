@@ -186,28 +186,31 @@ corridor's chain; a hedge-only listing is prefunded and schedules neither. The
 distinction exists so that fill watching and inventory polling can go
 multi-chain before rebalancing does: it names the chain the still-single-chain
 paths use. Equity and cash rebalancing are per chain (see Equity Allocation
-Planner and USDC Rebalancing), so `primary` is only the operator's default
-chain, and may be removed. Zero or multiple primary claimants fail startup with
-a named error. Chains without a trading table are **transport** chains (RPC +
-confirmations only, e.g. Ethereum while it only carries CCTP transfers). Watch
-settings are per chain: poll interval, ingestion cutoff, asset tables with
-per-chain enable/disable flags. The periodic position check sweeps a symbol when
-any hedged chain enables it and sizes the hedge with the tightest operational
-limit among those chains (one `Position` per symbol cannot say which chain its
-fills came from; the remainder is hedged on a later tick). Startup verifies
-every hedged chain (chain-id identity, cutoff support, and each token address
-the chain's role uses answering `decimals()` on that chain's own endpoint: every
-equity's wrapped share, plus the unwrapped token of each equity the chain
-rebalances) and any failure is fatal; degraded per-chain startup is deferred to
-the chain-disable work. Each probed equity token must report 18 decimals: every
-equity quantity the bot scales is 18-decimal share-wei, so a token at another
-precision is refused by name rather than honoured. The settlement stable is not
-probed: its decimals are pinned in code beside its address. Each wrapped share
-must additionally report the equity's configured unwrapped token as its ERC-4626
-`asset()` — the same attestation the tokenization preflight makes, which a
-hedge-only chain never reaches and a rebalancing secondary makes only for the
-equities that opt in — so a typo landing on another live token refuses startup
-instead of surfacing as the first unresolvable fill.
+Planner and USDC Rebalancing), so `primary` is otherwise only the operator's
+default chain. For now the primary must be Base, and any other primary fails
+startup with a named error: equity wallet polling and recovery read the Base
+wallet with the primary's token addresses. Zero or multiple primary claimants
+fail startup with a named error. Chains without a trading table are
+**transport** chains (RPC + confirmations only, e.g. Ethereum while it only
+carries CCTP transfers). Watch settings are per chain: poll interval, ingestion
+cutoff, asset tables with per-chain enable/disable flags. The periodic position
+check sweeps a symbol when any hedged chain enables it and sizes the hedge with
+the tightest operational limit among those chains (one `Position` per symbol
+cannot say which chain its fills came from; the remainder is hedged on a later
+tick). Startup verifies every hedged chain (chain-id identity, cutoff support,
+and each token address the chain's role uses answering `decimals()` on that
+chain's own endpoint: every equity's wrapped share, plus the unwrapped token of
+each equity the chain rebalances) and any failure is fatal; degraded per-chain
+startup is deferred to the chain-disable work. Each probed equity token must
+report 18 decimals: every equity quantity the bot scales is 18-decimal
+share-wei, so a token at another precision is refused by name rather than
+honoured. The settlement stable is not probed: its decimals are pinned in code
+beside its address. Each wrapped share must additionally report the equity's
+configured unwrapped token as its ERC-4626 `asset()` — the same attestation the
+tokenization preflight makes, which a hedge-only chain never reaches and a
+rebalancing secondary makes only for the equities that opt in — so a typo
+landing on another live token refuses startup instead of surfacing as the first
+unresolvable fill.
 
 The lifecycle is a strict ceiling over the chain's asset settings. The hedged
 chain with `primary = true` must be `active`; startup rejects an observe-only or

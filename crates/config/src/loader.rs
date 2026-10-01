@@ -1848,7 +1848,16 @@ fn validate_config(
 
     validate_asset_tables(&config.assets, &config.chains)?;
     let polling_intervals = validated_polling_intervals(config)?;
-    let trading_table = ChainRegistry::validate_configs(&config.chains)?;
+    let (primary_chain, trading_table) = ChainRegistry::validate_configs(&config.chains)?;
+
+    // Equity wallet polling and recovery read the Base wallet with the
+    // primary's token addresses, which are Base's only on a Base primary.
+    if primary_chain != Chain::Base {
+        return Err(CtxError::PrimaryChainNotBase {
+            primary: primary_chain,
+        });
+    }
+
     let log_query_url_template = config
         .log_query_url_template
         .clone()
@@ -12334,43 +12343,42 @@ mod tests {
         );
     }
 
-    /// A corridor runs on its own chain's orderbook, vault and depth, so an
-    /// Ethereum primary with a Base corridor loads.
+    /// A corridor runs on its own chain's orderbook, vault and depth, so the
+    /// corridor check accepts a corridor off the primary chain.
     #[test]
-    fn corridor_off_the_primary_chain_loads() {
-        let mut deployed: toml::Table =
-            toml::from_str(include_str!("../../../config/prod/st0x-hedge.toml")).unwrap();
-        let chains = deployed["chains"].as_table_mut().unwrap();
-        let mut ethereum_trading = chains["base"]["trading"].clone();
-        ethereum_trading
-            .as_table_mut()
-            .unwrap()
-            .insert("primary".to_string(), toml::Value::Boolean(true));
-        chains["base"]["trading"]
-            .as_table_mut()
-            .unwrap()
-            .insert("primary".to_string(), toml::Value::Boolean(false));
-        ethereum_trading["assets"]
-            .as_table_mut()
-            .unwrap()
-            .remove("cash");
-        chains["ethereum"]
-            .as_table_mut()
-            .unwrap()
-            .insert("trading".to_string(), ethereum_trading);
-        let config = toml_file(&toml::to_string(&deployed).unwrap());
+    fn corridor_off_the_primary_chain_passes_the_corridor_check() {
+        let mut config = prod_config();
+        for (chain, primary) in [(Chain::Base, false), (Chain::Robinhood, true)] {
+            config
+                .chains
+                .get_mut(&chain)
+                .and_then(|chain_config| chain_config.trading.as_mut())
+                .unwrap()
+                .primary = primary;
+        }
 
-        Ctx::validate_config_file(config.path(), TokenFile::Skipped).unwrap();
+        validate_usdc_corridor_chains(&config.rebalancing.as_ref().unwrap().usdc, &config.chains)
+            .unwrap();
     }
 
-    /// With no corridor table Base via CCTP is served while Base holds a cash
-    /// vault, so a non-Base primary loads with USDC mode disabled.
+    /// The primary must be Base whatever the USDC corridors, so an Ethereum
+    /// primary with no corridor table is refused too.
     #[test]
-    fn a_non_base_primary_without_a_corridor_table_serves_base() {
+    fn full_validation_refuses_a_non_base_primary_without_a_corridor_table() {
         let config =
             toml_file(&toml::to_string(&ethereum_primary_without_corridor_table()).unwrap());
 
-        Ctx::validate_config_file(config.path(), TokenFile::Skipped).unwrap();
+        let error = Ctx::validate_config_file(config.path(), TokenFile::Skipped).unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                CtxError::PrimaryChainNotBase {
+                    primary: Chain::Ethereum
+                }
+            ),
+            "got {error:?}"
+        );
     }
 
     /// With no corridor table and no Base cash vault the build has no cash
@@ -12378,7 +12386,7 @@ mod tests {
     /// in startup.
     #[test]
     fn full_validation_refuses_a_config_serving_no_usdc_corridor() {
-        let mut deployed = ethereum_primary_without_corridor_table();
+        let mut deployed = prod_without_corridor_table();
         deployed["chains"]["base"]["trading"]["assets"]
             .as_table_mut()
             .unwrap()
@@ -12391,7 +12399,7 @@ mod tests {
             matches!(
                 error,
                 CtxError::NoServedUsdcCorridor {
-                    chain: Chain::Ethereum
+                    chain: Chain::Robinhood
                 }
             ),
             "got {error:?}"
@@ -12437,11 +12445,25 @@ mod tests {
         );
     }
 
-    /// The deployed config with Ethereum as the primary, Base as a secondary
-    /// and USDC mode disabled with no corridor table.
-    fn ethereum_primary_without_corridor_table() -> toml::Table {
+    /// The deployed config with USDC mode disabled and no corridor table.
+    fn prod_without_corridor_table() -> toml::Table {
         let mut deployed: toml::Table =
             toml::from_str(include_str!("../../../config/prod/st0x-hedge.toml")).unwrap();
+        deployed["rebalancing"].as_table_mut().unwrap().insert(
+            "usdc".to_string(),
+            toml::Value::Table(toml::Table::from_iter([(
+                "mode".to_string(),
+                toml::Value::String("disabled".to_string()),
+            )])),
+        );
+
+        deployed
+    }
+
+    /// [`prod_without_corridor_table`] with Ethereum as the primary and Base
+    /// as a secondary.
+    fn ethereum_primary_without_corridor_table() -> toml::Table {
+        let mut deployed = prod_without_corridor_table();
         let chains = deployed["chains"].as_table_mut().unwrap();
         let mut ethereum_trading = chains["base"]["trading"].clone();
         ethereum_trading
@@ -12456,13 +12478,6 @@ mod tests {
             .as_table_mut()
             .unwrap()
             .insert("trading".to_string(), ethereum_trading);
-        deployed["rebalancing"].as_table_mut().unwrap().insert(
-            "usdc".to_string(),
-            toml::Value::Table(toml::Table::from_iter([(
-                "mode".to_string(),
-                toml::Value::String("disabled".to_string()),
-            )])),
-        );
 
         deployed
     }
