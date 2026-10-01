@@ -65,12 +65,14 @@ are arrays; the client keeps every entry.
 A `refund` counts as a paid refund (`IntentStatus::Refund`) only with at least
 one refund tx and no `refundFailReason`. With no refund tx it is
 `IntentStatus::Refunding` (not terminal); with a `refundFailReason` it is
-`IntentStatus::RefundFailed` (terminal: the refund will not be paid).
+`IntentStatus::RefundFailed`, which carries that `refund_fail_reason` (terminal:
+the refund will not be paid).
 
-Only `success`, `refund` and `failure` are terminal. A status name the client
-does not know is `IntentStatus::Unknown` and stays non-terminal, so the transfer
-keeps waiting rather than settling on a guess. Known fail reasons are
-`SLIPPAGE`, `TOO_LITTLE_RECEIVED`, `SOLVER_CAPACITY_EXCEEDED`, `TTL_EXPIRED`,
+Terminal statuses are `Success`, a paid `Refund`, `RefundFailed` and `Failure`;
+`Refunding` is not. A status name the client does not know is
+`IntentStatus::Unknown` and stays non-terminal, so the transfer keeps waiting
+rather than settling on a guess. Known fail reasons are `SLIPPAGE`,
+`TOO_LITTLE_RECEIVED`, `SOLVER_CAPACITY_EXCEEDED`, `TTL_EXPIRED`,
 `DEPOSIT_CONFIRMATION_TIMEOUT`, `DEPOSIT_REORGED`, `BLOCKED_WALLET`,
 `TRANSACTION_NOT_INCLUDED`, plus `DEPOSITED_AMOUNT_TOO_LOW_TO_FILL` (seen on the
 forced refund, not in the docs).
@@ -166,9 +168,12 @@ would refuse an honest quote.
   the tx sender was a different relayer EOA every time, so it is never trusted.
   The only log is the stable's `Transfer(solver, recipient, amount)`. One fill
   tx per transfer in every run.
-- **Refund.** Same shape on the origin chain in the deposited token, paid from
-  the solver to `refundTo`; the depository emits nothing. The forced refund (3
-  USDG deposited against a 5 USDG quote) returned 2.995154 USDG 15 s after the
-  quote, with `failReason: DEPOSITED_AMOUNT_TOO_LOW_TO_FILL`.
+- **Refund.** Same shape, paid from the solver to `refundTo`; the depository
+  emits nothing. Every quote offers two refund options in
+  `protocol.v2.orderData.inputs[].refunds[]`: the origin stable on the origin
+  chain and the destination stable on the destination chain, so a refund proof
+  must look on both. The forced refund (3 USDG deposited against a 5 USDG quote)
+  was paid on the origin chain in USDG: 2.995154 USDG 15 s after the quote, with
+  `failReason: DEPOSITED_AMOUNT_TOO_LOW_TO_FILL`.
 
 Both fills paid exactly the quoted expected amount, in 32 and 59 s.
