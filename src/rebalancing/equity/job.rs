@@ -26,7 +26,6 @@ use std::time::Duration;
 
 use apalis_core::error::BoxDynError;
 use async_trait::async_trait;
-use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tracing::{info, warn};
@@ -52,7 +51,7 @@ use crate::alerts::Notifier;
 use crate::bot_gas::BotGasReceiptCostEnqueuer;
 use crate::bot_gas::redrive::{BotGasFailureClassifier, redrive_on_bot_gas_failure};
 use crate::conductor::job::{
-    BackpressureStreak, Job, JobQueue, Label, QueuePushError, TaskIdentity,
+    BackpressureStreak, Job, JobQueue, Label, QueuePushError, TaskIdentity, has_live_sibling_job,
 };
 use crate::equity_redemption::{EquityRedemption, RedemptionAggregateId};
 use crate::position::{
@@ -262,35 +261,6 @@ pub(super) async fn restore_position_reservation(
     }
 }
 
-pub(super) async fn has_live_sibling_equity_transfer<JobPayload>(
-    pool: &apalis_sqlite::SqlitePool,
-    task_identity: &TaskIdentity,
-    same_owner: impl Fn(&JobPayload) -> bool,
-) -> Result<bool, BoxDynError>
-where
-    JobPayload: DeserializeOwned,
-{
-    let payloads: Vec<Vec<u8>> = sqlx_apalis::query_scalar(
-        "SELECT job FROM Jobs \
-         WHERE id <> ? AND job_type = ? \
-         AND (status IN ('Pending', 'Queued', 'Running') \
-              OR (status = 'Failed' AND attempts < max_attempts))",
-    )
-    .bind(task_identity.as_str())
-    .bind(std::any::type_name::<JobPayload>())
-    .fetch_all(pool)
-    .await?;
-
-    for payload in payloads {
-        let sibling: JobPayload = serde_json::from_slice(&payload)?;
-        if same_owner(&sibling) {
-            return Ok(true);
-        }
-    }
-
-    Ok(false)
-}
-
 impl TransferEquityToMarketMaking {
     async fn abandon_if_stopped_and_fresh(
         &self,
@@ -367,7 +337,6 @@ impl TransferEquityToMarketMaking {
         Ok(())
     }
 }
-
 impl Job<TransferEquityToMarketMakingCtx> for TransferEquityToMarketMaking {
     type Output = ();
     type Error = TransferEquityToMarketMakingJobError;
@@ -657,14 +626,10 @@ impl Job<TransferEquityToMarketMakingCtx> for TransferEquityToMarketMaking {
             );
             return Ok(());
         }
-        if has_live_sibling_equity_transfer::<Self>(
-            ctx.job_queue.pool(),
-            task_identity,
-            |sibling| {
-                sibling.issuer_request_id == self.issuer_request_id
-                    && sibling.generation == self.generation
-            },
-        )
+        if has_live_sibling_job::<Self>(ctx.job_queue.pool(), task_identity, |sibling| {
+            sibling.issuer_request_id == self.issuer_request_id
+                && sibling.generation == self.generation
+        })
         .await?
         {
             warn!(
@@ -1297,14 +1262,10 @@ impl Job<TransferEquityToHedgingCtx> for TransferEquityToHedging {
                     | EquityRedemption::VaultWithdrawSubmitted { .. }
             );
             if unresolved_submission
-                && !has_live_sibling_equity_transfer::<Self>(
-                    ctx.job_queue.pool(),
-                    task_identity,
-                    |sibling| {
-                        sibling.aggregate_id == self.aggregate_id
-                            && sibling.generation == self.generation
-                    },
-                )
+                && !has_live_sibling_job::<Self>(ctx.job_queue.pool(), task_identity, |sibling| {
+                    sibling.aggregate_id == self.aggregate_id
+                        && sibling.generation == self.generation
+                })
                 .await?
             {
                 let message = format!(
@@ -1355,13 +1316,9 @@ impl Job<TransferEquityToHedgingCtx> for TransferEquityToHedging {
             );
             return Ok(());
         }
-        if has_live_sibling_equity_transfer::<Self>(
-            ctx.job_queue.pool(),
-            task_identity,
-            |sibling| {
-                sibling.aggregate_id == self.aggregate_id && sibling.generation == self.generation
-            },
-        )
+        if has_live_sibling_job::<Self>(ctx.job_queue.pool(), task_identity, |sibling| {
+            sibling.aggregate_id == self.aggregate_id && sibling.generation == self.generation
+        })
         .await?
         {
             warn!(
