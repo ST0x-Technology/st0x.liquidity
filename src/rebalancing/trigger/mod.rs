@@ -834,13 +834,14 @@ fn mint_event_tokenization_request_id(
 }
 
 /// Marker left behind by a transfer timeout cleanup. Records when the
-/// cleanup ran and which symbol's inflight it cleared, so a late completion
-/// event for the tombstoned aggregate can release the symbol's inflight
+/// cleanup ran and which symbol and chain's inflight it cleared, so a late
+/// completion event for the tombstoned aggregate can release that inflight
 /// suppression without any tracking context (cleanup drops the tracking
 /// entry, and completion events do not carry the symbol).
 #[derive(Debug, Clone)]
 struct TimeoutTombstone {
     symbol: Symbol,
+    chain: Chain,
     timed_out_at: DateTime<Utc>,
 }
 
@@ -880,6 +881,8 @@ struct SnapshotReconciliation {
     accepted_onchain_cash: Option<ReconciliationGeneration>,
     accepted_offchain_equity: Option<ReconciliationGeneration>,
 }
+
+type InflightSuppression = HashMap<(Symbol, Chain), DateTime<Utc>>;
 
 /// Service that folds CQRS events into rebalancing state and
 /// schedules follow-up imbalance checks. Also serves as the apalis
@@ -955,7 +958,10 @@ pub(crate) struct RebalancingService {
     /// Tracks USDC rebalance lifecycle data needed to settle inventory on
     /// terminal events with the actual amount received.
     usdc_tracking: Arc<RwLock<HashMap<UsdcRebalanceId, usdc::UsdcRebalanceTracking>>>,
-    suppressed_inflight_symbols: Arc<RwLock<HashMap<Symbol, DateTime<Utc>>>>,
+    /// When the inflight of each `(symbol, chain)` was last cleared by a
+    /// timeout or terminal failure. Provider polls fetched before that
+    /// moment are stale for the pair and are filtered out.
+    suppressed_inflight_symbols: Arc<RwLock<InflightSuppression>>,
     timed_out_mints: Arc<RwLock<HashMap<IssuerRequestId, TimeoutTombstone>>>,
     timed_out_redemptions: Arc<RwLock<HashMap<RedemptionAggregateId, TimeoutTombstone>>>,
     /// Terminal transfer reservations whose release is pending. Lifecycle
@@ -2411,24 +2417,31 @@ impl RebalancingService {
     async fn retire_stale_suppression_and_collect_active_symbols(
         &self,
         fetched_at: DateTime<Utc>,
-    ) -> HashSet<Symbol> {
+    ) -> HashSet<(Symbol, Chain)> {
         let mut suppressed_symbols = self.suppressed_inflight_symbols.write().await;
         suppressed_symbols.retain(|_, cleared_at| *cleared_at >= fetched_at);
         suppressed_symbols.keys().cloned().collect()
     }
 
+    /// Drops suppressed entries from a provider inflight snapshot. Mints sit
+    /// in the broker's single offchain slot, so a suppression on any chain
+    /// drops the symbol's mint entry. Redemptions sit on their own chain's
+    /// slot, so only a suppression on `redemption_chain` drops one.
     fn filter_suppressed_inflight_snapshot(
-        mints: &std::collections::BTreeMap<Symbol, FractionalShares>,
-        redemptions: &std::collections::BTreeMap<Symbol, FractionalShares>,
-        active_suppressed_symbols: &HashSet<Symbol>,
+        mints: &BTreeMap<Symbol, FractionalShares>,
+        redemptions: &BTreeMap<Symbol, FractionalShares>,
+        redemption_chain: Chain,
+        active_suppressed: &HashSet<(Symbol, Chain)>,
     ) -> (
-        std::collections::BTreeMap<Symbol, FractionalShares>,
-        std::collections::BTreeMap<Symbol, FractionalShares>,
+        BTreeMap<Symbol, FractionalShares>,
+        BTreeMap<Symbol, FractionalShares>,
     ) {
         let filtered_mints = mints
             .iter()
             .filter(|(symbol, _)| {
-                let keep = !active_suppressed_symbols.contains(*symbol);
+                let keep = !active_suppressed
+                    .iter()
+                    .any(|(suppressed, _)| suppressed == *symbol);
 
                 if !keep {
                     debug!(
@@ -2443,15 +2456,30 @@ impl RebalancingService {
             .map(|(symbol, quantity)| (symbol.clone(), *quantity))
             .collect();
 
-        let filtered_redemptions = redemptions
+        let filtered_redemptions = Self::filter_suppressed_inflight_redemptions(
+            redemptions,
+            redemption_chain,
+            active_suppressed,
+        );
+
+        (filtered_mints, filtered_redemptions)
+    }
+
+    fn filter_suppressed_inflight_redemptions(
+        redemptions: &BTreeMap<Symbol, FractionalShares>,
+        chain: Chain,
+        active_suppressed: &HashSet<(Symbol, Chain)>,
+    ) -> BTreeMap<Symbol, FractionalShares> {
+        redemptions
             .iter()
             .filter(|(symbol, _)| {
-                let keep = !active_suppressed_symbols.contains(*symbol);
+                let keep = !active_suppressed.contains(&((*symbol).clone(), chain));
 
                 if !keep {
                     debug!(
                         target: "rebalance",
                         %symbol,
+                        %chain,
                         "Ignoring inflight redemption snapshot after timeout cleanup"
                     );
                 }
@@ -2459,9 +2487,7 @@ impl RebalancingService {
                 keep
             })
             .map(|(symbol, quantity)| (symbol.clone(), *quantity))
-            .collect();
-
-        (filtered_mints, filtered_redemptions)
+            .collect()
     }
 
     async fn cleanup_timed_out_mint(
@@ -2487,7 +2513,7 @@ impl RebalancingService {
         let mut inventory = self.inventory.write().await;
         *inventory = inventory
             .clone()
-            .clear_equity_inflight(&tracking.symbol, Venue::Hedging, now)?
+            .clear_equity_inflight_at(&tracking.symbol, tracking.chain, Venue::Hedging, now)?
             .clear_active_mint(&tracking.symbol);
         drop(inventory);
 
@@ -2495,13 +2521,14 @@ impl RebalancingService {
             id.clone(),
             TimeoutTombstone {
                 symbol: tracking.symbol.clone(),
+                chain: tracking.chain,
                 timed_out_at: now,
             },
         );
         self.suppressed_inflight_symbols
             .write()
             .await
-            .insert(tracking.symbol.clone(), now);
+            .insert((tracking.symbol.clone(), tracking.chain), now);
         tracking_guard.remove(id);
         drop(tracking_guard);
 
@@ -2579,6 +2606,7 @@ impl RebalancingService {
                         id.clone(),
                         TimeoutTombstone {
                             symbol: tracking.symbol.clone(),
+                            chain: tracking.chain,
                             timed_out_at: now,
                         },
                     );
@@ -2621,13 +2649,14 @@ impl RebalancingService {
             id.clone(),
             TimeoutTombstone {
                 symbol: tracking.symbol.clone(),
+                chain: tracking.chain,
                 timed_out_at: now,
             },
         );
         self.suppressed_inflight_symbols
             .write()
             .await
-            .insert(tracking.symbol.clone(), now);
+            .insert((tracking.symbol.clone(), tracking.chain), now);
         tracking_guard.remove(id);
         drop(tracking_guard);
 
@@ -3059,7 +3088,24 @@ impl RebalancingService {
                 Some(Self::filter_suppressed_inflight_snapshot(
                     mints,
                     redemptions,
+                    Chain::Base,
                     &active_suppressed_symbols,
+                ))
+            }
+            ChainInflightRedemptions {
+                chain, redemptions, ..
+            } => {
+                let active_suppressed_symbols = self
+                    .retire_stale_suppression_and_collect_active_symbols(fetched_at)
+                    .await;
+
+                Some((
+                    BTreeMap::new(),
+                    Self::filter_suppressed_inflight_redemptions(
+                        redemptions,
+                        *chain,
+                        &active_suppressed_symbols,
+                    ),
                 ))
             }
             _ => None,
@@ -3182,6 +3228,19 @@ impl RebalancingService {
                     Ok(inventory.clone())
                 }
             }
+
+            ChainInflightRedemptions { chain, .. } => {
+                if let Some((_, redemptions)) = &filtered_inflight {
+                    inventory.clone().apply_inflight_redemptions_at(
+                        *chain,
+                        redemptions,
+                        fetched_at,
+                        now,
+                    )
+                } else {
+                    Ok(inventory.clone())
+                }
+            }
         }?;
 
         *inventory = updated;
@@ -3295,31 +3354,42 @@ impl RebalancingService {
         let recovery_reason = Arc::new(inventory_error);
 
         let now = Utc::now();
-        let mut suppression_guard = if matches!(&event, InflightEquity { .. }) {
+        let mut suppression_guard = if matches!(
+            &event,
+            InflightEquity { .. } | ChainInflightRedemptions { .. }
+        ) {
             Some(self.suppressed_inflight_symbols.write().await)
         } else {
             None
         };
+        let mut active_suppressed_symbols = || {
+            let fetched_at = event.timestamp();
+            suppression_guard
+                .as_mut()
+                .map_or_else(HashSet::new, |suppressed| {
+                    suppressed.retain(|_, cleared_at| *cleared_at >= fetched_at);
+                    suppressed.keys().cloned().collect()
+                })
+        };
         let filtered_inflight = match &event {
             InflightEquity {
+                mints, redemptions, ..
+            } => Some(Self::filter_suppressed_inflight_snapshot(
                 mints,
                 redemptions,
-                fetched_at,
-            } => {
-                let active_suppressed_symbols =
-                    suppression_guard
-                        .as_mut()
-                        .map_or_else(HashSet::new, |suppressed| {
-                            suppressed.retain(|_, cleared_at| *cleared_at >= *fetched_at);
-                            suppressed.keys().cloned().collect()
-                        });
-
-                Some(Self::filter_suppressed_inflight_snapshot(
-                    mints,
+                Chain::Base,
+                &active_suppressed_symbols(),
+            )),
+            ChainInflightRedemptions {
+                chain, redemptions, ..
+            } => Some((
+                BTreeMap::new(),
+                Self::filter_suppressed_inflight_redemptions(
                     redemptions,
-                    &active_suppressed_symbols,
-                ))
-            }
+                    *chain,
+                    &active_suppressed_symbols(),
+                ),
+            )),
             _ => None,
         };
         let mut inventory = self.inventory.write().await;
@@ -3329,8 +3399,18 @@ impl RebalancingService {
         // plain default() here would clear the open-hedge block for every
         // symbol and re-open the double-apply race — and since the force
         // path below skips gated symbols, a wiped gated balance would have
-        // no writer left to restore it.
-        *inventory = inventory.reset_preserving_offchain_order_state();
+        // no writer left to restore it. A provider inflight event also keeps
+        // the inflight the other provider events own, since only it is
+        // reapplied below.
+        *inventory = match &event {
+            InflightEquity { .. } => {
+                inventory.reset_carrying_other_provider_inflight(Chain::Base, now)
+            }
+            ChainInflightRedemptions { chain, .. } => {
+                inventory.reset_carrying_other_provider_inflight(*chain, now)
+            }
+            _ => inventory.reset_preserving_offchain_order_state(),
+        };
 
         let updated = match &event {
             // The reconcile events never reach here at runtime -- the early
@@ -3365,6 +3445,21 @@ impl RebalancingService {
                     inventory
                         .clone()
                         .apply_inflight_snapshot(mints, redemptions, *fetched_at, now)
+                } else {
+                    Ok(inventory.clone())
+                }
+            }
+
+            ChainInflightRedemptions {
+                chain, fetched_at, ..
+            } => {
+                if let Some((_, redemptions)) = &filtered_inflight {
+                    inventory.clone().apply_inflight_redemptions_at(
+                        *chain,
+                        redemptions,
+                        *fetched_at,
+                        now,
+                    )
                 } else {
                     Ok(inventory.clone())
                 }
@@ -3473,7 +3568,8 @@ impl RebalancingService {
             // Inflight snapshots don't trigger rebalancing -- they
             // indicate transfers already in progress, not new balances
             // to rebalance.
-            | InflightEquity { .. } => {}
+            | InflightEquity { .. }
+            | ChainInflightRedemptions { .. } => {}
         }
     }
 
@@ -4062,11 +4158,14 @@ impl PendingRequestOwnership for RebalancingService {
                 .collect(),
             redemption_tokenizations: redemption_tracking
                 .values()
-                .filter_map(|tracking| tracking.tokenization_request_id.clone())
+                .filter_map(|tracking| {
+                    let id = tracking.tokenization_request_id.clone()?;
+                    Some((id, tracking.chain))
+                })
                 .collect(),
             redemption_txs: redemption_tracking
                 .values()
-                .filter_map(|tracking| tracking.redemption_tx)
+                .filter_map(|tracking| Some((tracking.redemption_tx?, tracking.chain)))
                 .collect(),
         }
     }
@@ -4082,9 +4181,15 @@ pub(crate) enum RecoveryRollback {
     /// The rebuild touched no inventory balances (called on a non-failed
     /// aggregate). Rollback only drops the tracking + in-progress guard.
     TrackingOnly,
-    /// Redemption recovery restored a released (zero) in-flight without
-    /// changing available. Rollback clears the chain's in-flight again.
-    ClearRestoredRedemptionInflight { chain: Chain },
+    /// Redemption recovery restores released exposure or claims one seeded
+    /// failure. Rollback removes only the added exposure and restores the seeded identity.
+    RestoreRedemptionInventory {
+        chain: Chain,
+        added: FractionalShares,
+        stranded: Option<crate::equity_redemption::StrandedRedemption>,
+        timed_out_at: Option<DateTime<Utc>>,
+        suppressed_at: Option<DateTime<Utc>>,
+    },
     /// The rebuild moved available -> in-flight via `Start` (an explicitly
     /// failed transfer that had cancelled its in-flight back to available).
     /// Rollback cancels the in-flight back to available.
@@ -4802,7 +4907,7 @@ impl RebalancingService {
                 );
                 *inventory = inventory
                     .clone()
-                    .clear_equity_inflight(symbol, venue, now)?;
+                    .clear_equity_inflight_at(symbol, chain, venue, now)?;
                 EquitySettlementOutcome::DeferredToSnapshot
             }
             Err(error) => return Err(error.into()),
@@ -7782,7 +7887,7 @@ impl RebalancingService {
                     .suppressed_inflight_symbols
                     .read()
                     .await
-                    .get(symbol)
+                    .get(&(symbol.clone(), entity.chain()))
                     .copied();
                 (
                     Box::new(Inventory::set_inflight(Venue::Hedging, quantity)),
@@ -7867,7 +7972,7 @@ impl RebalancingService {
             self.suppressed_inflight_symbols
                 .write()
                 .await
-                .remove(symbol);
+                .remove(&(symbol.clone(), entity.chain()));
         }
 
         self.mint_tracking.write().await.insert(
@@ -7903,7 +8008,7 @@ impl RebalancingService {
     ) -> Result<(), RebalancingServiceError> {
         match rollback {
             RecoveryRollback::TrackingOnly
-            | RecoveryRollback::ClearRestoredRedemptionInflight { .. } => {}
+            | RecoveryRollback::RestoreRedemptionInventory { .. } => {}
             RecoveryRollback::CancelInflight => {
                 self.apply_equity_update(
                     symbol,
@@ -7929,6 +8034,7 @@ impl RebalancingService {
                     id.clone(),
                     TimeoutTombstone {
                         symbol: symbol.clone(),
+                        chain,
                         timed_out_at,
                     },
                 );
@@ -7936,7 +8042,7 @@ impl RebalancingService {
                     self.suppressed_inflight_symbols
                         .write()
                         .await
-                        .insert(symbol.clone(), suppressed_at);
+                        .insert((symbol.clone(), chain), suppressed_at);
                 }
             }
         }
@@ -7991,7 +8097,7 @@ impl RebalancingService {
             self.suppressed_inflight_symbols
                 .read()
                 .await
-                .get(symbol)
+                .get(&(symbol.clone(), entity.chain()))
                 .copied()
         } else {
             None
@@ -8002,7 +8108,7 @@ impl RebalancingService {
         // its first event records an active ID. A stale self-owned redemption
         // already holds that guard and reuses it.
         let recovery_guard;
-        let previous = {
+        let (added, stranded) = {
             let mut inventory = self.inventory.write().await;
             if inventory.active_mint(symbol).is_some()
                 || matches!(inventory.active_redemption(symbol), Some(active) if active != id)
@@ -8051,11 +8157,23 @@ impl RebalancingService {
                     symbol: symbol.clone(),
                     chain: entity.chain(),
                 })?;
-            if timed_out_at.is_some() || previous.is_zero()? {
-                *inventory = inventory.clone().update_equity_at(
+            let mut updated = inventory.clone();
+            let stranded = updated.claim_stranded_redemption(id);
+            let floor = updated.stranded_redemption_quantity(symbol, entity.chain())?;
+            if stranded.is_none()
+                && (timed_out_at.is_some()
+                    || previous.is_zero()?
+                    || (!floor.is_zero()? && !reuses_self_owned_guard))
+            {
+                let restored = if floor.is_zero()? {
+                    quantity
+                } else {
+                    (previous + quantity)?
+                };
+                updated = updated.update_equity_at(
                     symbol,
                     entity.chain(),
-                    Inventory::set_inflight(Venue::MarketMaking, quantity),
+                    Inventory::set_inflight(Venue::MarketMaking, restored),
                     Utc::now(),
                 )?;
             } else if previous.inner().lt(quantity.inner())? {
@@ -8067,29 +8185,28 @@ impl RebalancingService {
                     .into(),
                 );
             }
+            let restored = updated
+                .equity_inflight_at(symbol, Venue::MarketMaking, entity.chain())
+                .unwrap_or(FractionalShares::ZERO);
+            let added = (restored - previous)?;
+            *inventory = updated;
             drop(inventory);
-            previous
+            (added, stranded)
         };
 
-        let rollback = if let Some(timed_out_at) = timed_out_at {
-            // The inventory update succeeded; now consume the timeout markers.
+        if timed_out_at.is_some() {
             self.timed_out_redemptions.write().await.remove(id);
             self.suppressed_inflight_symbols
                 .write()
                 .await
-                .remove(symbol);
-
-            RecoveryRollback::RestoreTombstone {
-                chain: entity.chain(),
-                timed_out_at,
-                suppressed_at,
-            }
-        } else if previous.is_zero()? {
-            RecoveryRollback::ClearRestoredRedemptionInflight {
-                chain: entity.chain(),
-            }
-        } else {
-            RecoveryRollback::TrackingOnly
+                .remove(&(symbol.clone(), entity.chain()));
+        }
+        let rollback = RecoveryRollback::RestoreRedemptionInventory {
+            chain: entity.chain(),
+            added,
+            stranded,
+            timed_out_at,
+            suppressed_at,
         };
 
         self.redemption_tracking.write().await.insert(
@@ -8121,40 +8238,70 @@ impl RebalancingService {
         rollback: RecoveryRollback,
     ) -> Result<(), RebalancingServiceError> {
         match rollback {
-            RecoveryRollback::TrackingOnly | RecoveryRollback::CancelInflight => {}
-            RecoveryRollback::ClearRestoredRedemptionInflight { chain } => {
-                self.apply_equity_update(
-                    symbol,
-                    chain,
-                    Inventory::set_inflight(Venue::MarketMaking, FractionalShares::ZERO),
-                )
-                .await?;
-            }
-            RecoveryRollback::RestoreTombstone {
+            RecoveryRollback::TrackingOnly
+            | RecoveryRollback::CancelInflight
+            | RecoveryRollback::RestoreTombstone { .. } => {}
+            RecoveryRollback::RestoreRedemptionInventory {
                 chain,
+                added,
+                stranded,
                 timed_out_at,
                 suppressed_at,
             } => {
                 let mut inventory = self.inventory.write().await;
-                *inventory = inventory.clone().clear_equity_inflight_at(
-                    symbol,
-                    chain,
-                    Venue::MarketMaking,
-                    Utc::now(),
-                )?;
+                if !added.is_zero()? {
+                    let current = inventory
+                        .equity_inflight_at(symbol, Venue::MarketMaking, chain)
+                        .unwrap_or(FractionalShares::ZERO);
+                    let remaining = if current.inner().lt(added.inner())? {
+                        FractionalShares::ZERO
+                    } else {
+                        (current - added)?
+                    };
+                    let floor = inventory.stranded_redemption_quantity(symbol, chain)?;
+                    let remaining = if remaining.inner().lt(floor.inner())? {
+                        floor
+                    } else {
+                        remaining
+                    };
+                    *inventory = inventory.clone().update_equity_at(
+                        symbol,
+                        chain,
+                        Inventory::set_inflight(Venue::MarketMaking, remaining),
+                        Utc::now(),
+                    )?;
+                }
+                if let Some(stranded) = stranded {
+                    inventory.restore_stranded_redemption_claim(id, stranded);
+                    let floor = inventory.stranded_redemption_quantity(symbol, chain)?;
+                    let current = inventory
+                        .equity_inflight_at(symbol, Venue::MarketMaking, chain)
+                        .unwrap_or(FractionalShares::ZERO);
+                    if current.inner().lt(floor.inner())? {
+                        *inventory = inventory.clone().update_equity_at(
+                            symbol,
+                            chain,
+                            Inventory::set_inflight(Venue::MarketMaking, floor),
+                            Utc::now(),
+                        )?;
+                    }
+                }
                 drop(inventory);
-                self.timed_out_redemptions.write().await.insert(
-                    id.clone(),
-                    TimeoutTombstone {
-                        symbol: symbol.clone(),
-                        timed_out_at,
-                    },
-                );
+                if let Some(timed_out_at) = timed_out_at {
+                    self.timed_out_redemptions.write().await.insert(
+                        id.clone(),
+                        TimeoutTombstone {
+                            symbol: symbol.clone(),
+                            chain,
+                            timed_out_at,
+                        },
+                    );
+                }
                 if let Some(suppressed_at) = suppressed_at {
                     self.suppressed_inflight_symbols
                         .write()
                         .await
-                        .insert(symbol.clone(), suppressed_at);
+                        .insert((symbol.clone(), chain), suppressed_at);
                 }
             }
         }
@@ -8329,7 +8476,7 @@ impl RebalancingService {
             self.suppressed_inflight_symbols
                 .write()
                 .await
-                .remove(&tombstone.symbol);
+                .remove(&(tombstone.symbol.clone(), tombstone.chain));
             warn!(
                 target: "rebalance",
                 id = %id,
@@ -8473,7 +8620,7 @@ impl RebalancingService {
             self.suppressed_inflight_symbols
                 .write()
                 .await
-                .remove(&tombstone.symbol);
+                .remove(&(tombstone.symbol.clone(), tombstone.chain));
             warn!(
                 target: "rebalance",
                 id = %id,
@@ -8515,18 +8662,21 @@ impl RebalancingService {
                     "Redemption unwrapped more than tracked (NAV appreciation); \
                      updating inflight to actual"
                 );
-                // set_inflight replaces rather than adds, so it works even when
-                // available is 0 (full-position NAV redemption). No last_rebalancing
-                // bump needed: redemptions are detection-based -- Alpaca reports the
-                // redemption only after the bot sends the actual unwrapped amount, so
-                // any inflight snapshot reports that same amount and an overwrite is
-                // a no-op.
-                self.apply_equity_update(
+                // Set the slot to the actual quantity plus any older failed
+                // redemption that shares it after startup. Absolute, so a slot
+                // wiped by a recovery reset still releases cleanly on completion.
+                let now = Utc::now();
+                let mut inventory = self.inventory.write().await;
+                let stranded =
+                    inventory.stranded_redemption_quantity(&existing.symbol, existing.chain)?;
+                let inflight = (stranded + actual_quantity)?;
+                *inventory = inventory.clone().update_equity_at(
                     &existing.symbol,
                     existing.chain,
-                    Inventory::set_inflight(Venue::MarketMaking, actual_quantity),
-                )
-                .await?;
+                    Inventory::set_inflight(Venue::MarketMaking, inflight),
+                    now,
+                )?;
+                drop(inventory);
             }
         }
 
@@ -8561,7 +8711,7 @@ impl RebalancingService {
             let mut inventory = self.inventory.write().await;
             *inventory = inventory
                 .clone()
-                .clear_previous_inflight_redemption_marker(&symbol);
+                .clear_previous_inflight_redemption_marker(&symbol, tracking.chain);
         }
 
         self.update_active_redemption(&id, &symbol, tracking.chain, &event)
@@ -8585,8 +8735,8 @@ impl RebalancingService {
                         Venue::MarketMaking,
                         cleared_at,
                     )?
-                    .clear_previous_inflight_redemption_marker(&symbol);
-                suppressed.insert(symbol.clone(), cleared_at);
+                    .clear_previous_inflight_redemption_marker(&symbol, tracking.chain);
+                suppressed.insert((symbol.clone(), tracking.chain), cleared_at);
                 drop(inventory);
                 drop(suppressed);
             }
@@ -9986,9 +10136,9 @@ mod tests {
         assert!(
             ownership
                 .redemption_tokenizations
-                .contains(&tokenization_request_id("TOK-2"))
+                .contains_key(&tokenization_request_id("TOK-2"))
         );
-        assert!(ownership.redemption_txs.contains(&redemption_tx));
+        assert!(ownership.redemption_txs.contains_key(&redemption_tx));
 
         let inflight = {
             let inventory = trigger.inventory.read().await;
@@ -10121,6 +10271,7 @@ mod tests {
             mint_id.clone(),
             TimeoutTombstone {
                 symbol: symbol.clone(),
+                chain: Chain::Base,
                 timed_out_at: Utc::now(),
             },
         );
@@ -10541,6 +10692,7 @@ mod tests {
             redemption_id.clone(),
             TimeoutTombstone {
                 symbol: symbol.clone(),
+                chain: Chain::Base,
                 timed_out_at: Utc::now(),
             },
         );
@@ -10781,6 +10933,7 @@ mod tests {
             recovering.clone(),
             TimeoutTombstone {
                 symbol: symbol.clone(),
+                chain: Chain::Base,
                 timed_out_at: tombstone_at,
             },
         );
@@ -10891,6 +11044,7 @@ mod tests {
             recovering.clone(),
             TimeoutTombstone {
                 symbol: symbol.clone(),
+                chain: Chain::Base,
                 timed_out_at: tombstone_at,
             },
         );
@@ -10960,6 +11114,7 @@ mod tests {
             recovering.clone(),
             TimeoutTombstone {
                 symbol: symbol.clone(),
+                chain: Chain::Base,
                 timed_out_at: tombstone_at,
             },
         );
@@ -11128,6 +11283,7 @@ mod tests {
             recovering.clone(),
             TimeoutTombstone {
                 symbol: symbol.clone(),
+                chain: Chain::Base,
                 timed_out_at: tombstone_at,
             },
         );
@@ -11289,6 +11445,7 @@ mod tests {
             mint_id.clone(),
             TimeoutTombstone {
                 symbol: symbol.clone(),
+                chain: Chain::Base,
                 timed_out_at: tombstone_at,
             },
         );
@@ -11296,7 +11453,7 @@ mod tests {
             .suppressed_inflight_symbols
             .write()
             .await
-            .insert(symbol.clone(), tombstone_at);
+            .insert((symbol.clone(), Chain::Base), tombstone_at);
 
         let failed = TokenizedEquityMint::Failed {
             chain: Chain::Base,
@@ -11351,7 +11508,7 @@ mod tests {
                 .suppressed_inflight_symbols
                 .read()
                 .await
-                .contains_key(&symbol)
+                .contains_key(&(symbol.clone(), Chain::Base))
         );
         let inventory = trigger.inventory.read().await;
         assert_eq!(
@@ -11387,6 +11544,7 @@ mod tests {
             redemption_id.clone(),
             TimeoutTombstone {
                 symbol: symbol.clone(),
+                chain: Chain::Base,
                 timed_out_at: tombstone_at,
             },
         );
@@ -11394,7 +11552,7 @@ mod tests {
             .suppressed_inflight_symbols
             .write()
             .await
-            .insert(symbol.clone(), tombstone_at);
+            .insert((symbol.clone(), Chain::Base), tombstone_at);
 
         let failed = EquityRedemption::Failed {
             chain: Chain::Base,
@@ -11495,6 +11653,7 @@ mod tests {
             redemption_id.clone(),
             TimeoutTombstone {
                 symbol: symbol.clone(),
+                chain: Chain::Base,
                 timed_out_at: tombstone_at,
             },
         );
@@ -11502,7 +11661,7 @@ mod tests {
             .suppressed_inflight_symbols
             .write()
             .await
-            .insert(symbol.clone(), tombstone_at);
+            .insert((symbol.clone(), Chain::Base), tombstone_at);
 
         let failed = EquityRedemption::Failed {
             chain: Chain::Ethereum,
@@ -11589,6 +11748,7 @@ mod tests {
             redemption_id.clone(),
             TimeoutTombstone {
                 symbol: symbol.clone(),
+                chain: Chain::Base,
                 timed_out_at: tombstone_at,
             },
         );
@@ -11596,7 +11756,7 @@ mod tests {
             .suppressed_inflight_symbols
             .write()
             .await
-            .insert(symbol.clone(), tombstone_at);
+            .insert((symbol.clone(), Chain::Base), tombstone_at);
 
         let failed = EquityRedemption::Failed {
             chain: Chain::HyperEvm,
@@ -11674,7 +11834,7 @@ mod tests {
                 .suppressed_inflight_symbols
                 .read()
                 .await
-                .get(&symbol),
+                .get(&(symbol.clone(), Chain::Base)),
             Some(&tombstone_at)
         );
         assert!(
@@ -12158,7 +12318,7 @@ mod tests {
             .unwrap();
 
         let ownership = trigger.pending_request_ownership().await;
-        assert!(ownership.redemption_txs.contains(&redemption_tx));
+        assert!(ownership.redemption_txs.contains_key(&redemption_tx));
 
         trigger
             .on_redemption(
@@ -12176,9 +12336,9 @@ mod tests {
         assert!(
             ownership
                 .redemption_tokenizations
-                .contains(&tokenization_request_id)
+                .contains_key(&tokenization_request_id)
         );
-        assert!(ownership.redemption_txs.contains(&redemption_tx));
+        assert!(ownership.redemption_txs.contains_key(&redemption_tx));
 
         trigger
             .on_redemption(
@@ -12194,9 +12354,9 @@ mod tests {
         assert!(
             !ownership
                 .redemption_tokenizations
-                .contains(&tokenization_request_id)
+                .contains_key(&tokenization_request_id)
         );
-        assert!(!ownership.redemption_txs.contains(&redemption_tx));
+        assert!(!ownership.redemption_txs.contains_key(&redemption_tx));
     }
 
     #[tokio::test]
@@ -12264,11 +12424,11 @@ mod tests {
                 .unwrap();
 
             let ownership = trigger.pending_request_ownership().await;
-            assert!(ownership.redemption_txs.contains(&redemption_tx));
+            assert!(ownership.redemption_txs.contains_key(&redemption_tx));
             assert!(
                 ownership
                     .redemption_tokenizations
-                    .contains(&tokenization_request_id)
+                    .contains_key(&tokenization_request_id)
             );
 
             trigger
@@ -12278,13 +12438,13 @@ mod tests {
 
             let ownership = trigger.pending_request_ownership().await;
             assert!(
-                !ownership.redemption_txs.contains(&redemption_tx),
+                !ownership.redemption_txs.contains_key(&redemption_tx),
                 "redemption_tx must drop after terminal event {terminal_event:?}"
             );
             assert!(
                 !ownership
                     .redemption_tokenizations
-                    .contains(&tokenization_request_id),
+                    .contains_key(&tokenization_request_id),
                 "redemption tokenization id must drop after terminal event {terminal_event:?}"
             );
         }
@@ -20332,6 +20492,518 @@ mod tests {
         assert!(!RebalancingService::is_terminal_redemption_event(
             &make_redemption_detected()
         ));
+    }
+
+    async fn trigger_with_stranded_and_active_redemptions() -> (
+        Arc<RebalancingService>,
+        Symbol,
+        RedemptionAggregateId,
+        RedemptionAggregateId,
+    ) {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let stranded = redemption_aggregate_id("startup-stranded");
+        let active = redemption_aggregate_id("restored-active");
+        let now = Utc::now();
+        let inventory = InventoryView::default()
+            .with_equity(symbol.clone(), shares(50), shares(50))
+            .update_equity_at(
+                &symbol,
+                Chain::Base,
+                Inventory::set_inflight(Venue::MarketMaking, shares(3)),
+                now,
+            )
+            .unwrap()
+            .update_equity_at(
+                &symbol,
+                Chain::HyperEvm,
+                Inventory::available(Venue::MarketMaking, Operator::Add, shares(45)),
+                now,
+            )
+            .unwrap()
+            .update_equity_at(
+                &symbol,
+                Chain::HyperEvm,
+                Inventory::set_inflight(Venue::MarketMaking, shares(5)),
+                now,
+            )
+            .unwrap()
+            .seed_stranded_redemption(&stranded, &symbol, Chain::HyperEvm, shares(7), now)
+            .unwrap()
+            .set_active_redemption(symbol.clone(), Chain::HyperEvm, active.clone());
+        let trigger = make_trigger_with_inventory(inventory).await;
+        trigger.redemption_tracking.write().await.insert(
+            active.clone(),
+            RedemptionTracking {
+                symbol: symbol.clone(),
+                chain: Chain::HyperEvm,
+                quantity: shares(5),
+                tokenization_request_id: Some(tokenization_request_id("restored-provider")),
+                redemption_tx: Some(TxHash::random()),
+                stage: RedemptionTrackingStage::UnwrapPending,
+                last_progress_at: now - ChronoDuration::hours(24),
+            },
+        );
+        trigger.mark_equity_active_transfer(&symbol, Chain::HyperEvm, || {
+            equity::GUARD_GENERATION.next()
+        });
+        (trigger, symbol, stranded, active)
+    }
+
+    #[tokio::test]
+    async fn restored_active_redemption_nav_and_completion_preserve_stranded_exposure() {
+        let (trigger, symbol, _, active) = trigger_with_stranded_and_active_redemptions().await;
+        trigger
+            .on_redemption(
+                active.clone(),
+                EquityRedemptionEvent::TokensUnwrapped {
+                    quantity: Some(float!(6)),
+                    underlying_token: UnwrappedProvenance::Attested {
+                        attested: UnwrappedToken::unchecked(Address::random()),
+                    },
+                    unwrap_tx_hash: TxHash::random(),
+                    unwrapped_amount: U256::from(6_000_000_000_000_000_000_u128),
+                    unwrap_block: None,
+                    unwrapped_at: Utc::now(),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            trigger.inventory.read().await.equity_inflight_at(
+                &symbol,
+                Venue::MarketMaking,
+                Chain::HyperEvm
+            ),
+            Some(shares(13))
+        );
+        {
+            let mut view = trigger.inventory.write().await;
+            *view = view
+                .clone()
+                .apply_inflight_redemptions_at(
+                    Chain::HyperEvm,
+                    &BTreeMap::from([(symbol.clone(), shares(6))]),
+                    Utc::now(),
+                    Utc::now(),
+                )
+                .unwrap()
+                .apply_inflight_redemptions_at(
+                    Chain::HyperEvm,
+                    &BTreeMap::new(),
+                    Utc::now(),
+                    Utc::now(),
+                )
+                .unwrap();
+            assert_eq!(
+                view.equity_inflight_at(&symbol, Venue::MarketMaking, Chain::HyperEvm),
+                Some(shares(13))
+            );
+            drop(view);
+        }
+        trigger
+            .on_redemption(active, make_redemption_completed())
+            .await
+            .unwrap();
+        let view = trigger.inventory.read().await;
+        assert_eq!(
+            view.equity_inflight_at(&symbol, Venue::MarketMaking, Chain::HyperEvm),
+            Some(shares(7))
+        );
+        assert_eq!(
+            view.equity_available(&symbol, Venue::Hedging),
+            Some(shares(56))
+        );
+        assert_eq!(
+            view.equity_inflight_at(&symbol, Venue::MarketMaking, Chain::Base),
+            Some(shares(3))
+        );
+        drop(view);
+    }
+
+    #[tokio::test]
+    async fn nav_surplus_after_reset_wiped_the_active_slot_restores_absolute_inflight() {
+        let (trigger, symbol, _, active) = trigger_with_stranded_and_active_redemptions().await;
+        {
+            let mut view = trigger.inventory.write().await;
+            *view = view
+                .clone()
+                .update_equity_at(
+                    &symbol,
+                    Chain::HyperEvm,
+                    Inventory::set_inflight(Venue::MarketMaking, shares(7)),
+                    Utc::now(),
+                )
+                .unwrap();
+            drop(view);
+        }
+        trigger
+            .on_redemption(
+                active.clone(),
+                EquityRedemptionEvent::TokensUnwrapped {
+                    quantity: Some(float!(6)),
+                    underlying_token: UnwrappedProvenance::Attested {
+                        attested: UnwrappedToken::unchecked(Address::random()),
+                    },
+                    unwrap_tx_hash: TxHash::random(),
+                    unwrapped_amount: U256::from(6_000_000_000_000_000_000_u128),
+                    unwrap_block: None,
+                    unwrapped_at: Utc::now(),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            trigger.inventory.read().await.equity_inflight_at(
+                &symbol,
+                Venue::MarketMaking,
+                Chain::HyperEvm
+            ),
+            Some(shares(13))
+        );
+
+        trigger
+            .on_redemption(active, make_redemption_completed())
+            .await
+            .unwrap();
+        let view = trigger.inventory.read().await;
+        assert_eq!(
+            view.equity_inflight_at(&symbol, Venue::MarketMaking, Chain::HyperEvm),
+            Some(shares(7))
+        );
+        assert_eq!(
+            view.equity_available(&symbol, Venue::Hedging),
+            Some(shares(56))
+        );
+        drop(view);
+    }
+
+    #[tokio::test]
+    async fn restored_active_redemption_failures_preserve_stranded_exposure() {
+        for failure in [make_detection_failed(), make_redemption_rejected()] {
+            let (trigger, symbol, _, active) = trigger_with_stranded_and_active_redemptions().await;
+            trigger.on_redemption(active, failure).await.unwrap();
+            let view = trigger.inventory.read().await;
+            assert_eq!(
+                view.equity_inflight_at(&symbol, Venue::MarketMaking, Chain::HyperEvm),
+                Some(shares(7))
+            );
+            assert_eq!(
+                view.stranded_redemption_quantity(&symbol, Chain::HyperEvm)
+                    .unwrap(),
+                shares(7)
+            );
+            assert_eq!(
+                view.equity_inflight_at(&symbol, Venue::MarketMaking, Chain::Base),
+                Some(shares(3))
+            );
+            drop(view);
+        }
+    }
+
+    #[tokio::test]
+    async fn restored_active_redemption_underflow_preserves_stranded_exposure() {
+        let (trigger, symbol, _, active) = trigger_with_stranded_and_active_redemptions().await;
+        {
+            let mut view = trigger.inventory.write().await;
+            *view = view
+                .clone()
+                .update_equity_at(
+                    &symbol,
+                    Chain::HyperEvm,
+                    Inventory::set_inflight(Venue::MarketMaking, shares(8)),
+                    Utc::now(),
+                )
+                .unwrap();
+            drop(view);
+        }
+        trigger
+            .on_redemption(active, make_redemption_completed())
+            .await
+            .unwrap();
+        let view = trigger.inventory.read().await;
+        assert_eq!(
+            view.equity_inflight_at(&symbol, Venue::MarketMaking, Chain::HyperEvm),
+            Some(shares(7))
+        );
+        assert_eq!(
+            view.equity_inflight_at(&symbol, Venue::MarketMaking, Chain::Base),
+            Some(shares(3))
+        );
+        assert_eq!(
+            view.stranded_redemption_quantity(&symbol, Chain::HyperEvm)
+                .unwrap(),
+            shares(7)
+        );
+        drop(view);
+        assert!(
+            trigger
+                .divergence_gate
+                .has_pending_onchain_equity_reconcile(Chain::HyperEvm)
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_response_after_underflow_keeps_stranded_inflight_and_clears_gate() {
+        let (trigger, symbol, _, active) = trigger_with_stranded_and_active_redemptions().await;
+        {
+            let mut view = trigger.inventory.write().await;
+            *view = view
+                .clone()
+                .update_equity_at(
+                    &symbol,
+                    Chain::HyperEvm,
+                    Inventory::set_inflight(Venue::MarketMaking, shares(8)),
+                    Utc::now(),
+                )
+                .unwrap();
+            drop(view);
+        }
+        trigger
+            .on_redemption(active, make_redemption_completed())
+            .await
+            .unwrap();
+        let generations = trigger
+            .divergence_gate
+            .claim_pending_onchain_equity_reconciles(Chain::HyperEvm);
+        assert!(generations.contains_key(&symbol));
+
+        trigger
+            .on_snapshot(InventorySnapshotEvent::OnchainEquityReconciled {
+                chain: Chain::HyperEvm,
+                balances: BTreeMap::from([(symbol.clone(), shares(40))]),
+                fetched_at: Utc::now(),
+                block_number: None,
+                generations,
+            })
+            .await
+            .unwrap();
+
+        let view = trigger.inventory.read().await;
+        assert_eq!(
+            view.equity_inflight_at(&symbol, Venue::MarketMaking, Chain::HyperEvm),
+            Some(shares(7))
+        );
+        assert_eq!(
+            view.onchain_equity_available_at(&symbol, Chain::HyperEvm),
+            Some(shares(40))
+        );
+        drop(view);
+        assert!(
+            !trigger
+                .divergence_gate
+                .has_pending_onchain_equity_reconcile(Chain::HyperEvm)
+        );
+
+        // Leave the stranded exposure as the symbol's only inflight.
+        {
+            let mut view = trigger.inventory.write().await;
+            *view = view
+                .clone()
+                .update_equity_at(
+                    &symbol,
+                    Chain::Base,
+                    Inventory::set_inflight(Venue::MarketMaking, FractionalShares::ZERO),
+                    Utc::now(),
+                )
+                .unwrap();
+            drop(view);
+        }
+        let (_, generation) = trigger
+            .divergence_gate
+            .claim_pending_offchain_equity_reconciles()
+            .into_iter()
+            .find(|(pending, _)| pending == &symbol)
+            .unwrap();
+        trigger
+            .on_snapshot(InventorySnapshotEvent::OffchainEquityReconciled {
+                symbol: symbol.clone(),
+                position: shares(55),
+                fetched_at: Utc::now(),
+                ledger_position: Some(shares(50)),
+                consecutive_polls: 0,
+                generation: Some(generation),
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            trigger
+                .inventory
+                .read()
+                .await
+                .equity_available(&symbol, Venue::Hedging),
+            Some(shares(55)),
+            "stranded exposure must not keep the broker reconcile busy"
+        );
+        assert!(!trigger.divergence_gate.is_engaged(&symbol));
+    }
+
+    #[tokio::test]
+    async fn restored_active_redemption_timeout_preserves_stranded_exposure() {
+        let (trigger, symbol, _, active) = trigger_with_stranded_and_active_redemptions().await;
+        let cleanup = trigger
+            .cleanup_timed_out_redemption(&active, Utc::now())
+            .await
+            .unwrap();
+        assert!(matches!(
+            cleanup,
+            Some(RedemptionTimeoutCleanup::TimedOut { .. })
+        ));
+        let view = trigger.inventory.read().await;
+        assert_eq!(
+            view.equity_inflight_at(&symbol, Venue::MarketMaking, Chain::HyperEvm),
+            Some(shares(7))
+        );
+        assert_eq!(
+            view.stranded_redemption_quantity(&symbol, Chain::HyperEvm)
+                .unwrap(),
+            shares(7)
+        );
+        assert_eq!(
+            view.equity_inflight_at(&symbol, Venue::MarketMaking, Chain::Base),
+            Some(shares(3))
+        );
+        drop(view);
+    }
+
+    #[tokio::test]
+    async fn stranded_redemption_recovery_claim_rollback_and_completion_preserve_ownership() {
+        let (trigger, symbol, stranded, active) =
+            trigger_with_stranded_and_active_redemptions().await;
+        trigger
+            .on_redemption(active, make_redemption_completed())
+            .await
+            .unwrap();
+        let failed = EquityRedemption::Failed {
+            chain: Chain::HyperEvm,
+            symbol: symbol.clone(),
+            quantity: float!(7),
+            raindex_withdraw_tx: None,
+            redemption_tx: Some(TxHash::random()),
+            tokenization_request_id: Some(tokenization_request_id("old-stranded-provider")),
+            reason: Some("rejected".to_string()),
+            started_at: Utc::now(),
+            failed_at: Utc::now(),
+        };
+        let claim = trigger
+            .rebuild_redemption_tracking_for_recovery(&stranded, &failed)
+            .await
+            .unwrap();
+        let RecoveryClaim::Guarded { rollback, guard } = claim else {
+            panic!("recovery must carry its guard")
+        };
+        assert_eq!(
+            trigger
+                .inventory
+                .read()
+                .await
+                .stranded_redemption_quantity(&symbol, Chain::HyperEvm)
+                .unwrap(),
+            shares(0)
+        );
+        trigger
+            .rollback_redemption_tracking_for_recovery(&stranded, &symbol, rollback)
+            .await
+            .unwrap();
+        drop(guard);
+        assert_eq!(
+            trigger
+                .inventory
+                .read()
+                .await
+                .stranded_redemption_quantity(&symbol, Chain::HyperEvm)
+                .unwrap(),
+            shares(7)
+        );
+        let claim = trigger
+            .rebuild_redemption_tracking_for_recovery(&stranded, &failed)
+            .await
+            .unwrap();
+        trigger
+            .on_redemption(
+                stranded,
+                EquityRedemptionEvent::ProviderCompletionRecovered {
+                    tokenization_request_id: tokenization_request_id("old-stranded-provider"),
+                    recovered_at: Utc::now(),
+                },
+            )
+            .await
+            .unwrap();
+        drop(claim);
+        let view = trigger.inventory.read().await;
+        assert_eq!(
+            view.equity_inflight_at(&symbol, Venue::MarketMaking, Chain::HyperEvm),
+            Some(shares(0))
+        );
+        assert_eq!(
+            view.stranded_redemption_quantity(&symbol, Chain::HyperEvm)
+                .unwrap(),
+            shares(0)
+        );
+        assert_eq!(
+            view.equity_available(&symbol, Venue::Hedging),
+            Some(shares(62))
+        );
+        drop(view);
+    }
+
+    #[tokio::test]
+    async fn later_failed_redemption_recovery_does_not_claim_older_stranded_exposure() {
+        let (trigger, symbol, _, active) = trigger_with_stranded_and_active_redemptions().await;
+        trigger
+            .on_redemption(active.clone(), make_redemption_rejected())
+            .await
+            .unwrap();
+        let failed = EquityRedemption::Failed {
+            chain: Chain::HyperEvm,
+            symbol: symbol.clone(),
+            quantity: float!(5),
+            raindex_withdraw_tx: None,
+            redemption_tx: Some(TxHash::random()),
+            tokenization_request_id: Some(tokenization_request_id("later-failed-provider")),
+            reason: Some("rejected".to_string()),
+            started_at: Utc::now(),
+            failed_at: Utc::now(),
+        };
+        let claim = trigger
+            .rebuild_redemption_tracking_for_recovery(&active, &failed)
+            .await
+            .unwrap();
+        {
+            let view = trigger.inventory.read().await;
+            assert_eq!(
+                view.equity_inflight_at(&symbol, Venue::MarketMaking, Chain::HyperEvm),
+                Some(shares(12))
+            );
+            assert_eq!(
+                view.stranded_redemption_quantity(&symbol, Chain::HyperEvm)
+                    .unwrap(),
+                shares(7)
+            );
+            drop(view);
+        }
+        trigger
+            .on_redemption(
+                active,
+                EquityRedemptionEvent::ProviderCompletionRecovered {
+                    tokenization_request_id: tokenization_request_id("later-failed-provider"),
+                    recovered_at: Utc::now(),
+                },
+            )
+            .await
+            .unwrap();
+        drop(claim);
+        let view = trigger.inventory.read().await;
+        assert_eq!(
+            view.equity_inflight_at(&symbol, Venue::MarketMaking, Chain::HyperEvm),
+            Some(shares(7))
+        );
+        assert_eq!(
+            view.stranded_redemption_quantity(&symbol, Chain::HyperEvm)
+                .unwrap(),
+            shares(7)
+        );
+        drop(view);
     }
 
     #[tokio::test]
@@ -30795,6 +31467,7 @@ mod tests {
                 mints,
                 redemptions: BTreeMap::new(),
                 fetched_at: Utc::now(),
+                base_redemptions_chain_scoped: true,
             },
         )
         .await
@@ -30875,6 +31548,7 @@ mod tests {
                 mints: BTreeMap::new(),
                 redemptions: BTreeMap::new(),
                 fetched_at: Utc::now(),
+                base_redemptions_chain_scoped: true,
             },
         )
         .await
@@ -30951,6 +31625,7 @@ mod tests {
             mints: BTreeMap::new(),
             redemptions: BTreeMap::from([(symbol.clone(), shares(10))]),
             fetched_at: Utc::now(),
+            base_redemptions_chain_scoped: true,
         };
         trigger.on_snapshot(pending.clone()).await.unwrap();
 
@@ -30972,6 +31647,7 @@ mod tests {
                 mints: BTreeMap::new(),
                 redemptions: BTreeMap::new(),
                 fetched_at: Utc::now(),
+                base_redemptions_chain_scoped: true,
             },
         )
         .await
@@ -31017,6 +31693,7 @@ mod tests {
             mints: BTreeMap::new(),
             redemptions: BTreeMap::from([(symbol.clone(), shares(10))]),
             fetched_at: Utc::now(),
+            base_redemptions_chain_scoped: true,
         };
         reactor.on_snapshot(pending.clone()).await.unwrap();
         reactor
@@ -31059,6 +31736,7 @@ mod tests {
             mints: BTreeMap::new(),
             redemptions: BTreeMap::from([(symbol.clone(), shares(10))]),
             fetched_at: Utc::now(),
+            base_redemptions_chain_scoped: true,
         };
         let inventory_guard = reactor.inventory.write().await;
         let recovering = reactor.clone();
@@ -31200,6 +31878,7 @@ mod tests {
                 mints: BTreeMap::new(),
                 redemptions: BTreeMap::new(),
                 fetched_at: Utc::now(),
+                base_redemptions_chain_scoped: true,
             },
         )
         .await
@@ -31275,6 +31954,7 @@ mod tests {
                 mints: BTreeMap::new(),
                 redemptions: BTreeMap::new(),
                 fetched_at: Utc::now(),
+                base_redemptions_chain_scoped: true,
             },
         )
         .await
@@ -31352,6 +32032,7 @@ mod tests {
                 mints: BTreeMap::new(),
                 redemptions: BTreeMap::new(),
                 fetched_at: Utc::now(),
+                base_redemptions_chain_scoped: true,
             },
         )
         .await
@@ -31508,6 +32189,7 @@ mod tests {
                 mints: mints.clone(),
                 redemptions: BTreeMap::new(),
                 fetched_at: Utc::now(),
+                base_redemptions_chain_scoped: true,
             },
         )
         .await
@@ -31521,6 +32203,7 @@ mod tests {
                 mints,
                 redemptions: BTreeMap::new(),
                 fetched_at: Utc::now(),
+                base_redemptions_chain_scoped: true,
             },
         )
         .await
@@ -31536,6 +32219,72 @@ mod tests {
             0,
             "Inflight still present should not trigger recheck"
         );
+    }
+
+    #[tokio::test]
+    async fn chain_inflight_reactor_suppresses_only_the_redemptions_chain() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let fetched_at = Utc::now();
+        for suppressed_chain in [Chain::Base, Chain::Robinhood] {
+            let inventory = InventoryView::default()
+                .with_equity(symbol.clone(), shares(50), shares(50))
+                .update_equity_at(
+                    &symbol,
+                    Chain::Robinhood,
+                    Inventory::available(Venue::MarketMaking, Operator::Add, shares(50)),
+                    fetched_at,
+                )
+                .unwrap();
+            let reactor = make_trigger_with_inventory_and_registry(inventory, &symbol).await;
+            reactor.suppressed_inflight_symbols.write().await.insert(
+                (symbol.clone(), suppressed_chain),
+                fetched_at + chrono::Duration::seconds(1),
+            );
+            apply_and_dispatch_snapshot(
+                reactor.clone(),
+                InventorySnapshotId {
+                    orderbook: TEST_ORDERBOOK,
+                    owner: TEST_ORDER_OWNER,
+                },
+                InventorySnapshotEvent::ChainInflightRedemptions {
+                    chain: Chain::Robinhood,
+                    redemptions: BTreeMap::from([(symbol.clone(), shares(7))]),
+                    fetched_at,
+                },
+            )
+            .await
+            .unwrap();
+            let expected = if suppressed_chain == Chain::Robinhood {
+                FractionalShares::ZERO
+            } else {
+                shares(7)
+            };
+            let view = reactor.inventory.read().await;
+            assert_eq!(
+                view.equity_inflight_at(&symbol, Venue::MarketMaking, Chain::Robinhood),
+                Some(expected)
+            );
+            assert_eq!(
+                view.equity_inflight_at(&symbol, Venue::MarketMaking, Chain::Base),
+                Some(FractionalShares::ZERO)
+            );
+            drop(view);
+        }
+    }
+
+    #[test]
+    fn secondary_suppression_filters_shared_mints_but_keeps_base_redemptions() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let pending = BTreeMap::from([(symbol.clone(), shares(7))]);
+        let suppressed = HashSet::from([(symbol, Chain::Robinhood)]);
+        let (mints, redemptions) = RebalancingService::filter_suppressed_inflight_snapshot(
+            &pending,
+            &pending,
+            Chain::Base,
+            &suppressed,
+        );
+        assert!(mints.is_empty());
+        assert_eq!(redemptions, pending);
     }
 
     #[tokio::test]
@@ -31615,6 +32364,7 @@ mod tests {
                 mints: stale_mints,
                 redemptions: BTreeMap::new(),
                 fetched_at: Utc::now(),
+                base_redemptions_chain_scoped: true,
             },
         )
         .await
@@ -31713,6 +32463,7 @@ mod tests {
                 mints: BTreeMap::new(),
                 redemptions: stale_redemptions,
                 fetched_at: Utc::now(),
+                base_redemptions_chain_scoped: true,
             },
         )
         .await
@@ -31843,6 +32594,7 @@ mod tests {
                     mints: BTreeMap::new(),
                     redemptions,
                     fetched_at: stale_snapshot_time,
+                    base_redemptions_chain_scoped: true,
                 },
             ),
         )
@@ -31878,6 +32630,7 @@ mod tests {
                     mints: BTreeMap::new(),
                     redemptions: newer_redemptions,
                     fetched_at: newer_snapshot_time,
+                    base_redemptions_chain_scoped: true,
                 },
             ),
         )
@@ -31897,7 +32650,7 @@ mod tests {
                 .suppressed_inflight_symbols
                 .read()
                 .await
-                .contains_key(&symbol),
+                .contains_key(&(symbol.clone(), Chain::Base)),
             "a newer inflight snapshot should retire suppression for the symbol"
         );
     }
@@ -31977,6 +32730,7 @@ mod tests {
                     mints: BTreeMap::new(),
                     redemptions: stale_redemptions,
                     fetched_at: cleared_at,
+                    base_redemptions_chain_scoped: true,
                 },
             ),
         )
@@ -31997,7 +32751,7 @@ mod tests {
                 .suppressed_inflight_symbols
                 .read()
                 .await
-                .contains_key(&symbol),
+                .contains_key(&(symbol.clone(), Chain::Base)),
             "suppression should remain active until a newer inflight poll arrives"
         );
     }
@@ -32045,11 +32799,11 @@ mod tests {
 
         // Before timeout the redemption is owned, so a poll would count it.
         let ownership = trigger.pending_request_ownership().await;
-        assert!(ownership.redemption_txs.contains(&redemption_tx));
+        assert!(ownership.redemption_txs.contains_key(&redemption_tx));
         assert!(
             ownership
                 .redemption_tokenizations
-                .contains(&tokenization_request_id)
+                .contains_key(&tokenization_request_id)
         );
 
         trigger.expire_stuck_operations(Utc::now()).await.unwrap();
@@ -32057,11 +32811,11 @@ mod tests {
         // After timeout it is no longer owned: a provider poll that STILL lists
         // this request treats it as external and does not re-introduce inflight.
         let ownership = trigger.pending_request_ownership().await;
-        assert!(!ownership.redemption_txs.contains(&redemption_tx));
+        assert!(!ownership.redemption_txs.contains_key(&redemption_tx));
         assert!(
             !ownership
                 .redemption_tokenizations
-                .contains(&tokenization_request_id)
+                .contains_key(&tokenization_request_id)
         );
 
         assert_eq!(
@@ -32190,7 +32944,7 @@ mod tests {
                 .suppressed_inflight_symbols
                 .read()
                 .await
-                .contains_key(&symbol),
+                .contains_key(&(symbol.clone(), Chain::Base)),
             "inflight suppression should already exist after cleanup"
         );
 
@@ -32289,6 +33043,7 @@ mod tests {
             id.clone(),
             TimeoutTombstone {
                 symbol: symbol.clone(),
+                chain: Chain::Base,
                 timed_out_at: Utc::now(),
             },
         );
@@ -32360,7 +33115,7 @@ mod tests {
                 .suppressed_inflight_symbols
                 .read()
                 .await
-                .contains_key(&symbol),
+                .contains_key(&(symbol.clone(), Chain::Base)),
             "inflight suppression should already exist after cleanup"
         );
 
@@ -32546,6 +33301,7 @@ mod tests {
             id.clone(),
             TimeoutTombstone {
                 symbol: symbol.clone(),
+                chain: Chain::Base,
                 timed_out_at: Utc::now(),
             },
         );
@@ -32753,7 +33509,7 @@ mod tests {
             .suppressed_inflight_symbols
             .write()
             .await
-            .insert(symbol.clone(), cleared_at);
+            .insert((symbol.clone(), Chain::Base), cleared_at);
 
         trigger
             .on_snapshot_recovery(
@@ -32766,6 +33522,7 @@ mod tests {
                     mints: BTreeMap::new(),
                     redemptions: BTreeMap::from([(symbol.clone(), shares(10))]),
                     fetched_at: cleared_at,
+                    base_redemptions_chain_scoped: true,
                 },
             )
             .await
@@ -32784,8 +33541,202 @@ mod tests {
                 .suppressed_inflight_symbols
                 .read()
                 .await
-                .contains_key(&symbol),
+                .contains_key(&(symbol.clone(), Chain::Base)),
             "stale recovery snapshots should keep suppression active"
+        );
+    }
+
+    #[tokio::test]
+    async fn redemption_recovery_rollback_preserves_a_concurrent_provider_clear() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        for (added, current, stranded, expected) in
+            [(0, 0, None, 0), (3, 6, None, 3), (0, 0, Some(7), 7)]
+        {
+            let inventory = InventoryView::default()
+                .with_equity(symbol.clone(), shares(50), shares(50))
+                .update_equity_at(
+                    &symbol,
+                    Chain::Base,
+                    Inventory::set_inflight(Venue::MarketMaking, shares(current)),
+                    Utc::now(),
+                )
+                .unwrap();
+            let trigger = make_trigger_with_inventory_and_registry(inventory, &symbol).await;
+            trigger
+                .rollback_redemption_tracking_for_recovery(
+                    &RedemptionAggregateId::generate(),
+                    &symbol,
+                    RecoveryRollback::RestoreRedemptionInventory {
+                        chain: Chain::Base,
+                        added: shares(added),
+                        stranded: stranded.map(|quantity| {
+                            crate::equity_redemption::StrandedRedemption {
+                                symbol: symbol.clone(),
+                                chain: Chain::Base,
+                                quantity: shares(quantity),
+                            }
+                        }),
+                        timed_out_at: None,
+                        suppressed_at: None,
+                    },
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                trigger.inventory.read().await.equity_inflight_at(
+                    &symbol,
+                    Venue::MarketMaking,
+                    Chain::Base,
+                ),
+                Some(shares(expected)),
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn redemption_recovery_rollback_preserves_an_unrelated_stranded_floor() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let mut inventory = InventoryView::default()
+            .with_equity(symbol.clone(), shares(50), shares(50))
+            .update_equity_at(
+                &symbol,
+                Chain::Base,
+                Inventory::set_inflight(Venue::MarketMaking, shares(7)),
+                Utc::now(),
+            )
+            .unwrap();
+        inventory.restore_stranded_redemption_claim(
+            &RedemptionAggregateId::generate(),
+            crate::equity_redemption::StrandedRedemption {
+                symbol: symbol.clone(),
+                chain: Chain::Base,
+                quantity: shares(7),
+            },
+        );
+        let trigger = make_trigger_with_inventory_and_registry(inventory, &symbol).await;
+        trigger
+            .rollback_redemption_tracking_for_recovery(
+                &RedemptionAggregateId::generate(),
+                &symbol,
+                RecoveryRollback::RestoreRedemptionInventory {
+                    chain: Chain::Base,
+                    added: shares(5),
+                    stranded: None,
+                    timed_out_at: None,
+                    suppressed_at: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            trigger.inventory.read().await.equity_inflight_at(
+                &symbol,
+                Venue::MarketMaking,
+                Chain::Base,
+            ),
+            Some(shares(7)),
+        );
+    }
+
+    #[tokio::test]
+    async fn inflight_recovery_keeps_the_other_provider_events_inflight() {
+        let aapl = Symbol::new("AAPL").unwrap();
+        let tsla = Symbol::new("TSLA").unwrap();
+        let now = Utc::now();
+        let inventory = InventoryView::default()
+            .with_equity(aapl.clone(), shares(50), shares(50))
+            .with_equity(tsla.clone(), shares(50), shares(50))
+            .apply_inflight_snapshot(
+                &BTreeMap::from([(aapl.clone(), shares(2))]),
+                &BTreeMap::from([(tsla.clone(), shares(3))]),
+                now,
+                now,
+            )
+            .unwrap()
+            .apply_inflight_redemptions_at(
+                Chain::Robinhood,
+                &BTreeMap::from([(aapl.clone(), shares(7))]),
+                now,
+                now,
+            )
+            .unwrap();
+        let trigger = make_trigger_with_inventory_and_registry(inventory, &aapl).await;
+        let recovery_error = || {
+            RebalancingServiceError::Inventory(InventoryViewError::Equity(
+                InventoryError::NegativeInflight {
+                    value: FractionalShares::new(float!(-1)),
+                },
+            ))
+        };
+        let assert_all_inflight = |view: &InventoryView| {
+            assert_eq!(view.equity_inflight(&aapl, Venue::Hedging), Some(shares(2)));
+            assert_eq!(
+                view.equity_inflight_at(&tsla, Venue::MarketMaking, Chain::Base),
+                Some(shares(3))
+            );
+            assert_eq!(
+                view.equity_inflight_at(&aapl, Venue::MarketMaking, Chain::Robinhood),
+                Some(shares(7))
+            );
+        };
+
+        trigger
+            .on_snapshot_recovery(
+                recovery_error(),
+                InventorySnapshotEvent::ChainInflightRedemptions {
+                    chain: Chain::Robinhood,
+                    redemptions: BTreeMap::from([(aapl.clone(), shares(7))]),
+                    fetched_at: now,
+                },
+            )
+            .await
+            .unwrap();
+        let view = trigger.inventory.read().await.clone();
+        assert_all_inflight(&view);
+        assert_eq!(
+            view.equity_available(&aapl, Venue::Hedging),
+            Some(shares(50))
+        );
+        assert_eq!(
+            view.onchain_equity_available_at(&tsla, Chain::Base),
+            Some(shares(50))
+        );
+        let later = now + ChronoDuration::seconds(1);
+        let cleared = view
+            .apply_inflight_snapshot(&BTreeMap::new(), &BTreeMap::new(), later, later)
+            .unwrap();
+        assert_eq!(
+            cleared.equity_inflight(&aapl, Venue::Hedging),
+            Some(FractionalShares::ZERO),
+            "the carried mint keeps its poll marker"
+        );
+        assert_eq!(
+            cleared.equity_inflight_at(&tsla, Venue::MarketMaking, Chain::Base),
+            Some(FractionalShares::ZERO),
+            "the carried Base redemption keeps its poll marker"
+        );
+
+        trigger
+            .on_snapshot_recovery(
+                recovery_error(),
+                InventorySnapshotEvent::InflightEquity {
+                    mints: BTreeMap::from([(aapl.clone(), shares(2))]),
+                    redemptions: BTreeMap::from([(tsla.clone(), shares(3))]),
+                    fetched_at: now,
+                    base_redemptions_chain_scoped: true,
+                },
+            )
+            .await
+            .unwrap();
+        let view = trigger.inventory.read().await.clone();
+        assert_all_inflight(&view);
+        let cleared = view
+            .apply_inflight_redemptions_at(Chain::Robinhood, &BTreeMap::new(), later, later)
+            .unwrap();
+        assert_eq!(
+            cleared.equity_inflight_at(&aapl, Venue::MarketMaking, Chain::Robinhood),
+            Some(FractionalShares::ZERO),
+            "the carried Robinhood redemption keeps its poll marker"
         );
     }
 
@@ -32833,6 +33784,7 @@ mod tests {
                     mints: BTreeMap::from([(symbol.clone(), shares(10))]),
                     redemptions: BTreeMap::new(),
                     fetched_at,
+                    base_redemptions_chain_scoped: true,
                 },
             )
             .await
@@ -32847,7 +33799,7 @@ mod tests {
                 .suppressed_inflight_symbols
                 .read()
                 .await
-                .contains_key(&symbol),
+                .contains_key(&(symbol.clone(), Chain::Base)),
             "recovery timeout sweep should suppress the stale inflight snapshot"
         );
 
@@ -32880,11 +33832,12 @@ mod tests {
             .suppressed_inflight_symbols
             .write()
             .await
-            .insert(symbol.clone(), stale_time);
+            .insert((symbol.clone(), Chain::Base), stale_time);
         trigger.timed_out_mints.write().await.insert(
             mint_id,
             TimeoutTombstone {
                 symbol: symbol.clone(),
+                chain: Chain::Base,
                 timed_out_at: stale_time,
             },
         );
@@ -32892,6 +33845,7 @@ mod tests {
             redemption_id,
             TimeoutTombstone {
                 symbol: symbol.clone(),
+                chain: Chain::Base,
                 timed_out_at: stale_time,
             },
         );
@@ -33250,7 +34204,7 @@ mod tests {
         // snapshots fetched before the stamp are rejected.
         let inventory = InventoryView::default()
             .with_equity(symbol.clone(), shares(0), shares(136))
-            .clear_equity_inflight(&symbol, Venue::Hedging, now)
+            .clear_equity_inflight_at(&symbol, Chain::Base, Venue::Hedging, now)
             .unwrap();
 
         let reactor = make_trigger_with_inventory_and_registry(inventory, &symbol).await;
@@ -36742,7 +37696,7 @@ mod tests {
                 .suppressed_inflight_symbols
                 .read()
                 .await
-                .contains_key(&symbol)
+                .contains_key(&(symbol.clone(), Chain::Base))
         );
     }
 
@@ -37279,6 +38233,7 @@ mod tests {
             id.clone(),
             TimeoutTombstone {
                 symbol: symbol.clone(),
+                chain: Chain::Base,
                 timed_out_at: Utc::now(),
             },
         );
@@ -37286,7 +38241,7 @@ mod tests {
             .suppressed_inflight_symbols
             .write()
             .await
-            .insert(symbol.clone(), Utc::now());
+            .insert((symbol.clone(), Chain::Base), Utc::now());
 
         trigger
             .on_mint(id.clone(), make_tokens_received())
@@ -37303,7 +38258,7 @@ mod tests {
                 .suppressed_inflight_symbols
                 .read()
                 .await
-                .contains_key(&symbol),
+                .contains_key(&(symbol.clone(), Chain::Base)),
             "inflight suppression must lift so snapshot polls resume \
              recording the symbol"
         );
@@ -37336,6 +38291,7 @@ mod tests {
             id.clone(),
             TimeoutTombstone {
                 symbol: symbol.clone(),
+                chain: Chain::Base,
                 timed_out_at: Utc::now(),
             },
         );
@@ -37343,7 +38299,7 @@ mod tests {
             .suppressed_inflight_symbols
             .write()
             .await
-            .insert(symbol.clone(), Utc::now());
+            .insert((symbol.clone(), Chain::Base), Utc::now());
 
         trigger
             .on_mint(id.clone(), make_mint_accepted())
@@ -37359,7 +38315,7 @@ mod tests {
                 .suppressed_inflight_symbols
                 .read()
                 .await
-                .contains_key(&symbol),
+                .contains_key(&(symbol.clone(), Chain::Base)),
             "a late non-completion event must leave inflight suppression \
              in place"
         );
@@ -37384,6 +38340,7 @@ mod tests {
             id.clone(),
             TimeoutTombstone {
                 symbol: symbol.clone(),
+                chain: Chain::Base,
                 timed_out_at: Utc::now(),
             },
         );
@@ -37391,7 +38348,7 @@ mod tests {
             .suppressed_inflight_symbols
             .write()
             .await
-            .insert(symbol.clone(), Utc::now());
+            .insert((symbol.clone(), Chain::Base), Utc::now());
 
         trigger
             .on_redemption(id.clone(), make_redemption_completed())
@@ -37408,7 +38365,7 @@ mod tests {
                 .suppressed_inflight_symbols
                 .read()
                 .await
-                .contains_key(&symbol),
+                .contains_key(&(symbol.clone(), Chain::Base)),
             "inflight suppression must lift so snapshot polls resume \
              recording the symbol"
         );

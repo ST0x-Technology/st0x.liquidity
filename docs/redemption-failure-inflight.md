@@ -9,6 +9,23 @@ and operator reconciliation):
 - Startup seeds unreconciled stranded redemptions into inflight. Operator
   reconciliation prevents that aggregate from being seeded on the next restart;
   it does not change the running process's balances.
+- Invalid chain data on a stuck-redemption row makes startup recovery fail
+  before it seeds any stranded redemptions. That is fail-closed: the operator
+  must fix the row. Recovery does not skip it and seed later rows.
+
+Startup retains each stranded redemption's aggregate ID, chain and quantity
+apart from active provider ownership. It adds that exposure to any active
+transfer already restored on the same chain. Hydration ignores saved provider
+entries on those slots, since a saved pending entry may name a request that
+failed after the last poll. Fresh owned pending reads add the stranded amount;
+disappearance, timeout and terminal failure preserve it. A restored active
+transfer's NAV adjustment changes only its own quantity.
+
+Provider-completion recovery moves only the selected aggregate's seeded amount
+into active ownership without changing total inflight. Dispatch rollback
+restores both the prior total and that exact seeded identity. Recovering a newer
+runtime failure restores its own released amount alongside older stranded
+exposure.
 
 Do not depend on the pending-provider poll having observed a request before its
 terminal failure. A quick rejection can occur entirely between polls; relying on
