@@ -39,7 +39,7 @@ use crate::{
     ChainEquityAsset, ChainLifecycle, ChainRegistry, ChainSecrets, ExecutionThreshold,
     HedgingAssets, InvalidThresholdError, OperationMode, OrchestratorConfig, PricingConfig,
     PricingCtx, PricingCtxError, RebalancingConfig, RebalancingCtx, RebalancingCtxError,
-    TelemetryConfig, TelemetryCtx, UsdcRebalancing,
+    TelemetryConfig, TelemetryCtx, UsdcCorridors, UsdcRebalancing,
 };
 
 /// Alpaca minimum execution threshold: $2.
@@ -1869,9 +1869,9 @@ fn validate_config(
         let Some(rebalancing) = &config.rebalancing else {
             return Err(CtxError::MissingRebalancing);
         };
-        RebalancingCtx::new(rebalancing, base_cash_vault(&config.chains))?;
+        let rebalancing_ctx = RebalancingCtx::new(rebalancing, base_cash_vault(&config.chains))?;
         rebalancing.allocation()?.validate(&config.chains)?;
-        validate_usdc_corridor_chains(&rebalancing.usdc, &config.chains)?;
+        validate_usdc_corridor_chains(&rebalancing.usdc, &rebalancing_ctx.usdc, &config.chains)?;
 
         let minimum = *crate::ALPACA_TO_BASE_MINIMUM_TRANSFER;
 
@@ -1959,11 +1959,12 @@ fn base_cash_vault(chains: &BTreeMap<Chain, ChainConfig>) -> BaseCashVault {
 }
 
 /// Checks the cash corridors against the chain tables: each corridor's chain
-/// is configured, enabled and holds a cash vault, the build serves at least
+/// is configured, enabled and holds a cash vault, `corridors` serves at least
 /// one corridor, and with USDC mode enabled every chain whose cash rebalances
 /// has a corridor.
 fn validate_usdc_corridor_chains(
     usdc: &UsdcRebalancing,
+    corridors: &UsdcCorridors,
     chains: &BTreeMap<Chain, ChainConfig>,
 ) -> Result<(), CtxError> {
     for chain in usdc.corridors.keys().copied() {
@@ -1986,10 +1987,9 @@ fn validate_usdc_corridor_chains(
         }
     }
 
-    // Every table is served, and Base via CCTP while Base holds a cash vault.
     // A config with cash on a chain but no served corridor has no service to
     // move it; one with no cash table at all (a CLI-only config) moves none.
-    if usdc.corridors.is_empty() && base_cash_vault(chains) == BaseCashVault::Absent {
+    if corridors.served().is_empty() {
         let cash_chain = chains.iter().find(|(_, config)| {
             config.lifecycle != ChainLifecycle::Disabled
                 && config
@@ -12240,9 +12240,15 @@ mod tests {
         toml::from_str(include_str!("../../../config/prod/st0x-hedge.toml")).unwrap()
     }
 
+    fn validate_corridor_chains(config: &Config) -> Result<(), CtxError> {
+        let rebalancing = config.rebalancing.as_ref().unwrap();
+        let ctx = RebalancingCtx::new(rebalancing, base_cash_vault(&config.chains)).unwrap();
+
+        validate_usdc_corridor_chains(&rebalancing.usdc, &ctx.usdc, &config.chains)
+    }
+
     fn corridor_chain_error(config: &Config) -> CtxError {
-        validate_usdc_corridor_chains(&config.rebalancing.as_ref().unwrap().usdc, &config.chains)
-            .unwrap_err()
+        validate_corridor_chains(config).unwrap_err()
     }
 
     fn cash_mut(config: &mut Config, chain: Chain) -> &mut crate::ChainCashAsset {
@@ -12274,7 +12280,7 @@ mod tests {
         );
         assert!(usdc.threshold.target.eq(float!(0.6)).unwrap());
         assert!(usdc.threshold.deviation.eq(float!(0.05)).unwrap());
-        validate_usdc_corridor_chains(&rebalancing.usdc, &config.chains).unwrap();
+        validate_usdc_corridor_chains(&rebalancing.usdc, &corridors, &config.chains).unwrap();
     }
 
     #[test]
@@ -12357,8 +12363,7 @@ mod tests {
                 .primary = primary;
         }
 
-        validate_usdc_corridor_chains(&config.rebalancing.as_ref().unwrap().usdc, &config.chains)
-            .unwrap();
+        validate_corridor_chains(&config).unwrap();
     }
 
     /// The primary must be Base whatever the USDC corridors, so an Ethereum
@@ -12488,8 +12493,7 @@ mod tests {
         cash_mut(&mut config, Chain::Robinhood).rebalancing = OperationMode::Enabled;
         config.chains.get_mut(&Chain::Robinhood).unwrap().lifecycle = ChainLifecycle::Disabled;
 
-        validate_usdc_corridor_chains(&config.rebalancing.as_ref().unwrap().usdc, &config.chains)
-            .unwrap();
+        validate_corridor_chains(&config).unwrap();
     }
 
     #[test]
@@ -12499,7 +12503,6 @@ mod tests {
         usdc.mode = OperationMode::Disabled;
         usdc.corridors.clear();
 
-        validate_usdc_corridor_chains(&config.rebalancing.as_ref().unwrap().usdc, &config.chains)
-            .unwrap();
+        validate_corridor_chains(&config).unwrap();
     }
 }

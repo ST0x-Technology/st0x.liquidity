@@ -161,7 +161,7 @@ pub struct UsdcCorridorCtx {
 
 /// Whether Base is a hedged chain holding a cash vault. Base via CCTP is then
 /// served with no corridor table, so its in-flight transfers always recover.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy)]
 pub(crate) enum BaseCashVault {
     Held,
     Absent,
