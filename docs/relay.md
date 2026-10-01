@@ -238,6 +238,9 @@ requires:
   word of calldata;
 - the calldata `to` is our wallet on that chain and the trailing word is the
   order id;
+- the calldata `from` is not our wallet and the amount is not zero, so neither a
+  transfer of our own funds back to us nor an empty `transferFrom` anyone can
+  send with any order id passes;
 - exactly one `Transfer` of that stable to our wallet, from the calldata's
   `from`, whose amount equals the calldata amount.
 
