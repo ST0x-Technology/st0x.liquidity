@@ -20,10 +20,13 @@ pub enum IntentStatus {
     /// Quoted, no deposit seen.
     Waiting,
     InFlight(InFlightStage),
-    /// Every tx in Relay's `txHashes`; settlement proof checks each.
+    /// Every tx in Relay's `txHashes`, never empty; settlement proof checks
+    /// each.
     Success {
         fill_txs: Vec<TxHash>,
     },
+    /// Relay says `success` but names no fill tx yet.
+    Filling,
     /// Paid back to `refund_to`: on the origin chain in the origin stable or
     /// on the destination chain in the destination stable, as the quote
     /// offers both. `refund_txs` is never empty and Relay reports no refund
@@ -57,7 +60,11 @@ impl IntentStatus {
             | Self::Refund { .. }
             | Self::RefundFailed { .. }
             | Self::Failure { .. } => true,
-            Self::Waiting | Self::InFlight(_) | Self::Refunding { .. } | Self::Unknown(_) => false,
+            Self::Waiting
+            | Self::InFlight(_)
+            | Self::Filling
+            | Self::Refunding { .. }
+            | Self::Unknown(_) => false,
         }
     }
 }
@@ -136,6 +143,7 @@ impl From<StatusResponse> for IntentStatusReport {
             "pending" => IntentStatus::InFlight(InFlightStage::Pending),
             "submitted" => IntentStatus::InFlight(InFlightStage::Submitted),
             "delayed" => IntentStatus::InFlight(InFlightStage::Delayed),
+            "success" if response.tx_hashes.is_empty() => IntentStatus::Filling,
             "success" => IntentStatus::Success {
                 fill_txs: response.tx_hashes,
             },
@@ -227,7 +235,8 @@ mod tests {
     fn success_without_a_fill_tx_is_not_terminal() {
         let report = report(&json!({"status": "success", "failReason": "N/A"}).to_string());
 
-        assert!(!report.status.is_terminal(), "{report:?}");
+        assert_eq!(report.status, IntentStatus::Filling);
+        assert!(!report.status.is_terminal());
     }
 
     #[test]
