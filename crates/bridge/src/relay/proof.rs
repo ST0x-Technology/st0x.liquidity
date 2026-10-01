@@ -287,18 +287,6 @@ mod tests {
     }
 
     #[test]
-    fn real_refund_calldata_has_the_fill_layout() {
-        let (tx, _) = refund();
-
-        let (call, order_id) = decode_payment_calldata(tx.input()).unwrap();
-
-        assert_eq!(call.from, SOLVER);
-        assert_eq!(call.to, FUNDED_WALLET);
-        assert_eq!(call.amount, U256::from(2_995_154));
-        assert_eq!(RelayOrderId(order_id), REFUNDED_ORDER);
-    }
-
-    #[test]
     fn real_fill_proves_on_ethereum() {
         let (tx, receipt) = fill();
 

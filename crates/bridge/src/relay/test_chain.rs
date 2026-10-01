@@ -32,10 +32,11 @@ pub(super) struct RelayChain {
 }
 
 impl RelayChain {
-    /// Deploys from Anvil key `deployer`. Two chains deployed from different
-    /// keys get different contract addresses, as the real ends do.
-    pub(super) async fn spawn(deployer: usize) -> Self {
-        let anvil = Anvil::new().spawn();
+    /// Deploys from Anvil key `deployer` on chain `chain_id`. Two chains
+    /// deployed from different keys get different contract addresses, as the
+    /// real ends do.
+    pub(super) async fn spawn(deployer: usize, chain_id: u64) -> Self {
+        let anvil = Anvil::new().chain_id(chain_id).spawn();
         let signer = signing_provider(&anvil, deployer);
 
         let RelayEndContracts { stable, depository } = deploy_relay_end(&signer).await.unwrap();
