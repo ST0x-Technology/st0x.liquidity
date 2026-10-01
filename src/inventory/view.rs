@@ -20,7 +20,7 @@ use st0x_tokenization::IssuerRequestId;
 use super::divergence::{PersistentBrokerCashDivergence, PersistentBrokerDivergence};
 use super::snapshot::InventorySnapshotEvent;
 use super::venue_balance::{InventoryError, VenueBalance};
-use crate::equity_redemption::RedemptionAggregateId;
+use crate::equity_redemption::{RedemptionAggregateId, StrandedRedemption};
 use crate::offchain::order::OffchainOrderId;
 use crate::usdc_rebalance::{RebalanceDirection, UsdcRebalanceId};
 
@@ -449,6 +449,22 @@ where
         })
     }
 
+    /// Increase a transfer's in-flight amount without moving available shares.
+    /// NAV appreciation belongs to that transfer, even when another failed
+    /// transfer's exposure occupies the same slot after a restart.
+    pub(crate) fn increase_inflight(
+        venue: Venue,
+        amount: T,
+    ) -> Box<dyn FnOnce(Self, Chain) -> Result<Self, InventoryError<T>> + Send> {
+        Box::new(move |inventory, chain| {
+            let current = inventory
+                .get_venue(venue, chain)
+                .unwrap_or_default()
+                .inflight();
+            Self::set_inflight(venue, (current + amount)?)(inventory, chain)
+        })
+    }
+
     /// Apply a fetched venue snapshot.
     ///
     /// Skips if ANY venue has inflight operations, because we cannot
@@ -786,9 +802,13 @@ pub(crate) struct InventoryView {
     /// completed or rejected) so its inflight can be zeroed.
     #[serde(default)]
     previous_inflight_mint_symbols: HashSet<Symbol>,
-    /// Symbols that appeared in the most recent inflight redemption poll.
+    /// Symbols that appeared in the most recent inflight redemption poll of
+    /// each chain. A redemption's in-flight sits on the chain it withdraws
+    /// from, so each chain's disappearances zero only that chain's slot.
     #[serde(default)]
-    previous_inflight_redemption_symbols: HashSet<Symbol>,
+    previous_inflight_redemptions: HashMap<Chain, HashSet<Symbol>>,
+    #[serde(default)]
+    startup_stranded_redemptions: HashMap<RedemptionAggregateId, StrandedRedemption>,
     /// Latest absolute equity snapshot timestamp by symbol for the onchain venue.
     /// Local-clock time: the snapshot aggregate stamps `fetched_at` itself, so
     /// this is never the chain's or the broker's clock.
@@ -1292,7 +1312,8 @@ impl Default for InventoryView {
             active_redemptions: HashMap::new(),
             inflight_equity: HashMap::new(),
             previous_inflight_mint_symbols: HashSet::new(),
-            previous_inflight_redemption_symbols: HashSet::new(),
+            previous_inflight_redemptions: HashMap::new(),
+            startup_stranded_redemptions: HashMap::new(),
             onchain_equity_snapshot_watermarks: HashMap::new(),
             offchain_equity_snapshot_watermarks: HashMap::new(),
             pending_offchain_orders: HashMap::new(),
@@ -1667,6 +1688,18 @@ impl InventoryView {
 
         let updated = update(inventory, chain)?;
 
+        let stranded = self.stranded_redemption_quantity(symbol, chain)?;
+        let inflight = updated
+            .get_venue(Venue::MarketMaking, chain)
+            .map_or(FractionalShares::ZERO, VenueBalance::inflight);
+        if inflight.inner().lt(stranded.inner())? {
+            return Err(InventoryError::InsufficientInflight {
+                requested: stranded,
+                inflight,
+            }
+            .into());
+        }
+
         let mut equities = self.equities;
         equities.insert(symbol.clone(), updated);
 
@@ -1684,7 +1717,8 @@ impl InventoryView {
             active_redemptions: self.active_redemptions,
             inflight_equity: self.inflight_equity,
             previous_inflight_mint_symbols: self.previous_inflight_mint_symbols,
-            previous_inflight_redemption_symbols: self.previous_inflight_redemption_symbols,
+            previous_inflight_redemptions: self.previous_inflight_redemptions,
+            startup_stranded_redemptions: self.startup_stranded_redemptions,
             onchain_equity_snapshot_watermarks: self.onchain_equity_snapshot_watermarks,
             offchain_equity_snapshot_watermarks: self.offchain_equity_snapshot_watermarks,
             pending_offchain_orders: self.pending_offchain_orders,
@@ -1736,7 +1770,8 @@ impl InventoryView {
             active_redemptions: self.active_redemptions,
             inflight_equity: self.inflight_equity,
             previous_inflight_mint_symbols: self.previous_inflight_mint_symbols,
-            previous_inflight_redemption_symbols: self.previous_inflight_redemption_symbols,
+            previous_inflight_redemptions: self.previous_inflight_redemptions,
+            startup_stranded_redemptions: self.startup_stranded_redemptions,
             onchain_equity_snapshot_watermarks: self.onchain_equity_snapshot_watermarks,
             offchain_equity_snapshot_watermarks: self.offchain_equity_snapshot_watermarks,
             pending_offchain_orders: self.pending_offchain_orders,
@@ -2087,7 +2122,8 @@ impl InventoryView {
         corrections
     }
 
-    /// A fresh default view retaining only the offchain-order guard state
+    /// A fresh default view retaining stranded redemption exposure and the
+    /// offchain-order guard state
     /// (pending orders and applied-fill times) and, for each gated symbol,
     /// the Hedging available balance that state guards.
     ///
@@ -2099,15 +2135,18 @@ impl InventoryView {
     /// double-apply race. The delta-owned balance must survive with it: while
     /// the gate is held, snapshots are skipped, so nothing can repopulate a
     /// wiped balance — the symbol would sit uninitialized and imbalance
-    /// detection would silently stop for it. Inflight is deliberately NOT
-    /// carried (stuck inflight is the wedge class recovery exists to clear)
-    /// and the onchain venue is left uninitialized (it is not delta-owned and
-    /// nothing blocks its repopulation). Every other field is intentionally
+    /// detection would silently stop for it. Stranded MarketMaking slots keep
+    /// their inflight (stranded plus any provider share), the poll markers
+    /// that can later drop the provider share, and their onchain snapshot
+    /// watermarks, so a delayed older fill or read cannot be counted again on
+    /// top of the kept balance; other onchain venues are left
+    /// uninitialized (they are not delta-owned and nothing blocks their
+    /// repopulation). Every other field is intentionally
     /// defaulted, which is why this uses functional-update syntax rather than
     /// an exhaustive literal: a future field should default here unless it is
     /// guard state.
     pub(crate) fn reset_preserving_offchain_order_state(&self) -> Self {
-        let equities = self
+        let mut equities: HashMap<Symbol, Inventory<FractionalShares>> = self
             .equities
             .iter()
             .filter(|(symbol, _)| self.pending_offchain_orders.contains_key(*symbol))
@@ -2130,8 +2169,61 @@ impl InventoryView {
             })
             .collect();
 
+        let mut previous_inflight_redemptions: HashMap<Chain, HashSet<Symbol>> = HashMap::new();
+        let mut onchain_equity_snapshot_watermarks: HashMap<Chain, HashMap<Symbol, DateTime<Utc>>> =
+            HashMap::new();
+        let mut onchain_equity_snapshot_block_watermarks: HashMap<Chain, HashMap<Symbol, u64>> =
+            HashMap::new();
+        for stranded in self.startup_stranded_redemptions.values() {
+            if let Some(balance) = self
+                .equities
+                .get(&stranded.symbol)
+                .and_then(|inventory| inventory.get_venue(Venue::MarketMaking, stranded.chain))
+            {
+                equities
+                    .entry(stranded.symbol.clone())
+                    .or_default()
+                    .onchain
+                    .insert(stranded.chain, balance);
+                if let Some(watermark) = self
+                    .onchain_equity_snapshot_watermarks
+                    .get(&stranded.chain)
+                    .and_then(|watermarks| watermarks.get(&stranded.symbol))
+                {
+                    onchain_equity_snapshot_watermarks
+                        .entry(stranded.chain)
+                        .or_default()
+                        .insert(stranded.symbol.clone(), *watermark);
+                }
+                if let Some(block) = self
+                    .onchain_equity_snapshot_block_watermarks
+                    .get(&stranded.chain)
+                    .and_then(|watermarks| watermarks.get(&stranded.symbol))
+                {
+                    onchain_equity_snapshot_block_watermarks
+                        .entry(stranded.chain)
+                        .or_default()
+                        .insert(stranded.symbol.clone(), *block);
+                }
+                if self
+                    .previous_inflight_redemptions
+                    .get(&stranded.chain)
+                    .is_some_and(|symbols| symbols.contains(&stranded.symbol))
+                {
+                    previous_inflight_redemptions
+                        .entry(stranded.chain)
+                        .or_default()
+                        .insert(stranded.symbol.clone());
+                }
+            }
+        }
+
         Self {
             equities,
+            startup_stranded_redemptions: self.startup_stranded_redemptions.clone(),
+            previous_inflight_redemptions,
+            onchain_equity_snapshot_watermarks,
+            onchain_equity_snapshot_block_watermarks,
             pending_offchain_orders: self.pending_offchain_orders.clone(),
             last_terminal_offchain_orders: self.last_terminal_offchain_orders.clone(),
             last_offchain_fill_applied_at: self.last_offchain_fill_applied_at.clone(),
@@ -2141,6 +2233,74 @@ impl InventoryView {
             primary_chain: self.primary_chain,
             ..Self::default()
         }
+    }
+
+    /// Resets the failed provider event's slots while carrying the complete
+    /// balances and snapshot watermarks of slots owned by other provider events.
+    pub(crate) fn reset_carrying_other_provider_inflight(
+        &self,
+        failed_chain: Chain,
+        _now: DateTime<Utc>,
+    ) -> Self {
+        let mut view = self.reset_preserving_offchain_order_state();
+        for (chain, symbols) in &self.previous_inflight_redemptions {
+            if *chain == failed_chain {
+                continue;
+            }
+            for symbol in symbols {
+                if let Some(balance) = self
+                    .equities
+                    .get(symbol)
+                    .and_then(|inventory| inventory.onchain.get(chain))
+                {
+                    view.equities
+                        .entry(symbol.clone())
+                        .or_default()
+                        .onchain
+                        .insert(*chain, *balance);
+                }
+                if let Some(watermark) = self
+                    .onchain_equity_snapshot_watermarks
+                    .get(chain)
+                    .and_then(|watermarks| watermarks.get(symbol))
+                {
+                    view.onchain_equity_snapshot_watermarks
+                        .entry(*chain)
+                        .or_default()
+                        .insert(symbol.clone(), *watermark);
+                }
+                if let Some(block) = self
+                    .onchain_equity_snapshot_block_watermarks
+                    .get(chain)
+                    .and_then(|watermarks| watermarks.get(symbol))
+                {
+                    view.onchain_equity_snapshot_block_watermarks
+                        .entry(*chain)
+                        .or_default()
+                        .insert(symbol.clone(), *block);
+                }
+            }
+            view.previous_inflight_redemptions
+                .insert(*chain, symbols.clone());
+        }
+        if failed_chain != Chain::Base {
+            for symbol in &self.previous_inflight_mint_symbols {
+                if let Some(balance) = self
+                    .equities
+                    .get(symbol)
+                    .and_then(|inventory| inventory.offchain)
+                {
+                    view.equities.entry(symbol.clone()).or_default().offchain = Some(balance);
+                }
+                if let Some(watermark) = self.offchain_equity_snapshot_watermarks.get(symbol) {
+                    view.offchain_equity_snapshot_watermarks
+                        .insert(symbol.clone(), *watermark);
+                }
+            }
+            view.previous_inflight_mint_symbols
+                .clone_from(&self.previous_inflight_mint_symbols);
+        }
+        view
     }
 
     /// Note a skipped equity snapshot for `symbol` at `venue`, warning
@@ -2616,15 +2776,32 @@ impl InventoryView {
                         return Ok((view, applied_symbols));
                     }
 
+                    let preserve_inflight = if venue == Venue::MarketMaking
+                        && !view
+                            .stranded_redemption_quantity(symbol, chain)?
+                            .is_zero()?
+                    {
+                        view.equity_inflight_at(symbol, Venue::MarketMaking, chain)
+                    } else {
+                        None
+                    };
                     let view = view
                         .update_equity_at(
                             symbol,
                             chain,
-                            Inventory::force_on_snapshot(
-                                venue,
-                                *snapshot_balance,
-                                Arc::new(InventoryViewError::DeferredSnapshotReconciliation),
-                            ),
+                            |inventory, chain| {
+                                let forced = Inventory::force_on_snapshot(
+                                    venue,
+                                    *snapshot_balance,
+                                    Arc::new(InventoryViewError::DeferredSnapshotReconciliation),
+                                )(inventory, chain)?;
+                                match preserve_inflight {
+                                    Some(inflight) => {
+                                        Inventory::set_inflight(venue, inflight)(forced, chain)
+                                    }
+                                    None => Ok(forced),
+                                }
+                            },
                             now,
                         )?
                         .reset_equity_snapshot_skip(symbol, venue, chain);
@@ -2753,19 +2930,9 @@ impl InventoryView {
         self
     }
 
-    pub(crate) fn clear_equity_inflight(
-        self,
-        symbol: &Symbol,
-        venue: Venue,
-        now: DateTime<Utc>,
-    ) -> Result<Self, InventoryViewError> {
-        let chain = self.primary_chain;
-        self.clear_equity_inflight_at(symbol, chain, venue, now)
-    }
-
-    /// Like [`Self::clear_equity_inflight`], addressed to an explicit chain's
-    /// slot: a recovery rollback clears the in-flight on the chain the
-    /// transfer's record names rather than the primary chain.
+    /// Clear provider-owned in-flight at `venue` on `chain`, preserving the
+    /// chain's startup-stranded redemptions, and stamp the rebalancing time.
+    /// Other chains' slots stay intact.
     pub(crate) fn clear_equity_inflight_at(
         self,
         symbol: &Symbol,
@@ -2773,48 +2940,22 @@ impl InventoryView {
         venue: Venue,
         now: DateTime<Utc>,
     ) -> Result<Self, InventoryViewError> {
-        let Some(inventory) = self.equities.get(symbol).cloned() else {
+        if !self.equities.contains_key(symbol) {
             return Ok(self);
+        }
+        let remaining = match venue {
+            Venue::MarketMaking => self.stranded_redemption_quantity(symbol, chain)?,
+            Venue::Hedging => FractionalShares::ZERO,
         };
-
-        let cleared = Inventory::set_inflight(venue, FractionalShares::ZERO)(inventory, chain)?;
-        let cleared = Inventory::with_last_rebalancing(now)(cleared, chain)?;
-
-        let mut equities = self.equities;
-        equities.insert(symbol.clone(), cleared);
-
-        Ok(Self {
-            equities,
-            last_updated: now,
-            usdc: self.usdc,
-            buying_power_cents: self.buying_power_cents,
-            withdrawable_cash_cents: self.withdrawable_cash_cents,
-            offchain_gross_usd_cents: self.offchain_gross_usd_cents,
-            alpaca_usdc: self.alpaca_usdc,
-            inflight_cash: self.inflight_cash,
-            active_usdc_rebalances: self.active_usdc_rebalances,
-            active_mints: self.active_mints,
-            active_redemptions: self.active_redemptions,
-            inflight_equity: self.inflight_equity,
-            previous_inflight_mint_symbols: self.previous_inflight_mint_symbols,
-            previous_inflight_redemption_symbols: self.previous_inflight_redemption_symbols,
-            onchain_equity_snapshot_watermarks: self.onchain_equity_snapshot_watermarks,
-            offchain_equity_snapshot_watermarks: self.offchain_equity_snapshot_watermarks,
-            pending_offchain_orders: self.pending_offchain_orders,
-            last_terminal_offchain_orders: self.last_terminal_offchain_orders,
-            last_offchain_fill_applied_at: self.last_offchain_fill_applied_at,
-            onchain_equity_snapshot_block_watermarks: self.onchain_equity_snapshot_block_watermarks,
-            onchain_usdc_snapshot_block_watermark: self.onchain_usdc_snapshot_block_watermark,
-            last_offchain_cash_fill_applied_at: self.last_offchain_cash_fill_applied_at,
-            offchain_equity_snapshot_skip_streaks: self.offchain_equity_snapshot_skip_streaks,
-            onchain_equity_snapshot_skip_streaks: self.onchain_equity_snapshot_skip_streaks,
-            offchain_usd_snapshot_skip_streak: self.offchain_usd_snapshot_skip_streak,
-            onchain_usdc_snapshot_skip_streaks: self.onchain_usdc_snapshot_skip_streaks,
-            offchain_usd_snapshot_watermark: self.offchain_usd_snapshot_watermark,
-            restart_tainted_offchain_symbols: self.restart_tainted_offchain_symbols,
-            restart_tainted_offchain_cash: self.restart_tainted_offchain_cash,
-            primary_chain: self.primary_chain,
-        })
+        self.update_equity_at(
+            symbol,
+            chain,
+            |inventory, chain| {
+                let cleared = Inventory::set_inflight(venue, remaining)(inventory, chain)?;
+                Inventory::with_last_rebalancing(now)(cleared, chain)
+            },
+            now,
+        )
     }
 
     /// Zeroes the USDC inflight at `venue` in `chain`'s slot: a transfer
@@ -2842,7 +2983,8 @@ impl InventoryView {
             active_redemptions: self.active_redemptions,
             inflight_equity: self.inflight_equity,
             previous_inflight_mint_symbols: self.previous_inflight_mint_symbols,
-            previous_inflight_redemption_symbols: self.previous_inflight_redemption_symbols,
+            previous_inflight_redemptions: self.previous_inflight_redemptions,
+            startup_stranded_redemptions: self.startup_stranded_redemptions,
             onchain_equity_snapshot_watermarks: self.onchain_equity_snapshot_watermarks,
             offchain_equity_snapshot_watermarks: self.offchain_equity_snapshot_watermarks,
             pending_offchain_orders: self.pending_offchain_orders,
@@ -3030,7 +3172,8 @@ impl InventoryView {
             .is_some_and(|last_rebalancing| fetched_at < last_rebalancing)
     }
 
-    /// Apply an inflight equity snapshot from the tokenization provider poll.
+    /// Apply an inflight equity snapshot from the tokenization provider poll:
+    /// mints on every chain, and Base's redemptions.
     ///
     /// Sets inflight for symbols **present** in the maps. For symbols
     /// that were in the **previous** poll but are now **absent**, zeros
@@ -3055,7 +3198,6 @@ impl InventoryView {
     ) -> Result<Self, InventoryViewError> {
         let mut this = self;
         let prev_mints = std::mem::take(&mut this.previous_inflight_mint_symbols);
-        let prev_redemptions = std::mem::take(&mut this.previous_inflight_redemption_symbols);
         let mut view = this;
 
         // Set inflight for symbols present in the poll.
@@ -3078,25 +3220,6 @@ impl InventoryView {
             )?;
         }
 
-        for (symbol, &quantity) in redemptions {
-            if view.is_stale_for_symbol(symbol, fetched_at) {
-                debug!(
-                    target: "inventory",
-                    %symbol,
-                    ?fetched_at,
-                    "Skipping redemption inflight snapshot: \
-                     fetched before last rebalancing"
-                );
-                continue;
-            }
-
-            view = view.update_equity(
-                symbol,
-                Inventory::set_inflight(Venue::MarketMaking, quantity),
-                now,
-            )?;
-        }
-
         // Zero inflight for symbols that were in the previous poll but
         // disappeared. These are requests that completed or were rejected.
         for symbol in &prev_mints {
@@ -3109,19 +3232,228 @@ impl InventoryView {
             }
         }
 
+        // Track current poll symbols for next cycle's cleanup.
+        view.previous_inflight_mint_symbols = mints.keys().cloned().collect();
+
+        view.apply_inflight_redemptions_at(Chain::Base, redemptions, fetched_at, now)
+    }
+
+    /// Restore a failed redemption separately from the active transfer already
+    /// restored on its chain. Keep its identity so recovering a later failure
+    /// cannot consume an older redemption's exposure.
+    pub(crate) fn seed_stranded_redemption(
+        self,
+        id: &RedemptionAggregateId,
+        symbol: &Symbol,
+        chain: Chain,
+        quantity: FractionalShares,
+        now: DateTime<Utc>,
+    ) -> Result<Self, InventoryViewError> {
+        if self.startup_stranded_redemptions.contains_key(id) {
+            return Ok(self);
+        }
+        let current = self
+            .equity_inflight_at(symbol, Venue::MarketMaking, chain)
+            .unwrap_or(FractionalShares::ZERO);
+        let mut view = self.update_equity_at(
+            symbol,
+            chain,
+            Inventory::set_inflight(Venue::MarketMaking, (current + quantity)?),
+            now,
+        )?;
+        view.startup_stranded_redemptions.insert(
+            id.clone(),
+            StrandedRedemption {
+                symbol: symbol.clone(),
+                chain,
+                quantity,
+            },
+        );
+        Ok(view.clear_previous_inflight_redemption_marker(symbol, chain))
+    }
+
+    pub(crate) fn stranded_redemption_quantity(
+        &self,
+        symbol: &Symbol,
+        chain: Chain,
+    ) -> Result<FractionalShares, FloatError> {
+        self.startup_stranded_redemptions
+            .values()
+            .filter(|stranded| &stranded.symbol == symbol && stranded.chain == chain)
+            .try_fold(FractionalShares::ZERO, |total, stranded| {
+                total + stranded.quantity
+            })
+    }
+
+    /// Move this exact failed redemption from stranded exposure into active
+    /// ownership. The slot's total is unchanged; completion subtracts it once.
+    pub(crate) fn claim_stranded_redemption(
+        &mut self,
+        id: &RedemptionAggregateId,
+    ) -> Option<StrandedRedemption> {
+        let stranded = self.startup_stranded_redemptions.remove(id)?;
+        if let Some(symbols) = self.previous_inflight_redemptions.get_mut(&stranded.chain) {
+            symbols.remove(&stranded.symbol);
+        }
+        Some(stranded)
+    }
+
+    pub(crate) fn restore_stranded_redemption_claim(
+        &mut self,
+        id: &RedemptionAggregateId,
+        stranded: StrandedRedemption,
+    ) {
+        if let Some(symbols) = self.previous_inflight_redemptions.get_mut(&stranded.chain) {
+            symbols.remove(&stranded.symbol);
+        }
+        self.startup_stranded_redemptions
+            .insert(id.clone(), stranded);
+    }
+
+    /// Saved provider entries can still name a redemption whose later terminal
+    /// event seeded its exposure at startup. Those entries are not current
+    /// ownership and must not be added to the restored total a second time.
+    ///
+    /// A legacy snapshot cannot identify the redemption chain. Its redemption
+    /// totals are deferred to the first provider poll rather than applied to Base.
+    #[cfg(test)]
+    pub(crate) fn apply_snapshot_hydration_event(
+        self,
+        event: &InventorySnapshotEvent,
+        now: DateTime<Utc>,
+    ) -> Result<Self, InventoryViewError> {
+        self.apply_snapshot_hydration_event_with_format(event, now, false)
+    }
+
+    pub(crate) fn apply_snapshot_hydration_event_with_format(
+        self,
+        event: &InventorySnapshotEvent,
+        now: DateTime<Utc>,
+        legacy_redemptions: bool,
+    ) -> Result<Self, InventoryViewError> {
+        let exclude_stranded = |redemptions: &BTreeMap<Symbol, FractionalShares>, chain| {
+            redemptions
+                .iter()
+                .filter(|(symbol, _)| {
+                    !self
+                        .startup_stranded_redemptions
+                        .values()
+                        .any(|stranded| &stranded.symbol == *symbol && stranded.chain == chain)
+                })
+                .map(|(symbol, quantity)| (symbol.clone(), *quantity))
+                .collect()
+        };
+        match event {
+            InventorySnapshotEvent::InflightEquity {
+                mints,
+                redemptions,
+                fetched_at,
+                ..
+            } => {
+                let redemptions: BTreeMap<Symbol, FractionalShares> = if legacy_redemptions {
+                    BTreeMap::new()
+                } else {
+                    exclude_stranded(redemptions, Chain::Base)
+                };
+                self.apply_inflight_snapshot(mints, &redemptions, *fetched_at, now)
+            }
+            InventorySnapshotEvent::ChainInflightRedemptions {
+                chain,
+                redemptions,
+                fetched_at,
+            } => {
+                let redemptions = exclude_stranded(redemptions, *chain);
+                self.apply_inflight_redemptions_at(*chain, &redemptions, *fetched_at, now)
+            }
+            InventorySnapshotEvent::OnchainEquity { .. }
+            | InventorySnapshotEvent::OnchainEquityReconciled { .. }
+            | InventorySnapshotEvent::OnchainUsdc { .. }
+            | InventorySnapshotEvent::OnchainUsdcReconciled { .. }
+            | InventorySnapshotEvent::OffchainEquity { .. }
+            | InventorySnapshotEvent::OffchainEquityReconciled { .. }
+            | InventorySnapshotEvent::OffchainUsd { .. }
+            | InventorySnapshotEvent::OffchainUsdReconciled { .. }
+            | InventorySnapshotEvent::OffchainCashBuyingPower { .. }
+            | InventorySnapshotEvent::OffchainCashWithdrawable { .. }
+            | InventorySnapshotEvent::AlpacaUsdc { .. }
+            | InventorySnapshotEvent::EthereumUsdc { .. }
+            | InventorySnapshotEvent::BaseWalletUsdc { .. }
+            | InventorySnapshotEvent::BaseWalletUnwrappedEquity { .. }
+            | InventorySnapshotEvent::BaseWalletWrappedEquity { .. }
+            | InventorySnapshotEvent::ChainWalletUnwrappedEquity { .. }
+            | InventorySnapshotEvent::ChainWalletWrappedEquity { .. } => {
+                self.apply_snapshot_event(event, now)
+            }
+        }
+    }
+
+    /// Apply one chain's pending provider redemptions to that chain's
+    /// MarketMaking slot, with the same present/disappeared/stale rules as
+    /// [`Self::apply_inflight_snapshot`]. Other chains' slots and markers
+    /// are untouched.
+    pub(crate) fn apply_inflight_redemptions_at(
+        self,
+        chain: Chain,
+        redemptions: &BTreeMap<Symbol, FractionalShares>,
+        fetched_at: DateTime<Utc>,
+        now: DateTime<Utc>,
+    ) -> Result<Self, InventoryViewError> {
+        let mut this = self;
+        let prev_redemptions = this
+            .previous_inflight_redemptions
+            .remove(&chain)
+            .unwrap_or_default();
+        let mut view = this;
+
+        let mut observed_symbols = prev_redemptions.clone();
+        for (symbol, &quantity) in redemptions {
+            if view.is_stale_for_symbol(symbol, fetched_at) {
+                debug!(
+                    target: "inventory",
+                    %symbol,
+                    %chain,
+                    ?fetched_at,
+                    "Skipping redemption inflight snapshot: \
+                     fetched before last rebalancing"
+                );
+                continue;
+            }
+
+            let total = (view.stranded_redemption_quantity(symbol, chain)? + quantity)?;
+            view = view.update_equity_at(
+                symbol,
+                chain,
+                Inventory::set_inflight(Venue::MarketMaking, total),
+                now,
+            )?;
+            observed_symbols.insert(symbol.clone());
+        }
+
         for symbol in &prev_redemptions {
             if !redemptions.contains_key(symbol) && !view.is_stale_for_symbol(symbol, fetched_at) {
-                view = view.update_equity(
+                let remaining = view.stranded_redemption_quantity(symbol, chain)?;
+                if !remaining.is_zero()?
+                    && view
+                        .active_redemptions
+                        .get(symbol)
+                        .is_some_and(|active| active.chain == chain)
+                {
+                    continue;
+                }
+                view = view.update_equity_at(
                     symbol,
-                    Inventory::set_inflight(Venue::MarketMaking, FractionalShares::ZERO),
+                    chain,
+                    Inventory::set_inflight(Venue::MarketMaking, remaining),
                     now,
                 )?;
+                observed_symbols.remove(symbol);
             }
         }
 
-        // Track current poll symbols for next cycle's cleanup.
-        view.previous_inflight_mint_symbols = mints.keys().cloned().collect();
-        view.previous_inflight_redemption_symbols = redemptions.keys().cloned().collect();
+        if !observed_symbols.is_empty() {
+            view.previous_inflight_redemptions
+                .insert(chain, observed_symbols);
+        }
 
         Ok(view)
     }
@@ -3138,14 +3470,20 @@ impl InventoryView {
         self
     }
 
-    /// Remove a symbol from the previous inflight redemption marker set.
+    /// Remove a symbol from `chain`'s previous inflight redemption markers.
     ///
     /// Called when a new redemption transfer starts
     /// (`VaultWithdrawPending` for legacy aggregates or
     /// `VaultWithdrawSubmitting` for new aggregates) for the same reason as
     /// [`Self::clear_previous_inflight_mint_marker`].
-    pub(crate) fn clear_previous_inflight_redemption_marker(mut self, symbol: &Symbol) -> Self {
-        self.previous_inflight_redemption_symbols.remove(symbol);
+    pub(crate) fn clear_previous_inflight_redemption_marker(
+        mut self,
+        symbol: &Symbol,
+        chain: Chain,
+    ) -> Self {
+        if let Some(symbols) = self.previous_inflight_redemptions.get_mut(&chain) {
+            symbols.remove(symbol);
+        }
         self
     }
 
@@ -3626,6 +3964,10 @@ impl InventoryView {
             InflightEquity {
                 mints, redemptions, ..
             } => self.apply_inflight_snapshot(mints, redemptions, fetched_at, now),
+
+            ChainInflightRedemptions {
+                chain, redemptions, ..
+            } => self.apply_inflight_redemptions_at(*chain, redemptions, fetched_at, now),
         }
     }
 
@@ -3695,14 +4037,28 @@ impl InventoryView {
         balances
             .iter()
             .try_fold(self, |view, (symbol, snapshot_balance)| {
+                let preserve_inflight = if view
+                    .stranded_redemption_quantity(symbol, chain)?
+                    .is_zero()?
+                {
+                    FractionalShares::ZERO
+                } else {
+                    view.equity_inflight_at(symbol, Venue::MarketMaking, chain)
+                        .unwrap_or(FractionalShares::ZERO)
+                };
                 view.update_equity_at(
                     symbol,
                     chain,
-                    Inventory::force_on_snapshot(
-                        Venue::MarketMaking,
-                        *snapshot_balance,
-                        reason.clone(),
-                    ),
+                    |inventory, chain| {
+                        let updated = Inventory::force_on_snapshot(
+                            Venue::MarketMaking,
+                            *snapshot_balance,
+                            reason.clone(),
+                        )(inventory, chain)?;
+                        Inventory::set_inflight(Venue::MarketMaking, preserve_inflight)(
+                            updated, chain,
+                        )
+                    },
                     now,
                 )
                 .map(|view| view.reset_equity_snapshot_skip(symbol, Venue::MarketMaking, chain))
@@ -4029,7 +4385,14 @@ impl InventoryView {
                 mints,
                 redemptions,
                 fetched_at,
+                ..
             } => self.apply_inflight_snapshot(mints, redemptions, *fetched_at, now),
+
+            ChainInflightRedemptions {
+                chain,
+                redemptions,
+                fetched_at,
+            } => self.apply_inflight_redemptions_at(*chain, redemptions, *fetched_at, now),
         }
     }
 }
@@ -4230,7 +4593,8 @@ mod tests {
             active_redemptions: HashMap::new(),
             inflight_equity: HashMap::new(),
             previous_inflight_mint_symbols: HashSet::new(),
-            previous_inflight_redemption_symbols: HashSet::new(),
+            previous_inflight_redemptions: HashMap::new(),
+            startup_stranded_redemptions: HashMap::new(),
             onchain_equity_snapshot_watermarks: HashMap::new(),
             offchain_equity_snapshot_watermarks: HashMap::new(),
             pending_offchain_orders: HashMap::new(),
@@ -4275,7 +4639,8 @@ mod tests {
             active_redemptions: HashMap::new(),
             inflight_equity: HashMap::new(),
             previous_inflight_mint_symbols: HashSet::new(),
-            previous_inflight_redemption_symbols: HashSet::new(),
+            previous_inflight_redemptions: HashMap::new(),
+            startup_stranded_redemptions: HashMap::new(),
             onchain_equity_snapshot_watermarks: HashMap::new(),
             offchain_equity_snapshot_watermarks: HashMap::new(),
             pending_offchain_orders: HashMap::new(),
@@ -6431,6 +6796,478 @@ mod tests {
     }
 
     #[test]
+    fn stranded_secondary_redemption_survives_hydration_and_provider_disappearance() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let now = Utc::now();
+        let base = BTreeMap::from([(symbol.clone(), shares(3))]);
+        let stale_secondary = BTreeMap::from([(symbol.clone(), shares(7))]);
+        let view = InventoryView::default()
+            .with_equity(symbol.clone(), shares(50), shares(50))
+            .apply_inflight_snapshot(&BTreeMap::new(), &base, now, now)
+            .unwrap()
+            .seed_stranded_redemption(
+                &RedemptionAggregateId::generate(),
+                &symbol,
+                Chain::Robinhood,
+                shares(7),
+                now,
+            )
+            .unwrap()
+            .seed_stranded_redemption(
+                &RedemptionAggregateId::generate(),
+                &symbol,
+                Chain::Robinhood,
+                shares(5),
+                now,
+            )
+            .unwrap()
+            .apply_snapshot_hydration_event(
+                &InventorySnapshotEvent::ChainInflightRedemptions {
+                    chain: Chain::Robinhood,
+                    redemptions: stale_secondary,
+                    fetched_at: now,
+                },
+                now,
+            )
+            .unwrap()
+            .apply_inflight_redemptions_at(Chain::Robinhood, &BTreeMap::new(), now, now)
+            .unwrap();
+        assert_eq!(
+            view.equity_inflight_at(&symbol, Venue::MarketMaking, Chain::Robinhood),
+            Some(shares(12))
+        );
+        assert_eq!(
+            view.equity_inflight_at(&symbol, Venue::MarketMaking, Chain::Base),
+            Some(shares(3))
+        );
+    }
+
+    #[test]
+    fn snapshot_error_reset_preserves_stranded_exposure_on_each_chain() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let now = Utc::now();
+        let view = InventoryView::default()
+            .seed_stranded_redemption(
+                &RedemptionAggregateId::generate(),
+                &symbol,
+                Chain::Base,
+                shares(3),
+                now,
+            )
+            .unwrap()
+            .seed_stranded_redemption(
+                &RedemptionAggregateId::generate(),
+                &symbol,
+                Chain::Robinhood,
+                shares(7),
+                now,
+            )
+            .unwrap()
+            .reset_preserving_offchain_order_state()
+            .apply_inflight_redemptions_at(
+                Chain::Robinhood,
+                &BTreeMap::from([(symbol.clone(), shares(2))]),
+                now,
+                now,
+            )
+            .unwrap()
+            .apply_inflight_snapshot(&BTreeMap::new(), &BTreeMap::new(), now, now)
+            .unwrap();
+        assert_eq!(
+            view.equity_inflight_at(&symbol, Venue::MarketMaking, Chain::Base),
+            Some(shares(3))
+        );
+        assert_eq!(
+            view.equity_inflight_at(&symbol, Venue::MarketMaking, Chain::Robinhood),
+            Some(shares(9))
+        );
+    }
+
+    #[test]
+    fn stranded_exposure_survives_force_applied_vault_snapshot() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let now = Utc::now();
+        let view = InventoryView::default()
+            .seed_stranded_redemption(
+                &RedemptionAggregateId::generate(),
+                &symbol,
+                Chain::Robinhood,
+                shares(7),
+                now,
+            )
+            .unwrap()
+            .reset_preserving_offchain_order_state()
+            .force_apply_snapshot_event(
+                &InventorySnapshotEvent::OnchainEquity {
+                    chain: Chain::Robinhood,
+                    balances: BTreeMap::from([(symbol.clone(), shares(40))]),
+                    fetched_at: now,
+                    block_number: Some(42),
+                },
+                now,
+                Arc::new(InventoryViewError::DeferredSnapshotReconciliation),
+            )
+            .unwrap();
+        assert_eq!(
+            view.onchain_equity_available_at(&symbol, Chain::Robinhood),
+            Some(shares(40))
+        );
+        assert_eq!(
+            view.equity_inflight_at(&symbol, Venue::MarketMaking, Chain::Robinhood),
+            Some(shares(7))
+        );
+        assert_eq!(
+            view.stranded_redemption_quantity(&symbol, Chain::Robinhood)
+                .unwrap(),
+            shares(7)
+        );
+    }
+
+    #[test]
+    fn hydrated_failed_snapshot_does_not_double_restored_active_and_stranded_quantities() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let now = Utc::now();
+        let view = InventoryView::default()
+            .update_equity_at(
+                &symbol,
+                Chain::Robinhood,
+                Inventory::set_inflight(Venue::MarketMaking, shares(5)),
+                now,
+            )
+            .unwrap()
+            .seed_stranded_redemption(
+                &RedemptionAggregateId::generate(),
+                &symbol,
+                Chain::Robinhood,
+                shares(7),
+                now,
+            )
+            .unwrap()
+            .set_active_redemption(
+                symbol.clone(),
+                Chain::Robinhood,
+                RedemptionAggregateId::generate(),
+            )
+            .apply_snapshot_hydration_event(
+                &InventorySnapshotEvent::ChainInflightRedemptions {
+                    chain: Chain::Robinhood,
+                    redemptions: BTreeMap::from([(symbol.clone(), shares(7))]),
+                    fetched_at: now,
+                },
+                now,
+            )
+            .unwrap();
+        assert_eq!(
+            view.equity_inflight_at(&symbol, Venue::MarketMaking, Chain::Robinhood),
+            Some(shares(12))
+        );
+        let view = view
+            .apply_inflight_redemptions_at(
+                Chain::Robinhood,
+                &BTreeMap::from([(symbol.clone(), shares(5))]),
+                now,
+                now,
+            )
+            .unwrap()
+            .apply_inflight_redemptions_at(Chain::Robinhood, &BTreeMap::new(), now, now)
+            .unwrap();
+        assert_eq!(
+            view.equity_inflight_at(&symbol, Venue::MarketMaking, Chain::Robinhood),
+            Some(shares(12))
+        );
+    }
+
+    #[test]
+    fn forced_reconcile_preserves_stranded_inflight() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let now = Utc::now();
+        let later = now + Duration::seconds(1);
+        let view = InventoryView::default()
+            .apply_snapshot_event(
+                &InventorySnapshotEvent::OnchainEquity {
+                    chain: Chain::Robinhood,
+                    balances: BTreeMap::from([(symbol.clone(), shares(40))]),
+                    fetched_at: now,
+                    block_number: None,
+                },
+                now,
+            )
+            .unwrap()
+            .seed_stranded_redemption(
+                &RedemptionAggregateId::generate(),
+                &symbol,
+                Chain::Robinhood,
+                shares(7),
+                now,
+            )
+            .unwrap();
+        let balances = BTreeMap::from([(symbol.clone(), shares(40))]);
+        let view = view
+            .apply_reconciled_onchain_equity_snapshot(
+                Chain::Robinhood,
+                balances.iter(),
+                later,
+                None,
+                later,
+                &BTreeSet::from([symbol.clone()]),
+                &BTreeSet::new(),
+            )
+            .unwrap();
+        assert_eq!(
+            view.equity_inflight_at(&symbol, Venue::MarketMaking, Chain::Robinhood),
+            Some(shares(7))
+        );
+        assert_eq!(
+            view.onchain_equity_available_at(&symbol, Chain::Robinhood),
+            Some(shares(40))
+        );
+    }
+
+    #[test]
+    fn reset_keeps_stranded_slot_snapshot_watermarks() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let now = Utc::now();
+        let balances = BTreeMap::from([(symbol.clone(), shares(40))]);
+        let view = InventoryView::default()
+            .seed_stranded_redemption(
+                &RedemptionAggregateId::generate(),
+                &symbol,
+                Chain::Robinhood,
+                shares(7),
+                now,
+            )
+            .unwrap()
+            .apply_reconciled_onchain_equity_snapshot(
+                Chain::Robinhood,
+                balances.iter(),
+                now,
+                Some(42),
+                now,
+                &BTreeSet::from([symbol.clone()]),
+                &BTreeSet::new(),
+            )
+            .unwrap();
+        assert!(view.onchain_fill_absorbed_by_equity_snapshot(&symbol, Chain::Robinhood, Some(41)));
+
+        let reset = view.reset_preserving_offchain_order_state();
+        assert_eq!(
+            reset.onchain_equity_available_at(&symbol, Chain::Robinhood),
+            Some(shares(40))
+        );
+        assert!(
+            reset.onchain_fill_absorbed_by_equity_snapshot(&symbol, Chain::Robinhood, Some(41)),
+            "a delayed older fill must stay absorbed by the kept balance"
+        );
+        assert!(!reset.onchain_fill_absorbed_by_equity_snapshot(
+            &symbol,
+            Chain::Robinhood,
+            Some(43)
+        ));
+        assert_eq!(
+            reset.equity_snapshot_watermark(&symbol, Venue::MarketMaking, Chain::Robinhood),
+            Some(now)
+        );
+    }
+
+    #[test]
+    fn new_snapshot_keeps_base_redemptions_when_other_chain_has_stranded_shares() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let now = Utc::now();
+        let view = InventoryView::default()
+            .seed_stranded_redemption(
+                &RedemptionAggregateId::generate(),
+                &symbol,
+                Chain::Robinhood,
+                shares(7),
+                now,
+            )
+            .unwrap()
+            .apply_snapshot_hydration_event_with_format(
+                &InventorySnapshotEvent::InflightEquity {
+                    mints: BTreeMap::new(),
+                    redemptions: BTreeMap::from([(symbol.clone(), shares(3))]),
+                    fetched_at: now,
+                    base_redemptions_chain_scoped: true,
+                },
+                now,
+                false,
+            )
+            .unwrap();
+        assert_eq!(
+            view.equity_inflight_at(&symbol, Venue::MarketMaking, Chain::Base),
+            Some(shares(3))
+        );
+        assert_eq!(
+            view.equity_inflight_at(&symbol, Venue::MarketMaking, Chain::Robinhood),
+            Some(shares(7))
+        );
+    }
+
+    #[test]
+    fn legacy_base_redemption_entry_is_not_hydrated_onto_base_for_other_chain_inflight() {
+        let aapl = Symbol::new("AAPL").unwrap();
+        let tsla = Symbol::new("TSLA").unwrap();
+        let now = Utc::now();
+        let view = InventoryView::default();
+
+        let hydrated = view
+            .apply_snapshot_hydration_event_with_format(
+                &InventorySnapshotEvent::InflightEquity {
+                    mints: BTreeMap::new(),
+                    redemptions: BTreeMap::from([
+                        (aapl.clone(), shares(5)),
+                        (tsla.clone(), shares(2)),
+                    ]),
+                    fetched_at: now,
+                    base_redemptions_chain_scoped: true,
+                },
+                now,
+                true,
+            )
+            .unwrap();
+
+        assert_eq!(
+            hydrated.equity_inflight_at(&aapl, Venue::MarketMaking, Chain::Base),
+            None
+        );
+        assert_eq!(
+            hydrated.equity_inflight_at(&aapl, Venue::MarketMaking, Chain::Robinhood),
+            None
+        );
+        assert_eq!(
+            hydrated.equity_inflight_at(&tsla, Venue::MarketMaking, Chain::Base),
+            None
+        );
+    }
+
+    #[test]
+    fn reset_keeps_stranded_provider_inflight_markers() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let now = Utc::now();
+        let later = now + Duration::seconds(1);
+        let view = InventoryView::default()
+            .seed_stranded_redemption(
+                &RedemptionAggregateId::generate(),
+                &symbol,
+                Chain::Robinhood,
+                shares(7),
+                now,
+            )
+            .unwrap()
+            .apply_inflight_redemptions_at(
+                Chain::Robinhood,
+                &BTreeMap::from([(symbol.clone(), shares(5))]),
+                now,
+                now,
+            )
+            .unwrap();
+        assert_eq!(
+            view.equity_inflight_at(&symbol, Venue::MarketMaking, Chain::Robinhood),
+            Some(shares(12))
+        );
+        let reset = view.reset_preserving_offchain_order_state();
+        assert_eq!(
+            reset.equity_inflight_at(&symbol, Venue::MarketMaking, Chain::Robinhood),
+            Some(shares(12))
+        );
+        let cleared = reset
+            .apply_inflight_redemptions_at(Chain::Robinhood, &BTreeMap::new(), later, later)
+            .unwrap();
+        assert_eq!(
+            cleared.equity_inflight_at(&symbol, Venue::MarketMaking, Chain::Robinhood),
+            Some(shares(7))
+        );
+    }
+
+    #[test]
+    fn clearing_stranded_exposure_allows_later_pending_disappearance() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let now = Utc::now();
+        let fresh = now + Duration::seconds(1);
+        let id = RedemptionAggregateId::generate();
+        let mut view = InventoryView::default()
+            .seed_stranded_redemption(&id, &symbol, Chain::Robinhood, shares(7), now)
+            .unwrap();
+        let claimed = view.claim_stranded_redemption(&id).unwrap();
+        assert_eq!(claimed.quantity, shares(7));
+        let view = view
+            .clear_equity_inflight_at(&symbol, Chain::Robinhood, Venue::MarketMaking, now)
+            .unwrap()
+            .apply_inflight_redemptions_at(
+                Chain::Robinhood,
+                &BTreeMap::from([(symbol.clone(), shares(4))]),
+                fresh,
+                fresh,
+            )
+            .unwrap()
+            .apply_inflight_redemptions_at(Chain::Robinhood, &BTreeMap::new(), fresh, fresh)
+            .unwrap();
+        assert_eq!(
+            view.equity_inflight_at(&symbol, Venue::MarketMaking, Chain::Robinhood),
+            Some(FractionalShares::ZERO)
+        );
+    }
+
+    #[test]
+    fn stale_pending_poll_preserves_disappearance_marker_until_fresh_poll() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let now = Utc::now();
+        let fresh = now + Duration::seconds(1);
+        let pending = BTreeMap::from([(symbol.clone(), shares(4))]);
+        let view = InventoryView::default()
+            .apply_inflight_redemptions_at(Chain::Robinhood, &pending, now, now)
+            .unwrap()
+            .update_equity_at(
+                &symbol,
+                Chain::Robinhood,
+                Inventory::with_last_rebalancing(fresh),
+                fresh,
+            )
+            .unwrap()
+            .apply_inflight_redemptions_at(Chain::Robinhood, &pending, now, fresh)
+            .unwrap()
+            .apply_inflight_redemptions_at(Chain::Robinhood, &BTreeMap::new(), fresh, fresh)
+            .unwrap();
+        assert_eq!(
+            view.equity_inflight_at(&symbol, Venue::MarketMaking, Chain::Robinhood),
+            Some(FractionalShares::ZERO)
+        );
+    }
+
+    #[test]
+    fn secondary_redemption_disappearance_leaves_base_inflight_unchanged() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let now = Utc::now();
+        let base = BTreeMap::from([(symbol.clone(), shares(3))]);
+        let secondary = BTreeMap::from([(symbol.clone(), shares(7))]);
+        let view = InventoryView::default()
+            .with_equity(symbol.clone(), shares(50), shares(50))
+            .apply_inflight_snapshot(&BTreeMap::new(), &base, now, now)
+            .unwrap()
+            .apply_inflight_redemptions_at(Chain::Robinhood, &secondary, now, now)
+            .unwrap();
+        assert_eq!(
+            view.equity_inflight_at(&symbol, Venue::MarketMaking, Chain::Base),
+            Some(shares(3))
+        );
+        assert_eq!(
+            view.equity_inflight_at(&symbol, Venue::MarketMaking, Chain::Robinhood),
+            Some(shares(7))
+        );
+        let view = view
+            .apply_inflight_redemptions_at(Chain::Robinhood, &BTreeMap::new(), now, now)
+            .unwrap();
+        assert_eq!(
+            view.equity_inflight_at(&symbol, Venue::MarketMaking, Chain::Base),
+            Some(shares(3))
+        );
+        assert_eq!(
+            view.equity_inflight_at(&symbol, Venue::MarketMaking, Chain::Robinhood),
+            Some(FractionalShares::ZERO)
+        );
+    }
+
+    #[test]
     fn clear_previous_redemption_marker_prevents_incorrect_zeroing() {
         let symbol = Symbol::new("AAPL").unwrap();
         let now = Utc::now();
@@ -6466,7 +7303,7 @@ mod tests {
                 now,
             )
             .unwrap()
-            .clear_previous_inflight_redemption_marker(&symbol);
+            .clear_previous_inflight_redemption_marker(&symbol, Chain::Base);
 
         // Poll 2: empty (Alpaca hasn't reflected the new request).
         let view = view
@@ -6585,7 +7422,8 @@ mod tests {
             active_redemptions: HashMap::new(),
             inflight_equity: HashMap::new(),
             previous_inflight_mint_symbols: HashSet::new(),
-            previous_inflight_redemption_symbols: HashSet::new(),
+            previous_inflight_redemptions: HashMap::new(),
+            startup_stranded_redemptions: HashMap::new(),
             onchain_equity_snapshot_watermarks: HashMap::new(),
             offchain_equity_snapshot_watermarks: HashMap::new(),
             pending_offchain_orders: HashMap::new(),
@@ -6652,7 +7490,8 @@ mod tests {
             active_redemptions: HashMap::new(),
             inflight_equity: HashMap::new(),
             previous_inflight_mint_symbols: HashSet::new(),
-            previous_inflight_redemption_symbols: HashSet::new(),
+            previous_inflight_redemptions: HashMap::new(),
+            startup_stranded_redemptions: HashMap::new(),
             onchain_equity_snapshot_watermarks: HashMap::new(),
             offchain_equity_snapshot_watermarks: HashMap::new(),
             pending_offchain_orders: HashMap::new(),
@@ -7284,7 +8123,7 @@ mod tests {
         // last_rebalancing = now, the guard that wedges the view.
         let view = InventoryView::default()
             .with_equity(spym.clone(), shares(0), shares(136))
-            .clear_equity_inflight(&spym, Venue::Hedging, now)
+            .clear_equity_inflight_at(&spym, Chain::Base, Venue::Hedging, now)
             .unwrap();
 
         // An ordinary snapshot fetched before the stamp stays rejected.
