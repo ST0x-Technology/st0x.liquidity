@@ -177,7 +177,7 @@ mod tests {
 
     use st0x_config::{
         ChainAssets, ChainEquities, ChainEquityAsset, EquityHedgePolicy, ExecutionThreshold,
-        HedgedEquities, HedgingAssets, OperationMode,
+        HedgedEquities, HedgingAssets, OperationMode, RebalancingMode,
     };
     use st0x_event_sorcery::{Projection, Store, StoreBuilder};
     use st0x_evm::Chain;
@@ -238,7 +238,7 @@ mod tests {
                         tokenized_equity_derivative: Address::ZERO,
                         vault_ids: Vec::new(),
                         trading: OperationMode::Enabled,
-                        rebalancing: OperationMode::Disabled,
+                        rebalancing: RebalancingMode::Disabled,
                         wrapped_equity_recovery: OperationMode::Disabled,
                         operational_limit: None,
                         target_share: None,
@@ -698,7 +698,7 @@ mod tests {
                         tokenized_equity_derivative: Address::ZERO,
                         vault_ids: Vec::new(),
                         trading: OperationMode::Enabled,
-                        rebalancing: OperationMode::Disabled,
+                        rebalancing: RebalancingMode::Disabled,
                         wrapped_equity_recovery: OperationMode::Disabled,
                         operational_limit: Some(
                             Positive::new(FractionalShares::new(float!(3.0))).unwrap(),

@@ -81,6 +81,8 @@ pub enum RegistryError {
     NotATable { what: String },
     #[error("token file: {what}.{key} must be \"enabled\" or \"disabled\"")]
     BadSwitch { what: String, key: &'static str },
+    #[error("token file: {what}.rebalancing must be \"enabled\", \"paused\" or \"disabled\"")]
+    BadRebalancingMode { what: String },
     #[error("token file: {what}.{key} missing")]
     MissingAddress { what: String, key: &'static str },
     #[error("token file: no slot carries the bot's keys; refusing an empty universe")]
@@ -148,6 +150,7 @@ impl RegistryError {
             | Self::SchemaVersion { .. }
             | Self::NotATable { .. }
             | Self::BadSwitch { .. }
+            | Self::BadRebalancingMode { .. }
             | Self::MissingAddress { .. }
             | Self::EmptyUniverse
             | Self::UndeclaredChain { .. }
@@ -286,6 +289,13 @@ fn is_switch(value: Option<&Value>) -> bool {
     matches!(value.and_then(Value::as_str), Some("enabled" | "disabled"))
 }
 
+fn is_rebalancing_mode(value: Option<&Value>) -> bool {
+    matches!(
+        value.and_then(Value::as_str),
+        Some("enabled" | "paused" | "disabled")
+    )
+}
+
 /// Turn the token file into the bot's per-symbol tables.
 ///
 /// A chain row is taken from every slot that carries any of the bot's own
@@ -335,10 +345,13 @@ pub fn project(file: &Table) -> Result<Projection, RegistryError> {
             if !ours {
                 continue;
             }
-            for key in ["trading", "rebalancing", "wrapped_equity_recovery"] {
+            for key in ["trading", "wrapped_equity_recovery"] {
                 if !is_switch(slot.get(key)) {
                     return Err(RegistryError::BadSwitch { what, key });
                 }
+            }
+            if !is_rebalancing_mode(slot.get("rebalancing")) {
+                return Err(RegistryError::BadRebalancingMode { what });
             }
             for key in ["tokenized_equity", "tokenized_equity_derivative"] {
                 if slot.get(key).and_then(Value::as_str).is_none() {
@@ -837,6 +850,24 @@ mod tests {
         assert!(projection.slots().contains("base/FGI"));
     }
 
+    /// A paused row passes the projection and reaches the loader as
+    /// `RebalancingMode::Paused`, so the pause switch works on the token-file
+    /// path that prod and staging use.
+    #[test]
+    fn a_paused_rebalancing_row_is_projected() {
+        let mut file = parse(fixture("tokens-staging.toml").as_bytes()).unwrap();
+        file["chains"]["base"]["assets"]["equities"]["FGI"]
+            .as_table_mut()
+            .unwrap()
+            .insert("rebalancing".into(), Value::String("paused".into()));
+
+        let projection = project(&file).unwrap();
+        let row = projection.chain_rows["base"]["FGI"].clone();
+        let asset: crate::ChainEquityAsset = Value::Table(row).try_into().unwrap();
+
+        assert_eq!(asset.rebalancing, crate::RebalancingMode::Paused);
+    }
+
     #[test]
     fn a_bad_switch_a_wrong_schema_and_an_undeclared_chain_are_refused() {
         let mut file = parse(fixture("tokens-staging.toml").as_bytes()).unwrap();
@@ -847,6 +878,16 @@ mod tests {
         assert!(matches!(
             project(&file).unwrap_err(),
             RegistryError::BadSwitch { key: "trading", .. }
+        ));
+
+        let mut file = parse(fixture("tokens-staging.toml").as_bytes()).unwrap();
+        file["chains"]["base"]["assets"]["equities"]["FGI"]
+            .as_table_mut()
+            .unwrap()
+            .insert("rebalancing".into(), Value::String("pause".into()));
+        assert!(matches!(
+            project(&file).unwrap_err(),
+            RegistryError::BadRebalancingMode { .. }
         ));
 
         let mut file = parse(fixture("tokens-staging.toml").as_bytes()).unwrap();

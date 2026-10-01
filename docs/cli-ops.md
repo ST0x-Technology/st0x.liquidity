@@ -249,12 +249,12 @@ automated path for this, the operator deposits it. Prerequisites, all per chain:
 - A `[chains.<name>.trading]` table with the chain's orderbook, inventory, vault
   owner, asset table and `redemption_wallet`. The wallet and a deployed wrapper
   vault per equity are required only when the chain rebalances equity (the
-  primary, or a secondary with an equity that has `rebalancing = "enabled"`);
-  the bot fails startup without them there. A hedge-only secondary (every equity
-  `rebalancing = "disabled"`) needs neither: its fills are hedged and nothing is
-  minted, wrapped or redeemed on it, so its startup MAX approvals (and the
-  Turnkey policies `verify-approvals` demands for them) are the single USDC
-  grant alone, with no wrapper to approve. That grant names the chain's
+  primary, or a secondary with an equity that has `rebalancing = "enabled"` or
+  `"paused"`); the bot fails startup without them there. A hedge-only secondary
+  (every equity `rebalancing = "disabled"`) needs neither: its fills are hedged
+  and nothing is minted, wrapped or redeemed on it, so its startup MAX approvals
+  (and the Turnkey policies `verify-approvals` demands for them) are the single
+  USDC grant alone, with no wrapper to approve. That grant names the chain's
   orderbook when its `inventory_mode` is `legacy`, and its configured
   `inventory` when it is `managed`.
 - A signing wallet for the chain in `[wallet]`, funded with native gas, and an
@@ -287,6 +287,15 @@ the server resumes an interrupted transfer with that chain's wallet, vault and
 issuer. A resumed mint (`--issuer-request-id`) must be given the network it
 started on; a `--network` that disagrees with the record is refused, and the
 `transfer` recovery verbs carry no network at all.
+
+Fresh `transfer-equity` mints and redemptions require the listing on the
+selected chain to have `rebalancing = "enabled"`. Paused or disabled listings
+refuse new operations, including manually requested transfers. Resuming a
+persisted mint with `--issuer-request-id` remains available while paused or
+disabled. A persisted mint that the issuer has no record of is not replayed on
+such a listing. The lookup is inconclusive, so the resume errors and leaves the
+mint at `MintRequested` with its reservation. Confirm with the issuer that it
+never received the request, then use `transfer fail --kind mint`.
 
 ### Orchestrator Rollout per Chain
 

@@ -13,7 +13,7 @@ use thiserror::Error;
 use st0x_evm::Chain;
 use st0x_execution::Symbol;
 
-use crate::assets::{ChainAssets, ChainEquityAsset, OperationMode};
+use crate::assets::{ChainAssets, ChainEquityAsset, OperationMode, RebalancingMode};
 
 /// How far along a chain is in its bring-up.
 ///
@@ -222,13 +222,14 @@ pub enum ChainEnablementError {
         symbol: Symbol,
     },
     #[error(
-        "[chains.{chain}] is \"{lifecycle}\" while {symbol} has rebalancing = \"enabled\": \
+        "[chains.{chain}] is \"{lifecycle}\" while {symbol} has rebalancing = \"{mode}\": \
          only an active chain may rebalance equity"
     )]
     EquityRebalancingExceedsLifecycle {
         chain: Chain,
         lifecycle: ChainLifecycle,
         symbol: Symbol,
+        mode: RebalancingMode,
     },
     #[error(
         "[chains.{chain}] is \"{lifecycle}\" while cash has rebalancing = \"enabled\": \
@@ -288,13 +289,14 @@ pub fn check_enablement(
         && !lifecycle.allows_rebalancing()
         && let Some(assets) = assets
     {
-        if let Some(symbol) = first_equity_matching(assets, |equity| {
-            equity.rebalancing == OperationMode::Enabled
-        }) {
+        if let Some(symbol) =
+            first_equity_matching(assets, |equity| equity.rebalancing.keeps_services())
+        {
             return Err(ChainEnablementError::EquityRebalancingExceedsLifecycle {
                 chain,
                 lifecycle,
                 symbol: symbol.clone(),
+                mode: assets.rebalancing_mode(symbol),
             });
         }
 
@@ -443,7 +445,7 @@ mod tests {
                 tokenized_equity_derivative: alloy::primitives::Address::ZERO,
                 vault_ids: vec![],
                 trading: OperationMode::Enabled,
-                rebalancing: OperationMode::Enabled,
+                rebalancing: RebalancingMode::Enabled,
                 wrapped_equity_recovery: OperationMode::Disabled,
                 operational_limit: None,
                 target_share: None,
@@ -495,7 +497,7 @@ mod tests {
                 tokenized_equity_derivative: alloy::primitives::Address::ZERO,
                 vault_ids: vec![],
                 trading: OperationMode::Enabled,
-                rebalancing: OperationMode::Enabled,
+                rebalancing: RebalancingMode::Enabled,
                 wrapped_equity_recovery: OperationMode::Disabled,
                 operational_limit: None,
                 target_share: None,
@@ -526,7 +528,7 @@ mod tests {
                 tokenized_equity_derivative: alloy::primitives::Address::ZERO,
                 vault_ids: Vec::new(),
                 trading: OperationMode::Enabled,
-                rebalancing: OperationMode::Disabled,
+                rebalancing: RebalancingMode::Disabled,
                 wrapped_equity_recovery: OperationMode::Disabled,
                 operational_limit: None,
                 target_share: None,
@@ -565,7 +567,7 @@ mod tests {
                     tokenized_equity_derivative: alloy::primitives::Address::ZERO,
                     vault_ids: Vec::new(),
                     trading: OperationMode::Enabled,
-                    rebalancing: OperationMode::Disabled,
+                    rebalancing: RebalancingMode::Disabled,
                     wrapped_equity_recovery: OperationMode::Disabled,
                     operational_limit: None,
                     target_share: None,
@@ -588,48 +590,58 @@ mod tests {
         ));
     }
 
+    /// A paused listing keeps the chain's equity services, so it needs an
+    /// active chain just as an enabled one does.
     #[test]
     fn non_active_lifecycles_refuse_equity_rebalancing_by_name() {
-        let symbol = Symbol::new("AAPL").unwrap();
-        let mut assets = ChainAssets::default();
-        assets.equities.symbols.insert(
-            symbol.clone(),
-            crate::ChainEquityAsset {
-                tokenized_equity: alloy::primitives::Address::ZERO,
-                tokenized_equity_derivative: alloy::primitives::Address::ZERO,
-                vault_ids: Vec::new(),
-                trading: OperationMode::Disabled,
-                rebalancing: OperationMode::Enabled,
-                wrapped_equity_recovery: OperationMode::Disabled,
-                operational_limit: None,
-                target_share: None,
-            },
-        );
-
-        for lifecycle in [ChainLifecycle::ObserveOnly, ChainLifecycle::Prefunded] {
-            let error = check_enablement(Chain::Base, lifecycle, true, Some(&assets)).unwrap_err();
-            assert_eq!(
-                error.to_string(),
-                format!(
-                    "[chains.base] is \"{lifecycle}\" while AAPL has rebalancing = \
-                     \"enabled\": only an active chain may rebalance equity"
-                )
+        for (mode, label) in [
+            (RebalancingMode::Enabled, "enabled"),
+            (RebalancingMode::Paused, "paused"),
+        ] {
+            let symbol = Symbol::new("AAPL").unwrap();
+            let mut assets = ChainAssets::default();
+            assets.equities.symbols.insert(
+                symbol.clone(),
+                crate::ChainEquityAsset {
+                    tokenized_equity: alloy::primitives::Address::ZERO,
+                    tokenized_equity_derivative: alloy::primitives::Address::ZERO,
+                    vault_ids: Vec::new(),
+                    trading: OperationMode::Disabled,
+                    rebalancing: mode,
+                    wrapped_equity_recovery: OperationMode::Disabled,
+                    operational_limit: None,
+                    target_share: None,
+                },
             );
 
-            let ChainEnablementError::EquityRebalancingExceedsLifecycle {
-                chain,
-                lifecycle: actual_lifecycle,
-                symbol: actual_symbol,
-            } = error
-            else {
-                panic!("expected EquityRebalancingExceedsLifecycle, got: {error:?}")
-            };
-            assert_eq!(chain, Chain::Base);
-            assert_eq!(actual_lifecycle, lifecycle);
-            assert_eq!(actual_symbol, symbol);
-        }
+            for lifecycle in [ChainLifecycle::ObserveOnly, ChainLifecycle::Prefunded] {
+                let error =
+                    check_enablement(Chain::Base, lifecycle, true, Some(&assets)).unwrap_err();
+                assert_eq!(
+                    error.to_string(),
+                    format!(
+                        "[chains.base] is \"{lifecycle}\" while AAPL has rebalancing = \
+                         \"{label}\": only an active chain may rebalance equity"
+                    )
+                );
 
-        check_enablement(Chain::Base, ChainLifecycle::Active, true, Some(&assets)).unwrap();
+                let ChainEnablementError::EquityRebalancingExceedsLifecycle {
+                    chain,
+                    lifecycle: actual_lifecycle,
+                    symbol: actual_symbol,
+                    mode: actual_mode,
+                } = error
+                else {
+                    panic!("expected EquityRebalancingExceedsLifecycle, got: {error:?}")
+                };
+                assert_eq!(chain, Chain::Base);
+                assert_eq!(actual_lifecycle, lifecycle);
+                assert_eq!(actual_symbol, symbol);
+                assert_eq!(actual_mode, mode);
+            }
+
+            check_enablement(Chain::Base, ChainLifecycle::Active, true, Some(&assets)).unwrap();
+        }
     }
 
     #[test]
@@ -680,7 +692,7 @@ mod tests {
                 tokenized_equity_derivative: alloy::primitives::Address::ZERO,
                 vault_ids: Vec::new(),
                 trading: OperationMode::Enabled,
-                rebalancing: OperationMode::Enabled,
+                rebalancing: RebalancingMode::Enabled,
                 wrapped_equity_recovery: OperationMode::Disabled,
                 operational_limit: None,
                 target_share: None,

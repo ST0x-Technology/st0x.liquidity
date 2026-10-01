@@ -496,6 +496,7 @@ mod tests {
 
     use st0x_config::{
         ChainAssets, ChainEquities, ChainEquityAsset, ChainRole, InventoryMode, OperationMode,
+        RebalancingMode,
     };
     use st0x_evm::turnkey::{TurnkeyPolicy, TurnkeyPolicyEffect, TurnkeyPolicySnapshot};
     use st0x_evm::{USDC_BASE, USDC_ETHEREUM, USDC_HYPEREVM};
@@ -929,7 +930,7 @@ mod tests {
                             ),
                             vault_ids: Vec::new(),
                             trading: OperationMode::Enabled,
-                            rebalancing: OperationMode::Disabled,
+                            rebalancing: RebalancingMode::Disabled,
                             wrapped_equity_recovery: OperationMode::Disabled,
                             operational_limit: None,
                             target_share: None,

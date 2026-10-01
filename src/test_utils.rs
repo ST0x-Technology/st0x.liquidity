@@ -24,7 +24,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Condvar, LazyLock, Mutex};
 use std::time::Duration;
 
-use st0x_config::{BrokerCtx, ChainEquities, ChainEquityAsset, OperationMode};
+use st0x_config::{BrokerCtx, ChainEquities, ChainEquityAsset, OperationMode, RebalancingMode};
 #[cfg(any(test, feature = "test-support"))]
 use st0x_event_sorcery::{DomainEvent, EventSourced};
 use st0x_evm::Chain;
@@ -162,7 +162,7 @@ pub fn try_rebalancing_enabled_equities(symbols: &[&str]) -> anyhow::Result<Chai
                         tokenized_equity_derivative: Address::ZERO,
                         vault_ids: Vec::new(),
                         trading: OperationMode::Disabled,
-                        rebalancing: OperationMode::Enabled,
+                        rebalancing: RebalancingMode::Enabled,
                         wrapped_equity_recovery: OperationMode::Disabled,
                         operational_limit: None,
                         target_share: None,
@@ -186,7 +186,7 @@ pub fn trading_enabled_equity() -> ChainEquityAsset {
         tokenized_equity_derivative: Address::ZERO,
         vault_ids: Vec::new(),
         trading: OperationMode::Enabled,
-        rebalancing: OperationMode::Disabled,
+        rebalancing: RebalancingMode::Disabled,
         wrapped_equity_recovery: OperationMode::Disabled,
         operational_limit: None,
         target_share: None,

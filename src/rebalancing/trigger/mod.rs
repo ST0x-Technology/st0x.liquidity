@@ -31,8 +31,8 @@ use uuid::Uuid;
 use rain_math_float::Float;
 use st0x_bridge::corridor::{UsdcCorridor, legacy_base_cctp};
 use st0x_config::{
-    AllocationCtx, ChainAssets, ChainEquityAsset, ExecutionThreshold, OperationMode, TargetShare,
-    UsdcCorridorCtx, UsdcCorridors,
+    AllocationCtx, ChainAssets, ChainEquityAsset, ExecutionThreshold, OperationMode,
+    RebalancingMode, TargetShare, UsdcCorridorCtx, UsdcCorridors,
 };
 #[cfg(test)]
 use st0x_config::{ChainCashAsset, ChainEquities};
@@ -51,8 +51,8 @@ use st0x_tokenization::{ClientRequestId, IssuerRequestId, TokenizationRequestId}
 use st0x_wrapper::{Wrapper, WrapperError};
 
 use self::allocation::{
-    ChainSlot, DeclineReason, EquityPlan, EquityPlanInput, PlannedDirection, PlannedOperation,
-    plan_equity_operation,
+    ChainSlot, DeclineReason, EquityPlan, EquityPlanInput, Participation, PlannedDirection,
+    PlannedOperation, plan_equity_operation,
 };
 use self::freeze::FreezeStatusReader;
 use self::usdc::UsdcRebalanceOperation;
@@ -322,18 +322,21 @@ pub(crate) struct RebalancingServiceConfig {
 impl RebalancingServiceConfig {
     /// Whitelist gate for the equity rebalancing trigger: a symbol is
     /// planned only when some hedged chain lists it with
-    /// `rebalancing = "enabled"`. Symbols observed in inventory but absent
-    /// from every table are skipped cleanly instead of falling through to
-    /// the `WrapperService` `SymbolNotConfigured` error backstop.
+    /// `rebalancing = "enabled"` or `"paused"`; the planner never starts an
+    /// operation on a paused listing but still counts its inventory.
+    /// Symbols observed in inventory but absent from every table are
+    /// skipped cleanly instead of falling through to the `WrapperService`
+    /// `SymbolNotConfigured` error backstop.
     fn rebalances_equity(&self, symbol: &Symbol) -> bool {
         self.chains
             .values()
-            .any(|chain| chain.assets.is_rebalancing_enabled(symbol))
+            .any(|chain| chain.assets.rebalancing_mode(symbol).keeps_services())
     }
 
-    /// Every hedged chain whose listing of `symbol` rebalances it. A
-    /// hedge-only listing (`rebalancing = "disabled"`) is neither slotted
-    /// nor counted: its prefunded inventory is outside the planner's total.
+    /// Every hedged chain whose listing of `symbol` rebalances it, enabled or
+    /// paused. A hedge-only listing (`rebalancing = "disabled"`) is neither
+    /// slotted nor counted: its prefunded inventory is outside the planner's
+    /// total.
     fn rebalancing_listings<'config>(
         &'config self,
         symbol: &'config Symbol,
@@ -350,7 +353,7 @@ impl RebalancingServiceConfig {
                 .equities
                 .symbols
                 .get(symbol)
-                .filter(|listing| listing.rebalancing == OperationMode::Enabled)
+                .filter(|listing| listing.rebalancing.keeps_services())
                 .map(|listing| (*chain, config, listing))
         })
     }
@@ -1451,7 +1454,7 @@ impl RebalancingService {
         Ok(())
     }
 
-    async fn retry_pending_equity_transfer_reservation_restores(
+    pub(super) async fn retry_pending_equity_transfer_reservation_restores(
         &self,
     ) -> Result<(), RebalancingServiceError> {
         if self
@@ -4291,18 +4294,25 @@ impl RebalancingService {
             let target = listing
                 .target_share
                 .or_else(|| self.config.allocation.targets.get(&chain).copied());
-            let (enabled, target) = target.map_or_else(
+            let (participation, target) = target.map_or_else(
                 || {
                     error!(
                         target: "rebalance",
                         %symbol,
                         %chain,
-                        "A rebalancing-enabled listing has no target share; treating it as \
+                        "A rebalancing listing (enabled or paused) has no target share; treating it as \
                          disabled -- config validation should have refused this"
                     );
-                    (false, TargetShare::ZERO)
+                    (Participation::NoTarget, TargetShare::ZERO)
                 },
-                |target| (true, target),
+                |target| {
+                    let participation = match listing.rebalancing {
+                        RebalancingMode::Enabled => Participation::Plans,
+                        RebalancingMode::Paused => Participation::Paused,
+                        RebalancingMode::Disabled => Participation::NoTarget,
+                    };
+                    (participation, target)
+                },
             );
 
             onchain.insert(
@@ -4317,7 +4327,7 @@ impl RebalancingService {
                     // Both probed only once the planner picks the chain.
                     gas_ready: true,
                     registry_known: true,
-                    enabled,
+                    participation,
                 },
             );
         }
@@ -4511,7 +4521,8 @@ impl RebalancingService {
             (
                 DeclineReason::BelowMinimum { chain }
                 | DeclineReason::NoGas { chain }
-                | DeclineReason::CoolingDown { chain },
+                | DeclineReason::CoolingDown { chain }
+                | DeclineReason::Paused { chain },
                 _,
             ) => {
                 info!(
@@ -6571,7 +6582,7 @@ impl RebalancingService {
         false
     }
 
-    async fn cancel_pending_equity_transfer_reservation_restore(
+    pub(super) async fn cancel_pending_equity_transfer_reservation_restore(
         &self,
         reservation_id: EquityTransferReservationId,
     ) {
@@ -8790,7 +8801,7 @@ mod tests {
     use st0x_bridge::corridor::HopKind;
     use st0x_config::{
         ChainCashAsset, ChainEquities, ChainEquityAsset, ExecutionThreshold, ImbalanceThreshold,
-        OperationMode,
+        OperationMode, RebalancingMode,
     };
     use st0x_dto::Statement;
     use st0x_event_sorcery::{
@@ -9009,7 +9020,7 @@ mod tests {
                     tokenized_equity_derivative: Address::random(),
                     vault_ids: Vec::new(),
                     trading: OperationMode::Enabled,
-                    rebalancing: OperationMode::Enabled,
+                    rebalancing: RebalancingMode::Enabled,
                     wrapped_equity_recovery: OperationMode::Enabled,
                     operational_limit: None,
                     target_share: None,
@@ -9080,7 +9091,7 @@ mod tests {
                     tokenized_equity_derivative: Address::random(),
                     vault_ids: Vec::new(),
                     trading: OperationMode::Disabled,
-                    rebalancing: OperationMode::Disabled,
+                    rebalancing: RebalancingMode::Disabled,
                     wrapped_equity_recovery: OperationMode::Enabled,
                     operational_limit: None,
                     target_share: None,
@@ -9151,7 +9162,7 @@ mod tests {
                     tokenized_equity_derivative: Address::random(),
                     vault_ids: Vec::new(),
                     trading: OperationMode::Disabled,
-                    rebalancing: OperationMode::Disabled,
+                    rebalancing: RebalancingMode::Disabled,
                     wrapped_equity_recovery: OperationMode::Disabled,
                     operational_limit: None,
                     target_share: None,
@@ -9281,7 +9292,7 @@ mod tests {
                                 tokenized_equity_derivative: Address::ZERO,
                                 vault_ids: Vec::new(),
                                 trading: OperationMode::Disabled,
-                                rebalancing: OperationMode::Enabled,
+                                rebalancing: RebalancingMode::Enabled,
                                 wrapped_equity_recovery: OperationMode::Enabled,
                                 operational_limit: None,
                                 target_share: None,
@@ -12144,7 +12155,7 @@ mod tests {
             .symbols
             .get_mut(&symbol)
             .expect("AAPL is configured")
-            .rebalancing = OperationMode::Disabled;
+            .rebalancing = RebalancingMode::Disabled;
 
         let trigger = make_imbalanced_trigger_with_equities(&symbol, equities).await;
 
@@ -12160,6 +12171,103 @@ mod tests {
             0,
             "Disabled asset should not trigger equity rebalancing"
         );
+    }
+
+    /// A symbol configured with `rebalancing = "paused"` passes the whitelist
+    /// and is planned, but the imbalance starts no job: the planner records a
+    /// `paused` decline for the chain instead.
+    #[tracing_test::traced_test]
+    #[tokio::test]
+    async fn paused_asset_starts_no_equity_operation() {
+        let symbol = Symbol::new("AAPL").unwrap();
+
+        let mut equities = rebalancing_enabled_equities(&["AAPL"]);
+        equities
+            .symbols
+            .get_mut(&symbol)
+            .expect("AAPL is configured")
+            .rebalancing = RebalancingMode::Paused;
+
+        let trigger = make_imbalanced_trigger_with_equities(&symbol, equities).await;
+
+        trigger.check_and_trigger_equity(&symbol).await.unwrap();
+
+        assert_eq!(count_pending_equity_mint_jobs(&trigger).await, 0);
+        assert_eq!(count_pending_equity_redemption_jobs(&trigger).await, 0);
+        assert!(
+            logs_contain("reason=\"paused\"") && logs_contain("chain=base"),
+            "the paused listing must be planned and declined by name"
+        );
+    }
+
+    #[tokio::test]
+    async fn restarted_trigger_dispatches_again_after_enabled_paused_enabled_cycle() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let mut trigger =
+            make_imbalanced_trigger_with_equities(&symbol, rebalancing_enabled_equities(&["AAPL"]))
+                .await;
+        let queue_pool = trigger
+            .transfer_equity_to_market_making_queue
+            .pool()
+            .clone();
+        let (position, threshold) = trigger.position_authority().await.unwrap();
+        let projection = trigger.position_projection.read().await.clone().unwrap();
+
+        for (mode, expected_jobs) in [
+            (RebalancingMode::Enabled, 1),
+            (RebalancingMode::Paused, 0),
+            (RebalancingMode::Enabled, 1),
+        ] {
+            let mut config = trigger.config.clone();
+            config
+                .chains
+                .get_mut(&Chain::Base)
+                .unwrap()
+                .assets
+                .equities
+                .symbols
+                .get_mut(&symbol)
+                .unwrap()
+                .rebalancing = mode;
+            let restarted = Arc::new(RebalancingService::new(
+                config,
+                trigger.vault_registry.clone(),
+                trigger.registry_ids.clone(),
+                trigger.inventory.clone(),
+                trigger.wrappers.clone(),
+                RebalancingSchedulers::new(&queue_pool),
+                trigger.notifier.clone(),
+            ));
+            restarted
+                .set_position_authority(position.clone(), projection.clone(), threshold)
+                .await;
+            restarted
+                .set_last_price_reader(Arc::new(StubLastPrice(float!(100))))
+                .await;
+            drop(trigger);
+            trigger = restarted;
+
+            trigger.check_and_trigger_equity(&symbol).await.unwrap();
+
+            let jobs = take_pending_equity_mint_jobs(&trigger).await;
+            assert_eq!(jobs.len(), expected_jobs, "restarted in {mode} mode");
+            assert_eq!(count_pending_equity_redemption_jobs(&trigger).await, 0);
+            for job in jobs {
+                assert_eq!(job.symbol, symbol);
+                assert_eq!(job.chain, Chain::Base);
+                // Drain the admitted queue work before the next restart, leaving
+                // the same imbalance so the next mode is what decides dispatch.
+                assert!(
+                    trigger
+                        .release_terminal_equity_transfer(
+                            &symbol,
+                            EquityTransferReservationId::from_uuid(job.issuer_request_id.0),
+                        )
+                        .await
+                        .unwrap()
+                );
+            }
+        }
     }
 
     /// A symbol observed in inventory but absent from the equity assets
@@ -12230,7 +12338,7 @@ mod tests {
             .symbols
             .get_mut(&symbol)
             .expect("AAPL is configured")
-            .rebalancing = OperationMode::Disabled;
+            .rebalancing = RebalancingMode::Disabled;
         let config = RebalancingServiceConfig {
             chains: BTreeMap::from([
                 (
@@ -12273,6 +12381,86 @@ mod tests {
         assert_eq!(jobs.len(), 1, "Base alone is under its target");
         assert_eq!(jobs[0].chain, Chain::Base);
         assert_eq!(jobs[0].quantity, shares(30));
+    }
+
+    /// A paused listing still counts in the planner's total, so its chain
+    /// must stay polled: a stale paused Robinhood slot declines the symbol
+    /// even though Base is fresh and under its target.
+    #[tracing_test::traced_test]
+    #[tokio::test]
+    async fn stale_paused_secondary_declines_the_symbol() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let inventory = InventoryView::default()
+            .with_equity(symbol.clone(), shares(20), shares(80))
+            .update_equity_at(
+                &symbol,
+                Chain::Robinhood,
+                Inventory::available(Venue::MarketMaking, Operator::Add, shares(100)),
+                Utc::now(),
+            )
+            .unwrap();
+        let mut paused = rebalancing_enabled_equities(&["AAPL"]);
+        paused
+            .symbols
+            .get_mut(&symbol)
+            .expect("AAPL is configured")
+            .rebalancing = RebalancingMode::Paused;
+        let freshness = PollFreshness::new();
+        freshness.set_observed(
+            PortfolioLocation::MarketMaking(Chain::Base),
+            PortfolioAsset::Equity(symbol.clone()),
+            Utc::now(),
+        );
+        freshness.set_observed(
+            PortfolioLocation::MarketMaking(Chain::Robinhood),
+            PortfolioAsset::Equity(symbol.clone()),
+            Utc::now() - chrono::Duration::seconds(301),
+        );
+        let config = RebalancingServiceConfig {
+            poll_freshness: freshness,
+            inventory_staleness_bound: Duration::from_secs(300),
+            chains: BTreeMap::from([
+                (
+                    Chain::Base,
+                    ChainRebalancingConfig::for_test(ChainAssets {
+                        equities: rebalancing_enabled_equities(&["AAPL"]),
+                        cash: None,
+                    }),
+                ),
+                (
+                    Chain::Robinhood,
+                    ChainRebalancingConfig::for_test(ChainAssets {
+                        equities: paused,
+                        cash: None,
+                    }),
+                ),
+            ]),
+            ..test_config()
+        };
+        let trigger = make_trigger_with_inventory_registry_and_wrappers(
+            inventory,
+            &symbol,
+            BTreeMap::from([
+                (
+                    Chain::Base,
+                    Arc::new(MockWrapper::new()) as Arc<dyn Wrapper>,
+                ),
+                (
+                    Chain::Robinhood,
+                    Arc::new(MockWrapper::new()) as Arc<dyn Wrapper>,
+                ),
+            ]),
+            config,
+        )
+        .await;
+
+        trigger.check_and_trigger_equity(&symbol).await.unwrap();
+
+        assert_eq!(count_pending_equity_mint_jobs(&trigger).await, 0);
+        assert!(
+            logs_contain("chain_stale") && logs_contain("chain=robinhood"),
+            "the stale paused chain must decline the symbol by name"
+        );
     }
 
     /// Cross-chain staleness rule: an equity evaluation must not run off a
@@ -15780,7 +15968,7 @@ mod tests {
                 .symbols
                 .get_mut(&symbol)
                 .expect("AAPL is configured")
-                .rebalancing = OperationMode::Disabled;
+                .rebalancing = RebalancingMode::Disabled;
             let mut config = test_config();
             config.chains.insert(
                 Chain::Robinhood,
@@ -22911,7 +23099,7 @@ mod tests {
                     tokenized_equity_derivative: Address::ZERO,
                     vault_ids: Vec::new(),
                     trading: OperationMode::Disabled,
-                    rebalancing: OperationMode::Enabled,
+                    rebalancing: RebalancingMode::Enabled,
                     wrapped_equity_recovery: OperationMode::Enabled,
                     operational_limit: None,
                     target_share: None,

@@ -28,7 +28,7 @@ pub use allocation::{
 };
 pub use assets::{
     CashHedgePolicy, ChainAssets, ChainCashAsset, ChainEquities, ChainEquityAsset,
-    EquityHedgePolicy, HedgedEquities, HedgingAssets, OperationMode,
+    EquityHedgePolicy, HedgedEquities, HedgingAssets, OperationMode, RebalancingMode,
 };
 pub use bot_gas_valuation::BotGasValuationConfig;
 pub use chain::{

@@ -54,7 +54,7 @@ use st0x_hedge::mock_api::{
 };
 use st0x_hedge::{
     AllocationCtx, ChainAssets, ChainCashAsset, ChainEquities, ChainEquityAsset,
-    ImbalanceThreshold, OperationMode, Position, RebalancingCtx,
+    ImbalanceThreshold, OperationMode, Position, RebalancingCtx, RebalancingMode,
     seed_simulated_equity_redemption_history, seed_simulated_hedge_latency_history,
     seed_simulated_mint_history, seed_simulated_usdc_rebalance_history,
 };
@@ -113,7 +113,7 @@ pub(crate) fn build_full_system_ctx<P: Provider + Clone>(
                     tokenized_equity_derivative: *wrapped,
                     vault_ids: equity_vault_ids.get(symbol).copied().into_iter().collect(),
                     trading: OperationMode::Enabled,
-                    rebalancing: OperationMode::Enabled,
+                    rebalancing: RebalancingMode::Enabled,
                     wrapped_equity_recovery: OperationMode::Disabled,
                     operational_limit: None,
                     target_share: None,
