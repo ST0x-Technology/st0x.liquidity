@@ -1,0 +1,5 @@
+{
+  "message": "Quote amount exceeds the maximum for this pair",
+  "errorCode": "AMOUNT_TOO_HIGH",
+  "requestId": "0x17908814532c7473ba2b8f298e18956d4064cd7c8b6cd07c2e59860d2c2c70d9"
+}
