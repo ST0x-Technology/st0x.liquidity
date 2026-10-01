@@ -291,6 +291,11 @@ pub trait Raindex: Send + Sync {
     /// canonical receipt for it. Does not wait. See [`st0x_evm::mined_tx`].
     async fn mined_tx(&self, tx_hash: TxHash) -> Result<Option<MinedTx>, RaindexError>;
 
+    /// `tx_hash`'s receipt as the node shows it now, or `None` when it shows
+    /// none. Does not wait, confirm or touch the wallet's nonce bookkeeping.
+    async fn tx_receipt(&self, tx_hash: TxHash)
+    -> Result<Option<TransactionReceipt>, RaindexError>;
+
     /// Wait for a previously submitted transaction to be confirmed.
     async fn confirm_tx(&self, tx_hash: TxHash) -> Result<(), RaindexError> {
         self.confirm_tx_receipt(tx_hash).await.map(|_| ())

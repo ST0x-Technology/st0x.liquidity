@@ -793,12 +793,13 @@ stox transfer reconcile --kind redemption --id <redemption-aggregate-id> \
     is mined from the bot wallet, at the withdrawal's nonce, is not the
     withdrawal itself, has the chain's required confirmations, succeeded, and is
     a `withdraw4` to the contract the withdrawal calls, from the same token and
-    vault; the amount may differ. A reverted tx withdrew nothing: reconcile with
-    it as the `--superseding-tx` instead. After adoption the redemption's
-    redrive confirms `<tx>`, records the vault transfer its receipt shows,
-    releases the withdrawal's nonce and continues with the unwrap and send.
-    After the reconciliation deadline the redrive runs every 30 minutes, so to
-    continue at once, or when the job budget page fired and no job remains, run
+    vault, and its receipt shows a transfer of that token to the bot wallet; the
+    amount may differ. A reverted tx withdrew nothing: reconcile with it as the
+    `--superseding-tx` instead. After adoption the redemption's redrive confirms
+    `<tx>`, records the vault transfer its receipt shows, releases the
+    withdrawal's nonce and continues with the unwrap and send. After the
+    reconciliation deadline the redrive runs every 30 minutes, so to continue at
+    once, or when the job budget page fired and no job remains, run
     `stox transfer resume --kind equity` or restart the bot. Once adopted,
     reconcile always refuses the redemption; the redrive is the only exit. A
     legacy redemption holding only a withdrawal hash is refused too once that

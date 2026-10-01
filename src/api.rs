@@ -3301,8 +3301,9 @@ async fn reconcile_equity_transfer(
 /// hash (`None` when there is none), which the command checks is still the
 /// redemption's, so a withdrawal signed during the check is never reconciled
 /// unproven. A `supersedingTx` on a redemption with no signed withdrawal is a
-/// `400`. A redemption holding only a withdrawal hash (an adopted replacement,
-/// or a legacy submission) is refused once that hash mined and succeeded.
+/// `400`. A legacy redemption holding only a withdrawal hash is refused once
+/// that hash mined and succeeded; an adopted one is left for the command to
+/// refuse, with no chain read.
 async fn check_signed_withdrawal_superseded(
     state: &AppState,
     id: &RedemptionAggregateId,
@@ -3559,6 +3560,7 @@ fn replacement_not_adoptable_response(
         | ReplacementNotAdoptable::ReplacementCallsAnotherContract { .. }
         | ReplacementNotAdoptable::ReplacementNotAWithdrawal { .. }
         | ReplacementNotAdoptable::ReplacementWithdrawsAnotherVault { .. }
+        | ReplacementNotAdoptable::ReplacementWithdrewNothing { .. }
         | ReplacementNotAdoptable::NoConfirmationDepth { .. }
         | ReplacementNotAdoptable::ChainServicesMissing(_) => (
             StatusCode::CONFLICT,
@@ -10426,6 +10428,22 @@ mod tests {
         }
     }
 
+    /// A chain showing `speed_up` as a confirmed `withdraw4` of the signed
+    /// withdrawal's token and vault at its nonce, whose receipt pays the bot
+    /// wallet.
+    fn adoptable_speed_up(bot_wallet: Address, speed_up: TxHash) -> MockRaindex {
+        MockRaindex::new()
+            .with_mined_tx(
+                speed_up,
+                mined_at_withdrawal_nonce(
+                    bot_wallet,
+                    SIGNED_WITHDRAWAL_TARGET,
+                    B256::repeat_byte(0x02),
+                ),
+            )
+            .with_transfer_receipt(speed_up, SIGNED_WITHDRAWAL_TOKEN, bot_wallet, U256::from(7))
+    }
+
     async fn adopt(
         state: &AppState,
         id: &RedemptionAggregateId,
@@ -10452,14 +10470,7 @@ mod tests {
         let bot_wallet = signer.address();
         let prepared = sign_vault_withdrawal(&signer);
         let speed_up = TxHash::repeat_byte(0x5E);
-        let raindex = MockRaindex::new().with_mined_tx(
-            speed_up,
-            mined_at_withdrawal_nonce(
-                bot_wallet,
-                SIGNED_WITHDRAWAL_TARGET,
-                B256::repeat_byte(0x02),
-            ),
-        );
+        let raindex = adoptable_speed_up(bot_wallet, speed_up);
         let id = redemption_aggregate_id("api-redemption-adopt");
         let state = signed_withdrawal_reconcile_state(bot_wallet, raindex, &id, prepared).await;
 
@@ -10500,14 +10511,7 @@ mod tests {
         let prepared = sign_vault_withdrawal(&signer);
         let replaced = prepared.tx_hash();
         let speed_up = TxHash::repeat_byte(0x5E);
-        let raindex = MockRaindex::new().with_mined_tx(
-            speed_up,
-            mined_at_withdrawal_nonce(
-                bot_wallet,
-                SIGNED_WITHDRAWAL_TARGET,
-                B256::repeat_byte(0x02),
-            ),
-        );
+        let raindex = adoptable_speed_up(bot_wallet, speed_up);
         let state = signed_withdrawal_ready_state(bot_wallet, raindex).await;
         let id = redemption_aggregate_id("api-redemption-adopt-view");
         seed_redemption_submitting(&state.pool, &id, prepared).await;
@@ -10539,22 +10543,15 @@ mod tests {
         );
     }
 
-    /// An adopted replacement holds no signed bytes, but it already withdrew
-    /// the equity, so reconcile on the operator's word is refused: the redrive
+    /// An adopted replacement moved the equity, so reconcile refuses it as
+    /// adopted, without treating it as a legacy hash to read: the redrive
     /// confirms it.
     #[tokio::test]
-    async fn reconcile_refuses_an_adopted_replacement_that_went_through() {
+    async fn reconcile_refuses_an_adopted_replacement() {
         let signer = PrivateKeySigner::random();
         let bot_wallet = signer.address();
         let speed_up = TxHash::repeat_byte(0x5E);
-        let raindex = MockRaindex::new().with_mined_tx(
-            speed_up,
-            mined_at_withdrawal_nonce(
-                bot_wallet,
-                SIGNED_WITHDRAWAL_TARGET,
-                B256::repeat_byte(0x02),
-            ),
-        );
+        let raindex = adoptable_speed_up(bot_wallet, speed_up);
         let id = redemption_aggregate_id("api-redemption-adopt-then-reconcile");
         let state = signed_withdrawal_reconcile_state(
             bot_wallet,
@@ -10577,11 +10574,12 @@ mod tests {
         )
         .await
         else {
-            panic!("an adopted replacement that went through must not be reconciled");
+            panic!("an adopted replacement must not be reconciled");
         };
         assert_eq!(status, StatusCode::CONFLICT);
         assert!(
-            body.error.contains("the withdrawal went through"),
+            body.error
+                .contains("is an adopted replacement that moved the equity"),
             "{}",
             body.error
         );
@@ -10722,6 +10720,43 @@ mod tests {
         assert_eq!(status, StatusCode::CONFLICT);
         assert!(
             body.error.contains("is the vault withdrawal itself"),
+            "{}",
+            body.error
+        );
+
+        // A successful withdraw4 that paid the bot wallet nothing, e.g. one of
+        // zero, would leave ConfirmWithdraw no transfer to record.
+        let paid_elsewhere = TxHash::repeat_byte(0x6E);
+        let raindex = MockRaindex::new()
+            .with_mined_tx(
+                paid_elsewhere,
+                mined_at_withdrawal_nonce(
+                    bot_wallet,
+                    SIGNED_WITHDRAWAL_TARGET,
+                    B256::repeat_byte(0x02),
+                ),
+            )
+            .with_transfer_receipt(
+                paid_elsewhere,
+                SIGNED_WITHDRAWAL_TOKEN,
+                other,
+                U256::from(7),
+            );
+        let id = redemption_aggregate_id("api-redemption-adopt-paid-nothing");
+        let state = signed_withdrawal_reconcile_state(
+            bot_wallet,
+            raindex,
+            &id,
+            sign_vault_withdrawal(&signer),
+        )
+        .await;
+        let Err((status, Json(body))) = adopt(&state, &id, paid_elsewhere).await else {
+            panic!("a replacement that paid the bot wallet nothing must not be adopted");
+        };
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert!(
+            body.error.contains("so it did not do the withdrawal")
+                && body.error.contains("paid the bot wallet"),
             "{}",
             body.error
         );

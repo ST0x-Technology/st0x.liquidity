@@ -421,8 +421,9 @@ pub async fn verify_withdrawal_superseded(
 /// Refuses to reconcile a redemption holding only its withdrawal's hash once
 /// that hash mined and succeeded.
 ///
-/// Such a redemption holds an adopted replacement, or a withdrawal from before
-/// the signed bytes were kept. A success means the equity left the vault and
+/// Such a redemption holds a withdrawal from before the signed bytes were kept
+/// (an adopted replacement is refused by `Reconcile` itself, with no read). A
+/// success means the equity left the vault and
 /// the redrive confirms it, as for a signed withdrawal that went through. With
 /// no signed bytes there is no nonce to prove unused, so anything else
 /// reconciles on the operator's word.
@@ -550,6 +551,18 @@ pub enum ReplacementNotAdoptable {
         expected_token: Address,
         expected_vault_id: B256,
     },
+    /// `ConfirmWithdraw` records the vault transfer from the receipt and
+    /// refuses one with none, and an adopted redemption cannot be reconciled,
+    /// so a replacement that moved nothing would strand it.
+    #[error(
+        "replacement {replacement} paid the bot wallet {bot_wallet} none of token {token} \
+         (for example a withdraw4 of zero), so it did not do the withdrawal"
+    )]
+    ReplacementWithdrewNothing {
+        replacement: TxHash,
+        token: Address,
+        bot_wallet: Address,
+    },
     #[error("no [chains.{chain}] required_confirmations: it gates the replacement check")]
     NoConfirmationDepth { chain: Chain },
     #[error(transparent)]
@@ -571,7 +584,8 @@ pub enum ReplacementNotAdoptable {
 /// `replacement` must be a different tx from `bot_wallet` at the withdrawal's
 /// nonce with `required_confirmations`, and a successful `withdraw4` to the
 /// contract the withdrawal calls, from the same token and vault. `withdraw4`
-/// pays its caller, so the recipient is the bot wallet; the amount may differ.
+/// pays its caller, so the recipient is the bot wallet; the amount may differ,
+/// but its receipt must show a transfer of the token to the bot wallet.
 /// Taking the nonce means the signed withdrawal can never land, and that call
 /// is what moved the equity, so the redemption continues from it:
 /// `ConfirmWithdraw` records what its receipt actually transferred, and
@@ -671,6 +685,26 @@ pub async fn verify_withdrawal_replacement(
             vault_id: call.vaultId,
             expected_token: withdrawal.token,
             expected_vault_id: withdrawal.vaultId,
+        });
+    }
+
+    let receipt = raindex
+        .tx_receipt(replacement)
+        .await
+        .map_err(|source| ReplacementNotAdoptable::Read {
+            tx: replacement,
+            source: Box::new(source),
+        })?
+        .ok_or(ReplacementNotAdoptable::ReplacementNotMined { replacement })?;
+    if crate::equity_redemption::actual_withdrawn_amount_from_receipt(
+        &receipt, call.token, bot_wallet,
+    )
+    .is_err()
+    {
+        return Err(ReplacementNotAdoptable::ReplacementWithdrewNothing {
+            replacement,
+            token: call.token,
+            bot_wallet,
         });
     }
 
@@ -1028,6 +1062,10 @@ impl Raindex for PanickingRaindex {
     }
 
     async fn mined_tx(&self, _: TxHash) -> Result<Option<MinedTx>, RaindexError> {
+        unimplemented!("PanickingRaindex: not available in CLI context")
+    }
+
+    async fn tx_receipt(&self, _: TxHash) -> Result<Option<TransactionReceipt>, RaindexError> {
         unimplemented!("PanickingRaindex: not available in CLI context")
     }
 

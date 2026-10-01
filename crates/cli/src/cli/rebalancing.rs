@@ -1569,8 +1569,8 @@ pub(crate) enum WithdrawalCheck<'a> {
         prepared: &'a PreparedTransaction,
         superseding_tx: Option<TxHash>,
     },
-    /// A withdrawal known only by its hash: an adopted replacement, or a
-    /// legacy submission.
+    /// A legacy withdrawal known only by its hash. An adopted replacement is
+    /// not checked: the command refuses it.
     HashOnly(TxHash),
 }
 
@@ -6665,12 +6665,10 @@ mod tests {
         );
     }
 
-    /// An adopted replacement leaves only its hash, which the CLI checks on
-    /// chain before reconciling; one that went through is refused.
+    /// An adopted replacement moved the equity, so the CLI refuses to
+    /// reconcile it without reading the chain: the command refuses it.
     #[tokio::test]
-    async fn reconcile_equity_redemption_checks_an_adopted_replacement_on_chain() {
-        use st0x_hedge::operator::rebalancing::equity::WithdrawalNotSuperseded;
-
+    async fn reconcile_equity_redemption_refuses_an_adopted_replacement_without_a_chain_check() {
         let pool = setup_test_db().await;
         let id = redemption_aggregate_id("cli-reconcile-adopted-replacement");
         seed_redemption_to_submitting(&pool, &id).await;
@@ -6694,17 +6692,13 @@ mod tests {
             "settled by hand".parse().unwrap(),
             None,
             &pool,
-            async |chain, check: WithdrawalCheck<'_>| {
-                assert_eq!(chain, Chain::Base);
-                assert_eq!(check, WithdrawalCheck::HashOnly(speed_up));
-                Err(WithdrawalNotSuperseded::WithdrawalWentThrough { tx: speed_up }.into())
-            },
+            no_withdrawal_to_verify,
         )
         .await
         .unwrap_err();
 
         assert!(
-            format!("{error:#}").contains("the withdrawal went through"),
+            format!("{error:#}").contains("is an adopted replacement that moved the equity"),
             "got: {error:#}"
         );
         let entity = st0x_event_sorcery::load_entity::<EquityRedemption>(&pool, &id)

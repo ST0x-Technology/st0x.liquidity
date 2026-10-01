@@ -760,6 +760,13 @@ impl<W: Wallet> Raindex for RaindexService<W> {
         Ok(st0x_evm::mined_tx(self.evm.provider(), tx_hash).await?)
     }
 
+    async fn tx_receipt(
+        &self,
+        tx_hash: TxHash,
+    ) -> Result<Option<TransactionReceipt>, RaindexError> {
+        Ok(self.evm.provider().get_transaction_receipt(tx_hash).await?)
+    }
+
     async fn confirm_tx_receipt(
         &self,
         tx_hash: TxHash,

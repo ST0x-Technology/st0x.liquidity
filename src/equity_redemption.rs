@@ -728,7 +728,7 @@ fn resolve_withdrawn_wrapped_amount(
     actual_wrapped_amount.unwrap_or(wrapped_amount)
 }
 
-fn actual_withdrawn_amount_from_receipt(
+pub(crate) fn actual_withdrawn_amount_from_receipt(
     receipt: &TransactionReceipt,
     token: Address,
     recipient: Address,
@@ -1534,13 +1534,15 @@ impl EquityRedemption {
         }
     }
 
-    /// The withdrawal hash of a `VaultWithdrawSubmitted` that holds no signed
-    /// bytes: an adopted replacement, or a legacy hash only submission.
+    /// The withdrawal hash of a legacy `VaultWithdrawSubmitted` that holds no
+    /// signed bytes. An adopted replacement has none either, but it is not
+    /// one: `Reconcile` refuses it outright, so no chain read is needed.
     pub fn hash_only_withdrawal(&self) -> Option<TxHash> {
         match self {
             Self::VaultWithdrawSubmitted {
                 tx_hash,
                 prepared: None,
+                adopted_from: None,
                 ..
             } => Some(*tx_hash),
             _ => None,
