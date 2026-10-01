@@ -264,7 +264,9 @@ pub enum PreparedSwap {
     /// the deposit, so the deposit was discarded. The approve, an allowance
     /// to the pinned depository, goes out alone through
     /// [`SwapBridge::broadcast_approve`] to fill its nonce; the caller then
-    /// prepares the deposit again.
+    /// prepares the deposit again. The caller must persist and broadcast it:
+    /// a dropped approve leaves its nonce as a gap that every later send from
+    /// the wallet waits behind until restart.
     ApproveOnly {
         approve: PreparedTransaction,
     },
@@ -340,7 +342,9 @@ pub trait SwapBridge: Send + Sync + 'static {
     type OrderId: Copy + Send + Sync;
 
     /// Signs the quote's approve (when the allowance does not already cover
-    /// the deposit) and its deposit on the origin chain, without broadcasting.
+    /// the deposit) and its deposit on the origin chain, without broadcasting,
+    /// or only the approve ([`PreparedSwap::ApproveOnly`]) when another send
+    /// split the pair.
     async fn prepare_deposit(
         &self,
         direction: HopDirection,
