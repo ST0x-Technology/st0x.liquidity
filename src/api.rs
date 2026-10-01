@@ -1377,8 +1377,10 @@ pub(crate) struct ProcessTxHandle {
 }
 
 /// Serializes operator transfer-recovery requests so they cannot race through
-/// duplicate or conflicting mint/redemption flows.
-pub(crate) struct ResumeLock(pub(crate) Mutex<()>);
+/// duplicate or conflicting mint/redemption flows. The mutex sits behind an
+/// `Arc` so a detached task can own its guard past the request:
+/// `capital cctp-bridge` holds it until its burn confirms.
+pub(crate) struct ResumeLock(pub(crate) Arc<Mutex<()>>);
 
 /// The operator request asking to pause the USDC driver, logged when the pause
 /// is refused so the refusal is traceable to that request.
@@ -4055,45 +4057,55 @@ where
     })
 }
 
-/// Where a route's detached task sends its answer; see
-/// [`answer_from_detached`].
-type DetachedAnswer<Answer> = tokio::sync::oneshot::Sender<Result<Answer, OpsError>>;
-
-/// Runs `work` through [`spawn_detached`] for a route that answers at a
-/// broadcast rather than at the outcome: `work` sends the answer through the
-/// sender it is given as soon as the transaction is broadcast (or the refusal
-/// as soon as it refuses), then keeps running to await the confirmation and
-/// log it. That answer returns here at once, so a confirmation slower than
-/// the 60 second load balancer cut still reaches the operator with the tx
-/// hash. Whatever `work` holds (a lock, a driver pause) stays held until the
-/// task ends.
+/// Runs a route's work through [`spawn_detached`] in two phases, for a route
+/// that answers at a broadcast rather than at the outcome. `broadcast` runs
+/// up to the transaction's broadcast and returns the answer together with
+/// the confirmation to run next; this helper sends that answer to the request
+/// at once, then awaits the confirmation on the same task. A refusal from
+/// `broadcast` is the answer instead, and nothing runs after it. So a
+/// confirmation slower than the 60 second load balancer cut still reaches the
+/// operator with the tx hash, and every path through the task answers.
+/// Whatever the confirmation future owns (a lock guard, a driver pause) stays
+/// held until it completes.
 ///
 /// The request cannot be the one to join the task, since it returns before
 /// the task ends, so a tracked watcher joins it: a panic in either phase still
 /// reaches the join failure log of [`spawn_detached`], after the answer or a
 /// dropped request alike.
-async fn answer_from_detached<Answer, Subject, Work>(
+async fn answer_from_detached<Answer, Subject, Broadcast, Confirm>(
     detached_tasks: &TaskTracker,
     operation: &'static str,
     subject: Subject,
-    work: impl FnOnce(DetachedAnswer<Answer>) -> Work,
+    broadcast: Broadcast,
 ) -> Result<Answer, OpsError>
 where
     Answer: Send + 'static,
     Subject: std::fmt::Display + Send + 'static,
-    Work: Future<Output = ()> + Send + 'static,
+    Broadcast: Future<Output = Result<(Answer, Confirm), OpsError>> + Send + 'static,
+    Confirm: Future<Output = ()> + Send + 'static,
 {
     let (answer, answered) = tokio::sync::oneshot::channel();
-    let worker = spawn_detached(detached_tasks, operation, subject, work(answer))?;
+    let worker = spawn_detached(detached_tasks, operation, subject, async move {
+        // A dropped request has no receiver left, so a failed send is fine.
+        match broadcast.await {
+            Ok((reply, confirm)) => {
+                let _ = answer.send(Ok(reply));
+                confirm.await;
+            }
+            Err(refusal) => {
+                let _ = answer.send(Err(refusal));
+            }
+        }
+    })?;
     detached_tasks.spawn(async move {
         let _joined = worker.await;
     });
 
     match answered.await {
         Ok(answer) => answer,
-        // The task dropped its sender without answering: it panicked before
-        // the broadcast, and the watcher logs the join failure.
-        Err(_answerless) => Err((
+        // Every path through the task answers, so a dropped sender means the
+        // broadcast phase panicked; the watcher logs the join failure.
+        Err(_panicked) => Err((
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(ErrorResponse {
                 error: format!("{operation} worker task failed"),
@@ -4678,7 +4690,7 @@ mod tests {
             ),
             recovery: Arc::new(tokio::sync::OnceCell::new()),
             process_tx: Arc::new(tokio::sync::OnceCell::new()),
-            resume_lock: Arc::new(ResumeLock(Mutex::new(()))),
+            resume_lock: Arc::new(ResumeLock(Arc::new(Mutex::new(())))),
             vault_deposit_lock: Arc::new(Mutex::new(())),
             projection_maintenance: Arc::new(
                 crate::conductor::projection_pause::ProjectionMaintenance::for_test(),
@@ -10984,7 +10996,7 @@ mod tests {
     /// unpaused, and only the (never reached) mint submission would take them.
     #[tokio::test]
     async fn complete_cctp_mint_poll_does_not_park_usdc_work_while_unattested() {
-        let resume_lock = Arc::new(ResumeLock(Mutex::new(())));
+        let resume_lock = Arc::new(ResumeLock(Arc::new(Mutex::new(()))));
         let (pause, gate) = usdc_driver_pause();
         let lock_free = Arc::new(AtomicBool::new(false));
         let driver_free = Arc::new(AtomicBool::new(false));
@@ -11132,7 +11144,7 @@ mod tests {
     /// mint failure.
     #[tokio::test]
     async fn complete_cctp_mint_reports_an_inconclusive_mint_as_retryable() {
-        let resume_lock = Arc::new(ResumeLock(Mutex::new(())));
+        let resume_lock = Arc::new(ResumeLock(Arc::new(Mutex::new(()))));
         let (pause, _gate) = usdc_driver_pause();
 
         let resp = complete_cctp_mint_recovery(
@@ -11194,7 +11206,7 @@ mod tests {
     /// reports the raw values and the conversion error rather than nulls.
     #[tokio::test]
     async fn complete_cctp_mint_reports_undecodable_amounts_with_the_error() {
-        let resume_lock = Arc::new(ResumeLock(Mutex::new(())));
+        let resume_lock = Arc::new(ResumeLock(Arc::new(Mutex::new(()))));
         let (pause, _gate) = usdc_driver_pause();
 
         let Ok(Json(body)) = complete_cctp_mint_recovery(

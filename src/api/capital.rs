@@ -493,97 +493,88 @@ pub(super) async fn cctp_bridge(
         )
     })?;
 
-    let resume_lock = Arc::clone(&state.resume_lock);
+    let resume_lock = Arc::clone(&state.resume_lock.0);
     let driver_pause = Arc::clone(&handle.usdc_driver_pause);
     answer_from_detached(
         &state.detached_tasks,
         "cctp-bridge",
         source_chain,
-        move |answer| async move {
-            let broadcast = async {
-                let guard = resume_lock.0.try_lock().map_err(|_| {
-                    (
-                        StatusCode::CONFLICT,
-                        Json(ErrorResponse {
-                            error: "A resume or recheck operation is already in progress".to_string(),
-                        }),
-                    )
-                })?;
-                let driver_paused = quiesce_usdc_driver(
-                    &driver_pause,
-                    UsdcDriverPauseRequest::CctpBurn { direction },
+        async move {
+            let resume_guard = resume_lock.try_lock_owned().map_err(|_| {
+                (
+                    StatusCode::CONFLICT,
+                    Json(ErrorResponse {
+                        error: "A resume or recheck operation is already in progress".to_string(),
+                    }),
                 )
-                .await?;
+            })?;
+            let driver_paused = quiesce_usdc_driver(
+                &driver_pause,
+                UsdcDriverPauseRequest::CctpBurn { direction },
+            )
+            .await?;
 
-                let amount = match &amount {
-                    BurnAmount::Exact(amount) => *amount,
-                    // Read under the driver pause, so no transfer spends the
-                    // balance between this read and the burn.
-                    BurnAmount::All => {
-                        let balance = source_wallet
-                            .call::<OpenChainErrorRegistry, _>(
-                                source_usdc,
-                                IERC20::balanceOfCall {
-                                    account: source_wallet.address(),
-                                },
-                            )
-                            .await
-                            .map_err(|error| onchain_failure("cctp-bridge", source_chain, &error))?;
-                        if balance.is_zero() {
-                            warn!(%source_chain, "CCTP burn of the whole balance refused: it is zero");
-                            return Err(ops_precondition_error(format!(
-                                "the {source_chain} wallet's USDC balance is zero"
-                            )));
-                        }
-                        balance
+            let amount = match &amount {
+                BurnAmount::Exact(amount) => *amount,
+                // Read under the driver pause, so no transfer spends the balance
+                // between this read and the burn.
+                BurnAmount::All => {
+                    let balance = source_wallet
+                        .call::<OpenChainErrorRegistry, _>(
+                            source_usdc,
+                            IERC20::balanceOfCall {
+                                account: source_wallet.address(),
+                            },
+                        )
+                        .await
+                        .map_err(|error| onchain_failure("cctp-bridge", source_chain, &error))?;
+                    if balance.is_zero() {
+                        warn!(%source_chain, "CCTP burn of the whole balance refused: it is zero");
+                        return Err(ops_precondition_error(format!(
+                            "the {source_chain} wallet's USDC balance is zero"
+                        )));
                     }
-                };
-
-                let burn_tx = bridge
-                    .submit_burn(direction, amount, recipient)
-                    .await
-                    .map_err(|error| onchain_failure("cctp-bridge", source_chain, &error))?;
-                info!(%burn_tx, ?direction, %amount, "CCTP burn broadcast via API");
-                Ok::<_, OpsError>((guard, driver_paused, amount, burn_tx))
-            }
-            .await;
-
-            // The lock and the pause stay held through the confirmation below.
-            let (_guard, _driver_paused, amount, burn_tx) = match broadcast {
-                Ok(broadcast) => broadcast,
-                Err(refusal) => {
-                    // A refusal, the balance read, or a reverted send broadcast
-                    // nothing. A transport error from `submit_burn` may have
-                    // broadcast anyway, which is why `onchain_failure` tells the
-                    // operator to check the chain before retrying. A dropped
-                    // request has no receiver left.
-                    let _ = answer.send(Err(refusal));
-                    return;
+                    balance
                 }
             };
-            let _ = answer.send(Ok(CctpBridgeResponse {
+
+            // A refusal, the balance read, or a reverted send broadcast nothing.
+            // A transport error from `submit_burn` may have broadcast anyway,
+            // which is why `onchain_failure` tells the operator to check the chain
+            // before retrying.
+            let burn_tx = bridge
+                .submit_burn(direction, amount, recipient)
+                .await
+                .map_err(|error| onchain_failure("cctp-bridge", source_chain, &error))?;
+            info!(%burn_tx, ?direction, %amount, "CCTP burn broadcast via API");
+
+            let confirm = async move {
+                // The lock and the pause stay held until the burn confirms.
+                let _held = (resume_guard, driver_paused);
+                match bridge.confirm_burn(direction, burn_tx, amount).await {
+                    Ok(receipt) => info!(
+                        burn_tx = %receipt.tx,
+                        ?direction,
+                        amount = %receipt.amount,
+                        "CCTP burn confirmed via API"
+                    ),
+                    Err(error) => error!(
+                        %burn_tx,
+                        ?direction,
+                        %amount,
+                        ?error,
+                        "CCTP burn broadcast via API did not confirm; check the tx onchain \
+                         before completing the mint or retrying"
+                    ),
+                }
+            };
+            let response = CctpBridgeResponse {
                 burn_tx,
                 source_chain,
                 destination_chain,
                 amount_raw: amount.to_string(),
-            }));
-
-            match bridge.confirm_burn(direction, burn_tx, amount).await {
-                Ok(receipt) => info!(
-                    burn_tx = %receipt.tx,
-                    ?direction,
-                    amount = %receipt.amount,
-                    "CCTP burn confirmed via API"
-                ),
-                Err(error) => error!(
-                    %burn_tx,
-                    ?direction,
-                    %amount,
-                    ?error,
-                    "CCTP burn broadcast via API did not confirm; check the tx onchain \
-                     before completing the mint or retrying"
-                ),
-            }
+            };
+            Ok::<_, OpsError>((response, confirm))
         },
     )
     .await
@@ -608,24 +599,14 @@ pub(super) async fn reset_allowance(
     let owner = wallet.address();
     let raindex = RaindexService::new(wallet, contracts, owner);
 
-    let outcome = answer_from_detached(
-        &state.detached_tasks,
-        "reset-allowance",
-        chain,
-        move |answer| async move {
-            let outcome = match raindex
-                .submit_revoke_orderbook_allowance::<OpenChainErrorRegistry>(token)
-                .await
-            {
-                Ok(outcome) => outcome,
-                Err(error) => {
-                    let _ = answer.send(Err(onchain_failure("reset-allowance", chain, &error)));
-                    return;
-                }
-            };
-            info!(%chain, %token, %spender, ?outcome, "Orderbook allowance reset via API");
-            let _ = answer.send(Ok(outcome));
+    let outcome = answer_from_detached(&state.detached_tasks, "reset-allowance", chain, async move {
+        let outcome = raindex
+            .submit_revoke_orderbook_allowance::<OpenChainErrorRegistry>(token)
+            .await
+            .map_err(|error| onchain_failure("reset-allowance", chain, &error))?;
+        info!(%chain, %token, %spender, ?outcome, "Orderbook allowance reset via API");
 
+        let confirm = async move {
             let RevokeOutcome::Revoked { tx } = outcome else {
                 return;
             };
@@ -639,8 +620,9 @@ pub(super) async fn reset_allowance(
                      before retrying"
                 ),
             }
-        },
-    )
+        };
+        Ok::<_, OpsError>((outcome, confirm))
+    })
     .await?;
 
     let (outcome, tx) = match outcome {
@@ -857,84 +839,71 @@ async fn run_vault_operation(
     let route = operation.route();
 
     let deposit_lock = Arc::clone(&state.vault_deposit_lock);
-    answer_from_detached(&state.detached_tasks, route, token, move |answer| async move {
-        let broadcast = async {
-            // Held through the approve, the deposit and its confirmation,
-            // inside the task so a dropped request cannot release it early;
-            // see `AppState::vault_deposit_lock`. Withdrawals approve nothing.
-            let deposit_guard = match operation {
-                VaultOperation::Deposit => Some(deposit_lock.try_lock().map_err(|_| {
-                    warn!(route, %chain, %token, "Vault deposit refused: another deposit is in progress");
-                    (
-                        StatusCode::CONFLICT,
-                        Json(ErrorResponse {
-                            error: "Another vault deposit is in progress; retry once it finishes"
-                                .to_string(),
-                        }),
-                    )
-                })?),
-                VaultOperation::Withdraw | VaultOperation::WithdrawUsdc => None,
-            };
-            let decimals = wallet
-                .call::<OpenChainErrorRegistry, _>(token, IERC20::decimalsCall {})
-                .await
-                .map_err(|error| onchain_failure(route, chain, &error))?;
-            let amount_raw = amount.inner().to_fixed_decimal(decimals).map_err(|error| {
-                warn!(route, %chain, %token, ?error, "Vault amount does not fit the token's decimals");
-                ops_precondition_error(format!(
-                    "amount {} does not fit the token's {decimals} decimals: {error}",
-                    format_float_with_fallback(&amount.inner())
-                ))
-            })?;
-
-            let submitted = match operation {
-                VaultOperation::Deposit => {
-                    raindex
-                        .submit_deposit(token, RaindexVaultId(vault_id), amount_raw, decimals)
-                        .await
-                }
-                VaultOperation::Withdraw | VaultOperation::WithdrawUsdc => {
-                    raindex
-                        .submit_withdraw(token, RaindexVaultId(vault_id), amount_raw, decimals)
-                        .await
-                }
-            };
-            let tx = submitted.map_err(|error| onchain_failure(route, chain, &error))?;
-            info!(route, %chain, %token, %vault_id, %amount_raw, %tx, "Vault operation broadcast via API");
-            Ok::<_, OpsError>((
-                deposit_guard,
-                VaultOutcome {
-                    decimals,
-                    amount_raw,
-                    tx,
-                },
+    answer_from_detached(&state.detached_tasks, route, token, async move {
+        // Held through the approve, the deposit and its confirmation, inside
+        // the task so a dropped request cannot release it early; see
+        // `AppState::vault_deposit_lock`. Withdrawals approve nothing.
+        let deposit_guard = match operation {
+            VaultOperation::Deposit => Some(deposit_lock.try_lock_owned().map_err(|_| {
+                warn!(route, %chain, %token, "Vault deposit refused: another deposit is in progress");
+                (
+                    StatusCode::CONFLICT,
+                    Json(ErrorResponse {
+                        error: "Another vault deposit is in progress; retry once it finishes"
+                            .to_string(),
+                    }),
+                )
+            })?),
+            VaultOperation::Withdraw | VaultOperation::WithdrawUsdc => None,
+        };
+        let decimals = wallet
+            .call::<OpenChainErrorRegistry, _>(token, IERC20::decimalsCall {})
+            .await
+            .map_err(|error| onchain_failure(route, chain, &error))?;
+        let amount_raw = amount.inner().to_fixed_decimal(decimals).map_err(|error| {
+            warn!(route, %chain, %token, ?error, "Vault amount does not fit the token's decimals");
+            ops_precondition_error(format!(
+                "amount {} does not fit the token's {decimals} decimals: {error}",
+                format_float_with_fallback(&amount.inner())
             ))
-        }
-        .await;
+        })?;
 
-        // The deposit guard stays held through the confirmation below.
-        let (_deposit_guard, outcome) = match broadcast {
-            Ok(broadcast) => broadcast,
-            Err(refusal) => {
-                // A dropped request has no receiver left.
-                let _ = answer.send(Err(refusal));
-                return;
+        let submitted = match operation {
+            VaultOperation::Deposit => {
+                raindex
+                    .submit_deposit(token, RaindexVaultId(vault_id), amount_raw, decimals)
+                    .await
+            }
+            VaultOperation::Withdraw | VaultOperation::WithdrawUsdc => {
+                raindex
+                    .submit_withdraw(token, RaindexVaultId(vault_id), amount_raw, decimals)
+                    .await
             }
         };
-        let VaultOutcome { amount_raw, tx, .. } = outcome;
-        let _ = answer.send(Ok(outcome));
+        let tx = submitted.map_err(|error| onchain_failure(route, chain, &error))?;
+        info!(route, %chain, %token, %vault_id, %amount_raw, %tx, "Vault operation broadcast via API");
 
-        match raindex.confirm_tx(tx).await {
-            Ok(()) => info!(
-                route, %chain, %token, %vault_id, %amount_raw, %tx,
-                "Vault operation confirmed via API"
-            ),
-            Err(error) => error!(
-                route, %chain, %token, %vault_id, %amount_raw, %tx, ?error,
-                "Vault operation broadcast via API did not confirm; check the tx onchain \
-                 before retrying"
-            ),
-        }
+        let confirm = async move {
+            // The deposit guard stays held until the deposit confirms.
+            let _deposit_guard = deposit_guard;
+            match raindex.confirm_tx(tx).await {
+                Ok(()) => info!(
+                    route, %chain, %token, %vault_id, %amount_raw, %tx,
+                    "Vault operation confirmed via API"
+                ),
+                Err(error) => error!(
+                    route, %chain, %token, %vault_id, %amount_raw, %tx, ?error,
+                    "Vault operation broadcast via API did not confirm; check the tx onchain \
+                     before retrying"
+                ),
+            }
+        };
+        let outcome = VaultOutcome {
+            decimals,
+            amount_raw,
+            tx,
+        };
+        Ok::<_, OpsError>((outcome, confirm))
     })
     .await
 }

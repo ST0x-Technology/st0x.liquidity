@@ -311,7 +311,7 @@ async fn run_bot_session_inner(
     let shutdown_token = CancellationToken::new();
     let recovery_cell = Arc::new(tokio::sync::OnceCell::new());
     let process_tx_cell = Arc::new(tokio::sync::OnceCell::new());
-    let resume_lock = Arc::new(api::ResumeLock(tokio::sync::Mutex::new(())));
+    let resume_lock = Arc::new(api::ResumeLock(Arc::new(tokio::sync::Mutex::new(()))));
 
     // Pre-bind both server ports synchronously so a port-in-use failure
     // surfaces at startup instead of looping in the supervisor.

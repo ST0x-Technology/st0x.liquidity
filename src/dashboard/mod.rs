@@ -852,7 +852,9 @@ mod tests {
             settings: empty_settings(),
             recovery: Arc::new(tokio::sync::OnceCell::new()),
             process_tx: Arc::new(tokio::sync::OnceCell::new()),
-            resume_lock: Arc::new(crate::api::ResumeLock(tokio::sync::Mutex::new(()))),
+            resume_lock: Arc::new(crate::api::ResumeLock(Arc::new(
+                tokio::sync::Mutex::new(()),
+            ))),
             vault_deposit_lock: Arc::new(tokio::sync::Mutex::new(())),
             projection_maintenance: Arc::new(
                 crate::conductor::projection_pause::ProjectionMaintenance::for_test(),
