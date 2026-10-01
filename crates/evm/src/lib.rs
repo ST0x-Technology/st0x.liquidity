@@ -264,9 +264,9 @@ pub enum EvmError {
     #[error("replacement fee bump overflowed u128 (network fee estimate too large)")]
     #[cfg(any(feature = "turnkey", feature = "local-signer"))]
     ReplacementFeeOverflow,
-    /// Padding a gas estimate overflowed `u64`. Only reachable if the RPC
-    /// returns an absurd estimate.
-    #[error("gas limit padding overflowed u64 (gas estimate {estimate} too large)")]
+    /// Padding a gas limit overflowed `u64`: an absurd RPC estimate or an
+    /// absurd pinned limit.
+    #[error("gas limit padding overflowed u64 (unpadded gas limit {estimate} too large)")]
     #[cfg(any(feature = "turnkey", feature = "local-signer"))]
     GasLimitOverflow { estimate: u64 },
     #[cfg(feature = "local-signer")]
@@ -851,6 +851,22 @@ pub trait Wallet: Evm {
         note: &str,
     ) -> Result<PreparedTransaction, EvmError>;
 
+    /// [`prepare_pending`](Self::prepare_pending) with a caller-supplied gas limit in place of
+    /// `eth_estimateGas`. The signed limit is the padded value, never `unpadded_gas_limit` itself.
+    ///
+    /// For the second of a dependent pair (a deposit behind its unmined approve), whose estimate
+    /// would revert until the first transaction mines.
+    ///
+    /// Discard such a pair second-then-first, never the first alone while the second is held:
+    /// discarding the first rewinds the nonce cache under the held second.
+    async fn prepare_pending_with_gas_limit(
+        &self,
+        contract: Address,
+        calldata: Bytes,
+        unpadded_gas_limit: u64,
+        note: &str,
+    ) -> Result<PreparedTransaction, EvmError>;
+
     /// Broadcast a previously prepared transaction.
     ///
     /// Repeated calls are idempotent because they submit the exact same signed
@@ -1110,6 +1126,18 @@ impl<Inner: Wallet + ?Sized> Wallet for Arc<Inner> {
         note: &str,
     ) -> Result<PreparedTransaction, EvmError> {
         (**self).prepare_pending(contract, calldata, note).await
+    }
+
+    async fn prepare_pending_with_gas_limit(
+        &self,
+        contract: Address,
+        calldata: Bytes,
+        unpadded_gas_limit: u64,
+        note: &str,
+    ) -> Result<PreparedTransaction, EvmError> {
+        (**self)
+            .prepare_pending_with_gas_limit(contract, calldata, unpadded_gas_limit, note)
+            .await
     }
 
     async fn broadcast_prepared(

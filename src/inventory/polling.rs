@@ -2178,6 +2178,18 @@ mod tests {
             panic!("MockEthereumWallet::prepare_pending should not be called in polling tests")
         }
 
+        async fn prepare_pending_with_gas_limit(
+            &self,
+            _contract: Address,
+            _calldata: Bytes,
+            _unpadded_gas_limit: u64,
+            _note: &str,
+        ) -> Result<PreparedTransaction, EvmError> {
+            panic!(
+                "MockEthereumWallet::prepare_pending_with_gas_limit should not be called in polling tests"
+            )
+        }
+
         async fn broadcast_prepared(
             &self,
             _prepared: &PreparedTransaction,
@@ -2255,6 +2267,18 @@ mod tests {
             _note: &str,
         ) -> Result<PreparedTransaction, EvmError> {
             panic!("MockBaseWallet::prepare_pending should not be called in polling tests")
+        }
+
+        async fn prepare_pending_with_gas_limit(
+            &self,
+            _contract: Address,
+            _calldata: Bytes,
+            _unpadded_gas_limit: u64,
+            _note: &str,
+        ) -> Result<PreparedTransaction, EvmError> {
+            panic!(
+                "MockBaseWallet::prepare_pending_with_gas_limit should not be called in polling tests"
+            )
         }
 
         async fn broadcast_prepared(

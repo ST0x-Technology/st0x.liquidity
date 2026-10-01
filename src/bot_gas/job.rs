@@ -656,6 +656,16 @@ mod tests {
             panic!("MockWallet::prepare_pending should not be called in job tests")
         }
 
+        async fn prepare_pending_with_gas_limit(
+            &self,
+            _contract: Address,
+            _calldata: alloy::primitives::Bytes,
+            _unpadded_gas_limit: u64,
+            _note: &str,
+        ) -> Result<PreparedTransaction, EvmError> {
+            panic!("MockWallet::prepare_pending_with_gas_limit should not be called in job tests")
+        }
+
         async fn broadcast_prepared(
             &self,
             _prepared: &PreparedTransaction,

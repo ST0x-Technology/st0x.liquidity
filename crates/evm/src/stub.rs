@@ -77,6 +77,19 @@ impl Wallet for StubWallet {
         )
     }
 
+    async fn prepare_pending_with_gas_limit(
+        &self,
+        _contract: Address,
+        _calldata: Bytes,
+        _unpadded_gas_limit: u64,
+        _note: &str,
+    ) -> Result<PreparedTransaction, EvmError> {
+        panic!(
+            "StubWallet::prepare_pending_with_gas_limit called - use a real wallet in tests that \
+             need transactions"
+        )
+    }
+
     async fn broadcast_prepared(
         &self,
         _prepared: &PreparedTransaction,
