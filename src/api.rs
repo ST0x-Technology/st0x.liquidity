@@ -3350,7 +3350,9 @@ async fn check_signed_withdrawal_superseded(
     verified
         .map(|()| Some(prepared.tx_hash()))
         .map_err(|error| {
-            warn!(?error, %id, "Refused to reconcile a redemption with a signed vault withdrawal");
+            // `Display`, not `Debug`: a read error's `Debug` names the RPC URL,
+            // whose path carries the key.
+            warn!(%error, %id, "Refused to reconcile a redemption with a signed vault withdrawal");
             let (status, message) = withdrawal_not_superseded_response(id, &error);
             (status, Json(ErrorResponse { error: message }))
         })
@@ -3358,8 +3360,6 @@ async fn check_signed_withdrawal_superseded(
 
 /// Maps a refused vault withdrawal chain check to an HTTP status: an unproven
 /// withdrawal is a `409` naming why; a failed chain read is a transient `502`.
-/// A failed wallet code read is a `409` with its reason, since it keeps failing
-/// on a node that pruned the block's state.
 fn withdrawal_not_superseded_response(
     id: &RedemptionAggregateId,
     error: &WithdrawalNotSuperseded,
@@ -3376,7 +3376,6 @@ fn withdrawal_not_superseded_response(
         | WithdrawalNotSuperseded::SupersedingTxAtAnotherNonce { .. }
         | WithdrawalNotSuperseded::SupersedingTxUnconfirmed { .. }
         | WithdrawalNotSuperseded::SupersedingTxNotAPlainCancel { .. }
-        | WithdrawalNotSuperseded::WalletCodeUnreadable { .. }
         | WithdrawalNotSuperseded::NoConfirmationDepth { .. }
         | WithdrawalNotSuperseded::ChainServicesMissing(_) => (
             StatusCode::CONFLICT,
@@ -10008,8 +10007,8 @@ mod tests {
                 value: U256::ZERO,
                 has_calldata: false,
                 tx_type: EIP1559_TX_TYPE_ID,
-                block_number: 1,
                 succeeded: true,
+                emitted_logs: false,
                 confirmations: 1,
             },
         );
@@ -10059,8 +10058,8 @@ mod tests {
                 value: U256::ZERO,
                 has_calldata: true,
                 tx_type: EIP1559_TX_TYPE_ID,
-                block_number: 1,
                 succeeded: false,
+                emitted_logs: false,
                 confirmations: 1,
             },
         );
@@ -10253,39 +10252,6 @@ mod tests {
             },
         );
         assert_eq!(status, StatusCode::BAD_GATEWAY);
-
-        // A pruned node fails this read on every retry, so it is not a 502.
-        let unreadable_code = WithdrawalNotSuperseded::WalletCodeUnreadable {
-            superseding: tx,
-            bot_wallet: Address::repeat_byte(0xB0),
-            block: 42,
-            read_error: Box::new(st0x_raindex::RaindexError::ZeroAmount),
-        };
-        assert_eq!(
-            withdrawal_not_superseded_response(&id, &unreadable_code),
-            (
-                StatusCode::CONFLICT,
-                format!("Redemption {id}: refusing to reconcile: {unreadable_code}")
-            )
-        );
-
-        // A transport failure names the RPC URL, whose path carries the key.
-        let keyed_url = WithdrawalNotSuperseded::WalletCodeUnreadable {
-            superseding: tx,
-            bot_wallet: Address::repeat_byte(0xB0),
-            block: 42,
-            read_error: Box::new(st0x_raindex::RaindexError::RpcTransport(
-                alloy::transports::TransportErrorKind::custom_str(
-                    "error sending request for url (https://base-mainnet.g.alchemy.com/v2/SECRETKEY)",
-                ),
-            )),
-        };
-        let (_, body) = withdrawal_not_superseded_response(&id, &keyed_url);
-        assert!(!body.contains("SECRETKEY"), "the RPC key leaked: {body}");
-        assert!(
-            body.contains("https://base-mainnet.g.alchemy.com"),
-            "{body}"
-        );
     }
 
     #[tokio::test]

@@ -18,17 +18,15 @@
 
 use alloy::consensus::transaction::SignerRecoverable as _;
 use alloy::consensus::{Transaction, TxEnvelope};
+use alloy::eips::BlockId;
 use alloy::eips::Typed2718 as _;
 #[cfg(any(feature = "turnkey", feature = "local-signer"))]
 use alloy::eips::eip2718::Encodable2718;
 use alloy::eips::eip2718::{Decodable2718, Eip2718Error};
-use alloy::eips::eip7702::SignedAuthorization;
-use alloy::eips::{BlockId, BlockNumberOrTag};
 use alloy::primitives::{Address, B256, Bytes, Signature, TxHash, U256};
 use alloy::providers::Provider;
 use alloy::rpc::types::{TransactionReceipt, TransactionRequest};
 use alloy::sol_types::SolCall;
-use alloy::transports::TransportErrorKind;
 use async_trait::async_trait;
 use serde::{Deserialize, Deserializer, Serialize};
 use std::sync::Arc;
@@ -1348,8 +1346,8 @@ impl ReceiptWaitConfig {
 /// A mined transaction as the node reports it.
 ///
 /// Who sent it, what it called, with what value and calldata, at which nonce,
-/// whether it succeeded, and how deep it is (the inclusion block counts as
-/// confirmation 1).
+/// whether it succeeded and emitted logs, and how deep it is (the inclusion
+/// block counts as confirmation 1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MinedTx {
     pub from: Address,
@@ -1361,10 +1359,11 @@ pub struct MinedTx {
     pub has_calldata: bool,
     /// The EIP-2718 type byte. `EIP7702_TX_TYPE_ID` sets code on accounts.
     pub tx_type: u8,
-    /// The inclusion block.
-    pub block_number: u64,
     /// `false` when it reverted. A reverted tx still used its nonce.
     pub succeeded: bool,
+    /// Whether its receipt holds any log. A reverted frame drops its logs, so
+    /// every log here is from code that ran to completion.
+    pub emitted_logs: bool,
     pub confirmations: u64,
 }
 
@@ -1411,83 +1410,10 @@ pub async fn mined_tx(
         value: tx.value(),
         has_calldata: !tx.input().is_empty(),
         tx_type: tx.ty(),
-        block_number: tx_block,
         succeeded: receipt.status(),
+        emitted_logs: !receipt.inner.logs().is_empty(),
         confirmations: head.saturating_sub(tx_block).saturating_add(1),
     }))
-}
-
-/// Whether `address` held code when `tx_hash`, mined in `block`, ran: a
-/// contract, or an account with an EIP-7702 delegation.
-///
-/// A delegation runs code even on a plain call to the account, and any tx can
-/// set or clear it, so neither the head nor the end of `block` shows the code
-/// at `tx_hash`. This reads the code as `block` started (as of its parent), and
-/// counts as code any EIP-7702 authorization for `address` in `tx_hash` or a
-/// tx before it in `block`, even one the chain may have skipped as invalid: a
-/// tx applies its own authorizations before it runs.
-/// Reading the parent's state needs a node that still holds it (a full node
-/// prunes it after about 128 blocks); one that does not fails the read rather
-/// than guessing. A block that no longer holds `tx_hash` fails too.
-///
-/// The block's txs are read untyped, since a block holds tx types the Ethereum
-/// envelope rejects (the Base deposit tx, `0x7e`, opens every Base block).
-pub async fn had_code_at_tx(
-    provider: &impl Provider,
-    address: Address,
-    block: u64,
-    tx_hash: TxHash,
-) -> alloy::transports::TransportResult<bool> {
-    let before = provider
-        .get_code_at(address)
-        .number(block.saturating_sub(1))
-        .await?;
-    if !before.is_empty() {
-        return Ok(true);
-    }
-
-    let Some(block_txs) = provider
-        .raw_request::<_, Option<BlockTxs>>(
-            "eth_getBlockByNumber".into(),
-            (BlockNumberOrTag::Number(block), true),
-        )
-        .await?
-    else {
-        return Err(TransportErrorKind::custom_str(&format!(
-            "block {block} is not available"
-        )));
-    };
-    let txs = block_txs.transactions;
-    let Some(position) = txs.iter().position(|tx| tx.hash == tx_hash) else {
-        return Err(TransportErrorKind::custom_str(&format!(
-            "block {block} does not hold tx {tx_hash}"
-        )));
-    };
-
-    Ok(txs[..=position]
-        .iter()
-        .filter_map(|tx| tx.authorization_list.as_deref())
-        .flatten()
-        .any(|authorization| {
-            authorization
-                .recover_authority()
-                .is_ok_and(|authority| authority == address)
-        }))
-}
-
-/// A block's txs with only the fields `had_code_at_tx` reads, so any tx type
-/// the chain defines decodes.
-#[derive(Debug, Deserialize)]
-struct BlockTxs {
-    transactions: Vec<BlockTx>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct BlockTx {
-    hash: TxHash,
-    /// Present only on EIP-7702 txs.
-    authorization_list: Option<Vec<SignedAuthorization>>,
 }
 
 /// Polls for a transaction receipt with confirmation depth, bypassing alloy's
@@ -1758,7 +1684,6 @@ mod tests {
     use alloy::consensus::{SignableTransaction, TxEip1559};
     use alloy::eips::eip2718::{EIP1559_TX_TYPE_ID, Encodable2718};
     use alloy::eips::eip2930::AccessList;
-    use alloy::eips::eip7702::Authorization;
     use alloy::network::{EthereumWallet, TransactionBuilder};
     use alloy::node_bindings::{Anvil, AnvilInstance};
     #[cfg(any(feature = "turnkey", feature = "local-signer"))]
@@ -1769,7 +1694,6 @@ mod tests {
     use alloy::providers::mock::Asserter;
     #[cfg(any(feature = "turnkey", feature = "local-signer"))]
     use alloy::rpc::types::TransactionReceipt;
-    use alloy::signers::SignerSync as _;
     use alloy::signers::local::PrivateKeySigner;
     use alloy::sol;
     use std::sync::Arc;
@@ -2264,6 +2188,9 @@ mod tests {
     /// PUSH0 PUSH0 REVERT runtime (always reverts); the init code copies the
     /// 3-byte runtime from bytecode offset 10 into memory and returns it.
     const ALWAYS_REVERTS_INIT_CODE: [u8; 13] = hex!("0x6003600a5f3960035ff35f5ffd");
+    /// PUSH0 PUSH0 LOG0 STOP runtime (emits one empty log), deployed the same
+    /// way.
+    const EMITS_A_LOG_INIT_CODE: [u8; 14] = hex!("0x6004600a5f3960045ff35f5fa000");
 
     #[tokio::test]
     async fn mined_tx_returns_none_for_unknown_hash() {
@@ -2306,8 +2233,8 @@ mod tests {
             value: U256::from(1),
             has_calldata: false,
             tx_type: EIP1559_TX_TYPE_ID,
-            block_number: 1,
             succeeded: true,
+            emitted_logs: false,
             confirmations: 1,
         };
         assert_eq!(
@@ -2352,8 +2279,8 @@ mod tests {
                 value: U256::ZERO,
                 has_calldata: true,
                 tx_type: EIP1559_TX_TYPE_ID,
-                block_number: 1,
                 succeeded: true,
+                emitted_logs: false,
                 confirmations: 1,
             })
         );
@@ -2400,268 +2327,45 @@ mod tests {
                 value: U256::ZERO,
                 has_calldata: false,
                 tx_type: EIP1559_TX_TYPE_ID,
-                block_number: 2,
                 succeeded: false,
+                emitted_logs: false,
                 confirmations: 1,
             })
         );
     }
 
+    /// A log from a call that ran to completion is in the receipt, so a tx that
+    /// moved tokens through a contract never reads as having emitted none.
     #[tokio::test]
-    async fn had_code_at_tx_sees_a_contract_but_not_an_eoa() {
+    async fn mined_tx_reports_a_call_that_emitted_logs() {
         let anvil = Anvil::new().spawn();
         let provider = ProviderBuilder::new()
             .wallet(anvil_signer(&anvil))
             .connect_http(anvil.endpoint_url());
+        let emitter = provider
+            .send_transaction(TransactionRequest::default().with_deploy_code(EMITS_A_LOG_INIT_CODE))
+            .await
+            .unwrap()
+            .get_receipt()
+            .await
+            .unwrap()
+            .contract_address
+            .unwrap();
 
-        let deployment = provider
-            .send_transaction(
-                TransactionRequest::default().with_deploy_code(ALWAYS_REVERTS_INIT_CODE),
-            )
+        let receipt = provider
+            .send_transaction(TransactionRequest::default().to(emitter))
             .await
             .unwrap()
             .get_receipt()
             .await
             .unwrap();
-        let contract = deployment.contract_address.unwrap();
-        let later = provider
-            .send_transaction(
-                TransactionRequest::default()
-                    .to(contract)
-                    .gas_limit(100_000),
-            )
+
+        let mined = mined_tx(&provider, receipt.transaction_hash)
             .await
             .unwrap()
-            .get_receipt()
-            .await
             .unwrap();
-        let later_block = later.block_number.unwrap();
-
-        assert!(
-            had_code_at_tx(&provider, contract, later_block, later.transaction_hash)
-                .await
-                .unwrap()
-        );
-        // The deployment itself ran before the contract had code.
-        assert!(
-            !had_code_at_tx(
-                &provider,
-                contract,
-                deployment.block_number.unwrap(),
-                deployment.transaction_hash
-            )
-            .await
-            .unwrap()
-        );
-        assert!(
-            !had_code_at_tx(
-                &provider,
-                anvil.addresses()[0],
-                later_block,
-                later.transaction_hash
-            )
-            .await
-            .unwrap()
-        );
-    }
-
-    /// An EIP-7702 delegation set before a tx and cleared after it in the
-    /// same block leaves no code at either end of the block, yet the tx ran
-    /// against the delegated code.
-    #[tokio::test]
-    async fn had_code_at_tx_sees_a_delegation_set_and_cleared_around_the_tx() {
-        let anvil = Anvil::new().spawn();
-        let sponsor: PrivateKeySigner = anvil.keys()[0].clone().into();
-        let authority: PrivateKeySigner = anvil.keys()[1].clone().into();
-        let caller: PrivateKeySigner = anvil.keys()[2].clone().into();
-        let (sponsor_address, caller_address) = (sponsor.address(), caller.address());
-        let mut wallet = EthereumWallet::from(sponsor);
-        wallet.register_signer(caller);
-        let provider = ProviderBuilder::new()
-            .wallet(wallet)
-            .connect_http(anvil.endpoint_url());
-        let chain_id = U256::from(anvil.chain_id());
-        let delegation = |delegate: Address, nonce: u64| {
-            let authorization = Authorization {
-                chain_id,
-                address: delegate,
-                nonce,
-            };
-            let signature = authority
-                .sign_hash_sync(&authorization.signature_hash())
-                .unwrap();
-            authorization.into_signed(signature)
-        };
-        let send = |from: Address, nonce: u64, tip_gwei: u128| {
-            TransactionRequest::default()
-                .from(from)
-                .to(authority.address())
-                .nonce(nonce)
-                .gas_limit(200_000)
-                .max_fee_per_gas(100_000_000_000)
-                .max_priority_fee_per_gas(tip_gwei * 1_000_000_000)
-        };
-
-        provider.anvil_set_auto_mine(false).await.unwrap();
-        // Anvil orders a block by tip, so the delegation runs first and the
-        // clearing last.
-        let mut set = send(sponsor_address, 0, 3);
-        set.authorization_list = Some(vec![delegation(Address::repeat_byte(0xDE), 0)]);
-        let mut clear = send(sponsor_address, 1, 1);
-        clear.authorization_list = Some(vec![delegation(Address::ZERO, 1)]);
-        let set = *provider.send_transaction(set).await.unwrap().tx_hash();
-        let call = *provider
-            .send_transaction(send(caller_address, 0, 2))
-            .await
-            .unwrap()
-            .tx_hash();
-        let clear = *provider.send_transaction(clear).await.unwrap().tx_hash();
-        provider.evm_mine(None).await.unwrap();
-
-        let mut receipts = Vec::new();
-        for tx in [set, call, clear] {
-            receipts.push(provider.get_transaction_receipt(tx).await.unwrap().unwrap());
-        }
-        let block = receipts[1].block_number.unwrap();
-        assert!(
-            receipts
-                .iter()
-                .all(|receipt| receipt.block_number == Some(block)),
-            "all three txs must share one block"
-        );
-        assert_eq!(
-            receipts
-                .iter()
-                .map(|receipt| receipt.transaction_index.unwrap())
-                .collect::<Vec<_>>(),
-            vec![0, 1, 2],
-            "the call must run between the delegation and its clearing"
-        );
-        for number in [block - 1, block] {
-            assert!(
-                provider
-                    .get_code_at(authority.address())
-                    .number(number)
-                    .await
-                    .unwrap()
-                    .is_empty(),
-                "neither end of the block shows the delegation"
-            );
-        }
-
-        assert!(
-            had_code_at_tx(&provider, authority.address(), block, call)
-                .await
-                .unwrap()
-        );
-        assert!(
-            had_code_at_tx(&provider, authority.address(), block, set)
-                .await
-                .unwrap(),
-            "a tx applies its own delegation before it runs"
-        );
-        assert!(
-            !had_code_at_tx(&provider, caller_address, block, call)
-                .await
-                .unwrap(),
-            "only the wallet that signed the delegation has code"
-        );
-    }
-
-    /// Every Base block opens with a deposit tx (type `0x7e`), which the
-    /// Ethereum envelope rejects, so the block must still read and the
-    /// delegation check must still see an authorization before the tx.
-    #[tokio::test]
-    async fn had_code_at_tx_reads_a_block_holding_a_base_deposit_tx() {
-        let authority = PrivateKeySigner::random();
-        let authorization = Authorization {
-            chain_id: U256::from(8453),
-            address: Address::repeat_byte(0xDE),
-            nonce: 0,
-        };
-        let signature = authority
-            .sign_hash_sync(&authorization.signature_hash())
-            .unwrap();
-        let deposit_hash = B256::repeat_byte(0xD0);
-        let delegation_hash = B256::repeat_byte(0xD1);
-        let cancel_hash = B256::repeat_byte(0xCA);
-        let deposit = serde_json::json!({
-            "type": "0x7e",
-            "hash": deposit_hash,
-            "sourceHash": B256::repeat_byte(0x50),
-            "from": Address::repeat_byte(0xDE),
-            "to": Address::repeat_byte(0x15),
-            "mint": "0x0",
-            "value": "0x0",
-            "gas": "0xf4240",
-            "isSystemTx": false,
-            "input": "0x098999be",
-            "nonce": "0x1",
-            "transactionIndex": "0x0",
-        });
-        let delegation = serde_json::json!({
-            "type": "0x4",
-            "hash": delegation_hash,
-            "authorizationList": [authorization.into_signed(signature)],
-        });
-        let cancel = serde_json::json!({ "type": "0x2", "hash": cancel_hash });
-        let block = |transactions: Vec<serde_json::Value>| serde_json::json!({ "number": "0x64", "transactions": transactions });
-
-        let asserter = Asserter::new();
-        asserter.push_success(&"0x");
-        asserter.push_success(&block(vec![deposit.clone(), cancel.clone()]));
-        asserter.push_success(&"0x");
-        asserter.push_success(&block(vec![deposit, delegation, cancel]));
-        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
-
-        assert!(
-            !had_code_at_tx(&provider, authority.address(), 100, cancel_hash)
-                .await
-                .unwrap()
-        );
-        assert!(
-            had_code_at_tx(&provider, authority.address(), 100, cancel_hash)
-                .await
-                .unwrap(),
-            "a delegation signed by the wallet before the cancel counts as code"
-        );
-    }
-
-    /// A block the node no longer serves, or one that no longer holds the tx
-    /// (a reorg moved it), leaves the tx's position unchecked, so the read
-    /// fails rather than reporting no code.
-    #[tokio::test]
-    async fn had_code_at_tx_fails_when_the_block_or_the_tx_is_missing() {
-        let cancel_hash = B256::repeat_byte(0xCA);
-        let asserter = Asserter::new();
-        asserter.push_success(&"0x");
-        asserter.push_success(&serde_json::Value::Null);
-        asserter.push_success(&"0x");
-        asserter.push_success(&serde_json::json!({
-            "number": "0x64",
-            "transactions": [{ "type": "0x2", "hash": B256::repeat_byte(0xAA) }],
-        }));
-        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
-        let wallet = Address::repeat_byte(0xB0);
-
-        let missing_block = had_code_at_tx(&provider, wallet, 100, cancel_hash)
-            .await
-            .unwrap_err();
-        assert!(
-            missing_block
-                .to_string()
-                .contains("block 100 is not available"),
-            "{missing_block}"
-        );
-        let missing_tx = had_code_at_tx(&provider, wallet, 100, cancel_hash)
-            .await
-            .unwrap_err();
-        assert!(
-            missing_tx
-                .to_string()
-                .contains(&format!("block 100 does not hold tx {cancel_hash}")),
-            "{missing_tx}"
-        );
+        assert!(mined.succeeded);
+        assert!(mined.emitted_logs);
     }
 
     #[cfg(any(feature = "turnkey", feature = "local-signer"))]

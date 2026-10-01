@@ -263,13 +263,14 @@ pub enum WithdrawalNotSuperseded {
     },
     /// Only a plain cancel provably moved nothing: any other successful tx (a
     /// fee bumped copy of the withdrawal, a call through another contract, a
-    /// contract creation, or code run at the wallet via EIP-7702) may have
+    /// contract creation, or one whose receipt holds a log, as code run at the
+    /// wallet via EIP-7702 would leave if it moved anything) may have
     /// withdrawn the vault.
     #[error(
         "superseding tx {superseding} succeeded but is not a plain cancel (a 0-value transfer \
-         with no calldata from the bot wallet {bot_wallet} to itself, not EIP-7702, with no \
-         code at the wallet), so it may have withdrawn the vault: do not reconcile or settle \
-         by hand until you have checked what it did onchain"
+         with no calldata from the bot wallet {bot_wallet} to itself, not EIP-7702, that \
+         emitted no logs), so it may have withdrawn the vault: do not reconcile or settle by \
+         hand until you have checked what it did onchain"
     )]
     SupersedingTxNotAPlainCancel {
         superseding: TxHash,
@@ -279,23 +280,6 @@ pub enum WithdrawalNotSuperseded {
     NoConfirmationDepth { chain: Chain },
     #[error(transparent)]
     ChainServicesMissing(#[from] ChainServicesMissing),
-    /// Only a plain-looking successful cancel reaches this read. Historical
-    /// state needs a node that still holds it, so it can keep failing. The
-    /// read error is in the message, scrubbed of RPC keys, and deliberately
-    /// not the error's source: an error chain printer would show it unscrubbed.
-    #[error(
-        "could not read the bot wallet {bot_wallet}'s code where superseding tx {superseding} ran \
-         in block {block}, to rule out an EIP-7702 delegation ({}): retry. If the error says \
-         the state is missing, the RPC no longer holds the state before that block (a full node \
-         keeps about 128 blocks), so reconcile against an archive RPC",
-        crate::telemetry::scrub_secrets(&read_error.to_string())
-    )]
-    WalletCodeUnreadable {
-        superseding: TxHash,
-        bot_wallet: Address,
-        block: u64,
-        read_error: Box<RaindexError>,
-    },
     /// Reading the chain failed: transient, retry later.
     #[error("could not read tx {tx} on chain; retry")]
     Read {
@@ -315,10 +299,12 @@ pub enum WithdrawalNotSuperseded {
 /// operator-named `superseding_tx` must be a different tx from `bot_wallet` at
 /// the withdrawal's nonce with `required_confirmations` that moved nothing:
 /// either it reverted, or it is a plain cancel, a 0-value transfer with no
-/// calldata from `bot_wallet` to itself that is not EIP-7702 while the wallet
-/// held no code in its block. Any other successful tx may have withdrawn the
-/// vault, so it is refused. Only that last check reads historical state, so a
-/// revert or a refusal never depends on an archive node. Unlike the USDC
+/// calldata from `bot_wallet` to itself that is not EIP-7702 and emitted no
+/// logs. A vault withdrawal always logs (the inventory's withdraw event and the
+/// token transfer), and a reverted frame drops its logs, so a successful tx
+/// with none moved nothing, even if code ran at the wallet through an EIP-7702
+/// delegation. Any other successful tx may have withdrawn the vault, so it is
+/// refused. Unlike the USDC
 /// deposit send, no other transfer's tx can hold the nonce, because the bot
 /// keeps it reserved from signing until the withdrawal confirms or is
 /// definitively dropped. Only a tx the node shows
@@ -373,7 +359,7 @@ pub async fn verify_withdrawal_superseded(
         value,
         has_calldata,
         tx_type,
-        block_number,
+        emitted_logs,
         succeeded,
         confirmations,
     }) = read_mined_tx(raindex, superseding).await?
@@ -407,27 +393,16 @@ pub async fn verify_withdrawal_superseded(
         return Ok(());
     }
 
-    let plain_cancel =
-        to == Some(bot_wallet) && value.is_zero() && !has_calldata && tx_type != EIP7702_TX_TYPE_ID;
-    let not_a_plain_cancel = WithdrawalNotSuperseded::SupersedingTxNotAPlainCancel {
-        superseding,
-        bot_wallet,
-    };
+    let plain_cancel = to == Some(bot_wallet)
+        && value.is_zero()
+        && !has_calldata
+        && tx_type != EIP7702_TX_TYPE_ID
+        && !emitted_logs;
     if !plain_cancel {
-        return Err(not_a_plain_cancel);
-    }
-
-    let wallet_had_code = raindex
-        .had_code_at_tx(bot_wallet, block_number, superseding)
-        .await
-        .map_err(|read_error| WithdrawalNotSuperseded::WalletCodeUnreadable {
+        return Err(WithdrawalNotSuperseded::SupersedingTxNotAPlainCancel {
             superseding,
             bot_wallet,
-            block: block_number,
-            read_error: Box::new(read_error),
-        })?;
-    if wallet_had_code {
-        return Err(not_a_plain_cancel);
+        });
     }
 
     Ok(())
@@ -808,10 +783,6 @@ impl Raindex for PanickingRaindex {
     }
 
     async fn mined_tx(&self, _: TxHash) -> Result<Option<MinedTx>, RaindexError> {
-        unimplemented!("PanickingRaindex: not available in CLI context")
-    }
-
-    async fn had_code_at_tx(&self, _: Address, _: u64, _: TxHash) -> Result<bool, RaindexError> {
         unimplemented!("PanickingRaindex: not available in CLI context")
     }
 
@@ -7042,7 +7013,7 @@ mod withdrawal_superseded_tests {
     }
 
     /// A confirmed plain cancel from `bot` at the withdrawal's nonce: a 0-value
-    /// self-transfer with no calldata.
+    /// self-transfer with no calldata that emitted no logs.
     fn plain_cancel(bot: Address) -> MinedTx {
         MinedTx {
             from: bot,
@@ -7051,18 +7022,20 @@ mod withdrawal_superseded_tests {
             value: U256::ZERO,
             has_calldata: false,
             tx_type: EIP1559_TX_TYPE_ID,
-            block_number: 100,
             succeeded: true,
+            emitted_logs: false,
             confirmations: REQUIRED,
         }
     }
 
-    /// The signed withdrawal itself as mined: a call into the inventory.
+    /// The signed withdrawal itself as mined: a call into the inventory, which
+    /// logs when it succeeds.
     fn mined_withdrawal(bot: Address, succeeded: bool, confirmations: u64) -> MinedTx {
         MinedTx {
             to: Some(INVENTORY),
             has_calldata: true,
             succeeded,
+            emitted_logs: succeeded,
             confirmations,
             ..plain_cancel(bot)
         }
@@ -7386,13 +7359,19 @@ mod withdrawal_superseded_tests {
                     ..cancel
                 },
             ),
+            (
+                // What code run at the wallet through an EIP-7702 delegation
+                // leaves when it moves anything.
+                "self-transfer that emitted logs",
+                MinedTx {
+                    emitted_logs: true,
+                    ..cancel
+                },
+            ),
         ];
 
         for (shape, mined) in shapes {
-            // Each shape is refused on its own fields: no code read needed.
-            let raindex = MockRaindex::new()
-                .with_mined_tx(fixture.cancel, mined)
-                .with_code_read_error(fixture.bot);
+            let raindex = MockRaindex::new().with_mined_tx(fixture.cancel, mined);
             let error = verify(raindex, &fixture, Some(fixture.cancel))
                 .await
                 .unwrap_err();
@@ -7406,106 +7385,18 @@ mod withdrawal_superseded_tests {
             assert_eq!(superseding, fixture.cancel, "{shape}");
             assert_eq!(bot_wallet, fixture.bot, "{shape}");
 
-            let reverted = MockRaindex::new()
-                .with_mined_tx(
-                    fixture.cancel,
-                    MinedTx {
-                        succeeded: false,
-                        ..mined
-                    },
-                )
-                .with_code_read_error(fixture.bot);
+            let reverted = MockRaindex::new().with_mined_tx(
+                fixture.cancel,
+                MinedTx {
+                    succeeded: false,
+                    emitted_logs: false,
+                    ..mined
+                },
+            );
             verify(reverted, &fixture, Some(fixture.cancel))
                 .await
                 .unwrap_or_else(|error| panic!("a reverted {shape} moved nothing: {error:?}"));
         }
-    }
-
-    /// An EIP-7702 delegation on the bot wallet runs code even on a plain
-    /// self-transfer, so a cancel into a wallet with code is not proof.
-    #[tokio::test]
-    async fn a_plain_cancel_into_a_wallet_with_delegated_code_is_not_proof() {
-        let fixture = fixture();
-        let raindex = MockRaindex::new()
-            .with_mined_tx(fixture.cancel, plain_cancel(fixture.bot))
-            .with_code_at(fixture.bot);
-
-        let error = verify_withdrawal_superseded(
-            &raindex,
-            &fixture.prepared,
-            Some(fixture.cancel),
-            fixture.bot,
-            REQUIRED,
-        )
-        .await
-        .unwrap_err();
-        assert_eq!(
-            raindex.code_reads(),
-            vec![(
-                fixture.bot,
-                plain_cancel(fixture.bot).block_number,
-                fixture.cancel
-            )],
-            "the code check reads the bot wallet at the cancel's block and position"
-        );
-
-        let WithdrawalNotSuperseded::SupersedingTxNotAPlainCancel {
-            superseding,
-            bot_wallet,
-        } = error
-        else {
-            panic!("delegated code may have withdrawn the vault: {error:?}");
-        };
-        assert_eq!(superseding, fixture.cancel);
-        assert_eq!(bot_wallet, fixture.bot);
-    }
-
-    #[tokio::test]
-    async fn an_unreadable_wallet_code_is_not_proof() {
-        let fixture = fixture();
-        let raindex = MockRaindex::new()
-            .with_mined_tx(fixture.cancel, plain_cancel(fixture.bot))
-            .with_code_read_error(fixture.bot);
-
-        let error = verify(raindex, &fixture, Some(fixture.cancel))
-            .await
-            .unwrap_err();
-        assert!(
-            std::error::Error::source(&error).is_none(),
-            "the unscrubbed read error must not be chained"
-        );
-
-        let WithdrawalNotSuperseded::WalletCodeUnreadable {
-            superseding,
-            bot_wallet,
-            block,
-            read_error,
-        } = error
-        else {
-            panic!("an unread wallet may hold a delegation: {error:?}");
-        };
-        assert_eq!(superseding, fixture.cancel);
-        assert_eq!(bot_wallet, fixture.bot);
-        assert_eq!(block, plain_cancel(fixture.bot).block_number);
-        assert!(
-            matches!(*read_error, RaindexError::RpcTransport(_)),
-            "got: {read_error:?}"
-        );
-    }
-
-    /// Only a successful plain cancel needs historical state, so a reverted
-    /// withdrawal proves itself on a node that pruned it.
-    #[tokio::test]
-    async fn a_reverted_withdrawal_needs_no_wallet_code_read() {
-        let fixture = fixture();
-        let raindex = MockRaindex::new()
-            .with_mined_tx(
-                fixture.prepared.tx_hash(),
-                mined_withdrawal(fixture.bot, false, REQUIRED),
-            )
-            .with_code_read_error(fixture.bot);
-
-        verify(raindex, &fixture, None).await.unwrap();
     }
 
     #[tokio::test]

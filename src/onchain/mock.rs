@@ -96,9 +96,6 @@ pub struct MockRaindex {
     withdrawals_mined: bool,
     mined_txs: HashMap<TxHash, MinedTx>,
     mined_tx_read_errors: HashSet<TxHash>,
-    accounts_with_code: HashSet<Address>,
-    code_read_errors: HashSet<Address>,
-    code_reads: Mutex<Vec<(Address, u64, TxHash)>>,
 }
 
 fn successful_receipt(tx_hash: TxHash, logs: Vec<Log>) -> TransactionReceipt {
@@ -173,9 +170,6 @@ impl MockRaindex {
             withdrawals_mined: false,
             mined_txs: HashMap::new(),
             mined_tx_read_errors: HashSet::new(),
-            accounts_with_code: HashSet::new(),
-            code_read_errors: HashSet::new(),
-            code_reads: Mutex::new(Vec::new()),
         }
     }
 
@@ -207,22 +201,6 @@ impl MockRaindex {
     #[cfg(test)]
     pub(crate) fn with_mined_tx_read_error(mut self, tx_hash: TxHash) -> Self {
         self.mined_tx_read_errors.insert(tx_hash);
-        self
-    }
-
-    /// Makes `had_code_at_tx` report `address` as holding code at every tx;
-    /// every other address reads as codeless.
-    #[cfg(test)]
-    pub(crate) fn with_code_at(mut self, address: Address) -> Self {
-        self.accounts_with_code.insert(address);
-        self
-    }
-
-    /// Makes `had_code_at_tx` fail to read `address` with a transport
-    /// error, as a node without that block's state would.
-    #[cfg(test)]
-    pub(crate) fn with_code_read_error(mut self, address: Address) -> Self {
-        self.code_read_errors.insert(address);
         self
     }
 
@@ -322,16 +300,6 @@ impl MockRaindex {
             panic!("mock restore-submitted-withdrawal mutex poisoned");
         };
         calls.clone()
-    }
-
-    /// Every `had_code_at_tx` call as `(address, block, tx_hash)`, so a test
-    /// can assert which account, block and tx position the check read.
-    #[cfg(test)]
-    pub(crate) fn code_reads(&self) -> Vec<(Address, u64, TxHash)> {
-        let Ok(reads) = self.code_reads.lock() else {
-            panic!("mock code-read mutex poisoned");
-        };
-        reads.clone()
     }
 
     /// Every withdrawal released via `release_superseded_withdraw`, by tx hash,
@@ -538,26 +506,6 @@ impl Raindex for MockRaindex {
         }
 
         Ok(self.mined_txs.get(&tx_hash).copied())
-    }
-
-    async fn had_code_at_tx(
-        &self,
-        address: Address,
-        block: u64,
-        tx_hash: TxHash,
-    ) -> Result<bool, RaindexError> {
-        let Ok(mut reads) = self.code_reads.lock() else {
-            panic!("mock code-read mutex poisoned");
-        };
-        reads.push((address, block, tx_hash));
-        drop(reads);
-        if self.code_read_errors.contains(&address) {
-            return Err(RaindexError::RpcTransport(
-                alloy::transports::TransportErrorKind::backend_gone(),
-            ));
-        }
-
-        Ok(self.accounts_with_code.contains(&address))
     }
 
     async fn confirm_tx_receipt(

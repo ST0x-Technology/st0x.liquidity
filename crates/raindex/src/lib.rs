@@ -291,15 +291,6 @@ pub trait Raindex: Send + Sync {
     /// canonical receipt for it. Does not wait. See [`st0x_evm::mined_tx`].
     async fn mined_tx(&self, tx_hash: TxHash) -> Result<Option<MinedTx>, RaindexError>;
 
-    /// Whether `address` held code when `tx_hash`, mined in `block`, ran. See
-    /// [`st0x_evm::had_code_at_tx`].
-    async fn had_code_at_tx(
-        &self,
-        address: Address,
-        block: u64,
-        tx_hash: TxHash,
-    ) -> Result<bool, RaindexError>;
-
     /// Wait for a previously submitted transaction to be confirmed.
     async fn confirm_tx(&self, tx_hash: TxHash) -> Result<(), RaindexError> {
         self.confirm_tx_receipt(tx_hash).await.map(|_| ())

@@ -949,7 +949,7 @@ pub enum TransferCommand {
         /// usdc, pay the deposit address USDC (unless another transfer recorded
         /// it as its own deposit send); for a redemption, it must have reverted
         /// or be a plain cancel (0 value, no calldata, to the bot wallet itself,
-        /// not EIP-7702, with no code at the wallet).
+        /// not EIP-7702, with no logs in its receipt).
         #[arg(long = "superseding-tx")]
         superseding_tx: Option<TxHash>,
     },
