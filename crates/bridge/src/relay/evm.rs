@@ -77,6 +77,8 @@ pub enum RelayBridgeError {
     NoDepository { chain: Chain },
     #[error("the corridor chain must not be the Ethereum hub")]
     HubAsCorridorChain,
+    #[error("{chain} needs at least one confirmation, or a deposit scan reads the raw head")]
+    ZeroConfirmations { chain: Chain },
     #[error("{step:?} step targets chain {step_chain}, the wallet is on chain {wallet_chain}")]
     StepChain {
         step: QuoteStep,
@@ -375,6 +377,10 @@ impl<EthWallet: Wallet, ChainWallet: Wallet> SwapBridge for RelayBridge<EthWalle
 
 impl<W: Wallet> RelayEnd<W> {
     fn pinned(chain: Chain, wallet: W, confirmations: u64) -> Result<Self, RelayBridgeError> {
+        if confirmations == 0 {
+            return Err(RelayBridgeError::ZeroConfirmations { chain });
+        }
+
         let depository = chain
             .relay_depository()
             .ok_or(RelayBridgeError::NoDepository { chain })?;
@@ -1099,6 +1105,43 @@ mod tests {
         assert!(
             matches!(error, RelayBridgeError::HubAsCorridorChain),
             "{error:?}"
+        );
+    }
+
+    #[test]
+    fn zero_confirmations_on_either_end_are_refused() {
+        let refused = |ethereum_confirmations, chain_confirmations| {
+            RelayBridge::try_from_ctx(RelayCtx {
+                chain: Chain::Robinhood,
+                ethereum_wallet: offline_wallet(),
+                chain_wallet: offline_wallet(),
+                ethereum_confirmations,
+                chain_confirmations,
+            })
+            .err()
+            .unwrap()
+        };
+
+        let hub = refused(0, CONFIRMATIONS);
+        let chain = refused(CONFIRMATIONS, 0);
+
+        assert!(
+            matches!(
+                hub,
+                RelayBridgeError::ZeroConfirmations {
+                    chain: Chain::Ethereum
+                }
+            ),
+            "{hub:?}"
+        );
+        assert!(
+            matches!(
+                chain,
+                RelayBridgeError::ZeroConfirmations {
+                    chain: Chain::Robinhood
+                }
+            ),
+            "{chain:?}"
         );
     }
 
