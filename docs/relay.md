@@ -109,14 +109,14 @@ The approve is optional because Relay may leave it out when the allowance
 already covers the amount (not observed; the funded test always had one).
 
 `QuoteAmounts::accept` then checks the amounts against `QuoteBounds`, in checked
-integer basis points (an overflow is `QuoteAcceptanceError::Overflow`, never a
-panic):
+integer basis points rounded up, so a bound never sits below its exact value (an
+overflow is `QuoteAcceptanceError::Overflow`, never a panic):
 
 - `expected_out >= amount_in * (10000 - max_loss) / 10000`, else
   `QuoteLossExceedsBound`;
 - `minimum_out >= expected_out * (10000 - slippage) / 10000`, else
-  `QuoteFloorBelowBound`: Relay's floor is not looser than the slippage we asked
-  for;
+  `QuoteFloorBelowBound`: Relay's floor is not looser than the slippage we sent,
+  which `QuoteAmounts` carries from the request;
 - `minimum_out >= downstream_minimum`, else `QuoteBelowDownstreamMinimum`;
 - `minimum_out <= expected_out`, else `MinimumAboveExpected`.
 
