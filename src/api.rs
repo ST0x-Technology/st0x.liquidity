@@ -8625,12 +8625,11 @@ mod tests {
         gate: &tokio::sync::watch::Sender<ReceiptGate>,
     ) {
         state.detached_tasks.close();
-        assert!(
-            tokio::time::timeout(Duration::from_millis(200), state.detached_tasks.wait())
-                .await
-                .is_err(),
-            "the route's task must keep running until its confirmation"
-        );
+        let Err(_still_confirming) =
+            tokio::time::timeout(Duration::from_millis(200), state.detached_tasks.wait()).await
+        else {
+            panic!("the route's task must keep running until its confirmation");
+        };
         gate.send_replace(ReceiptGate::Released);
         state.detached_tasks.wait().await;
         state.detached_tasks.reopen();
@@ -8924,6 +8923,74 @@ mod tests {
         state.detached_tasks.wait().await;
         assert!(logs_contain("reset-allowance worker task failed"));
         assert!(!logs_contain("Orderbook allowance reset confirmed via API"));
+    }
+
+    /// A confirmation that fails after the answer is logged as not confirmed
+    /// with the tx the route answered with, for a vault verb and for
+    /// `reset-allowance` alike, and the failed deposit still releases the
+    /// deposit lock.
+    #[tracing_test::traced_test]
+    #[tokio::test]
+    async fn a_failed_confirmation_is_logged_with_the_answered_tx() {
+        let chain = AnvilRaindexChain::deploy().await;
+        let supply = U256::from(1_000_u64) * U256::from(10_u64).pow(U256::from(18_u64));
+        let token = chain.deploy_bot_token(18, supply).await;
+        let usdc = Chain::Base.settlement_stable().address;
+        chain.etch_bot_stable(usdc, U256::ZERO).await;
+        chain
+            .approve_from_bot(usdc, chain.orderbook, U256::from(5_000_000_u64))
+            .await;
+        let (ctx, gate) = capital_ctx_on(&chain);
+        gate.send_replace(ReceiptGate::Fail);
+        let state = empty_app_state(ctx).await;
+        state.health.set_ready();
+
+        let deposit = capital_success(
+            "vault-deposit",
+            capital::vault_deposit(
+                State(state.clone()),
+                capital_request(vault_request(token, B256::with_last_byte(3), "1.5")),
+            )
+            .await,
+        );
+        let reset = capital_success(
+            "reset-allowance",
+            capital::reset_allowance(
+                State(state.clone()),
+                capital_request(serde_json::json!({"chain": "base"})),
+            )
+            .await,
+        );
+        state.detached_tasks.close();
+        state.detached_tasks.wait().await;
+
+        let Ok(_released) = state.vault_deposit_lock.try_lock() else {
+            panic!("a deposit whose confirmation failed must release the deposit lock");
+        };
+        let deposit_tx: TxHash = serde_json::from_value(deposit["depositTx"].clone()).unwrap();
+        let reset_tx: TxHash = serde_json::from_value(reset["tx"].clone()).unwrap();
+        logs_assert(|lines| {
+            for (message, tx) in [
+                (
+                    "Vault operation broadcast via API did not confirm",
+                    deposit_tx,
+                ),
+                (
+                    "Orderbook allowance reset via API did not confirm",
+                    reset_tx,
+                ),
+            ] {
+                let tx_field = format!("tx={tx}");
+                if !lines
+                    .iter()
+                    .any(|line| line.contains(message) && line.contains(&tx_field))
+                {
+                    return Err(format!("no `{message}` line names {tx_field}"));
+                }
+            }
+            Ok(())
+        });
+        assert!(!logs_contain("confirmed via API"));
     }
 
     /// End to end against CCTP V2 deployed on two Anvil nodes, reached

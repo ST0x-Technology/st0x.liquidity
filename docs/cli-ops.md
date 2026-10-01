@@ -358,14 +358,24 @@ keeps answering `502` for it.
 `capital vault-deposit`, `capital vault-withdraw`, `capital vault-withdraw-usdc`
 and `capital reset-allowance` also print their tx as soon as it is broadcast,
 and the bot confirms it afterwards, so they answer within the load balancer cut
-on Ethereum too. The outcome is `Vault operation confirmed via API` or
+even on a chain that needs many confirmations, such as Ethereum's 12. They
+refuse a chain without a `[chains.<name>.trading]` table with `400`, and
+Ethereum has none in staging or prod today. The outcome is
+`Vault operation confirmed via API` or
 `Vault operation broadcast via API did not confirm` for the vault verbs, and
 `Orderbook allowance reset confirmed via API` or
 `Orderbook allowance reset via API did not confirm` for `reset-allowance`, each
 with the tx hash. A tx that did not confirm may still land, so check it onchain
 before retrying. When the allowance is short, `capital vault-deposit` first
 approves and waits for the approve to confirm, so a deposit of a token without
-the startup MAX grant can still time out on Ethereum.
+the startup MAX grant can still time out on a chain that needs many
+confirmations. The answer comes before the onchain effect: the vault balance or
+the allowance changes only once the tx confirms. A rerun before that sends a
+second tx: `capital vault-withdraw` and `capital vault-withdraw-usdc` withdraw
+again, and `capital reset-allowance` sends a redundant `approve(0)`.
+`capital vault-deposit` answers `409` until its deposit confirms. Wait for the
+confirmed line with the answered tx before rerunning a verb or reading the new
+balance.
 
 A request that times out on the client may still complete in the bot; check the
 bot logs and the chain for the transaction before retrying a vault or allowance

@@ -2,11 +2,13 @@
 //! of `st0x-cli`, run inside the bot so they sign with its own wallets and
 //! share their nonce state instead of building a second signer.
 //!
-//! No route waits on CCTP attestation, on USDC settlement, or on a
-//! transaction's confirmations, since the ops load balancer times out first:
-//! `transfer-usdc` enqueues the transfer on the bot's own worker and returns
-//! its id, and every route that sends a transaction answers at its broadcast
-//! through `answer_from_detached` and confirms it on the task. The routes that
+//! No route waits on CCTP attestation, on USDC settlement, or on the
+//! confirmations of the transaction it answers with, since the ops load
+//! balancer times out first: `transfer-usdc` enqueues the transfer on the
+//! bot's own worker and returns its id, and every route that sends a
+//! transaction answers at its broadcast through `answer_from_detached` and
+//! confirms it on the task. Only a prerequisite approve, when an allowance is
+//! short, is awaited before that broadcast. The routes that
 //! send transactions, and the
 //! `transfer-usdc` enqueue, run through `spawn_detached`, so a dropped request
 //! cannot cancel them midway (between broadcast and receipt, or between the
@@ -627,8 +629,8 @@ pub(super) async fn reset_allowance(
             let RevokeOutcome::Revoked { tx } = outcome else {
                 return;
             };
-            match raindex.confirm_tx_receipt(tx).await {
-                Ok(_receipt) => {
+            match raindex.confirm_tx(tx).await {
+                Ok(()) => {
                     info!(%chain, %token, %spender, %tx, "Orderbook allowance reset confirmed via API");
                 }
                 Err(error) => error!(
@@ -829,7 +831,7 @@ struct VaultOutcome {
 /// Answers as soon as the vault transaction is broadcast, like `cctp_bridge`:
 /// the chain's required confirmations (12 on Ethereum in production) outlast
 /// the 60 second load balancer cut. The task then awaits the confirmation
-/// through `Raindex::confirm_tx_receipt`, as the USDC transfer worker does
+/// through `Raindex::confirm_tx`, as the USDC transfer worker does
 /// after its own `submit_deposit`, and logs the outcome. A deposit still
 /// awaits its approve's confirmation before the broadcast when the allowance
 /// is short, so only a deposit of a token without the startup MAX grant can
@@ -922,8 +924,8 @@ async fn run_vault_operation(
         let VaultOutcome { amount_raw, tx, .. } = outcome;
         let _ = answer.send(Ok(outcome));
 
-        match raindex.confirm_tx_receipt(tx).await {
-            Ok(_receipt) => info!(
+        match raindex.confirm_tx(tx).await {
+            Ok(()) => info!(
                 route, %chain, %token, %vault_id, %amount_raw, %tx,
                 "Vault operation confirmed via API"
             ),

@@ -1002,6 +1002,8 @@ mod held_receipt {
         Released,
         /// Panics, as a confirmation that blows up after its broadcast.
         Panic,
+        /// Fails with a revert, as a confirmation that does not land.
+        Fail,
     }
 
     /// Delegates to the wrapped wallet, except that `await_receipt` waits
@@ -1112,6 +1114,7 @@ mod held_receipt {
                 ReceiptGate::Panic => {
                     panic!("HeldReceiptWallet panics at the receipt of {tx_hash}")
                 }
+                ReceiptGate::Fail => Err(EvmError::Reverted { tx_hash }),
                 ReceiptGate::Held => unreachable!("wait_for returned a held gate"),
             }
         }

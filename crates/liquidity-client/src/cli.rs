@@ -420,17 +420,19 @@ pub(crate) enum Capital {
     /// the deposit tx as soon as it is broadcast; the bot confirms it
     /// afterwards and logs the outcome. When the allowance is short it first
     /// waits for the approve to confirm, so a token without the startup MAX
-    /// grant can still time out on Ethereum.
+    /// grant can still time out on a chain that needs many confirmations.
     VaultDeposit(VaultArgs),
     /// Withdraw tokens from a Raindex vault to the bot's wallet, resolving
     /// token decimals from onchain metadata. Returns the withdraw tx as soon
     /// as it is broadcast; the bot confirms it afterwards and logs the
-    /// outcome.
+    /// outcome. Not idempotent: a rerun withdraws again, even while the first
+    /// withdraw is still unconfirmed.
     VaultWithdraw(VaultArgs),
     /// Withdraw the chain's settlement stable (USDC, or USDG on Robinhood)
     /// from its configured Raindex cash vault. Returns the withdraw tx as
     /// soon as it is broadcast; the bot confirms it afterwards and logs the
-    /// outcome.
+    /// outcome. Not idempotent: a rerun withdraws again, even while the first
+    /// withdraw is still unconfirmed.
     VaultWithdrawUsdc {
         /// Amount of the settlement stable to withdraw, as a decimal.
         #[arg(short = 'a', long, allow_negative_numbers = true)]
@@ -465,7 +467,8 @@ pub(crate) enum Capital {
     },
     /// Reset the bot wallet's settlement stable allowance (USDC, or USDG on
     /// Robinhood) for the orderbook to zero. Returns the revoke tx as soon as
-    /// it is broadcast; the bot confirms it afterwards and logs the outcome.
+    /// it is broadcast; the bot confirms it afterwards and logs the outcome. A
+    /// rerun before the confirmation sends a redundant revoke.
     ResetAllowance {
         /// Chain whose allowance to reset: its wallet, its settlement stable
         /// and its `[chains.<name>.trading]` orderbook.
