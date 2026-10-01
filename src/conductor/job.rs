@@ -468,23 +468,11 @@ impl<Task: Serialize + DeserializeOwned + Send + Sync + Unpin + 'static> JobQueu
     /// callers that need to discard stale work after a terminal domain event
     /// invalidates everything queued before it.
     pub(crate) async fn cancel_all_pending(&self) {
-        self.cancel_pending_rows("").await;
-    }
-
-    /// Like [`Self::cancel_all_pending`], but keeps rows pushed with a delay
-    /// that has not elapsed yet: those are deliberate retries scheduled for
-    /// later, not work queued against the state the terminal event replaced.
-    pub(crate) async fn cancel_due_pending(&self) {
-        self.cancel_pending_rows(" AND run_at <= CAST(strftime('%s', 'now') AS INTEGER)")
-            .await;
-    }
-
-    async fn cancel_pending_rows(&self, filter: &str) {
         let job_type = self.queue_key();
-        if let Err(error) = sqlx_apalis::query(&format!(
+        if let Err(error) = sqlx_apalis::query(
             "UPDATE Jobs SET status = 'Done' \
-             WHERE status = 'Pending' AND job_type = ?{filter}"
-        ))
+             WHERE status = 'Pending' AND job_type = ?",
+        )
         .bind(job_type)
         .execute(self.pool())
         .await
@@ -498,17 +486,57 @@ impl<Task: Serialize + DeserializeOwned + Send + Sync + Unpin + 'static> JobQueu
         }
     }
 
-    /// Whether a pending row of this queue that `matches` was pushed with a
-    /// delay that has not elapsed yet. A row whose payload no longer decodes
-    /// as `Task` does not match.
-    pub(crate) async fn has_scheduled(
+    /// Like [`Self::cancel_all_pending`], but keeps every pending row whose
+    /// payload `keep` accepts, whatever its `run_at`. A row whose payload no
+    /// longer decodes as `Task` is cancelled.
+    pub(crate) async fn cancel_pending_except(&self, keep: impl Fn(&Task) -> bool) {
+        let job_type = self.queue_key();
+        if let Err(error) = self.try_cancel_pending_except(keep).await {
+            warn!(
+                target: "rebalance",
+                %error,
+                job_type,
+                "Failed to cancel pending rows for job type",
+            );
+        }
+    }
+
+    async fn try_cancel_pending_except(
+        &self,
+        keep: impl Fn(&Task) -> bool,
+    ) -> Result<(), SqlxError> {
+        let rows: Vec<(String, Vec<u8>)> = sqlx_apalis::query_as(
+            "SELECT id, job FROM Jobs WHERE status = 'Pending' AND job_type = ?",
+        )
+        .bind(self.queue_key())
+        .fetch_all(self.pool())
+        .await?;
+
+        for (id, payload) in rows {
+            if serde_json::from_slice::<Task>(&payload).is_ok_and(|task| keep(&task)) {
+                continue;
+            }
+            // A worker may have claimed the row since the read; only a row
+            // still pending is cancelled.
+            sqlx_apalis::query(
+                "UPDATE Jobs SET status = 'Done' WHERE id = ? AND status = 'Pending'",
+            )
+            .bind(id)
+            .execute(self.pool())
+            .await?;
+        }
+
+        Ok(())
+    }
+
+    /// Whether a pending row of this queue matches, due or not. A row whose
+    /// payload no longer decodes as `Task` does not match.
+    pub(crate) async fn has_pending(
         &self,
         matches: impl Fn(&Task) -> bool,
     ) -> Result<bool, SqlxError> {
         let payloads: Vec<Vec<u8>> = sqlx_apalis::query_scalar(
-            "SELECT job FROM Jobs \
-             WHERE status = 'Pending' AND job_type = ? \
-             AND run_at > CAST(strftime('%s', 'now') AS INTEGER)",
+            "SELECT job FROM Jobs WHERE status = 'Pending' AND job_type = ?",
         )
         .bind(self.queue_key())
         .fetch_all(self.pool())

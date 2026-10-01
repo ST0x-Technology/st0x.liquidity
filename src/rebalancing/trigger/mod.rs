@@ -4345,7 +4345,7 @@ impl RebalancingService {
                     "Broker sell check failed, so the redemption waits and is checked again"
                 );
                 self.equity_scheduler
-                    .enqueue_delayed_check(symbol.clone(), SELL_CHECK_RETRY_DELAY)
+                    .enqueue_sell_check_retry(symbol.clone(), SELL_CHECK_RETRY_DELAY)
                     .await;
                 Ok(None)
             }
@@ -32594,6 +32594,7 @@ mod tests {
 
         EquityRebalancingCheck {
             symbol: symbol.clone(),
+            sell_check_retry: false,
         }
         .perform(&trigger)
         .await
@@ -32627,6 +32628,7 @@ mod tests {
 
         EquityRebalancingCheck {
             symbol: symbol.clone(),
+            sell_check_retry: false,
         }
         .perform(&trigger)
         .await
@@ -32643,6 +32645,7 @@ mod tests {
 
         EquityRebalancingCheck {
             symbol: symbol.clone(),
+            sell_check_retry: false,
         }
         .perform(&trigger)
         .await
@@ -33103,6 +33106,7 @@ mod tests {
 
         EquityRebalancingCheck {
             symbol: symbol.clone(),
+            sell_check_retry: false,
         }
         .perform(&trigger)
         .await
@@ -33115,6 +33119,7 @@ mod tests {
 
         EquityRebalancingCheck {
             symbol: symbol.clone(),
+            sell_check_retry: false,
         }
         .perform(&trigger)
         .await
@@ -33229,6 +33234,7 @@ mod tests {
 
         EquityRebalancingCheck {
             symbol: symbol.clone(),
+            sell_check_retry: false,
         }
         .perform(&trigger)
         .await
@@ -33324,6 +33330,7 @@ mod tests {
 
         EquityRebalancingCheck {
             symbol: symbol.clone(),
+            sell_check_retry: false,
         }
         .perform(&trigger)
         .await
@@ -33357,6 +33364,7 @@ mod tests {
 
         EquityRebalancingCheck {
             symbol: symbol.clone(),
+            sell_check_retry: false,
         }
         .perform(&trigger)
         .await
@@ -33385,6 +33393,7 @@ mod tests {
         .await;
         let check = EquityRebalancingCheck {
             symbol: symbol.clone(),
+            sell_check_retry: false,
         };
 
         check.perform(&trigger).await.unwrap();
@@ -33407,11 +33416,121 @@ mod tests {
         };
         let delayed: EquityRebalancingCheck = serde_json::from_slice(payload).unwrap();
         assert_eq!(delayed.symbol, symbol);
+        assert!(
+            delayed.sell_check_retry,
+            "the retry must be marked so a terminal transfer event keeps it"
+        );
         let expected_run_at =
             Utc::now().timestamp() + i64::try_from(SELL_CHECK_RETRY_DELAY.as_secs()).unwrap();
         assert!(
             (expected_run_at - 5..=expected_run_at).contains(run_at),
             "the delayed check must run {SELL_CHECK_RETRY_DELAY:?} after the failure"
+        );
+    }
+
+    /// A sell check that refuses the hedge for lack of shares and, while it
+    /// is asked, moves the inventory so the next plan is a mint, as onchain
+    /// activity can between the two plans of one check.
+    struct InventoryMovingSellCheck {
+        inventory: Arc<BroadcastingInventory>,
+        moved_to: InventoryView,
+    }
+
+    #[async_trait]
+    impl OrderPlacer for InventoryMovingSellCheck {
+        async fn place_market_order(
+            &self,
+            _order: MarketOrder,
+        ) -> Result<
+            crate::offchain::order::OrderPlacementResult,
+            Box<dyn std::error::Error + Send + Sync>,
+        > {
+            Err("the admission test places no order".into())
+        }
+
+        async fn place_limit_order(
+            &self,
+            _order: st0x_execution::LimitOrder,
+        ) -> Result<
+            crate::offchain::order::OrderPlacementResult,
+            Box<dyn std::error::Error + Send + Sync>,
+        > {
+            Err("the admission test places no order".into())
+        }
+
+        async fn cancel_order(
+            &self,
+            _executor_order_id: &ExecutorOrderId,
+        ) -> Result<st0x_execution::CancellationOutcome, Box<dyn std::error::Error + Send + Sync>>
+        {
+            Err("the admission test cancels no order".into())
+        }
+
+        async fn preflight_counter_trade_with_reserved_buying_power(
+            &self,
+            order: MarketOrder,
+            _reserved: BuyingPowerReservationCents,
+        ) -> Result<st0x_execution::CounterTradePreflight, Box<dyn std::error::Error + Send + Sync>>
+        {
+            *self.inventory.write().await = self.moved_to.clone();
+            Ok(st0x_execution::CounterTradePreflight::Skipped(
+                st0x_execution::CounterTradeSkipReason::HeldAtFloor {
+                    symbol: order.symbol,
+                    floor: FractionalShares::new(float!(0.01)),
+                    available: FractionalShares::new(float!(0.01)),
+                },
+            ))
+        }
+    }
+
+    /// Position takes a refused sell as proof for any reservation, so the
+    /// trigger must not confirm one for a mint: when the plan after the
+    /// reservation is no longer a redemption, nothing is dispatched and the
+    /// reservation is released.
+    #[tokio::test]
+    async fn equity_check_does_not_dispatch_a_mint_on_a_reservation_admitted_for_a_redemption() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let redemption_inventory = InventoryView::default()
+            .with_equity(symbol.clone(), shares(86), FractionalShares::ZERO)
+            .with_usdc(usdc(1_000_000), usdc(1_000_000));
+        let mint_inventory = InventoryView::default()
+            .with_equity(symbol.clone(), shares(20), shares(80))
+            .with_usdc(usdc(1_000_000), usdc(1_000_000));
+        let trigger = make_trigger_with_inventory_and_registry(redemption_inventory, &symbol).await;
+        hold_long_position_needing_hedge(&trigger, &symbol, shares(61)).await;
+        trigger
+            .set_hedge_sell_check(Arc::new(InventoryMovingSellCheck {
+                inventory: Arc::clone(&trigger.inventory),
+                moved_to: mint_inventory,
+            }))
+            .await;
+
+        EquityRebalancingCheck {
+            symbol: symbol.clone(),
+            sell_check_retry: false,
+        }
+        .perform(&trigger)
+        .await
+        .unwrap();
+
+        assert_eq!(count_pending_equity_mint_jobs(&trigger).await, 0);
+        assert_eq!(count_pending_equity_redemption_jobs(&trigger).await, 0);
+        let projection = trigger
+            .position_projection
+            .read()
+            .await
+            .as_ref()
+            .cloned()
+            .unwrap();
+        assert_eq!(
+            projection
+                .load(&symbol)
+                .await
+                .unwrap()
+                .unwrap()
+                .equity_transfer_reservation,
+            None,
+            "the reservation admitted for the redemption must be released"
         );
     }
 
@@ -33447,6 +33566,7 @@ mod tests {
 
         EquityRebalancingCheck {
             symbol: symbol.clone(),
+            sell_check_retry: false,
         }
         .perform(&trigger)
         .await
@@ -33487,6 +33607,7 @@ mod tests {
 
         EquityRebalancingCheck {
             symbol: symbol.clone(),
+            sell_check_retry: false,
         }
         .perform(&trigger)
         .await
@@ -34818,6 +34939,7 @@ mod tests {
 
         EquityRebalancingCheck {
             symbol: symbol.clone(),
+            sell_check_retry: false,
         }
         .perform(&trigger)
         .await
@@ -34837,6 +34959,7 @@ mod tests {
 
         EquityRebalancingCheck {
             symbol: symbol.clone(),
+            sell_check_retry: false,
         }
         .perform(&trigger)
         .await

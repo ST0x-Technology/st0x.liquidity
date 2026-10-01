@@ -476,6 +476,12 @@ pub(crate) fn claim_guard_for_recovery_or_orphan(
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct EquityRebalancingCheck {
     pub symbol: Symbol,
+    /// Set on the delayed retry scheduled after the broker's sell check could
+    /// not be asked. Nothing else checks the symbol again while its balances
+    /// are unchanged, so a terminal transfer event never cancels it. Rows
+    /// queued before this field existed were ordinary checks.
+    #[serde(default)]
+    pub sell_check_retry: bool,
 }
 
 pub(crate) type EquityRebalancingCheckJobQueue = JobQueue<EquityRebalancingCheck>;
@@ -534,40 +540,52 @@ impl EquityRebalancingCheckScheduler {
     /// re-trigger.
     pub(super) async fn enqueue_check(&self, symbol: Symbol) {
         let mut queue = self.queue.clone();
-        if let Err(QueuePushError(error)) = queue.push(EquityRebalancingCheck { symbol }).await {
+        let check = EquityRebalancingCheck {
+            symbol,
+            sell_check_retry: false,
+        };
+        if let Err(QueuePushError(error)) = queue.push(check).await {
             warn!(target: "rebalance", %error, "Failed to enqueue EquityRebalancingCheck job");
         }
     }
 
-    /// Best-effort delayed enqueue, skipped when a delayed check for `symbol`
-    /// is already scheduled, so repeated triggers keep one retry per symbol.
-    pub(super) async fn enqueue_delayed_check(&self, symbol: Symbol, delay: std::time::Duration) {
+    /// Best-effort delayed retry after the broker's sell check could not be
+    /// asked, skipped when a retry for `symbol` is already pending, so
+    /// repeated failures keep one retry per symbol.
+    pub(super) async fn enqueue_sell_check_retry(
+        &self,
+        symbol: Symbol,
+        delay: std::time::Duration,
+    ) {
         match self
             .queue
-            .has_scheduled(|check| check.symbol == symbol)
+            .has_pending(|check| check.sell_check_retry && check.symbol == symbol)
             .await
         {
             Ok(true) => return,
             Ok(false) => {}
             Err(error) => {
-                warn!(target: "rebalance", %symbol, %error, "Failed to read scheduled EquityRebalancingCheck jobs");
+                warn!(target: "rebalance", %symbol, %error, "Failed to read pending EquityRebalancingCheck jobs");
                 return;
             }
         }
 
+        let retry = EquityRebalancingCheck {
+            symbol,
+            sell_check_retry: true,
+        };
         let mut queue = self.queue.clone();
-        if let Err(QueuePushError(error)) = queue
-            .push_with_delay(EquityRebalancingCheck { symbol }, delay)
-            .await
-        {
+        if let Err(QueuePushError(error)) = queue.push_with_delay(retry, delay).await {
             warn!(target: "rebalance", %error, "Failed to enqueue delayed EquityRebalancingCheck job");
         }
     }
 
-    /// Keeps delayed checks: they retry a symbol whose redemption waits on
-    /// fresh broker data, which a terminal event elsewhere does not supply.
+    /// Keeps sell check retries, due or not: a terminal event elsewhere does
+    /// not bring the broker answer they wait for.
     pub(super) async fn cancel_pending(&self) {
-        self.queue.cancel_due_pending().await;
+        self.queue
+            .cancel_pending_except(|check| check.sell_check_retry)
+            .await;
     }
 }
 
@@ -999,6 +1017,7 @@ mod tests {
     fn equity_rebalancing_check_label_includes_symbol() {
         let job = EquityRebalancingCheck {
             symbol: Symbol::new("RKLB").unwrap(),
+            sell_check_retry: false,
         };
         assert_eq!(job.label().as_str(), "EquityRebalancingCheck(RKLB)");
     }
@@ -1057,17 +1076,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn equity_scheduler_delayed_check_keeps_one_row_per_symbol() {
+    async fn equity_scheduler_sell_check_retry_keeps_one_row_per_symbol() {
         let apalis_pool = crate::test_utils::setup_test_apalis_pool().await;
         let scheduler = EquityRebalancingCheckScheduler::new(&apalis_pool);
         let aapl = Symbol::new("AAPL").unwrap();
         let delay = std::time::Duration::from_secs(300);
 
         scheduler.enqueue_check(aapl.clone()).await;
-        scheduler.enqueue_delayed_check(aapl.clone(), delay).await;
-        scheduler.enqueue_delayed_check(aapl, delay).await;
         scheduler
-            .enqueue_delayed_check(Symbol::new("MSFT").unwrap(), delay)
+            .enqueue_sell_check_retry(aapl.clone(), delay)
+            .await;
+        scheduler.enqueue_sell_check_retry(aapl, delay).await;
+        scheduler
+            .enqueue_sell_check_retry(Symbol::new("MSFT").unwrap(), delay)
             .await;
 
         assert_eq!(
@@ -1078,23 +1099,47 @@ mod tests {
         );
     }
 
+    /// A terminal transfer event cancels ordinary checks but keeps sell check
+    /// retries, including one already due that no worker has claimed yet.
     #[tokio::test]
-    async fn equity_scheduler_cancel_pending_keeps_delayed_checks() {
+    async fn equity_scheduler_cancel_pending_keeps_sell_check_retries_due_or_not() {
         let apalis_pool = crate::test_utils::setup_test_apalis_pool().await;
         let scheduler = EquityRebalancingCheckScheduler::new(&apalis_pool);
-        let symbol = Symbol::new("AAPL").unwrap();
+        let overdue = Symbol::new("AAPL").unwrap();
+        let not_due = Symbol::new("MSFT").unwrap();
 
-        scheduler.enqueue_check(symbol.clone()).await;
+        scheduler.enqueue_check(overdue.clone()).await;
         scheduler
-            .enqueue_delayed_check(symbol, std::time::Duration::from_secs(300))
+            .enqueue_sell_check_retry(overdue.clone(), std::time::Duration::ZERO)
+            .await;
+        scheduler
+            .enqueue_sell_check_retry(not_due.clone(), std::time::Duration::from_secs(300))
             .await;
         scheduler.cancel_pending().await;
 
+        let mut kept: Vec<String> = sqlx_apalis::query_scalar::<_, Vec<u8>>(
+            "SELECT job FROM Jobs WHERE status = 'Pending' AND job_type = ?",
+        )
+        .bind(std::any::type_name::<EquityRebalancingCheck>())
+        .fetch_all(&apalis_pool)
+        .await
+        .unwrap()
+        .iter()
+        .map(|payload| serde_json::from_slice::<EquityRebalancingCheck>(payload).unwrap())
+        .inspect(|check| {
+            assert!(
+                check.sell_check_retry,
+                "an ordinary check survived: {check:?}"
+            );
+        })
+        .map(|check| check.symbol.to_string())
+        .collect();
+        kept.sort();
         assert_eq!(
-            count_pending_equity_check_jobs(&apalis_pool).await,
-            1,
-            "a terminal event must not drop a delayed check, which waits for \
-             data that event does not bring"
+            kept,
+            vec![overdue.to_string(), not_due.to_string()],
+            "a terminal event must keep every sell check retry, which waits for \
+             a broker answer that event does not bring"
         );
     }
 }

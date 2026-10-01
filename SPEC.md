@@ -3108,9 +3108,9 @@ enum TriggerReason {
   one, so it never admits a redemption over a hedge that could run. A sell check
   that cannot be asked schedules one delayed equity check of the symbol five
   minutes later, because nothing else checks it again until its balances change;
-  a terminal transfer event cancels only checks already due, not delayed ones. A
-  reservation taken with the proof is dropped before confirmation if the
-  post-reservation plan is no longer a redemption.
+  a terminal transfer event cancels other pending equity checks but never that
+  retry, due or not. A reservation taken with the proof is dropped before
+  confirmation if the post-reservation plan is no longer a redemption.
   `transfer-equity --direction to-alpaca` asks the same check through the broker
   client. Startup restoration always uses the standard admission. The sell check
   is asked about the whole net, which covers the hedge request because config
@@ -3133,11 +3133,13 @@ enum TriggerReason {
   cannot suppress hedging. The replacement job may recreate a missing confirmed
   reservation only under the same pending-order, hedge-readiness, and price
   eligibility checks as fresh transfer admission. A redemption admitted over a
-  sell hedge the broker refused for lack of shares keeps its reservation
-  instead, recorded by the `admission` its job carries. The retry restores by
-  reservation ID alone: a matching confirmed reservation is left unchanged and a
-  matching reserved one is confirmed. Only when no reservation exists is one
-  recreated, always under the standard admission, which refuses a redemption
+  sell hedge the broker refused for lack of shares keeps its reservation instead
+  while the position is still long, recorded by the `admission` its job carries;
+  once fills turn the position flat or short, the refused sell is no longer the
+  hedge and the reservation is released like a standard one. The retry restores
+  by reservation ID alone: a matching confirmed reservation is left unchanged
+  and a matching reserved one is confirmed. Only when no reservation exists is
+  one recreated, always under the standard admission, which refuses a redemption
   whose position still needs a hedge; a released reservation would therefore
   leave the job rescheduling forever. No hedge order is placed for the symbol
   until the wallet has gas again.

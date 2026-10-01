@@ -35,7 +35,7 @@ use alloy::primitives::TxHash;
 use st0x_config::ExecutionThreshold;
 use st0x_event_sorcery::{AggregateError, LifecycleError, SendError, Store};
 use st0x_evm::Chain;
-use st0x_execution::{FractionalShares, Symbol};
+use st0x_execution::{FractionalShares, Positive, Symbol};
 use st0x_tokenization::IssuerRequestId;
 
 use super::{
@@ -818,6 +818,24 @@ pub(crate) struct TransferEquityToHedging {
 }
 
 impl TransferEquityToHedging {
+    /// Whether a gas deferral releases this job's Position reservation: always
+    /// for a standard one, and for one admitted over a refused sell hedge only
+    /// once the position is no longer long.
+    async fn gas_deferral_releases_reservation(
+        &self,
+        position_store: &Store<Position>,
+    ) -> Result<bool, SendError<Position>> {
+        if self.admission == EquityTransferAdmission::Standard {
+            return Ok(true);
+        }
+
+        let net = position_store
+            .load(&self.symbol)
+            .await?
+            .map_or(FractionalShares::ZERO, |position| position.net);
+        Ok(Positive::new(net).is_err())
+    }
+
     /// Releases the wallet nonce reservation that a reconciled redemption's
     /// signed withdrawal still holds. A reconcile is pure bookkeeping and never
     /// touches the wallet, so without this release later sends from the wallet
@@ -984,14 +1002,17 @@ impl Job<TransferEquityToHedgingCtx> for TransferEquityToHedging {
             // A standard reservation is released, like the mint job does, so
             // a low wallet cannot suppress hedging; the retry restores it once
             // hedging allows. A reservation admitted over a sell hedge the
-            // broker refused for lack of shares is kept:
-            // `restore_position_reservation` only knows the standard
-            // admission, so the retry would be refused and reschedule forever,
-            // which is the deadlock that admission exists to break. Meanwhile
-            // no hedge order runs for the symbol, and the broker could not fill
-            // one when the redemption was admitted.
-            if self.admission == EquityTransferAdmission::Standard
-                && let Some((position_store, _)) = &ctx.position_authority
+            // broker refused for lack of shares is kept while the position is
+            // still long: `restore_position_reservation` only knows the
+            // standard admission, so the retry would be refused and reschedule
+            // forever, which is the deadlock that admission exists to break.
+            // Once fills turn the position flat or short, the refused sell is
+            // no longer the hedge, and a buy hedge the broker may fill must not
+            // wait for gas, so it is released too.
+            if let Some((position_store, _)) = &ctx.position_authority
+                && self
+                    .gas_deferral_releases_reservation(position_store)
+                    .await?
             {
                 position_store
                     .send(
@@ -1154,6 +1175,7 @@ mod tests {
     use std::sync::Mutex;
 
     use alloy::primitives::{Address, TxHash, U256};
+    use rain_math_float::Float;
     use serde_json::json;
     use st0x_config::{ChainEquities, ChainEquityAsset, ExecutionThreshold, OperationMode};
     use st0x_event_sorcery::{AggregateError, LifecycleError, StoreBuilder, test_store};
@@ -2841,10 +2863,80 @@ mod tests {
         }
     }
 
-    /// Runs a fresh redemption holding a confirmed reservation taken with
-    /// `admission` into a gas-readiness refusal. Returns the Position
-    /// reservation afterwards and the delayed redrive payload.
+    fn low_gas_aggregate_id() -> RedemptionAggregateId {
+        redemption_aggregate_id("low-gas")
+    }
+
+    async fn acknowledge_fill(
+        position_store: &Store<Position>,
+        direction: Direction,
+        amount: Float,
+        log_index: u64,
+    ) {
+        let symbol = Symbol::new("AAPL").unwrap();
+        position_store
+            .send(
+                &symbol,
+                PositionCommand::AcknowledgeOnChainFill {
+                    symbol: symbol.clone(),
+                    threshold: ExecutionThreshold::whole_share(),
+                    trade_id: TradeId {
+                        chain: Chain::Base,
+                        tx_hash: TxHash::random(),
+                        log_index,
+                    },
+                    amount: FractionalShares::new(amount),
+                    direction,
+                    price_usdc: float!(150),
+                    block_timestamp: chrono::Utc::now(),
+                    block_number: None,
+                },
+            )
+            .await
+            .unwrap();
+    }
+
+    /// A long 61 share position whose sell hedge the broker refused for lack
+    /// of shares, holding the confirmed reservation that refusal admitted.
+    async fn refused_sell_reservation() -> (Arc<Store<Position>>, EquityTransferAdmission) {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let position_store = Arc::new(test_store::<Position>(
+            crate::test_utils::setup_test_db().await,
+            (),
+        ));
+        acknowledge_fill(&position_store, Direction::Buy, float!(61), 1).await;
+        let admission = EquityTransferAdmission::Redemption {
+            refused_sell: FractionalShares::new(float!(61)),
+        };
+        let reservation_id = EquityTransferReservationId::from_uuid(low_gas_aggregate_id().0);
+        position_store
+            .send(
+                &symbol,
+                PositionCommand::ReserveEquityTransfer {
+                    symbol: symbol.clone(),
+                    threshold: ExecutionThreshold::whole_share(),
+                    reservation_id,
+                    admission,
+                },
+            )
+            .await
+            .unwrap();
+        position_store
+            .send(
+                &symbol,
+                PositionCommand::ConfirmEquityTransfer { reservation_id },
+            )
+            .await
+            .unwrap();
+        (position_store, admission)
+    }
+
+    /// Runs a fresh redemption holding the confirmed reservation in
+    /// `position_store`, taken with `admission`, into a gas-readiness refusal.
+    /// Returns the Position reservation afterwards and the delayed redrive
+    /// payload.
     async fn perform_low_gas_redemption(
+        position_store: Arc<Store<Position>>,
         admission: EquityTransferAdmission,
     ) -> (
         Option<crate::position::EquityTransferReservation>,
@@ -2853,12 +2945,7 @@ mod tests {
         let apalis_pool = crate::test_utils::setup_test_apalis_pool().await;
         let retry_interval = Duration::from_secs(23);
         let symbol = Symbol::new("AAPL").unwrap();
-        let aggregate_id = redemption_aggregate_id("low-gas");
-        let position_store = confirmed_position_reservation(
-            &symbol,
-            EquityTransferReservationId::from_uuid(aggregate_id.0),
-        )
-        .await;
+        let aggregate_id = low_gas_aggregate_id();
         let mut ctx = redemption_test_ctx(
             Arc::new(GasReadinessFailureRedemptionResume(retry_interval)),
             TransferEquityToHedgingJobQueue::new(&apalis_pool),
@@ -2912,7 +2999,15 @@ mod tests {
     #[tokio::test]
     async fn redemption_gas_readiness_failure_releases_standard_reservation_before_delayed_redrive()
     {
-        let (reservation, _) = perform_low_gas_redemption(EquityTransferAdmission::Standard).await;
+        let symbol = Symbol::new("AAPL").unwrap();
+        let position_store = confirmed_position_reservation(
+            &symbol,
+            EquityTransferReservationId::from_uuid(low_gas_aggregate_id().0),
+        )
+        .await;
+
+        let (reservation, _) =
+            perform_low_gas_redemption(position_store, EquityTransferAdmission::Standard).await;
 
         assert_eq!(
             reservation, None,
@@ -2924,11 +3019,9 @@ mod tests {
     #[tokio::test]
     async fn redemption_gas_readiness_failure_keeps_floor_admitted_reservation_for_delayed_redrive()
     {
-        let admission = EquityTransferAdmission::Redemption {
-            refused_sell: FractionalShares::new(float!(10)),
-        };
+        let (position_store, admission) = refused_sell_reservation().await;
 
-        let (reservation, redriven) = perform_low_gas_redemption(admission).await;
+        let (reservation, redriven) = perform_low_gas_redemption(position_store, admission).await;
 
         assert_eq!(
             reservation,
@@ -2944,6 +3037,23 @@ mod tests {
             redriven.admission, admission,
             "the redrive must carry the admission so its next gas refusal \
              keeps the reservation too"
+        );
+    }
+
+    /// Fills that turn the position short while the wallet is low on gas
+    /// replace the refused sell hedge with a buy hedge the broker may fill, so
+    /// the gas redrive releases the reservation instead of blocking it.
+    #[tokio::test]
+    async fn redemption_gas_readiness_failure_releases_refused_sell_reservation_once_short() {
+        let (position_store, admission) = refused_sell_reservation().await;
+        acknowledge_fill(&position_store, Direction::Sell, float!(100), 2).await;
+
+        let (reservation, _) = perform_low_gas_redemption(position_store, admission).await;
+
+        assert_eq!(
+            reservation, None,
+            "a short position's buy hedge must not wait for gas behind the \
+             redemption"
         );
     }
 
