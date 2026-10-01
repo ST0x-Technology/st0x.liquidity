@@ -43,10 +43,13 @@ use crate::position::Position;
 use crate::rebalancing::usdc::{UsdcTransferError, u256_to_usdc};
 use crate::vault_registry::{VaultRegistry, VaultRegistryId};
 
-/// Pending mints and redemptions aggregated by symbol.
+/// Pending mints aggregated by symbol, and pending redemptions by the chain
+/// they withdraw from, then symbol. A mint's in-flight shares leave the
+/// broker, one offchain slot shared by every chain, so mints are not split
+/// by chain.
 struct PendingRequests {
     mints: BTreeMap<Symbol, FractionalShares>,
-    redemptions: BTreeMap<Symbol, FractionalShares>,
+    redemptions: BTreeMap<Chain, BTreeMap<Symbol, FractionalShares>>,
 }
 
 async fn timestamp_before<F>(future: F) -> (DateTime<Utc>, F::Output)
@@ -57,13 +60,22 @@ where
     (fetched_at, future.await)
 }
 
-/// Active bot-owned tokenization provider request identifiers.
+/// Active bot-owned tokenization provider request identifiers. Each
+/// redemption identifier maps to the chain the redemption withdraws from.
+/// Mints are not split by chain (see [`PendingRequests`]).
 #[derive(Debug, Clone, Default)]
 pub(crate) struct PendingRequestOwnershipSnapshot {
     pub(crate) mint_issuers: HashSet<ClientRequestId>,
     pub(crate) mint_tokenizations: HashSet<TokenizationRequestId>,
-    pub(crate) redemption_tokenizations: HashSet<TokenizationRequestId>,
-    pub(crate) redemption_txs: HashSet<TxHash>,
+    pub(crate) redemption_tokenizations: HashMap<TokenizationRequestId, Chain>,
+    pub(crate) redemption_txs: HashMap<TxHash, Chain>,
+}
+
+/// A pending provider request the bot owns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OwnedRequest {
+    Mint,
+    Redemption(Chain),
 }
 
 #[async_trait]
@@ -1852,13 +1864,13 @@ where
     }
 
     fn aggregate_pending_requests(
-        requests: impl Iterator<Item = st0x_tokenization::TokenizationRequest>,
+        requests: impl Iterator<Item = (st0x_tokenization::TokenizationRequest, OwnedRequest)>,
     ) -> Result<PendingRequests, FloatError> {
         let mut mints: BTreeMap<Symbol, FractionalShares> = BTreeMap::new();
-        let mut redemptions: BTreeMap<Symbol, FractionalShares> = BTreeMap::new();
+        let mut redemptions: BTreeMap<Chain, BTreeMap<Symbol, FractionalShares>> = BTreeMap::new();
         let mut seen = HashSet::new();
 
-        for request in requests {
+        for (request, owned) in requests {
             if !seen.insert(request.id.clone()) {
                 warn!(
                     target: "inventory",
@@ -1869,18 +1881,9 @@ where
                 continue;
             }
 
-            let target = match request.r#type {
-                Some(TokenizationRequestType::Mint) => &mut mints,
-                Some(TokenizationRequestType::Redeem) => &mut redemptions,
-                None => {
-                    warn!(
-                        target: "inventory",
-                        request_id = %request.id,
-                        symbol = %request.underlying_symbol,
-                        "Pending tokenization request has no type, skipping"
-                    );
-                    continue;
-                }
+            let target = match owned {
+                OwnedRequest::Mint => &mut mints,
+                OwnedRequest::Redemption(chain) => redemptions.entry(chain).or_default(),
             };
 
             let entry = target
@@ -1905,25 +1908,30 @@ where
             })
     }
 
-    fn is_own_request(
+    /// The bot's own mint or redemption behind `request`, or `None` when the
+    /// request is not the bot's.
+    fn own_request(
         &self,
         request: &st0x_tokenization::TokenizationRequest,
         ownership: &PendingRequestOwnershipSnapshot,
-    ) -> bool {
-        let is_owned = match request.r#type {
-            Some(TokenizationRequestType::Mint) => {
-                request
-                    .client_request_id
-                    .as_ref()
-                    .is_some_and(|id| ownership.mint_issuers.contains(id))
-                    || ownership.mint_tokenizations.contains(&request.id)
-            }
-            Some(TokenizationRequestType::Redeem) => {
-                ownership.redemption_tokenizations.contains(&request.id)
-                    || request
+    ) -> Option<OwnedRequest> {
+        let owned = match request.r#type {
+            Some(TokenizationRequestType::Mint) => (request
+                .client_request_id
+                .as_ref()
+                .is_some_and(|id| ownership.mint_issuers.contains(id))
+                || ownership.mint_tokenizations.contains(&request.id))
+            .then_some(OwnedRequest::Mint),
+            Some(TokenizationRequestType::Redeem) => ownership
+                .redemption_tokenizations
+                .get(&request.id)
+                .or_else(|| {
+                    request
                         .tx_hash
-                        .is_some_and(|tx_hash| ownership.redemption_txs.contains(&tx_hash))
-            }
+                        .and_then(|tx_hash| ownership.redemption_txs.get(&tx_hash))
+                })
+                .copied()
+                .map(OwnedRequest::Redemption),
             None => {
                 // Dedup through the same warn-once set as external requests so a
                 // persistently typeless provider row does not warn on every poll.
@@ -1939,12 +1947,12 @@ where
                     );
                 }
 
-                return false;
+                return None;
             }
         };
 
-        if is_owned {
-            return true;
+        if owned.is_some() {
+            return owned;
         }
 
         if request
@@ -1971,7 +1979,7 @@ where
             }
         }
 
-        false
+        None
     }
 
     async fn poll_inflight_equity(
@@ -1998,21 +2006,26 @@ where
         let current_request_ids: HashSet<TokenizationRequestId> =
             pending.iter().map(|request| request.id.clone()).collect();
 
-        let PendingRequests { mints, redemptions } = Self::aggregate_pending_requests(
-            pending
-                .into_iter()
-                .filter(|request| self.is_own_request(request, &ownership)),
-        )?;
+        let PendingRequests {
+            mints,
+            mut redemptions,
+        } = Self::aggregate_pending_requests(pending.into_iter().filter_map(|request| {
+            let owned = self.own_request(&request, &ownership)?;
+            Some((request, owned))
+        }))?;
 
         // Bound the warn-once dedup set to requests still present this poll so it
         // cannot grow without bound as external requests appear and complete.
         self.lock_external_pending_warnings()
             .retain(|id| current_request_ids.contains(id));
 
+        let base_redemptions = redemptions.remove(&Chain::Base).unwrap_or_default();
+
         debug!(
             target: "inventory",
             mint_symbols = mints.len(),
-            redemption_symbols = redemptions.len(),
+            base_redemption_symbols = base_redemptions.len(),
+            other_redemption_chains = redemptions.len(),
             "Polled inflight equity from tokenization provider"
         );
 
@@ -2021,6 +2034,16 @@ where
                 snapshot_id,
                 InventorySnapshotCommand::InflightEquity {
                     mints,
+                    redemptions: base_redemptions,
+                    fetched_at,
+                },
+            )
+            .await?;
+
+        self.snapshot
+            .send(
+                snapshot_id,
+                InventorySnapshotCommand::ChainInflightRedemptions {
                     redemptions,
                     fetched_at,
                 },
@@ -2164,6 +2187,10 @@ mod tests {
         }
     }
 
+    fn test_tokenization_request_id(id: &str) -> TokenizationRequestId {
+        TokenizationRequestId::try_new(id).expect("test tokenization request id must be non-empty")
+    }
+
     fn ownership(
         mint_issuer_request_ids: impl IntoIterator<Item = &'static str>,
         mint_tokenization_request_ids: impl IntoIterator<Item = &'static str>,
@@ -2179,19 +2206,16 @@ mod tests {
                     .collect(),
                 mint_tokenizations: mint_tokenization_request_ids
                     .into_iter()
-                    .map(|id| {
-                        TokenizationRequestId::try_new(id)
-                            .expect("test tokenization request id must be non-empty")
-                    })
+                    .map(test_tokenization_request_id)
                     .collect(),
                 redemption_tokenizations: redemption_tokenization_request_ids
                     .into_iter()
-                    .map(|id| {
-                        TokenizationRequestId::try_new(id)
-                            .expect("test tokenization request id must be non-empty")
-                    })
+                    .map(|id| (test_tokenization_request_id(id), Chain::Base))
                     .collect(),
-                redemption_txs: redemption_txs.into_iter().collect(),
+                redemption_txs: redemption_txs
+                    .into_iter()
+                    .map(|tx| (tx, Chain::Base))
+                    .collect(),
             },
         ))
     }
@@ -6102,41 +6126,215 @@ mod tests {
         assert_eq!(redemptions.get(&test_symbol("AAPL")), Some(&test_shares(5)));
     }
 
+    #[tokio::test]
+    async fn poll_inflight_equity_records_each_owned_redemption_on_its_own_chain() {
+        let pool = setup_test_db().await;
+        let provider = mock_provider();
+        let raindex_service = create_test_raindex_service(provider.clone());
+        let (orderbook, order_owner) = test_addresses();
+        let base_tx = TxHash::random();
+        let robinhood_tx = TxHash::random();
+
+        let tokenizer = Arc::new(
+            st0x_tokenization::mock::MockTokenizer::new().with_pending_requests(vec![
+                mock_pending_request_with_tx_hash(
+                    st0x_tokenization::TokenizationRequestType::Redeem,
+                    "AAPL",
+                    5,
+                    base_tx,
+                    Some(order_owner),
+                ),
+                mock_pending_request_with_tx_hash(
+                    st0x_tokenization::TokenizationRequestType::Redeem,
+                    "AAPL",
+                    7,
+                    robinhood_tx,
+                    Some(order_owner),
+                ),
+            ]),
+        );
+
+        let service = InventoryPollingService::new(
+            PollFreshness::new(),
+            vec![ChainVaultPolling::new(
+                Chain::Base,
+                raindex_service,
+                orderbook,
+                order_owner,
+            )],
+            MockExecutor::new(),
+            Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
+            InventorySnapshotId {
+                orderbook,
+                owner: order_owner,
+            },
+            Arc::new(test_store(pool.clone(), ())),
+            None,
+            Some(tokenizer),
+            Usd::ZERO,
+        )
+        .with_pending_request_ownership(Arc::new(TestPendingRequestOwnership(
+            PendingRequestOwnershipSnapshot {
+                redemption_txs: HashMap::from([
+                    (base_tx, Chain::Base),
+                    (robinhood_tx, Chain::Robinhood),
+                ]),
+                ..PendingRequestOwnershipSnapshot::default()
+            },
+        )));
+
+        service.poll_and_record().await.unwrap();
+
+        let events = load_snapshot_events(&pool, orderbook, order_owner).await;
+        let base_redemptions = events
+            .iter()
+            .find_map(|event| match event {
+                InventorySnapshotEvent::InflightEquity { redemptions, .. } => Some(redemptions),
+                _ => None,
+            })
+            .expect("Expected InflightEquity event");
+        assert_eq!(
+            *base_redemptions,
+            BTreeMap::from([(test_symbol("AAPL"), test_shares(5))]),
+            "Base must not carry the Robinhood redemption"
+        );
+
+        let chain_events: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event {
+                InventorySnapshotEvent::ChainInflightRedemptions {
+                    chain, redemptions, ..
+                } => Some((*chain, redemptions.clone())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            chain_events,
+            vec![(
+                Chain::Robinhood,
+                BTreeMap::from([(test_symbol("AAPL"), test_shares(7))])
+            )]
+        );
+    }
+
+    #[tokio::test]
+    async fn poll_inflight_equity_skips_none_type_but_keeps_valid_rows() {
+        let pool = setup_test_db().await;
+        let provider = mock_provider();
+        let raindex_service = create_test_raindex_service(provider.clone());
+        let (orderbook, order_owner) = test_addresses();
+
+        let tokenizer = Arc::new(
+            st0x_tokenization::mock::MockTokenizer::new().with_pending_requests(vec![
+                mock_pending_request_no_type("AAPL", 5),
+                mock_pending_request(st0x_tokenization::TokenizationRequestType::Mint, "AAPL", 10),
+                mock_pending_request(
+                    st0x_tokenization::TokenizationRequestType::Redeem,
+                    "TSLA",
+                    20,
+                ),
+            ]),
+        );
+
+        let service = InventoryPollingService::new(
+            PollFreshness::new(),
+            vec![ChainVaultPolling::new(
+                Chain::Base,
+                raindex_service,
+                orderbook,
+                order_owner,
+            )],
+            MockExecutor::new(),
+            Arc::new(test_store::<VaultRegistry>(pool.clone(), ())),
+            InventorySnapshotId {
+                orderbook,
+                owner: order_owner,
+            },
+            Arc::new(test_store(pool.clone(), ())),
+            None,
+            Some(tokenizer),
+            Usd::ZERO,
+        )
+        .with_pending_request_ownership(ownership(
+            [],
+            ["REQ_AAPL_10", "REQ_AAPL_5_notype"],
+            ["REQ_TSLA_20", "REQ_AAPL_5_notype"],
+            [],
+        ));
+
+        service.poll_and_record().await.unwrap();
+
+        let events = load_snapshot_events(&pool, orderbook, order_owner).await;
+        let (mints, redemptions) = events
+            .iter()
+            .find_map(|event| match event {
+                InventorySnapshotEvent::InflightEquity {
+                    mints, redemptions, ..
+                } => Some((mints, redemptions)),
+                _ => None,
+            })
+            .expect("Expected InflightEquity event");
+        assert_eq!(
+            *mints,
+            BTreeMap::from([(test_symbol("AAPL"), test_shares(10))])
+        );
+        assert_eq!(
+            *redemptions,
+            BTreeMap::from([(test_symbol("TSLA"), test_shares(20))])
+        );
+    }
+
     #[test]
-    fn aggregate_pending_requests_skips_none_type_but_keeps_valid_rows() {
-        let requests = vec![
-            mock_pending_request_no_type("AAPL", 5),
-            mock_pending_request(st0x_tokenization::TokenizationRequestType::Mint, "AAPL", 10),
-            mock_pending_request(
-                st0x_tokenization::TokenizationRequestType::Redeem,
-                "TSLA",
-                20,
-            ),
-            mock_pending_request(st0x_tokenization::TokenizationRequestType::Mint, "AAPL", 3),
-        ];
+    fn aggregate_pending_requests_splits_redemptions_by_chain_and_sums_mints() {
+        let base_redemption = mock_pending_request(
+            st0x_tokenization::TokenizationRequestType::Redeem,
+            "AAPL",
+            4,
+        );
+        let robinhood_redemption = mock_pending_request(
+            st0x_tokenization::TokenizationRequestType::Redeem,
+            "AAPL",
+            6,
+        );
+        let first_mint =
+            mock_pending_request(st0x_tokenization::TokenizationRequestType::Mint, "AAPL", 1);
+        let second_mint =
+            mock_pending_request(st0x_tokenization::TokenizationRequestType::Mint, "AAPL", 2);
 
         let PendingRequests { mints, redemptions } = InventoryPollingService::<
             ReadOnlyEvm<RootProvider>,
             MockExecutor,
         >::aggregate_pending_requests(
-            requests.into_iter()
+            [
+                (base_redemption, OwnedRequest::Redemption(Chain::Base)),
+                (
+                    robinhood_redemption,
+                    OwnedRequest::Redemption(Chain::Robinhood),
+                ),
+                (first_mint, OwnedRequest::Mint),
+                (second_mint, OwnedRequest::Mint),
+            ]
+            .into_iter(),
         )
         .unwrap();
 
         assert_eq!(
-            mints.get(&test_symbol("AAPL")),
-            Some(&test_shares(13)),
-            "Valid mint rows should aggregate despite a None-type row"
+            mints,
+            BTreeMap::from([(test_symbol("AAPL"), test_shares(3))])
         );
-
         assert_eq!(
-            redemptions.get(&test_symbol("TSLA")),
-            Some(&test_shares(20)),
-            "Redemption row should be unaffected by the None-type row"
+            redemptions,
+            BTreeMap::from([
+                (
+                    Chain::Base,
+                    BTreeMap::from([(test_symbol("AAPL"), test_shares(4))])
+                ),
+                (
+                    Chain::Robinhood,
+                    BTreeMap::from([(test_symbol("AAPL"), test_shares(6))])
+                ),
+            ])
         );
-
-        assert_eq!(mints.len(), 1);
-        assert_eq!(redemptions.len(), 1);
     }
 
     #[test]
@@ -6150,7 +6348,9 @@ mod tests {
             ReadOnlyEvm<RootProvider>,
             MockExecutor,
         >::aggregate_pending_requests(
-            requests.into_iter()
+            requests
+                .into_iter()
+                .map(|request| (request, OwnedRequest::Mint)),
         )
         .unwrap();
 
@@ -6984,7 +7184,7 @@ mod tests {
         // Phantom credit at Hedging, guard armed by clear_equity_inflight.
         let view = InventoryView::default()
             .with_equity(spym.clone(), FractionalShares::ZERO, phantom)
-            .clear_equity_inflight(&spym, Venue::Hedging, now)
+            .clear_equity_inflight_at(&spym, Chain::Base, Venue::Hedging, now)
             .unwrap();
         let inventory = broadcasting_inventory(view);
         let gate = Arc::new(InventoryDivergenceGate::default());
@@ -7050,7 +7250,7 @@ mod tests {
             let mut view = inventory.write().await;
             *view = view
                 .clone()
-                .clear_equity_inflight(&spym, Venue::Hedging, Utc::now())
+                .clear_equity_inflight_at(&spym, Chain::Base, Venue::Hedging, Utc::now())
                 .unwrap();
         }
 
