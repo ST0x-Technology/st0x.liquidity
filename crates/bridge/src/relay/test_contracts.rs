@@ -65,10 +65,7 @@ impl RelayChain {
             reader,
         };
 
-        let relayer = chain.address(3);
-        chain
-            .send(chain.solver(), chain.stable, approve(relayer, U256::MAX))
-            .await;
+        chain.approve_relayer(chain.solver()).await;
 
         chain
     }
@@ -129,12 +126,31 @@ impl RelayChain {
             .unwrap()
     }
 
+    /// Lets the relayer EOA spend all of `owner`'s stable.
+    pub(super) async fn approve_relayer(&self, owner: Address) {
+        let relayer = self.address(3);
+        self.send(owner, self.stable, approve(relayer, U256::MAX))
+            .await;
+    }
+
     /// Pays `recipient` from the solver the way Relay does: the relayer EOA
     /// calls `transferFrom(solver, recipient, amount)` on the stable with
     /// `order_id` appended. Mined even when it reverts.
     pub(super) async fn pay(&self, recipient: Address, amount: U256, order_id: B256) -> TxHash {
+        self.pay_from(self.solver(), recipient, amount, order_id)
+            .await
+    }
+
+    /// [`Self::pay`] from `from` in place of the solver.
+    pub(super) async fn pay_from(
+        &self,
+        from: Address,
+        recipient: Address,
+        amount: U256,
+        order_id: B256,
+    ) -> TxHash {
         let mut calldata = IERC20::transferFromCall {
-            from: self.solver(),
+            from,
             to: recipient,
             amount,
         }

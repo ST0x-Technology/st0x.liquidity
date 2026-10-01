@@ -55,6 +55,10 @@ pub enum UnverifiedReason {
     Recipient {
         recipient: Address,
     },
+    /// The calldata moves our wallet's own funds back to it.
+    SelfTransfer,
+    /// The calldata moves nothing: anyone can send it with any order id.
+    ZeroAmount,
     /// The trailing calldata word is another order's id.
     OrderId {
         found: B256,
@@ -112,6 +116,14 @@ pub(super) fn check_payment(
 
     if call.to != terms.recipient {
         return Err(UnverifiedReason::Recipient { recipient: call.to });
+    }
+
+    if call.from == terms.recipient {
+        return Err(UnverifiedReason::SelfTransfer);
+    }
+
+    if call.amount.is_zero() {
+        return Err(UnverifiedReason::ZeroAmount);
     }
 
     let RelayOrderId(expected) = terms.order_id;
