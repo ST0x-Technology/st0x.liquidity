@@ -43,8 +43,9 @@ side effect (`docs/cqrs.md`, "Persist intent with one command").
 1. **Client operation id.** The request carries a required `operationId` (a
    UUID). `st0x-liquidity-client capital cctp-bridge` generates a v4 UUID per
    run unless `--operation-id <uuid>` is given, and prints it to stderr before
-   sending, with the rerun command. The server never generates the id. The
-   capital group has not shipped, so the field is required from the start.
+   sending, with the `--operation-id` flag to rerun with. The server never
+   generates the id. The capital group has not shipped, so the field is required
+   from the start.
 2. **New aggregate `CctpBurnOperation`** in `src/cctp_burn.rs`, id
    `CctpBurnOperationId(Uuid)` (ADR 0004), with no projection (`Nil`). The route
    reads one operation with `Store::load`; startup lists the pending ones with a
@@ -56,8 +57,13 @@ side effect (`docs/cqrs.md`, "Persist intent with one command").
      request said, and `amount` is the resolved burn amount.
    - `Confirmed { confirmed_at }` and `Reverted { reverted_at }`, decided by the
      burn's own canonical receipt at the source chain's required confirmations.
-   - `Superseded { superseding_tx, superseded_at }`, when another tx from the
-     source wallet took the burn's nonce.
+     `Confirmed` also needs the CCTP `MessageSent` event that `confirm_burn`
+     requires; a successful receipt without it pages and stays pending.
+   - `Superseded { superseding_tx, superseded_at }`, when a cancel (or any
+     reverted tx) from the source wallet took the burn's nonce.
+   - `Replaced { replacement_tx, replaced_at }`, when a fee bumped copy of the
+     burn took its nonce and burned in its place; the copy is then the
+     operation's burn tx.
 
    `Prepare` on an existing operation is refused (`AlreadyPrepared`), so an id
    has at most one signed burn. An outcome applies only to a pending burn; the
@@ -66,17 +72,28 @@ side effect (`docs/cqrs.md`, "Persist intent with one command").
    standing allowance check with its possible approve, the Circle fee query,
    then `prepare_pending` of `deposit_for_burn_call`),
    `broadcast_prepared_burn`, `discard_prepared_burn`, `restore_prepared_burn`,
-   `release_superseded_burn`, `source_mined_tx` and `source_token_messenger`,
-   mirroring the Ethereum USDC send wrappers. `Bridge::submit_burn` and the
-   `UsdcRebalance` burn path do not change.
+   `release_superseded_burn`, `source_mined_tx`, `source_emitted_message_sent`,
+   `source_knows_tx` and `source_signer`, mirroring the Ethereum USDC send
+   wrappers. `Bridge::submit_burn` and the `UsdcRebalance` burn path do not
+   change.
 4. **Route flow.**
-   - After the startup gate, the route looks the id up. A known id is adopted
-     with no gas check and no lock: the request must match the recorded source
-     and `requested`, else `409`. A pending burn is broadcast again from its
-     recorded bytes, then its receipt is read; one at the required confirmations
-     records `Confirmed` or `Reverted`. The answer carries the operation id, the
-     recorded burn tx, both chains, the raw amount and a `status` of `pending`,
-     `confirmed`, `reverted` or `superseded`.
+   - After the startup gate, the route looks the id up. The request must match
+     the recorded source and `requested`, else `409`. A settled burn, or a
+     pending one a node already holds, is answered with no gas check and no
+     lock, since nothing is sent: its receipt is read, and one at the required
+     confirmations records `Confirmed` or `Reverted`. The answer carries the
+     operation id, the recorded burn tx, both chains, the raw amount and a
+     `status` of `pending`, `confirmed`, `reverted`, `superseded` or `replaced`.
+   - A pending burn no node holds is sent again from its recorded bytes under
+     the lock and the pause, like a new burn, since sending spends the wallet's
+     USDC. A failed broadcast, on this path or the first one, reloads the
+     operation, since the supersede route may have settled it meanwhile (and
+     then releases its nonce again), and so does an accepted one; a failed one
+     also records the outcome the burn's own receipt proves, and answers `502`
+     only while it is still pending.
+   - A burn signed by another address than the source wallet (a rotated key)
+     never goes through this wallet's nonce bookkeeping: no rebroadcast, no
+     restore.
    - An unknown id takes the existing path: gas check, then the resume lock and
      the driver pause on the detached task. Under the lock the route looks the
      id up again, since a concurrent request with the same id may have recorded
@@ -86,8 +103,9 @@ side effect (`docs/cqrs.md`, "Persist intent with one command").
      broadcasts them. Another burn recorded: the new signature's nonce is
      released and the recorded burn is adopted. Nothing recorded: the nonce is
      released and the route answers `500` with nothing broadcast. The reload
-     fails: the nonce stays reserved, as in ADR 0006, and the `500` says to
-     rerun with the same id.
+     fails: the nonce stays reserved until a restart, as in ADR 0006, and the
+     `500` says to rerun with the same id only after a restart, since a rerun
+     before then could sign behind the reserved nonce.
    - After `Prepare` the route broadcasts (a failure answers `502`; a rerun with
      the id sends the same bytes), answers with `status: pending`, and confirms
      on the detached task, recording `Confirmed` or `Reverted` from the burn's
@@ -96,11 +114,14 @@ side effect (`docs/cqrs.md`, "Persist intent with one command").
      stays pending.
 5. **Startup.** Next to the deposit send restore and before any startup approval
    or revoke, the bot records the outcome of every pending burn whose receipt
-   now decides, and for every other one reserves the nonce
-   (`restore_prepared_burn`) and rebroadcasts its bytes without waiting for a
-   receipt. A chain with a restored burn not mined yet, or both corridor chains
-   when the burns cannot be listed or loaded, joins the chains whose startup
-   approvals and revokes are skipped. Nothing here fails startup.
+   now decides, and for every other one signed by the source wallet reserves the
+   nonce (`restore_prepared_burn`) and rebroadcasts its bytes without waiting
+   for a receipt. A burn already mined at the required confirmations without
+   `MessageSent` keeps the reservation but is not sent again, and a burn signed
+   by another wallet is not restored and gates its chain. A chain with a
+   restored burn not mined yet, or both corridor chains when the burns cannot be
+   listed or loaded, joins the chains whose startup approvals and revokes are
+   skipped. Nothing here fails startup.
 6. **Settling a burn that will never mine.**
    `POST /liquidity-write/capital/cctp-burn-supersede` (`operationId`,
    `supersedingTx`; client `capital cctp-burn-supersede`) mirrors
@@ -108,12 +129,18 @@ side effect (`docs/cqrs.md`, "Persist intent with one command").
    and unmined; the named tx must be a different tx from that wallet at the
    burn's nonce with the required confirmations, and either reverted or a plain
    cancel (a 0 value transfer to the wallet itself with no calldata, no logs,
-   not EIP-7702), since a successful tx of any other kind at the nonce could be
-   a fee bumped copy of the burn. It then records `Superseded` and releases the
-   nonce in the wallet, so startup stops restoring the burn. A burn whose own
-   receipt already decides reports that outcome instead.
-7. **A reverted or superseded burn is final.** A rerun with its id reports it
-   and burns nothing. Burning again takes a new id.
+   not EIP-7702). It then records `Superseded` and releases the nonce in the
+   wallet, so startup stops restoring the burn. Like `adopt-withdrawal` for the
+   vault withdrawal, a successful tx that sent the burn's exact calldata to the
+   contract the signed burn calls (its own `to`, not the configured
+   TokenMessenger) with no value and emitted `MessageSent` (a wallet's speed up)
+   is a copy of the burn: it records `Replaced`, and the copy becomes the burn
+   tx. Any other successful tx is refused. A burn whose outcome is recorded or
+   whose own receipt decides reports that outcome instead, and a settled burn's
+   nonce is released again on every call, since a stale rebroadcast can book it
+   again.
+7. **A reverted, superseded or replaced burn is final.** A rerun with its id
+   reports it and burns nothing. Burning again takes a new id.
 
 ## Consequences
 
@@ -133,7 +160,7 @@ side effect (`docs/cqrs.md`, "Persist intent with one command").
 
 ### Negative / costs
 
-- Four permanent event types.
+- Five permanent event types.
 - A signed burn is never resigned or fee bumped. A burn that will not mine at
   its fee keeps its nonce on the shared bot wallet, and later sends from that
   wallet queue behind it, until it mines or the operator cancels it and settles

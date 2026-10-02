@@ -525,8 +525,9 @@ impl<W: Wallet> CctpEndpoint<W> {
     }
 
     /// Builds the `depositForBurn` call for a fast CCTP transfer, shared by the
-    /// atomic [`deposit_for_burn`](Self::deposit_for_burn) and the two-phase
-    /// [`submit_deposit_for_burn`](Self::submit_deposit_for_burn).
+    /// atomic [`deposit_for_burn`](Self::deposit_for_burn), the two-phase
+    /// [`submit_deposit_for_burn`](Self::submit_deposit_for_burn), and the
+    /// signed [`prepare_deposit_for_burn`](Self::prepare_deposit_for_burn).
     fn deposit_for_burn_call(
         &self,
         amount: U256,
@@ -863,6 +864,37 @@ impl<W: Wallet> CctpEndpoint<W> {
     /// [`st0x_evm::mined_tx`].
     pub(super) async fn mined_tx(&self, tx_hash: TxHash) -> Result<Option<MinedTx>, CctpError> {
         Ok(st0x_evm::mined_tx(self.wallet.provider(), tx_hash).await?)
+    }
+
+    /// Whether `tx_hash`'s receipt carries the CCTP `MessageSent` event that
+    /// [`confirm_burn`](Self::confirm_burn) requires of a burn, read without
+    /// waiting. `None` while the node shows no receipt: a lagging node proves
+    /// nothing either way.
+    pub(super) async fn emitted_message_sent(
+        &self,
+        tx_hash: TxHash,
+    ) -> Result<Option<bool>, CctpError> {
+        let Some(receipt) = self
+            .wallet
+            .provider()
+            .get_transaction_receipt(tx_hash)
+            .await?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(receipt.inner.logs().iter().any(|log| {
+            MessageTransmitterV2::MessageSent::decode_log(log.as_ref()).is_ok()
+        })))
+    }
+
+    /// Whether the node knows `tx_hash`, mined or still pending.
+    pub(super) async fn knows_tx(&self, tx_hash: TxHash) -> Result<bool, CctpError> {
+        Ok(self
+            .wallet
+            .provider()
+            .get_transaction_by_hash(tx_hash)
+            .await?
+            .is_some())
     }
 
     /// Sums the USDC `Transfer` logs in `tx_hash`'s receipt that pay `recipient`:
@@ -1695,13 +1727,8 @@ impl<W: Wallet> CctpEndpoint<W> {
         Ok(())
     }
 
-    #[cfg(test)]
     pub(super) fn owner(&self) -> Address {
         self.wallet.address()
-    }
-
-    pub(super) const fn token_messenger(&self) -> Address {
-        self.token_messenger_address
     }
 
     #[cfg(test)]

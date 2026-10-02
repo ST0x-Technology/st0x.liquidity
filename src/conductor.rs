@@ -3009,7 +3009,7 @@ async fn restore_capital_cctp_burns(
         restored,
         settled,
         ?unmined_chains,
-        "Restored and rebroadcast the pending capital CCTP burns"
+        "Reserved the nonces of the pending capital CCTP burns at startup"
     );
     unmined_chains
 }

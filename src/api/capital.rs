@@ -25,6 +25,7 @@ use axum::Json;
 use axum::extract::State;
 use axum::http::StatusCode;
 use futures_util::FutureExt as _;
+use futures_util::future::BoxFuture;
 use rain_math_float::Float;
 use serde::{Deserialize, Serialize};
 use tracing::{error, info, warn};
@@ -45,8 +46,9 @@ use super::{
 use crate::AppState;
 use crate::cctp_burn::{
     BotCctpBridge, BurnNotSuperseded, BurnReceiptFate, CctpBurnOperation, CctpBurnOperationCommand,
-    CctpBurnOperationId, CctpBurnStatus, CctpSourceChain, RequestedBurn, bot_cctp_bridge,
-    burn_receipt_fate, record_burn_fate, settle_burn_from_receipt, verify_burn_superseded,
+    CctpBurnOperationId, CctpBurnStatus, CctpSourceChain, NonceTakenBy, RequestedBurn,
+    bot_cctp_bridge, burn_receipt_fate, record_burn_fate, settle_burn_from_receipt,
+    signed_by_source_wallet, verify_burn_superseded,
 };
 use crate::rebalancing::UsdcResumeError;
 use crate::usdc_rebalance::RebalanceDirection;
@@ -173,7 +175,7 @@ impl CctpBridgeResponse {
     ) -> Self {
         Self {
             operation_id,
-            burn_tx: operation.burn_tx(),
+            burn_tx: operation.effective_burn_tx(),
             source_chain: operation.source.chain(),
             destination_chain: operation.source.destination_chain(),
             amount_raw: operation.amount.to_string(),
@@ -447,8 +449,10 @@ pub(super) async fn vault_withdraw_usdc(
 /// one burn (`CctpBurnOperation`, ADR 0023). The route signs the burn, records
 /// the signed bytes under the id, then broadcasts them, so a retry with the
 /// same id, even after a dropped request or a restart, reports the recorded
-/// burn and sends the same bytes again instead of burning twice. A known id is
-/// answered before the gas check and the locks, since it sends nothing new.
+/// burn and sends the same bytes again instead of burning twice. A known id
+/// whose burn is settled, or pending and already held by a node, is answered
+/// before the gas check and the locks, since it sends nothing; a pending burn
+/// no node holds is sent again under the lock and the pause, like a new one.
 ///
 /// Like `complete_cctp_mint`, the recovery handle is checked before the
 /// resume lock, and the lock and the driver pause are held around the work
@@ -483,10 +487,19 @@ pub(super) async fn cctp_bridge(
         required_confirmations,
     };
 
+    // A settled burn, or a pending one a node already holds, sends nothing new,
+    // so it is answered at once, without the gas check, the lock and the pause.
+    // A pending burn no node holds must be sent again, which spends the
+    // wallet's USDC, so it takes the locked path below.
     if let Some(recorded) = load_burn_operation(&store, &operation_id).await? {
-        return adopt_recorded_burn(&store, &bridge, &request, &recorded)
-            .await
-            .map(Json);
+        ensure_same_burn(&request, &recorded)?;
+        if recorded.outcome.status() != CctpBurnStatus::Pending
+            || burn_known_to_node(&bridge, &recorded).await
+        {
+            return Ok(Json(
+                report_recorded_burn(&store, &bridge, &request, &recorded).await,
+            ));
+        }
     }
 
     // Every other corridor move proves both wallets can pay gas first: the
@@ -529,25 +542,27 @@ pub(super) async fn cctp_bridge(
         "cctp-bridge",
         source_chain,
         async move {
-            let resume_guard = resume_lock.try_lock_owned().map_err(|_| {
-                (
-                    StatusCode::CONFLICT,
-                    Json(ErrorResponse {
-                        error: "A resume or recheck operation is already in progress".to_string(),
-                    }),
-                )
-            })?;
-            let driver_paused = quiesce_usdc_driver(
-                &driver_pause,
-                UsdcDriverPauseRequest::CctpBurn { direction },
-            )
-            .await?;
+            // The lock and the pause stay held until the burn confirms; the
+            // confirmation future owns them.
+            let held = (
+                resume_lock.try_lock_owned().map_err(|_| {
+                    (
+                        StatusCode::CONFLICT,
+                        Json(ErrorResponse {
+                            error: "A resume or recheck operation is already in progress"
+                                .to_string(),
+                        }),
+                    )
+                })?,
+                quiesce_usdc_driver(&driver_pause, UsdcDriverPauseRequest::CctpBurn { direction })
+                    .await?,
+            );
 
             // A request with the same id may have recorded its burn since the
             // lookup above; the lock serializes burns, so this read is final.
             if let Some(recorded) = load_burn_operation(&store, &operation_id).await? {
-                let response = adopt_recorded_burn(&store, &bridge, &request, &recorded).await?;
-                return Ok((response, std::future::ready(()).boxed()));
+                return answer_recorded_burn_under_lock(store, bridge, request, &recorded, held)
+                    .await;
             }
 
             let amount = match request.requested {
@@ -599,45 +614,14 @@ pub(super) async fn cctp_bridge(
                 let recorded =
                     release_unpersisted_burn(&bridge, &store, &request, &prepared).await?;
                 if recorded.burn_tx() != burn_tx {
-                    let response =
-                        adopt_recorded_burn(&store, &bridge, &request, &recorded).await?;
-                    return Ok((response, std::future::ready(()).boxed()));
+                    return answer_recorded_burn_under_lock(
+                        store, bridge, request, &recorded, held,
+                    )
+                    .await;
                 }
             }
 
-            bridge
-                .broadcast_prepared_burn(direction, &prepared)
-                .boxed()
-                .await
-                .map_err(|error| {
-                    error!(%operation_id, %burn_tx, ?direction, ?error, "Broadcasting the recorded CCTP burn failed");
-                    (
-                        StatusCode::BAD_GATEWAY,
-                        Json(ErrorResponse {
-                            error: format!(
-                                "Burn {burn_tx} is signed and recorded under operation id \
-                                 {operation_id}, but its broadcast failed; rerun with the same \
-                                 operation id to broadcast the same burn again"
-                            ),
-                        }),
-                    )
-                })?;
-            info!(%operation_id, %burn_tx, ?direction, %amount, "CCTP burn broadcast via API");
-
-            let response = CctpBridgeResponse {
-                operation_id,
-                burn_tx,
-                source_chain,
-                destination_chain: from.destination_chain(),
-                amount_raw: amount.to_string(),
-                status: CctpBurnStatus::Pending,
-            };
-            let confirm = async move {
-                // The lock and the pause stay held until the burn confirms.
-                let _held = (resume_guard, driver_paused);
-                confirm_recorded_burn(&store, &bridge, &request, burn_tx, amount).await;
-            };
-            Ok::<_, OpsError>((response, confirm.boxed()))
+            broadcast_and_answer(store, bridge, request, &prepared, amount, held).await
         },
     )
     .await
@@ -705,47 +689,46 @@ async fn load_burn_operation(
     })
 }
 
-/// Answers a request whose operation id already holds a burn with that burn:
-/// it never signs or burns again. A pending burn is broadcast again from its
-/// recorded bytes, so a burn no node holds anymore (a restart before the
-/// broadcast, or a drop) goes out, and one already known is untouched; then
-/// its own receipt decides its status. A request that differs from the
-/// recorded one is refused: the id names one burn.
-async fn adopt_recorded_burn(
+/// Refuses a request that differs from the burn its operation id holds: the
+/// id names one burn.
+fn ensure_same_burn(request: &BurnRequest, recorded: &CctpBurnOperation) -> Result<(), OpsError> {
+    if (recorded.source, recorded.requested) == (request.from, request.requested) {
+        return Ok(());
+    }
+    let operation_id = request.operation_id;
+    let burn_tx = recorded.burn_tx();
+    warn!(
+        %operation_id, %burn_tx, recorded_source = ?recorded.source,
+        recorded_request = ?recorded.requested, source = ?request.from,
+        requested = ?request.requested,
+        "CCTP burn refused: the operation id already holds a different burn"
+    );
+    Err((
+        StatusCode::CONFLICT,
+        Json(ErrorResponse {
+            error: format!(
+                "Operation id {operation_id} already holds burn {burn_tx} of {} from {}; use a \
+                 new operation id for a different burn",
+                describe_requested_burn(recorded.requested),
+                recorded.source.chain()
+            ),
+        }),
+    ))
+}
+
+/// Answers with the burn an operation id holds, sending nothing: a settled
+/// burn reports its outcome (and releases a taken nonce again, idempotent),
+/// and a pending one reports what its own receipt now proves.
+async fn report_recorded_burn(
     store: &Store<CctpBurnOperation>,
     bridge: &BotCctpBridge,
     request: &BurnRequest,
     recorded: &CctpBurnOperation,
-) -> Result<CctpBridgeResponse, OpsError> {
+) -> CctpBridgeResponse {
     let operation_id = request.operation_id;
-    let burn_tx = recorded.burn_tx();
-    if (recorded.source, recorded.requested) != (request.from, request.requested) {
-        warn!(
-            %operation_id, %burn_tx, recorded_source = ?recorded.source,
-            recorded_request = ?recorded.requested, source = ?request.from,
-            requested = ?request.requested,
-            "CCTP burn refused: the operation id already holds a different burn"
-        );
-        return Err((
-            StatusCode::CONFLICT,
-            Json(ErrorResponse {
-                error: format!(
-                    "Operation id {operation_id} already holds burn {burn_tx} of {} from {}; \
-                     use a new operation id for a different burn",
-                    describe_requested_burn(recorded.requested),
-                    recorded.source.chain()
-                ),
-            }),
-        ));
-    }
-
-    if recorded.outcome.status() == CctpBurnStatus::Pending
-        && let Err(error) = bridge
-            .broadcast_prepared_burn(request.from.bridge_direction(), &recorded.prepared)
-            .boxed()
-            .await
-    {
-        warn!(%operation_id, %burn_tx, ?error, "Could not broadcast the recorded CCTP burn again; reporting its receipt's status");
+    if recorded.outcome.status() != CctpBurnStatus::Pending {
+        release_settled_burn_nonce(bridge, recorded).await;
+        return CctpBridgeResponse::of(operation_id, recorded, recorded.outcome.status());
     }
     let status = settle_burn_from_receipt(
         store,
@@ -755,8 +738,160 @@ async fn adopt_recorded_burn(
         request.required_confirmations,
     )
     .await;
-    info!(%operation_id, %burn_tx, ?status, "CCTP burn adopted via API: the operation id already holds this burn");
-    Ok(CctpBridgeResponse::of(operation_id, recorded, status))
+    info!(%operation_id, burn_tx = %recorded.burn_tx(), ?status, "CCTP burn reported via API: the operation id already holds this burn");
+    CctpBridgeResponse::of(operation_id, recorded, status)
+}
+
+/// Whether a node already holds the pending burn, mined or in its mempool, so
+/// a rerun has nothing to send. A failed or lagging read counts as unknown:
+/// the rerun then sends the same bytes under the lock and the pause.
+async fn burn_known_to_node(bridge: &BotCctpBridge, recorded: &CctpBurnOperation) -> bool {
+    matches!(
+        bridge
+            .source_knows_tx(recorded.source.bridge_direction(), recorded.burn_tx())
+            .boxed()
+            .await,
+        Ok(true)
+    )
+}
+
+/// Answers, under the resume lock and the driver pause, a request whose
+/// operation id already holds a burn: a settled one is reported, and a
+/// pending one is sent again from its recorded bytes, like a fresh burn, since
+/// sending spends the wallet's USDC.
+async fn answer_recorded_burn_under_lock<Held: Send + 'static>(
+    store: Arc<Store<CctpBurnOperation>>,
+    bridge: Arc<BotCctpBridge>,
+    request: BurnRequest,
+    recorded: &CctpBurnOperation,
+    held: Held,
+) -> Result<(CctpBridgeResponse, BoxFuture<'static, ()>), OpsError> {
+    ensure_same_burn(&request, recorded)?;
+    if recorded.outcome.status() != CctpBurnStatus::Pending {
+        let response = report_recorded_burn(&store, &bridge, &request, recorded).await;
+        return Ok((response, std::future::ready(()).boxed()));
+    }
+    broadcast_and_answer(
+        store,
+        bridge,
+        request,
+        &recorded.prepared,
+        recorded.amount,
+        held,
+    )
+    .await
+}
+
+/// Broadcasts a recorded burn's signed bytes while the caller holds the
+/// resume lock and the driver pause in `held`, and answers with the burn as
+/// pending; the returned future confirms it and holds `held` until then.
+/// After every broadcast attempt the operation is reloaded: the supersede
+/// route may have settled it meanwhile, and a broadcast after its nonce
+/// release books the nonce again (even an accepted one, from a node that has
+/// not seen the other tx), so a settled burn releases it again and reports its
+/// outcome. A failed broadcast also reports what the burn's own receipt
+/// proves, and answers `502` only while it is still pending, so the operator
+/// never takes an unsent burn for one in flight. A burn signed by another
+/// address than the source wallet (a rotated key) is never broadcast through
+/// this wallet, whose nonce bookkeeping is per address.
+async fn broadcast_and_answer<Held: Send + 'static>(
+    store: Arc<Store<CctpBurnOperation>>,
+    bridge: Arc<BotCctpBridge>,
+    request: BurnRequest,
+    prepared: &PreparedTransaction,
+    amount: U256,
+    held: Held,
+) -> Result<(CctpBridgeResponse, BoxFuture<'static, ()>), OpsError> {
+    let operation_id = request.operation_id;
+    let direction = request.from.bridge_direction();
+    let burn_tx = prepared.tx_hash();
+    let wallet = bridge.source_signer(direction);
+    let failure = if prepared.signer() == Some(wallet) {
+        bridge
+            .broadcast_prepared_burn(direction, prepared)
+            .boxed()
+            .await
+            .err()
+            .map(|error| {
+                format!(
+                    "its broadcast failed ({error}); rerun with the same operation id to \
+                     broadcast the same burn again, or, if another tx took its nonce, settle it \
+                     with cctp-burn-supersede"
+                )
+            })
+    } else {
+        Some(format!(
+            "it was signed by {:?}, not this bot's wallet {wallet} (was the key rotated?), so \
+             this bot never broadcasts it; check it onchain",
+            prepared.signer()
+        ))
+    };
+    // Never fatal: after an accepted broadcast the burn is live, so a failed
+    // read must not drop `held` or claim nothing burned. Without the reload,
+    // an accepted burn is answered pending and confirmed as usual, and a
+    // failed one gets its `502`.
+    let current = store.load(&operation_id).await.unwrap_or_else(|error| {
+        warn!(%operation_id, %burn_tx, ?error, "Could not reload the CCTP burn operation after its broadcast attempt; answering from the attempt");
+        None
+    });
+    if let Some(current) = &current
+        && current.outcome.status() != CctpBurnStatus::Pending
+    {
+        release_settled_burn_nonce(&bridge, current).await;
+        let response = CctpBridgeResponse::of(operation_id, current, current.outcome.status());
+        return Ok((response, std::future::ready(()).boxed()));
+    }
+    if let Some(failure) = failure {
+        if let Some(current) = &current {
+            let response = report_recorded_burn(&store, &bridge, &request, current).await;
+            if response.status != CctpBurnStatus::Pending {
+                return Ok((response, std::future::ready(()).boxed()));
+            }
+        }
+        error!(target: "operational_alert", alert = true, %operation_id, %burn_tx, ?direction, %failure, "A recorded CCTP burn could not be sent, and its receipt does not prove its outcome");
+        return Err((
+            StatusCode::BAD_GATEWAY,
+            Json(ErrorResponse {
+                error: format!(
+                    "Burn {burn_tx} is recorded under operation id {operation_id}, but \
+                     {failure}"
+                ),
+            }),
+        ));
+    }
+    info!(%operation_id, %burn_tx, ?direction, %amount, "CCTP burn broadcast via API");
+
+    let response = CctpBridgeResponse {
+        operation_id,
+        burn_tx,
+        source_chain: request.from.chain(),
+        destination_chain: request.from.destination_chain(),
+        amount_raw: amount.to_string(),
+        status: CctpBurnStatus::Pending,
+    };
+    let confirm = async move {
+        // The lock and the pause stay held until the burn confirms.
+        let _held = held;
+        confirm_recorded_burn(&store, &bridge, &request, burn_tx, amount).await;
+    };
+    Ok((response, confirm.boxed()))
+}
+
+/// Releases the source wallet's hold on the nonce of a burn another tx took
+/// (`Superseded` or `Replaced`). Idempotent, so a stale broadcast that booked
+/// the nonce again after an earlier release is cleared too. A burn signed by
+/// another wallet holds no nonce here.
+async fn release_settled_burn_nonce(bridge: &BotCctpBridge, operation: &CctpBurnOperation) {
+    let nonce_taken = matches!(
+        operation.outcome.status(),
+        CctpBurnStatus::Superseded | CctpBurnStatus::Replaced
+    );
+    if nonce_taken && signed_by_source_wallet(bridge, operation) {
+        bridge
+            .release_superseded_burn(operation.source.bridge_direction(), &operation.prepared)
+            .boxed()
+            .await;
+    }
 }
 
 fn describe_requested_burn(requested: RequestedBurn) -> String {
@@ -771,8 +906,8 @@ fn describe_requested_burn(requested: RequestedBurn) -> String {
 /// Another burn recorded under the id: releases this signature's nonce and
 /// returns the recorded burn to adopt. Nothing recorded: releases the nonce,
 /// since nothing will broadcast it. A failed reload cannot tell, so the nonce
-/// stays reserved, as for the deposit send, and the operator reruns with the
-/// same id. Mirrors `release_unpersisted_deposit_send`.
+/// stays reserved until a restart, as for the deposit send: a rerun before
+/// then could sign behind it. Mirrors `release_unpersisted_deposit_send`.
 async fn release_unpersisted_burn(
     bridge: &BotCctpBridge,
     store: &Store<CctpBurnOperation>,
@@ -814,14 +949,16 @@ async fn release_unpersisted_burn(
             ))
         }
         Err(error) => {
-            error!(target: "operational_alert", alert = true, %operation_id, %burn_tx, nonce, ?error, "Cannot tell whether a signed CCTP burn was recorded; its nonce stays reserved and later sends from the source wallet wait behind it until a restart or a cctp-bridge rerun with its operation id");
+            error!(target: "operational_alert", alert = true, %operation_id, %burn_tx, nonce, ?error, "Cannot tell whether a signed CCTP burn was recorded; its nonce stays reserved and every later send from the source wallet waits behind it until a restart");
             Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ErrorResponse {
                     error: format!(
                         "Could not tell whether burn {burn_tx} was recorded under operation id \
-                         {operation_id}; nothing was broadcast. Rerun with the same operation \
-                         id: it broadcasts the burn if it was recorded"
+                         {operation_id}; nothing was broadcast, and its nonce stays reserved \
+                         until the bot restarts. Rerun with the same operation id only after \
+                         a restart: it then broadcasts the burn if it was recorded, or burns \
+                         once if not"
                     ),
                 }),
             ))
@@ -843,8 +980,8 @@ async fn confirm_recorded_burn(
 ) {
     let operation_id = request.operation_id;
     let direction = request.from.bridge_direction();
-    let fate = match bridge.confirm_burn(direction, burn_tx, amount).await {
-        Ok(_) => BurnReceiptFate::Confirmed,
+    let (fate, error) = match bridge.confirm_burn(direction, burn_tx, amount).await {
+        Ok(_) => (BurnReceiptFate::Confirmed, None),
         // The receipt decides when the error does not: a revert whose replay
         // decodes nothing still mined.
         Err(error) => match burn_receipt_fate(
@@ -855,7 +992,7 @@ async fn confirm_recorded_burn(
         )
         .await
         {
-            Ok(Some(fate)) => fate,
+            Ok(Some(fate)) => (fate, Some(error)),
             read => {
                 warn!(
                     %operation_id, %burn_tx, ?direction, %amount, ?error, ?read,
@@ -868,11 +1005,11 @@ async fn confirm_recorded_burn(
     };
     match fate {
         BurnReceiptFate::Confirmed => info!(
-            %operation_id, %burn_tx, ?direction, %amount,
+            %operation_id, %burn_tx, ?direction, %amount, ?error,
             "CCTP burn confirmed via API"
         ),
         BurnReceiptFate::Reverted => error!(
-            %operation_id, %burn_tx, ?direction, %amount,
+            %operation_id, %burn_tx, ?direction, %amount, ?error,
             "CCTP burn broadcast via API reverted; it burned nothing, and a new operation id \
              burns again"
         ),
@@ -881,13 +1018,15 @@ async fn confirm_recorded_burn(
 }
 
 /// Settles a pending capital CCTP burn that can never mine because another
-/// tx from its source wallet took its nonce: the operator cancels it with a
-/// plain 0 value self transfer at that nonce, then names that tx here. The
-/// checks mirror `transfer reconcile --superseding-tx` for a signed vault
-/// withdrawal (`verify_burn_superseded`). The operation records the burn
-/// superseded, and the source wallet releases the burn's nonce, so startup
-/// stops restoring it. A burn whose own receipt already decides reports that
-/// outcome instead.
+/// tx from its source wallet took its nonce. The operator names that tx: a
+/// plain 0 value self transfer that cancelled the burn, or a fee bumped copy
+/// of the burn (a wallet's speed up) that burned in its place. The checks
+/// mirror `transfer reconcile --superseding-tx` and `adopt-withdrawal` for a
+/// signed vault withdrawal (`verify_burn_superseded`). The operation records
+/// the burn `Superseded` or `Replaced`, and the source wallet releases the
+/// burn's nonce, so startup stops restoring it. A burn whose outcome is
+/// already recorded, or whose own receipt now decides, reports that outcome
+/// instead, and a settled one releases the nonce again (idempotent).
 pub(super) async fn cctp_burn_supersede(
     State(state): State<AppState>,
     Json(request): Json<CctpBurnSupersedeRequest>,
@@ -921,18 +1060,18 @@ pub(super) async fn cctp_burn_supersede(
     )
     .await;
     if status != CctpBurnStatus::Pending {
-        return Ok(Json(CctpBridgeResponse::of(
-            operation_id,
-            &recorded,
-            status,
-        )));
+        let current = load_burn_operation(store, &operation_id)
+            .await?
+            .unwrap_or(recorded);
+        release_settled_burn_nonce(&bridge, &current).await;
+        return Ok(Json(CctpBridgeResponse::of(operation_id, &current, status)));
     }
 
     let source_wallet = match source {
         CctpSourceChain::Ethereum => wallets.ethereum_wallet(),
         CctpSourceChain::Base => wallets.base_wallet(),
     };
-    verify_burn_superseded(
+    let taken_by = verify_burn_superseded(
         &bridge,
         source,
         &recorded.prepared,
@@ -967,25 +1106,28 @@ pub(super) async fn cctp_burn_supersede(
         )
     })?;
 
+    let command = match taken_by {
+        NonceTakenBy::Cancel => CctpBurnOperationCommand::RecordSuperseded { superseding_tx },
+        NonceTakenBy::Replacement => CctpBurnOperationCommand::RecordReplaced {
+            replacement_tx: superseding_tx,
+        },
+    };
     store
-        .send(
-            &operation_id,
-            CctpBurnOperationCommand::RecordSuperseded { superseding_tx },
-        )
+        .send(&operation_id, command)
         .await
         .map_err(ops_command_error)?;
-    bridge
-        .release_superseded_burn(source.bridge_direction(), &recorded.prepared)
-        .boxed()
-        .await;
+    let settled = load_burn_operation(store, &operation_id)
+        .await?
+        .unwrap_or(recorded);
+    release_settled_burn_nonce(&bridge, &settled).await;
     info!(
-        %operation_id, burn_tx = %recorded.burn_tx(), %superseding_tx,
-        "CCTP burn settled as superseded via API"
+        %operation_id, burn_tx = %settled.burn_tx(), %superseding_tx, ?taken_by,
+        "CCTP burn settled via API: another tx took its nonce"
     );
     Ok(Json(CctpBridgeResponse::of(
         operation_id,
-        &recorded,
-        CctpBurnStatus::Superseded,
+        &settled,
+        settled.outcome.status(),
     )))
 }
 

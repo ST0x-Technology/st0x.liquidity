@@ -340,15 +340,20 @@ attested it.
 
 Every `capital cctp-bridge` run prints `operation id <id>` to stderr before it
 sends the request, and the bot records the signed burn under that id before
-broadcasting it. After a timeout, a `502`, a `500`, or any other doubt, rerun
-the same command with `--operation-id <id>`: it never burns a second time, and
-it prints the burn tx of that id with its `status`, broadcasting a pending burn
-again in case no node holds it. A rerun must repeat the same `--from` and
-`--amount` (or `--all`), else it answers `409`. Without `--operation-id` the
-client generates a new id, which is a new burn. The `status` is `pending` (not
-mined with the required confirmations yet), `confirmed` (finish with
-`complete-mint`), `reverted` (it burned nothing; burn again with a new id), or
-`superseded` (another tx took its nonce; it can never burn).
+broadcasting it. After a timeout, a `502`, any `500` except the one that says
+the bot cannot tell whether the burn was recorded (see below), or any other
+doubt, rerun the same command with `--operation-id <id>`: it never burns a
+second time, and it prints the burn tx of that id with its `status`. A pending
+burn that no node holds is sent again from its recorded bytes, under the
+recovery lock and the driver pause like a new burn, so that rerun can answer
+`409` while another operation holds the lock; retry it. A rerun must repeat the
+same `--from` and `--amount` (or `--all`), else it answers `409`. Without
+`--operation-id` the client generates a new id, which is a new burn. The
+`status` is `pending` (not mined with the required confirmations yet),
+`confirmed` (finish with `complete-mint`), `reverted` (it burned nothing; burn
+again with a new id), `superseded` (another tx took its nonce; it can never
+burn), or `replaced` (a fee bumped copy of the burn burned in its place; the
+printed `burnTx` is that copy, which is the one to pass to `complete-mint`).
 
 After answering, the bot keeps the recovery lock and the driver pause until the
 burn has the source chain's required confirmations (12 blocks on Ethereum in
@@ -364,24 +369,37 @@ confirmations. Until then every verb that takes the recovery lock answers `409`:
 says `A transfer recovery operation is already in progress`. `complete-mint`
 answers `502` instead while Circle has not attested the burn, since it fetches
 the attestation before it tries the lock; both mean retry. A rerun with the
-burn's own operation id is answered at once. After the task finishes, the lock
-is free again. The outcome is `CCTP burn confirmed via API`,
-`CCTP burn broadcast via API reverted`, or
+burn's own operation id is answered at once while its burn is settled or a node
+holds it; one that must send the burn again waits for the lock like any other.
+After the task finishes, the lock is free again. The outcome is
+`CCTP burn confirmed via API`, `CCTP burn broadcast via API reverted`, or
 `CCTP burn broadcast via API is not confirmed yet` when the receipt wait timed
 out or a drop report or RPC errors left the burn unproven; a rerun with its
 operation id reports its status later. A burn that never confirmed never
 attests, and `complete-mint` keeps answering `502` for it.
 
-At startup the bot rebroadcasts every pending burn before any other send from
-its wallet. A pending burn that will not mine at its fee keeps its nonce, and
-later sends from that wallet queue behind it. To clear it, send a 0 value
-transfer from the bot wallet to itself, with no calldata, at the burn's nonce
-and a higher fee; once that cancel has the chain's required confirmations, run
+At startup the bot reserves the nonce of every pending burn and rebroadcasts it
+before any other send from its wallet (a burn already mined with the required
+confirmations but without `MessageSent` keeps its nonce and is not sent again).
+A pending burn that will not mine at its fee keeps its nonce, and later sends
+from that wallet queue behind it. To clear it, send a 0 value transfer from the
+bot wallet to itself, with no calldata, at the burn's nonce and a higher fee;
+once that cancel has the chain's required confirmations, run
 `capital cctp-burn-supersede --operation-id <id> --superseding-tx <cancel-tx>`.
 The bot checks the cancel is mined from the burn's signer at the burn's nonce
-and is a plain cancel or a revert (a successful tx of any other kind at the
-nonce could be a fee bumped copy of the burn), then records the burn
-`superseded` and frees its nonce. A refused tx answers `409` with the reason.
+and is a plain cancel or a revert, then records the burn `superseded` and frees
+its nonce. If a wallet speed up already sent a copy of the burn (the same
+calldata at the same nonce with a higher fee), name that copy instead: the bot
+checks it called the same TokenMessenger with the burn's exact calldata and
+emitted `MessageSent`, records the burn `replaced`, and prints the copy as the
+burn tx to pass to `complete-mint`. Any other successful tx at the nonce is
+refused with `409`, since it may have moved funds. A burn signed by a key the
+bot no longer uses (after a rotation) is never rebroadcast or restored: startup
+pages and skips that chain's approvals and revokes, and a rerun answers `502`.
+
+A burn whose receipt succeeded without the CCTP `MessageSent` event pages
+`emitted no MessageSent` and stays `pending`: Circle has nothing to attest, so
+check the configured TokenMessenger before anything else.
 
 `capital vault-deposit`, `capital vault-withdraw`, `capital vault-withdraw-usdc`
 and `capital reset-allowance` also print their tx as soon as it is broadcast,
@@ -428,10 +446,12 @@ verb. A `cctp-bridge` rerun with the printed operation id is always safe, as
 described above. If the logs show `Capital route failed onchain` for
 `cctp-bridge`, the burn was not signed or recorded: the balance read, the
 allowance approve or the Circle fee lookup failed, and a rerun with the same
-operation id burns once. Every capital verb answers `503` until the bot finishes
-starting. The tokenization and issuer verbs (`transfer-equity`, `wrap-equity`,
-`unwrap-equity`, `donate-equity`, `dividend-bump`) have no client subcommand and
-stay on `st0x-cli`.
+operation id burns once. A `500` that says the bot cannot tell whether the burn
+was recorded keeps its nonce reserved until a restart: rerun with the same
+operation id only after the restart. Every capital verb answers `503` until the
+bot finishes starting. The tokenization and issuer verbs (`transfer-equity`,
+`wrap-equity`, `unwrap-equity`, `donate-equity`, `dividend-bump`) have no client
+subcommand and stay on `st0x-cli`.
 
 ### Orchestrator Rollout per Chain
 

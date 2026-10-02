@@ -6680,34 +6680,35 @@ effect rather than a generic intent:
   and never wait on settlement.** `st0x-liquidity-client capital` posts to
   `POST /liquidity-write/capital/{verb}` for `transfer-usdc`, `vault-deposit`,
   `vault-withdraw`, `vault-withdraw-usdc`, `cctp-bridge` and `reset-allowance`,
-  the network counterparts of the `st0x-cli` verbs of the same names. The routes
-  sign with the wallets the conductor uses, so they share its nonce manager
-  instead of running a second one. The ops load balancer times a request out
-  after 60 seconds, so no route waits on CCTP attestation, USDC settlement, or
-  the confirmations of the transaction it answers with; only a prerequisite
-  approve, when an allowance is short, is awaited before that broadcast.
-  `transfer-usdc` starts a fresh transfer on the bot's own transfer worker, the
-  path the rebalancer uses, and returns its new id at once. It runs on the
-  served corridor its optional `chain` names, picked by the same rule as
-  `st0x-cli transfer-usdc --chain`: `chain` may be left out while the build
-  serves one corridor, and a missing or ambiguous choice is refused with `422`.
-  An amount that is not positive or is finer than USDC's six decimals is refused
-  with `400` before anything else, then it refuses with `503` until startup
-  completes, then it takes the recovery lock (`409`), quiesces the USDC
-  rebalancing driver (`503`), then applies the single flight gates of
-  `transfer resume --kind usdc` in order: an every corridor latch, a live USDC
-  job row, or a durable guard holder refuses with `409`; then, like the trigger
-  before every fresh transfer, it refuses with `409` while a cash snapshot
-  divergence is engaged or the cash balance is restart tainted (the transfer
-  would mark the cash venue busy and keep the poller from resolving either), and
-  with `503` while the Base or Ethereum signing wallet cannot be shown to pay
-  gas; last, a corridor guard held in memory refuses the claim with `409`. A
-  retried request can therefore not start a second transfer while the first is
-  in flight. Everything after the startup gate runs on a tracked detached task,
-  so a dropped request cannot release the corridor claim after the job is
-  queued. `cctp-bridge` only burns: it applies the same corridor gas check
-  (`503`) as `transfer-usdc`, since the burn and the mint that completes it
-  spend both wallets' gas, then holds the recovery lock and the driver pause
+  the network counterparts of the `st0x-cli` verbs of the same names, and for
+  `cctp-burn-supersede`, which settles a `cctp-bridge` burn and has no
+  `st0x-cli` counterpart. The routes sign with the wallets the conductor uses,
+  so they share its nonce manager instead of running a second one. The ops load
+  balancer times a request out after 60 seconds, so no route waits on CCTP
+  attestation, USDC settlement, or the confirmations of the transaction it
+  answers with; only a prerequisite approve, when an allowance is short, is
+  awaited before that broadcast. `transfer-usdc` starts a fresh transfer on the
+  bot's own transfer worker, the path the rebalancer uses, and returns its new
+  id at once. It runs on the served corridor its optional `chain` names, picked
+  by the same rule as `st0x-cli transfer-usdc --chain`: `chain` may be left out
+  while the build serves one corridor, and a missing or ambiguous choice is
+  refused with `422`. An amount that is not positive or is finer than USDC's six
+  decimals is refused with `400` before anything else, then it refuses with
+  `503` until startup completes, then it takes the recovery lock (`409`),
+  quiesces the USDC rebalancing driver (`503`), then applies the single flight
+  gates of `transfer resume --kind usdc` in order: an every corridor latch, a
+  live USDC job row, or a durable guard holder refuses with `409`; then, like
+  the trigger before every fresh transfer, it refuses with `409` while a cash
+  snapshot divergence is engaged or the cash balance is restart tainted (the
+  transfer would mark the cash venue busy and keep the poller from resolving
+  either), and with `503` while the Base or Ethereum signing wallet cannot be
+  shown to pay gas; last, a corridor guard held in memory refuses the claim with
+  `409`. A retried request can therefore not start a second transfer while the
+  first is in flight. Everything after the startup gate runs on a tracked
+  detached task, so a dropped request cannot release the corridor claim after
+  the job is queued. `cctp-bridge` only burns: it applies the same corridor gas
+  check (`503`) as `transfer-usdc`, since the burn and the mint that completes
+  it spend both wallets' gas, then holds the recovery lock and the driver pause
   around the burn like `cctp complete-mint` does around the mint, and returns
   the burn tx as soon as the burn is broadcast, not when it confirms: an approve
   plus the burn's confirmations can outlast the 60 second load balancer cut, and
@@ -6718,49 +6719,68 @@ effect rather than a generic intent:
   the lock, the pause and the amount, the route signs the burn without
   broadcasting it, records the signed bytes under the id (`Prepared`), and only
   then broadcasts them, so the burn is on record before it can exist onchain. A
-  request whose id already holds a burn is answered before the gas check and the
-  locks, since it sends nothing new: it reports the recorded burn tx and its
-  status, after broadcasting a pending burn's recorded bytes again (a burn no
-  node holds after a restart or a drop goes out, one already known is
-  untouched). Its `from` and amount (or `all`) must match the recorded burn's,
-  else `409`. Under the lock the route looks the id up again, so two concurrent
-  requests with one id burn once, and the aggregate refuses a second `Prepare`
-  for an id. A failed record releases the signature's nonce when a reload shows
-  nothing recorded (`500`, nothing broadcast), adopts the burn another request
-  recorded, and keeps the nonce reserved when the reload fails too (`500`, rerun
-  with the same id). A failed broadcast of a recorded burn answers `502`; a
-  rerun with the same id broadcasts the same bytes. The response carries the
-  operation id, the burn tx, both chains, the raw amount and a `status`:
-  `pending`, `confirmed`, `reverted` or `superseded`. The detached task then
-  awaits the receipt, still holding the lock and the pause, until the burn has
-  the source chain's required confirmations or the wait gives up (up to 5
-  minutes for inclusion plus 30 minutes for the confirmations), and records the
-  outcome its own canonical receipt proves at those confirmations: `Confirmed`,
-  or `Reverted` (which burned nothing). A receipt timeout, a drop report, an RPC
-  error or a shallower receipt proves nothing, so the burn stays pending and a
-  rerun with its id reports it and broadcasts it again. Meanwhile every route
-  that takes the recovery lock answers `409`, and `cctp complete-mint` answers
-  `502` until Circle attests the burn and `409` once it has, since it fetches
-  the attestation before it tries the lock. The operator finishes with
-  `cctp complete-mint`. A reverted burn is final: a rerun with its id reports
-  `reverted` and burns nothing, and burning again takes a new id. A signed burn
-  is never resigned or fee bumped. At startup, next to the signed deposit sends
-  and before any startup approval or revoke, the bot records the outcome of
-  every pending burn whose receipt now decides, and reserves the nonce of every
-  other one and rebroadcasts its exact bytes; a chain with such a burn not mined
-  yet skips its startup approvals and revokes, as for a deposit send. A pending
-  burn that will not mine at its fee keeps its nonce on the source wallet, and
-  later sends from that wallet queue behind it, until it mines or the operator
-  cancels it with a plain 0 value transfer to the wallet itself, with no
-  calldata and a higher fee, at the burn's nonce, then settles it with
-  `POST /liquidity-write/capital/cctp-burn-supersede` (`operationId`,
-  `supersedingTx`). That route records `Superseded` and releases the nonce once
-  the chain shows the named tx mined from the burn's signer at the burn's nonce
-  with the source chain's required confirmations, the burn itself unmined, and
-  the tx either reverted or a plain cancel (a successful tx at the nonce could
-  be a fee bumped copy of the burn); any other tx is refused with `409`, a
-  failed chain read with `502`, and an unknown id with `404`. A burn whose own
-  receipt already decides reports that status instead. The vault verbs and
+  request whose id already holds a burn never signs or burns again, and its
+  `from` and amount (or `all`) must match the recorded burn's, else `409`. A
+  settled burn, or a pending one a node already holds (mined or in its mempool),
+  is answered before the gas check and the locks, since nothing is sent: the
+  recorded burn tx and the status its own receipt proves. A pending burn no node
+  holds (a restart before its broadcast, or a drop) is sent again from its
+  recorded bytes under the lock and the pause, like a new burn, since sending
+  spends the wallet's USDC. After every broadcast attempt, accepted or not and
+  on either path, the route reloads the operation, which the supersede route may
+  have settled meanwhile: a settled burn releases its nonce again and reports
+  its outcome, and a failed attempt also reports what the burn's own receipt
+  proves. A failed reload never drops the lock or the pause. Under the lock the
+  route looks the id up again, so two concurrent requests with one id burn once,
+  and the aggregate refuses a second `Prepare` for an id. A failed record
+  releases the signature's nonce when a reload shows nothing recorded (`500`,
+  nothing broadcast), adopts the burn another request recorded, and keeps the
+  nonce reserved when the reload fails too (`500`, rerun only after a restart,
+  since until then a rerun could sign behind the reserved nonce). A failed
+  broadcast of a recorded burn answers `502` only while its receipt does not
+  prove the outcome; a rerun with the same id broadcasts the same bytes. A burn
+  signed by another address than the source wallet (a rotated key) is never
+  broadcast or restored through this wallet, whose nonce bookkeeping is per
+  address. The response carries the operation id, the burn tx, both chains, the
+  raw amount and a `status`: `pending`, `confirmed`, `reverted`, `superseded` or
+  `replaced`. The detached task then awaits the receipt, still holding the lock
+  and the pause, until the burn has the source chain's required confirmations or
+  the wait gives up (up to 5 minutes for inclusion plus 30 minutes for the
+  confirmations), and records the outcome its own canonical receipt proves at
+  those confirmations: `Confirmed`, only with the CCTP `MessageSent` event that
+  `cctp complete-mint` needs (a successful receipt without it pages and stays
+  pending), or `Reverted` (which burned nothing). A receipt timeout, a drop
+  report, an RPC error or a shallower receipt proves nothing, so the burn stays
+  pending and a rerun with its id reports it and broadcasts it again. Meanwhile
+  every route that takes the recovery lock answers `409`, and
+  `cctp complete-mint` answers `502` until Circle attests the burn and `409`
+  once it has, since it fetches the attestation before it tries the lock. The
+  operator finishes with `cctp complete-mint`. A reverted burn is final: a rerun
+  with its id reports `reverted` and burns nothing, and burning again takes a
+  new id. A signed burn is never resigned or fee bumped. At startup, next to the
+  signed deposit sends and before any startup approval or revoke, the bot
+  records the outcome of every pending burn whose receipt now decides, and
+  reserves the nonce of every other one signed by the source wallet and
+  rebroadcasts its exact bytes (except one already mined at the required
+  confirmations without `MessageSent`, which keeps the reservation only; one
+  signed by another wallet is skipped and gates its chain); a chain with such a
+  burn not mined yet skips its startup approvals and revokes, as for a deposit
+  send. A pending burn that will not mine at its fee keeps its nonce on the
+  source wallet, and later sends from that wallet queue behind it, until it
+  mines or the operator cancels it with a plain 0 value transfer to the wallet
+  itself, with no calldata and a higher fee, at the burn's nonce, then settles
+  it with `POST /liquidity-write/capital/cctp-burn-supersede` (`operationId`,
+  `supersedingTx`). The named tx must be mined from the burn's signer at the
+  burn's nonce with the source chain's required confirmations, and the burn
+  itself unmined. A reverted tx or a plain cancel records `Superseded`. A fee
+  bumped copy of the burn (a wallet's speed up: the burn's exact calldata to the
+  same TokenMessenger, no value, with `MessageSent` in its receipt) records
+  `Replaced`, and the copy becomes the operation's burn tx for `complete-mint`.
+  Either way the route releases the wallet's hold on the nonce, again on every
+  later call, since a stale rebroadcast can book it again. Any other successful
+  tx is refused with `409`, since it may have moved funds; a failed chain read
+  answers `502`, and an unknown id `404`. A burn whose outcome is recorded or
+  whose own receipt now decides reports that status instead. The vault verbs and
   `reset-allowance` take neither the lock nor the pause, like the `st0x-cli`
   verbs: pausing the driver would refuse every vault operation for the length of
   each USDC transfer. `vault-deposit` does take its own lock (`409` while

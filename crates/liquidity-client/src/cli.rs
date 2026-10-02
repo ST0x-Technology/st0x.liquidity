@@ -479,11 +479,14 @@ pub(crate) enum Capital {
         operation_id: Option<Uuid>,
     },
     /// Settle a pending `cctp-bridge` burn that can never mine because
-    /// another tx from the source wallet took its nonce: first cancel it with
-    /// a 0 value transfer to the wallet itself, with no calldata, at the
-    /// burn's nonce and a higher fee, then pass that tx once it has the
-    /// chain's required confirmations. Startup then stops rebroadcasting the
-    /// burn. A burn whose own receipt already decides reports that status.
+    /// another tx from the source wallet took its nonce. Pass that tx once it
+    /// has the chain's required confirmations: either a cancel you sent (a 0
+    /// value transfer to the wallet itself, with no calldata, at the burn's
+    /// nonce and a higher fee), which settles the burn `superseded`, or a fee
+    /// bumped copy of the burn a wallet speed up already sent, which settles
+    /// it `replaced` and prints that copy as the burn tx for `complete-mint`.
+    /// Startup then stops rebroadcasting the burn. A burn whose own receipt
+    /// already decides reports that status.
     CctpBurnSupersede {
         /// The operation id the burn's `cctp-bridge` run printed.
         #[arg(long)]

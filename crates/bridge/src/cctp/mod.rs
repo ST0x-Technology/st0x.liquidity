@@ -1402,11 +1402,41 @@ impl<EthWallet: Wallet, BaseWallet: Wallet> CctpBridge<EthWallet, BaseWallet> {
         }
     }
 
-    /// The `TokenMessengerV2` that `direction`'s burns call.
-    pub const fn source_token_messenger(&self, direction: BridgeDirection) -> Address {
+    /// Whether `tx_hash`'s receipt on `direction`'s source chain carries the
+    /// CCTP `MessageSent` event, as [`confirm_burn`](crate::Bridge::confirm_burn)
+    /// requires of a burn. Reads without waiting; `None` while the node shows
+    /// no receipt.
+    pub async fn source_emitted_message_sent(
+        &self,
+        direction: BridgeDirection,
+        tx_hash: TxHash,
+    ) -> Result<Option<bool>, CctpError> {
         match direction {
-            BridgeDirection::EthereumToBase => self.ethereum.token_messenger(),
-            BridgeDirection::BaseToEthereum => self.base.token_messenger(),
+            BridgeDirection::EthereumToBase => self.ethereum.emitted_message_sent(tx_hash).await,
+            BridgeDirection::BaseToEthereum => self.base.emitted_message_sent(tx_hash).await,
+        }
+    }
+
+    /// Whether the node on `direction`'s source chain knows `tx_hash`, mined
+    /// or still pending. `false` can be a lagging node, so it never proves the
+    /// tx is gone.
+    pub async fn source_knows_tx(
+        &self,
+        direction: BridgeDirection,
+        tx_hash: TxHash,
+    ) -> Result<bool, CctpError> {
+        match direction {
+            BridgeDirection::EthereumToBase => self.ethereum.knows_tx(tx_hash).await,
+            BridgeDirection::BaseToEthereum => self.base.knows_tx(tx_hash).await,
+        }
+    }
+
+    /// The wallet that signs `direction`'s burns. A persisted signed burn from
+    /// another address must not go through this wallet's nonce bookkeeping.
+    pub fn source_signer(&self, direction: BridgeDirection) -> Address {
+        match direction {
+            BridgeDirection::EthereumToBase => self.ethereum.owner(),
+            BridgeDirection::BaseToEthereum => self.base.owner(),
         }
     }
 

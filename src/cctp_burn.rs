@@ -92,6 +92,7 @@ pub(crate) enum CctpBurnStatus {
     Confirmed,
     Reverted,
     Superseded,
+    Replaced,
 }
 
 /// The client's id for one burn: every request carrying it means that burn.
@@ -137,6 +138,13 @@ pub(crate) enum CctpBurnOutcome {
         superseding_tx: TxHash,
         superseded_at: DateTime<Utc>,
     },
+    /// A fee bumped copy of the burn (same signer, nonce, contract and
+    /// calldata) is mined at the burn's nonce, succeeded and emitted
+    /// `MessageSent`, at the required confirmations: that copy did the burn.
+    Replaced {
+        replacement_tx: TxHash,
+        replaced_at: DateTime<Utc>,
+    },
 }
 
 impl CctpBurnOutcome {
@@ -146,6 +154,7 @@ impl CctpBurnOutcome {
             Self::Confirmed { .. } => CctpBurnStatus::Confirmed,
             Self::Reverted { .. } => CctpBurnStatus::Reverted,
             Self::Superseded { .. } => CctpBurnStatus::Superseded,
+            Self::Replaced { .. } => CctpBurnStatus::Replaced,
         }
     }
 }
@@ -163,8 +172,21 @@ pub(crate) struct CctpBurnOperation {
 }
 
 impl CctpBurnOperation {
+    /// The signed burn's own hash, which the bot broadcasts and restores.
     pub(crate) fn burn_tx(&self) -> TxHash {
         self.prepared.tx_hash()
+    }
+
+    /// The tx that burned: the replacement that took the signed burn's
+    /// nonce, if one was recorded, else the signed burn.
+    pub(crate) fn effective_burn_tx(&self) -> TxHash {
+        match self.outcome {
+            CctpBurnOutcome::Replaced { replacement_tx, .. } => replacement_tx,
+            CctpBurnOutcome::Pending
+            | CctpBurnOutcome::Confirmed { .. }
+            | CctpBurnOutcome::Reverted { .. }
+            | CctpBurnOutcome::Superseded { .. } => self.burn_tx(),
+        }
     }
 }
 
@@ -195,6 +217,9 @@ pub(crate) enum CctpBurnOperationCommand {
     RecordSuperseded {
         superseding_tx: TxHash,
     },
+    RecordReplaced {
+        replacement_tx: TxHash,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -217,6 +242,10 @@ pub(crate) enum CctpBurnOperationEvent {
         superseding_tx: TxHash,
         superseded_at: DateTime<Utc>,
     },
+    Replaced {
+        replacement_tx: TxHash,
+        replaced_at: DateTime<Utc>,
+    },
 }
 
 const PREPARED_EVENT_TYPE: &str = "CctpBurnOperationEvent::Prepared";
@@ -228,6 +257,7 @@ impl DomainEvent for CctpBurnOperationEvent {
             Self::Confirmed { .. } => "CctpBurnOperationEvent::Confirmed".to_owned(),
             Self::Reverted { .. } => "CctpBurnOperationEvent::Reverted".to_owned(),
             Self::Superseded { .. } => "CctpBurnOperationEvent::Superseded".to_owned(),
+            Self::Replaced { .. } => "CctpBurnOperationEvent::Replaced".to_owned(),
         }
     }
 
@@ -261,6 +291,16 @@ impl CctpBurnOperation {
                 superseding_tx,
                 superseded_at,
             },
+            (
+                CctpBurnOutcome::Pending,
+                CctpBurnOutcome::Replaced {
+                    replacement_tx,
+                    replaced_at,
+                },
+            ) => CctpBurnOperationEvent::Replaced {
+                replacement_tx,
+                replaced_at,
+            },
             (CctpBurnOutcome::Confirmed { .. }, CctpBurnOutcome::Confirmed { .. })
             | (CctpBurnOutcome::Reverted { .. }, CctpBurnOutcome::Reverted { .. }) => {
                 return Ok(Vec::new());
@@ -272,6 +312,13 @@ impl CctpBurnOperation {
                 },
                 CctpBurnOutcome::Superseded { superseding_tx, .. },
             ) if recorded == superseding_tx => return Ok(Vec::new()),
+            (
+                CctpBurnOutcome::Replaced {
+                    replacement_tx: recorded,
+                    ..
+                },
+                CctpBurnOutcome::Replaced { replacement_tx, .. },
+            ) if recorded == replacement_tx => return Ok(Vec::new()),
             (recorded, attempted) => {
                 return Err(CctpBurnOperationError::OutcomeConflict {
                     recorded,
@@ -316,7 +363,8 @@ impl EventSourced for CctpBurnOperation {
             }),
             CctpBurnOperationEvent::Confirmed { .. }
             | CctpBurnOperationEvent::Reverted { .. }
-            | CctpBurnOperationEvent::Superseded { .. } => None,
+            | CctpBurnOperationEvent::Superseded { .. }
+            | CctpBurnOperationEvent::Replaced { .. } => None,
         }
     }
 
@@ -335,6 +383,13 @@ impl EventSourced for CctpBurnOperation {
             } => CctpBurnOutcome::Superseded {
                 superseding_tx: *superseding_tx,
                 superseded_at: *superseded_at,
+            },
+            CctpBurnOperationEvent::Replaced {
+                replacement_tx,
+                replaced_at,
+            } => CctpBurnOutcome::Replaced {
+                replacement_tx: *replacement_tx,
+                replaced_at: *replaced_at,
             },
         };
         Ok(Some(Self {
@@ -364,7 +419,8 @@ impl EventSourced for CctpBurnOperation {
             }]),
             CctpBurnOperationCommand::RecordConfirmed
             | CctpBurnOperationCommand::RecordReverted
-            | CctpBurnOperationCommand::RecordSuperseded { .. } => {
+            | CctpBurnOperationCommand::RecordSuperseded { .. }
+            | CctpBurnOperationCommand::RecordReplaced { .. } => {
                 Err(CctpBurnOperationError::NotPrepared)
             }
         }
@@ -392,6 +448,12 @@ impl EventSourced for CctpBurnOperation {
                     superseded_at: now,
                 })
             }
+            CctpBurnOperationCommand::RecordReplaced { replacement_tx } => {
+                self.record_outcome(CctpBurnOutcome::Replaced {
+                    replacement_tx,
+                    replaced_at: now,
+                })
+            }
         }
     }
 }
@@ -403,11 +465,13 @@ impl EventSourced for CctpBurnOperation {
 pub(crate) async fn pending_cctp_burn_ids(
     pool: &SqlitePool,
 ) -> Result<(Vec<CctpBurnOperationId>, Vec<String>), sqlx::Error> {
+    // Bound to the constants the aggregate writes, so a rename can never
+    // silently empty the startup restore.
     let rows: Vec<String> = sqlx::query_scalar(
         "WITH latest AS ( \
              SELECT aggregate_id, MAX(sequence) AS max_seq \
              FROM events \
-             WHERE aggregate_type = 'CctpBurnOperation' \
+             WHERE aggregate_type = ?1 \
              GROUP BY aggregate_id \
          ) \
          SELECT latest.aggregate_id \
@@ -415,10 +479,12 @@ pub(crate) async fn pending_cctp_burn_ids(
          INNER JOIN latest \
              ON last_ev.aggregate_id = latest.aggregate_id \
             AND last_ev.sequence = latest.max_seq \
-         WHERE last_ev.aggregate_type = 'CctpBurnOperation' \
-           AND last_ev.event_type = 'CctpBurnOperationEvent::Prepared' \
+         WHERE last_ev.aggregate_type = ?1 \
+           AND last_ev.event_type = ?2 \
          ORDER BY latest.aggregate_id",
     )
+    .bind(CctpBurnOperation::AGGREGATE_TYPE)
+    .bind(PREPARED_EVENT_TYPE)
     .fetch_all(pool)
     .await?;
 
@@ -438,26 +504,42 @@ pub(crate) enum BurnReceiptFate {
 
 /// Reads the burn's own canonical receipt on its source chain: `None` while it
 /// is unmined or shallower than `required_confirmations`, since a drop report,
-/// a timeout or a shallow receipt proves nothing.
+/// a timeout or a shallow receipt proves nothing. A successful receipt counts
+/// as a burn only with the CCTP `MessageSent` event, the rule `confirm_burn`
+/// applies: without it Circle has nothing to attest, so the burn is not
+/// recorded confirmed but paged, and stays pending for the operator.
 pub(crate) async fn burn_receipt_fate(
     bridge: &BotCctpBridge,
     source: CctpSourceChain,
     burn_tx: TxHash,
     required_confirmations: u64,
 ) -> Result<Option<BurnReceiptFate>, CctpError> {
-    let mined = bridge
-        .source_mined_tx(source.bridge_direction(), burn_tx)
+    let direction = source.bridge_direction();
+    let Some(mined) = bridge
+        .source_mined_tx(direction, burn_tx)
         .boxed()
-        .await?;
-    Ok(mined
+        .await?
         .filter(|mined| mined.confirmations >= required_confirmations)
-        .map(|mined| {
-            if mined.succeeded {
-                BurnReceiptFate::Confirmed
-            } else {
-                BurnReceiptFate::Reverted
-            }
-        }))
+    else {
+        return Ok(None);
+    };
+    if !mined.succeeded {
+        return Ok(Some(BurnReceiptFate::Reverted));
+    }
+    match bridge
+        .source_emitted_message_sent(direction, burn_tx)
+        .boxed()
+        .await?
+    {
+        Some(true) => Ok(Some(BurnReceiptFate::Confirmed)),
+        Some(false) => {
+            error!(target: "operational_alert", alert = true, %burn_tx, ?source, "CCTP burn mined and succeeded but emitted no MessageSent, so Circle has nothing to attest; check the configured TokenMessenger before completing or retrying it");
+            Ok(None)
+        }
+        // The node that answered this read has no receipt yet, though the
+        // previous read found one: it lags, and proves nothing.
+        None => Ok(None),
+    }
 }
 
 /// Records `fate` on the operation. A failed write is logged: the burn's
@@ -524,9 +606,9 @@ pub(crate) enum BurnNotSuperseded {
         bot_wallet: Address,
     },
     #[error(
-        "burn {tx} itself is mined with {confirmations} of the {required} required \
-         confirmations; rerun cctp-bridge with its operation id once it has them to record \
-         its outcome"
+        "burn {tx} itself is mined, with {confirmations} of the {required} required \
+         confirmations, so no other tx took its nonce; a cctp-bridge rerun with its operation \
+         id reports its outcome"
     )]
     BurnMined {
         tx: TxHash,
@@ -564,11 +646,13 @@ pub(crate) enum BurnNotSuperseded {
         confirmations: u64,
         required: u64,
     },
-    /// A successful tx at the nonce could be a fee bumped copy of the burn,
-    /// which burned the USDC; only a plain cancel proves it burned nothing.
+    /// A successful tx at the nonce moved something unless it is a plain
+    /// cancel; only a copy of the burn itself is adopted as its replacement.
     #[error(
-        "superseding tx {superseding} succeeded but is not a plain cancel (a 0 value transfer \
-         to the bot wallet {bot_wallet} with no calldata and no logs), so it may have burned"
+        "superseding tx {superseding} succeeded but is neither a plain cancel (a 0 value \
+         transfer to the bot wallet {bot_wallet} with no calldata and no logs) nor a copy of \
+         the burn (its calldata sent to the TokenMessenger, emitting MessageSent), so what it \
+         did is unknown"
     )]
     SupersedingTxNotAPlainCancel {
         superseding: TxHash,
@@ -582,16 +666,31 @@ pub(crate) enum BurnNotSuperseded {
     },
 }
 
-/// Checks that `superseding` proves `prepared`, an operation's signed burn,
-/// can never mine, so the operation records it superseded and the source
-/// wallet releases its nonce. Mirrors `verify_withdrawal_superseded`.
+/// How a mined tx took a signed burn's nonce.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NonceTakenBy {
+    /// A plain cancel, or any reverted tx: nothing was burned.
+    Cancel,
+    /// A fee bumped copy of the burn: it burned in the signed burn's place.
+    Replacement,
+}
+
+/// Checks that `superseding` took the nonce of `prepared`, an operation's
+/// signed burn, so the burn can never mine. Mirrors
+/// `verify_withdrawal_superseded`, and like the vault withdrawal's
+/// `verify_withdrawal_replacement` it adopts a copy of the signed tx that
+/// went out in its place.
 ///
 /// The burn must be signed by `bot_wallet` and not be mined itself.
 /// `superseding` must be a different tx from `bot_wallet` at the burn's nonce
-/// with `required_confirmations`. A reverted one burned nothing; a successful
-/// one must be a plain cancel, since a fee bumped copy of the burn would also
-/// take the nonce and burn. Only a tx the node shows mined in the canonical
-/// chain counts, so a node that lags refuses rather than settles.
+/// with `required_confirmations`. A reverted one burned nothing. A successful
+/// one is a [`NonceTakenBy::Cancel`] only as a plain cancel, or a
+/// [`NonceTakenBy::Replacement`] only when it sent the burn's exact calldata to
+/// the burn's `TokenMessengerV2` with no value and emitted `MessageSent`: a fee
+/// bumped copy of the burn, which burned the same amount toward the same
+/// recipient. Anything else is refused, since it may have moved funds. Only a
+/// tx the node shows mined in the canonical chain counts, so a node that lags
+/// refuses rather than settles.
 pub(crate) async fn verify_burn_superseded(
     bridge: &BotCctpBridge,
     source: CctpSourceChain,
@@ -599,7 +698,7 @@ pub(crate) async fn verify_burn_superseded(
     superseding: TxHash,
     bot_wallet: Address,
     required_confirmations: u64,
-) -> Result<(), BurnNotSuperseded> {
+) -> Result<NonceTakenBy, BurnNotSuperseded> {
     let tx = prepared.tx_hash();
     let nonce = prepared.nonce();
     let direction = source.bridge_direction();
@@ -661,7 +760,7 @@ pub(crate) async fn verify_burn_superseded(
         });
     }
     if !succeeded {
-        return Ok(());
+        return Ok(NonceTakenBy::Cancel);
     }
 
     let plain_cancel = to == Some(bot_wallet)
@@ -669,13 +768,31 @@ pub(crate) async fn verify_burn_superseded(
         && input.is_empty()
         && tx_type != EIP7702_TX_TYPE_ID
         && !emitted_logs;
-    if !plain_cancel {
-        return Err(BurnNotSuperseded::SupersedingTxNotAPlainCancel {
-            superseding,
-            bot_wallet,
-        });
+    if plain_cancel {
+        return Ok(NonceTakenBy::Cancel);
     }
-    Ok(())
+    // A copy calls the same contract the signed burn calls, with its exact
+    // calldata, so it burned the same amount toward the same recipient. Its
+    // tx type does not matter: the `MessageSent` event proves the burn.
+    let copies_the_burn =
+        to == prepared.to() && value.is_zero() && prepared.input().as_ref() == Some(&input);
+    let burned = copies_the_burn
+        && bridge
+            .source_emitted_message_sent(direction, superseding)
+            .boxed()
+            .await
+            .map_err(|source| BurnNotSuperseded::Read {
+                tx: superseding,
+                source: Box::new(source),
+            })?
+            == Some(true);
+    if burned {
+        return Ok(NonceTakenBy::Replacement);
+    }
+    Err(BurnNotSuperseded::SupersedingTxNotAPlainCancel {
+        superseding,
+        bot_wallet,
+    })
 }
 
 async fn read_source_tx(
@@ -693,10 +810,21 @@ async fn read_source_tx(
         })
 }
 
+/// Whether the burn's signed bytes were signed by the wallet that would
+/// restore or rebroadcast them. Nonce bookkeeping is per wallet address, so a
+/// burn signed by another key (a rotated wallet) must never enter it.
+pub(crate) fn signed_by_source_wallet(
+    bridge: &BotCctpBridge,
+    operation: &CctpBurnOperation,
+) -> bool {
+    operation.prepared.signer() == Some(bridge.source_signer(operation.source.bridge_direction()))
+}
+
 /// What the startup restore of pending burns did.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(crate) struct RestoredCctpBurns {
-    /// Burns whose nonce was reserved again and whose bytes were rebroadcast.
+    /// Burns whose nonce was reserved again; each is also rebroadcast unless
+    /// it is mined at the required confirmations without `MessageSent`.
     pub(crate) restored: usize,
     /// Pending burns whose receipt now decides, recorded instead of restored.
     pub(crate) settled: usize,
@@ -706,10 +834,13 @@ pub(crate) struct RestoredCctpBurns {
     pub(crate) unmined_chains: BTreeSet<Chain>,
 }
 
-/// Reserves the nonce of every pending burn and rebroadcasts its exact bytes,
-/// so no other send from its source wallet takes that nonce or waits behind a
-/// burn no node holds after a restart. A pending burn whose receipt now
-/// decides is recorded instead. Never fails startup: a burn that cannot be
+/// Reserves the nonce of every pending burn signed by the source wallet and
+/// rebroadcasts its exact bytes, so no other send from that wallet takes the
+/// nonce or waits behind a burn no node holds after a restart. A pending burn
+/// whose receipt now decides is recorded instead. One already mined at the
+/// required confirmations without `MessageSent` keeps its reservation but is
+/// not sent again, and one signed by another wallet (a rotated key) is not
+/// restored and gates its chain. Never fails startup: a burn that cannot be
 /// listed, loaded or rebroadcast pages, and a rerun of `cctp-bridge` with its
 /// operation id rebroadcasts it again. Mirrors
 /// `restore_prepared_deposit_sends`.
@@ -751,7 +882,8 @@ pub(crate) async fn restore_pending_cctp_burns(
         let burn_tx = operation.burn_tx();
         let nonce = operation.prepared.nonce();
 
-        if let Some(required) = chains.required_confirmations(source.chain())
+        let required = chains.required_confirmations(source.chain());
+        if let Some(required) = required
             && settle_burn_from_receipt(store, bridge, &id, &operation, required).await
                 != CctpBurnStatus::Pending
         {
@@ -760,6 +892,14 @@ pub(crate) async fn restore_pending_cctp_burns(
         }
 
         let direction = source.bridge_direction();
+        if !signed_by_source_wallet(bridge, &operation) {
+            error!(target: "operational_alert", alert = true, operation_id = %id, %burn_tx, nonce, signer = ?operation.prepared.signer(), wallet = %bridge.source_signer(direction), "A pending capital CCTP burn was signed by another wallet (was the key rotated?); not restoring it into this wallet's nonces, so startup skips that chain's token approvals and allowance revokes");
+            outcome.unmined_chains.insert(source.chain());
+            continue;
+        }
+        // Like the siblings, the nonce is reserved even for a burn the node
+        // shows mined: a shallow one can still be reorged out, and the hold
+        // keeps a fresh send from taking its nonce then.
         bridge
             .restore_prepared_burn(direction, &operation.prepared)
             .boxed()
@@ -767,6 +907,14 @@ pub(crate) async fn restore_pending_cctp_burns(
         info!(operation_id = %id, %burn_tx, nonce, ?source, "Reserved the nonce of a pending capital CCTP burn");
         outcome.restored += 1;
 
+        // A burn mined at the required confirmations that is still pending
+        // succeeded without `MessageSent` (paged by the receipt read above):
+        // sending its bytes again cannot change anything.
+        if let Ok(Some(mined)) = bridge.source_mined_tx(direction, burn_tx).boxed().await
+            && required.is_some_and(|required| mined.confirmations >= required)
+        {
+            continue;
+        }
         if let Err(error) = bridge
             .broadcast_prepared_burn(direction, &operation.prepared)
             .boxed()
