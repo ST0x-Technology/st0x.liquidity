@@ -33,7 +33,7 @@ use st0x_bridge::Bridge;
 use st0x_bridge::cctp::{CctpBridge, CctpCtx};
 use st0x_bridge::corridor::UsdcCorridor;
 use st0x_config::{HedgedChain, OnchainWalletCtx};
-use st0x_evm::{Chain, Evm, IERC20, OpenChainErrorRegistry, Wallet};
+use st0x_evm::{Chain, Evm, IERC20, MinedTx, OpenChainErrorRegistry, Wallet};
 use st0x_finance::{HasZero, Positive, Usdc};
 use st0x_float_serde::format_float_with_fallback;
 use st0x_raindex::{Raindex, RaindexError, RaindexService, RaindexVaultId, RevokeOutcome};
@@ -806,9 +806,62 @@ struct VaultOutcome {
 }
 
 /// How long a vault route waits before it awaits its tx's confirmation again
-/// after an inconclusive outcome (a receipt timeout or an RPC failure). The
-/// graceful shutdown drain has its own timeout, so the wait never blocks exit.
+/// after an inconclusive outcome (a receipt timeout, a drop report, or an RPC
+/// failure). The graceful shutdown drain has its own timeout, so the wait
+/// never blocks exit.
+#[cfg(not(test))]
 const VAULT_CONFIRM_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(30);
+#[cfg(test)]
+const VAULT_CONFIRM_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// What a vault tx's confirmation attempt proved.
+#[derive(Debug, PartialEq, Eq)]
+enum VaultTxFate {
+    Confirmed,
+    /// The tx mined and failed: a status 0 receipt at the chain's required
+    /// confirmations, or a decoded revert, which the wallet only produces from
+    /// such a receipt.
+    Failed,
+    /// Nothing proven: the tx may still mine. A drop report is in here too:
+    /// the wallet calls a tx dropped when the node it asks has no receipt and
+    /// no pending tx for it, which a lagging or load balanced node also says
+    /// of a tx another node still holds.
+    Unknown,
+}
+
+/// Decides a vault tx's fate after `confirm_tx` failed with `error`, from the
+/// error and from `mined`, the tx's own canonical receipt as the node shows it
+/// now. The receipt decides whenever it has `required_confirmations`, so a
+/// revert whose replay cannot be decoded (no revert data, or pruned state)
+/// still ends the wait.
+fn vault_tx_fate(
+    error: &RaindexError,
+    mined: Option<&MinedTx>,
+    required_confirmations: u64,
+) -> VaultTxFate {
+    if let Some(mined) = mined
+        && mined.confirmations >= required_confirmations
+    {
+        return if mined.succeeded {
+            VaultTxFate::Confirmed
+        } else {
+            VaultTxFate::Failed
+        };
+    }
+    match error {
+        RaindexError::Evm(evm) if evm.is_revert() => VaultTxFate::Failed,
+        RaindexError::InsufficientVaultLiquidity { .. } => VaultTxFate::Failed,
+        RaindexError::Evm(_)
+        | RaindexError::Contract(_)
+        | RaindexError::Float(_)
+        | RaindexError::ZeroAmount
+        | RaindexError::RpcTransport(_)
+        | RaindexError::SolType(_)
+        | RaindexError::ScanInconclusive { .. }
+        | RaindexError::ScanAnomalousLog { .. }
+        | RaindexError::MissingOperatorRole { .. } => VaultTxFate::Unknown,
+    }
+}
 
 /// Reads the token's decimals, scales the amount to the token's smallest unit
 /// like the CLI's `float_to_u256`, and runs the operation through the chain's
@@ -837,6 +890,7 @@ async fn run_vault_operation(
         crate::onchain::raindex_contracts(trading),
         wallet.address(),
     );
+    let required_confirmations = trading.required_confirmations;
     let VaultTarget {
         chain,
         token,
@@ -846,12 +900,13 @@ async fn run_vault_operation(
     let route = operation.route();
 
     // Each vault verb holds its lock from before its first read until its tx's
-    // fate is proven (confirmed, reverted, or dropped), inside the task so a
+    // fate is proven (confirmed, or mined and failed), inside the task so a
     // dropped request cannot release it early; see `AppState::vault_deposit_lock`
-    // and `AppState::vault_withdraw_lock`. A panic while confirming leaves the
-    // fate unknown, so it keeps the lock until a restart. A failed send frees
-    // it, like `st0x-cli`: its error cannot tell whether the tx went out, which
-    // `onchain_failure` tells the operator to check before retrying.
+    // and `AppState::vault_withdraw_lock`. A tx that never gets a receipt, or a
+    // panic while confirming, leaves the fate unknown, so it keeps the lock
+    // until a restart. A failed send frees it, like `st0x-cli`: its error
+    // cannot tell whether the tx went out, which `onchain_failure` tells the
+    // operator to check before retrying.
     let (lock, refusal) = match operation {
         VaultOperation::Deposit => (
             Arc::clone(&state.vault_deposit_lock),
@@ -904,7 +959,7 @@ async fn run_vault_operation(
         let confirm = async move {
             let wait = async {
                 loop {
-                    match raindex.confirm_tx(tx).await {
+                    let error = match raindex.confirm_tx(tx).await {
                         Ok(()) => {
                             info!(
                                 route, %chain, %token, %vault_id, %amount_raw, %tx,
@@ -912,17 +967,33 @@ async fn run_vault_operation(
                             );
                             return;
                         }
-                        Err(error) if proves_vault_tx_failed(&error) => {
+                        Err(error) => error,
+                    };
+                    // The tx's own receipt decides when the error does not:
+                    // a revert whose replay cannot be decoded still mined.
+                    let mined = raindex.mined_tx(tx).await.unwrap_or_else(|read_error| {
+                        warn!(route, %chain, %tx, ?read_error, "Could not read the vault tx's receipt");
+                        None
+                    });
+                    match vault_tx_fate(&error, mined.as_ref(), required_confirmations) {
+                        VaultTxFate::Confirmed => {
+                            info!(
+                                route, %chain, %token, %vault_id, %amount_raw, %tx, ?error,
+                                "Vault operation confirmed via API"
+                            );
+                            return;
+                        }
+                        VaultTxFate::Failed => {
                             error!(
                                 route, %chain, %token, %vault_id, %amount_raw, %tx, ?error,
                                 "Vault operation broadcast via API did not confirm"
                             );
                             return;
                         }
-                        // A receipt timeout or any RPC failure proves nothing:
-                        // the tx can still land, and releasing the lock would
-                        // let a rerun send a second one.
-                        Err(error) => {
+                        // A receipt timeout, a drop report, or an RPC failure
+                        // proves nothing: the tx can still land, and releasing
+                        // the lock would let a rerun send a second one.
+                        VaultTxFate::Unknown => {
                             warn!(
                                 route, %chain, %token, %vault_id, %amount_raw, %tx, ?error,
                                 "Vault operation broadcast via API is not confirmed yet; keeping \
@@ -960,24 +1031,6 @@ async fn run_vault_operation(
     .await
 }
 
-/// Whether a vault tx's confirmation error proves the tx failed for good:
-/// it reverted (including a decoded `InsufficientVaultLiquidity`) or was
-/// dropped from the mempool. Every other error leaves its fate unknown.
-fn proves_vault_tx_failed(error: &RaindexError) -> bool {
-    match error {
-        RaindexError::Evm(evm) => evm.is_revert() || evm.is_transaction_dropped(),
-        RaindexError::InsufficientVaultLiquidity { .. } => true,
-        RaindexError::Contract(_)
-        | RaindexError::Float(_)
-        | RaindexError::ZeroAmount
-        | RaindexError::RpcTransport(_)
-        | RaindexError::SolType(_)
-        | RaindexError::ScanInconclusive { .. }
-        | RaindexError::ScanAnomalousLog { .. }
-        | RaindexError::MissingOperatorRole { .. } => false,
-    }
-}
-
 /// Records an onchain failure inside a capital route's detached task, where
 /// the record survives a dropped request, and renders a generic 500. A failed
 /// send may still have landed, so the message points at the chain.
@@ -1001,6 +1054,83 @@ fn onchain_failure(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use st0x_evm::EvmError;
+
+    fn mined(succeeded: bool, confirmations: u64) -> MinedTx {
+        MinedTx {
+            from: Address::ZERO,
+            to: Some(Address::ZERO),
+            nonce: 0,
+            value: U256::ZERO,
+            input: alloy::primitives::Bytes::new(),
+            tx_type: 2,
+            succeeded,
+            emitted_logs: succeeded,
+            confirmations,
+        }
+    }
+
+    fn dropped() -> RaindexError {
+        RaindexError::Evm(EvmError::TransactionDropped {
+            tx_hash: TxHash::ZERO,
+            elapsed_secs: 0,
+        })
+    }
+
+    fn unreplayable() -> RaindexError {
+        RaindexError::Evm(EvmError::Transport(alloy::transports::RpcError::ErrorResp(
+            alloy::rpc::json_rpc::ErrorPayload {
+                code: -32000,
+                message: "missing trie node".into(),
+                data: None,
+            },
+        )))
+    }
+
+    /// A drop report proves nothing while the node shows no receipt: the tx
+    /// may still be pending on another node.
+    #[test]
+    fn a_drop_report_without_a_receipt_leaves_the_fate_unknown() {
+        assert_eq!(vault_tx_fate(&dropped(), None, 3), VaultTxFate::Unknown);
+    }
+
+    /// The tx's own receipt at the required depth decides over the error,
+    /// whichever way it went.
+    #[test]
+    fn a_receipt_at_the_required_depth_decides_the_fate() {
+        assert_eq!(
+            vault_tx_fate(&dropped(), Some(&mined(true, 3)), 3),
+            VaultTxFate::Confirmed
+        );
+        assert_eq!(
+            vault_tx_fate(&unreplayable(), Some(&mined(false, 3)), 3),
+            VaultTxFate::Failed
+        );
+    }
+
+    /// A receipt short of the required depth can still be reorged out, so
+    /// only a decoded revert decides then.
+    #[test]
+    fn a_shallow_receipt_does_not_decide_the_fate() {
+        assert_eq!(
+            vault_tx_fate(&unreplayable(), Some(&mined(false, 2)), 3),
+            VaultTxFate::Unknown
+        );
+        assert_eq!(
+            vault_tx_fate(&dropped(), Some(&mined(true, 2)), 3),
+            VaultTxFate::Unknown
+        );
+        assert_eq!(
+            vault_tx_fate(
+                &RaindexError::Evm(EvmError::Reverted {
+                    tx_hash: TxHash::ZERO
+                }),
+                None,
+                3
+            ),
+            VaultTxFate::Failed
+        );
+    }
 
     #[test]
     fn transfer_request_parses_the_cli_direction_spelling_and_a_string_amount() {

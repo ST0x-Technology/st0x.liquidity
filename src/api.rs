@@ -9000,7 +9000,8 @@ mod tests {
     /// A confirmation that fails after the answer is logged as not confirmed
     /// with the tx the route answered with, for a vault verb and for
     /// `reset-allowance` alike, and the failed deposit still releases the
-    /// deposit lock.
+    /// deposit lock. Anvil does not mine, so the gate's revert is the only
+    /// outcome either route sees.
     #[tracing_test::traced_test]
     #[tokio::test]
     async fn a_failed_confirmation_is_logged_with_the_answered_tx() {
@@ -9012,6 +9013,12 @@ mod tests {
         chain
             .approve_from_bot(usdc, chain.orderbook, U256::from(5_000_000_u64))
             .await;
+        // Pre-approve the deposit, whose approve would otherwise wait for a
+        // block that never comes.
+        chain
+            .approve_from_bot(token, chain.orderbook, U256::MAX)
+            .await;
+        chain.set_automine(false).await;
         let (ctx, gate) = capital_ctx_on(&chain);
         gate.send_replace(ReceiptGate::Fail);
         let state = empty_app_state(ctx).await;
@@ -9065,14 +9072,15 @@ mod tests {
         assert!(!logs_contain("confirmed via API"));
     }
 
-    /// Deposits into a vault, then withdraws from it with the receipt gate
-    /// set to `gate`, waits until `outcome_logged` sees the confirmation's
-    /// outcome, and returns the refusal of an immediate rerun of the same
-    /// withdraw. Panics if the rerun is not refused.
+    /// Deposits into a vault, stops Anvil from mining so the next tx stays
+    /// pending, then withdraws with the receipt gate set to `gate`, waits until
+    /// `outcome_logged` sees the confirmation's outcome, and returns the chain,
+    /// the state, and the refusal of an immediate rerun of the same withdraw.
+    /// Panics if the rerun is not refused.
     async fn rerun_after_withdraw_outcome(
         gate: ReceiptGate,
         outcome_logged: impl Fn() -> bool + Send + Sync,
-    ) -> (StatusCode, ErrorResponse) {
+    ) -> (AnvilRaindexChain, AppState, (StatusCode, ErrorResponse)) {
         let chain = AnvilRaindexChain::deploy().await;
         let supply = U256::from(1_000_u64) * U256::from(10_u64).pow(U256::from(18_u64));
         let token = chain.deploy_bot_token(18, supply).await;
@@ -9089,6 +9097,9 @@ mod tests {
             .await,
         );
         confirm_after_the_answer(&state, &receipts).await;
+        // The route reads the tx's own receipt when the gate fails the wait,
+        // so the tx must really be unmined for the outcome to be unknown.
+        chain.set_automine(false).await;
         receipts.send_replace(gate);
 
         capital_success(
@@ -9117,7 +9128,7 @@ mod tests {
         else {
             panic!("a rerun before the withdraw's fate is proven must not withdraw again");
         };
-        (status, rerun)
+        (chain, state, (status, rerun))
     }
 
     fn assert_withdraw_lock_refusal((status, refusal): (StatusCode, ErrorResponse)) {
@@ -9135,7 +9146,7 @@ mod tests {
     #[tracing_test::traced_test]
     #[tokio::test]
     async fn a_withdraw_whose_receipt_times_out_keeps_its_lock() {
-        let refusal = rerun_after_withdraw_outcome(ReceiptGate::TimeOut, || {
+        let (_chain, _state, refusal) = rerun_after_withdraw_outcome(ReceiptGate::TimeOut, || {
             logs_contain("is not confirmed yet") || logs_contain("did not confirm")
         })
         .await;
@@ -9151,7 +9162,7 @@ mod tests {
     #[tracing_test::traced_test]
     #[tokio::test]
     async fn a_withdraw_whose_receipt_poll_errors_keeps_its_lock() {
-        let refusal = rerun_after_withdraw_outcome(ReceiptGate::RpcError, || {
+        let (_chain, _state, refusal) = rerun_after_withdraw_outcome(ReceiptGate::RpcError, || {
             logs_contain("is not confirmed yet") || logs_contain("did not confirm")
         })
         .await;
@@ -9167,7 +9178,7 @@ mod tests {
     #[tracing_test::traced_test]
     #[tokio::test]
     async fn a_withdraw_whose_confirmation_panics_keeps_its_lock() {
-        let refusal = rerun_after_withdraw_outcome(ReceiptGate::Panic, || {
+        let (_chain, _state, refusal) = rerun_after_withdraw_outcome(ReceiptGate::Panic, || {
             logs_contain("vault-withdraw worker task failed")
         })
         .await;
@@ -9176,6 +9187,90 @@ mod tests {
         assert!(logs_contain(
             "Vault operation confirmation panicked; keeping its lock until a restart"
         ));
+    }
+
+    /// A drop report does not prove the withdraw can never land: the node the
+    /// wallet asked may just not have it. The lock stays held, a rerun still
+    /// answers 409, and once the tx mines its receipt confirms it and frees
+    /// the lock, though the wallet still reports a drop.
+    #[tracing_test::traced_test]
+    #[tokio::test]
+    async fn a_withdraw_reported_dropped_keeps_its_lock_until_it_mines() {
+        let (chain, state, refusal) = rerun_after_withdraw_outcome(ReceiptGate::Dropped, || {
+            logs_contain("is not confirmed yet") || logs_contain("did not confirm")
+        })
+        .await;
+
+        assert_withdraw_lock_refusal(refusal);
+        assert!(!logs_contain(
+            "Vault operation broadcast via API did not confirm"
+        ));
+
+        chain.mine().await;
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while state.vault_withdraw_lock.try_lock().is_err() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the mined withdraw must free the withdraw lock");
+        logs_assert(|lines| {
+            let confirmed = lines
+                .iter()
+                .filter(|line| line.contains("Vault operation confirmed via API"))
+                .count();
+            // One for the deposit, one for the withdraw that mined.
+            (confirmed == 2)
+                .then_some(())
+                .ok_or_else(|| format!("expected 2 confirmed lines, got {confirmed}"))
+        });
+    }
+
+    /// A deposit that mines with a status 0 receipt, while the replay that
+    /// would decode its revert fails as it does on a node with pruned state,
+    /// is still a proven failure: its own receipt shows it mined and failed.
+    /// The route logs it as not confirmed and frees the deposit lock instead
+    /// of waiting forever.
+    #[tracing_test::traced_test]
+    #[tokio::test]
+    async fn a_mined_failure_whose_replay_decodes_nothing_frees_its_lock() {
+        let chain = AnvilRaindexChain::deploy().await;
+        let supply = U256::from(1_000_u64) * U256::from(10_u64).pow(U256::from(18_u64));
+        let token = chain.deploy_bot_token(18, supply).await;
+        chain
+            .approve_from_bot(token, chain.orderbook, U256::MAX)
+            .await;
+        chain.set_automine(false).await;
+        let (ctx, gate) = capital_ctx_on(&chain);
+        gate.send_replace(ReceiptGate::Unreplayable);
+        let state = empty_app_state(ctx).await;
+        state.health.set_ready();
+
+        capital_success(
+            "vault-deposit",
+            capital::vault_deposit(
+                State(state.clone()),
+                capital_request(vault_request(token, B256::with_last_byte(5), "1.5")),
+            )
+            .await,
+        );
+        // The pending deposit's token transfer now reverts, so the block
+        // mines it with a status 0 receipt.
+        chain.make_always_revert(token).await;
+        chain.mine().await;
+
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while state.vault_deposit_lock.try_lock().is_err() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the mined failure must free the deposit lock");
+        assert!(logs_contain(
+            "Vault operation broadcast via API did not confirm"
+        ));
+        assert!(logs_contain("missing trie node"));
+        assert!(!logs_contain("confirmed via API"));
     }
 
     /// End to end against CCTP V2 deployed on two Anvil nodes, reached

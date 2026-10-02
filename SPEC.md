@@ -6672,27 +6672,32 @@ effect rather than a generic intent:
   a `[chains.<name>.trading]` table with `400`, and Ethereum has none in staging
   or prod today, so that cost applies once Ethereum gets one. The task then
   awaits the confirmation and logs the outcome with the tx hash, so a tx that
-  reverts or drops after the answer shows only in the bot logs. The answer does
-  not wait for the onchain effect, so the vault balance may not have moved yet
-  when it arrives (or may have, if the tx was included quickly). The vault verbs
-  hold their lock until their tx's fate is proven: it confirms, reverts, or is
-  dropped. Any other confirmation error (a receipt timeout, a transport failure,
-  a JSON-RPC error reply) proves none of those, so the task keeps the lock and
-  waits for the receipt again 30 seconds later; each wait can itself take up to
-  5 minutes for inclusion plus 30 minutes for the confirmations, so the lock can
-  stay held for hours. A panic while confirming leaves the fate unknown, so the
-  task keeps the lock until a restart. A failed send frees the lock and answers
-  `500`, like `st0x-cli`: its error cannot tell whether the tx went out, so the
-  operator checks onchain before a rerun. Until the lock is freed a rerun of
-  `vault-deposit`, `vault-withdraw`, or `vault-withdraw-usdc` answers `409`
-  instead of sending a second tx. The locks live in memory, so a restart frees
-  them. A rerun of `reset-allowance` still sends a redundant `approve(0)`, which
-  moves no funds. When the allowance is short `vault-deposit` still awaits the
-  approve's confirmation before it broadcasts the deposit, so only a deposit of
-  a token without the startup MAX grant can still outlast the cut. The
-  tokenization and issuer verbs (`transfer-equity`, `wrap-equity`,
-  `unwrap-equity`, `donate-equity`, `dividend-bump`) have no route: they touch
-  tokenization and the issuer wallet, not liquidity capital.
+  reverts after the answer shows only in the bot logs. The answer does not wait
+  for the onchain effect, so the vault balance may not have moved yet when it
+  arrives (or may have, if the tx was included quickly). The vault verbs hold
+  their lock until their tx's fate is proven: its own canonical receipt at the
+  chain's required confirmations shows it succeeded or failed, or the wallet
+  decoded its revert. After a confirmation error the task reads that receipt, so
+  a failed tx whose revert replay decodes nothing (no revert data, or pruned
+  state) still frees the lock. Any other confirmation error (a receipt timeout,
+  a drop report, a transport failure, a JSON-RPC error reply) proves nothing: a
+  lagging or load balanced RPC can report a tx dropped while another node still
+  holds it pending. So the task keeps the lock and waits for the receipt again
+  30 seconds later; each wait can itself take up to 5 minutes for inclusion plus
+  30 minutes for the confirmations, so the lock can stay held for hours. A panic
+  while confirming leaves the fate unknown, so the task keeps the lock until a
+  restart. A failed send frees the lock and answers `500`, like `st0x-cli`: its
+  error cannot tell whether the tx went out, so the operator checks onchain
+  before a rerun. Until the lock is freed a rerun of `vault-deposit`,
+  `vault-withdraw`, or `vault-withdraw-usdc` answers `409` instead of sending a
+  second tx. The locks live in memory, so a restart frees them. A rerun of
+  `reset-allowance` still sends a redundant `approve(0)`, which moves no funds.
+  When the allowance is short `vault-deposit` still awaits the approve's
+  confirmation before it broadcasts the deposit, so only a deposit of a token
+  without the startup MAX grant can still outlast the cut. The tokenization and
+  issuer verbs (`transfer-equity`, `wrap-equity`, `unwrap-equity`,
+  `donate-equity`, `dividend-bump`) have no route: they touch tokenization and
+  the issuer wallet, not liquidity capital.
 - **`transfer resume --kind usdc` routes through the running bot.** The CLI
   posts to `POST /transfers/usdc/resume/{direction}/{id}`. The endpoint
   validates server-side (unknown id refuses -- a mistyped id must never start a

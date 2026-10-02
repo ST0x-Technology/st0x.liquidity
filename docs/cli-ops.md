@@ -369,29 +369,34 @@ Ethereum has none in staging or prod today. The outcome is
 `Orderbook allowance reset confirmed via API` or
 `Orderbook allowance reset via API did not confirm` for `reset-allowance`, each
 with the tx hash. A vault verb whose confirmation hits any error that does not
-prove the tx's fate (a receipt timeout, a transport failure, a JSON-RPC error
-reply) logs `Vault operation broadcast via API is not confirmed yet` and waits
-for the receipt again 30 seconds later, still holding its lock. Each wait can
-take up to 5 minutes for inclusion plus 30 minutes for the confirmations, so the
-`409` can last for hours. It ends only on a confirm, a revert, or a dropped tx,
-so a vault `did not confirm` line is final. For `reset-allowance` it may also
-mean a timeout, so check the tx onchain before retrying. A
-`Vault operation confirmation panicked` line keeps the lock until a restart, and
-the 409 then says the outcome is unknown; check the vault and the wallet onchain
-before rerunning after the restart. A vault send that fails logs
-`Capital route failed onchain`, answers `500`, and frees the lock, but its tx
-may still have gone out, so check the vault and the wallet onchain before
-rerunning. When the allowance is short, `capital vault-deposit` first approves
-and waits for the approve to confirm, so a deposit of a token without the
-startup MAX grant can still time out on a chain that needs many confirmations.
-The answer does not wait for the onchain effect, so the vault balance or the
-allowance may not have changed yet when it arrives. A rerun of a vault verb that
-answered with a tx answers `409` until that tx's outcome line, so it cannot
-withdraw or deposit twice. The `409` then clears on either outcome line, so
-rerun only after a `did not confirm` line: after `confirmed via API` the move
-already happened. The locks live in memory, so after a bot restart check the
-vault onchain before rerunning. A rerun of `capital reset-allowance` sends a
-redundant `approve(0)`, which moves no funds.
+prove the tx's fate (a receipt timeout, a drop report, a transport failure, a
+JSON-RPC error reply) logs
+`Vault operation broadcast via API is not confirmed
+yet` and waits for the
+receipt again 30 seconds later, still holding its lock. A drop report keeps the
+lock because a lagging or load balanced RPC can report a tx dropped while it is
+still pending elsewhere. Each wait can take up to 5 minutes for inclusion plus
+30 minutes for the confirmations, so the `409` can last for hours. It ends only
+when the tx's own receipt at the required confirmations shows it succeeded or
+failed, or on a decoded revert, so a vault `did not confirm` line is final. A tx
+that never mines keeps the lock until a restart; check the wallet's nonce
+onchain. For `reset-allowance` it may also mean a timeout, so check the tx
+onchain before retrying. A `Vault operation confirmation panicked` line keeps
+the lock until a restart, and the 409 then says the outcome is unknown; check
+the vault and the wallet onchain before rerunning after the restart. A vault
+send that fails logs `Capital route failed onchain`, answers `500`, and frees
+the lock, but its tx may still have gone out, so check the vault and the wallet
+onchain before rerunning. When the allowance is short, `capital vault-deposit`
+first approves and waits for the approve to confirm, so a deposit of a token
+without the startup MAX grant can still time out on a chain that needs many
+confirmations. The answer does not wait for the onchain effect, so the vault
+balance or the allowance may not have changed yet when it arrives. A rerun of a
+vault verb that answered with a tx answers `409` until that tx's outcome line,
+so it cannot withdraw or deposit twice. The `409` then clears on either outcome
+line, so rerun only after a `did not confirm` line: after `confirmed via API`
+the move already happened. The locks live in memory, so after a bot restart
+check the vault onchain before rerunning. A rerun of `capital reset-allowance`
+sends a redundant `approve(0)`, which moves no funds.
 
 A request that times out on the client may still complete in the bot; check the
 bot logs and the chain for the transaction before retrying a vault or allowance

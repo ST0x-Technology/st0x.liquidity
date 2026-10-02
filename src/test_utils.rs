@@ -502,6 +502,37 @@ impl AnvilRaindexChain {
             .unwrap();
         Float::from_raw(balance).to_fixed_decimal(decimals).unwrap()
     }
+
+    /// Turns block production on each tx on or off. With it off, a broadcast
+    /// tx stays pending, with no receipt, until [`Self::mine`].
+    pub(crate) async fn set_automine(&self, on: bool) {
+        self.bot_wallet
+            .provider()
+            .anvil_set_auto_mine(on)
+            .await
+            .unwrap();
+    }
+
+    /// Mines one block with every pending tx.
+    pub(crate) async fn mine(&self) {
+        self.bot_wallet
+            .provider()
+            .anvil_mine(Some(1), None)
+            .await
+            .unwrap();
+    }
+
+    /// Replaces the code at `address` with one that reverts every call with
+    /// no revert data, so a pending tx calling it mines with a status 0
+    /// receipt.
+    pub(crate) async fn make_always_revert(&self, address: Address) {
+        // PUSH0 PUSH0 REVERT
+        self.bot_wallet
+            .provider()
+            .anvil_set_code(address, alloy::primitives::bytes!("5f5ffd"))
+            .await
+            .unwrap();
+    }
 }
 
 #[cfg(test)]
@@ -1010,6 +1041,13 @@ mod held_receipt {
         /// Fails with a formal JSON-RPC error reply, as a receipt poll that a
         /// struggling node answers with an error: the tx's fate is unknown.
         RpcError,
+        /// Fails as a drop report: the node the wallet asked has neither a
+        /// receipt nor the pending tx, though another node may still hold it.
+        Dropped,
+        /// Waits for the real receipt, and if it has status 0, fails as the
+        /// wallet's revert replay does on a node that pruned the block's
+        /// state: with an error that decodes no revert.
+        Unreplayable,
     }
 
     /// Delegates to the wrapped wallet, except that `await_receipt` waits
@@ -1132,6 +1170,23 @@ mod held_receipt {
                         data: None,
                     }),
                 )),
+                ReceiptGate::Dropped => Err(EvmError::TransactionDropped {
+                    tx_hash,
+                    elapsed_secs: 0,
+                }),
+                ReceiptGate::Unreplayable => {
+                    let receipt = self.inner.await_receipt(tx_hash).await?;
+                    if receipt.status() {
+                        return Ok(receipt);
+                    }
+                    Err(EvmError::Transport(alloy::transports::RpcError::ErrorResp(
+                        alloy::rpc::json_rpc::ErrorPayload {
+                            code: -32000,
+                            message: "missing trie node".into(),
+                            data: None,
+                        },
+                    )))
+                }
                 ReceiptGate::Held => unreachable!("wait_for returned a held gate"),
             }
         }
