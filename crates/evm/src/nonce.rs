@@ -192,7 +192,7 @@ impl ResettableNonceManager {
     /// Releases a prepared nonce that will never be broadcast. The cache is
     /// rewound only as far as that nonce; every other prepared or in-flight
     /// nonce remains protected and is skipped by `get_next_nonce`.
-    #[cfg(any(feature = "turnkey", feature = "local-signer", test))]
+    #[cfg(test)]
     pub(crate) async fn release_prepared_nonce(&self, address: Address, nonce: u64) {
         self.release_nonce_and_rewind(address, nonce).await;
     }

@@ -1,5 +1,5 @@
 //! Tracks nonces this wallet itself has assigned to transactions it has
-//! signed or broadcast but not yet seen confirmed or proven dropped.
+//! signed or broadcast until confirmation or the configured drop policy resolves them.
 //!
 //! [`ResettableNonceManager`](crate::nonce::ResettableNonceManager) owns the
 //! allocator's coherent set of prepared and broadcast-but-unconfirmed nonces.
@@ -7,15 +7,16 @@
 //! created when a prepared transaction is signed, when a generic send is
 //! accepted, or when durable state is restored, and `await_receipt` resolves
 //! it. A mined transaction clears every competing
-//! hash recorded at its nonce. A proven-dropped generic transaction clears
+//! hash recorded at its nonce. A policy-qualified suspected generic drop clears
 //! only that hash and rewinds allocation when it was the final hash. Durable
 //! prepared transactions instead remain occupied after a drop because their
 //! persisted exact bytes will be rebroadcast.
 //!
-//! A `HashMap<TxHash, DropPolicy>` is kept per nonce, not a single hash,
+//! A `HashMap<TxHash, HashRecord>` is kept per nonce, not a single hash,
 //! because a fee-bumped replacement resubmits the *same* nonce under a *new*
 //! hash. Only one can mine, but every live or durably retryable hash must
-//! remain recognized as ours. Entries are never released by age: elapsed time
+//! remain recognized as ours, with drop policy and optional submission boundary.
+//! Entries are never released by age: elapsed time
 //! does not prove a transaction can no longer mine.
 //!
 //! ## What this tracker can and cannot prove
@@ -35,10 +36,17 @@
 use alloy::primitives::{Address, TxHash};
 use dashmap::DashMap;
 use std::collections::HashMap;
+#[cfg(any(feature = "turnkey", feature = "local-signer"))]
+use std::future::Future;
 use std::sync::Arc;
 use tracing::trace;
+#[cfg(any(feature = "turnkey", feature = "local-signer"))]
+use tracing::warn;
 
+use crate::TransactionSubmission;
 use crate::nonce::ResettableNonceManager;
+#[cfg(any(feature = "turnkey", feature = "local-signer"))]
+use crate::{EvmError, RECEIPT_POLL_INTERVAL};
 
 /// What a discard of a durable prepared transaction knows about its nonce,
 /// which decides whether allocation is rewound onto the freed nonce.
@@ -83,13 +91,25 @@ enum DropPolicy {
     RetainForRebroadcast,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct HashRecord {
+    policy: DropPolicy,
+    submission_boundary: SubmissionBoundary,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum SubmissionBoundary {
+    Unavailable { highest_observed: Option<u64> },
+    Complete(u64),
+}
+
 /// One address's in-flight bookkeeping: the nonces this process has
 /// recorded for it.
 #[derive(Debug, Default)]
 struct AddressRecord {
     /// Nonces this process has recorded as its own, each with every
-    /// still-outstanding transaction hash and its definitive-drop policy.
-    per_nonce: HashMap<u64, HashMap<TxHash, DropPolicy>>,
+    /// still-outstanding transaction hash and its suspected-drop policy.
+    per_nonce: HashMap<u64, HashMap<TxHash, HashRecord>>,
 }
 
 /// Clone-able handle around the wallet's own record of in-flight nonces.
@@ -150,13 +170,129 @@ impl InFlightNonces {
             .entry(tx_hash)
             .and_modify(|existing| {
                 if policy == DropPolicy::RetainForRebroadcast {
-                    *existing = policy;
+                    existing.policy = policy;
                 }
             })
-            .or_insert(policy);
+            .or_insert(HashRecord {
+                policy,
+                submission_boundary: SubmissionBoundary::Unavailable {
+                    highest_observed: None,
+                },
+            });
     }
 
-    /// Resolves a proven-dropped `tx_hash`.
+    pub(crate) fn submission(
+        &self,
+        address: Address,
+        tx_hash: TxHash,
+    ) -> Option<TransactionSubmission> {
+        self.nonces
+            .get(&address)?
+            .per_nonce
+            .iter()
+            .find_map(|(nonce, hashes)| {
+                hashes.get(&tx_hash).map(|record| TransactionSubmission {
+                    sender: address,
+                    nonce: *nonce,
+                    submitted_after_block: match record.submission_boundary {
+                        SubmissionBoundary::Unavailable { .. } => None,
+                        SubmissionBoundary::Complete(block) => Some(block),
+                    },
+                })
+            })
+    }
+
+    /// Preserve the highest observed submission boundary across exact rebroadcasts.
+    pub(crate) fn record_submission_block(&self, address: Address, tx_hash: TxHash, block: u64) {
+        if let Some(mut record) = self.nonces.get_mut(&address) {
+            for hashes in record.per_nonce.values_mut() {
+                if let Some(hash) = hashes.get_mut(&tx_hash) {
+                    let highest = match hash.submission_boundary {
+                        SubmissionBoundary::Unavailable { highest_observed } => {
+                            highest_observed.map_or(block, |old| old.max(block))
+                        }
+                        SubmissionBoundary::Complete(old) => old.max(block),
+                    };
+                    hash.submission_boundary = SubmissionBoundary::Complete(highest);
+                    return;
+                }
+            }
+        }
+    }
+
+    /// Hide the usable floor before broadcasting, while retaining its monotonic
+    /// history. Cancellation or a failed post-read leaves freshness unavailable.
+    pub(crate) fn begin_submission_observation(
+        &self,
+        address: Address,
+        tx_hash: TxHash,
+        block: u64,
+    ) {
+        if let Some(mut record) = self.nonces.get_mut(&address) {
+            for hashes in record.per_nonce.values_mut() {
+                if let Some(hash) = hashes.get_mut(&tx_hash) {
+                    let highest = match hash.submission_boundary {
+                        SubmissionBoundary::Unavailable { highest_observed } => {
+                            highest_observed.map_or(block, |old| old.max(block))
+                        }
+                        SubmissionBoundary::Complete(old) => old.max(block),
+                    };
+                    hash.submission_boundary = SubmissionBoundary::Unavailable {
+                        highest_observed: Some(highest),
+                    };
+                    return;
+                }
+            }
+        }
+    }
+
+    /// Bracket a successful operation without turning a later read failure into
+    /// a submission failure. Unknown boundaries cannot qualify absence as dropped.
+    #[cfg(any(feature = "turnkey", feature = "local-signer"))]
+    pub(crate) async fn observe_submission_boundary(
+        &self,
+        head: impl Future<Output = Result<u64, EvmError>> + Send,
+        address: Address,
+        tx_hash: TxHash,
+        before_block: u64,
+    ) {
+        match tokio::time::timeout(RECEIPT_POLL_INTERVAL, head).await {
+            Ok(Ok(after_block)) => {
+                self.record_submission_block(address, tx_hash, before_block.max(after_block));
+            }
+            Ok(Err(error)) => {
+                warn!(%address, %tx_hash, ?error,
+                    "Operation completed but post-operation head is unavailable; retaining ownership without a new drop boundary");
+            }
+            Err(error) => {
+                warn!(%address, %tx_hash, ?error,
+                    "Post-submission head observation timed out; retaining ownership with unknown freshness");
+            }
+        }
+    }
+
+    /// Remove only a fresh signed preparation that has not returned or crossed
+    /// the broadcast boundary. The preparation guard holds the wallet send lock.
+    #[cfg(any(feature = "turnkey", feature = "local-signer"))]
+    pub(crate) fn discard_unreturned_preparation(
+        &self,
+        address: Address,
+        nonce: u64,
+        tx_hash: TxHash,
+    ) {
+        let Some(mut record) = self.nonces.get_mut(&address) else {
+            return;
+        };
+        let Some(hashes) = record.per_nonce.get_mut(&nonce) else {
+            return;
+        };
+        if hashes.remove(&tx_hash).is_some() && hashes.is_empty() {
+            record.per_nonce.remove(&nonce);
+            self.nonce_manager.release_occupied_nonce(address, nonce);
+        }
+    }
+
+    /// Resolves a `tx_hash` classified as suspected dropped by wallet policy.
     ///
     /// Generic hashes are removed. If the hash was the nonce's final entry,
     /// occupancy and the cached allocation are atomically rewound while the
@@ -177,7 +313,7 @@ impl InFlightNonces {
                 tx_hashes
                     .get(&tx_hash)
                     .copied()
-                    .map(|policy| (*nonce, policy))
+                    .map(|record| (*nonce, record.policy))
             }) else {
                 return;
             };
@@ -314,6 +450,42 @@ mod tests {
     const ADDRESS: Address = address!("00000000000000000000000000000000000000a9");
     const OTHER_ADDRESS: Address = address!("00000000000000000000000000000000000000b7");
     const NONCE: u64 = 42;
+
+    #[test]
+    fn restored_identity_cannot_invent_submission_floor_and_observations_never_lower_floor() {
+        let tracker = InFlightNonces::default();
+        let hash = TxHash::random();
+        tracker.record_durable(ADDRESS, NONCE, hash);
+        assert_eq!(
+            tracker
+                .submission(ADDRESS, hash)
+                .unwrap()
+                .submitted_after_block,
+            None
+        );
+        tracker.record_submission_block(ADDRESS, hash, 100);
+        tracker.record_durable(ADDRESS, NONCE, hash);
+        tracker.record_submission_block(ADDRESS, hash, 200);
+        assert_eq!(
+            tracker.submission(ADDRESS, hash),
+            Some(TransactionSubmission {
+                sender: ADDRESS,
+                nonce: NONCE,
+                submitted_after_block: Some(200),
+            })
+        );
+        tracker.record_submission_block(ADDRESS, hash, 150);
+        assert_eq!(
+            tracker
+                .submission(ADDRESS, hash)
+                .unwrap()
+                .submitted_after_block,
+            Some(200)
+        );
+        assert_eq!(tracker.submission(OTHER_ADDRESS, hash), None);
+        tracker.release_nonce_for_hash(ADDRESS, hash);
+        assert_eq!(tracker.submission(ADDRESS, hash), None);
+    }
     const OTHER_NONCE: u64 = 43;
 
     #[test]
