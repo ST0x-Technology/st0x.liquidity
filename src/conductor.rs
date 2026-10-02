@@ -3738,6 +3738,16 @@ fn spawn_rebalancing_infrastructure<Signer: Wallet + Clone>(
             )
             .await?;
 
+        // Reads only the recovery records and their job rows, so it refuses
+        // before the tokenization recovery below requeues jobs or rebroadcasts
+        // a signed withdrawal.
+        refuse_chainless_recoveries_on_non_base_primary(
+            &deps.pool,
+            &deps.apalis_pool,
+            deps.ctx.chains.primary().chain,
+        )
+        .await?;
+
         let mut resume_tokenization_queue = ResumeTokenizationJobQueue::new(&deps.apalis_pool);
 
         let mut unmined_restore_chains = recover_interrupted_tokenization_aggregates(
@@ -3748,13 +3758,6 @@ fn spawn_rebalancing_infrastructure<Signer: Wallet + Clone>(
             built.redemption.clone(),
             &equity_transfer_services,
             &mut resume_tokenization_queue,
-        )
-        .await?;
-
-        refuse_chainless_recoveries_on_non_base_primary(
-            &deps.pool,
-            &deps.apalis_pool,
-            deps.ctx.chains.primary().chain,
         )
         .await?;
 

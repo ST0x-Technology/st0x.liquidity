@@ -1560,16 +1560,20 @@ migration files in `migrations/`.
   equity-recovery aggregates' `DispatchToMint`/ `DispatchToRedemption` handoff
   swallows a bot-gas enqueue failure into `RecoveryFailed` (permanently losing
   that mint/redemption-resume gas fact) rather than redriving it. Both jobs now
-  resume from `Detected` (the wrapped job skips `Detect` and fails a record
-  whose shares changed or whose active transfer no longer validates; changed
-  shares queue one replacement, while invalid dispatch alerts and retains any
-  existing hold without replacement). The unwrapped resume path does not match
-  that: a validation failure there sends `FailRecovery`, returns `Ok`, and
-  `perform` releases the hold, so a `HeldForRecovery` slot can drop while tokens
-  are still in the wallet. The remaining bot-gas fix is to propagate that
-  enqueue failure from both aggregates and let the shared redrive handle it.
-  Until then `/pnl`'s bot-gas line is a lower bound on actual gas spend, not an
-  exact figure
+  resume from `Detected`. The wrapped job skips `Detect`. A record whose shares
+  changed fails as stale (`FailStaleDetection`) and queues one replacement
+  detection under an idempotent key; if that enqueue fails, the job errors, and
+  its retry finds the stale record and queues the replacement again. A record
+  whose active transfer no longer validates fails with `FailInvalidDetection`,
+  alerts, and keeps any existing hold, with no replacement. The unwrapped resume
+  path does not match that, and this is a defect, not a deliberate gap: a
+  validation failure there sends `FailRecovery`, returns `Ok`, and `perform`
+  releases the hold, so a `HeldForRecovery` slot can drop while tokens are still
+  in the wallet. It is part of the equity recovery work of
+  [RAI-2596](https://linear.app/makeitrain/issue/RAI-2596). The remaining
+  bot-gas fix is to propagate that enqueue failure from both aggregates and let
+  the shared redrive handle it. Until then `/pnl`'s bot-gas line is a lower
+  bound on actual gas spend, not an exact figure
 
 #### Reporting and Analysis
 
