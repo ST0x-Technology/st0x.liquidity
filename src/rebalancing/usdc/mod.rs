@@ -17,7 +17,7 @@ pub(crate) use driver_pause::{
 pub(crate) use job::{
     ResumeAlpacaToBase, ResumeBaseToAlpaca, TransferUsdcToHedging, TransferUsdcToHedgingCtx,
     TransferUsdcToHedgingJobQueue, TransferUsdcToMarketMaking, TransferUsdcToMarketMakingCtx,
-    TransferUsdcToMarketMakingJobQueue,
+    TransferUsdcToMarketMakingJobQueue, UnrecordedGuardRelease,
 };
 #[cfg(test)]
 pub(crate) use manager::RecoveredCctpMint;

@@ -1691,7 +1691,7 @@ mod tests {
         ResumeAlpacaToBase, ResumeBaseToAlpaca, UsdcDriverGate, UsdcTransferError,
     };
     use crate::startup::StartupBarrier;
-    use crate::test_utils::{setup_test_apalis_pool, setup_test_pools};
+    use crate::test_utils::{setup_test_apalis_pool, setup_test_pools, wait_for_terminal_job};
     use crate::usdc_rebalance::UsdcRebalanceId;
     use crate::vault_lookup::MockVaultLookup;
 
@@ -2403,28 +2403,6 @@ mod tests {
         }
     }
 
-    async fn wait_for_terminal_job<Task: 'static>(apalis_pool: &apalis_sqlite::SqlitePool) {
-        tokio::time::timeout(Duration::from_secs(15), async {
-            loop {
-                let terminal_count: i64 = sqlx_apalis::query_scalar(
-                    "SELECT COUNT(*) FROM Jobs \
-                     WHERE job_type = ? AND status IN ('Failed', 'Killed') \
-                     AND attempts >= max_attempts",
-                )
-                .bind(std::any::type_name::<Task>())
-                .fetch_one(apalis_pool)
-                .await
-                .unwrap();
-                if terminal_count == 1 {
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(25)).await;
-            }
-        })
-        .await
-        .expect("the poison job must reach a visible terminal state");
-    }
-
     fn mint_transfer_ctx(
         transfer: Arc<dyn ResumeEquityToMarketMaking>,
         cqrs_pool: sqlx::SqlitePool,
@@ -2614,6 +2592,7 @@ mod tests {
             job_queue: queue.clone(),
             max_burn_revert_redrives: 1,
             notifier: notifier.clone(),
+            unrecorded_guards: None,
         });
         let failure_injector = FailureInjector::new();
         let monitor = register_transfer_usdc_to_hedging_worker(
@@ -2701,6 +2680,7 @@ mod tests {
             job_queue: queue.clone(),
             max_burn_revert_redrives: 1,
             notifier: notifier.clone(),
+            unrecorded_guards: None,
         });
         let monitor = register_transfer_usdc_to_market_making_worker(
             Monitor::new().should_restart(|_ctx, _error, _attempt| false),

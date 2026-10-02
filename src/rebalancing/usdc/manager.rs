@@ -27819,6 +27819,7 @@ mod tests {
             max_burn_revert_redrives: 5,
             notifier: Arc::new(CapturingNotifier::default()),
             driver_gate: UsdcDriverGate::unpaused(),
+            unrecorded_guards: None,
         };
         let job = TransferUsdcToMarketMaking {
             id,

@@ -4930,6 +4930,17 @@ redrives) and at the final allowed redrive. Errors that propagate through apalis
 do not alert per attempt; the worker emits one operational alert only after the
 row reaches durable terminality.
 
+**Corridor guard of a dead letter**: A dead lettered transfer that recorded any
+event keeps its corridor guard; the reactor, the timeout sweep, or the operator
+frees it from there. A job that exhausts its retries before its transfer
+recorded any event (a gas check that refuses with no retry interval, an amount
+that cannot be converted, a failed chain head read before `BeginWithdrawal`)
+frees the guard on its last attempt instead, unless another live job row still
+drives the same id or the store cannot be read. No event means nothing was
+withdrawn, converted, or burned, and neither the reactor nor the sweep would
+ever see that id, so the guard would otherwise stay held until a restart and
+both the trigger and `capital transfer-usdc` would refuse the corridor.
+
 ##### Startup re-arm for `BridgingSubmitting` and `WithdrawalSubmitting{BaseToAlpaca}`
 
 On startup, `recover_usdc_guard` re-arms transfer jobs for aggregates at

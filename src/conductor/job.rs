@@ -915,6 +915,41 @@ impl fmt::Display for TaskIdentity {
     }
 }
 
+/// Whether another job row of `JobPayload`'s type, other than
+/// `task_identity`, can still run for the same owner. A terminal attempt
+/// calls this before releasing what its job owns: a live sibling row still
+/// drives that owner, so the release would let a second transfer start beside
+/// it. A `Failed` row with attempts left is live; one that exhausted its
+/// budget is a dead letter.
+pub(crate) async fn has_live_sibling_job<JobPayload>(
+    pool: &SqlitePool,
+    task_identity: &TaskIdentity,
+    same_owner: impl Fn(&JobPayload) -> bool,
+) -> Result<bool, BoxDynError>
+where
+    JobPayload: DeserializeOwned,
+{
+    let payloads: Vec<Vec<u8>> = sqlx_apalis::query_scalar(
+        "SELECT job FROM Jobs \
+         WHERE id <> ? AND job_type = ? \
+         AND (status IN ('Pending', 'Queued', 'Running') \
+              OR (status = 'Failed' AND attempts < max_attempts))",
+    )
+    .bind(task_identity.as_str())
+    .bind(std::any::type_name::<JobPayload>())
+    .fetch_all(pool)
+    .await?;
+
+    for payload in payloads {
+        let sibling: JobPayload = serde_json::from_slice(&payload)?;
+        if same_owner(&sibling) {
+            return Ok(true);
+        }
+    }
+
+    Ok(false)
+}
+
 /// Allows e2e tests to force the next job of a specific kind to
 /// fail terminally. Each [`JobKind`] has an independent injection
 /// state so arming one queue cannot be consumed by the other.
