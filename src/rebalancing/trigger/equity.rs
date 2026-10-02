@@ -10,9 +10,10 @@ use async_trait::async_trait;
 use chrono::Utc;
 use rain_math_float::FloatError;
 use serde::{Deserialize, Serialize};
-use tracing::warn;
+use tracing::{error, warn};
 
 use st0x_event_sorcery::{Projection, ProjectionError, SendError};
+use st0x_evm::Chain;
 use st0x_execution::{FractionalShares, Symbol};
 use st0x_wrapper::WrapperError;
 
@@ -27,7 +28,7 @@ use crate::position::{Position, PriceObservation};
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum EquityTriggerError {
     #[error("no wrapper is wired for {chain}, so its equity ratios cannot be read")]
-    UnwiredWrapper { chain: st0x_evm::Chain },
+    UnwiredWrapper { chain: Chain },
     #[error(transparent)]
     Venues(#[from] EquityVenuesError),
     #[error(transparent)]
@@ -141,9 +142,11 @@ pub(crate) enum GuardState {
     ActiveTransfer { generation: GuardGeneration },
     /// Tokens were received but post-receipt processing failed.
     /// A recovery job must run to wrap/deposit them.
-    /// Blocks new triggers; does NOT block `UnwrappedEquityRecovery` or
-    /// `WrappedEquityRecovery`.
-    HeldForRecovery,
+    /// Blocks new triggers; does NOT block an `UnwrappedEquityRecovery` or
+    /// `WrappedEquityRecovery` on `chain`, the chain whose wallet holds the
+    /// tokens. A recovery on any other chain is refused like an active
+    /// transfer, so it never takes over tokens it cannot reach.
+    HeldForRecovery { chain: Chain },
 }
 
 /// Identifies the exact process and claim that owns an active equity transfer.
@@ -336,9 +339,10 @@ impl Drop for InProgressGuard {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RecoveryClaimOrigin {
     /// Claimed from `HeldForRecovery` (deadlock-break path). On Drop, the
-    /// slot is restored to `HeldForRecovery` so the next recovery attempt can
-    /// claim it without a new transfer job starting in the meantime.
-    HeldForRecovery,
+    /// slot is restored to `HeldForRecovery` for the same chain so the next
+    /// recovery attempt can claim it without a new transfer job starting in
+    /// the meantime.
+    HeldForRecovery { chain: Chain },
     /// Claimed from absent (orphan path). On Drop, the slot is removed so
     /// the next inventory poll can start a fresh recovery or transfer job.
     Orphan,
@@ -395,7 +399,10 @@ impl RecoveryGuard {
     /// job left to drain it -- wedging the symbol. Re-enqueuing with a delay
     /// keeps polling until the balance resolves or the slot is cleared.
     pub(crate) fn claimed_from_held_for_recovery(&self) -> bool {
-        self.claim_origin == RecoveryClaimOrigin::HeldForRecovery
+        match self.claim_origin {
+            RecoveryClaimOrigin::HeldForRecovery { .. } => true,
+            RecoveryClaimOrigin::Orphan => false,
+        }
     }
 }
 
@@ -431,11 +438,11 @@ impl Drop for RecoveryGuard {
         }
 
         match self.claim_origin {
-            RecoveryClaimOrigin::HeldForRecovery => {
+            RecoveryClaimOrigin::HeldForRecovery { chain } => {
                 // Recovery failed: restore to HeldForRecovery so retries can
                 // claim the slot but a new transfer cannot start while tokens
                 // are still stranded (prevents double-mints).
-                guard.insert(self.symbol.clone(), GuardState::HeldForRecovery);
+                guard.insert(self.symbol.clone(), GuardState::HeldForRecovery { chain });
             }
             RecoveryClaimOrigin::Orphan => {
                 // Orphan failure: no prior guard state; remove entirely so
@@ -466,9 +473,13 @@ impl Drop for RecoveryGuard {
 ///    drop, the slot is removed entirely.
 /// 3. `ActiveTransfer`: a live transfer job owns the slot; returns `None` so
 ///    the caller reschedules.
+/// 4. `HeldForRecovery` for a chain other than `chain`: the tokens sit in
+///    another chain's wallet, which this recovery cannot reach; returns
+///    `None` so the caller reschedules until that chain's recovery finishes.
 pub(crate) fn claim_guard_for_recovery_or_orphan(
     map: &Arc<RwLock<HashMap<Symbol, GuardState>>>,
     symbol: &Symbol,
+    chain: Chain,
 ) -> Option<RecoveryGuard> {
     let mut guard = match map.write() {
         Ok(guard) => guard,
@@ -487,7 +498,24 @@ pub(crate) fn claim_guard_for_recovery_or_orphan(
             // A live transfer job owns the slot; reschedule.
             return None;
         }
-        Some(GuardState::HeldForRecovery) => RecoveryClaimOrigin::HeldForRecovery,
+        Some(GuardState::HeldForRecovery { chain: held_chain }) if *held_chain == chain => {
+            RecoveryClaimOrigin::HeldForRecovery { chain }
+        }
+        Some(GuardState::HeldForRecovery { chain: held_chain }) => {
+            // The caller reschedules on every cycle, like the other
+            // cross-chain waits, so this pages on every cycle too: no job
+            // may be draining the other chain's hold.
+            error!(
+                target: "operational_alert",
+                alert = true,
+                %symbol,
+                %held_chain,
+                claiming_chain = %chain,
+                "Recovery claim refused: the slot is held for another chain's recovery; \
+                 this chain's tokens wait until that hold clears"
+            );
+            return None;
+        }
         None => RecoveryClaimOrigin::Orphan,
     };
 
@@ -754,9 +782,10 @@ mod tests {
     fn exact_generation_removal_preserves_recovery_hold() {
         let map = make_in_progress();
         let symbol = Symbol::new("AAPL").unwrap();
-        map.write()
-            .unwrap()
-            .insert(symbol.clone(), GuardState::HeldForRecovery);
+        map.write().unwrap().insert(
+            symbol.clone(),
+            GuardState::HeldForRecovery { chain: Chain::Base },
+        );
 
         assert!(!remove_active_transfer(
             &map,
@@ -765,7 +794,7 @@ mod tests {
         ));
         assert_eq!(
             map.read().unwrap().get(&symbol),
-            Some(&GuardState::HeldForRecovery)
+            Some(&GuardState::HeldForRecovery { chain: Chain::Base })
         );
     }
 
@@ -840,7 +869,7 @@ mod tests {
 
         // A recovery claim must also fail when state is ActiveTransfer.
         assert!(
-            claim_guard_for_recovery_or_orphan(&in_progress, &symbol).is_none(),
+            claim_guard_for_recovery_or_orphan(&in_progress, &symbol, Chain::Base).is_none(),
             "ActiveTransfer must block a recovery claim"
         );
     }
@@ -851,10 +880,10 @@ mod tests {
         let symbol = Symbol::new("AAPL").unwrap();
 
         // Manually insert HeldForRecovery state (as mark_held_for_recovery would do).
-        in_progress
-            .write()
-            .unwrap()
-            .insert(symbol.clone(), GuardState::HeldForRecovery);
+        in_progress.write().unwrap().insert(
+            symbol.clone(),
+            GuardState::HeldForRecovery { chain: Chain::Base },
+        );
 
         // A transfer claim must fail -- no new transfer while recovery pending.
         assert!(
@@ -864,7 +893,7 @@ mod tests {
         );
 
         // A recovery claim via the production function must succeed.
-        let guard = claim_guard_for_recovery_or_orphan(&in_progress, &symbol);
+        let guard = claim_guard_for_recovery_or_orphan(&in_progress, &symbol, Chain::Base);
         let guard = guard.expect("HeldForRecovery must allow a recovery claim");
         drop(guard);
     }
@@ -874,12 +903,13 @@ mod tests {
         let in_progress = make_in_progress();
         let symbol = Symbol::new("AAPL").unwrap();
 
-        in_progress
-            .write()
-            .unwrap()
-            .insert(symbol.clone(), GuardState::HeldForRecovery);
+        in_progress.write().unwrap().insert(
+            symbol.clone(),
+            GuardState::HeldForRecovery { chain: Chain::Base },
+        );
 
-        let _guard = claim_guard_for_recovery_or_orphan(&in_progress, &symbol).unwrap();
+        let _guard =
+            claim_guard_for_recovery_or_orphan(&in_progress, &symbol, Chain::Base).unwrap();
 
         // After claiming for recovery, state transitions to ActiveTransfer.
         assert!(
@@ -900,11 +930,12 @@ mod tests {
         let map = make_in_progress();
         let symbol = Symbol::new("AAPL").unwrap();
 
-        map.write()
-            .unwrap()
-            .insert(symbol.clone(), GuardState::HeldForRecovery);
+        map.write().unwrap().insert(
+            symbol.clone(),
+            GuardState::HeldForRecovery { chain: Chain::Base },
+        );
 
-        let guard = claim_guard_for_recovery_or_orphan(&map, &symbol)
+        let guard = claim_guard_for_recovery_or_orphan(&map, &symbol, Chain::Base)
             .expect("HeldForRecovery must allow claim");
         assert!(
             matches!(
@@ -920,12 +951,12 @@ mod tests {
         // Must restore to HeldForRecovery (not absent, not ActiveTransfer).
         assert_eq!(
             map.read().unwrap().get(&symbol),
-            Some(&GuardState::HeldForRecovery),
+            Some(&GuardState::HeldForRecovery { chain: Chain::Base }),
             "drop from HeldForRecovery claim must restore to HeldForRecovery, not remove"
         );
 
         // A subsequent recovery claim must still succeed (recovery can retry).
-        let second_guard = claim_guard_for_recovery_or_orphan(&map, &symbol).expect(
+        let second_guard = claim_guard_for_recovery_or_orphan(&map, &symbol, Chain::Base).expect(
             "a subsequent recovery claim must succeed after guard is restored to HeldForRecovery",
         );
         assert!(
@@ -938,6 +969,38 @@ mod tests {
         drop(second_guard);
     }
 
+    /// A slot held for a Robinhood recovery belongs to the tokens in
+    /// Robinhood's wallet: a Base recovery cannot reach them and is refused,
+    /// while a Robinhood recovery takes it and a failed attempt hands it back
+    /// to Robinhood, not to Base.
+    #[test]
+    fn held_for_recovery_is_claimed_only_by_a_recovery_on_the_held_chain() {
+        let map = make_in_progress();
+        let symbol = Symbol::new("AAPL").unwrap();
+        let held = GuardState::HeldForRecovery {
+            chain: Chain::Robinhood,
+        };
+        map.write().unwrap().insert(symbol.clone(), held.clone());
+
+        assert!(
+            claim_guard_for_recovery_or_orphan(&map, &symbol, Chain::Base).is_none(),
+            "a Base recovery must not claim a slot held for Robinhood"
+        );
+        assert_eq!(map.read().unwrap().get(&symbol), Some(&held));
+
+        let guard = claim_guard_for_recovery_or_orphan(&map, &symbol, Chain::Robinhood)
+            .expect("a Robinhood recovery must claim a slot held for Robinhood");
+        assert!(guard.claimed_from_held_for_recovery());
+        assert!(matches!(
+            map.read().unwrap().get(&symbol),
+            Some(GuardState::ActiveTransfer { .. })
+        ));
+
+        drop(guard);
+
+        assert_eq!(map.read().unwrap().get(&symbol), Some(&held));
+    }
+
     /// ABA race: a terminal event clears the slot (absent), a NEW transfer
     /// immediately claims `ActiveTransfer`, and THEN an old `RecoveryGuard` drops.
     /// The old guard must detect the generation mismatch and NOT clobber the new
@@ -948,10 +1011,11 @@ mod tests {
         let symbol = Symbol::new("AAPL").unwrap();
 
         // Step 1: Recovery claims the slot from HeldForRecovery.
-        map.write()
-            .unwrap()
-            .insert(symbol.clone(), GuardState::HeldForRecovery);
-        let recovery_guard = claim_guard_for_recovery_or_orphan(&map, &symbol)
+        map.write().unwrap().insert(
+            symbol.clone(),
+            GuardState::HeldForRecovery { chain: Chain::Base },
+        );
+        let recovery_guard = claim_guard_for_recovery_or_orphan(&map, &symbol, Chain::Base)
             .expect("HeldForRecovery must allow claim");
 
         // Step 2: Simulate terminal event clearing the slot (as if clear_equity_in_progress
@@ -996,7 +1060,7 @@ mod tests {
         let in_progress = make_in_progress();
         let symbol = Symbol::new("AAPL").unwrap();
 
-        let _guard = claim_guard_for_recovery_or_orphan(&in_progress, &symbol)
+        let _guard = claim_guard_for_recovery_or_orphan(&in_progress, &symbol, Chain::Base)
             .expect("absent entry must be treated as orphan and allow a recovery claim");
 
         assert!(

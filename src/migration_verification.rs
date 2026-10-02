@@ -930,6 +930,7 @@ mod tests {
         );
 
         let wrapped_recovery = WrappedEquityRecovery::Detected {
+            chain: Chain::Base,
             symbol: symbol.clone(),
             shares: FractionalShares::new(float!(1)),
             detected_at: now,
@@ -941,15 +942,18 @@ mod tests {
         ));
         assert!(
             references_for(&WrappedEquityRecovery::Failed {
+                chain: Chain::Base,
                 symbol: symbol.clone(),
                 shares: FractionalShares::new(float!(1)),
                 reason: "failed".to_string(),
                 failed_at: now,
+                detection_failure: None,
             })
             .is_empty()
         );
 
         let unwrapped_recovery = UnwrappedEquityRecovery::Detected {
+            chain: Chain::Base,
             symbol: symbol.clone(),
             shares: FractionalShares::new(float!(1)),
             detected_at: now,
@@ -961,6 +965,7 @@ mod tests {
         ));
         assert!(
             references_for(&UnwrappedEquityRecovery::Failed {
+                chain: Chain::Base,
                 symbol,
                 shares: FractionalShares::new(float!(1)),
                 reason: "failed".to_string(),
