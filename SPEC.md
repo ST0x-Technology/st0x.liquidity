@@ -6004,10 +6004,13 @@ transfer dispatch. It does not calculate cross-venue inventory imbalances.
   snapshot aggregate emits even for an unchanged balance; once a read pinned at
   or past the deposit block applies, it replaces the balance, absorbs every fill
   up to its block (ADR 0018), releases the gate, and enqueues the check (ADR
-  0024). A request already pending for the chain keeps its block when it is
-  higher or when the new request has none. An event without the block (a
-  BaseToAlpaca deposit at Alpaca, or one recorded before the block was captured)
-  requests no read
+  0024). The request asks for the higher of the deposit block and the chain's
+  applied USDC block watermark, since a read already forced in past the deposit
+  contains it and the view rejects any older read. A request already pending for
+  the chain keeps its block when it is higher or when the new request has none;
+  the onchain equity request merges its block the same way. An event without the
+  block (a BaseToAlpaca deposit at Alpaca, or one recorded before the block was
+  captured) requests no read
 - `UsdcRebalanceEvent::ConversionConfirmed` - Terminal success for BaseToAlpaca;
   moves from inflight to destination available
 - `UsdcRebalanceEvent::WithdrawalFailed`, BaseToAlpaca pre-burn

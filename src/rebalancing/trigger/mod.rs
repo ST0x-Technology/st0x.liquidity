@@ -18251,6 +18251,62 @@ mod tests {
         );
     }
 
+    /// A fill underflow can force a vault read in while the transfer is still
+    /// inflight. A read at block 120 already contains the deposit made in
+    /// block 110 and its spend, so the credit then counts the deposit twice
+    /// (1,550 onchain against 500). The view rejects any read below 120, so
+    /// a read at 115 must not release the gate; the read at 121 does, and
+    /// its 1,050 against 500 is inside the band.
+    #[tokio::test]
+    async fn deposit_credit_waits_past_a_forced_read_applied_while_inflight() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let inventory = InventoryView::default()
+            .with_equity(symbol.clone(), shares(50), shares(50))
+            .with_usdc(usdc(1000), usdc(1000));
+        let trigger = make_trigger_with_inventory_and_registry(inventory, &symbol).await;
+        let harness = ReactorHarness::new(Arc::clone(&trigger));
+        let id = UsdcRebalanceId(Uuid::new_v4());
+
+        for event in [
+            make_usdc_initiated(RebalanceDirection::AlpacaToBase, usdc(500)),
+            make_usdc_bridged_with_amounts(usdc(500), Usdc::ZERO),
+        ] {
+            harness
+                .receive::<UsdcRebalance>(id.clone(), event)
+                .await
+                .unwrap();
+        }
+        trigger
+            .divergence_gate()
+            .request_onchain_cash_reconcile(Chain::Base, Some(110));
+        apply_pinned_base_usdc_read(&trigger, usdc(1050), 120).await;
+        usdc::drain_pending_usdc_jobs(&trigger).await;
+
+        harness
+            .receive::<UsdcRebalance>(
+                id,
+                UsdcRebalanceEvent::DepositConfirmed {
+                    direction: RebalanceDirection::AlpacaToBase,
+                    deposit_confirmed_at: Utc::now(),
+                    vault_deposit_block: Some(110),
+                },
+            )
+            .await
+            .unwrap();
+        usdc::drain_pending_usdc_jobs(&trigger).await;
+        assert_eq!(take_pending_usdc_transfer_jobs(&trigger).await, vec![]);
+
+        apply_pinned_base_usdc_read(&trigger, usdc(1050), 115).await;
+        usdc::drain_pending_usdc_jobs(&trigger).await;
+        assert!(trigger.divergence_gate().is_cash_engaged());
+        assert_eq!(take_pending_usdc_transfer_jobs(&trigger).await, vec![]);
+
+        apply_pinned_base_usdc_read(&trigger, usdc(1050), 121).await;
+        assert_eq!(usdc::drain_pending_usdc_jobs(&trigger).await, 1);
+        assert!(!trigger.divergence_gate().is_cash_engaged());
+        assert_eq!(take_pending_usdc_transfer_jobs(&trigger).await, vec![]);
+    }
+
     #[tokio::test]
     async fn alpaca_to_base_usdc_lifecycle_tracks_started_and_cleared_inflight() {
         let inventory = InventoryView::default().with_usdc(usdc(100), usdc(900));

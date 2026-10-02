@@ -1527,7 +1527,7 @@ impl RebalancingService {
                     .await
                     .onchain_usdc_block_watermark(chain);
                 self.divergence_gate
-                    .request_onchain_cash_reconcile_at_least(chain, floor);
+                    .request_onchain_cash_reconcile(chain, floor);
             } else {
                 warn!(target: "rebalance", %chain, "No served corridor polls this chain's cash vault; not requesting a forced vault read");
             }
@@ -1624,18 +1624,25 @@ impl RebalancingService {
         let mut inventory = self.inventory.write().await;
         let outcome = match inventory.clone().update_usdc_at(chain, update, now) {
             Ok(updated) => {
-                *inventory = updated;
                 // A fill in the deposit's block or earlier may already have
                 // spent the credit onchain while the order fill reader, which
                 // trails the chain tip, has not delivered it. Hold every USDC
                 // check until a vault read pinned at or past the deposit
-                // block replaces the balance (ADR 0024). The request is made
+                // block replaces the balance (ADR 0024). A read already
+                // applied past that block (a forced read while the transfer
+                // was inflight) contains the deposit, so the credit counts it
+                // twice: the request then needs a read at or past that read,
+                // since the view rejects anything older. The request is made
                 // under the same write as the credit, so no check reads the
                 // credit without it.
                 if let Some(block_number) = vault_deposit_block {
+                    let minimum_block = updated
+                        .onchain_usdc_block_watermark(chain)
+                        .map_or(block_number, |watermark| watermark.max(block_number));
                     self.divergence_gate
-                        .request_onchain_cash_reconcile(chain, Some(block_number));
+                        .request_onchain_cash_reconcile(chain, Some(minimum_block));
                 }
+                *inventory = updated;
                 UsdcSettlementOutcome::Reconciled
             }
             Err(InventoryViewError::Usdc(InventoryError::InsufficientInflight {

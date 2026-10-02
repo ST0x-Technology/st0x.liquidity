@@ -60,6 +60,16 @@ at or past the deposit's block reaches the view.**
    pending one. A read that misses either block cannot resolve both. The claimed
    read is fetched after the newest request, which covers a request without a
    block.
+4. **The request is never below the applied watermark.** A fill underflow can
+   force a read in while the transfer is still inflight. A read past the deposit
+   block already contains the deposit, so the credit counts it twice, and the
+   view rejects any later read below that read's block. The credit's request
+   therefore asks for the higher of the deposit block and the chain's applied
+   USDC watermark, so a read the view would reject cannot resolve it.
+5. **The equity twin keeps its block the same way.** A fill underflow and a mint
+   or redemption settlement underflow without a block can both request a read of
+   one symbol, so `request_onchain_equity_reconcile` merges the pending block
+   exactly as the cash request does.
 
 The request is in memory only. After a restart the view is rebuilt from
 snapshots, and a terminal event without tracking defers to the next snapshot

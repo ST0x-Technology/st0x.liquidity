@@ -189,15 +189,22 @@ impl InventoryDivergenceGate {
         }
     }
 
+    /// Requests a pinned onchain read of `symbol` at or past `minimum_block`,
+    /// keeping a pending request's block the same way
+    /// [`Self::request_onchain_cash_reconcile`] does: a fill underflow and a
+    /// settlement underflow without a block can both request for one symbol.
     pub(crate) fn request_onchain_equity_reconcile(
         &self,
         chain: Chain,
         symbol: &Symbol,
         minimum_block: Option<u64>,
     ) -> ReconciliationGeneration {
-        let request = self.new_reconciliation_request(minimum_block);
-        self.write_pending_onchain_equity()
-            .insert((chain, symbol.clone()), request);
+        let key = (chain, symbol.clone());
+        let mut pending = self.write_pending_onchain_equity();
+        let pending_block = pending.get(&key).and_then(|request| request.minimum_block);
+        let request = self.new_reconciliation_request(pending_block.max(minimum_block));
+        pending.insert(key, request);
+        drop(pending);
         request.generation
     }
 
@@ -267,8 +274,9 @@ impl InventoryDivergenceGate {
 
     /// Requests a pinned onchain cash read at or past `minimum_block`. A
     /// request already pending for the chain keeps its block when it is
-    /// higher, or when the new request has none, so a later request cannot
-    /// let a read that misses the pending one's block resolve both. The
+    /// higher, or when the new request has none: a fill that could not apply
+    /// its cash delta pins the request to its block, and lowering that floor
+    /// would let a read from a node below the fill clear the gate. The
     /// claimed read is fetched after the newest request, which covers a
     /// request without a block.
     pub(crate) fn request_onchain_cash_reconcile(
@@ -285,25 +293,6 @@ impl InventoryDivergenceGate {
         pending.insert(chain, request);
         drop(pending);
         request.generation
-    }
-
-    /// Requests a fresh onchain cash reconcile whose read must reach at least
-    /// `minimum_block`, keeping the higher floor of a request already
-    /// pending: a fill that could not apply its cash delta pins the request
-    /// to its block, and lowering that floor would let a read from a node
-    /// below the fill clear the gate. With no floor on either side, only a
-    /// read fetched after now is admitted.
-    pub(crate) fn request_onchain_cash_reconcile_at_least(
-        &self,
-        chain: Chain,
-        minimum_block: Option<u64>,
-    ) {
-        let mut pending = self.write_pending_onchain_cash();
-        let pending_floor = pending
-            .get(&chain)
-            .and_then(|request| request.minimum_block);
-        let request = self.new_reconciliation_request(pending_floor.max(minimum_block));
-        pending.insert(chain, request);
     }
 
     pub(crate) fn claim_pending_onchain_cash_reconcile(
@@ -601,11 +590,11 @@ mod tests {
     /// A rejected withdraw must not lower the floor a fill pinned to its
     /// block: a read below that block would then clear the gate.
     #[test]
-    fn reconcile_at_least_keeps_the_higher_pending_floor() {
+    fn cash_reconcile_keeps_the_higher_pending_floor() {
         let gate = InventoryDivergenceGate::default();
         gate.request_onchain_cash_reconcile(Chain::Base, Some(101));
 
-        gate.request_onchain_cash_reconcile_at_least(Chain::Base, Some(90));
+        gate.request_onchain_cash_reconcile(Chain::Base, Some(90));
 
         let current = gate
             .claim_pending_onchain_cash_reconcile(Chain::Base)
@@ -619,11 +608,11 @@ mod tests {
 
     /// A floor above the pending one (the view's watermark) wins.
     #[test]
-    fn reconcile_at_least_raises_the_floor() {
+    fn cash_reconcile_raises_the_floor() {
         let gate = InventoryDivergenceGate::default();
         gate.request_onchain_cash_reconcile(Chain::Base, Some(101));
 
-        gate.request_onchain_cash_reconcile_at_least(Chain::Base, Some(120));
+        gate.request_onchain_cash_reconcile(Chain::Base, Some(120));
 
         let current = gate
             .claim_pending_onchain_cash_reconcile(Chain::Base)
@@ -635,12 +624,12 @@ mod tests {
     /// With no floor on either side, the request needs a read fetched after
     /// it.
     #[test]
-    fn reconcile_at_least_without_a_floor_needs_a_later_read() {
+    fn cash_reconcile_without_a_floor_needs_a_later_read() {
         let gate = InventoryDivergenceGate::default();
         let earlier = gate.request_onchain_cash_reconcile(Chain::Base, None);
         let before = Utc::now();
 
-        gate.request_onchain_cash_reconcile_at_least(Chain::Base, None);
+        gate.request_onchain_cash_reconcile(Chain::Base, None);
 
         let current = gate
             .claim_pending_onchain_cash_reconcile(Chain::Base)
@@ -650,31 +639,17 @@ mod tests {
         assert!(gate.is_cash_engaged());
     }
 
-    /// A cash read request for an earlier block, such as a vault deposit
-    /// settling after a later fill underflowed, or for no block, such as a
-    /// fill recorded without one, must not let a read below the pending
-    /// block resolve the request.
+    /// A request without a block, such as a fill recorded without one, must
+    /// not drop a pending block: a read below it would then resolve the
+    /// request on time alone.
     #[test]
-    fn cash_reconcile_request_keeps_the_pending_block() {
+    fn cash_reconcile_without_a_block_keeps_the_pending_block() {
         let gate = InventoryDivergenceGate::default();
         let after_requests = Utc::now() + chrono::Duration::seconds(1);
 
         gate.request_onchain_cash_reconcile(Chain::Base, Some(120));
-        let earlier = gate.request_onchain_cash_reconcile(Chain::Base, Some(110));
-        assert!(!gate.accepts_onchain_cash_reconcile(
-            Chain::Base,
-            earlier,
-            after_requests,
-            Some(119)
-        ));
-        assert!(gate.accepts_onchain_cash_reconcile(
-            Chain::Base,
-            earlier,
-            after_requests,
-            Some(120)
-        ));
-
         let blockless = gate.request_onchain_cash_reconcile(Chain::Base, None);
+
         assert!(!gate.accepts_onchain_cash_reconcile(
             Chain::Base,
             blockless,
@@ -687,6 +662,34 @@ mod tests {
             after_requests,
             Some(120)
         ));
+    }
+
+    /// The equity twin: a fill underflow and a settlement underflow without
+    /// a block can both request a read of one symbol, and the later request
+    /// must not let a read below the pending block resolve it.
+    #[test]
+    fn equity_reconcile_request_keeps_the_pending_block() {
+        let spym = Symbol::new("SPYM").unwrap();
+        let gate = InventoryDivergenceGate::default();
+        let after_requests = Utc::now() + chrono::Duration::seconds(1);
+        let accepts = |generation, block_number| {
+            gate.accepts_onchain_equity_reconcile(
+                Chain::Base,
+                &spym,
+                generation,
+                after_requests,
+                Some(block_number),
+            )
+        };
+
+        gate.request_onchain_equity_reconcile(Chain::Base, &spym, Some(120));
+        let earlier = gate.request_onchain_equity_reconcile(Chain::Base, &spym, Some(110));
+        assert!(!accepts(earlier, 119));
+        assert!(accepts(earlier, 120));
+
+        let blockless = gate.request_onchain_equity_reconcile(Chain::Base, &spym, None);
+        assert!(!accepts(blockless, 119));
+        assert!(accepts(blockless, 120));
     }
 
     #[test]
