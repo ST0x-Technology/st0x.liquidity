@@ -102,12 +102,13 @@ pub enum RaindexError {
     /// re-submitting the same reverting withdraw.
     #[error(
         "inventory vault under-funded for {token}: requested {requested}, \
-         vault could cover {received}"
+         vault could cover {received} ({broadcast})"
     )]
     InsufficientVaultLiquidity {
         token: Address,
         requested: U256,
         received: U256,
+        broadcast: WithdrawBroadcast,
     },
     /// The bot's signing wallet does not hold `OPERATOR_ROLE` on the configured
     /// `RaindexInventory`, so every `deposit4`/`withdraw4` would revert
@@ -120,6 +121,20 @@ pub enum RaindexError {
          grant it before enabling rebalancing"
     )]
     MissingOperatorRole { inventory: Address, wallet: Address },
+}
+
+/// Whether the `withdraw4` that reverted
+/// [`RaindexError::InsufficientVaultLiquidity`] could have reached the chain.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum WithdrawBroadcast {
+    /// The revert came from the first send attempt's gas estimate: no raw
+    /// transaction was sent, so nothing can land later.
+    #[error("rejected before broadcast")]
+    NotBroadcast,
+    /// The revert was mined, or came from a resend after the first raw send
+    /// may have been accepted, so a withdraw for this call may have landed.
+    #[error("a withdraw may have been broadcast")]
+    MayHaveBroadcast,
 }
 
 /// What made a withdrawal-scan log anomalous, for

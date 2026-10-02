@@ -2593,6 +2593,7 @@ mod tests {
             max_burn_revert_redrives: 1,
             notifier: notifier.clone(),
             unrecorded_guards: None,
+            underfunded_alerts: crate::rebalancing::usdc::UnderfundedAlertLatch::default(),
         });
         let failure_injector = FailureInjector::new();
         let monitor = register_transfer_usdc_to_hedging_worker(

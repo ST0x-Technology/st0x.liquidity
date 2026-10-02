@@ -29,7 +29,10 @@ use st0x_evm::{
 use st0x_execution::FractionalShares;
 use st0x_finance::Usdc;
 
-use crate::{Raindex, RaindexContracts, RaindexError, RaindexVaultId, RevokeOutcome, ScanAnomaly};
+use crate::{
+    Raindex, RaindexContracts, RaindexError, RaindexVaultId, RevokeOutcome, ScanAnomaly,
+    WithdrawBroadcast,
+};
 
 sol!(
     #![sol(all_derives = true, rpc)]
@@ -615,14 +618,22 @@ fn map_withdraw_revert(err: EvmError) -> RaindexError {
     let Some(revert_data) = err.revert_data() else {
         return err.into();
     };
-    IRaindexInventory::InsufficientVaultLiquidity::abi_decode(revert_data.as_ref()).map_or_else(
-        |_| err.into(),
-        |decoded| RaindexError::InsufficientVaultLiquidity {
-            token: decoded.token,
-            requested: decoded.requested,
-            received: decoded.received,
-        },
-    )
+    let Ok(decoded) =
+        IRaindexInventory::InsufficientVaultLiquidity::abi_decode(revert_data.as_ref())
+    else {
+        return err.into();
+    };
+    let broadcast = if err.was_never_broadcast() {
+        WithdrawBroadcast::NotBroadcast
+    } else {
+        WithdrawBroadcast::MayHaveBroadcast
+    };
+    RaindexError::InsufficientVaultLiquidity {
+        token: decoded.token,
+        requested: decoded.requested,
+        received: decoded.received,
+        broadcast,
+    }
 }
 
 #[async_trait]
@@ -1533,23 +1544,31 @@ mod tests {
             .await
             .unwrap_err();
 
-        assert_maps_to_insufficient_liquidity(error, requested, received);
+        assert_maps_to_insufficient_liquidity(
+            error,
+            requested,
+            received,
+            WithdrawBroadcast::MayHaveBroadcast,
+        );
     }
 
     fn assert_maps_to_insufficient_liquidity(
         mapped: RaindexError,
         requested: U256,
         received: U256,
+        expected_broadcast: WithdrawBroadcast,
     ) {
         match mapped {
             RaindexError::InsufficientVaultLiquidity {
                 token,
                 requested: r,
                 received: rc,
+                broadcast,
             } => {
                 assert_eq!(token, USDC_BASE);
                 assert_eq!(r, requested);
                 assert_eq!(rc, received);
+                assert_eq!(broadcast, expected_broadcast);
             }
             other => panic!("expected InsufficientVaultLiquidity, got {other:?}"),
         }
@@ -1566,7 +1585,12 @@ mod tests {
 
         let mapped = map_withdraw_revert(EvmError::Contract(contract_err));
 
-        assert_maps_to_insufficient_liquidity(mapped, requested, received);
+        assert_maps_to_insufficient_liquidity(
+            mapped,
+            requested,
+            received,
+            WithdrawBroadcast::MayHaveBroadcast,
+        );
     }
 
     #[test]
@@ -1581,7 +1605,31 @@ mod tests {
 
         let mapped = map_withdraw_revert(EvmError::Transport(TransportError::ErrorResp(payload)));
 
-        assert_maps_to_insufficient_liquidity(mapped, requested, received);
+        assert_maps_to_insufficient_liquidity(
+            mapped,
+            requested,
+            received,
+            WithdrawBroadcast::MayHaveBroadcast,
+        );
+    }
+
+    #[test]
+    fn map_withdraw_revert_marks_a_revert_rejected_before_broadcast() {
+        let requested = U256::from(2000u64);
+        let received = U256::ZERO;
+        let payload =
+            revert_error_payload(&insufficient_liquidity_revert_bytes(requested, received));
+
+        let mapped = map_withdraw_revert(EvmError::RejectedBeforeBroadcast {
+            source: Box::new(EvmError::Transport(TransportError::ErrorResp(payload))),
+        });
+
+        assert_maps_to_insufficient_liquidity(
+            mapped,
+            requested,
+            received,
+            WithdrawBroadcast::NotBroadcast,
+        );
     }
 
     #[test]
@@ -1595,7 +1643,12 @@ mod tests {
 
         let mapped = map_withdraw_revert(EvmError::DecodedRevert(decoded));
 
-        assert_maps_to_insufficient_liquidity(mapped, requested, received);
+        assert_maps_to_insufficient_liquidity(
+            mapped,
+            requested,
+            received,
+            WithdrawBroadcast::MayHaveBroadcast,
+        );
     }
 
     #[test]

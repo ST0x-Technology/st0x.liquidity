@@ -46,6 +46,14 @@ impl UsdcCashGuards {
             .insert(id.clone(), direction);
     }
 
+    /// The chain whose guard `id` holds, if any.
+    pub(super) fn held_chain(&self, id: &UsdcRebalanceId) -> Option<Chain> {
+        self.state()
+            .holders
+            .iter()
+            .find_map(|(chain, holders)| holders.contains_key(id).then_some(*chain))
+    }
+
     /// Frees whatever `id` holds; other holders keep their guards.
     pub(crate) fn release(&self, id: &UsdcRebalanceId) {
         self.state().holders.retain(|_, holders| {

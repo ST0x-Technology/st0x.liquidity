@@ -21,8 +21,9 @@
 //! ever see that id, so the guard would otherwise stay held until a restart
 //! (see [`UnrecordedGuardRelease`]).
 
+use std::collections::HashMap;
 use std::ops::ControlFlow;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use apalis_core::error::BoxDynError;
@@ -36,7 +37,7 @@ use tracing::{error, info, warn};
 use st0x_bridge::cctp::CctpError;
 use st0x_bridge::corridor::{UsdcCorridor, legacy_base_cctp};
 use st0x_event_sorcery::Store;
-use st0x_evm::Wallet;
+use st0x_evm::{Chain, Wallet};
 use st0x_execution::{AlpacaWalletError, Backpressure};
 use st0x_finance::Usdc;
 
@@ -50,7 +51,7 @@ use crate::conductor::job::{
     BackpressureStep, BackpressureStreak, Job, JobQueue, Label, QueuePushError, TaskIdentity,
     advance_backpressure, apply_backpressure_step, find_backpressure, has_live_sibling_job,
 };
-use crate::rebalancing::trigger::UsdcCashGuards;
+use crate::rebalancing::trigger::{USDC_WITHDRAW_REJECTION_COOLDOWN, UsdcCashGuards};
 use crate::usdc_rebalance::{UsdcRebalance, UsdcRebalanceId};
 
 const ATTESTATION_REDRIVE_DELAY: Duration = Duration::from_secs(60);
@@ -734,6 +735,48 @@ impl UnrecordedGuardRelease {
     }
 }
 
+/// When each chain's under-funded vault withdraw last paged. The hedging job
+/// pages a rejected withdraw on a chain at most once per
+/// [`USDC_WITHDRAW_REJECTION_COOLDOWN`], so a cause that persists pages again
+/// each time the chain's withdraw cooldown ends; the rebalancing trigger
+/// clears the chain when a transfer on it completes, and an operator fail or
+/// resume clears every chain.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct UnderfundedAlertLatch(Arc<Mutex<HashMap<Chain, DateTime<Utc>>>>);
+
+impl UnderfundedAlertLatch {
+    /// `true`, recording `now`, when `chain` has not paged since it was last
+    /// cleared or its last page is at least one cooldown old. A page stamped
+    /// after `now` still counts as recent.
+    pub(crate) fn first_since_reset(&self, chain: Chain, now: DateTime<Utc>) -> bool {
+        let mut paged = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        let recently_paged = paged.get(&chain).is_some_and(|paged_at| {
+            now.signed_duration_since(*paged_at)
+                .to_std()
+                .map_or(true, |age| age < USDC_WITHDRAW_REJECTION_COOLDOWN)
+        });
+        if recently_paged {
+            return false;
+        }
+        paged.insert(chain, now);
+        true
+    }
+
+    pub(crate) fn reset(&self, chain: Chain) {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(&chain);
+    }
+
+    pub(crate) fn reset_all(&self) {
+        self.0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clear();
+    }
+}
+
 /// Dependencies the job needs to resume the transfer.
 pub(crate) struct TransferUsdcToHedgingCtx {
     pub(crate) transfer: Arc<dyn ResumeBaseToAlpaca>,
@@ -756,6 +799,9 @@ pub(crate) struct TransferUsdcToHedgingCtx {
     /// tests that do not wire the service's guards and store, including ones
     /// that drive a row to a dead letter.
     pub(crate) unrecorded_guards: Option<UnrecordedGuardRelease>,
+    /// Pages one under-funded withdraw per chain until a transfer there
+    /// completes or an operator acts. Shared with the rebalancing trigger.
+    pub(crate) underfunded_alerts: UnderfundedAlertLatch,
 }
 
 /// Errors emitted by [`TransferUsdcToHedging::perform`].
@@ -1093,30 +1139,13 @@ impl Job<TransferUsdcToHedgingCtx> for TransferUsdcToHedging {
                     warn!(target: "rebalance", ?error, "Failed to deliver USDC hedging unresolved-conversion alert");
                 }
             }
-            // Deterministic vault-liquidity revert: the withdraw is atomic
-            // (nothing left the vault) and re-issuing it just reverts again
-            // until the vault is refunded, burning gas per attempt. Returning
-            // `Ok(())` ends the apalis job with NO retry, so the aggregate
-            // stays latched at `WithdrawalSubmitting` and the alert fires
-            // exactly once. The operator refunds the vault and redrives via
-            // resume-usdc-transfer; the resume's withdrawal scan still guards
-            // against a double-withdraw.
-            Err(error @ UsdcTransferError::InsufficientVaultLiquidity { .. }) => {
-                let id = &self.id;
-                error!(
-                    target: "rebalance",
-                    %id,
-                    %error,
-                    "Base->Alpaca USDC transfer: inventory vault under-funded on withdraw; \
-                     latched at WithdrawalSubmitting for operator reconciliation \
-                     (no auto-retry)"
-                );
-                let message =
-                    format!("USDC transfer {id}: {error}. Refund the vault, then redrive.");
-                if let Err(error) = ctx.notifier.notify(&message).await {
-                    warn!(target: "rebalance", ?error, "Failed to deliver USDC hedging vault-liquidity alert");
-                }
-            }
+            // The inventory vault could not cover the withdraw. Either way the
+            // job ends with NO retry and one alert: see
+            // `alert_under_funded_withdraw`.
+            Err(
+                error @ (UsdcTransferError::WithdrawalRejectedUnderfunded { .. }
+                | UsdcTransferError::InsufficientVaultLiquidity { .. }),
+            ) => self.alert_under_funded_withdraw(ctx, &error).await,
             Err(error) => return self.handle_terminal_or_backpressure_error(ctx, error).await,
         }
 
@@ -1143,6 +1172,81 @@ impl Job<TransferUsdcToHedgingCtx> for TransferUsdcToHedging {
 }
 
 impl TransferUsdcToHedging {
+    /// Logs and alerts once for an under-funded vault withdraw. The job then
+    /// ends without a redrive.
+    ///
+    /// - `WithdrawalRejectedUnderfunded`: the withdraw was rejected before
+    ///   broadcast and `RejectWithdrawal` already failed the transfer. Nothing
+    ///   left the vault, and the reactor clears the guard on `WithdrawalFailed`.
+    ///   It pages at most once per chain per cooldown (see
+    ///   [`UnderfundedAlertLatch`]).
+    /// - `InsufficientVaultLiquidity`: a withdraw may have been broadcast, so
+    ///   the aggregate stays latched at `WithdrawalSubmitting`. A redrive never
+    ///   re-issues the withdraw: it only adopts one mined after `from_block`.
+    ///   The operator checks the chain and either resumes (a withdrawal
+    ///   landed) or fails the transfer (none did).
+    async fn alert_under_funded_withdraw(
+        &self,
+        ctx: &TransferUsdcToHedgingCtx,
+        error: &UsdcTransferError,
+    ) {
+        let message = match error {
+            UsdcTransferError::WithdrawalRejectedUnderfunded { .. }
+                if !ctx
+                    .underfunded_alerts
+                    .first_since_reset(self.corridor.chain(), Utc::now()) =>
+            {
+                warn!(
+                    target: "rebalance",
+                    id = %self.id,
+                    %error,
+                    "Base->Alpaca USDC transfer: inventory vault under-funded on withdraw; \
+                     rejected before broadcast, transfer failed (already paged for this chain)"
+                );
+                return;
+            }
+            UsdcTransferError::WithdrawalRejectedUnderfunded { .. } => {
+                error!(
+                    target: "rebalance",
+                    id = %self.id,
+                    %error,
+                    "Base->Alpaca USDC transfer: inventory vault under-funded on withdraw; \
+                     rejected before broadcast, transfer failed"
+                );
+                format!(
+                    "{error}. Nothing was sent or withdrawn; rebalancing plans again from fresh \
+                     balances."
+                )
+            }
+            UsdcTransferError::InsufficientVaultLiquidity { from_block, .. } => {
+                error!(
+                    target: "rebalance",
+                    id = %self.id,
+                    %error,
+                    "Base->Alpaca USDC transfer: inventory vault under-funded on withdraw; \
+                     latched at WithdrawalSubmitting for operator reconciliation \
+                     (no auto-retry)"
+                );
+                format!(
+                    "{error}. Check on chain for an OperatorWithdraw by the bot wallet after block \
+                     {from_block}: if one landed, `transfer resume` adopts it; if none did, fail \
+                     the transfer with `fail-usdc-transfer`."
+                )
+            }
+            other => {
+                error!(target: "rebalance", id = %self.id, error = %other, "Unexpected error routed to the under-funded withdraw alert");
+                format!("{other}.")
+            }
+        };
+        if let Err(notify_error) = ctx.notifier.notify(&message).await {
+            warn!(target: "rebalance", error = ?notify_error, "Failed to deliver USDC hedging vault-liquidity alert");
+            // The page never went out, so the next rejection must try again.
+            if let UsdcTransferError::WithdrawalRejectedUnderfunded { .. } = error {
+                ctx.underfunded_alerts.reset(self.corridor.chain());
+            }
+        }
+    }
+
     /// Handles the generic (unclassified-by-name) terminal error arm:
     /// reschedules with a classified delay on broker rate-limiting (429)
     /// instead of consuming the terminal retry budget, or propagates any other
@@ -2489,6 +2593,7 @@ mod tests {
             max_burn_revert_redrives: 5,
             notifier: Arc::new(LogNotifier),
             unrecorded_guards: None,
+            underfunded_alerts: UnderfundedAlertLatch::default(),
         }
     }
 
@@ -2628,9 +2733,12 @@ mod tests {
         BurnRecordFailed,
         BurnRecordTaskFailed,
         BurnTxDropped,
-        /// Deterministic vault-liquidity revert: re-issuing the withdraw just
-        /// reverts again until the vault is refunded, so the job must latch.
+        /// Under-funded revert where a withdraw may have been broadcast: a
+        /// redrive only scans, so the job must latch.
         InsufficientVaultLiquidity,
+        /// Under-funded revert rejected before broadcast: `RejectWithdrawal`
+        /// already failed the transfer, so a retry has nothing left to do.
+        WithdrawalRejectedUnderfunded,
         /// The conversion order may still be live: a redrive would race it and
         /// could reach the resume's failure transition, releasing the in-flight
         /// guard while real money can still move.
@@ -2689,10 +2797,20 @@ mod tests {
                     burn_tx: TxHash::from([0xAB; 32]),
                 },
                 Self::InsufficientVaultLiquidity => UsdcTransferError::InsufficientVaultLiquidity {
+                    id: id.clone(),
+                    from_block: 52_027_377,
                     token: Address::from([0xEE; 20]),
                     requested: U256::from(100),
                     received: U256::from(40),
                 },
+                Self::WithdrawalRejectedUnderfunded => {
+                    UsdcTransferError::WithdrawalRejectedUnderfunded {
+                        id: id.clone(),
+                        token: Address::from([0xEE; 20]),
+                        requested: U256::from(100),
+                        received: U256::ZERO,
+                    }
+                }
                 Self::ConversionOutcomeUnresolved => {
                     UsdcTransferError::ConversionOutcomeUnresolved {
                         id: id.clone(),
@@ -3158,6 +3276,7 @@ mod tests {
             max_burn_revert_redrives: 5,
             notifier: Arc::new(LogNotifier),
             unrecorded_guards: None,
+            underfunded_alerts: UnderfundedAlertLatch::default(),
         };
         let job = TransferUsdcToHedging {
             corridor: UsdcCorridor::BASE_CCTP,
@@ -3213,6 +3332,7 @@ mod tests {
             max_burn_revert_redrives: 3,
             notifier: Arc::new(LogNotifier),
             unrecorded_guards: None,
+            underfunded_alerts: UnderfundedAlertLatch::default(),
         };
         // Simulate a job that has already used all its redrive budget.
         let job = TransferUsdcToHedging {
@@ -3511,6 +3631,7 @@ mod tests {
             max_burn_revert_redrives: 5,
             notifier: notifier.clone(),
             unrecorded_guards: None,
+            underfunded_alerts: UnderfundedAlertLatch::default(),
         };
         // `revert_redrive_attempts` starts nonzero and distinct from
         // `backpressure_streak` so a copy-paste swap of which counter
@@ -3556,6 +3677,7 @@ mod tests {
             max_burn_revert_redrives: 5,
             notifier: notifier.clone(),
             unrecorded_guards: None,
+            underfunded_alerts: UnderfundedAlertLatch::default(),
         };
         let job = TransferUsdcToHedging {
             corridor: UsdcCorridor::BASE_CCTP,
@@ -3601,6 +3723,7 @@ mod tests {
             max_burn_revert_redrives: 5,
             notifier: notifier.clone(),
             unrecorded_guards: None,
+            underfunded_alerts: UnderfundedAlertLatch::default(),
         };
         let job = TransferUsdcToHedging {
             corridor: UsdcCorridor::BASE_CCTP,
@@ -4463,6 +4586,7 @@ mod tests {
             max_burn_revert_redrives: 5,
             notifier: notifier.clone(),
             unrecorded_guards: None,
+            underfunded_alerts: UnderfundedAlertLatch::default(),
         };
         let job = TransferUsdcToHedging {
             corridor: UsdcCorridor::BASE_CCTP,
@@ -4520,6 +4644,7 @@ mod tests {
             max_burn_revert_redrives: 5,
             notifier: notifier.clone(),
             unrecorded_guards: None,
+            underfunded_alerts: UnderfundedAlertLatch::default(),
         };
         let job = TransferUsdcToHedging {
             corridor: UsdcCorridor::BASE_CCTP,
@@ -4723,7 +4848,7 @@ mod tests {
         outcome: TerminalOutcome,
         label: &str,
         expect_burn_tx: Option<TxHash>,
-    ) {
+    ) -> Vec<String> {
         let pool = setup_queue_pool().await;
         let notifier = Arc::new(CapturingNotifier::default());
         let ctx = TransferUsdcToHedgingCtx {
@@ -4734,6 +4859,7 @@ mod tests {
             max_burn_revert_redrives: 5,
             notifier: notifier.clone(),
             unrecorded_guards: None,
+            underfunded_alerts: UnderfundedAlertLatch::default(),
         };
         let job = TransferUsdcToHedging {
             corridor: UsdcCorridor::BASE_CCTP,
@@ -4771,6 +4897,7 @@ mod tests {
                 messages[0]
             );
         }
+        messages
     }
 
     async fn assert_market_making_fail_closed(
@@ -4875,19 +5002,80 @@ mod tests {
         .await;
     }
 
-    /// An `InsufficientVaultLiquidity` withdraw revert is atomic (nothing left
-    /// the vault) and deterministic: re-issuing the withdraw reverts again until
-    /// the vault is refunded. The job must latch the aggregate at
-    /// `WithdrawalSubmitting` (Ok, no redrive, one alert) instead of letting
-    /// apalis retries burn gas re-submitting the same reverting withdraw.
+    /// An under-funded withdraw that may have been broadcast must latch at
+    /// `WithdrawalSubmitting` (Ok, no redrive, one alert): a redrive only
+    /// scans and never re-issues. The alert must give the operator the scan
+    /// block and both exits, not "refund the vault and redrive".
     #[tokio::test]
     async fn hedging_job_latches_on_insufficient_vault_liquidity() {
-        assert_hedging_fail_closed(
+        let messages = assert_hedging_fail_closed(
             TerminalOutcome::InsufficientVaultLiquidity,
             "InsufficientVaultLiquidity (hedging)",
             None,
         )
         .await;
+
+        assert!(
+            messages[0].contains("after block 52027377")
+                && messages[0].contains("transfer resume")
+                && messages[0].contains("fail-usdc-transfer"),
+            "latch alert must name the scan block and both operator exits; got: {:?}",
+            messages[0]
+        );
+    }
+
+    /// An under-funded withdraw rejected before broadcast is already failed by
+    /// `RejectWithdrawal`: the job ends cleanly with one alert and no redrive.
+    #[tokio::test]
+    async fn hedging_job_ends_on_withdrawal_rejected_underfunded() {
+        let messages = assert_hedging_fail_closed(
+            TerminalOutcome::WithdrawalRejectedUnderfunded,
+            "WithdrawalRejectedUnderfunded (hedging)",
+            None,
+        )
+        .await;
+
+        assert!(
+            messages[0].contains("Nothing was sent or withdrawn"),
+            "alert must say nothing moved; got: {:?}",
+            messages[0]
+        );
+    }
+
+    /// One under-funded page per chain per cooldown: a second rejection on the
+    /// same chain stays quiet until the latch is reset (a completed transfer
+    /// there, or an operator fail or resume) or the cooldown ends.
+    #[tokio::test]
+    async fn hedging_job_pages_one_withdrawal_rejected_underfunded_per_chain() {
+        let pool = setup_queue_pool().await;
+        let notifier = Arc::new(CapturingNotifier::default());
+        let ctx = TransferUsdcToHedgingCtx {
+            driver_gate: UsdcDriverGate::unpaused(),
+            transfer: Arc::new(TerminalBaseToAlpaca(
+                TerminalOutcome::WithdrawalRejectedUnderfunded,
+            )),
+            timeout: Duration::from_secs(3600),
+            job_queue: TransferUsdcToHedgingJobQueue::new(&pool),
+            max_burn_revert_redrives: 5,
+            notifier: notifier.clone(),
+            unrecorded_guards: None,
+            underfunded_alerts: UnderfundedAlertLatch::default(),
+        };
+        let job = || TransferUsdcToHedging {
+            corridor: UsdcCorridor::BASE_CCTP,
+            id: UsdcRebalanceId(Uuid::new_v4()),
+            amount: Usdc::new(float!(100)),
+            revert_redrive_attempts: 0,
+            backpressure_streak: BackpressureStreak::default(),
+        };
+
+        Job::perform(&job(), &ctx).await.unwrap();
+        Job::perform(&job(), &ctx).await.unwrap();
+        assert_eq!(notifier.messages().len(), 1, "the repeat must not page");
+
+        ctx.underfunded_alerts.reset(Chain::Base);
+        Job::perform(&job(), &ctx).await.unwrap();
+        assert_eq!(notifier.messages().len(), 2, "a reset re-arms the page");
     }
 
     #[tokio::test]
@@ -5344,6 +5532,7 @@ mod tests {
             max_burn_revert_redrives: 5,
             notifier: notifier.clone(),
             unrecorded_guards: None,
+            underfunded_alerts: UnderfundedAlertLatch::default(),
         };
         let job = TransferUsdcToHedging {
             corridor: UsdcCorridor::BASE_CCTP,
@@ -5427,6 +5616,7 @@ mod tests {
             max_burn_revert_redrives: 5,
             notifier: notifier.clone(),
             unrecorded_guards: None,
+            underfunded_alerts: UnderfundedAlertLatch::default(),
         };
         let job = TransferUsdcToHedging {
             corridor: UsdcCorridor::BASE_CCTP,
@@ -5487,6 +5677,7 @@ mod tests {
             max_burn_revert_redrives: 5,
             notifier: notifier.clone(),
             unrecorded_guards: None,
+            underfunded_alerts: UnderfundedAlertLatch::default(),
         };
         let job = TransferUsdcToHedging {
             corridor: UsdcCorridor::BASE_CCTP,
@@ -5573,6 +5764,7 @@ mod tests {
             notifier: notifier.clone(),
             driver_gate: UsdcDriverGate::unpaused(),
             unrecorded_guards: None,
+            underfunded_alerts: UnderfundedAlertLatch::default(),
         };
         let job = TransferUsdcToHedging {
             corridor: UsdcCorridor::BASE_CCTP,
@@ -5786,6 +5978,7 @@ mod tests {
             max_burn_revert_redrives: 5,
             notifier: notifier.clone(),
             unrecorded_guards: None,
+            underfunded_alerts: UnderfundedAlertLatch::default(),
         };
         let job = TransferUsdcToHedging {
             corridor: UsdcCorridor::BASE_CCTP,
@@ -5844,6 +6037,64 @@ mod tests {
         }
     }
 
+    /// A cause that persists pages again once the chain's cooldown has
+    /// passed, and not before.
+    #[test]
+    fn under_funded_page_rearms_when_the_cooldown_ends() {
+        let latch = UnderfundedAlertLatch::default();
+        let paged_at = Utc::now();
+        let cooldown = chrono::Duration::from_std(USDC_WITHDRAW_REJECTION_COOLDOWN).unwrap();
+
+        assert!(latch.first_since_reset(Chain::Base, paged_at));
+        assert!(!latch.first_since_reset(
+            Chain::Base,
+            paged_at + cooldown - chrono::Duration::seconds(1)
+        ));
+        assert!(
+            !latch.first_since_reset(Chain::Base, paged_at - chrono::Duration::seconds(1)),
+            "a page stamped after now still counts as recent"
+        );
+        assert!(latch.first_since_reset(Chain::Base, paged_at + cooldown));
+        assert!(
+            latch.first_since_reset(Chain::Ethereum, paged_at),
+            "chains page independently"
+        );
+    }
+
+    /// A page that fails to go out leaves the chain un-paged, so the next
+    /// under-funded rejection there tries to page again.
+    #[tokio::test]
+    async fn failed_under_funded_page_rearms_the_chain() {
+        let pool = setup_queue_pool().await;
+        let ctx = TransferUsdcToHedgingCtx {
+            driver_gate: UsdcDriverGate::unpaused(),
+            transfer: Arc::new(TerminalBaseToAlpaca(
+                TerminalOutcome::WithdrawalRejectedUnderfunded,
+            )),
+            timeout: Duration::from_secs(3600),
+            job_queue: TransferUsdcToHedgingJobQueue::new(&pool),
+            max_burn_revert_redrives: 5,
+            notifier: Arc::new(FailingNotifier),
+            unrecorded_guards: None,
+            underfunded_alerts: UnderfundedAlertLatch::default(),
+        };
+        let job = TransferUsdcToHedging {
+            corridor: UsdcCorridor::BASE_CCTP,
+            id: UsdcRebalanceId(Uuid::new_v4()),
+            amount: Usdc::new(float!(100)),
+            revert_redrive_attempts: 0,
+            backpressure_streak: BackpressureStreak::default(),
+        };
+
+        Job::perform(&job, &ctx).await.unwrap();
+
+        assert!(
+            ctx.underfunded_alerts
+                .first_since_reset(Chain::Base, Utc::now()),
+            "an undelivered page must not mark the chain as paged"
+        );
+    }
+
     /// A failing notifier must not abort the job. The notifier error is swallowed
     /// and logged as a warning; the job returns the same outcome it would have
     /// with a working notifier.
@@ -5858,6 +6109,7 @@ mod tests {
             max_burn_revert_redrives: 1,
             notifier: Arc::new(FailingNotifier),
             unrecorded_guards: None,
+            underfunded_alerts: UnderfundedAlertLatch::default(),
         };
         // attempts=0 -> next=1 == max=1: limit alert fires (and is swallowed), redrive enqueued
         let job = TransferUsdcToHedging {
@@ -6077,6 +6329,7 @@ mod tests {
             max_burn_revert_redrives: 3,
             notifier: Arc::new(LogNotifier),
             unrecorded_guards: None,
+            underfunded_alerts: UnderfundedAlertLatch::default(),
         };
         let job = TransferUsdcToHedging {
             corridor: UsdcCorridor::BASE_CCTP,
@@ -6144,6 +6397,7 @@ mod tests {
             max_burn_revert_redrives: 5,
             notifier: notifier.clone(),
             unrecorded_guards: None,
+            underfunded_alerts: UnderfundedAlertLatch::default(),
         };
         let job = TransferUsdcToHedging {
             corridor: UsdcCorridor::BASE_CCTP,
@@ -6177,6 +6431,7 @@ mod tests {
             max_burn_revert_redrives: 5,
             notifier: notifier.clone(),
             unrecorded_guards: None,
+            underfunded_alerts: UnderfundedAlertLatch::default(),
         };
         // attempts=2 -> next=3 == 5/2+1 == 3: exactly at threshold
         let job = TransferUsdcToHedging {
@@ -6227,6 +6482,7 @@ mod tests {
             max_burn_revert_redrives: 3,
             notifier: notifier.clone(),
             unrecorded_guards: None,
+            underfunded_alerts: UnderfundedAlertLatch::default(),
         };
         // attempts=2 -> next=3 == max=3: last allowed redrive, alert fires
         let job = TransferUsdcToHedging {
@@ -6276,6 +6532,7 @@ mod tests {
             max_burn_revert_redrives: 3,
             notifier: notifier.clone(),
             unrecorded_guards: None,
+            underfunded_alerts: UnderfundedAlertLatch::default(),
         };
         // attempts=3 -> next=4 > max=3: over-limit, returns Err, no alert
         let job = TransferUsdcToHedging {
@@ -6322,6 +6579,7 @@ mod tests {
             max_burn_revert_redrives: 1,
             notifier: notifier.clone(),
             unrecorded_guards: None,
+            underfunded_alerts: UnderfundedAlertLatch::default(),
         };
         // attempts=0 -> next=1 == max=1: last allowed redrive, limit alert fires
         let job = TransferUsdcToHedging {
@@ -6367,6 +6625,7 @@ mod tests {
             max_burn_revert_redrives: 2,
             notifier: notifier.clone(),
             unrecorded_guards: None,
+            underfunded_alerts: UnderfundedAlertLatch::default(),
         };
         // attempts=1 -> next=2 == max=2: last allowed redrive, limit alert fires
         let job = TransferUsdcToHedging {
@@ -6407,6 +6666,7 @@ mod tests {
             max_burn_revert_redrives: 3,
             notifier: notifier.clone(),
             unrecorded_guards: None,
+            underfunded_alerts: UnderfundedAlertLatch::default(),
         };
         // attempts=2 -> next=3 == max=3: last allowed timeout redrive, alert fires
         let job = TransferUsdcToHedging {
@@ -6456,6 +6716,7 @@ mod tests {
             max_burn_revert_redrives: 3,
             notifier: notifier.clone(),
             unrecorded_guards: None,
+            underfunded_alerts: UnderfundedAlertLatch::default(),
         };
         // attempts=3 -> next=4 > max=3: over-limit, returns Err, no alert
         let job = TransferUsdcToHedging {
@@ -6501,6 +6762,7 @@ mod tests {
             max_burn_revert_redrives: 5,
             notifier: notifier.clone(),
             unrecorded_guards: None,
+            underfunded_alerts: UnderfundedAlertLatch::default(),
         };
         // attempts=2 -> next=3 == 5/2+1: exactly at threshold
         let job = TransferUsdcToHedging {
@@ -6845,6 +7107,7 @@ mod tests {
             max_burn_revert_redrives: 5,
             notifier: notifier.clone(),
             unrecorded_guards: None,
+            underfunded_alerts: UnderfundedAlertLatch::default(),
         };
         let job = TransferUsdcToHedging {
             corridor: UsdcCorridor::BASE_CCTP,
@@ -6947,6 +7210,7 @@ mod tests {
             max_burn_revert_redrives: 5,
             notifier: notifier.clone(),
             unrecorded_guards: None,
+            underfunded_alerts: UnderfundedAlertLatch::default(),
         };
         let job = TransferUsdcToHedging {
             corridor: UsdcCorridor::BASE_CCTP,
@@ -7194,6 +7458,7 @@ mod tests {
             notifier: notifier.clone(),
             driver_gate: UsdcDriverGate::unpaused(),
             unrecorded_guards: None,
+            underfunded_alerts: UnderfundedAlertLatch::default(),
         };
         let market_making = TransferUsdcToMarketMakingCtx {
             transfer: Arc::new(TerminalAlpacaToBase(TerminalOutcome::CorridorMismatch)),

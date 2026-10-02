@@ -110,7 +110,9 @@ use crate::wrapped_equity_recovery::{WrappedEquityRecoveryJob, WrappedEquityReco
 pub(crate) use equity::{EquityRebalancingCheck, EquityRebalancingCheckScheduler};
 #[cfg(test)]
 pub(crate) use freeze::StubFreezeReader;
-pub(crate) use usdc::{UsdcRebalancingCheck, UsdcRebalancingCheckScheduler};
+pub(crate) use usdc::{
+    USDC_WITHDRAW_REJECTION_COOLDOWN, UsdcRebalancingCheck, UsdcRebalancingCheckScheduler,
+};
 
 /// Bundle of the equity + USDC schedulers so constructors and plumbing
 /// functions can pass them as a single argument instead of two.
@@ -873,6 +875,14 @@ pub(crate) struct RebalancingService {
     /// When each `(symbol, chain)` pair last dispatched an operation, so a
     /// transfer truncated by a limit is not re-planned every tick.
     equity_cooldowns: RwLock<HashMap<(Symbol, Chain), DateTime<Utc>>>,
+    /// When a Base->Alpaca vault withdraw on a chain last failed without
+    /// starting (see `usdc::USDC_WITHDRAW_REJECTION_COOLDOWN`). The `None`
+    /// key holds every chain, for a failure whose corridor is unknown.
+    usdc_withdraw_rejections: RwLock<HashMap<Option<Chain>, DateTime<Utc>>>,
+    /// Shared with the Base->Alpaca job: at most one under-funded page per
+    /// chain per cooldown, cleared when a transfer on the chain completes or
+    /// an operator acts.
+    underfunded_alerts: crate::rebalancing::usdc::UnderfundedAlertLatch,
     /// Each symbol's price for valuing the minimum, attached through
     /// `set_last_price_reader`; without one no minimum can be valued and
     /// every plan declines.
@@ -1192,6 +1202,8 @@ impl RebalancingService {
             usdc_gas_readiness: RwLock::new(BTreeMap::new()),
             equity_gas_readiness: RwLock::new(BTreeMap::new()),
             equity_cooldowns: RwLock::new(HashMap::new()),
+            usdc_withdraw_rejections: RwLock::new(HashMap::new()),
+            underfunded_alerts: crate::rebalancing::usdc::UnderfundedAlertLatch::default(),
             last_prices: RwLock::new(None),
             equity_in_progress: Arc::new(std::sync::RwLock::new(HashMap::new())),
             divergence_gate: Arc::default(),
@@ -5366,6 +5378,19 @@ impl RebalancingService {
             return;
         };
 
+        if let UsdcRebalanceOperation::BaseToAlpaca { amount } = sized
+            && self.usdc_withdraw_cooling_down(chain, Utc::now()).await
+        {
+            info!(
+                target: "rebalance",
+                %chain,
+                ?amount,
+                "Skipped USDC trigger: a vault withdraw on this chain failed without \
+                 starting within the cooldown"
+            );
+            return;
+        }
+
         // The id is minted before the claim so the guard records which
         // transfer holds it; a refused or undispatched claim leaves no row.
         let id = UsdcRebalanceId(Uuid::new_v4());
@@ -5614,6 +5639,31 @@ impl RebalancingService {
             }
             ZombieJobKillOutcome::StillInFlight => Ok(true),
         }
+    }
+
+    /// Kills the Base->Alpaca job rows still queued for `id`, a transfer an
+    /// operator failed through the API. A queued row counts as an in-flight
+    /// USDC transfer, so without this no transfer is planned on the corridor
+    /// until the row next runs and finds the aggregate failed. The API route
+    /// holds the USDC driver paused, so no row is running. Returns how many
+    /// rows were killed.
+    pub(crate) async fn kill_queued_usdc_hedging_jobs(
+        &self,
+        id: &UsdcRebalanceId,
+    ) -> Result<u64, sqlx_apalis::Error> {
+        let result = sqlx_apalis::query(
+            "UPDATE Jobs SET status='Killed', done_at=strftime('%s','now') \
+             WHERE job_type = ? \
+             AND json_extract(CAST(job AS TEXT), '$.id') = ? \
+             AND (status IN ('Pending', 'Queued') \
+                  OR (status = 'Failed' AND attempts < max_attempts))",
+        )
+        .bind(std::any::type_name::<TransferUsdcToHedging>())
+        .bind(id.to_string())
+        .execute(self.transfer_usdc_to_hedging_queue.pool())
+        .await?;
+
+        Ok(result.rows_affected())
     }
 
     /// Terminates a zombie apalis Jobs row by setting its status to `Killed`.
@@ -6051,6 +6101,8 @@ impl RebalancingService {
                     claim.defuse();
                 }
                 self.usdc_guards.hold(corridor.chain(), id, direction);
+                // An operator resuming a USDC transfer re-arms the under-funded page.
+                self.underfunded_alerts.reset_all();
                 info!(
                     target: "rebalance",
                     %id,
@@ -7079,6 +7131,13 @@ impl RebalancingService {
         &self.notifier
     }
 
+    /// The under-funded withdraw page latch the Base->Alpaca job shares.
+    pub(crate) const fn underfunded_alerts(
+        &self,
+    ) -> &crate::rebalancing::usdc::UnderfundedAlertLatch {
+        &self.underfunded_alerts
+    }
+
     /// Clears the in-progress flag for an equity symbol.
     ///
     /// Removes the entry regardless of its current `GuardState`. Called by
@@ -7218,6 +7277,51 @@ impl RebalancingService {
     /// re-enqueues a transfer job keyed by the existing id. The live/row-existence
     /// checks make this idempotent with apalis's own re-pick of still-owned rows.
     /// See ADR 2.
+    /// Restores the withdraw cooldown, and the forced onchain cash reconcile,
+    /// for a Base->Alpaca withdrawal rejected before broadcast within the
+    /// cooldown before this start: the offline `fail-usdc-transfer`, or a
+    /// rejection the previous process recorded, never reached this process's
+    /// reactor. An aggregate that cannot be loaded holds every chain, as an
+    /// unknown chain does at runtime.
+    async fn restore_withdrawal_rejection_cooldowns(
+        &self,
+        pool: &SqlitePool,
+        usdc_store: &Store<UsdcRebalance>,
+    ) -> Result<(), RebalancingServiceError> {
+        let recent = crate::usdc_rebalance::recent_withdrawal_failures(
+            pool,
+            Utc::now(),
+            usdc::USDC_WITHDRAW_REJECTION_COOLDOWN,
+        )
+        .await?;
+        for id in recent {
+            match usdc_store.load(&id).await {
+                Ok(Some(UsdcRebalance::WithdrawalFailed {
+                    direction: RebalanceDirection::BaseToAlpaca,
+                    withdrawal_ref: None,
+                    corridor,
+                    failed_at,
+                    ..
+                })) => {
+                    let chain = corridor.chain();
+                    self.hold_after_withdraw_rejection(Some(chain), failed_at)
+                        .await;
+                    self.enqueue_cooldown_expiry_check(failed_at).await;
+                    info!(target: "rebalance", %id, %chain, %failed_at, "Restored the withdraw cooldown of a recent rejected withdrawal");
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    warn!(target: "rebalance", %id, ?error, "Failed to load a recent failed withdrawal; holding Base->Alpaca planning on every chain for the cooldown");
+                    let now = Utc::now();
+                    self.hold_after_withdraw_rejection(None, now).await;
+                    self.enqueue_cooldown_expiry_check(now).await;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     pub(crate) async fn recover_usdc_guard(
         &self,
         pool: &SqlitePool,
@@ -7227,6 +7331,8 @@ impl RebalancingService {
             ids: candidate_ids,
             unparseable,
         } = interrupted_usdc_rebalance_ids(pool).await?;
+        self.restore_withdrawal_rejection_cooldowns(pool, usdc_store)
+            .await?;
 
         let mut held = Vec::new();
         let mut held_tracking = Vec::new();
@@ -19377,6 +19483,7 @@ mod tests {
                 guards: Arc::clone(&trigger.usdc_guards),
                 store: Arc::clone(&store),
             }),
+            underfunded_alerts: crate::rebalancing::usdc::UnderfundedAlertLatch::default(),
         });
         let worker_queue = queue.clone();
         let monitor = apalis::prelude::Monitor::new()
@@ -20059,6 +20166,48 @@ mod tests {
 
     /// A `Reconciled` aggregate is a clearing terminal: startup guard recovery
     /// must NOT re-latch the guard for it (the opposite of a post-burn failure).
+    /// A withdrawal rejected before broadcast while the bot was down (the
+    /// offline `fail-usdc-transfer`) never reached the reactor, so startup
+    /// restores its cooldown and forced vault read.
+    #[tokio::test]
+    async fn recover_usdc_guard_restores_a_recent_withdrawal_rejection() {
+        let pool = crate::test_utils::setup_test_db().await;
+        let store = test_store::<UsdcRebalance>(pool.clone(), ());
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        store
+            .send(
+                &id,
+                UsdcRebalanceCommand::BeginWithdrawal {
+                    corridor: UsdcCorridor::BASE_CCTP,
+                    direction: RebalanceDirection::BaseToAlpaca,
+                    amount: usdc(400),
+                    from_block: 52_027_377,
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .send(
+                &id,
+                UsdcRebalanceCommand::RejectWithdrawal {
+                    reason: "no withdraw landed".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let service = make_trigger_with_inventory(InventoryView::default()).await;
+        service.recover_usdc_guard(&pool, &store).await.unwrap();
+
+        assert!(
+            service
+                .usdc_withdraw_cooling_down(Chain::Base, Utc::now())
+                .await
+        );
+        assert!(service.divergence_gate().is_cash_engaged());
+        assert!(!service.usdc_guards.is_held(Chain::Base));
+    }
+
     #[tokio::test]
     async fn recover_usdc_guard_does_not_relatch_for_reconciled() {
         let pool = crate::test_utils::setup_test_db().await;
@@ -23308,6 +23457,40 @@ mod tests {
         assert_eq!(
             zombie_status, "Killed",
             "zombie row must be killed even though the live Pending row blocks the overall enqueue"
+        );
+    }
+
+    /// The operator exit kills only the failed transfer's queued rows, so the
+    /// corridor stops counting it as in flight.
+    #[tokio::test]
+    async fn kill_queued_usdc_hedging_jobs_kills_only_that_transfers_rows() {
+        let service = make_trigger_with_inventory(InventoryView::default()).await;
+        let failed = UsdcRebalanceId(Uuid::new_v4());
+        let other = UsdcRebalanceId(Uuid::new_v4());
+        for id in [&failed, &other] {
+            service
+                .transfer_usdc_to_hedging_queue
+                .clone()
+                .push(TransferUsdcToHedging {
+                    corridor: UsdcCorridor::BASE_CCTP,
+                    id: id.clone(),
+                    amount: usdc(100),
+                    revert_redrive_attempts: 0,
+                    backpressure_streak: BackpressureStreak::default(),
+                })
+                .await
+                .unwrap();
+        }
+
+        let killed = service
+            .kill_queued_usdc_hedging_jobs(&failed)
+            .await
+            .unwrap();
+
+        assert_eq!(killed, 1);
+        assert_eq!(
+            count_pending_transfer_usdc_to_hedging_jobs(&service).await,
+            1
         );
     }
 
@@ -36670,6 +36853,218 @@ mod tests {
         );
     }
 
+    /// A withdrawal rejected before broadcast (`RejectWithdrawal`) fails with
+    /// no tracking: nothing moved, so the guard clears and inventory is
+    /// untouched. The plan rested on a vault balance the vault could not
+    /// cover, so later checks (a stale snapshot, a fill) must not plan the
+    /// same withdraw: USDC dispatch waits for a forced vault read fetched
+    /// after the rejection, and Base->Alpaca planning on the chain waits for
+    /// the cooldown.
+    #[tokio::test]
+    async fn withdrawal_failed_without_tracking_holds_base_to_alpaca_planning() {
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let before_rejection = Utc::now();
+        // 900 onchain, 100 offchain = TooMuchOnchain -> Base->Alpaca.
+        let inventory = InventoryView::default()
+            .with_usdc(usdc(900), usdc(100))
+            .set_active_usdc_rebalance(
+                id.clone(),
+                base_usdc_rebalance(RebalanceDirection::BaseToAlpaca),
+            );
+        let trigger = make_trigger_with_inventory(inventory).await;
+        let harness = ReactorHarness::new(Arc::clone(&trigger));
+        trigger
+            .usdc_guards
+            .hold(Chain::Base, &id, RebalanceDirection::BaseToAlpaca);
+
+        harness
+            .receive::<UsdcRebalance>(id.clone(), make_usdc_withdrawal_failed())
+            .await
+            .unwrap();
+
+        assert!(!trigger.usdc_guards.is_held(Chain::Base));
+        assert_eq!(trigger.inventory.read().await.active_usdc_rebalance(), None);
+        let available = {
+            let inventory = trigger.inventory.read().await;
+            (
+                inventory.usdc_available(Venue::MarketMaking),
+                inventory.usdc_available(Venue::Hedging),
+            )
+        };
+        assert_eq!(available, (Some(usdc(900)), Some(usdc(100))));
+        let delayed_checks: i64 = sqlx_apalis::query_scalar(
+            "SELECT COUNT(*) FROM Jobs WHERE status = 'Pending' AND job_type = ? \
+             AND run_at >= strftime('%s', 'now') + 1790",
+        )
+        .bind(std::any::type_name::<UsdcRebalancingCheck>())
+        .fetch_one(trigger.usdc_scheduler.queue().pool())
+        .await
+        .unwrap();
+        assert_eq!(
+            (
+                count_pending_usdc_check_jobs(&trigger).await,
+                delayed_checks
+            ),
+            (1, 1),
+            "the terminal event queues no immediate check, only one at the cooldown's end"
+        );
+        assert!(
+            trigger.divergence_gate().is_cash_engaged(),
+            "the rejection must request a forced vault read"
+        );
+
+        // A snapshot read before the rejection reaches the trigger late.
+        apply_and_dispatch_snapshot(
+            trigger.clone(),
+            InventorySnapshotId {
+                orderbook: TEST_ORDERBOOK,
+                owner: TEST_ORDER_OWNER,
+            },
+            InventorySnapshotEvent::OnchainUsdc {
+                chain: Chain::Base,
+                usdc_balance: usdc(900),
+                fetched_at: before_rejection,
+                block_number: Some(100),
+            },
+        )
+        .await
+        .unwrap();
+        usdc::drain_pending_usdc_jobs(&trigger).await;
+        trigger.check_and_trigger_usdc().await;
+        assert_eq!(
+            count_pending_transfer_usdc_to_hedging_jobs(&trigger).await,
+            0,
+            "a check after a stale snapshot must not plan the same withdraw again"
+        );
+        assert!(trigger.divergence_gate().is_cash_engaged());
+
+        // The forced read, fetched after the rejection, is admitted even though
+        // the balance did not change.
+        let generation = trigger
+            .divergence_gate()
+            .claim_pending_onchain_cash_reconcile(Chain::Base)
+            .expect("cash reconciliation request");
+        apply_and_dispatch_snapshot(
+            trigger.clone(),
+            InventorySnapshotId {
+                orderbook: TEST_ORDERBOOK,
+                owner: TEST_ORDER_OWNER,
+            },
+            InventorySnapshotEvent::OnchainUsdcReconciled {
+                chain: Chain::Base,
+                usdc_balance: usdc(900),
+                fetched_at: Utc::now(),
+                block_number: Some(101),
+                generation,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(!trigger.divergence_gate().is_cash_engaged());
+        usdc::drain_pending_usdc_jobs(&trigger).await;
+        trigger.check_and_trigger_usdc().await;
+        assert_eq!(
+            count_pending_transfer_usdc_to_hedging_jobs(&trigger).await,
+            0,
+            "the cooldown still holds Base->Alpaca planning on the chain"
+        );
+
+        let after_cooldown = Utc::now()
+            + chrono::Duration::from_std(usdc::USDC_WITHDRAW_REJECTION_COOLDOWN).unwrap();
+        assert!(
+            !trigger
+                .usdc_withdraw_cooling_down(Chain::Base, after_cooldown)
+                .await
+        );
+        trigger.check_and_trigger_usdc().await;
+        assert_eq!(
+            count_pending_transfer_usdc_to_hedging_jobs(&trigger).await,
+            1,
+            "planning resumes after the fresh read and the cooldown"
+        );
+    }
+
+    /// The forced read after a rejection is floored at the view's applied USDC
+    /// block: a read a lagging backend serves below it keeps the cash gate
+    /// engaged instead of clearing it while the view keeps its old balance.
+    #[tokio::test]
+    async fn forced_read_after_a_rejection_below_the_watermark_keeps_the_gate() {
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let trigger =
+            make_trigger_with_inventory(InventoryView::default().with_usdc(usdc(900), usdc(100)))
+                .await;
+        let harness = ReactorHarness::new(Arc::clone(&trigger));
+        let snapshot_id = InventorySnapshotId {
+            orderbook: TEST_ORDERBOOK,
+            owner: TEST_ORDER_OWNER,
+        };
+        apply_and_dispatch_snapshot(
+            trigger.clone(),
+            snapshot_id.clone(),
+            InventorySnapshotEvent::OnchainUsdc {
+                chain: Chain::Base,
+                usdc_balance: usdc(900),
+                fetched_at: Utc::now(),
+                block_number: Some(100),
+            },
+        )
+        .await
+        .unwrap();
+        trigger
+            .usdc_guards
+            .hold(Chain::Base, &id, RebalanceDirection::BaseToAlpaca);
+
+        harness
+            .receive::<UsdcRebalance>(id.clone(), make_usdc_withdrawal_failed())
+            .await
+            .unwrap();
+        let generation = trigger
+            .divergence_gate()
+            .claim_pending_onchain_cash_reconcile(Chain::Base)
+            .expect("cash reconciliation request");
+
+        apply_and_dispatch_snapshot(
+            trigger.clone(),
+            snapshot_id.clone(),
+            InventorySnapshotEvent::OnchainUsdcReconciled {
+                chain: Chain::Base,
+                usdc_balance: usdc(0),
+                fetched_at: Utc::now(),
+                block_number: Some(99),
+                generation,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(
+            trigger.divergence_gate().is_cash_engaged(),
+            "a forced read below the applied block must not clear the gate"
+        );
+
+        apply_and_dispatch_snapshot(
+            trigger.clone(),
+            snapshot_id,
+            InventorySnapshotEvent::OnchainUsdcReconciled {
+                chain: Chain::Base,
+                usdc_balance: usdc(0),
+                fetched_at: Utc::now(),
+                block_number: Some(100),
+                generation,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(!trigger.divergence_gate().is_cash_engaged());
+        assert_eq!(
+            trigger
+                .inventory
+                .read()
+                .await
+                .usdc_available(Venue::MarketMaking),
+            Some(usdc(0))
+        );
+    }
+
     #[tokio::test]
     async fn deposit_confirmed_with_destination_overflow_hard_fails_and_leaves_guard_latched() {
         // Forces the generic (non-InsufficientInflight) error arm of
@@ -38411,6 +38806,7 @@ mod tests {
             notifier: notifier.clone(),
             driver_gate: UsdcDriverGate::unpaused(),
             unrecorded_guards: None,
+            underfunded_alerts: crate::rebalancing::usdc::UnderfundedAlertLatch::default(),
         };
         job.perform(&unserved_build).await.unwrap();
 

@@ -4330,7 +4330,8 @@ or once an operator moves it to a state that holds no guard (such as a pre-burn
   (`find_recent_withdrawal`) from the captured head and adopt it. An empty mined
   log scan is not proof of absence because the submission may still be pending
   or hidden by a load-balanced RPC backend; it remains unresolved and must never
-  trigger another withdrawal.
+  trigger another withdrawal. See "Under-funded vault withdraw" for the one case
+  that fails the transfer instead.
 - `BridgingSubmitting`: scan for an already-submitted burn (`find_recent_burn`)
   and adopt it rather than burning twice. The burn match stays by
   `(depositor, amount, destinationDomain, mintRecipient)` when transfers of
@@ -4940,6 +4941,31 @@ drives the same id or the store cannot be read. No event means nothing was
 withdrawn, converted, or burned, and neither the reactor nor the sweep would
 ever see that id, so the guard would otherwise stay held until a restart and
 both the trigger and `capital transfer-usdc` would refuse the corridor.
+
+##### Under-funded vault withdraw
+
+The shared inventory reverts a `withdraw4` the vault cannot cover
+(`InsufficientVaultLiquidity`). Nothing leaves the vault on that revert, but
+only a revert at the first send attempt's gas estimate proves no withdraw for
+the transfer was ever sent. The wallet marks that case
+(`RejectedBeforeBroadcast`); nonce and fee recovery drop the mark, because a raw
+send before theirs may have been accepted.
+
+- Rejected before broadcast: the manager sends `RejectWithdrawal`, the transfer
+  ends in `WithdrawalFailed` with no withdrawal reference, and the guard clears.
+  Nothing is retried. The trigger then requests a forced onchain cash reconcile
+  for the chain (USDC dispatch waits for a vault read at or above the view's
+  applied block, emitted even when unchanged) and holds Base->Alpaca planning on
+  the chain for 30 minutes, so a cause a fresh read does not fix cannot loop. A
+  delayed USDC check runs when the hold ends. Startup restores the hold and the
+  forced read from recent `WithdrawalFailed` events with no withdrawal
+  reference, so a restart or the offline `fail-usdc-transfer` does not lift it.
+  The alert pages at most once per chain per 30 minutes while the cause
+  persists; a completed transfer on the chain, an operator fail or resume, or a
+  restart re-arms it at once.
+- Any other under-funded revert: the transfer latches at `WithdrawalSubmitting`
+  with one alert naming `from_block`. The operator checks the chain and either
+  resumes (a withdrawal landed) or fails it with `fail-usdc-transfer`.
 
 ##### Startup re-arm for `BridgingSubmitting` and `WithdrawalSubmitting{BaseToAlpaca}`
 
@@ -6287,7 +6313,20 @@ transfer or adopt a burn between the preflight and the send. The route does not
 read the chain, so the onchain check above still applies. Both send the same
 `FailBridging` command; the eligibility gate (`pre_burn_fail_eligibility`) is
 the single source shared by both, so both refuse the same states after the burn.
-The live route additionally refuses every BaseToAlpaca transfer.
+The live route additionally refuses every BaseToAlpaca transfer past its vault
+withdrawal.
+
+Both surfaces also accept a BaseToAlpaca transfer at `WithdrawalSubmitting`: the
+vault withdrawal intent is recorded but no withdrawal was ever initiated. For it
+they send `RejectWithdrawal { reason }`, which emits `WithdrawalFailed` with no
+withdrawal reference. No inventory moved, so the guard clears (live through the
+reactor, offline on restart), the live route kills the transfer's queued job
+rows, and the corridor's withdraw cooldown starts. The command does not read the
+chain: before using it the operator confirms on chain that the bot wallet made
+no `OperatorWithdraw` on the inventory after the transfer's `from_block`. A
+withdrawal that did land is adopted with `transfer resume` instead. The bot
+fails such a transfer itself when its withdraw was rejected before broadcast
+(see "Under-funded vault withdraw").
 
 The guard outcome depends on the direction. For a BaseToAlpaca transfer the
 vault withdrawal already moved the USDC to the market maker wallet, which the
@@ -6301,26 +6340,26 @@ transfer the withdrawal already completed, so the funds are off Alpaca:
 startup, and the operator settles the funds with
 `transfer reconcile --kind usdc`, which releases the guard. The live route
 reports this split in its `guardHeld` response field. The command is valid ONLY
-from `BridgingSubmitting` or `WithdrawalComplete` -- it is refused for all
-post-burn states (`Bridging`, `AwaitingAttestation`, `Attested`, `Bridged`,
-`DepositInitiated`, `DepositConfirmed`, `DepositFailed`, `Reconciled`, or any
-`BridgingFailed` with a recorded `burn_tx_hash`). The two surfaces differ in how
-the in-memory guard is reconciled. The live route sends `FailBridging` through
-the conductor-built wired store, so the rebalancing reactor runs in process and
-keeps the transfer's corridor guard held for the AlpacaToBase outcome, matching
-the reported `guardHeld`. The timeout sweep never clears the guard of an
-AlpacaToBase transfer past its withdrawal with no confirmed burn
-(`BridgingSubmitting`, or `BridgingFailed` with no burn): it holds the guard
-without a tombstone and pages once that the transfer has no confirmed burn and
-its funds are off Alpaca, naming the recovery step, until the operator
-reconciles. Neither state proves that no burn was broadcast: a crash between a
-burn's broadcast and its record leaves the same state. So before reconciling the
-operator verifies on chain that no burn left the market maker wallet. The
-offline CLI writes through a standalone store the (stopped) bot's reactor never
-observes, so its outcome is reconciled on the next startup: `recover_usdc_guard`
-clears a non-guard-holding aggregate and re-latches an AlpacaToBase one until
-the operator reconciles. Either way, once the guard is released automatic USDC
-rebalancing resumes.
+from `BridgingSubmitting`, `WithdrawalComplete`, or a BaseToAlpaca
+`WithdrawalSubmitting` (above) -- it is refused for all post-burn states
+(`Bridging`, `AwaitingAttestation`, `Attested`, `Bridged`, `DepositInitiated`,
+`DepositConfirmed`, `DepositFailed`, `Reconciled`, or any `BridgingFailed` with
+a recorded `burn_tx_hash`). The two surfaces differ in how the in-memory guard
+is reconciled. The live route sends `FailBridging` through the conductor-built
+wired store, so the rebalancing reactor runs in process and keeps the transfer's
+corridor guard held for the AlpacaToBase outcome, matching the reported
+`guardHeld`. The timeout sweep never clears the guard of an AlpacaToBase
+transfer past its withdrawal with no confirmed burn (`BridgingSubmitting`, or
+`BridgingFailed` with no burn): it holds the guard without a tombstone and pages
+once that the transfer has no confirmed burn and its funds are off Alpaca,
+naming the recovery step, until the operator reconciles. Neither state proves
+that no burn was broadcast: a crash between a burn's broadcast and its record
+leaves the same state. So before reconciling the operator verifies on chain that
+no burn left the market maker wallet. The offline CLI writes through a
+standalone store the (stopped) bot's reactor never observes, so its outcome is
+reconciled on the next startup: `recover_usdc_guard` clears a non-guard-holding
+aggregate and re-latches an AlpacaToBase one until the operator reconciles.
+Either way, once the guard is released automatic USDC rebalancing resumes.
 
 **Operator reconciliation of a stranded post-burn failure**: A USDC rebalance
 that fails after the CCTP burn holds the rebalancing guard, blocking further

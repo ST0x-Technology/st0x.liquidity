@@ -17,7 +17,7 @@ pub(crate) use driver_pause::{
 pub(crate) use job::{
     ResumeAlpacaToBase, ResumeBaseToAlpaca, TransferUsdcToHedging, TransferUsdcToHedgingCtx,
     TransferUsdcToHedgingJobQueue, TransferUsdcToMarketMaking, TransferUsdcToMarketMakingCtx,
-    TransferUsdcToMarketMakingJobQueue, UnrecordedGuardRelease,
+    TransferUsdcToMarketMakingJobQueue, UnderfundedAlertLatch, UnrecordedGuardRelease,
 };
 #[cfg(test)]
 pub(crate) use manager::RecoveredCctpMint;
@@ -115,16 +115,35 @@ pub enum UsdcTransferError {
         source: Box<RaindexError>,
     },
     /// The shared inventory reverted a `withdraw4` because the vault could not
-    /// cover the requested amount (a concurrent clear drained it). Distinct from
-    /// the opaque `Vault` wrap so it is not redriven blindly: retrying the same
-    /// withdraw reverts again until the vault is refunded, so the job latches
-    /// the aggregate at `WithdrawalSubmitting` for operator reconciliation
-    /// (no auto-retry); the operator refunds the vault, then redrives.
+    /// cover the requested amount (a concurrent clear drained it), and a
+    /// withdraw for this transfer may have been broadcast. Distinct from the
+    /// opaque `Vault` wrap so it is not redriven blindly: the job latches the
+    /// aggregate at `WithdrawalSubmitting` (no auto-retry). A resume only
+    /// adopts a withdrawal mined after `from_block`; if the operator finds none
+    /// on chain, they fail the transfer with `fail-usdc-transfer`.
     #[error(
-        "inventory vault under-funded on withdraw of {token}: requested {requested}, vault \
-         could cover only {received}; latched for operator reconciliation"
+        "USDC rebalance {id}: inventory vault under-funded on withdraw of {token}: requested \
+         {requested}, vault could cover only {received}; a withdraw may have been broadcast \
+         after block {from_block}, latched for operator reconciliation"
     )]
     InsufficientVaultLiquidity {
+        id: UsdcRebalanceId,
+        from_block: u64,
+        token: Address,
+        requested: U256,
+        received: U256,
+    },
+    /// The shared inventory could not cover the withdraw, and the evm layer
+    /// proved the withdraw was rejected before broadcast. `RejectWithdrawal`
+    /// is committed: the transfer is failed, nothing left the vault, and the
+    /// guard clears so rebalancing can plan again.
+    #[error(
+        "USDC rebalance {id}: inventory vault under-funded on withdraw of {token}: requested \
+         {requested}, vault could cover only {received}; rejected before broadcast, transfer \
+         failed"
+    )]
+    WithdrawalRejectedUnderfunded {
+        id: UsdcRebalanceId,
         token: Address,
         requested: U256,
         received: U256,
@@ -642,6 +661,7 @@ impl UsdcTransferError {
             | Self::BurnRevert(_)
             | Self::Vault(_)
             | Self::InsufficientVaultLiquidity { .. }
+            | Self::WithdrawalRejectedUnderfunded { .. }
             | Self::Aggregate(_)
             | Self::WithdrawalFailed { .. }
             | Self::DepositFailed { .. }
@@ -707,6 +727,7 @@ impl BotGasFailureClassifier for UsdcTransferError {
             | Self::BurnRevert(_)
             | Self::Vault(_)
             | Self::InsufficientVaultLiquidity { .. }
+            | Self::WithdrawalRejectedUnderfunded { .. }
             | Self::Aggregate(_)
             | Self::WithdrawalFailed { .. }
             | Self::DepositFailed { .. }

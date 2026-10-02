@@ -1406,8 +1406,9 @@ mod tests {
             .unwrap_err();
 
         assert!(
-            matches!(error, EvmError::Transport(_)),
-            "expected Transport error from Anvil pre-simulation revert, got: {error:?}"
+            error.was_never_broadcast() && matches!(error.underlying(), EvmError::Transport(_)),
+            "expected a Transport error from Anvil pre-simulation revert, marked as never \
+             broadcast, got: {error:?}"
         );
     }
 }

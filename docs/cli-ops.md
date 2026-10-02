@@ -720,7 +720,9 @@ guard records the transfers that hold it. Who touches it, and when:
 ### Clearing a pre-burn guard latch
 
 Use `fail-usdc-transfer` when a USDC rebalance is stranded at
-`WithdrawalComplete` or `BridgingSubmitting`. This transitions the aggregate to
+`WithdrawalComplete` or `BridgingSubmitting`, or a Base->Alpaca rebalance is
+stranded at `WithdrawalSubmitting` (see "Withdrawal that never reached the
+chain" below). For the first two it transitions the aggregate to
 `BridgingFailed` (pre-burn, `burn_tx_hash: None`). The guard outcome depends on
 the direction:
 
@@ -772,6 +774,26 @@ that no recent CCTP burn was submitted from the market-maker wallet (e.g. via
   accepts persisted post-burn terminals such as `DepositFailed`). Instead, run
   `transfer resume --kind usdc`: its `find_recent_burn` scan adopts the orphan
   burn, persists `BridgingInitiated`, and the transfer continues normally.
+
+#### Withdrawal that never reached the chain
+
+A Base->Alpaca transfer at `WithdrawalSubmitting` recorded its vault withdrawal
+intent (with `from_block`), but no withdrawal was initiated. A resume only
+adopts a withdrawal mined after `from_block` and never re-issues one, so if none
+landed it scans forever. First check on Base for an `OperatorWithdraw` by the
+bot wallet on the inventory after `from_block` (the latch alert names the
+block). A withdraw the network accepted but has not mined is not in the logs
+yet, so also wait until the transfer's attempt timeout has passed and confirm
+the bot wallet has no pending transaction to the inventory (no pending
+`withdraw4` in the explorer, or pending nonce equal to latest nonce):
+
+- **If one landed**: run `transfer resume --kind usdc`; it adopts it.
+- **If none landed**: run `fail-usdc-transfer`. It sends `RejectWithdrawal`, and
+  the transfer ends in `WithdrawalFailed` with no withdrawal recorded. Nothing
+  moved, so the guard clears. The live route (bot running) clears it at once and
+  kills the transfer's queued job rows; the offline command clears it on
+  restart. Base->Alpaca planning on the corridor then waits for the 30-minute
+  withdraw cooldown and a fresh vault read; both survive a restart.
 
 `transfer reconcile` is the path for persisted terminal failures whose funds
 left the source venue (e.g. `DepositFailed`, `BridgingFailed` with a burn tx

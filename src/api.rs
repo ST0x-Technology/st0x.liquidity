@@ -2632,6 +2632,9 @@ async fn clear_pending_usdc_burn(
     }))
 }
 
+/// `outcome` of a BaseToAlpaca transfer failed at `WithdrawalSubmitting`.
+const FAILED_WITHDRAWAL_NEVER_SENT: &str = "failed_withdrawal_never_sent";
+
 /// Wire contract for the fail-usdc-transfer route.
 #[derive(Deserialize)]
 struct FailUsdcTransferRequest {
@@ -2646,9 +2649,10 @@ struct FailUsdcTransferResponse {
     transfer_id: String,
     outcome: &'static str,
     /// Whether the rebalancing guard is still held after the failure, read
-    /// from the durable state. The route only fails AlpacaToBase transfers,
-    /// whose withdrawal already moved the funds off Alpaca, so the guard stays
-    /// held until `reconcile-usdc` settles them.
+    /// from the durable state. A pre-burn AlpacaToBase failure keeps it: the
+    /// withdrawal already moved the funds off Alpaca, so the guard stays held
+    /// until `reconcile-usdc` settles them. A BaseToAlpaca withdrawal that
+    /// never reached the chain clears it.
     guard_held: bool,
 }
 
@@ -2658,9 +2662,18 @@ struct FailUsdcTransferResponse {
 /// accepts post-burn `Bridging` / `Attested` and would emit a guard-holding
 /// failure, so [`UsdcRebalance::pre_burn_fail_eligibility`] is the
 /// authoritative gate, shared with `stox fail-usdc-transfer`. Also refuses
-/// every BaseToAlpaca transfer: its vault withdrawal already moved the USDC to
-/// the market maker wallet, and the live reactor would credit it back to the
-/// vault, so those stay with the offline CLI.
+/// every other BaseToAlpaca transfer: its vault withdrawal already moved the
+/// USDC to the market maker wallet, and the live reactor would credit it back
+/// to the vault, so those stay with the offline CLI.
+///
+/// A BaseToAlpaca transfer at `WithdrawalSubmitting` is accepted and failed
+/// with `RejectWithdrawal`: its withdrawal was never initiated, so the reactor
+/// credits nothing and clears the guard. The route cannot prove the withdraw
+/// never landed, so the operator first confirms on chain that the bot wallet
+/// made no `OperatorWithdraw` after the transfer's `from_block`; a withdrawal
+/// that did land must be adopted with resume-usdc instead. The route kills
+/// the transfer's queued job rows, which would otherwise count as an
+/// in-flight transfer, and the failure starts the corridor's withdraw cooldown.
 ///
 /// Runs in the bot process under the resume lock and with the USDC driver
 /// quiesced: a worker execution, including the burn broadcast it spawns,
@@ -2720,6 +2733,23 @@ async fn fail_usdc_transfer(
     .await?;
 
     let response = fail_pre_burn_usdc_transfer(&handle.usdc_store, &id, reason).await?;
+    // An operator acting on a USDC transfer re-arms the under-funded page.
+    handle.rebalancing_service.underfunded_alerts().reset_all();
+    if response.outcome == FAILED_WITHDRAWAL_NEVER_SENT {
+        match handle
+            .rebalancing_service
+            .kill_queued_usdc_hedging_jobs(&id)
+            .await
+        {
+            Ok(killed) => info!(%id, killed, "Killed the failed transfer's queued job rows"),
+            Err(error) => warn!(
+                %id,
+                ?error,
+                "Failed to kill the failed transfer's queued job rows; USDC planning on the \
+                 corridor resumes once the row next runs"
+            ),
+        }
+    }
     Ok(Json(response))
 }
 
@@ -2748,6 +2778,15 @@ async fn fail_pre_burn_usdc_transfer(
             }),
         ));
     };
+
+    if let UsdcRebalance::WithdrawalSubmitting {
+        direction: RebalanceDirection::BaseToAlpaca,
+        from_block,
+        ..
+    } = &rebalance
+    {
+        return reject_unsent_usdc_withdrawal(store, id, reason, *from_block).await;
+    }
 
     let eligibility = rebalance.pre_burn_fail_eligibility();
     let direction = rebalance.direction();
@@ -2781,8 +2820,9 @@ async fn fail_pre_burn_usdc_transfer(
              is already in its cleared state and will not re-arm on restart."
         )),
         PreBurnFailEligibility::NotAtBridgeBoundary => Some(format!(
-            "fail-usdc-transfer is only valid from WithdrawalComplete or BridgingSubmitting \
-             with no recorded burn; transfer {id} is in {}.",
+            "fail-usdc-transfer is only valid from WithdrawalComplete, BridgingSubmitting \
+             with no recorded burn, or a BaseToAlpaca WithdrawalSubmitting; transfer {id} is \
+             in {}.",
             rebalance.state_name()
         )),
     };
@@ -2827,6 +2867,47 @@ async fn fail_pre_burn_usdc_transfer(
     Ok(FailUsdcTransferResponse {
         transfer_id: id.to_string(),
         outcome: "failed_pre_burn",
+        guard_held,
+    })
+}
+
+/// Fails a BaseToAlpaca transfer at `WithdrawalSubmitting` whose withdraw the
+/// operator verified never landed (see [`fail_usdc_transfer`]). Goes through
+/// the wired store so the live reactor clears the guard.
+async fn reject_unsent_usdc_withdrawal(
+    store: &Store<UsdcRebalance>,
+    id: &UsdcRebalanceId,
+    reason: String,
+    from_block: u64,
+) -> Result<FailUsdcTransferResponse, (StatusCode, Json<ErrorResponse>)> {
+    store
+        .send(
+            id,
+            UsdcRebalanceCommand::RejectWithdrawal {
+                reason: reason.clone(),
+            },
+        )
+        .await
+        .map_err(ops_command_error)?;
+
+    let Some(failed) = store.load(id).await.map_err(ops_store_error)? else {
+        error!(%id, "USDC transfer could not be reloaded after RejectWithdrawal was recorded");
+        return Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: format!(
+                    "USDC transfer {id} was failed but could not be reloaded to report its \
+                     guard state"
+                ),
+            }),
+        ));
+    };
+    let guard_held = failed.holds_rebalance_guard();
+
+    info!(%id, %reason, from_block, guard_held, "USDC transfer whose withdrawal never reached the chain failed via API");
+    Ok(FailUsdcTransferResponse {
+        transfer_id: id.to_string(),
+        outcome: FAILED_WITHDRAWAL_NEVER_SENT,
         guard_held,
     })
 }
@@ -10780,6 +10861,43 @@ mod tests {
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert!(error.error.contains("reconcile-usdc"), "{}", error.error);
         assert!(!error.error.contains("cleared state"), "{}", error.error);
+    }
+
+    /// A BaseToAlpaca transfer latched at `WithdrawalSubmitting` (the
+    /// operator verified no withdraw landed) fails with no withdrawal recorded
+    /// and clears the guard.
+    #[tokio::test]
+    async fn fail_pre_burn_usdc_transfer_fails_a_base_to_alpaca_withdrawal_submitting() {
+        let pool = crate::test_utils::setup_test_db().await;
+        let id = UsdcRebalanceId(uuid::Uuid::new_v4());
+        let store = standalone_usdc_store(&pool).await;
+        store
+            .send(
+                &id,
+                UsdcRebalanceCommand::BeginWithdrawal {
+                    corridor: UsdcCorridor::BASE_CCTP,
+                    direction: RebalanceDirection::BaseToAlpaca,
+                    amount: Usdc::new(float!(1971.318665)),
+                    from_block: 52_027_377,
+                },
+            )
+            .await
+            .unwrap();
+
+        let body = fail_pre_burn_usdc_transfer(&store, &id, "no withdraw landed".to_string())
+            .await
+            .unwrap_or_else(|(status, Json(error))| panic!("{status}: {}", error.error));
+
+        assert_eq!(body.outcome, "failed_withdrawal_never_sent");
+        assert!(!body.guard_held);
+        assert!(matches!(
+            load_usdc_rebalance(&pool, &id).await,
+            UsdcRebalance::WithdrawalFailed {
+                direction: RebalanceDirection::BaseToAlpaca,
+                withdrawal_ref: None,
+                ..
+            }
+        ));
     }
 
     #[tokio::test]
