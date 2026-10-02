@@ -267,14 +267,14 @@ chain's signing wallet, orderbook, `redemption_wallet` and
 
 ### 4b. Publish and verify adoption
 
-Merge the `st0x.registry` change; its CI publishes the token file. After the
-unpinned reload release, the bot polls every ten seconds and validates each
-observed generation before a graceful restart. No liquidity pin-bump PR or
-config-only release is needed. Start with a disabled listing, verify adoption,
-then enable trading in a second publish. Newly configured contracts are probed
-including disabled rows; newly selected tokenization routes and changed startup
-approval targets are checked too. Missing Turnkey coverage or transient RPC
-failures defer adoption until the dependency is fixed, without a republish.
+Merge the `st0x.registry` change; its CI publishes the token file. Staging and
+production follow the latest copy. The bot polls every ten seconds and validates
+each observed generation before a graceful restart. No liquidity PR or release
+is needed. Start with a disabled listing, verify adoption, then enable trading
+in a second publish. Newly configured contracts are probed including disabled
+rows; newly selected tokenization routes and changed startup approval targets
+are checked too. Missing Turnkey coverage or transient RPC failures defer
+adoption until the dependency is fixed, without a republish.
 
 Check `registry_applied_generation`, the structured generation/hash logs and
 `registry_reloads_total{result}`. A refused copy sets `registry_invalid` and
@@ -282,12 +282,14 @@ leaves the current configuration running. Promotion to last-good requires ten
 minutes of uptime; two failed boots fall back to the previous good set plus new
 listings disabled. Reloads are debounced for two minutes.
 
-During rollout production still pins `generation`, and the watcher only reports
-changes. Release the state-seeding code first, verify last-good exists on the
-data disk, then remove the pin in a second release. The t0.devops compose gates
-must pass `--registry-state /mnt/data/registry` and manage the deployment hold
-before that second release. Keep the production fixture aligned with the pin
-until it is removed; `tokens-production-migration.toml` stays frozen.
+The bot config has no `generation` pin, and the bot refuses one. To hold a
+change back, do not merge it in `st0x.registry`. To undo a change, publish the
+previous file from `st0x.registry`: the bot applies it like any other change. A
+listing that the revert removes is carried forward disabled (see below).
+
+`tests/fixtures/tokens-production.toml` is a recent copy of the production file
+for tests. Refresh it by hand when a test needs a newer listing;
+`tokens-production-migration.toml` stays frozen.
 
 Offline checks continue to accept `--registry-file`. Deployment checks accept
 `--registry-state` and judge pending plus fallback, or running. These readers
@@ -297,7 +299,8 @@ never change boot attempts or promote state.
 
 Removing a listing from the token file carries its previous row forward with
 trading, rebalancing and wrapped-equity recovery disabled. The same applies to a
-listing removed on one chain while the symbol stays on another. Existing
+listing removed on one chain while the symbol stays on another. The bot does
+this as soon as it adopts the new copy; there is no pin to bump. Existing
 transfers and recoveries finish; new work stops. Already queued hedges still
 cover fills accepted before the disable.
 
@@ -338,8 +341,8 @@ For adding asset **XYZ**:
       first orchestrator-mode mint fails at signing without it
 - [ ] Verify staging applied the disabled asset generation
 - [ ] Enable trading in the token file and verify adoption
-- [ ] Repeat for production when staging looks good (during pinned rollout,
-      apply a reviewed generation bump and release)
+- [ ] Repeat for production in `t0/production.toml` when staging looks good, and
+      verify production applied the new generation
 
 ---
 

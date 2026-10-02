@@ -1806,12 +1806,8 @@ fn validate_config(
 ) -> Result<ValidatedConfigParts, CtxError> {
     if let (Some(registry), TokenFile::Bytes(_)) = (&config.registry, tokens) {
         startup_notices.push(StartupNotice::info(format!(
-            "per-symbol tables read from {} ({})",
-            registry.url,
-            registry.generation.map_or_else(
-                || "latest copy".to_string(),
-                |generation| format!("generation {generation}")
-            )
+            "per-symbol tables read from the token file for {}",
+            registry.url
         )));
     }
     if let Some(schedule) = config
@@ -2133,6 +2129,12 @@ fn config_from(
         path: config_path.to_path_buf(),
         source,
     };
+    if let Ok(table) = toml::from_str::<toml::Table>(config_str) {
+        registry::refuse_pin(&table).map_err(|source| CtxError::Registry {
+            path: config_path.to_path_buf(),
+            source,
+        })?;
+    }
     let config: Config = toml::from_str(config_str).map_err(config_error)?;
     let (table, registry) = config_table(config_str, config_path, tokens, startup_notices)?;
     if registry.is_none() {
@@ -2147,9 +2149,8 @@ fn config_from(
 #[derive(Debug, Clone, Copy)]
 pub enum TokenSource<'a> {
     /// What this host runs, read without writing anything (the CLI, the
-    /// deploy gates): the local copy when one is given, else the pinned
-    /// generation, else the state directory's running record, else the
-    /// latest bucket copy. `registry_state` names the state directory;
+    /// deploy gates): the local copy when one is given, else the state
+    /// directory's running record, else the latest bucket copy. `registry_state` names the state directory;
     /// without it, the one beside the database. See [`fetch_token_file`].
     Running {
         registry_file: Option<&'a Path>,
@@ -2175,11 +2176,9 @@ fn read_config_table(config_path: &Path) -> Result<toml::Table, CtxError> {
 /// The token file bytes a config needs, or `None` when it carries its
 /// per-symbol tables inline, without writing anything.
 ///
-/// A local copy wins;
-/// a pinned generation is read from the bucket; otherwise the record the
-/// server on this host runs, from `registry_state` or else the state beside
-/// its database; and the latest bucket copy when that state has no running
-/// record.
+/// A local copy wins; otherwise the record the server on this host runs,
+/// from `registry_state` or else the state beside its database; and the
+/// latest bucket copy when that state has no running record.
 pub async fn fetch_token_file(
     config_path: &Path,
     registry_file: Option<&Path>,
@@ -2193,7 +2192,7 @@ pub async fn fetch_token_file(
     let Some(source) = registry::source_of(&table).map_err(registry_error)? else {
         return Ok(None);
     };
-    if registry_file.is_none() && source.generation.is_none() {
+    if registry_file.is_none() {
         let running =
             running_tokens(&table, registry_state).map_err(|source| CtxError::RegistryState {
                 path: config_path.to_path_buf(),
@@ -2239,8 +2238,7 @@ pub async fn fetch_gate_token_files(
     else {
         return Ok(vec![None]);
     };
-    if source.generation.is_none()
-        && registry_file.is_none()
+    if registry_file.is_none()
         && let Some(dir) = state_dir
     {
         let copies = registry_state::gate_effective(dir, &table).map_err(|source| {
@@ -9812,7 +9810,7 @@ mod tests {
     /// runs, on a symbol whose policy enables extended hours.
     #[test]
     fn a_fallback_from_the_production_copy_passes_the_boot_checks() {
-        let tokens = registry::fixtures::pinned_production_tokens();
+        let tokens = registry::fixtures::production_tokens();
         let failed = registry::project(&registry::parse(&tokens).unwrap()).unwrap();
         let mut last_good = failed.clone();
         for rows in last_good.chain_rows.values_mut() {
@@ -9828,7 +9826,7 @@ mod tests {
     #[test]
     fn server_config_toml_is_valid() {
         let config_str = include_str!("../../../config/prod/st0x-hedge.toml");
-        let tokens = registry::fixtures::pinned_production_tokens();
+        let tokens = registry::fixtures::production_tokens();
         let (config, _) = config_from(
             config_str,
             Path::new("config/prod/st0x-hedge.toml"),
@@ -9980,7 +9978,7 @@ mod tests {
             (
                 "prod",
                 include_str!("../../../config/prod/st0x-hedge.toml"),
-                registry::fixtures::pinned_production_tokens(),
+                registry::fixtures::production_tokens(),
                 &prod_equities,
             ),
             (
@@ -10286,12 +10284,12 @@ mod tests {
         );
     }
 
-    /// The copy production runs is the fixture the pin names: a pin bump
-    /// without that fixture fails here, before a VM boot finds out, and the
-    /// copy must pass every check the deployed config runs.
+    /// A recent production copy passes every check the deployed config
+    /// runs, so a config change that a production token file cannot meet
+    /// fails here, before a VM boot finds out.
     #[test]
-    fn the_pinned_production_copy_passes_the_deployed_config() {
-        let tokens = registry::fixtures::pinned_production_tokens();
+    fn the_production_copy_passes_the_deployed_config() {
+        let tokens = registry::fixtures::production_tokens();
         let config_path = Path::new("config/prod/st0x-hedge.toml");
         let mut notices = Vec::new();
         let (config, live) = config_from(
@@ -10617,6 +10615,30 @@ mod tests {
         assert!(
             matches!(error, CtxError::ConfigToml { .. }),
             "expected ConfigToml, got {error:?}"
+        );
+    }
+
+    /// A pinned `[registry]` is refused by name on the config-only path too,
+    /// not as a generic unknown field.
+    #[test]
+    fn validate_config_file_refuses_a_registry_pin_by_name() {
+        let config_str = format!(
+            "{}\n[registry]\nurl = \"gs://bucket/tokens.toml\"\ngeneration = 1\n",
+            std::fs::read_to_string(example_config_toml()).unwrap()
+        );
+        let config = toml_file(&config_str);
+
+        let error = Ctx::validate_config_file(config.path(), TokenFile::Skipped).unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                CtxError::Registry {
+                    source: registry::RegistryError::Pinned,
+                    ..
+                }
+            ),
+            "expected the pin refusal, got {error:?}"
         );
     }
 

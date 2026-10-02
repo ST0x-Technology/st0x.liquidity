@@ -182,11 +182,11 @@ The deploy gates accept `--registry-state /mnt/data/registry` and validate
 pending plus fallback, or running; they never mutate the manifest. With an
 explicit state path but no seeded state, gates fetch the token file.
 
-After the separate unpin release, accepted token changes apply by a validated
+The bot follows the latest token file in every environment, and a `[registry]`
+`generation` pin is refused. Accepted token changes apply by a validated
 graceful restart, with ten-second metadata polling, immutable disk records,
 ten-minute last-good promotion and fallback after two failed boots. Removed
-listings persist disabled so durable work can finish. During the first rollout,
-production remains pinned and the watcher reports changes only. See
+listings persist disabled so durable work can finish. See
 [asset publication](docs/how-to-add-new-asset.md#4b-publish-and-verify-adoption)
 and [registry metrics](docs/observability.md#registry-reloads).
 

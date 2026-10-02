@@ -200,7 +200,7 @@ async fn poll(
     } else {
         error!("registry metric integer cannot be represented as f64");
     }
-    if held_for_deploy || live.source.generation.is_some() {
+    if held_for_deploy {
         return Ok(false);
     }
     let unchanged = registry::describe_change(&live.live, &candidate.projection).is_none();
@@ -664,7 +664,6 @@ mod tests {
         registry::RegistryLive::for_test(
             registry::RegistrySource {
                 url: "gs://bucket/tokens.toml".into(),
-                generation: None,
             },
             toml::Table::new(),
             registry::project(&registry::parse(bytes).unwrap()).unwrap(),
