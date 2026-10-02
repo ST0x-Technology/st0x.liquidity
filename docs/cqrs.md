@@ -412,6 +412,17 @@ let entity: Option<Position> = load_aggregate::<Position>(pool, &symbol)
 Gated behind `#[cfg(test)]` / `feature = "test-support"`. Bypasses the CQRS
 framework (no reactors dispatched). Production code reads through `Projection`.
 
+### Retained-history ownership checks
+
+The current aggregate state may no longer carry a transaction hash after
+reconciliation. For historical ownership checks, capture `head_rowid(pool)` once
+and page `events_since::<Entity>` through that fixed head, advancing from the
+last returned rowid. This uses typed framework events instead of raw event table
+SQL and bounds each page, not the history examined. It is valid for
+`CompactionPolicy::Retain` financial streams; a compacted observational stream
+cannot prove ownership from pruned events. Read/deserialization failures leave
+ownership unknown and must fail closed before adopting a financial transaction.
+
 ## Forbidden Patterns
 
 1. **NEVER write directly to the `events` table** -- use `Store::send()`
