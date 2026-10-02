@@ -492,6 +492,10 @@ is the source of truth for terminology and naming conventions.
   `Conductor::start`. Never call `sqlite_cqrs()` or `CqrsFramework::new()`
   elsewhere in the server path. Direct construction is fine in
   test/CLI/migration code
+- **`SCHEMA_VERSION` bumps at most once per PR**: compare with `master`, not
+  with earlier commits of the same PR. Nothing ships between review rounds, so a
+  PR that already bumps an entity's version must not bump it again. See
+  [docs/cqrs.md](docs/cqrs.md#schema-versioning)
 - **CQRS Aggregate Services Pattern**: Use cqrs-es Services for side-effects in
   `handle()` to ensure atomicity with events. **Naming:** `{Action}er` trait ->
   `{Domain}Service` implements -> `{Domain}Manager` orchestrates. See
