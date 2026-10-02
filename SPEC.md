@@ -6761,8 +6761,8 @@ effect rather than a generic intent:
   signed deposit sends and before any startup approval or revoke, the bot
   records the outcome of every pending burn whose receipt now decides, and
   reserves the nonce of every other one signed by the source wallet and
-  rebroadcasts its exact bytes (except one already mined at the required
-  confirmations without `MessageSent`, which keeps the reservation only; one
+  rebroadcasts its exact bytes (except one the node shows mined, a shallow
+  receipt or one without `MessageSent`, which keeps the reservation only; one
   signed by another wallet is skipped and gates its chain); a chain with such a
   burn not mined yet skips its startup approvals and revokes, as for a deposit
   send. A pending burn that will not mine at its fee keeps its nonce on the
@@ -6772,38 +6772,41 @@ effect rather than a generic intent:
   it with `POST /liquidity-write/capital/cctp-burn-supersede` (`operationId`,
   `supersedingTx`). The named tx must be mined from the burn's signer at the
   burn's nonce with the source chain's required confirmations, and the burn
-  itself unmined. A reverted tx or a plain cancel records `Superseded`. A fee
-  bumped copy of the burn (a wallet's speed up: the burn's exact calldata to the
-  same TokenMessenger, no value, with `MessageSent` in its receipt) records
-  `Replaced`, and the copy becomes the operation's burn tx for `complete-mint`.
-  Either way the route releases the wallet's hold on the nonce, again on every
-  later call, since a stale rebroadcast can book it again. Any other successful
-  tx is refused with `409`, since it may have moved funds; a failed chain read
-  answers `502`, and an unknown id `404`. A burn whose outcome is recorded or
-  whose own receipt now decides reports that status instead. The vault verbs and
-  `reset-allowance` take neither the lock nor the pause, like the `st0x-cli`
-  verbs: pausing the driver would refuse every vault operation for the length of
-  each USDC transfer. `vault-deposit` does take its own lock (`409` while
-  another `vault-deposit` request runs): the deposit reads the allowance and
-  approves exactly the amount when it is short, so two concurrent requests for a
-  token without the startup MAX grant could overwrite each other's approval. The
-  lock covers these requests only: without the MAX grant, a request can still
-  use up the exact approval of a USDC transfer worker's deposit, which then
-  reverts and needs a redrive. `vault-withdraw` and `vault-withdraw-usdc` share
-  a withdraw lock of their own (`409` while either runs), held until the outcome
-  of the tx it answered with is known, for the rerun reason below; it does not
-  cover the bot's own transfer withdrawals. Every capital route refuses with
-  `503` until startup completes, like `process-tx`, since the startup preflights
-  (each chain's id, the inventory `OPERATOR_ROLE`) have not passed before then.
-  Each route that sends a transaction runs it on a tracked detached task, like
-  `process-tx`, so a client or load balancer timeout cannot drop a transaction
-  between its broadcast and its receipt, graceful shutdown waits for it, and the
-  task logs its own outcome. The vault verbs and `reset-allowance` answer at the
-  broadcast like `cctp-bridge`, with the same response bodies, since the tx
-  hash, the raw amount and the decimals are all known before the send: the 12
-  confirmations production requires on Ethereum take about two and a half
-  minutes, longer than the load balancer cut. These verbs refuse a chain without
-  a `[chains.<name>.trading]` table with `400`, and Ethereum has none in staging
+  itself unmined. The signer is read from the burn's signed bytes, so a burn
+  signed by a rotated key can be settled too; its nonce is then not released,
+  since this wallet never booked it. A reverted tx or a plain cancel records
+  `Superseded`. A fee bumped copy of the burn (a wallet's speed up: the burn's
+  exact calldata to the same TokenMessenger, no value, with `MessageSent` in its
+  receipt) records `Replaced`, and the copy becomes the operation's burn tx for
+  `complete-mint`. Either way the route releases the wallet's hold on the nonce,
+  again on every later call, since a stale rebroadcast can book it again. Any
+  other successful tx is refused with `409`, since it may have moved funds; a
+  failed chain read answers `502`, and an unknown id `404`. A burn whose outcome
+  is recorded or whose own receipt now decides reports that status instead. The
+  vault verbs and `reset-allowance` take neither the lock nor the pause, like
+  the `st0x-cli` verbs: pausing the driver would refuse every vault operation
+  for the length of each USDC transfer. `vault-deposit` does take its own lock
+  (`409` while another `vault-deposit` request runs): the deposit reads the
+  allowance and approves exactly the amount when it is short, so two concurrent
+  requests for a token without the startup MAX grant could overwrite each
+  other's approval. The lock covers these requests only: without the MAX grant,
+  a request can still use up the exact approval of a USDC transfer worker's
+  deposit, which then reverts and needs a redrive. `vault-withdraw` and
+  `vault-withdraw-usdc` share a withdraw lock of their own (`409` while either
+  runs), held until the outcome of the tx it answered with is known, for the
+  rerun reason below; it does not cover the bot's own transfer withdrawals.
+  Every capital route refuses with `503` until startup completes, like
+  `process-tx`, since the startup preflights (each chain's id, the inventory
+  `OPERATOR_ROLE`) have not passed before then. Each route that sends a
+  transaction runs it on a tracked detached task, like `process-tx`, so a client
+  or load balancer timeout cannot drop a transaction between its broadcast and
+  its receipt, graceful shutdown waits for it, and the task logs its own
+  outcome. The vault verbs and `reset-allowance` answer at the broadcast like
+  `cctp-bridge`, with the same response bodies, since the tx hash, the raw
+  amount and the decimals are all known before the send: the 12 confirmations
+  production requires on Ethereum take about two and a half minutes, longer than
+  the load balancer cut. These verbs refuse a chain without a
+  `[chains.<name>.trading]` table with `400`, and Ethereum has none in staging
   or prod today, so that cost applies once Ethereum gets one. The task then
   awaits the confirmation and logs the outcome with the tx hash, so a tx that
   reverts after the answer shows only in the bot logs. The answer does not wait

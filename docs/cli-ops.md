@@ -379,12 +379,12 @@ operation id reports its status later. A burn that never confirmed never
 attests, and `complete-mint` keeps answering `502` for it.
 
 At startup the bot reserves the nonce of every pending burn and rebroadcasts it
-before any other send from its wallet (a burn already mined with the required
-confirmations but without `MessageSent` keeps its nonce and is not sent again).
-A pending burn that will not mine at its fee keeps its nonce, and later sends
-from that wallet queue behind it. To clear it, send a 0 value transfer from the
-bot wallet to itself, with no calldata, at the burn's nonce and a higher fee;
-once that cancel has the chain's required confirmations, run
+before any other send from its wallet (a burn the node already shows mined keeps
+its nonce and is not sent again). A pending burn that will not mine at its fee
+keeps its nonce, and later sends from that wallet queue behind it. To clear it,
+send a 0 value transfer from the bot wallet to itself, with no calldata, at the
+burn's nonce and a higher fee; once that cancel has the chain's required
+confirmations, run
 `capital cctp-burn-supersede --operation-id <id> --superseding-tx <cancel-tx>`.
 The bot checks the cancel is mined from the burn's signer at the burn's nonce
 and is a plain cancel or a revert, then records the burn `superseded` and frees
@@ -396,6 +396,8 @@ burn tx to pass to `complete-mint`. Any other successful tx at the nonce is
 refused with `409`, since it may have moved funds. A burn signed by a key the
 bot no longer uses (after a rotation) is never rebroadcast or restored: startup
 pages and skips that chain's approvals and revokes, and a rerun answers `502`.
+Cancel it with the old key at its nonce and settle it the same way: the bot
+checks the cancel against the burn's own signer.
 
 A burn whose receipt succeeded without the CCTP `MessageSent` event pages
 `emitted no MessageSent` and stays `pending`: Circle has nothing to attest, so

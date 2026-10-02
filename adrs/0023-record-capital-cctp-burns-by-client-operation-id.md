@@ -116,19 +116,20 @@ side effect (`docs/cqrs.md`, "Persist intent with one command").
    or revoke, the bot records the outcome of every pending burn whose receipt
    now decides, and for every other one signed by the source wallet reserves the
    nonce (`restore_prepared_burn`) and rebroadcasts its bytes without waiting
-   for a receipt. A burn already mined at the required confirmations without
-   `MessageSent` keeps the reservation but is not sent again, and a burn signed
-   by another wallet is not restored and gates its chain. A chain with a
-   restored burn not mined yet, or both corridor chains when the burns cannot be
-   listed or loaded, joins the chains whose startup approvals and revokes are
-   skipped. Nothing here fails startup.
+   for a receipt. A burn the node already shows mined (a shallow receipt, or one
+   without `MessageSent`) keeps the reservation but is not sent again, and a
+   burn signed by another wallet is not restored and gates its chain. A chain
+   with a restored burn not mined yet, or both corridor chains when the burns
+   cannot be listed or loaded, joins the chains whose startup approvals and
+   revokes are skipped. Nothing here fails startup.
 6. **Settling a burn that will never mine.**
    `POST /liquidity-write/capital/cctp-burn-supersede` (`operationId`,
    `supersedingTx`; client `capital cctp-burn-supersede`) mirrors
-   `verify_withdrawal_superseded`: the burn must be signed by the source wallet
-   and unmined; the named tx must be a different tx from that wallet at the
+   `verify_withdrawal_superseded`: the burn must be unmined; the named tx must
+   be a different tx from the burn's own signer (read from its signed bytes, so
+   a burn of a rotated key can be settled too, without a nonce release) at the
    burn's nonce with the required confirmations, and either reverted or a plain
-   cancel (a 0 value transfer to the wallet itself with no calldata, no logs,
+   cancel (a 0 value transfer to the signer itself with no calldata, no logs,
    not EIP-7702). It then records `Superseded` and releases the nonce in the
    wallet, so startup stops restoring the burn. Like `adopt-withdrawal` for the
    vault withdrawal, a successful tx that sent the burn's exact calldata to the

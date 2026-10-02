@@ -813,11 +813,18 @@ async fn broadcast_and_answer<Held: Send + 'static>(
             .await
             .err()
             .map(|error| {
-                format!(
-                    "its broadcast failed ({error}); rerun with the same operation id to \
-                     broadcast the same burn again, or, if another tx took its nonce, settle it \
-                     with cctp-burn-supersede"
-                )
+                // The error's text can carry the RPC URL, whose path or query
+                // holds the provider key, so it is logged scrubbed and never
+                // put in the answer or the alert.
+                error!(
+                    %operation_id, %burn_tx, ?direction,
+                    error = %crate::telemetry::scrub_secrets(&error.to_string()),
+                    "Broadcasting the recorded CCTP burn failed"
+                );
+                "its broadcast failed (see the bot logs); rerun with the same operation id to \
+                 broadcast the same burn again, or, if another tx took its nonce, settle it with \
+                 cctp-burn-supersede"
+                    .to_string()
             })
     } else {
         Some(format!(
@@ -966,11 +973,14 @@ async fn release_unpersisted_burn(
     }
 }
 
-/// Awaits the broadcast burn's receipt and records the outcome. A confirm
-/// error that the burn's own receipt does not decide (a timeout, a drop
-/// report, an RPC error, a shallow receipt) records nothing: the burn stays
-/// pending, and a rerun with its operation id reports it and broadcasts it
-/// again.
+/// Awaits the broadcast burn's receipt, then records the outcome a fresh read
+/// of its own receipt proves at the required confirmations. The wait alone
+/// does not decide: it keeps the first receipt it saw while it counts blocks,
+/// so a shallow reorg can remove the burn's block without it noticing, and
+/// the record is the one source of truth for the id. Anything the fresh read
+/// does not decide (a timeout, a drop report, an RPC error, a shallow or
+/// missing receipt) records nothing: the burn stays pending, and a rerun with
+/// its operation id reports it and broadcasts it again.
 async fn confirm_recorded_burn(
     store: &Store<CctpBurnOperation>,
     bridge: &BotCctpBridge,
@@ -980,28 +990,24 @@ async fn confirm_recorded_burn(
 ) {
     let operation_id = request.operation_id;
     let direction = request.from.bridge_direction();
-    let (fate, error) = match bridge.confirm_burn(direction, burn_tx, amount).await {
-        Ok(_) => (BurnReceiptFate::Confirmed, None),
-        // The receipt decides when the error does not: a revert whose replay
-        // decodes nothing still mined.
-        Err(error) => match burn_receipt_fate(
-            bridge,
-            request.from,
-            burn_tx,
-            request.required_confirmations,
-        )
-        .await
-        {
-            Ok(Some(fate)) => (fate, Some(error)),
-            read => {
-                warn!(
-                    %operation_id, %burn_tx, ?direction, %amount, ?error, ?read,
-                    "CCTP burn broadcast via API is not confirmed yet; a cctp-bridge rerun \
-                     with its operation id reports its status and broadcasts it again"
-                );
-                return;
-            }
-        },
+    let error = bridge.confirm_burn(direction, burn_tx, amount).await.err();
+    let fate = match burn_receipt_fate(
+        bridge,
+        request.from,
+        burn_tx,
+        request.required_confirmations,
+    )
+    .await
+    {
+        Ok(Some(fate)) => fate,
+        read => {
+            warn!(
+                %operation_id, %burn_tx, ?direction, %amount, ?error, ?read,
+                "CCTP burn broadcast via API is not confirmed yet; a cctp-bridge rerun with its \
+                 operation id reports its status and broadcasts it again"
+            );
+            return;
+        }
     };
     match fate {
         BurnReceiptFate::Confirmed => info!(
@@ -1067,16 +1073,11 @@ pub(super) async fn cctp_burn_supersede(
         return Ok(Json(CctpBridgeResponse::of(operation_id, &current, status)));
     }
 
-    let source_wallet = match source {
-        CctpSourceChain::Ethereum => wallets.ethereum_wallet(),
-        CctpSourceChain::Base => wallets.base_wallet(),
-    };
     let taken_by = verify_burn_superseded(
         &bridge,
         source,
         &recorded.prepared,
         superseding_tx,
-        source_wallet.address(),
         required_confirmations,
     )
     .await
@@ -1087,7 +1088,6 @@ pub(super) async fn cctp_burn_supersede(
         let status = match error {
             BurnNotSuperseded::Read { .. } => StatusCode::BAD_GATEWAY,
             BurnNotSuperseded::UnreadableBurn { .. }
-            | BurnNotSuperseded::BurnSignedByAnotherWallet { .. }
             | BurnNotSuperseded::BurnMined { .. }
             | BurnNotSuperseded::SupersedingTxIsTheBurn { .. }
             | BurnNotSuperseded::SupersedingTxNotMined { .. }

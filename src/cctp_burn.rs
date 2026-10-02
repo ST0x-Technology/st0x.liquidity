@@ -594,17 +594,6 @@ pub(crate) async fn settle_burn_from_receipt(
 pub(crate) enum BurnNotSuperseded {
     #[error("burn {tx} is not a readable signed tx; its signer is unknown")]
     UnreadableBurn { tx: TxHash },
-    /// Nonces are per sender, so only a tx from the burn's signer can take
-    /// its nonce, and the check reads the configured wallet's txs only.
-    #[error(
-        "burn {tx} was signed by {signer}, not the bot wallet {bot_wallet} (was the key \
-         rotated?): only a tx from {signer} at its nonce can supersede it"
-    )]
-    BurnSignedByAnotherWallet {
-        tx: TxHash,
-        signer: Address,
-        bot_wallet: Address,
-    },
     #[error(
         "burn {tx} itself is mined, with {confirmations} of the {required} required \
          confirmations, so no other tx took its nonce; a cctp-bridge rerun with its operation \
@@ -622,11 +611,14 @@ pub(crate) enum BurnNotSuperseded {
          once it is mined"
     )]
     SupersedingTxNotMined { superseding: TxHash },
-    #[error("superseding tx {superseding} was sent by {from}, not the bot wallet {bot_wallet}")]
+    /// Nonces are per sender, so only a tx from the burn's own signer can
+    /// take its nonce. The signer is read from the signed bytes, so a burn
+    /// signed by a key the bot no longer uses (a rotation) can be settled too.
+    #[error("superseding tx {superseding} was sent by {from}, not the burn's signer {signer}")]
     SupersedingTxFromAnotherSender {
         superseding: TxHash,
         from: Address,
-        bot_wallet: Address,
+        signer: Address,
     },
     #[error(
         "superseding tx {superseding} is at nonce {superseding_nonce}, not the burn's nonce \
@@ -650,13 +642,13 @@ pub(crate) enum BurnNotSuperseded {
     /// cancel; only a copy of the burn itself is adopted as its replacement.
     #[error(
         "superseding tx {superseding} succeeded but is neither a plain cancel (a 0 value \
-         transfer to the bot wallet {bot_wallet} with no calldata and no logs) nor a copy of \
+         transfer to the burn's signer {signer} with no calldata and no logs) nor a copy of \
          the burn (its calldata sent to the TokenMessenger, emitting MessageSent), so what it \
          did is unknown"
     )]
     SupersedingTxNotAPlainCancel {
         superseding: TxHash,
-        bot_wallet: Address,
+        signer: Address,
     },
     #[error("could not read tx {tx} on chain; retry")]
     Read {
@@ -681,9 +673,10 @@ pub(crate) enum NonceTakenBy {
 /// `verify_withdrawal_replacement` it adopts a copy of the signed tx that
 /// went out in its place.
 ///
-/// The burn must be signed by `bot_wallet` and not be mined itself.
-/// `superseding` must be a different tx from `bot_wallet` at the burn's nonce
-/// with `required_confirmations`. A reverted one burned nothing. A successful
+/// The burn must be readable and not mined itself. `superseding` must be a
+/// different tx from the burn's own signer (recovered from the signed bytes,
+/// so a burn of a rotated key can be settled too) at the burn's nonce with
+/// `required_confirmations`. A reverted one burned nothing. A successful
 /// one is a [`NonceTakenBy::Cancel`] only as a plain cancel, or a
 /// [`NonceTakenBy::Replacement`] only when it sent the burn's exact calldata to
 /// the burn's `TokenMessengerV2` with no value and emitted `MessageSent`: a fee
@@ -696,7 +689,6 @@ pub(crate) async fn verify_burn_superseded(
     source: CctpSourceChain,
     prepared: &PreparedTransaction,
     superseding: TxHash,
-    bot_wallet: Address,
     required_confirmations: u64,
 ) -> Result<NonceTakenBy, BurnNotSuperseded> {
     let tx = prepared.tx_hash();
@@ -706,13 +698,6 @@ pub(crate) async fn verify_burn_superseded(
     let signer = prepared
         .signer()
         .ok_or(BurnNotSuperseded::UnreadableBurn { tx })?;
-    if signer != bot_wallet {
-        return Err(BurnNotSuperseded::BurnSignedByAnotherWallet {
-            tx,
-            signer,
-            bot_wallet,
-        });
-    }
     if let Some(burn) = read_source_tx(bridge, direction, tx).await? {
         return Err(BurnNotSuperseded::BurnMined {
             tx,
@@ -738,11 +723,11 @@ pub(crate) async fn verify_burn_superseded(
     else {
         return Err(BurnNotSuperseded::SupersedingTxNotMined { superseding });
     };
-    if from != bot_wallet {
+    if from != signer {
         return Err(BurnNotSuperseded::SupersedingTxFromAnotherSender {
             superseding,
             from,
-            bot_wallet,
+            signer,
         });
     }
     if superseding_nonce != nonce {
@@ -763,7 +748,7 @@ pub(crate) async fn verify_burn_superseded(
         return Ok(NonceTakenBy::Cancel);
     }
 
-    let plain_cancel = to == Some(bot_wallet)
+    let plain_cancel = to == Some(signer)
         && value.is_zero()
         && input.is_empty()
         && tx_type != EIP7702_TX_TYPE_ID
@@ -791,7 +776,7 @@ pub(crate) async fn verify_burn_superseded(
     }
     Err(BurnNotSuperseded::SupersedingTxNotAPlainCancel {
         superseding,
-        bot_wallet,
+        signer,
     })
 }
 
@@ -824,7 +809,7 @@ pub(crate) fn signed_by_source_wallet(
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(crate) struct RestoredCctpBurns {
     /// Burns whose nonce was reserved again; each is also rebroadcast unless
-    /// it is mined at the required confirmations without `MessageSent`.
+    /// the node shows it mined.
     pub(crate) restored: usize,
     /// Pending burns whose receipt now decides, recorded instead of restored.
     pub(crate) settled: usize,
@@ -837,8 +822,8 @@ pub(crate) struct RestoredCctpBurns {
 /// Reserves the nonce of every pending burn signed by the source wallet and
 /// rebroadcasts its exact bytes, so no other send from that wallet takes the
 /// nonce or waits behind a burn no node holds after a restart. A pending burn
-/// whose receipt now decides is recorded instead. One already mined at the
-/// required confirmations without `MessageSent` keeps its reservation but is
+/// whose receipt now decides is recorded instead. One the node shows mined (a
+/// shallow receipt, or one without `MessageSent`) keeps its reservation but is
 /// not sent again, and one signed by another wallet (a rotated key) is not
 /// restored and gates its chain. Never fails startup: a burn that cannot be
 /// listed, loaded or rebroadcast pages, and a rerun of `cctp-bridge` with its
@@ -907,12 +892,11 @@ pub(crate) async fn restore_pending_cctp_burns(
         info!(operation_id = %id, %burn_tx, nonce, ?source, "Reserved the nonce of a pending capital CCTP burn");
         outcome.restored += 1;
 
-        // A burn mined at the required confirmations that is still pending
-        // succeeded without `MessageSent` (paged by the receipt read above):
-        // sending its bytes again cannot change anything.
-        if let Ok(Some(mined)) = bridge.source_mined_tx(direction, burn_tx).boxed().await
-            && required.is_some_and(|required| mined.confirmations >= required)
-        {
+        // A pending burn the node shows mined already used its nonce (its
+        // receipt is shallow, or lacks `MessageSent` and was paged above), so
+        // sending its bytes again cannot change anything; it keeps the
+        // reservation in case a reorg unmines it.
+        if let Ok(Some(_)) = bridge.source_mined_tx(direction, burn_tx).boxed().await {
             continue;
         }
         if let Err(error) = bridge

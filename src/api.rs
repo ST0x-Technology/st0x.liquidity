@@ -9992,6 +9992,51 @@ mod tests {
         );
     }
 
+    /// A pending burn signed by a key the bot no longer uses can still be
+    /// settled: the old key cancels it at its nonce, and the supersede route
+    /// checks the cancel against the burn's own signer, not the bot's current
+    /// wallet.
+    #[cfg(feature = "test-support")]
+    #[tokio::test]
+    async fn a_burn_of_a_rotated_key_is_settled_by_that_keys_cancel() {
+        let (cctp, _circle, state) = cctp_burn_state(U256::from(5_000_000_u64)).await;
+        let rotated = &cctp.rotated_base_wallet;
+        let one_usdc = U256::from(1_000_000_u64);
+        let prepared = rotated
+            .prepare_pending(cctp.bot, alloy::primitives::Bytes::new(), "old burn")
+            .await
+            .unwrap();
+        state
+            .recovery
+            .get()
+            .unwrap()
+            .cctp_burn_store
+            .send(
+                &TEST_OPERATION_ID.parse().unwrap(),
+                crate::cctp_burn::CctpBurnOperationCommand::Prepare {
+                    source: CctpSourceChain::Base,
+                    requested: crate::cctp_burn::RequestedBurn::Exact { amount: one_usdc },
+                    amount: one_usdc,
+                    recipient: cctp.bot,
+                    prepared: prepared.clone(),
+                },
+            )
+            .await
+            .unwrap();
+        rotated.discard_prepared(prepared.tx_hash()).await;
+        let cancel = rotated
+            .send(rotated.address(), alloy::primitives::Bytes::new(), "cancel")
+            .await
+            .unwrap();
+
+        let settled = capital_success(
+            "cctp-burn-supersede",
+            supersede_burn(&state, cancel.transaction_hash).await,
+        );
+
+        assert_eq!(settled["status"], "superseded");
+    }
+
     /// `UsdcResumeResponse` is the wire contract the CLI parses, so its
     /// serialization is pinned against a literal.
     #[test]
