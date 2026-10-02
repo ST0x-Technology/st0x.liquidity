@@ -12669,6 +12669,30 @@ mod tests {
         assert_eq!(burn_amount, None, "missing field must default to None");
     }
 
+    /// A `DepositConfirmed` persisted before the vault deposit block was
+    /// captured must still load, with no block and so no cash read request.
+    #[test]
+    fn deposit_confirmed_event_without_vault_deposit_block_deserializes_to_none() {
+        let old_event = json!({
+            "DepositConfirmed": {
+                "direction": "AlpacaToBase",
+                "deposit_confirmed_at": "2026-01-01T00:00:00Z"
+            }
+        });
+
+        let event: UsdcRebalanceEvent =
+            from_value(old_event).expect("old DepositConfirmed must still deserialize");
+
+        let UsdcRebalanceEvent::DepositConfirmed {
+            vault_deposit_block,
+            ..
+        } = event
+        else {
+            panic!("Expected DepositConfirmed");
+        };
+        assert_eq!(vault_deposit_block, None);
+    }
+
     /// State-level mirror: a `BridgingSubmitting` snapshot persisted before
     /// `burn_amount` existed must still load, defaulting the field to `None`.
     #[test]

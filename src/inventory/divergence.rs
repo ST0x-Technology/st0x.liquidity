@@ -265,13 +265,25 @@ impl InventoryDivergenceGate {
         }
     }
 
+    /// Requests a pinned onchain cash read at or past `minimum_block`. A
+    /// request already pending for the chain keeps its block when it is
+    /// higher, or when the new request has none, so a later request cannot
+    /// let a read that misses the pending one's block resolve both. The
+    /// claimed read is fetched after the newest request, which covers a
+    /// request without a block.
     pub(crate) fn request_onchain_cash_reconcile(
         &self,
         chain: Chain,
         minimum_block: Option<u64>,
     ) -> ReconciliationGeneration {
+        let mut pending = self.write_pending_onchain_cash();
+        let pending_block = pending
+            .get(&chain)
+            .and_then(|request| request.minimum_block);
+        let minimum_block = pending_block.max(minimum_block);
         let request = self.new_reconciliation_request(minimum_block);
-        self.write_pending_onchain_cash().insert(chain, request);
+        pending.insert(chain, request);
+        drop(pending);
         request.generation
     }
 
@@ -636,6 +648,45 @@ mod tests {
         assert_ne!(current, earlier);
         assert!(!gate.accepts_onchain_cash_reconcile(Chain::Base, current, before, None));
         assert!(gate.is_cash_engaged());
+    }
+
+    /// A cash read request for an earlier block, such as a vault deposit
+    /// settling after a later fill underflowed, or for no block, such as a
+    /// fill recorded without one, must not let a read below the pending
+    /// block resolve the request.
+    #[test]
+    fn cash_reconcile_request_keeps_the_pending_block() {
+        let gate = InventoryDivergenceGate::default();
+        let after_requests = Utc::now() + chrono::Duration::seconds(1);
+
+        gate.request_onchain_cash_reconcile(Chain::Base, Some(120));
+        let earlier = gate.request_onchain_cash_reconcile(Chain::Base, Some(110));
+        assert!(!gate.accepts_onchain_cash_reconcile(
+            Chain::Base,
+            earlier,
+            after_requests,
+            Some(119)
+        ));
+        assert!(gate.accepts_onchain_cash_reconcile(
+            Chain::Base,
+            earlier,
+            after_requests,
+            Some(120)
+        ));
+
+        let blockless = gate.request_onchain_cash_reconcile(Chain::Base, None);
+        assert!(!gate.accepts_onchain_cash_reconcile(
+            Chain::Base,
+            blockless,
+            after_requests,
+            Some(119)
+        ));
+        assert!(gate.accepts_onchain_cash_reconcile(
+            Chain::Base,
+            blockless,
+            after_requests,
+            Some(120)
+        ));
     }
 
     #[test]

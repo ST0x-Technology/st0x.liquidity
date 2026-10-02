@@ -16,7 +16,7 @@ use super::{RebalancingService, RebalancingServiceError};
 use crate::conductor::job::{Job, JobQueue, Label, QueuePushError};
 use crate::inventory::{
     ActiveUsdcRebalance, BroadcastingInventory, Imbalance, ImbalanceThreshold, Inventory,
-    InventoryError, InventoryViewError, TransferOp, UsdcCreditAheadOfFills, Venue,
+    InventoryError, InventoryViewError, TransferOp, Venue,
 };
 use crate::usdc_rebalance::{RebalanceDirection, UsdcRebalanceEvent, UsdcRebalanceId};
 
@@ -341,10 +341,6 @@ pub(crate) enum UsdcTriggerSkip {
     BelowMinimumTransfer { excess: Usdc },
     /// Arithmetic error during imbalance calculation.
     ArithmeticError,
-    /// The corridor chain's latest transfer credit is at a block no applied
-    /// fill or pinned snapshot has reached: a fill at or before that block
-    /// may have spent the credit onchain without reaching the inventory yet.
-    CreditAheadOfFills(UsdcCreditAheadOfFills),
 }
 
 /// Checks inventory for USDC imbalance and returns the appropriate bridging operation.
@@ -362,12 +358,6 @@ pub(super) async fn check_imbalance_and_build_operation(
 ) -> Result<UsdcRebalanceOperation, UsdcTriggerSkip> {
     let decision = {
         let inventory = inventory.read().await;
-        // Read under the same guard as the imbalance, so the credit and its
-        // block are seen together.
-        if let Some(credit) = inventory.onchain_usdc_credit_ahead_of_fills(chain) {
-            return Err(UsdcTriggerSkip::CreditAheadOfFills(credit));
-        }
-
         let imbalance = inventory
             .check_usdc_imbalance_with_gross_offchain(chain, threshold, reserved)
             .map_err(|error| {
@@ -1580,9 +1570,8 @@ impl RebalancingService {
     }
 
     /// Settles a tracked transfer into inventory. `vault_deposit_block` is
-    /// the block of a vault deposit crediting the corridor chain's
-    /// MarketMaking USDC; it is recorded in the same write as the credit, so
-    /// no imbalance check reads the credit without it.
+    /// the block of the vault deposit that credits the corridor chain's
+    /// MarketMaking USDC, `None` when the transfer credits Alpaca.
     async fn complete_usdc_rebalance(
         &self,
         id: &UsdcRebalanceId,
@@ -1635,12 +1624,18 @@ impl RebalancingService {
         let mut inventory = self.inventory.write().await;
         let outcome = match inventory.clone().update_usdc_at(chain, update, now) {
             Ok(updated) => {
-                *inventory = match vault_deposit_block {
-                    Some(block_number) => {
-                        updated.record_onchain_usdc_credit_block(chain, block_number)
-                    }
-                    None => updated,
-                };
+                *inventory = updated;
+                // A fill in the deposit's block or earlier may already have
+                // spent the credit onchain while the order fill reader, which
+                // trails the chain tip, has not delivered it. Hold every USDC
+                // check until a vault read pinned at or past the deposit
+                // block replaces the balance (ADR 0024). The request is made
+                // under the same write as the credit, so no check reads the
+                // credit without it.
+                if let Some(block_number) = vault_deposit_block {
+                    self.divergence_gate
+                        .request_onchain_cash_reconcile(chain, Some(block_number));
+                }
                 UsdcSettlementOutcome::Reconciled
             }
             Err(InventoryViewError::Usdc(InventoryError::InsufficientInflight {
@@ -1740,18 +1735,10 @@ impl Job<RebalancingService> for UsdcRebalancingCheck {
     }
 }
 
-/// How long a USDC check held behind a transfer credit waits before it runs
-/// again. The order fill reader trails the chain tip by its ingestion cutoff,
-/// so the fill that spent a credit reaches the reactor within tens of
-/// seconds.
-pub(super) const USDC_CREDIT_RECHECK_DELAY: std::time::Duration =
-    std::time::Duration::from_secs(10);
-
 /// Owns the USDC-check queue and the domain-level operations
 /// callers (the reactor, the conductor wiring) want: enqueue a check,
-/// reschedule a held one, cancel pending checks after a terminal event.
-/// Keeps queue plumbing out of [`RebalancingService`] and out of the
-/// conductor wiring.
+/// cancel pending checks after a terminal event. Keeps queue plumbing
+/// out of [`RebalancingService`] and out of the conductor wiring.
 #[derive(Clone)]
 pub(crate) struct UsdcRebalancingCheckScheduler {
     queue: UsdcRebalancingCheckJobQueue,
@@ -1787,38 +1774,14 @@ impl UsdcRebalancingCheckScheduler {
         }
     }
 
-    /// Schedules a check after [`USDC_CREDIT_RECHECK_DELAY`] unless one is
-    /// already waiting: a waiting check reschedules itself the same way
-    /// while the hold lasts, so one row keeps the hold polled. A failed
-    /// lookup still schedules, since a lost check strands the imbalance
-    /// when no later event re-triggers it.
-    pub(super) async fn reschedule_check(&self) {
-        match self.queue.has_waiting().await {
-            Ok(true) => return,
-            Ok(false) => {}
-            Err(error) => {
-                warn!(target: "rebalance", %error, "Failed to look up waiting UsdcRebalancingCheck jobs; scheduling one anyway");
-            }
-        }
-
-        let mut queue = self.queue.clone();
-        if let Err(QueuePushError(error)) = queue
-            .push_with_delay(UsdcRebalancingCheck, USDC_CREDIT_RECHECK_DELAY)
-            .await
-        {
-            warn!(target: "rebalance", %error, "Failed to reschedule UsdcRebalancingCheck job");
-        }
-    }
-
     pub(super) async fn cancel_pending(&self) {
         self.queue.cancel_all_pending().await;
     }
 }
 
-/// Test helper: synchronously drain every due USDC-check row the service
-/// enqueued, running each job's [`Job::perform`] and marking the row `Done`.
-/// A row delayed past now stays `Pending`, as the apalis worker would leave
-/// it; the row being performed is `Running`, as it is under the worker.
+/// Test helper: synchronously drain every pending USDC-check row the
+/// service enqueued, running each job's [`Job::perform`] and marking
+/// the row `Done`.
 #[cfg(test)]
 pub(crate) async fn drain_pending_usdc_jobs(service: &Arc<RebalancingService>) -> usize {
     let pool = service.usdc_scheduler.queue().pool().clone();
@@ -1830,7 +1793,6 @@ pub(crate) async fn drain_pending_usdc_jobs(service: &Arc<RebalancingService>) -
         let row: Option<(String, Vec<u8>)> = sqlx_apalis::query_as(
             "SELECT id, job FROM Jobs \
              WHERE status = 'Pending' AND job_type = ? \
-             AND run_at <= strftime('%s', 'now') \
              ORDER BY run_at LIMIT 1",
         )
         .bind(job_type)
@@ -1841,12 +1803,6 @@ pub(crate) async fn drain_pending_usdc_jobs(service: &Arc<RebalancingService>) -
         let Some((id, payload)) = row else {
             break;
         };
-
-        sqlx_apalis::query("UPDATE Jobs SET status = 'Running' WHERE id = ?")
-            .bind(&id)
-            .execute(&pool)
-            .await
-            .expect("mark usdc-check job running");
 
         let job: UsdcRebalancingCheck =
             serde_json::from_slice(&payload).expect("deserialize UsdcRebalancingCheck payload");
@@ -1865,35 +1821,6 @@ pub(crate) async fn drain_pending_usdc_jobs(service: &Arc<RebalancingService>) -
     }
 
     processed
-}
-
-/// Test helper: the number of USDC-check rows delayed past now, i.e. the
-/// rechecks a held check scheduled.
-#[cfg(test)]
-pub(crate) async fn count_delayed_usdc_check_jobs(service: &RebalancingService) -> i64 {
-    sqlx_apalis::query_scalar(
-        "SELECT COUNT(*) FROM Jobs \
-         WHERE status = 'Pending' AND job_type = ? \
-         AND run_at > strftime('%s', 'now')",
-    )
-    .bind(std::any::type_name::<UsdcRebalancingCheck>())
-    .fetch_one(service.usdc_scheduler.queue().pool())
-    .await
-    .expect("count delayed usdc-check jobs")
-}
-
-/// Test helper: makes every delayed USDC-check row due now, standing in for
-/// the recheck delay elapsing.
-#[cfg(test)]
-pub(crate) async fn make_delayed_usdc_checks_due(service: &RebalancingService) {
-    sqlx_apalis::query(
-        "UPDATE Jobs SET run_at = strftime('%s', 'now') \
-         WHERE status = 'Pending' AND job_type = ?",
-    )
-    .bind(std::any::type_name::<UsdcRebalancingCheck>())
-    .execute(service.usdc_scheduler.queue().pool())
-    .await
-    .expect("make delayed usdc-check jobs due");
 }
 
 #[cfg(test)]

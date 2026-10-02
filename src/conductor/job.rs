@@ -551,22 +551,6 @@ impl<Task: Serialize + DeserializeOwned + Send + Sync + Unpin + 'static> JobQueu
 
         Ok(in_flight > 0)
     }
-
-    /// Whether a row of this queue waits to run: `Pending` (due or delayed)
-    /// or `Queued` (fetched by a worker, not started). A running row is not
-    /// counted, so a job can ask whether anything besides itself will run.
-    pub(crate) async fn has_waiting(&self) -> Result<bool, SqlxError> {
-        let job_type = self.queue_key();
-        let waiting = sqlx_apalis::query_scalar::<_, i64>(
-            "SELECT COUNT(*) FROM Jobs \
-             WHERE job_type = ? AND status IN ('Pending', 'Queued')",
-        )
-        .bind(job_type)
-        .fetch_one(self.pool())
-        .await?;
-
-        Ok(waiting > 0)
-    }
 }
 
 /// Default upper bound on a single [`Job::perform`] invocation.

@@ -4449,7 +4449,9 @@ enum UsdcRebalanceCommand {
     // first broadcast. Refused when a send was already signed.
     PrepareDepositSend { prepared: PreparedTransaction },
     InitiateDeposit { deposit: TransferRef },
-    ConfirmDeposit,
+    // vault_deposit_block: the receipt block of the AlpacaToBase vault
+    // deposit; None for a BaseToAlpaca deposit at Alpaca.
+    ConfirmDeposit { vault_deposit_block: Option<u64> },
     // Valid from `DepositInitiated`, and from a BaseToAlpaca `Bridged` whose
     // deposit send cannot be resolved (the signed send, if any, becomes the
     // `deposit_ref`).
@@ -4551,6 +4553,9 @@ enum UsdcRebalanceEvent {
     },
     DepositConfirmed {
         deposit_confirmed_at: DateTime<Utc>,
+        // The AlpacaToBase vault deposit's block. None for a BaseToAlpaca
+        // deposit and for events recorded before the field existed.
+        vault_deposit_block: Option<u64>,
     },
     DepositFailed {
         deposit_ref: Option<TransferRef>,
@@ -5988,20 +5993,21 @@ transfer dispatch. It does not calculate cross-venue inventory imbalances.
   source)
 - `UsdcRebalanceEvent::DepositConfirmed` - Terminal success for AlpacaToBase;
   moves from inflight to destination available. The event carries the vault
-  deposit's block (`vault_deposit_block`, from the deposit receipt), recorded as
-  the corridor chain's latest transfer credit block in the same inventory write
-  as the credit. Every USDC check (transfer triggered, fill triggered, snapshot
-  triggered) skips a corridor whose credit block is past both the highest block
-  of an onchain fill the reactor has handled on that chain and the onchain USDC
-  snapshot block watermark: a fill in the credit's block or earlier may have
-  spent the credit onchain while the order fill reader, which trails the chain
-  tip, has not delivered it yet. The skipped check reschedules itself 10 seconds
-  later (one waiting row at a time), so the held imbalance is not dropped when
-  the check enqueued by the releasing fill or snapshot is lost or cancelled by a
-  later terminal transfer. The hold lifts once a fill at or past the credit's
-  block is handled or a snapshot pinned at or past it applies (ADR 0024). An
-  event without the block (a BaseToAlpaca deposit at Alpaca, or one recorded
-  before the block was captured) sets no hold
+  deposit's block (`vault_deposit_block`, from the deposit receipt). In the same
+  inventory write as the credit, the reactor requests a pinned onchain cash read
+  of the corridor chain at or past that block, the same request a fill whose
+  cash leg underflows makes. The order fill reader trails the chain tip, so a
+  fill in the deposit's block or earlier may have spent the credit onchain
+  before it reaches the view. While the request is pending the cash gate skips
+  every USDC check (transfer triggered, fill triggered, snapshot triggered). The
+  next inventory poll of that chain sends `ReconcileOnchainUsdc`, which the
+  snapshot aggregate emits even for an unchanged balance; once a read pinned at
+  or past the deposit block applies, it replaces the balance, absorbs every fill
+  up to its block (ADR 0018), releases the gate, and enqueues the check (ADR
+  0024). A request already pending for the chain keeps its block when it is
+  higher or when the new request has none. An event without the block (a
+  BaseToAlpaca deposit at Alpaca, or one recorded before the block was captured)
+  requests no read
 - `UsdcRebalanceEvent::ConversionConfirmed` - Terminal success for BaseToAlpaca;
   moves from inflight to destination available
 - `UsdcRebalanceEvent::WithdrawalFailed`, BaseToAlpaca pre-burn

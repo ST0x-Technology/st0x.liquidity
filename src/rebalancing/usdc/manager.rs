@@ -7174,6 +7174,7 @@ mod tests {
     use reqwest::StatusCode;
     use serde_json::json;
     use sqlx::SqlitePool;
+    use std::num::NonZeroU32;
     use std::str::FromStr;
     #[cfg(feature = "test-support")]
     use std::sync::LazyLock;
@@ -25276,6 +25277,77 @@ mod tests {
         assert_eq!(withdraw.token, usdg);
     }
 
+    /// The fresh deposit path records the block that holds the vault
+    /// deposit on `DepositConfirmed`, read from the deposit's receipt.
+    #[tokio::test]
+    async fn fresh_alpaca_to_base_deposit_records_the_deposit_block() {
+        let corridor = UsdcCorridor::HubRouted {
+            chain: Chain::Robinhood,
+            hop: HopKind::Cctp,
+        };
+        let pool = SqlitePool::connect(":memory:").await.unwrap();
+        sqlx::migrate!().run(&pool).await.unwrap();
+        let cqrs = Arc::new(test_store(pool.clone(), ()));
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let amount = usdc("1");
+        advance_to_bridged_alpaca_to_base_on(&cqrs, &id, amount, corridor).await;
+
+        let (_anvil, endpoint, private_key) = setup_anvil();
+        let wallet = create_test_wallet(&endpoint, &private_key);
+        wallet
+            .provider()
+            .anvil_set_code(
+                Chain::Robinhood.settlement_stable().address,
+                crate::bindings::DeployableERC20::DEPLOYED_BYTECODE.clone(),
+            )
+            .await
+            .unwrap();
+        let (manager, apalis_pool, _server) = manager_on_corridor_with_bot_gas_queue(
+            corridor,
+            cqrs,
+            wallet.clone(),
+            MockBridge::new(),
+        )
+        .await;
+
+        manager
+            .resume_alpaca_to_base(&id, amount, corridor)
+            .await
+            .unwrap();
+
+        let jobs = pending_bot_gas_jobs(&apalis_pool).await;
+        let deposit_block = wallet
+            .provider()
+            .get_transaction_receipt(jobs[0].tx_hash)
+            .await
+            .unwrap()
+            .and_then(|receipt| receipt.block_number)
+            .expect("the vault deposit is mined");
+        assert_eq!(
+            recorded_vault_deposit_block(&pool, &id).await,
+            Some(deposit_block)
+        );
+    }
+
+    /// The `vault_deposit_block` of `id`'s `DepositConfirmed`, read through
+    /// the event store API.
+    async fn recorded_vault_deposit_block(pool: &SqlitePool, id: &UsdcRebalanceId) -> Option<u64> {
+        let head = st0x_event_sorcery::head_rowid(pool).await.unwrap();
+        st0x_event_sorcery::events_since::<UsdcRebalance>(pool, 0, head, NonZeroU32::MAX)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|sequenced| sequenced.id == *id)
+            .find_map(|sequenced| match sequenced.event {
+                UsdcRebalanceEvent::DepositConfirmed {
+                    vault_deposit_block,
+                    ..
+                } => Some(vault_deposit_block),
+                _ => None,
+            })
+            .expect("a DepositConfirmed event")
+    }
+
     /// An enqueue failure for a confirmed vault withdrawal propagates as a
     /// hard error (fail fast) and leaves the aggregate un-advanced (enqueue
     /// runs BEFORE `Initiate`), so the caller's retry re-attempts both.
@@ -25756,25 +25828,13 @@ mod tests {
             .await
             .unwrap();
 
-        let payload: String = sqlx::query_scalar(
-            "SELECT payload FROM events WHERE aggregate_id = ? \
-             AND event_type = 'UsdcRebalanceEvent::DepositConfirmed'",
-        )
-        .bind(id.to_string())
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-        let UsdcRebalanceEvent::DepositConfirmed {
-            vault_deposit_block,
-            ..
-        } = serde_json::from_str(&payload).unwrap()
-        else {
-            panic!("expected DepositConfirmed, got {payload}");
-        };
         let deposit_block = deposit
             .block_number
             .expect("a mined receipt carries its block");
-        assert_eq!(vault_deposit_block, Some(deposit_block));
+        assert_eq!(
+            recorded_vault_deposit_block(&pool, &id).await,
+            Some(deposit_block)
+        );
     }
 
     /// CORRECTION C: when `pending_burn_tx` is set and `burn_status` reports the
