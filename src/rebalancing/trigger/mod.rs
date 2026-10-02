@@ -72,9 +72,10 @@ use crate::inventory::projection::InventoryProjectionError;
 use crate::inventory::snapshot::{InventorySnapshot, InventorySnapshotEvent};
 use crate::inventory::view::InFlightEquityLocation;
 use crate::inventory::{
-    BroadcastingInventory, Inventory, InventoryDivergenceGate, InventoryError, InventoryScope,
-    InventoryViewError, Operator, PendingRequestOwnership, PendingRequestOwnershipSnapshot,
-    PollFreshness, PortfolioAsset, PortfolioLocation, TransferOp, Venue,
+    BroadcastingInventory, CashAdmission, Inventory, InventoryDivergenceGate, InventoryError,
+    InventoryScope, InventoryViewError, Operator, PendingRequestOwnership,
+    PendingRequestOwnershipSnapshot, PollFreshness, PortfolioAsset, PortfolioLocation, TransferOp,
+    Venue,
 };
 use crate::native_gas::{ConfiguredGasReadiness, GasReadinessFailure, TransferGasRoute};
 use crate::offchain::order::OffchainOrderId;
@@ -3834,7 +3835,8 @@ impl RebalancingService {
                 }
                 if !usdc_reconciled {
                     self.divergence_gate
-                        .request_onchain_cash_reconcile(trade_id.chain, *block_number);
+                        .request_onchain_cash_reconcile(trade_id.chain, *block_number)
+                        .await;
                 }
                 self.schedule_fill_checks(
                     symbol,
@@ -5319,14 +5321,18 @@ impl RebalancingService {
         // restart-tainted cash balance is suspect for the same reason (the
         // hydrated number may or may not contain a straddling fill's cash
         // leg), with the same resolution path.
-        if self.divergence_gate.is_cash_engaged() {
+        //
+        // The admission is taken before any sizing and redeemed right before
+        // each enqueue, so a gate engaged at any point in between refuses
+        // the dispatch even if it was released again.
+        let Some(admission) = self.divergence_gate.cash_admission() else {
             warn!(
                 target: "rebalance",
                 "Skipped USDC trigger: unresolved cash snapshot divergence \
                  pending reconciliation"
             );
             return;
-        }
+        };
         if self.is_restart_cash_tainted().await {
             warn!(
                 target: "rebalance",
@@ -5337,7 +5343,7 @@ impl RebalancingService {
         }
 
         for (usdc, (usdc_limit, reserved)) in corridors {
-            self.check_and_trigger_usdc_corridor(usdc, usdc_limit, reserved)
+            self.check_and_trigger_usdc_corridor(usdc, usdc_limit, reserved, admission)
                 .await;
         }
     }
@@ -5349,6 +5355,7 @@ impl RebalancingService {
         usdc: &UsdcCorridorCtx,
         usdc_limit: Option<Usdc>,
         reserved: Option<Usd>,
+        admission: CashAdmission,
     ) {
         let chain = usdc.corridor.chain();
 
@@ -5423,23 +5430,23 @@ impl RebalancingService {
             return;
         }
 
-        // Re-check immediately before dispatch: the poller may have engaged
-        // the cash gate during the awaits in the imbalance build (mirrors
-        // the equity trigger's pre-dispatch re-checks). The restart taint
-        // needs no re-check: it is only seeded at boot, so it cannot appear
-        // during the build.
-        if self.divergence_gate.is_cash_engaged() {
-            warn!(
-                target: "rebalance",
-                "Skipped USDC trigger before dispatch: cash snapshot \
-                 divergence detected during operation sizing"
-            );
-            return;
-        }
-
         if !self.usdc_transfer_gas_is_ready(usdc.corridor.chain()).await {
             return;
         }
+
+        // Redeem the admission taken before sizing and hold the gate through
+        // the enqueue: a cash engagement since then, even one released
+        // again, refuses, and none can land until the job row is written,
+        // so no transfer goes out sized off a balance the gate has flagged.
+        // The restart taint needs no re-check: it is only seeded at boot.
+        let Some(cash_dispatch) = self.divergence_gate.hold_cash_admission(admission).await else {
+            warn!(
+                target: "rebalance",
+                "Skipped USDC trigger before dispatch: the cash gate engaged \
+                 while the operation was being sized"
+            );
+            return;
+        };
 
         let dispatched = match operation {
             UsdcRebalanceOperation::BaseToAlpaca { amount } => {
@@ -5451,6 +5458,7 @@ impl RebalancingService {
                     .await
             }
         };
+        drop(cash_dispatch);
 
         if !dispatched {
             return;
@@ -6181,14 +6189,14 @@ impl RebalancingService {
         // cash venue busy, which freezes the counter that resolves a divergence
         // and aborts the forced reconcile, so a manual start in either state
         // would keep the trigger blocked for the whole transfer.
-        if self.divergence_gate.is_cash_engaged() {
+        let Some(admission) = self.divergence_gate.cash_admission() else {
             warn!(
                 target: "rebalance",
                 %id,
                 "Manual USDC transfer refused: unresolved cash snapshot divergence"
             );
             return Err(UsdcResumeError::CashDivergenceEngaged);
-        }
+        };
         if self.is_restart_cash_tainted().await {
             warn!(
                 target: "rebalance",
@@ -6231,11 +6239,12 @@ impl RebalancingService {
                 }
             })?;
 
-        // Re-check right before the enqueue, like the trigger's dispatch: the
-        // poller may have engaged the cash gate during the awaits above.
+        // Redeem the admission and hold the gate through the push, like the
+        // trigger's dispatch: a cash engagement during the awaits above
+        // refuses, and none can land until the job row is written.
         // Returning drops `claim`, which releases the corridor. The restart
         // taint is only seeded at boot, so it cannot appear here.
-        if self.divergence_gate.is_cash_engaged() {
+        let Some(cash_dispatch) = self.divergence_gate.hold_cash_admission(admission).await else {
             warn!(
                 target: "rebalance",
                 %id,
@@ -6243,7 +6252,7 @@ impl RebalancingService {
                  during the preflight"
             );
             return Err(UsdcResumeError::CashDivergenceEngaged);
-        }
+        };
 
         // A plain push, as in the trigger's fresh dispatch: the id is fresh, so
         // an idempotency key could never collide. Single flight comes from the
@@ -6274,6 +6283,7 @@ impl RebalancingService {
                     .await
             }
         };
+        drop(cash_dispatch);
 
         match push {
             Ok(()) => {
@@ -16992,7 +17002,8 @@ mod tests {
 
         trigger
             .divergence_gate()
-            .request_onchain_cash_reconcile(Chain::Base, Some(101));
+            .request_onchain_cash_reconcile(Chain::Base, Some(101))
+            .await;
 
         trigger
             .on_snapshot(InventorySnapshotEvent::OnchainUsdc {
@@ -18278,7 +18289,8 @@ mod tests {
         }
         trigger
             .divergence_gate()
-            .request_onchain_cash_reconcile(Chain::Base, Some(110));
+            .request_onchain_cash_reconcile(Chain::Base, Some(110))
+            .await;
         apply_pinned_base_usdc_read(&trigger, usdc(1050), 120).await;
         usdc::drain_pending_usdc_jobs(&trigger).await;
 
@@ -19461,7 +19473,8 @@ mod tests {
         let (trigger, pool, _store) = make_resume_trigger().await;
         trigger
             .divergence_gate()
-            .engage_cash(InventoryScope::Hedging);
+            .engage_cash(InventoryScope::Hedging)
+            .await;
 
         let error = trigger
             .start_manual_usdc_transfer(
@@ -34358,7 +34371,8 @@ mod tests {
 
         trigger
             .divergence_gate()
-            .engage_cash(InventoryScope::Hedging);
+            .engage_cash(InventoryScope::Hedging)
+            .await;
 
         trigger.check_and_trigger_usdc().await;
         assert_eq!(

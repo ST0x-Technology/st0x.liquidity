@@ -1527,7 +1527,8 @@ impl RebalancingService {
                     .await
                     .onchain_usdc_block_watermark(chain);
                 self.divergence_gate
-                    .request_onchain_cash_reconcile(chain, floor);
+                    .request_onchain_cash_reconcile(chain, floor)
+                    .await;
             } else {
                 warn!(target: "rebalance", %chain, "No served corridor polls this chain's cash vault; not requesting a forced vault read");
             }
@@ -1640,7 +1641,8 @@ impl RebalancingService {
                         .onchain_usdc_block_watermark(chain)
                         .map_or(block_number, |watermark| watermark.max(block_number));
                     self.divergence_gate
-                        .request_onchain_cash_reconcile(chain, Some(minimum_block));
+                        .request_onchain_cash_reconcile(chain, Some(minimum_block))
+                        .await;
                 }
                 *inventory = updated;
                 UsdcSettlementOutcome::Reconciled

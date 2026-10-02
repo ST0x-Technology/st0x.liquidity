@@ -12,7 +12,9 @@ pub(crate) mod view;
 pub(crate) use st0x_config::ImbalanceThreshold;
 
 pub(crate) use broadcasting::BroadcastingInventory;
-pub(crate) use divergence::{InventoryDivergenceGate, InventoryDivergenceRecoveryCtx};
+pub(crate) use divergence::{
+    CashAdmission, InventoryDivergenceGate, InventoryDivergenceRecoveryCtx,
+};
 pub(crate) use freshness::PollFreshness;
 #[cfg(test)]
 pub(crate) use polling::PollerError;

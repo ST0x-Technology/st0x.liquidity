@@ -6172,10 +6172,15 @@ skip the events that arrive, and failed USDC-transfer cleanups stamp
   verified heal resets the counter and releases the gate, an aborted one keeps
   both so the next quiet poll re-escalates immediately.
 - **Dispatch gating**: while engaged, the venue-level cash gate suppresses the
-  USDC rebalancing trigger (checked before the guard claim and again immediately
-  before dispatch) -- a bridge sized off a diverged cash balance would move the
-  wrong amount and mark the venue busy, freezing the very counter that resolves
-  the divergence.
+  USDC rebalancing trigger and the manual USDC transfer route. A dispatch takes
+  an admission (the gate's cash epoch) before it sizes the transfer and redeems
+  it right before its enqueue, holding the gate's dispatch lock through the job
+  row write. Every cash engagement and every onchain cash read request bumps the
+  epoch under that lock exclusively, so a dispatch refuses when the gate engaged
+  at any point after its admission, even if it was released again, and no
+  engagement can land between the final check and the enqueue. A bridge sized
+  off a diverged cash balance would move the wrong amount and mark the venue
+  busy, freezing the very counter that resolves the divergence.
 
 The shared guard machinery follows inventory ownership. Hedging is one chainless
 broker scope, so its equity suppression and snapshot-skip streaks are keyed only

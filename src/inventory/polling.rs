@@ -1207,9 +1207,17 @@ where
 
         Self::resolve_matching_cash_taint(recovery, &state, tainted).await;
 
-        let Some(escalation) =
-            self.record_cash_divergence_observation(recovery, &state, usd_balance_cents, tainted)
-        else {
+        let escalation =
+            self.record_cash_divergence_observation(recovery, &state, usd_balance_cents, tainted);
+
+        // Engaged after the counter lock is released: the engagement waits
+        // for any USDC dispatch holding the gate, so it must not run under
+        // a synchronous lock.
+        if matches!(state, ObservedCashLedgerState::Divergence { .. }) {
+            recovery.gate.engage_cash(InventoryScope::Hedging).await;
+        }
+
+        let Some(escalation) = escalation else {
             return Ok(());
         };
 
@@ -1260,9 +1268,10 @@ where
             .clear_restart_cash_taint();
     }
 
-    /// Folds one poll's cash observation into the counter and the dispatch
-    /// gate. Synchronous on purpose: the counter guard must never be held
-    /// across an await.
+    /// Folds one poll's cash observation into the counter, releasing the
+    /// dispatch gate on a match; the caller engages it on a divergence.
+    /// Synchronous on purpose: the counter guard must never be held across
+    /// an await.
     fn record_cash_divergence_observation(
         &self,
         recovery: &InventoryDivergenceRecoveryCtx,
@@ -1283,7 +1292,6 @@ where
             }
             ObservedCashLedgerState::Divergence { ledger } => {
                 *counter += 1;
-                recovery.gate.engage_cash(InventoryScope::Hedging);
 
                 warn!(
                     target: "inventory",

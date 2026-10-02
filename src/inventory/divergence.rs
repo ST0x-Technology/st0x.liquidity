@@ -43,6 +43,18 @@ struct ReconciliationRequest {
     minimum_block: Option<u64>,
 }
 
+/// Proof that the cash gate was clear when it was taken: the cash epoch it
+/// saw. A USDC dispatch takes one before sizing and redeems it with
+/// [`InventoryDivergenceGate::hold_cash_admission`] before its enqueue.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct CashAdmission(u64);
+
+/// The shared side of the gate's dispatch lock. While it lives no cash
+/// engagement can land, so the enqueue it covers cannot race one.
+pub(crate) struct CashDispatch<'gate> {
+    _held: tokio::sync::RwLockReadGuard<'gate, ()>,
+}
+
 /// Inventory scopes with a detected but unresolved snapshot
 /// divergence.
 ///
@@ -77,6 +89,14 @@ pub(crate) struct InventoryDivergenceGate {
     /// wrong amount and marks the venue busy, freezing the very counter
     /// that resolves the divergence.
     cash: RwLock<HashSet<InventoryScope>>,
+    /// Bumped by every cash engagement and every onchain cash read request,
+    /// so a dispatch admitted before one refuses even when the gate has
+    /// been released again since.
+    cash_epoch: AtomicU64,
+    /// Orders cash engagements against USDC dispatches. A dispatch holds it
+    /// shared from its last gate check through its enqueue, and every
+    /// engagement takes it exclusively, so none lands in between.
+    cash_dispatch: tokio::sync::RwLock<()>,
 }
 
 impl InventoryDivergenceGate {
@@ -111,8 +131,11 @@ impl InventoryDivergenceGate {
                 .any(|(_, pending_symbol)| pending_symbol == symbol)
     }
 
-    pub(crate) fn engage_cash(&self, scope: InventoryScope) {
+    pub(crate) async fn engage_cash(&self, scope: InventoryScope) {
+        let dispatch = self.cash_dispatch.write().await;
+        self.cash_epoch.fetch_add(1, Ordering::SeqCst);
         write_recovering(&self.cash).insert(scope);
+        drop(dispatch);
     }
 
     pub(crate) fn release_cash(&self, scope: InventoryScope) {
@@ -122,6 +145,30 @@ impl InventoryDivergenceGate {
     /// Whether any scope holds an unresolved cash divergence.
     pub(crate) fn is_cash_engaged(&self) -> bool {
         !read_recovering(&self.cash).is_empty() || !self.read_pending_onchain_cash().is_empty()
+    }
+
+    /// The admission a USDC dispatch takes before it sizes the transfer, or
+    /// `None` while the cash gate is engaged. The epoch is read before the
+    /// engagement state, and an engagement bumps it before engaging, so an
+    /// engagement racing this call is caught when the admission is held.
+    pub(crate) fn cash_admission(&self) -> Option<CashAdmission> {
+        let epoch = self.cash_epoch.load(Ordering::SeqCst);
+        (!self.is_cash_engaged()).then_some(CashAdmission(epoch))
+    }
+
+    /// Redeems `admission` right before an enqueue: `None` when the gate is
+    /// engaged or was engaged at any point since the admission was taken.
+    /// Otherwise the returned hold keeps every engagement waiting until it
+    /// drops, so the check and the enqueue it covers are atomic against
+    /// them.
+    pub(crate) async fn hold_cash_admission(
+        &self,
+        admission: CashAdmission,
+    ) -> Option<CashDispatch<'_>> {
+        let held = self.cash_dispatch.read().await;
+        let unchanged =
+            self.cash_epoch.load(Ordering::SeqCst) == admission.0 && !self.is_cash_engaged();
+        unchanged.then_some(CashDispatch { _held: held })
     }
 
     pub(crate) fn request_offchain_equity_reconcile(
@@ -278,12 +325,15 @@ impl InventoryDivergenceGate {
     /// its cash delta pins the request to its block, and lowering that floor
     /// would let a read from a node below the fill clear the gate. The
     /// claimed read is fetched after the newest request, which covers a
-    /// request without a block.
-    pub(crate) fn request_onchain_cash_reconcile(
+    /// request without a block. Like [`Self::engage_cash`], it waits for any
+    /// USDC dispatch holding the gate and bumps the cash epoch.
+    pub(crate) async fn request_onchain_cash_reconcile(
         &self,
         chain: Chain,
         minimum_block: Option<u64>,
     ) -> ReconciliationGeneration {
+        let dispatch = self.cash_dispatch.write().await;
+        self.cash_epoch.fetch_add(1, Ordering::SeqCst);
         let mut pending = self.write_pending_onchain_cash();
         let pending_block = pending
             .get(&chain)
@@ -292,6 +342,7 @@ impl InventoryDivergenceGate {
         let request = self.new_reconciliation_request(minimum_block);
         pending.insert(chain, request);
         drop(pending);
+        drop(dispatch);
         request.generation
     }
 
@@ -537,8 +588,8 @@ mod tests {
 
     /// Inventory scopes diverge and heal independently, so one release must
     /// not lift suppression another venue or chain still needs.
-    #[test]
-    fn onchain_and_offchain_divergence_gates_release_independently() {
+    #[tokio::test]
+    async fn onchain_and_offchain_divergence_gates_release_independently() {
         let spym = Symbol::new("SPYM").unwrap();
         let gate = InventoryDivergenceGate::default();
 
@@ -565,9 +616,11 @@ mod tests {
             "releasing the last engaged venue lifts suppression"
         );
 
-        gate.engage_cash(InventoryScope::Hedging);
-        gate.engage_cash(InventoryScope::MarketMaking(Chain::Base));
-        gate.engage_cash(InventoryScope::MarketMaking(Chain::Robinhood));
+        gate.engage_cash(InventoryScope::Hedging).await;
+        gate.engage_cash(InventoryScope::MarketMaking(Chain::Base))
+            .await;
+        gate.engage_cash(InventoryScope::MarketMaking(Chain::Robinhood))
+            .await;
         gate.release_cash(InventoryScope::Hedging);
         assert!(
             gate.is_cash_engaged(),
@@ -589,12 +642,14 @@ mod tests {
 
     /// A rejected withdraw must not lower the floor a fill pinned to its
     /// block: a read below that block would then clear the gate.
-    #[test]
-    fn cash_reconcile_keeps_the_higher_pending_floor() {
+    #[tokio::test]
+    async fn cash_reconcile_keeps_the_higher_pending_floor() {
         let gate = InventoryDivergenceGate::default();
-        gate.request_onchain_cash_reconcile(Chain::Base, Some(101));
+        gate.request_onchain_cash_reconcile(Chain::Base, Some(101))
+            .await;
 
-        gate.request_onchain_cash_reconcile(Chain::Base, Some(90));
+        gate.request_onchain_cash_reconcile(Chain::Base, Some(90))
+            .await;
 
         let current = gate
             .claim_pending_onchain_cash_reconcile(Chain::Base)
@@ -607,12 +662,14 @@ mod tests {
     }
 
     /// A floor above the pending one (the view's watermark) wins.
-    #[test]
-    fn cash_reconcile_raises_the_floor() {
+    #[tokio::test]
+    async fn cash_reconcile_raises_the_floor() {
         let gate = InventoryDivergenceGate::default();
-        gate.request_onchain_cash_reconcile(Chain::Base, Some(101));
+        gate.request_onchain_cash_reconcile(Chain::Base, Some(101))
+            .await;
 
-        gate.request_onchain_cash_reconcile(Chain::Base, Some(120));
+        gate.request_onchain_cash_reconcile(Chain::Base, Some(120))
+            .await;
 
         let current = gate
             .claim_pending_onchain_cash_reconcile(Chain::Base)
@@ -623,13 +680,13 @@ mod tests {
 
     /// With no floor on either side, the request needs a read fetched after
     /// it.
-    #[test]
-    fn cash_reconcile_without_a_floor_needs_a_later_read() {
+    #[tokio::test]
+    async fn cash_reconcile_without_a_floor_needs_a_later_read() {
         let gate = InventoryDivergenceGate::default();
-        let earlier = gate.request_onchain_cash_reconcile(Chain::Base, None);
+        let earlier = gate.request_onchain_cash_reconcile(Chain::Base, None).await;
         let before = Utc::now();
 
-        gate.request_onchain_cash_reconcile(Chain::Base, None);
+        gate.request_onchain_cash_reconcile(Chain::Base, None).await;
 
         let current = gate
             .claim_pending_onchain_cash_reconcile(Chain::Base)
@@ -642,13 +699,14 @@ mod tests {
     /// A request without a block, such as a fill recorded without one, must
     /// not drop a pending block: a read below it would then resolve the
     /// request on time alone.
-    #[test]
-    fn cash_reconcile_without_a_block_keeps_the_pending_block() {
+    #[tokio::test]
+    async fn cash_reconcile_without_a_block_keeps_the_pending_block() {
         let gate = InventoryDivergenceGate::default();
         let after_requests = Utc::now() + chrono::Duration::seconds(1);
 
-        gate.request_onchain_cash_reconcile(Chain::Base, Some(120));
-        let blockless = gate.request_onchain_cash_reconcile(Chain::Base, None);
+        gate.request_onchain_cash_reconcile(Chain::Base, Some(120))
+            .await;
+        let blockless = gate.request_onchain_cash_reconcile(Chain::Base, None).await;
 
         assert!(!gate.accepts_onchain_cash_reconcile(
             Chain::Base,
@@ -662,6 +720,49 @@ mod tests {
             after_requests,
             Some(120)
         ));
+    }
+
+    /// A dispatch admitted before an engagement refuses even when the gate
+    /// was released again before the dispatch redeemed its admission: the
+    /// balance it sized from was flagged in between.
+    #[tokio::test]
+    async fn cash_admission_refuses_after_an_engagement_released_since() {
+        let gate = InventoryDivergenceGate::default();
+        let admission = gate.cash_admission().expect("the gate starts clear");
+
+        gate.engage_cash(InventoryScope::Hedging).await;
+        gate.release_cash(InventoryScope::Hedging);
+
+        assert_eq!(gate.hold_cash_admission(admission).await.map(|_| ()), None);
+        let fresh = gate.cash_admission().expect("the gate is clear again");
+        assert_eq!(gate.hold_cash_admission(fresh).await.map(|_| ()), Some(()));
+    }
+
+    /// An engagement waits while a dispatch holds its admission, so the
+    /// enqueue the hold covers cannot race it, and lands once it drops.
+    #[tokio::test]
+    async fn cash_engagement_waits_for_a_held_dispatch() {
+        let gate = Arc::new(InventoryDivergenceGate::default());
+        let admission = gate.cash_admission().expect("the gate starts clear");
+        let held = gate
+            .hold_cash_admission(admission)
+            .await
+            .expect("nothing engaged since the admission");
+
+        let request = tokio::spawn({
+            let gate = Arc::clone(&gate);
+            async move {
+                gate.request_onchain_cash_reconcile(Chain::Base, Some(110))
+                    .await
+            }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(!request.is_finished());
+        assert!(!gate.is_cash_engaged());
+
+        drop(held);
+        request.await.unwrap();
+        assert!(gate.is_cash_engaged());
     }
 
     /// The equity twin: a fill underflow and a settlement underflow without
