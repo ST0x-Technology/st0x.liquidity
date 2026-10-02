@@ -1114,6 +1114,18 @@ mod held_receipt {
             self.inner.prepare_pending(contract, calldata, note).await
         }
 
+        async fn prepare_pending_with_gas_limit(
+            &self,
+            contract: Address,
+            calldata: Bytes,
+            unpadded_gas_limit: u64,
+            note: &str,
+        ) -> Result<PreparedTransaction, EvmError> {
+            self.inner
+                .prepare_pending_with_gas_limit(contract, calldata, unpadded_gas_limit, note)
+                .await
+        }
+
         async fn broadcast_prepared(
             &self,
             prepared: &PreparedTransaction,
