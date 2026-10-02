@@ -24,6 +24,7 @@ use st0x_event_sorcery::{EventSourced, load_all_ids, load_entity};
 use st0x_execution::Symbol;
 
 use crate::bot_gas::BotGasReceiptCost;
+use crate::cctp_burn::CctpBurnOperation;
 use crate::equity_redemption::EquityRedemption;
 use crate::inventory::snapshot::InventorySnapshot;
 use crate::offchain::order::OffchainOrder;
@@ -374,6 +375,7 @@ async fn run_replay_checks_with_references(
     check!(WrappedEquityRecovery);
     check!(UnwrappedEquityRecovery);
     check!(BotGasReceiptCost);
+    check!(CctpBurnOperation);
 
     (reports, references)
 }
@@ -562,6 +564,10 @@ impl DurableSymbolReferences for UnwrappedEquityRecovery {
 }
 
 impl DurableSymbolReferences for BotGasReceiptCost {
+    fn add_durable_symbol_references(&self, _references: &mut SymbolReferences) {}
+}
+
+impl DurableSymbolReferences for CctpBurnOperation {
     fn add_durable_symbol_references(&self, _references: &mut SymbolReferences) {}
 }
 
@@ -1086,7 +1092,7 @@ mod tests {
 
         let reports = run_replay_checks(&pool).await;
 
-        assert_eq!(reports.len(), 12);
+        assert_eq!(reports.len(), 13);
         for report in &reports {
             assert_eq!(report.total, 0, "{}", report.aggregate_type);
             assert!(report.failures.is_empty(), "{}", report.aggregate_type);
@@ -1145,7 +1151,7 @@ mod tests {
         assert_eq!(bytes_before, bytes_after, "source database was mutated");
 
         assert!(!report.has_failures());
-        assert_eq!(report.replay_reports.len(), 12);
+        assert_eq!(report.replay_reports.len(), 13);
         assert_eq!(find_report(&report.replay_reports, "Position").total, 1);
     }
 

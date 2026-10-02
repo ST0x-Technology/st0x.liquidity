@@ -1300,6 +1300,146 @@ impl<EthWallet: Wallet, BaseWallet: Wallet> CctpBridge<EthWallet, BaseWallet> {
         self.ethereum.mined_tx(tx_hash).await
     }
 
+    /// Ensures the standing allowance, queries the fast transfer fee, and signs
+    /// the `depositForBurn` of `amount` toward `recipient` on `direction`'s
+    /// source chain without broadcasting it, so the caller can persist the
+    /// signed burn before [`broadcast_prepared_burn`](Self::broadcast_prepared_burn)
+    /// sends it. A failed persist releases the nonce through
+    /// [`discard_prepared_burn`](Self::discard_prepared_burn). The fee and the
+    /// gas price are fixed in the signed bytes, so the burn is never fee bumped.
+    pub async fn prepare_burn(
+        &self,
+        direction: BridgeDirection,
+        amount: U256,
+        recipient: Address,
+    ) -> Result<PreparedTransaction, CctpError> {
+        match direction {
+            BridgeDirection::EthereumToBase => {
+                self.ethereum
+                    .ensure_standing_allowance::<OpenChainErrorRegistry>()
+                    .await?;
+                let max_fee = self.query_fast_transfer_fee(amount, direction).await?;
+                self.ethereum
+                    .prepare_deposit_for_burn(amount, recipient, direction, max_fee)
+                    .await
+            }
+            BridgeDirection::BaseToEthereum => {
+                self.base
+                    .ensure_standing_allowance::<OpenChainErrorRegistry>()
+                    .await?;
+                let max_fee = self.query_fast_transfer_fee(amount, direction).await?;
+                self.base
+                    .prepare_deposit_for_burn(amount, recipient, direction, max_fee)
+                    .await
+            }
+        }
+    }
+
+    /// Broadcasts a burn signed by [`prepare_burn`](Self::prepare_burn). A
+    /// repeat sends the same bytes.
+    pub async fn broadcast_prepared_burn(
+        &self,
+        direction: BridgeDirection,
+        prepared: &PreparedTransaction,
+    ) -> Result<TxHash, CctpError> {
+        Ok(match direction {
+            BridgeDirection::EthereumToBase => self.ethereum.broadcast_burn(prepared).await?,
+            BridgeDirection::BaseToEthereum => self.base.broadcast_burn(prepared).await?,
+        })
+    }
+
+    /// Releases the nonce of a signed burn that was not persisted and so will
+    /// never be broadcast.
+    pub async fn discard_prepared_burn(
+        &self,
+        direction: BridgeDirection,
+        prepared: &PreparedTransaction,
+    ) {
+        match direction {
+            BridgeDirection::EthereumToBase => self.ethereum.discard_burn(prepared).await,
+            BridgeDirection::BaseToEthereum => self.base.discard_burn(prepared).await,
+        }
+    }
+
+    /// Reserves the nonce of a persisted signed burn after a restart, before
+    /// any other send from the source wallet can take it.
+    pub async fn restore_prepared_burn(
+        &self,
+        direction: BridgeDirection,
+        prepared: &PreparedTransaction,
+    ) {
+        match direction {
+            BridgeDirection::EthereumToBase => self.ethereum.restore_burn(prepared).await,
+            BridgeDirection::BaseToEthereum => self.base.restore_burn(prepared).await,
+        }
+    }
+
+    /// Releases the nonce of a signed burn whose nonce another mined tx took,
+    /// so the source wallet stops holding it.
+    pub async fn release_superseded_burn(
+        &self,
+        direction: BridgeDirection,
+        prepared: &PreparedTransaction,
+    ) {
+        match direction {
+            BridgeDirection::EthereumToBase => {
+                self.ethereum.release_superseded_burn(prepared).await;
+            }
+            BridgeDirection::BaseToEthereum => self.base.release_superseded_burn(prepared).await,
+        }
+    }
+
+    /// Returns `tx_hash` as mined on `direction`'s source chain, or `None`
+    /// while the node shows no canonical receipt for it.
+    pub async fn source_mined_tx(
+        &self,
+        direction: BridgeDirection,
+        tx_hash: TxHash,
+    ) -> Result<Option<MinedTx>, CctpError> {
+        match direction {
+            BridgeDirection::EthereumToBase => self.ethereum.mined_tx(tx_hash).await,
+            BridgeDirection::BaseToEthereum => self.base.mined_tx(tx_hash).await,
+        }
+    }
+
+    /// Whether `tx_hash`'s receipt on `direction`'s source chain carries the
+    /// CCTP `MessageSent` event, as [`confirm_burn`](crate::Bridge::confirm_burn)
+    /// requires of a burn. Reads without waiting; `None` while the node shows
+    /// no receipt.
+    pub async fn source_emitted_message_sent(
+        &self,
+        direction: BridgeDirection,
+        tx_hash: TxHash,
+    ) -> Result<Option<bool>, CctpError> {
+        match direction {
+            BridgeDirection::EthereumToBase => self.ethereum.emitted_message_sent(tx_hash).await,
+            BridgeDirection::BaseToEthereum => self.base.emitted_message_sent(tx_hash).await,
+        }
+    }
+
+    /// Whether the node on `direction`'s source chain knows `tx_hash`, mined
+    /// or still pending. `false` can be a lagging node, so it never proves the
+    /// tx is gone.
+    pub async fn source_knows_tx(
+        &self,
+        direction: BridgeDirection,
+        tx_hash: TxHash,
+    ) -> Result<bool, CctpError> {
+        match direction {
+            BridgeDirection::EthereumToBase => self.ethereum.knows_tx(tx_hash).await,
+            BridgeDirection::BaseToEthereum => self.base.knows_tx(tx_hash).await,
+        }
+    }
+
+    /// The wallet that signs `direction`'s burns. A persisted signed burn from
+    /// another address must not go through this wallet's nonce bookkeeping.
+    pub fn source_signer(&self, direction: BridgeDirection) -> Address {
+        match direction {
+            BridgeDirection::EthereumToBase => self.ethereum.owner(),
+            BridgeDirection::BaseToEthereum => self.base.owner(),
+        }
+    }
+
     /// Returns the block in which `tx_hash` was mined on Ethereum, the chain
     /// where BaseToEthereum mints land.
     ///
