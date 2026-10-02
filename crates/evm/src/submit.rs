@@ -187,11 +187,15 @@ const FEE_BUMP_PCT_PER_ATTEMPT: u64 = 15;
 /// whole padded limit, and the node admits a transaction only when the
 /// sender holds `gas_limit * max_fee_per_gas`. Raising this raises both.
 ///
-/// The padded limit is not capped at the chain's per-transaction or block gas
-/// limit. Every call we send estimates far below either, so a padded limit
-/// cannot reach them; a call estimating above two thirds of a cap would be
-/// rejected by the node.
+/// A padded estimate is not capped: every call we send estimates far below
+/// [`MAX_TX_GAS_LIMIT`]. A pinned limit is bounds-checked instead.
 const GAS_LIMIT_HEADROOM_PCT: u64 = 50;
+
+/// Intrinsic gas of any transaction; a lower gas limit cannot be included.
+const INTRINSIC_GAS: u64 = 21_000;
+
+/// EIP-7825 per-transaction gas cap (2^24); the node rejects a larger limit.
+const MAX_TX_GAS_LIMIT: u64 = 1 << 24;
 
 /// Minimum absolute headroom, in gas, added on top of `eth_estimateGas`.
 ///
@@ -224,7 +228,8 @@ pub(crate) enum GasLimitSource {
     /// `eth_estimateGas` against current state.
     Estimate,
     /// A caller-supplied unpadded limit, for a call whose estimate would revert
-    /// because a transaction it depends on has not mined yet.
+    /// because a transaction it depends on has not mined yet. Refused below
+    /// [`INTRINSIC_GAS`] or when padded past [`MAX_TX_GAS_LIMIT`].
     Pinned(u64),
 }
 
@@ -250,11 +255,17 @@ where
     F: TxFiller<Ethereum>,
     P: Provider<Ethereum>,
 {
-    let unpadded = match gas_limit {
-        GasLimitSource::Estimate => provider.estimate_gas(tx.clone()).await?,
-        GasLimitSource::Pinned(limit) => limit,
+    let padded = match gas_limit {
+        GasLimitSource::Estimate => pad_gas_estimate(provider.estimate_gas(tx.clone()).await?)?,
+        GasLimitSource::Pinned(unpadded) => {
+            let padded = pad_gas_estimate(unpadded)?;
+            if unpadded < INTRINSIC_GAS || padded > MAX_TX_GAS_LIMIT {
+                return Err(EvmError::PinnedGasLimitOutOfBounds { unpadded, padded });
+            }
+            padded
+        }
     };
-    Ok(tx.gas_limit(pad_gas_estimate(unpadded)?))
+    Ok(tx.gas_limit(padded))
 }
 
 /// Scale a fee value up by `pct` percent with checked arithmetic, rounding
