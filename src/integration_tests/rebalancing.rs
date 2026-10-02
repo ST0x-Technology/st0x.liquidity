@@ -3600,7 +3600,7 @@ async fn recovery_job_breaks_deadlock_when_wrap_landed_wrapped_equity_recovery()
     balances.insert(symbol.clone(), shares);
     let now = Utc::now();
     let view = InventoryView::default().set_inflight_equity_at_location(
-        InFlightEquityLocation::BaseWalletWrapped,
+        InFlightEquityLocation::WalletWrapped(Chain::Base),
         &balances,
         now,
         now,
@@ -3745,7 +3745,7 @@ async fn recovery_job_breaks_deadlock_when_wrap_failed_unwrapped_equity_recovery
     balances.insert(symbol.clone(), shares);
     let now = Utc::now();
     let view = InventoryView::default().set_inflight_equity_at_location(
-        InFlightEquityLocation::BaseWalletUnwrapped,
+        InFlightEquityLocation::WalletUnwrapped(Chain::Base),
         &balances,
         now,
         now,
@@ -3912,7 +3912,7 @@ async fn recovery_job_breaks_deadlock_when_wrap_failed_dispatches_active_mint() 
     let now = Utc::now();
     let view = InventoryView::default()
         .set_inflight_equity_at_location(
-            InFlightEquityLocation::BaseWalletUnwrapped,
+            InFlightEquityLocation::WalletUnwrapped(Chain::Base),
             &balances,
             now,
             now,
