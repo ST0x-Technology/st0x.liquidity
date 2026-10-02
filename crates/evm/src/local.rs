@@ -787,6 +787,69 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pinned_gas_limit_below_intrinsic_gas_rolls_back_nonce() {
+        let (_anvil, wallet, token_address, signer_address) = setup_anvil_with_token().await;
+        let nonce = wallet
+            .provider()
+            .get_transaction_count(signer_address)
+            .await
+            .unwrap();
+
+        let error = wallet
+            .prepare_pending_with_gas_limit(token_address, Bytes::new(), 0, "below intrinsic")
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                EvmError::PinnedGasLimitOutOfBounds {
+                    unpadded: 0,
+                    padded: 20_000
+                }
+            ),
+            "expected PinnedGasLimitOutOfBounds, got {error:?}"
+        );
+        assert_eq!(
+            wallet.nonce_manager.peek_next_nonce(signer_address).await,
+            Some(nonce),
+            "the failed preparation must roll back its nonce reservation"
+        );
+    }
+
+    #[tokio::test]
+    async fn pinned_gas_limit_padded_past_the_tx_cap_rolls_back_nonce() {
+        let (_anvil, wallet, token_address, signer_address) = setup_anvil_with_token().await;
+        let nonce = wallet
+            .provider()
+            .get_transaction_count(signer_address)
+            .await
+            .unwrap();
+
+        // 1.5x of 11,184,811 rounds up to 16,777,217: one gas over the 2^24 cap.
+        let error = wallet
+            .prepare_pending_with_gas_limit(token_address, Bytes::new(), 11_184_811, "past cap")
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                EvmError::PinnedGasLimitOutOfBounds {
+                    unpadded: 11_184_811,
+                    padded: 16_777_217
+                }
+            ),
+            "expected PinnedGasLimitOutOfBounds, got {error:?}"
+        );
+        assert_eq!(
+            wallet.nonce_manager.peek_next_nonce(signer_address).await,
+            Some(nonce),
+            "the failed preparation must roll back its nonce reservation"
+        );
+    }
+
+    #[tokio::test]
     async fn concurrent_sends_use_distinct_nonces() {
         let (_anvil, wallet, _token_address, signer_address) = setup_anvil_with_token().await;
 

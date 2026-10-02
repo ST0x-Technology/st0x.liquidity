@@ -269,6 +269,11 @@ pub enum EvmError {
     #[error("gas limit padding overflowed u64 (unpadded gas limit {estimate} too large)")]
     #[cfg(any(feature = "turnkey", feature = "local-signer"))]
     GasLimitOverflow { estimate: u64 },
+    /// A pinned gas limit the node would reject on every broadcast: the unpadded limit is below
+    /// the 21,000 intrinsic gas, or the padded limit exceeds the per-transaction gas cap.
+    #[error("pinned gas limit out of bounds (unpadded {unpadded}, padded {padded})")]
+    #[cfg(any(feature = "turnkey", feature = "local-signer"))]
+    PinnedGasLimitOutOfBounds { unpadded: u64, padded: u64 },
     #[cfg(feature = "local-signer")]
     #[error("invalid private key: {0}")]
     InvalidPrivateKey(#[from] alloy::signers::k256::ecdsa::Error),
@@ -337,6 +342,8 @@ impl EvmError {
             Self::ReplacementFeeOverflow => false,
             #[cfg(any(feature = "turnkey", feature = "local-signer"))]
             Self::GasLimitOverflow { .. } => false,
+            #[cfg(any(feature = "turnkey", feature = "local-signer"))]
+            Self::PinnedGasLimitOutOfBounds { .. } => false,
             #[cfg(feature = "local-signer")]
             Self::InvalidPrivateKey(_) => false,
             #[cfg(feature = "turnkey")]
@@ -373,6 +380,8 @@ impl EvmError {
             Self::ReplacementFeeOverflow => false,
             #[cfg(any(feature = "turnkey", feature = "local-signer"))]
             Self::GasLimitOverflow { .. } => false,
+            #[cfg(any(feature = "turnkey", feature = "local-signer"))]
+            Self::PinnedGasLimitOutOfBounds { .. } => false,
             #[cfg(feature = "local-signer")]
             Self::InvalidPrivateKey(_) => false,
             #[cfg(feature = "turnkey")]
@@ -414,6 +423,8 @@ impl EvmError {
             Self::ReplacementFeeOverflow => false,
             #[cfg(any(feature = "turnkey", feature = "local-signer"))]
             Self::GasLimitOverflow { .. } => false,
+            #[cfg(any(feature = "turnkey", feature = "local-signer"))]
+            Self::PinnedGasLimitOutOfBounds { .. } => false,
             #[cfg(feature = "local-signer")]
             Self::InvalidPrivateKey(_) => false,
             #[cfg(feature = "turnkey")]
@@ -463,6 +474,8 @@ impl EvmError {
             Self::ReplacementFeeOverflow => None,
             #[cfg(any(feature = "turnkey", feature = "local-signer"))]
             Self::GasLimitOverflow { .. } => None,
+            #[cfg(any(feature = "turnkey", feature = "local-signer"))]
+            Self::PinnedGasLimitOutOfBounds { .. } => None,
             #[cfg(feature = "local-signer")]
             Self::InvalidPrivateKey(_) => None,
             #[cfg(feature = "turnkey")]
