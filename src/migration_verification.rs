@@ -1,6 +1,6 @@
 //! Verifies that migrations apply cleanly to a real (prod/staging) database
-//! and that every currently persisted event still replays under the
-//! CURRENT aggregate code.
+//! and that every persisted aggregate type is covered and its durable
+//! state still replays under the CURRENT aggregate code.
 //!
 //! Catches cases where an event or aggregate shape change breaks legacy
 //! data that no migration has repaired yet. Never mutates the database it
@@ -20,7 +20,7 @@ use sqlx::sqlite::SqliteConnectOptions;
 use thiserror::Error;
 
 use st0x_config::DeploymentSymbolPolicy;
-use st0x_event_sorcery::{EventSourced, load_all_ids, load_entity};
+use st0x_event_sorcery::{EventSourced, SchemaRegistry, load_all_ids, load_entity};
 use st0x_execution::Symbol;
 
 use crate::bot_gas::BotGasReceiptCost;
@@ -36,6 +36,9 @@ use crate::usdc_rebalance::UsdcRebalance;
 use crate::vault_registry::VaultRegistry;
 use crate::wrapped_equity_recovery::aggregate::WrappedEquityRecovery;
 
+const PERSISTED_AGGREGATE_TYPES_QUERY: &str = "SELECT aggregate_type FROM events \
+     UNION SELECT aggregate_type FROM snapshots ORDER BY aggregate_type";
+
 /// One aggregate instance that failed to replay under current code.
 #[derive(Debug)]
 pub struct ReplayFailure {
@@ -46,7 +49,7 @@ pub struct ReplayFailure {
 /// Replay results for every persisted instance of one aggregate type.
 #[derive(Debug)]
 pub struct AggregateReplayReport {
-    pub aggregate_type: &'static str,
+    pub aggregate_type: String,
     pub total: usize,
     pub failures: Vec<ReplayFailure>,
 }
@@ -268,6 +271,8 @@ pub enum VerificationError {
     Migrate(#[from] sqlx::migrate::MigrateError),
     #[error("failed to clear stale snapshots before replay check")]
     ClearSnapshots(#[source] sqlx::Error),
+    #[error("failed to enumerate persisted aggregate types")]
+    EnumerateAggregateTypes(#[source] sqlx::Error),
     #[error("failed to create scratch directory")]
     ScratchDir(#[from] std::io::Error),
 }
@@ -312,10 +317,15 @@ pub async fn verify_migrations(
         .run(&scratch_pool)
         .await?;
 
+    let persisted_types = sqlx::query_scalar(PERSISTED_AGGREGATE_TYPES_QUERY)
+        .fetch_all(&scratch_pool)
+        .await
+        .map_err(VerificationError::EnumerateAggregateTypes)?;
+
     clear_snapshots(&scratch_pool).await?;
 
     let (replay_reports, symbol_references) =
-        run_replay_checks_with_references(&scratch_pool).await;
+        run_replay_checks_with_references(&scratch_pool, persisted_types).await;
     let symbol_compatibility = SymbolCompatibilityReport::new(symbol_policy, &symbol_references);
 
     scratch_pool.close().await;
@@ -347,11 +357,49 @@ async fn clear_snapshots(pool: &SqlitePool) -> Result<(), VerificationError> {
 
 #[cfg(test)]
 async fn run_replay_checks(pool: &SqlitePool) -> Vec<AggregateReplayReport> {
-    run_replay_checks_with_references(pool).await.0
+    let persisted_types = sqlx::query_scalar(PERSISTED_AGGREGATE_TYPES_QUERY)
+        .fetch_all(pool)
+        .await
+        .unwrap();
+    run_replay_checks_with_references(pool, persisted_types)
+        .await
+        .0
+}
+
+/// Compare durable types discovered before snapshot cleanup with the actual
+/// replay reports, rather than another hand-maintained coverage list. Compacted
+/// state can exist only in snapshots, including for an aggregate omitted from
+/// the replay checks whose snapshot cleanup would otherwise erase its evidence.
+fn uncovered_aggregate_reports(
+    persisted_types: Vec<String>,
+    covered_reports: &[AggregateReplayReport],
+) -> Vec<AggregateReplayReport> {
+    persisted_types
+        .into_iter()
+        .filter(|persisted| {
+            !covered_reports
+                .iter()
+                .any(|report| report.aggregate_type == *persisted)
+        })
+        .map(|uncovered| AggregateReplayReport {
+            aggregate_type: uncovered,
+            total: 0,
+            failures: vec![ReplayFailure {
+                aggregate_id: "*".to_string(),
+                error: "aggregate type is present in events or snapshots but not \
+                        covered by the replay checks; add replay support to \
+                        run_replay_checks_with_references; for a retired type, keep or restore \
+                        compatibility replay support for its durable history rather than \
+                        deleting retained events"
+                    .to_string(),
+            }],
+        })
+        .collect()
 }
 
 async fn run_replay_checks_with_references(
     pool: &SqlitePool,
+    persisted_types: Vec<String>,
 ) -> (Vec<AggregateReplayReport>, SymbolReferences) {
     let mut reports = Vec::new();
     let mut references = SymbolReferences::new();
@@ -374,6 +422,9 @@ async fn run_replay_checks_with_references(
     check!(WrappedEquityRecovery);
     check!(UnwrappedEquityRecovery);
     check!(BotGasReceiptCost);
+    check!(SchemaRegistry);
+
+    reports.extend(uncovered_aggregate_reports(persisted_types, &reports));
 
     (reports, references)
 }
@@ -390,7 +441,7 @@ where
         Ok(ids) => ids,
         Err(error) => {
             return AggregateReplayReport {
-                aggregate_type: Entity::AGGREGATE_TYPE,
+                aggregate_type: Entity::AGGREGATE_TYPE.to_string(),
                 total: 0,
                 failures: vec![ReplayFailure {
                     aggregate_id: "*".to_string(),
@@ -416,7 +467,7 @@ where
     }
 
     AggregateReplayReport {
-        aggregate_type: Entity::AGGREGATE_TYPE,
+        aggregate_type: Entity::AGGREGATE_TYPE.to_string(),
         total: ids.len(),
         failures,
     }
@@ -510,6 +561,10 @@ impl DurableSymbolReferences for PortfolioSnapshot {
 }
 
 impl DurableSymbolReferences for UsdcRebalance {
+    fn add_durable_symbol_references(&self, _references: &mut SymbolReferences) {}
+}
+
+impl DurableSymbolReferences for SchemaRegistry {
     fn add_durable_symbol_references(&self, _references: &mut SymbolReferences) {}
 }
 
@@ -686,6 +741,15 @@ mod tests {
                     block_number: Some(1),
                 },
             )
+            .await
+            .unwrap();
+
+        // Model fully compacted observational state with no retained event
+        // tail; its snapshot is the only durable source for this instance.
+        sqlx::query("DELETE FROM events WHERE aggregate_type = ? AND aggregate_id = ?")
+            .bind(InventorySnapshot::AGGREGATE_TYPE)
+            .bind(id.to_string())
+            .execute(pool)
             .await
             .unwrap();
     }
@@ -975,6 +1039,119 @@ mod tests {
         );
     }
 
+    /// The drift guard for the hand-maintained replay list: an aggregate type
+    /// persisted in the event store but absent from `run_replay_checks` must
+    /// fail the deploy gate closed -- otherwise a newly added `EventSourced`
+    /// aggregate silently ships with unverified legacy-event replay.
+    #[tokio::test]
+    async fn uncovered_persisted_aggregate_type_fails_the_gate() {
+        let (_source_dir, source_path, pool) = source_database().await;
+        insert_position_initialized(&pool, "AAPL").await;
+        insert_event(
+            &pool,
+            "BrandNewAggregate",
+            "some-id",
+            1,
+            "BrandNewAggregateEvent::Created",
+            "1.0",
+            json!({"Created": {}}),
+        )
+        .await;
+        insert_snapshot(&pool, "BrandNewAggregate", "some-id").await;
+        pool.close().await;
+        let bytes_before = std::fs::read(&source_path).unwrap();
+
+        let report = verify_migrations(&source_path, &symbol_policy(&["AAPL"], &[]))
+            .await
+            .unwrap();
+
+        assert!(report.has_failures(), "{report}");
+        assert_eq!(bytes_before, std::fs::read(&source_path).unwrap());
+        assert_eq!(report.replay_reports.len(), 14);
+        assert_eq!(
+            report
+                .replay_reports
+                .iter()
+                .filter(|report| report.has_failures())
+                .count(),
+            1
+        );
+        assert_eq!(
+            report
+                .replay_reports
+                .iter()
+                .filter(|report| report.aggregate_type == "BrandNewAggregate")
+                .count(),
+            1
+        );
+        let uncovered = find_report(&report.replay_reports, "BrandNewAggregate");
+        assert_eq!(uncovered.total, 0);
+        assert_eq!(uncovered.failures.len(), 1);
+        assert_eq!(uncovered.failures[0].aggregate_id, "*");
+        assert_eq!(
+            uncovered.failures[0].error,
+            "aggregate type is present in events or snapshots but not \
+             covered by the replay checks; add replay support to \
+             run_replay_checks_with_references; for a retired type, keep or restore \
+             compatibility replay support for its durable history rather than \
+             deleting retained events"
+        );
+
+        // The covered aggregates keep passing: the guard adds a failure, it
+        // does not poison the rest of the report.
+        let position_report = find_report(&report.replay_reports, "Position");
+        assert_eq!(position_report.failures.len(), 0);
+        let registry_report = find_report(&report.replay_reports, "SchemaRegistry");
+        assert_eq!(registry_report.total, 1);
+        assert_eq!(registry_report.failures.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn uncovered_snapshot_only_type_fails_before_cleanup_can_hide_it() {
+        let (_source_dir, source_path, pool) = source_database().await;
+        insert_snapshot(&pool, "CompactedUnknownAggregate", "snapshot-only-id").await;
+        pool.close().await;
+        let bytes_before = std::fs::read(&source_path).unwrap();
+
+        let report = verify_migrations(&source_path, &symbol_policy(&[], &[]))
+            .await
+            .unwrap();
+
+        assert!(report.has_failures(), "{report}");
+        let uncovered = find_report(&report.replay_reports, "CompactedUnknownAggregate");
+        assert_eq!(uncovered.failures.len(), 1);
+        assert_eq!(uncovered.failures[0].aggregate_id, "*");
+        assert!(report.to_string().contains("CompactedUnknownAggregate"));
+        assert_eq!(bytes_before, std::fs::read(&source_path).unwrap());
+    }
+
+    /// A store containing only covered aggregate types produces no synthetic
+    /// uncovered-type failures -- the guard stays silent on a healthy store.
+    #[tokio::test]
+    async fn covered_only_store_produces_no_uncovered_reports() {
+        let pool = migrated_pool().await;
+        insert_position_initialized(&pool, "AAPL").await;
+
+        let reports = run_replay_checks(&pool).await;
+
+        assert_eq!(reports.len(), 13);
+        assert_eq!(
+            reports
+                .iter()
+                .filter(|report| report.has_failures())
+                .count(),
+            0,
+            "no failing reports expected for a fully covered store: {reports:?}"
+        );
+        assert_eq!(
+            reports
+                .iter()
+                .map(|report| report.failures.len())
+                .sum::<usize>(),
+            0
+        );
+    }
+
     #[tokio::test]
     async fn replays_a_well_formed_position_cleanly() {
         let pool = migrated_pool().await;
@@ -1007,6 +1184,32 @@ mod tests {
         assert_eq!(usdc_report.total, 1);
         assert_eq!(usdc_report.failures.len(), 1);
         assert_eq!(usdc_report.failures[0].aggregate_id, A_USDC_REBALANCE_ID);
+    }
+
+    #[tokio::test]
+    async fn malformed_framework_schema_registry_event_fails_actual_replay() {
+        let (_source_dir, source_path, pool) = source_database().await;
+        insert_event(
+            &pool,
+            "SchemaRegistry",
+            "schema",
+            1,
+            "SchemaRegistryEvent::VersionUpdated",
+            "1.0",
+            json!({"VersionUpdated": {"name": "Position", "version": "invalid"}}),
+        )
+        .await;
+        pool.close().await;
+
+        let report = verify_migrations(&source_path, &symbol_policy(&[], &[]))
+            .await
+            .unwrap();
+
+        assert!(report.has_failures(), "{report}");
+        let registry = find_report(&report.replay_reports, "SchemaRegistry");
+        assert_eq!(registry.total, 1);
+        assert_eq!(registry.failures.len(), 1);
+        assert_eq!(registry.failures[0].aggregate_id, "schema");
     }
 
     /// The prod failure this migration repairs is `UsdcRebalance` *hydration*,
@@ -1086,7 +1289,7 @@ mod tests {
 
         let reports = run_replay_checks(&pool).await;
 
-        assert_eq!(reports.len(), 12);
+        assert_eq!(reports.len(), 13);
         for report in &reports {
             assert_eq!(report.total, 0, "{}", report.aggregate_type);
             assert!(report.failures.is_empty(), "{}", report.aggregate_type);
@@ -1103,6 +1306,7 @@ mod tests {
         let pool = migrated_pool().await;
         insert_snapshot(&pool, "Position", "AAPL").await;
         insert_snapshot(&pool, "UsdcRebalance", A_USDC_REBALANCE_ID).await;
+        insert_snapshot(&pool, "CompactedUnknownAggregate", "snapshot-only-id").await;
 
         clear_snapshots(&pool).await.unwrap();
 
@@ -1130,6 +1334,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn verify_migrations_replays_covered_snapshot_only_inventory_cleanly() {
+        let (_source_dir, source_path, pool) = source_database().await;
+        insert_inventory_snapshot_only(&pool, "AAPL").await;
+        let retained_event_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM events WHERE aggregate_type = 'InventorySnapshot'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(retained_event_count, 0);
+        pool.close().await;
+
+        let report = verify_migrations(&source_path, &symbol_policy(&["AAPL"], &[]))
+            .await
+            .unwrap();
+
+        assert!(!report.has_failures(), "{report}");
+        let inventory = find_report(&report.replay_reports, "InventorySnapshot");
+        assert_eq!(inventory.total, 1);
+        assert!(inventory.failures.is_empty());
+    }
+
+    #[tokio::test]
     async fn verify_migrations_never_mutates_the_source_and_covers_every_aggregate_type() {
         let (_source_dir, source_path, setup_pool) = source_database().await;
         insert_position_initialized(&setup_pool, "AAPL").await;
@@ -1145,7 +1372,7 @@ mod tests {
         assert_eq!(bytes_before, bytes_after, "source database was mutated");
 
         assert!(!report.has_failures());
-        assert_eq!(report.replay_reports.len(), 12);
+        assert_eq!(report.replay_reports.len(), 13);
         assert_eq!(find_report(&report.replay_reports, "Position").total, 1);
     }
 
@@ -1159,6 +1386,25 @@ mod tests {
         .unwrap_err();
 
         assert!(matches!(error, VerificationError::OpenSource { .. }));
+    }
+
+    #[tokio::test]
+    async fn verify_migrations_preserves_type_enumeration_error_source() {
+        let (_source_dir, source_path, pool) = source_database().await;
+        sqlx::query("DROP TABLE snapshots")
+            .execute(&pool)
+            .await
+            .unwrap();
+        pool.close().await;
+
+        let error = verify_migrations(&source_path, &symbol_policy(&[], &[]))
+            .await
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            VerificationError::EnumerateAggregateTypes(sqlx::Error::Database(_))
+        ));
     }
 
     #[tokio::test]
