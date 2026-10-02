@@ -415,6 +415,50 @@ answers `503` until the bot finishes starting. The tokenization and issuer verbs
 (`transfer-equity`, `wrap-equity`, `unwrap-equity`, `donate-equity`,
 `dividend-bump`) have no client subcommand and stay on `st0x-cli`.
 
+### Taking a Listing off Rebalancing
+
+To stop equity rebalancing for one symbol on one chain, go through `paused`.
+Do not go straight from `enabled` to `disabled`. On a secondary chain where no
+other equity is `enabled` or `paused`, `disabled` removes the chain's equity
+services, and startup then refuses any transfer still open there.
+
+1. In `st0x.registry`, set `rebalancing = "paused"` on
+   `[chains.<chain>.assets.equities.<SYM>]` and publish the token file. The
+   planner and `transfer-equity` start no new mint or redemption for that
+   listing. Transfers already under way, their resume jobs and wallet recovery
+   (the primary chain only, today) run to completion.
+2. Wait until nothing for that symbol and chain is in flight. This lists every
+   mint and redemption that has not reached a terminal state:
+
+   ```bash
+   st0x-liquidity-client --env <env> read resource interrupted
+   ```
+
+   For each id it lists, check the chain and symbol in its events:
+
+   ```bash
+   st0x-liquidity-client --env <env> read transfer-events mint <issuer-request-id>
+   st0x-liquidity-client --env <env> read transfer-events redemption <redemption-aggregate-id>
+   ```
+
+   A transfer of this listing that does not finish follows the normal recovery
+   steps in this guide (`transfer recheck`, `transfer resume`, `transfer fail`).
+   A mint that the issuer never received stays at `MintRequested` while paused.
+   Confirm with the issuer, then use `transfer fail --kind mint`.
+3. Set `rebalancing = "disabled"` and publish again.
+
+Pausing does not move the listing's equity off the chain. To move it first, use
+`vault-withdraw`, `unwrap-equity`, then `alpaca-redeem` with the unwrapped
+quantity, while the listing is paused. The chain still counts in the planner's
+total while paused. If its reads go stale, rebalancing of the symbol stops on
+every chain until it is fresh again or `disabled`.
+
+Before you publish `paused`, the running bot must read it, and the registry
+validator (`t0/check.jq`) must accept it. On rollback, restore the token value
+before you downgrade the binary. The dashboard shows paused and disabled
+listings with the same red rebalancing indicator, so check the mode in the
+registry, not on the dashboard, before step 3.
+
 ### Orchestrator Rollout per Chain
 
 Issuance keys an asset's `vault_mode` by symbol, so cutting an asset over to
