@@ -542,6 +542,13 @@ pub(crate) async fn burn_receipt_fate(
     }
 }
 
+/// An RPC error's text with the RPC URL's credentials removed: a transport
+/// error names the URL, whose path or query carries the provider key, so
+/// every RPC error this module or the route logs goes through this.
+pub(crate) fn scrubbed(error: &impl fmt::Display) -> String {
+    crate::telemetry::scrub_secrets(&error.to_string())
+}
+
 /// Records `fate` on the operation. A failed write is logged: the burn's
 /// receipt still decides, so the next read records it.
 pub(crate) async fn record_burn_fate(
@@ -583,7 +590,7 @@ pub(crate) async fn settle_burn_from_receipt(
         Ok(Some(fate)) => record_burn_fate(store, id, burn_tx, fate).await,
         Ok(None) => CctpBurnStatus::Pending,
         Err(error) => {
-            warn!(operation_id = %id, %burn_tx, ?error, "Could not read the CCTP burn's receipt; reporting it pending");
+            warn!(operation_id = %id, %burn_tx, error = %scrubbed(&error), "Could not read the CCTP burn's receipt; reporting it pending");
             CctpBurnStatus::Pending
         }
     }
@@ -904,7 +911,7 @@ pub(crate) async fn restore_pending_cctp_burns(
             .boxed()
             .await
         {
-            error!(target: "operational_alert", alert = true, operation_id = %id, %burn_tx, nonce, ?error, "Could not rebroadcast a pending capital CCTP burn at startup; its nonce stays reserved, so startup skips that chain's token approvals and allowance revokes, and a cctp-bridge rerun with its operation id broadcasts it again");
+            error!(target: "operational_alert", alert = true, operation_id = %id, %burn_tx, nonce, error = %scrubbed(&error), "Could not rebroadcast a pending capital CCTP burn at startup; its nonce stays reserved, so startup skips that chain's token approvals and allowance revokes, and a cctp-bridge rerun with its operation id broadcasts it again");
             outcome.unmined_chains.insert(source.chain());
             continue;
         }
@@ -915,7 +922,7 @@ pub(crate) async fn restore_pending_cctp_burns(
                 outcome.unmined_chains.insert(source.chain());
             }
             Err(error) => {
-                warn!(operation_id = %id, %burn_tx, nonce, ?error, "Could not read the receipt of a restored capital CCTP burn at startup; treating it as not mined");
+                warn!(operation_id = %id, %burn_tx, nonce, error = %scrubbed(&error), "Could not read the receipt of a restored capital CCTP burn at startup; treating it as not mined");
                 outcome.unmined_chains.insert(source.chain());
             }
         }

@@ -338,8 +338,13 @@ receipt: it returns the burn tx as soon as the burn is broadcast, and
 `debug cctp complete-mint` fetches the attestation and mints once Circle has
 attested it.
 
-Every `capital cctp-bridge` run prints `operation id <id>` to stderr before it
-sends the request, and the bot records the signed burn under that id before
+A bot release from before operation ids ignores the id and burns on every call,
+so the bot ships before this client: after deploy, and after a rollback of the
+bot, a rerun with `--operation-id` against an older bot burns again. The client
+warns when an answer does not echo the operation id and a `status`; then do not
+rerun, and finish that burn with `debug cctp complete-mint`. Every
+`capital cctp-bridge` run prints `operation id <id>` to stderr before it sends
+the request, and the bot records the signed burn under that id before
 broadcasting it. After a timeout, a `502`, any `500` except the one that says
 the bot cannot tell whether the burn was recorded (see below), or any other
 doubt, rerun the same command with `--operation-id <id>`: it never burns a
@@ -444,16 +449,16 @@ redundant `approve(0)`, which moves no funds.
 
 A request that times out on the client may still complete in the bot; check the
 bot logs and the chain for the transaction before retrying a vault or allowance
-verb. A `cctp-bridge` rerun with the printed operation id is always safe, as
-described above. If the logs show `Capital route failed onchain` for
-`cctp-bridge`, the burn was not signed or recorded: the balance read, the
-allowance approve or the Circle fee lookup failed, and a rerun with the same
-operation id burns once. A `500` that says the bot cannot tell whether the burn
-was recorded keeps its nonce reserved until a restart: rerun with the same
-operation id only after the restart. Every capital verb answers `503` until the
-bot finishes starting. The tokenization and issuer verbs (`transfer-equity`,
-`wrap-equity`, `unwrap-equity`, `donate-equity`, `dividend-bump`) have no client
-subcommand and stay on `st0x-cli`.
+verb. A `cctp-bridge` rerun with the printed operation id is safe, as described
+above, against a bot that records operation ids. If the logs show
+`Capital route failed onchain` for `cctp-bridge`, the burn was not signed or
+recorded: the balance read, the allowance approve or the Circle fee lookup
+failed, and a rerun with the same operation id burns once. A `500` that says the
+bot cannot tell whether the burn was recorded keeps its nonce reserved until a
+restart: rerun with the same operation id only after the restart. Every capital
+verb answers `503` until the bot finishes starting. The tokenization and issuer
+verbs (`transfer-equity`, `wrap-equity`, `unwrap-equity`, `donate-equity`,
+`dividend-bump`) have no client subcommand and stay on `st0x-cli`.
 
 ### Orchestrator Rollout per Chain
 

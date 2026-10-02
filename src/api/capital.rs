@@ -47,7 +47,7 @@ use crate::AppState;
 use crate::cctp_burn::{
     BotCctpBridge, BurnNotSuperseded, BurnReceiptFate, CctpBurnOperation, CctpBurnOperationCommand,
     CctpBurnOperationId, CctpBurnStatus, CctpSourceChain, NonceTakenBy, RequestedBurn,
-    bot_cctp_bridge, burn_receipt_fate, record_burn_fate, settle_burn_from_receipt,
+    bot_cctp_bridge, burn_receipt_fate, record_burn_fate, scrubbed, settle_burn_from_receipt,
     signed_by_source_wallet, verify_burn_superseded,
 };
 use crate::rebalancing::UsdcResumeError;
@@ -818,7 +818,7 @@ async fn broadcast_and_answer<Held: Send + 'static>(
                 // put in the answer or the alert.
                 error!(
                     %operation_id, %burn_tx, ?direction,
-                    error = %crate::telemetry::scrub_secrets(&error.to_string()),
+                    error = %scrubbed(&error),
                     "Broadcasting the recorded CCTP burn failed"
                 );
                 "its broadcast failed (see the bot logs); rerun with the same operation id to \
@@ -990,7 +990,11 @@ async fn confirm_recorded_burn(
 ) {
     let operation_id = request.operation_id;
     let direction = request.from.bridge_direction();
-    let error = bridge.confirm_burn(direction, burn_tx, amount).await.err();
+    let error = bridge
+        .confirm_burn(direction, burn_tx, amount)
+        .await
+        .err()
+        .map(|error| scrubbed(&error));
     let fate = match burn_receipt_fate(
         bridge,
         request.from,
@@ -1002,7 +1006,8 @@ async fn confirm_recorded_burn(
         Ok(Some(fate)) => fate,
         read => {
             warn!(
-                %operation_id, %burn_tx, ?direction, %amount, ?error, ?read,
+                %operation_id, %burn_tx, ?direction, %amount, ?error,
+                read = ?read.map_err(|error| scrubbed(&error)),
                 "CCTP burn broadcast via API is not confirmed yet; a cctp-bridge rerun with its \
                  operation id reports its status and broadcasts it again"
             );

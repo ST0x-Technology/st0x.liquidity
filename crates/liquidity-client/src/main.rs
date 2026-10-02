@@ -430,9 +430,10 @@ async fn dispatch_capital<A: TokenSource + Sync>(
             // interrupted run: the id is what makes the rerun safe.
             eprintln!(
                 "operation id {operation_id}: after a failure or a timeout, rerun with \
-                 --operation-id {operation_id} to report this burn instead of burning again"
+                 --operation-id {operation_id} to report this burn instead of burning again \
+                 (only against a bot that records operation ids, see below)"
             );
-            client
+            let answer = client
                 .post_json(
                     "/capital/cctp-bridge",
                     &wire::CctpBridgeRequest {
@@ -442,7 +443,16 @@ async fn dispatch_capital<A: TokenSource + Sync>(
                         all,
                     },
                 )
-                .await
+                .await?;
+            if !records_operation(&answer, operation_id) {
+                eprintln!(
+                    "WARNING: the bot did not answer with operation id {operation_id} and a \
+                     status, so it predates operation ids and did not record this burn. A \
+                     rerun, even with --operation-id, burns again: do not rerun, finish this \
+                     burn with debug cctp complete-mint"
+                );
+            }
+            Ok(answer)
         }
         Capital::CctpBurnSupersede {
             operation_id,
@@ -471,6 +481,21 @@ async fn dispatch_capital<A: TokenSource + Sync>(
     }
 }
 
+/// Whether a `cctp-bridge` answer comes from a bot that records operation
+/// ids: it echoes this run's id and a status. An older bot ignores the id and
+/// burns on every call, so a rerun with the same id is only safe when this
+/// holds.
+fn records_operation(answer: &serde_json::Value, operation_id: uuid::Uuid) -> bool {
+    let echoed = answer
+        .get("operationId")
+        .and_then(serde_json::Value::as_str)
+        == Some(operation_id.to_string().as_str());
+    echoed
+        && answer
+            .get("status")
+            .is_some_and(serde_json::Value::is_string)
+}
+
 /// The body `vault-deposit` and `vault-withdraw` share.
 fn vault_request(args: VaultArgs) -> wire::VaultTransferRequest {
     wire::VaultTransferRequest {
@@ -489,7 +514,7 @@ mod tests {
     use std::sync::mpsc::{Receiver, channel};
     use std::time::Duration;
 
-    use super::{ApiError, dispatch};
+    use super::{ApiError, dispatch, records_operation};
     use crate::auth::{AuthError, StaticToken};
     use crate::cli::{
         Capital, Cctp, CctpSourceChain, Command, Debug, EquityTransferKind, HedgedChain,
@@ -1209,6 +1234,35 @@ mod tests {
             request_body(&request),
             serde_json::json!({ "chain": "hyperevm" })
         );
+        Ok(())
+    }
+
+    /// Only an answer that echoes this run's operation id and a status comes
+    /// from a bot that records the burn; an older bot's answer, or one for
+    /// another id, must trigger the do not rerun warning.
+    #[test]
+    fn only_an_answer_echoing_the_operation_id_and_a_status_is_recorded()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let id: uuid::Uuid = "6f1c2a1e-6c39-4a77-9a8e-1f0b7d6e8c11".parse()?;
+        let recorded = serde_json::json!({
+            "operationId": id.to_string(),
+            "burnTx": "0x01",
+            "status": "pending",
+        });
+        let old_bot = serde_json::json!({
+            "burnTx": "0x01",
+            "sourceChain": "base",
+            "destinationChain": "ethereum",
+            "amountRaw": "1000000",
+        });
+        let other_id = serde_json::json!({
+            "operationId": uuid::Uuid::new_v4().to_string(),
+            "status": "pending",
+        });
+
+        assert!(records_operation(&recorded, id));
+        assert!(!records_operation(&old_bot, id));
+        assert!(!records_operation(&other_id, id));
         Ok(())
     }
 
