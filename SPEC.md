@@ -4449,7 +4449,9 @@ enum UsdcRebalanceCommand {
     // first broadcast. Refused when a send was already signed.
     PrepareDepositSend { prepared: PreparedTransaction },
     InitiateDeposit { deposit: TransferRef },
-    ConfirmDeposit,
+    // vault_deposit_block: the receipt block of the AlpacaToBase vault
+    // deposit; None for a BaseToAlpaca deposit at Alpaca.
+    ConfirmDeposit { vault_deposit_block: Option<u64> },
     // Valid from `DepositInitiated`, and from a BaseToAlpaca `Bridged` whose
     // deposit send cannot be resolved (the signed send, if any, becomes the
     // `deposit_ref`).
@@ -4551,6 +4553,9 @@ enum UsdcRebalanceEvent {
     },
     DepositConfirmed {
         deposit_confirmed_at: DateTime<Utc>,
+        // The AlpacaToBase vault deposit's block. None for a BaseToAlpaca
+        // deposit and for events recorded before the field existed.
+        vault_deposit_block: Option<u64>,
     },
     DepositFailed {
         deposit_ref: Option<TransferRef>,
@@ -5987,7 +5992,28 @@ transfer dispatch. It does not calculate cross-venue inventory imbalances.
 - `UsdcRebalanceEvent::WithdrawalConfirmed` - Moves USDC to inflight (leaving
   source)
 - `UsdcRebalanceEvent::DepositConfirmed` - Terminal success for AlpacaToBase;
-  moves from inflight to destination available
+  moves from inflight to destination available. The event carries the vault
+  deposit's block (`vault_deposit_block`, from the deposit receipt). In the same
+  inventory write as the credit, the reactor requests a pinned onchain cash read
+  of the corridor chain at or past that block, the same request a fill whose
+  cash leg underflows makes. The order fill reader trails the chain tip, so a
+  fill in the deposit's block or earlier may have spent the credit onchain
+  before it reaches the view. While the request is pending the cash gate skips
+  every USDC check (transfer triggered, fill triggered, snapshot triggered). The
+  next inventory poll of that chain sends `ReconcileOnchainUsdc`, which the
+  snapshot aggregate emits even for an unchanged balance; once a read pinned at
+  or past the deposit block applies, it replaces the balance, absorbs every fill
+  up to its block (ADR 0018), releases the gate, and enqueues the check (ADR
+  0024). The request asks for the higher of the deposit block and the chain's
+  applied USDC block watermark, since a read already forced in past the deposit
+  contains it and the view rejects any older read. A request already pending for
+  the chain keeps its block when it is higher or when the new request has none;
+  the onchain equity request merges its block the same way. A fill that applies
+  its cash leg while the read is pending raises the read's floor to the fill's
+  block in the same inventory write, and a read is accepted only under that
+  write lock, so a read pinned below the fill cannot replace the balance it
+  changed. An event without the block (a BaseToAlpaca deposit at Alpaca, or one
+  recorded before the block was captured) requests no read
 - `UsdcRebalanceEvent::ConversionConfirmed` - Terminal success for BaseToAlpaca;
   moves from inflight to destination available
 - `UsdcRebalanceEvent::WithdrawalFailed`, BaseToAlpaca pre-burn
@@ -6149,10 +6175,15 @@ skip the events that arrive, and failed USDC-transfer cleanups stamp
   verified heal resets the counter and releases the gate, an aborted one keeps
   both so the next quiet poll re-escalates immediately.
 - **Dispatch gating**: while engaged, the venue-level cash gate suppresses the
-  USDC rebalancing trigger (checked before the guard claim and again immediately
-  before dispatch) -- a bridge sized off a diverged cash balance would move the
-  wrong amount and mark the venue busy, freezing the very counter that resolves
-  the divergence.
+  USDC rebalancing trigger and the manual USDC transfer route. A dispatch takes
+  an admission (the gate's cash epoch) before it sizes the transfer and redeems
+  it right before its enqueue, holding the gate's dispatch lock through the job
+  row write. Every cash engagement and every onchain cash read request bumps the
+  epoch under that lock exclusively, so a dispatch refuses when the gate engaged
+  at any point after its admission, even if it was released again, and no
+  engagement can land between the final check and the enqueue. A bridge sized
+  off a diverged cash balance would move the wrong amount and mark the venue
+  busy, freezing the very counter that resolves the divergence.
 
 The shared guard machinery follows inventory ownership. Hedging is one chainless
 broker scope, so its equity suppression and snapshot-skip streaks are keyed only

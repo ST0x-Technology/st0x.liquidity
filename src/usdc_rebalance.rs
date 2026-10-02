@@ -520,7 +520,9 @@ pub enum UsdcRebalanceCommand {
         deposit_initiated_at: DateTime<Utc>,
     },
     /// Confirm successful deposit. Valid only from `DepositInitiated` state.
-    ConfirmDeposit,
+    /// `vault_deposit_block` is the block whose vault deposit credited
+    /// MarketMaking USDC (AlpacaToBase); `None` for an offchain deposit.
+    ConfirmDeposit { vault_deposit_block: Option<u64> },
     /// Test/fixture-only: identical to `ConfirmDeposit` but takes
     /// `deposit_confirmed_at` explicitly instead of stamping `Utc::now()`,
     /// so fixture seeding can backdate synthetic history.
@@ -731,6 +733,11 @@ pub enum UsdcRebalanceEvent {
     DepositConfirmed {
         direction: RebalanceDirection,
         deposit_confirmed_at: DateTime<Utc>,
+        /// The block of the AlpacaToBase vault deposit that credited
+        /// MarketMaking USDC. `None` for a BaseToAlpaca deposit at Alpaca and
+        /// for events recorded before the block was captured.
+        #[serde(default)]
+        vault_deposit_block: Option<u64>,
     },
     /// Deposit failed. Preserves deposit reference when available.
     DepositFailed {
@@ -3380,9 +3387,10 @@ impl EventSourced for UsdcRebalance {
             #[cfg(any(test, feature = "test-support"))]
             InitiateDepositAt { .. } => Err(UsdcRebalanceError::BridgingNotCompleted),
 
-            ConfirmDeposit | FailDeposit { .. } | RecoverDeposit | AttachDepositSend { .. } => {
-                Err(UsdcRebalanceError::DepositNotInitiated)
-            }
+            ConfirmDeposit { .. }
+            | FailDeposit { .. }
+            | RecoverDeposit
+            | AttachDepositSend { .. } => Err(UsdcRebalanceError::DepositNotInitiated),
             #[cfg(any(test, feature = "test-support"))]
             ConfirmDepositAt { .. } => Err(UsdcRebalanceError::DepositNotInitiated),
 
@@ -3566,11 +3574,13 @@ impl EventSourced for UsdcRebalance {
                 deposit_initiated_at,
             } => self.transition_initiate_deposit(deposit, deposit_initiated_at),
 
-            ConfirmDeposit => self.transition_confirm_deposit(Utc::now()),
+            ConfirmDeposit {
+                vault_deposit_block,
+            } => self.transition_confirm_deposit(Utc::now(), vault_deposit_block),
             #[cfg(any(test, feature = "test-support"))]
             ConfirmDepositAt {
                 deposit_confirmed_at,
-            } => self.transition_confirm_deposit(deposit_confirmed_at),
+            } => self.transition_confirm_deposit(deposit_confirmed_at, None),
 
             FailDeposit { reason } => self.transition_fail_deposit(reason),
             RecoverDeposit => self.transition_recover_deposit(),
@@ -4374,6 +4384,7 @@ impl UsdcRebalance {
     fn transition_confirm_deposit(
         &self,
         deposit_confirmed_at: DateTime<Utc>,
+        vault_deposit_block: Option<u64>,
     ) -> Result<Vec<UsdcRebalanceEvent>, UsdcRebalanceError> {
         use UsdcRebalanceEvent::*;
         match self {
@@ -4393,6 +4404,7 @@ impl UsdcRebalance {
             Self::DepositInitiated { direction, .. } => Ok(vec![DepositConfirmed {
                 direction: *direction,
                 deposit_confirmed_at,
+                vault_deposit_block,
             }]),
             Self::DepositConfirmed { .. }
             | Self::DepositFailed { .. }
@@ -7673,7 +7685,9 @@ mod tests {
                     deposit_initiated_at: Utc::now(),
                 },
             ])
-            .when(UsdcRebalanceCommand::ConfirmDeposit)
+            .when(UsdcRebalanceCommand::ConfirmDeposit {
+                vault_deposit_block: None,
+            })
             .await
             .events();
 
@@ -7724,7 +7738,9 @@ mod tests {
                     minted_at: Utc::now(),
                 },
             ])
-            .when(UsdcRebalanceCommand::ConfirmDeposit)
+            .when(UsdcRebalanceCommand::ConfirmDeposit {
+                vault_deposit_block: None,
+            })
             .await
             .then_expect_error();
 
@@ -7910,7 +7926,9 @@ mod tests {
                     deposit_initiated_at: Utc::now(),
                 },
             ])
-            .when(UsdcRebalanceCommand::ConfirmDeposit)
+            .when(UsdcRebalanceCommand::ConfirmDeposit {
+                vault_deposit_block: None,
+            })
             .await
             .events();
 
@@ -7966,7 +7984,9 @@ mod tests {
                     deposit_initiated_at: Utc::now(),
                 },
             ])
-            .when(UsdcRebalanceCommand::ConfirmDeposit)
+            .when(UsdcRebalanceCommand::ConfirmDeposit {
+                vault_deposit_block: None,
+            })
             .await
             .events();
 
@@ -8654,6 +8674,7 @@ mod tests {
             UsdcRebalanceEvent::DepositConfirmed {
                 direction: RebalanceDirection::BaseToAlpaca,
                 deposit_confirmed_at: Utc::now(),
+                vault_deposit_block: None,
             },
             UsdcRebalanceEvent::ConversionInitiated {
                 corridor: UsdcCorridor::BASE_CCTP,
@@ -9264,7 +9285,9 @@ mod tests {
                     failed_at: Utc::now(),
                 },
             ])
-            .when(UsdcRebalanceCommand::ConfirmDeposit)
+            .when(UsdcRebalanceCommand::ConfirmDeposit {
+                vault_deposit_block: None,
+            })
             .await
             .then_expect_error();
 
@@ -9318,6 +9341,7 @@ mod tests {
                 UsdcRebalanceEvent::DepositConfirmed {
                     direction: RebalanceDirection::AlpacaToBase,
                     deposit_confirmed_at: Utc::now(),
+                    vault_deposit_block: None,
                 },
             ])
             .when(UsdcRebalanceCommand::Initiate {
@@ -9379,9 +9403,12 @@ mod tests {
                 UsdcRebalanceEvent::DepositConfirmed {
                     direction: RebalanceDirection::AlpacaToBase,
                     deposit_confirmed_at: Utc::now(),
+                    vault_deposit_block: None,
                 },
             ])
-            .when(UsdcRebalanceCommand::ConfirmDeposit)
+            .when(UsdcRebalanceCommand::ConfirmDeposit {
+                vault_deposit_block: None,
+            })
             .await
             .then_expect_error();
 
@@ -9711,6 +9738,7 @@ mod tests {
                 UsdcRebalanceEvent::DepositConfirmed {
                     direction: RebalanceDirection::BaseToAlpaca,
                     deposit_confirmed_at: Utc::now(),
+                    vault_deposit_block: None,
                 },
             ])
             .when(UsdcRebalanceCommand::InitiatePostDepositConversion {
@@ -9781,6 +9809,7 @@ mod tests {
                 UsdcRebalanceEvent::DepositConfirmed {
                     direction: RebalanceDirection::AlpacaToBase,
                     deposit_confirmed_at: Utc::now(),
+                    vault_deposit_block: None,
                 },
             ])
             .when(UsdcRebalanceCommand::InitiatePostDepositConversion {
@@ -9857,6 +9886,7 @@ mod tests {
                 UsdcRebalanceEvent::DepositConfirmed {
                     direction: RebalanceDirection::BaseToAlpaca,
                     deposit_confirmed_at: Utc::now(),
+                    vault_deposit_block: None,
                 },
             ])
             .when(UsdcRebalanceCommand::InitiatePostDepositConversion {
@@ -9986,6 +10016,7 @@ mod tests {
                 UsdcRebalanceEvent::DepositConfirmed {
                     direction: RebalanceDirection::BaseToAlpaca,
                     deposit_confirmed_at: Utc::now(),
+                    vault_deposit_block: None,
                 },
             ])
             .when(UsdcRebalanceCommand::InitiatePostDepositConversionAt {
@@ -10437,6 +10468,7 @@ mod tests {
                 UsdcRebalanceEvent::DepositConfirmed {
                     direction: RebalanceDirection::BaseToAlpaca,
                     deposit_confirmed_at: Utc::now(),
+                    vault_deposit_block: None,
                 },
                 UsdcRebalanceEvent::ConversionInitiated {
                     corridor: UsdcCorridor::BASE_CCTP,
@@ -10509,6 +10541,7 @@ mod tests {
             UsdcRebalanceEvent::DepositConfirmed {
                 direction: RebalanceDirection::BaseToAlpaca,
                 deposit_confirmed_at,
+                vault_deposit_block: None,
             },
             UsdcRebalanceEvent::ConversionInitiated {
                 corridor: UsdcCorridor::BASE_CCTP,
@@ -12636,6 +12669,30 @@ mod tests {
         assert_eq!(burn_amount, None, "missing field must default to None");
     }
 
+    /// A `DepositConfirmed` persisted before the vault deposit block was
+    /// captured must still load, with no block and so no cash read request.
+    #[test]
+    fn deposit_confirmed_event_without_vault_deposit_block_deserializes_to_none() {
+        let old_event = json!({
+            "DepositConfirmed": {
+                "direction": "AlpacaToBase",
+                "deposit_confirmed_at": "2026-01-01T00:00:00Z"
+            }
+        });
+
+        let event: UsdcRebalanceEvent =
+            from_value(old_event).expect("old DepositConfirmed must still deserialize");
+
+        let UsdcRebalanceEvent::DepositConfirmed {
+            vault_deposit_block,
+            ..
+        } = event
+        else {
+            panic!("Expected DepositConfirmed");
+        };
+        assert_eq!(vault_deposit_block, None);
+    }
+
     /// State-level mirror: a `BridgingSubmitting` snapshot persisted before
     /// `burn_amount` existed must still load, defaulting the field to `None`.
     #[test]
@@ -13747,6 +13804,7 @@ mod tests {
             UsdcRebalanceEvent::DepositConfirmed {
                 direction: RebalanceDirection::AlpacaToBase,
                 deposit_confirmed_at: Utc::now(),
+                vault_deposit_block: None,
             },
         ])
         .unwrap()
@@ -13804,6 +13862,7 @@ mod tests {
             UsdcRebalanceEvent::DepositConfirmed {
                 direction: RebalanceDirection::BaseToAlpaca,
                 deposit_confirmed_at: Utc::now(),
+                vault_deposit_block: None,
             },
         ]
     }

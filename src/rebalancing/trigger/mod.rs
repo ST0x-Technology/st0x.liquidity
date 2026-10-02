@@ -72,9 +72,10 @@ use crate::inventory::projection::InventoryProjectionError;
 use crate::inventory::snapshot::{InventorySnapshot, InventorySnapshotEvent};
 use crate::inventory::view::InFlightEquityLocation;
 use crate::inventory::{
-    BroadcastingInventory, Inventory, InventoryDivergenceGate, InventoryError, InventoryScope,
-    InventoryViewError, Operator, PendingRequestOwnership, PendingRequestOwnershipSnapshot,
-    PollFreshness, PortfolioAsset, PortfolioLocation, TransferOp, Venue,
+    BroadcastingInventory, CashAdmission, Inventory, InventoryDivergenceGate, InventoryError,
+    InventoryScope, InventoryViewError, Operator, PendingRequestOwnership,
+    PendingRequestOwnershipSnapshot, PollFreshness, PortfolioAsset, PortfolioLocation, TransferOp,
+    Venue,
 };
 use crate::native_gas::{ConfiguredGasReadiness, GasReadinessFailure, TransferGasRoute};
 use crate::offchain::order::OffchainOrderId;
@@ -3058,6 +3059,10 @@ impl RebalancingService {
             }
             _ => None,
         };
+        // Reconciliation is evaluated under the inventory write lock: a fill
+        // raises a pending cash read's floor under the same lock, so a read
+        // accepted here cannot miss a fill already in the view.
+        let mut inventory = self.inventory.write().await;
         let SnapshotReconciliation {
             protected_onchain_equity_symbols,
             protected_offchain_equity_symbols,
@@ -3071,7 +3076,6 @@ impl RebalancingService {
             .cloned()
             .collect::<BTreeSet<_>>();
 
-        let mut inventory = self.inventory.write().await;
         let resolve_offchain_reconciliation = accepted_offchain_equity_reconciliation.is_some()
             && match &event {
                 OffchainEquityReconciled {
@@ -3820,6 +3824,15 @@ impl RebalancingService {
                             timestamp,
                         )?;
                     }
+                    // A cash read pending for this chain must not be resolved
+                    // by a read pinned below this fill: it would replace the
+                    // balance without the debit or credit just applied. The
+                    // floor is raised in the same inventory write, and the
+                    // snapshot reactor checks it under that lock too.
+                    if apply_usdc_leg && let Some(block_number) = *block_number {
+                        self.divergence_gate
+                            .raise_pending_onchain_cash_floor(trade_id.chain, block_number);
+                    }
                     *inventory = updated;
                     drop(inventory);
                     (equity_reconciled, usdc_reconciled)
@@ -3834,7 +3847,8 @@ impl RebalancingService {
                 }
                 if !usdc_reconciled {
                     self.divergence_gate
-                        .request_onchain_cash_reconcile(trade_id.chain, *block_number);
+                        .request_onchain_cash_reconcile(trade_id.chain, *block_number)
+                        .await;
                 }
                 self.schedule_fill_checks(
                     symbol,
@@ -5319,14 +5333,18 @@ impl RebalancingService {
         // restart-tainted cash balance is suspect for the same reason (the
         // hydrated number may or may not contain a straddling fill's cash
         // leg), with the same resolution path.
-        if self.divergence_gate.is_cash_engaged() {
+        //
+        // The admission is taken before any sizing and redeemed right before
+        // each enqueue, so a gate engaged at any point in between refuses
+        // the dispatch even if it was released again.
+        let Some(admission) = self.divergence_gate.cash_admission() else {
             warn!(
                 target: "rebalance",
                 "Skipped USDC trigger: unresolved cash snapshot divergence \
                  pending reconciliation"
             );
             return;
-        }
+        };
         if self.is_restart_cash_tainted().await {
             warn!(
                 target: "rebalance",
@@ -5337,7 +5355,7 @@ impl RebalancingService {
         }
 
         for (usdc, (usdc_limit, reserved)) in corridors {
-            self.check_and_trigger_usdc_corridor(usdc, usdc_limit, reserved)
+            self.check_and_trigger_usdc_corridor(usdc, usdc_limit, reserved, admission)
                 .await;
         }
     }
@@ -5349,6 +5367,7 @@ impl RebalancingService {
         usdc: &UsdcCorridorCtx,
         usdc_limit: Option<Usdc>,
         reserved: Option<Usd>,
+        admission: CashAdmission,
     ) {
         let chain = usdc.corridor.chain();
 
@@ -5423,23 +5442,23 @@ impl RebalancingService {
             return;
         }
 
-        // Re-check immediately before dispatch: the poller may have engaged
-        // the cash gate during the awaits in the imbalance build (mirrors
-        // the equity trigger's pre-dispatch re-checks). The restart taint
-        // needs no re-check: it is only seeded at boot, so it cannot appear
-        // during the build.
-        if self.divergence_gate.is_cash_engaged() {
-            warn!(
-                target: "rebalance",
-                "Skipped USDC trigger before dispatch: cash snapshot \
-                 divergence detected during operation sizing"
-            );
-            return;
-        }
-
         if !self.usdc_transfer_gas_is_ready(usdc.corridor.chain()).await {
             return;
         }
+
+        // Redeem the admission taken before sizing and hold the gate through
+        // the enqueue: a cash engagement since then, even one released
+        // again, refuses, and none can land until the job row is written,
+        // so no transfer goes out sized off a balance the gate has flagged.
+        // The restart taint needs no re-check: it is only seeded at boot.
+        let Some(cash_dispatch) = self.divergence_gate.hold_cash_admission(admission).await else {
+            warn!(
+                target: "rebalance",
+                "Skipped USDC trigger before dispatch: the cash gate engaged \
+                 while the operation was being sized"
+            );
+            return;
+        };
 
         let dispatched = match operation {
             UsdcRebalanceOperation::BaseToAlpaca { amount } => {
@@ -5451,6 +5470,7 @@ impl RebalancingService {
                     .await
             }
         };
+        drop(cash_dispatch);
 
         if !dispatched {
             return;
@@ -6181,14 +6201,14 @@ impl RebalancingService {
         // cash venue busy, which freezes the counter that resolves a divergence
         // and aborts the forced reconcile, so a manual start in either state
         // would keep the trigger blocked for the whole transfer.
-        if self.divergence_gate.is_cash_engaged() {
+        let Some(admission) = self.divergence_gate.cash_admission() else {
             warn!(
                 target: "rebalance",
                 %id,
                 "Manual USDC transfer refused: unresolved cash snapshot divergence"
             );
             return Err(UsdcResumeError::CashDivergenceEngaged);
-        }
+        };
         if self.is_restart_cash_tainted().await {
             warn!(
                 target: "rebalance",
@@ -6231,11 +6251,12 @@ impl RebalancingService {
                 }
             })?;
 
-        // Re-check right before the enqueue, like the trigger's dispatch: the
-        // poller may have engaged the cash gate during the awaits above.
+        // Redeem the admission and hold the gate through the push, like the
+        // trigger's dispatch: a cash engagement during the awaits above
+        // refuses, and none can land until the job row is written.
         // Returning drops `claim`, which releases the corridor. The restart
         // taint is only seeded at boot, so it cannot appear here.
-        if self.divergence_gate.is_cash_engaged() {
+        let Some(cash_dispatch) = self.divergence_gate.hold_cash_admission(admission).await else {
             warn!(
                 target: "rebalance",
                 %id,
@@ -6243,7 +6264,7 @@ impl RebalancingService {
                  during the preflight"
             );
             return Err(UsdcResumeError::CashDivergenceEngaged);
-        }
+        };
 
         // A plain push, as in the trigger's fresh dispatch: the id is fresh, so
         // an idempotency key could never collide. Single flight comes from the
@@ -6274,6 +6295,7 @@ impl RebalancingService {
                     .await
             }
         };
+        drop(cash_dispatch);
 
         match push {
             Ok(()) => {
@@ -16992,7 +17014,8 @@ mod tests {
 
         trigger
             .divergence_gate()
-            .request_onchain_cash_reconcile(Chain::Base, Some(101));
+            .request_onchain_cash_reconcile(Chain::Base, Some(101))
+            .await;
 
         trigger
             .on_snapshot(InventorySnapshotEvent::OnchainUsdc {
@@ -18057,6 +18080,293 @@ mod tests {
             "a Reconciled settlement must enqueue exactly one fresh USDC \
              imbalance check against the post-rebalance inventory"
         );
+    }
+
+    /// Seeds a Base vault read pinned at block 100 holding 1,000 USDC against
+    /// 1,000 at Alpaca, then settles a 500 USDC AlpacaToBase transfer whose
+    /// vault deposit is in block 110. The view then reads 1,500 onchain
+    /// against 500 offchain (75% onchain, past the 70% band) until a vault
+    /// read at or past block 110 replaces it. The settlement's check is left
+    /// queued.
+    async fn settle_vault_credit_in_block_110() -> (
+        Arc<RebalancingService>,
+        ReactorHarness<Arc<RebalancingService>>,
+        Symbol,
+    ) {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let inventory = InventoryView::default()
+            .with_equity(symbol.clone(), shares(50), shares(50))
+            .with_usdc(usdc(1000), usdc(1000));
+        let trigger = make_trigger_with_inventory_and_registry(inventory, &symbol).await;
+        let harness = ReactorHarness::new(Arc::clone(&trigger));
+
+        apply_and_dispatch_snapshot(
+            Arc::clone(&trigger),
+            InventorySnapshotId {
+                orderbook: TEST_ORDERBOOK,
+                owner: TEST_ORDER_OWNER,
+            },
+            InventorySnapshotEvent::OnchainUsdc {
+                chain: Chain::Base,
+                usdc_balance: usdc(1000),
+                fetched_at: Utc::now(),
+                block_number: Some(100),
+            },
+        )
+        .await
+        .unwrap();
+        usdc::drain_pending_usdc_jobs(&trigger).await;
+
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        for event in [
+            make_usdc_initiated(RebalanceDirection::AlpacaToBase, usdc(500)),
+            make_usdc_bridged_with_amounts(usdc(500), Usdc::ZERO),
+            UsdcRebalanceEvent::DepositConfirmed {
+                direction: RebalanceDirection::AlpacaToBase,
+                deposit_confirmed_at: Utc::now(),
+                vault_deposit_block: Some(110),
+            },
+        ] {
+            harness
+                .receive::<UsdcRebalance>(id.clone(), event)
+                .await
+                .unwrap();
+        }
+
+        (trigger, harness, symbol)
+    }
+
+    /// Applies the forced vault read the poller sends for a pending cash
+    /// reconcile request, pinned at `block_number`.
+    async fn apply_pinned_base_usdc_read(
+        trigger: &Arc<RebalancingService>,
+        usdc_balance: Usdc,
+        block_number: u64,
+    ) {
+        let generation = trigger
+            .divergence_gate()
+            .claim_pending_onchain_cash_reconcile(Chain::Base)
+            .expect("a pending cash read request");
+        apply_and_dispatch_snapshot(
+            Arc::clone(trigger),
+            InventorySnapshotId {
+                orderbook: TEST_ORDERBOOK,
+                owner: TEST_ORDER_OWNER,
+            },
+            InventorySnapshotEvent::OnchainUsdcReconciled {
+                chain: Chain::Base,
+                usdc_balance,
+                fetched_at: Utc::now(),
+                block_number: Some(block_number),
+                generation,
+            },
+        )
+        .await
+        .unwrap();
+    }
+
+    /// A fill in the vault deposit's own block spent the credit before the
+    /// fill reader delivered it. Neither the check the settlement enqueues
+    /// nor the one the late fill enqueues may plan a transfer, and the read
+    /// at the deposit block (1,050 onchain against 500) is inside the band.
+    #[tokio::test]
+    async fn same_block_deposit_and_spend_plans_no_transfer() {
+        let (trigger, harness, symbol) = settle_vault_credit_in_block_110().await;
+
+        assert_eq!(usdc::drain_pending_usdc_jobs(&trigger).await, 1);
+        assert_eq!(take_pending_usdc_transfer_jobs(&trigger).await, vec![]);
+
+        harness
+            .receive::<Position>(
+                symbol,
+                make_onchain_fill_in_block(shares(3), Direction::Buy, Some(110)),
+            )
+            .await
+            .unwrap();
+        usdc::drain_pending_usdc_jobs(&trigger).await;
+        assert_eq!(take_pending_usdc_transfer_jobs(&trigger).await, vec![]);
+
+        apply_pinned_base_usdc_read(&trigger, usdc(1050), 110).await;
+        assert_eq!(usdc::drain_pending_usdc_jobs(&trigger).await, 1);
+
+        assert!(!trigger.divergence_gate().is_cash_engaged());
+        assert_eq!(take_pending_usdc_transfer_jobs(&trigger).await, vec![]);
+    }
+
+    /// A fill from before the deposit's block reaching the reactor inside
+    /// the gap triggers a check that must plan nothing. The read at the
+    /// deposit block contains that fill and the deposit block's spend, so
+    /// its check plans off 1,350 onchain against 500, not the 1,650 the
+    /// view showed, and the spend arriving later is absorbed.
+    #[tokio::test]
+    async fn fill_triggered_check_waits_for_a_read_at_the_deposit_block() {
+        let (trigger, harness, symbol) = settle_vault_credit_in_block_110().await;
+        usdc::drain_pending_usdc_jobs(&trigger).await;
+
+        harness
+            .receive::<Position>(
+                symbol.clone(),
+                make_onchain_fill_in_block(shares(1), Direction::Sell, Some(105)),
+            )
+            .await
+            .unwrap();
+        assert_eq!(usdc::drain_pending_usdc_jobs(&trigger).await, 1);
+        assert_eq!(take_pending_usdc_transfer_jobs(&trigger).await, vec![]);
+
+        apply_pinned_base_usdc_read(&trigger, usdc(1350), 110).await;
+        assert_eq!(usdc::drain_pending_usdc_jobs(&trigger).await, 1);
+        assert_eq!(
+            take_pending_usdc_transfer_jobs(&trigger).await,
+            vec![UsdcRebalanceOperation::BaseToAlpaca { amount: usdc(425) }]
+        );
+
+        harness
+            .receive::<Position>(
+                symbol,
+                make_onchain_fill_in_block(shares(2), Direction::Buy, Some(110)),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            trigger
+                .inventory
+                .read()
+                .await
+                .onchain_usdc_available_at(Chain::Base),
+            Some(usdc(1350))
+        );
+    }
+
+    /// A periodic snapshot inside the gap triggers a check that must plan
+    /// nothing, and a vault read pinned below the deposit block cannot
+    /// release the hold: it may miss the deposit block's spend.
+    #[tokio::test]
+    async fn snapshot_triggered_check_waits_for_a_read_at_the_deposit_block() {
+        let (trigger, _harness, _symbol) = settle_vault_credit_in_block_110().await;
+        usdc::drain_pending_usdc_jobs(&trigger).await;
+
+        apply_and_dispatch_snapshot(
+            Arc::clone(&trigger),
+            InventorySnapshotId {
+                orderbook: TEST_ORDERBOOK,
+                owner: TEST_ORDER_OWNER,
+            },
+            InventorySnapshotEvent::OffchainCashWithdrawable {
+                cash_withdrawable_cents: Some(50_000),
+                fetched_at: Utc::now(),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(usdc::drain_pending_usdc_jobs(&trigger).await, 1);
+        assert_eq!(take_pending_usdc_transfer_jobs(&trigger).await, vec![]);
+
+        apply_pinned_base_usdc_read(&trigger, usdc(1500), 109).await;
+        usdc::drain_pending_usdc_jobs(&trigger).await;
+        assert!(trigger.divergence_gate().is_cash_engaged());
+        assert_eq!(take_pending_usdc_transfer_jobs(&trigger).await, vec![]);
+
+        apply_pinned_base_usdc_read(&trigger, usdc(1350), 110).await;
+        assert_eq!(usdc::drain_pending_usdc_jobs(&trigger).await, 1);
+        assert_eq!(
+            take_pending_usdc_transfer_jobs(&trigger).await,
+            vec![UsdcRebalanceOperation::BaseToAlpaca { amount: usdc(425) }]
+        );
+    }
+
+    /// A fill underflow can force a vault read in while the transfer is still
+    /// inflight. A read at block 120 already contains the deposit made in
+    /// block 110 and its spend, so the credit then counts the deposit twice
+    /// (1,550 onchain against 500). The view rejects any read below 120, so
+    /// a read at 115 must not release the gate; the read at 121 does, and
+    /// its 1,050 against 500 is inside the band.
+    #[tokio::test]
+    async fn deposit_credit_waits_past_a_forced_read_applied_while_inflight() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let inventory = InventoryView::default()
+            .with_equity(symbol.clone(), shares(50), shares(50))
+            .with_usdc(usdc(1000), usdc(1000));
+        let trigger = make_trigger_with_inventory_and_registry(inventory, &symbol).await;
+        let harness = ReactorHarness::new(Arc::clone(&trigger));
+        let id = UsdcRebalanceId(Uuid::new_v4());
+
+        for event in [
+            make_usdc_initiated(RebalanceDirection::AlpacaToBase, usdc(500)),
+            make_usdc_bridged_with_amounts(usdc(500), Usdc::ZERO),
+        ] {
+            harness
+                .receive::<UsdcRebalance>(id.clone(), event)
+                .await
+                .unwrap();
+        }
+        trigger
+            .divergence_gate()
+            .request_onchain_cash_reconcile(Chain::Base, Some(110))
+            .await;
+        apply_pinned_base_usdc_read(&trigger, usdc(1050), 120).await;
+        usdc::drain_pending_usdc_jobs(&trigger).await;
+
+        harness
+            .receive::<UsdcRebalance>(
+                id,
+                UsdcRebalanceEvent::DepositConfirmed {
+                    direction: RebalanceDirection::AlpacaToBase,
+                    deposit_confirmed_at: Utc::now(),
+                    vault_deposit_block: Some(110),
+                },
+            )
+            .await
+            .unwrap();
+        usdc::drain_pending_usdc_jobs(&trigger).await;
+        assert_eq!(take_pending_usdc_transfer_jobs(&trigger).await, vec![]);
+
+        apply_pinned_base_usdc_read(&trigger, usdc(1050), 115).await;
+        usdc::drain_pending_usdc_jobs(&trigger).await;
+        assert!(trigger.divergence_gate().is_cash_engaged());
+        assert_eq!(take_pending_usdc_transfer_jobs(&trigger).await, vec![]);
+
+        apply_pinned_base_usdc_read(&trigger, usdc(1050), 121).await;
+        assert_eq!(usdc::drain_pending_usdc_jobs(&trigger).await, 1);
+        assert!(!trigger.divergence_gate().is_cash_engaged());
+        assert_eq!(take_pending_usdc_transfer_jobs(&trigger).await, vec![]);
+    }
+
+    /// A fill that applies its cash leg cleanly while the deposit's read is
+    /// pending raises the read's floor to its block. A read pinned at block
+    /// 120 predates the block 121 spend, so it must not replace the balance
+    /// (1,050 after the spend) with 1,500 or release the gate; the read at
+    /// 121 contains the spend and does.
+    #[tokio::test]
+    async fn deposit_read_pinned_below_an_applied_fill_keeps_the_gate() {
+        let (trigger, harness, symbol) = settle_vault_credit_in_block_110().await;
+        usdc::drain_pending_usdc_jobs(&trigger).await;
+
+        harness
+            .receive::<Position>(
+                symbol,
+                make_onchain_fill_in_block(shares(3), Direction::Buy, Some(121)),
+            )
+            .await
+            .unwrap();
+        let onchain_usdc = || async {
+            trigger
+                .inventory
+                .read()
+                .await
+                .onchain_usdc_available_at(Chain::Base)
+        };
+        assert_eq!(onchain_usdc().await, Some(usdc(1050)));
+
+        apply_pinned_base_usdc_read(&trigger, usdc(1500), 120).await;
+        usdc::drain_pending_usdc_jobs(&trigger).await;
+        assert_eq!(onchain_usdc().await, Some(usdc(1050)));
+        assert!(trigger.divergence_gate().is_cash_engaged());
+        assert_eq!(take_pending_usdc_transfer_jobs(&trigger).await, vec![]);
+
+        apply_pinned_base_usdc_read(&trigger, usdc(1050), 121).await;
+        assert_eq!(usdc::drain_pending_usdc_jobs(&trigger).await, 1);
+        assert!(!trigger.divergence_gate().is_cash_engaged());
+        assert_eq!(take_pending_usdc_transfer_jobs(&trigger).await, vec![]);
     }
 
     #[tokio::test]
@@ -19213,7 +19523,8 @@ mod tests {
         let (trigger, pool, _store) = make_resume_trigger().await;
         trigger
             .divergence_gate()
-            .engage_cash(InventoryScope::Hedging);
+            .engage_cash(InventoryScope::Hedging)
+            .await;
 
         let error = trigger
             .start_manual_usdc_transfer(
@@ -21729,6 +22040,7 @@ mod tests {
         UsdcRebalanceEvent::DepositConfirmed {
             direction,
             deposit_confirmed_at: Utc::now(),
+            vault_deposit_block: None,
         }
     }
 
@@ -27242,7 +27554,12 @@ mod tests {
             .await
             .unwrap();
         store
-            .send(&id, UsdcRebalanceCommand::ConfirmDeposit)
+            .send(
+                &id,
+                UsdcRebalanceCommand::ConfirmDeposit {
+                    vault_deposit_block: None,
+                },
+            )
             .await
             .unwrap();
         store
@@ -29983,7 +30300,9 @@ mod tests {
             UsdcRebalanceCommand::InitiateDeposit {
                 deposit: TransferRef::OnchainTx(mint_tx),
             },
-            UsdcRebalanceCommand::ConfirmDeposit,
+            UsdcRebalanceCommand::ConfirmDeposit {
+                vault_deposit_block: None,
+            },
             UsdcRebalanceCommand::InitiatePostDepositConversion {
                 order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
                 amount: usdc(399),
@@ -30459,7 +30778,12 @@ mod tests {
             .unwrap();
 
         store
-            .send(&id, UsdcRebalanceCommand::ConfirmDeposit)
+            .send(
+                &id,
+                UsdcRebalanceCommand::ConfirmDeposit {
+                    vault_deposit_block: None,
+                },
+            )
             .await
             .unwrap();
 
@@ -30553,7 +30877,12 @@ mod tests {
             .unwrap();
 
         store
-            .send(&id, UsdcRebalanceCommand::ConfirmDeposit)
+            .send(
+                &id,
+                UsdcRebalanceCommand::ConfirmDeposit {
+                    vault_deposit_block: None,
+                },
+            )
             .await
             .unwrap();
 
@@ -30790,6 +31119,7 @@ mod tests {
                 UsdcRebalanceEvent::DepositConfirmed {
                     direction: RebalanceDirection::AlpacaToBase,
                     deposit_confirmed_at: chrono::Utc::now(),
+                    vault_deposit_block: None,
                 },
             )
             .await
@@ -30878,7 +31208,12 @@ mod tests {
             .unwrap();
 
         store
-            .send(&id, UsdcRebalanceCommand::ConfirmDeposit)
+            .send(
+                &id,
+                UsdcRebalanceCommand::ConfirmDeposit {
+                    vault_deposit_block: None,
+                },
+            )
             .await
             .unwrap();
 
@@ -33783,6 +34118,7 @@ mod tests {
                 UsdcRebalanceEvent::DepositConfirmed {
                     direction: RebalanceDirection::AlpacaToBase,
                     deposit_confirmed_at: Utc::now(),
+                    vault_deposit_block: None,
                 },
             )
             .await
@@ -34085,7 +34421,8 @@ mod tests {
 
         trigger
             .divergence_gate()
-            .engage_cash(InventoryScope::Hedging);
+            .engage_cash(InventoryScope::Hedging)
+            .await;
 
         trigger.check_and_trigger_usdc().await;
         assert_eq!(

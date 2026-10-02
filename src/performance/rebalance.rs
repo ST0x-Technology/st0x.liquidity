@@ -717,6 +717,7 @@ impl StoredOperation {
             UsdcRebalanceEvent::DepositConfirmed {
                 direction,
                 deposit_confirmed_at,
+                ..
             } => {
                 self.close(
                     operation_id,
@@ -1092,6 +1093,7 @@ mod tests {
             UsdcRebalanceEvent::DepositConfirmed {
                 direction: RebalanceDirection::AlpacaToBase,
                 deposit_confirmed_at: timestamp(730),
+                vault_deposit_block: None,
             },
         ]
     }
@@ -1909,6 +1911,7 @@ mod tests {
             UsdcRebalanceEvent::DepositConfirmed {
                 direction: RebalanceDirection::BaseToAlpaca,
                 deposit_confirmed_at: timestamp(100),
+                vault_deposit_block: None,
             },
             UsdcRebalanceEvent::ConversionInitiated {
                 corridor: UsdcCorridor::BASE_CCTP,
@@ -2466,6 +2469,7 @@ mod tests {
             UsdcRebalanceEvent::DepositConfirmed {
                 direction: RebalanceDirection::AlpacaToBase,
                 deposit_confirmed_at: timestamp(730),
+                vault_deposit_block: None,
             },
         ];
 
@@ -2729,6 +2733,7 @@ mod tests {
             UsdcRebalanceEvent::DepositConfirmed {
                 direction: RebalanceDirection::AlpacaToBase,
                 deposit_confirmed_at: timestamp(250),
+                vault_deposit_block: None,
             },
         ];
 

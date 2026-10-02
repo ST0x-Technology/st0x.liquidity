@@ -999,7 +999,7 @@ impl<
     /// enqueueing, or a crash during confirmation could re-submit a second
     /// deposit on resume. There the invariant is preserved differently: the
     /// `DepositInitiated` resume arm repeats this same enqueue call after its
-    /// own `confirm_tx`, since no resume path re-enters `deposit_to_vault`
+    /// own `confirm_tx_receipt`, since no resume path re-enters `deposit_to_vault`
     /// itself once past that state (see that resume arm's comment).
     async fn enqueue_bot_gas_cost(
         &self,
@@ -2167,10 +2167,10 @@ impl<
                 let TransferRef::OnchainTx(deposit_tx) = deposit_ref else {
                     return Err(UsdcTransferError::DepositRefMustBeOnchain { id: id.clone() });
                 };
-                match self.raindex.confirm_tx(deposit_tx).await {
-                    Ok(()) => {
+                match self.raindex.confirm_tx_receipt(deposit_tx).await {
+                    Ok(receipt) => {
                         // `deposit_to_vault`'s fresh path enqueues the `VaultDeposit`
-                        // bot-gas job right after this same `confirm_tx` call, before
+                        // bot-gas job right after this same `confirm_tx_receipt` call, before
                         // ever reaching `DepositConfirmed`. A crash between
                         // `InitiateDeposit` and that enqueue lands here, and no
                         // resume path re-enters `deposit_to_vault` once past
@@ -2184,11 +2184,11 @@ impl<
                             BotGasOperationCategory::VaultDeposit,
                         )
                         .await?;
-                        self.confirm_deposit(id).await
+                        self.confirm_deposit(id, receipt.block_number).await
                     }
                     // A dropped tx (gone from the mempool, will never mine) is a
                     // terminal failure -- distinct from a still-pending tx that
-                    // confirm_tx merely couldn't confirm yet. Without this, a
+                    // `confirm_tx_receipt` merely couldn't confirm yet. Without this, a
                     // dropped deposit retries forever until the breaker trips.
                     // Record FailDeposit so an operator can reconcile, then
                     // surface the error.
@@ -2912,8 +2912,8 @@ impl<
     ) -> Result<(), UsdcTransferError> {
         let amount_u256 = usdc_to_u256(amount_received)?;
 
-        self.deposit_to_vault(id, amount_u256).await?;
-        self.confirm_deposit(id).await?;
+        let vault_deposit_block = self.deposit_to_vault(id, amount_u256).await?;
+        self.confirm_deposit(id, vault_deposit_block).await?;
 
         Ok(())
     }
@@ -3665,19 +3665,21 @@ impl<
         Ok(mint_receipt)
     }
 
+    /// Submits, records and confirms the vault deposit, returning the block
+    /// that holds it.
     #[instrument(target = "rebalance", skip(self), fields(%id, %amount), level = tracing::Level::DEBUG)]
     async fn deposit_to_vault(
         &self,
         id: &UsdcRebalanceId,
         amount: U256,
-    ) -> Result<(), UsdcTransferError> {
+    ) -> Result<Option<u64>, UsdcTransferError> {
         // Submit the deposit and persist its tx hash as `InitiateDeposit` BEFORE
         // confirming. `deposit_usdc` would submit AND confirm atomically, only
         // recording the hash afterwards -- a crash during the (potentially long)
         // confirmation wait would leave the aggregate in `Bridged`, and resume
         // would re-enter here and submit a SECOND deposit for the same funds.
         // Persisting the hash first lands a crash in `DepositInitiated`, whose
-        // resume arm re-verifies the recorded tx via `confirm_tx` instead of
+        // resume arm re-verifies the recorded tx via `confirm_tx_receipt` instead of
         // re-depositing.
         let stable = self.corridor.chain().settlement_stable();
         let deposit_tx = match self
@@ -3712,7 +3714,7 @@ impl<
         // `DepositInitiated` (the hash is persisted) rather than emitting
         // `FailDeposit`: the deposit may still confirm, and the `DepositInitiated`
         // resume arm re-checks it. Propagate so apalis retries from there.
-        self.raindex.confirm_tx(deposit_tx).await?;
+        let receipt = self.raindex.confirm_tx_receipt(deposit_tx).await?;
 
         self.enqueue_bot_gas_cost(
             self.corridor.chain(),
@@ -3721,14 +3723,23 @@ impl<
         )
         .await?;
 
-        info!(target: "rebalance", %deposit_tx, "Vault deposit submitted, recorded, and confirmed");
-        Ok(())
+        info!(target: "rebalance", %deposit_tx, block_number = ?receipt.block_number, "Vault deposit submitted, recorded, and confirmed");
+        Ok(receipt.block_number)
     }
 
     #[instrument(target = "rebalance", skip(self), fields(%id), level = tracing::Level::DEBUG)]
-    async fn confirm_deposit(&self, id: &UsdcRebalanceId) -> Result<(), UsdcTransferError> {
+    async fn confirm_deposit(
+        &self,
+        id: &UsdcRebalanceId,
+        vault_deposit_block: Option<u64>,
+    ) -> Result<(), UsdcTransferError> {
         self.cqrs
-            .send(id, UsdcRebalanceCommand::ConfirmDeposit)
+            .send(
+                id,
+                UsdcRebalanceCommand::ConfirmDeposit {
+                    vault_deposit_block,
+                },
+            )
             .await?;
 
         info!(target: "rebalance", "Vault deposit confirmed");
@@ -6346,7 +6357,12 @@ impl<
         }
 
         self.cqrs
-            .send(id, UsdcRebalanceCommand::ConfirmDeposit)
+            .send(
+                id,
+                UsdcRebalanceCommand::ConfirmDeposit {
+                    vault_deposit_block: None,
+                },
+            )
             .await?;
 
         info!(target: "rebalance", "Alpaca deposit confirmed");
@@ -7158,6 +7174,7 @@ mod tests {
     use reqwest::StatusCode;
     use serde_json::json;
     use sqlx::SqlitePool;
+    use std::num::NonZeroU32;
     use std::str::FromStr;
     #[cfg(feature = "test-support")]
     use std::sync::LazyLock;
@@ -8498,9 +8515,14 @@ mod tests {
         .await
         .unwrap();
 
-        cqrs.send(id, UsdcRebalanceCommand::ConfirmDeposit)
-            .await
-            .unwrap();
+        cqrs.send(
+            id,
+            UsdcRebalanceCommand::ConfirmDeposit {
+                vault_deposit_block: None,
+            },
+        )
+        .await
+        .unwrap();
     }
 
     fn setup_anvil() -> (TestAnvilInstance, String, B256) {
@@ -8605,9 +8627,14 @@ mod tests {
         deposit_tx: TxHash,
     ) {
         advance_to_deposit_initiated_alpaca_to_base(cqrs, id, amount, deposit_tx).await;
-        cqrs.send(id, UsdcRebalanceCommand::ConfirmDeposit)
-            .await
-            .unwrap();
+        cqrs.send(
+            id,
+            UsdcRebalanceCommand::ConfirmDeposit {
+                vault_deposit_block: None,
+            },
+        )
+        .await
+        .unwrap();
     }
 
     /// Drives an Alpaca->Base aggregate through `InitiateConversion` ->
@@ -10413,9 +10440,14 @@ mod tests {
         .await
         .unwrap();
 
-        cqrs.send(&id, UsdcRebalanceCommand::ConfirmDeposit)
-            .await
-            .unwrap();
+        cqrs.send(
+            &id,
+            UsdcRebalanceCommand::ConfirmDeposit {
+                vault_deposit_block: None,
+            },
+        )
+        .await
+        .unwrap();
 
         let manager = CrossVenueCashTransfer::new(
             alpaca_broker,
@@ -12301,9 +12333,14 @@ mod tests {
         )
         .await
         .unwrap();
-        cqrs.send(id, UsdcRebalanceCommand::ConfirmDeposit)
-            .await
-            .unwrap();
+        cqrs.send(
+            id,
+            UsdcRebalanceCommand::ConfirmDeposit {
+                vault_deposit_block: None,
+            },
+        )
+        .await
+        .unwrap();
         cqrs.send(
             id,
             UsdcRebalanceCommand::InitiatePostDepositConversion {
@@ -13275,9 +13312,14 @@ mod tests {
         )
         .await
         .unwrap();
-        cqrs.send(&id, UsdcRebalanceCommand::ConfirmDeposit)
-            .await
-            .unwrap();
+        cqrs.send(
+            &id,
+            UsdcRebalanceCommand::ConfirmDeposit {
+                vault_deposit_block: None,
+            },
+        )
+        .await
+        .unwrap();
 
         let _order_mock =
             create_conversion_order_pending_mock(&server, ConversionDirection::UsdcToUsd, "100");
@@ -13333,9 +13375,14 @@ mod tests {
         )
         .await
         .unwrap();
-        cqrs.send(&id, UsdcRebalanceCommand::ConfirmDeposit)
-            .await
-            .unwrap();
+        cqrs.send(
+            &id,
+            UsdcRebalanceCommand::ConfirmDeposit {
+                vault_deposit_block: None,
+            },
+        )
+        .await
+        .unwrap();
 
         let _conversion_mock =
             create_conversion_order_mock(&server, ConversionDirection::UsdcToUsd, "100");
@@ -13390,9 +13437,14 @@ mod tests {
         )
         .await
         .unwrap();
-        cqrs.send(&id, UsdcRebalanceCommand::ConfirmDeposit)
-            .await
-            .unwrap();
+        cqrs.send(
+            &id,
+            UsdcRebalanceCommand::ConfirmDeposit {
+                vault_deposit_block: None,
+            },
+        )
+        .await
+        .unwrap();
         cqrs.send(
             &id,
             UsdcRebalanceCommand::InitiatePostDepositConversion {
@@ -14236,9 +14288,14 @@ mod tests {
             fixed_bytes!("0xdddd111111111111111111111111111111111111111111111111111111111111"),
         )
         .await;
-        cqrs.send(&id, UsdcRebalanceCommand::ConfirmDeposit)
-            .await
-            .unwrap();
+        cqrs.send(
+            &id,
+            UsdcRebalanceCommand::ConfirmDeposit {
+                vault_deposit_block: None,
+            },
+        )
+        .await
+        .unwrap();
 
         let outcome = manager.recheck_deposit(&id, None).await.unwrap();
 
@@ -20254,6 +20311,7 @@ mod tests {
             &UsdcRebalanceEvent::DepositConfirmed {
                 direction: RebalanceDirection::AlpacaToBase,
                 deposit_confirmed_at: Utc::now(),
+                vault_deposit_block: None,
             },
         )
         .await;
@@ -25219,6 +25277,77 @@ mod tests {
         assert_eq!(withdraw.token, usdg);
     }
 
+    /// The fresh deposit path records the block that holds the vault
+    /// deposit on `DepositConfirmed`, read from the deposit's receipt.
+    #[tokio::test]
+    async fn fresh_alpaca_to_base_deposit_records_the_deposit_block() {
+        let corridor = UsdcCorridor::HubRouted {
+            chain: Chain::Robinhood,
+            hop: HopKind::Cctp,
+        };
+        let pool = SqlitePool::connect(":memory:").await.unwrap();
+        sqlx::migrate!().run(&pool).await.unwrap();
+        let cqrs = Arc::new(test_store(pool.clone(), ()));
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let amount = usdc("1");
+        advance_to_bridged_alpaca_to_base_on(&cqrs, &id, amount, corridor).await;
+
+        let (_anvil, endpoint, private_key) = setup_anvil();
+        let wallet = create_test_wallet(&endpoint, &private_key);
+        wallet
+            .provider()
+            .anvil_set_code(
+                Chain::Robinhood.settlement_stable().address,
+                crate::bindings::DeployableERC20::DEPLOYED_BYTECODE.clone(),
+            )
+            .await
+            .unwrap();
+        let (manager, apalis_pool, _server) = manager_on_corridor_with_bot_gas_queue(
+            corridor,
+            cqrs,
+            wallet.clone(),
+            MockBridge::new(),
+        )
+        .await;
+
+        manager
+            .resume_alpaca_to_base(&id, amount, corridor)
+            .await
+            .unwrap();
+
+        let jobs = pending_bot_gas_jobs(&apalis_pool).await;
+        let deposit_block = wallet
+            .provider()
+            .get_transaction_receipt(jobs[0].tx_hash)
+            .await
+            .unwrap()
+            .and_then(|receipt| receipt.block_number)
+            .expect("the vault deposit is mined");
+        assert_eq!(
+            recorded_vault_deposit_block(&pool, &id).await,
+            Some(deposit_block)
+        );
+    }
+
+    /// The `vault_deposit_block` of `id`'s `DepositConfirmed`, read through
+    /// the event store API.
+    async fn recorded_vault_deposit_block(pool: &SqlitePool, id: &UsdcRebalanceId) -> Option<u64> {
+        let head = st0x_event_sorcery::head_rowid(pool).await.unwrap();
+        st0x_event_sorcery::events_since::<UsdcRebalance>(pool, 0, head, NonZeroU32::MAX)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|sequenced| sequenced.id == *id)
+            .find_map(|sequenced| match sequenced.event {
+                UsdcRebalanceEvent::DepositConfirmed {
+                    vault_deposit_block,
+                    ..
+                } => Some(vault_deposit_block),
+                _ => None,
+            })
+            .expect("a DepositConfirmed event")
+    }
+
     /// An enqueue failure for a confirmed vault withdrawal propagates as a
     /// hard error (fail fast) and leaves the aggregate un-advanced (enqueue
     /// runs BEFORE `Initiate`), so the caller's retry re-attempts both.
@@ -25670,6 +25799,42 @@ mod tests {
         assert_eq!(jobs[0].chain, Chain::Base);
         assert_eq!(jobs[0].tx_hash, deposit_tx);
         assert_eq!(jobs[0].symbol, None, "USDC paths carry no symbol");
+    }
+
+    /// The confirmation a resume records carries the deposit's own block,
+    /// read from its receipt, so the trigger can order the credit against
+    /// the fills of that block.
+    #[tokio::test]
+    async fn resume_alpaca_to_base_from_deposit_initiated_records_the_deposit_block() {
+        let pool = SqlitePool::connect(":memory:").await.unwrap();
+        sqlx::migrate!().run(&pool).await.unwrap();
+        let cqrs = Arc::new(test_store(pool.clone(), ()));
+        let (_anvil, endpoint, private_key) = setup_anvil();
+        let wallet = create_test_wallet(&endpoint, &private_key);
+
+        let deposit = wallet
+            .send(wallet.address(), Bytes::new(), "test deposit tx")
+            .await
+            .unwrap();
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let amount = usdc("1");
+        advance_to_deposit_initiated_alpaca_to_base(&cqrs, &id, amount, deposit.transaction_hash)
+            .await;
+        let (manager, _apalis_pool, _server) =
+            manager_with_bot_gas_queue(cqrs, wallet, MockBridge::new()).await;
+
+        manager
+            .resume_alpaca_to_base(&id, amount, UsdcCorridor::BASE_CCTP)
+            .await
+            .unwrap();
+
+        let deposit_block = deposit
+            .block_number
+            .expect("a mined receipt carries its block");
+        assert_eq!(
+            recorded_vault_deposit_block(&pool, &id).await,
+            Some(deposit_block)
+        );
     }
 
     /// CORRECTION C: when `pending_burn_tx` is set and `burn_status` reports the

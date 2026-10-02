@@ -1034,13 +1034,18 @@ impl RebalancingService {
                     id,
                     UsdcTrackingEvent::ConversionConfirmed,
                     conversion.received_amount,
+                    None,
                 )
                 .await?
             }
             DepositConfirmed {
                 direction: RebalanceDirection::AlpacaToBase,
+                vault_deposit_block,
                 ..
-            } => self.complete_alpaca_to_base_deposit(id).await?,
+            } => {
+                self.complete_alpaca_to_base_deposit(id, *vault_deposit_block)
+                    .await?
+            }
             // Transient intent markers persisted before the on-chain withdraw /
             // burn. Detailed stage tracking starts at the subsequent Initiated /
             // BridgingInitiated; the inventory's active-rebalance claim is set by
@@ -1348,6 +1353,7 @@ impl RebalancingService {
     async fn complete_alpaca_to_base_deposit(
         &self,
         id: &UsdcRebalanceId,
+        vault_deposit_block: Option<u64>,
     ) -> Result<UsdcSettlementOutcome, RebalancingServiceError> {
         let Some(tracking) = self.usdc_tracking.read().await.get(id).cloned() else {
             // Resumed after a restart with no rebuilt tracking: the transfer
@@ -1367,8 +1373,13 @@ impl RebalancingService {
             return Err(RebalancingServiceError::MissingUsdcBridgedAmount { id: id.clone() });
         };
 
-        self.complete_usdc_rebalance(id, UsdcTrackingEvent::DepositConfirmed, amount_received)
-            .await
+        self.complete_usdc_rebalance(
+            id,
+            UsdcTrackingEvent::DepositConfirmed,
+            amount_received,
+            vault_deposit_block,
+        )
+        .await
     }
 
     async fn cancel_tracked_usdc_rebalance(
@@ -1516,7 +1527,8 @@ impl RebalancingService {
                     .await
                     .onchain_usdc_block_watermark(chain);
                 self.divergence_gate
-                    .request_onchain_cash_reconcile_at_least(chain, floor);
+                    .request_onchain_cash_reconcile(chain, floor)
+                    .await;
             } else {
                 warn!(target: "rebalance", %chain, "No served corridor polls this chain's cash vault; not requesting a forced vault read");
             }
@@ -1558,11 +1570,15 @@ impl RebalancingService {
         rejections.contains_key(&Some(chain)) || rejections.contains_key(&None)
     }
 
+    /// Settles a tracked transfer into inventory. `vault_deposit_block` is
+    /// the block of the vault deposit that credits the corridor chain's
+    /// MarketMaking USDC, `None` when the transfer credits Alpaca.
     async fn complete_usdc_rebalance(
         &self,
         id: &UsdcRebalanceId,
         event: UsdcTrackingEvent,
         settled_amount: Usdc,
+        vault_deposit_block: Option<u64>,
     ) -> Result<UsdcSettlementOutcome, RebalancingServiceError> {
         let Some(tracking) = self.usdc_tracking.read().await.get(id).cloned() else {
             // Resumed after a restart with no rebuilt tracking: the transfer
@@ -1606,9 +1622,36 @@ impl RebalancingService {
         // A completed transfer re-arms the chain's under-funded page.
         self.underfunded_alerts.reset(chain);
 
+        // A vault credit requests a pinned read in the same inventory write
+        // as the credit. The gate's dispatch lock is taken first (lock
+        // order: dispatch, then inventory), so inventory writers never wait
+        // on a running USDC dispatch.
+        let cash_engagement = match vault_deposit_block {
+            Some(_) => Some(self.divergence_gate.lock_cash_engagement().await),
+            None => None,
+        };
         let mut inventory = self.inventory.write().await;
         let outcome = match inventory.clone().update_usdc_at(chain, update, now) {
             Ok(updated) => {
+                // A fill in the deposit's block or earlier may already have
+                // spent the credit onchain while the order fill reader, which
+                // trails the chain tip, has not delivered it. Hold every USDC
+                // check until a vault read pinned at or past the deposit
+                // block replaces the balance (ADR 0024). A read already
+                // applied past that block (a forced read while the transfer
+                // was inflight) contains the deposit, so the credit counts it
+                // twice: the request then needs a read at or past that read,
+                // since the view rejects anything older. The request is made
+                // under the same write as the credit, so no check reads the
+                // credit without it.
+                if let (Some(block_number), Some(cash_engagement)) =
+                    (vault_deposit_block, &cash_engagement)
+                {
+                    let minimum_block = updated
+                        .onchain_usdc_block_watermark(chain)
+                        .map_or(block_number, |watermark| watermark.max(block_number));
+                    cash_engagement.request_onchain_cash_reconcile(chain, Some(minimum_block));
+                }
                 *inventory = updated;
                 UsdcSettlementOutcome::Reconciled
             }
@@ -1655,6 +1698,7 @@ impl RebalancingService {
             Err(error) => return Err(error.into()),
         };
         drop(inventory);
+        drop(cash_engagement);
 
         Ok(outcome)
     }
@@ -2786,6 +2830,7 @@ mod tests {
         UsdcRebalanceEvent::DepositConfirmed {
             direction,
             deposit_confirmed_at: ts(108),
+            vault_deposit_block: None,
         }
     }
 
