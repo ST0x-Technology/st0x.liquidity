@@ -198,6 +198,59 @@ impl UsdcCorridors {
     }
 }
 
+/// Why a manual USDC transfer cannot pick its corridor.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum ManualCorridorError {
+    #[error("no served USDC corridor runs on {chain}; served: {served}")]
+    NoneOnChain { chain: Chain, served: String },
+    #[error("this build serves no USDC corridor")]
+    NoneServed,
+    #[error("several served USDC corridors run on {chain}: {served}")]
+    SeveralOnChain { chain: Chain, served: String },
+    #[error("several USDC corridors are served ({served}); pass --chain to pick one")]
+    ChainRequired { served: String },
+}
+
+/// The served corridor a manual transfer runs on.
+///
+/// It is the one on `chain`, or the only one when `chain` is left out.
+/// Several served corridors with no `chain`, or none on it, are refused with
+/// the choices named. Shared by `st0x-cli transfer-usdc` and the bot's
+/// `capital transfer-usdc` route.
+pub fn manual_transfer_corridor(
+    served: &BTreeSet<UsdcCorridor>,
+    chain: Option<Chain>,
+) -> Result<UsdcCorridor, ManualCorridorError> {
+    let candidates: Vec<UsdcCorridor> = served
+        .iter()
+        .copied()
+        .filter(|corridor| chain.is_none_or(|chain| corridor.chain() == chain))
+        .collect();
+    let served_list = || {
+        served
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+
+    match (candidates.as_slice(), chain) {
+        ([corridor], _) => Ok(*corridor),
+        ([], Some(chain)) => Err(ManualCorridorError::NoneOnChain {
+            chain,
+            served: served_list(),
+        }),
+        ([], None) => Err(ManualCorridorError::NoneServed),
+        (_, Some(chain)) => Err(ManualCorridorError::SeveralOnChain {
+            chain,
+            served: served_list(),
+        }),
+        (_, None) => Err(ManualCorridorError::ChainRequired {
+            served: served_list(),
+        }),
+    }
+}
+
 #[cfg(any(test, feature = "test-support"))]
 impl UsdcCorridors {
     /// Base via CCTP, active on `threshold`.

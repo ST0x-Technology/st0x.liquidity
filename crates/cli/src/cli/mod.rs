@@ -707,19 +707,20 @@ pub enum Commands {
         network: TokenizationNetwork,
     },
 
-    /// Withdraw USDC from the configured Raindex cash vault
+    /// Withdraw the chain's settlement stable (USDC, or USDG on Robinhood) from
+    /// the configured Raindex cash vault
     ///
-    /// This preserves the existing USDC-specific operator flow by resolving
+    /// This preserves the existing cash vault operator flow by resolving
     /// `vault_ids` from `[chains.<name>.trading.assets.cash]` in config and forwarding into the generic
     /// vault withdrawal implementation.
     VaultWithdrawUsdc {
-        /// Amount of USDC to withdraw
+        /// Amount of the settlement stable to withdraw
         #[arg(short = 'a', long = "amount")]
         amount: Usdc,
 
-        /// Chain of the cash vault: its canonical USDC and its
-        /// `[chains.<name>.trading.assets.cash]` vault; a chain with no pinned
-        /// USDC is refused
+        /// Chain of the cash vault: its settlement stable and its first
+        /// `[chains.<name>.trading.assets.cash]` vault; a chain with no cash
+        /// vault configured is refused
         #[arg(long = "network", value_enum, default_value_t = TokenizationNetwork::Base)]
         network: TokenizationNetwork,
     },
@@ -739,12 +740,13 @@ pub enum Commands {
         from: CctpChain,
     },
 
-    /// Reset USDC allowance for the orderbook to zero.
+    /// Reset the settlement stable allowance (USDC, or USDG on Robinhood) for
+    /// the orderbook to zero.
     ///
     /// Use this to investigate approval behavior or when switching orderbook addresses.
     ResetAllowance {
-        /// Chain whose USDC allowance to reset: its wallet, canonical USDC
-        /// and `[chains.<name>.trading]` orderbook
+        /// Chain whose allowance to reset: its wallet, its settlement stable
+        /// and its `[chains.<name>.trading]` orderbook
         #[arg(long = "network", value_enum, default_value_t = TokenizationNetwork::Base)]
         network: TokenizationNetwork,
     },

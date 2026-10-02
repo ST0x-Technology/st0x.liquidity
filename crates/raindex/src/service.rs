@@ -228,7 +228,9 @@ impl<W: Wallet> RaindexService<W> {
             .await?;
 
         info!(target: "inventory", tx_hash = %receipt.transaction_hash, %token, spender = %self.orderbook_address, "Revoked stale orderbook allowance");
-        Ok(RevokeOutcome::Revoked)
+        Ok(RevokeOutcome::Revoked {
+            tx: receipt.transaction_hash,
+        })
     }
 
     async fn deposit4_to_vault<Registry: IntoErrorRegistry>(
@@ -789,6 +791,7 @@ impl<W: Wallet> Raindex for RaindexService<W> {
 
 #[cfg(test)]
 mod tests {
+    use alloy::consensus::Transaction as _;
     use alloy::hex;
     use alloy::network::{Ethereum, TransactionBuilder};
     use alloy::node_bindings::{Anvil, AnvilInstance};
@@ -1727,11 +1730,32 @@ mod tests {
             .revoke_orderbook_allowance::<NoOpErrorRegistry>(local_evm.token_address)
             .await
             .unwrap();
-        assert_eq!(
-            outcome,
-            RevokeOutcome::Revoked,
-            "non-zero allowance must trigger a revoke tx"
-        );
+        let RevokeOutcome::Revoked { tx } = outcome else {
+            panic!("non-zero allowance must trigger a revoke tx, got {outcome:?}");
+        };
+
+        // The reported tx is the mined approve(orderbook, 0) the wallet sent to
+        // the token, the hash operators are shown to look it up onchain.
+        let receipt = local_evm
+            .wallet
+            .provider()
+            .get_transaction_receipt(tx)
+            .await
+            .unwrap()
+            .expect("the revoke tx must be mined");
+        assert!(receipt.status(), "the revoke tx must succeed");
+        assert_eq!(receipt.from, local_evm.wallet.address());
+        assert_eq!(receipt.to, Some(local_evm.token_address));
+        let sent = local_evm
+            .wallet
+            .provider()
+            .get_transaction_by_hash(tx)
+            .await
+            .unwrap()
+            .expect("the revoke tx must be visible");
+        let approve = IERC20::approveCall::abi_decode(sent.input()).unwrap();
+        assert_eq!(approve.spender, local_evm.orderbook_address);
+        assert_eq!(approve.amount, U256::ZERO);
 
         // Idempotent: a second call sees zero and does nothing.
         let second = service

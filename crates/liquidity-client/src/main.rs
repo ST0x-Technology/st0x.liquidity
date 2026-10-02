@@ -13,8 +13,8 @@ use std::process::ExitCode;
 
 use crate::auth::{AuthError, StaticToken, TokenSource};
 use crate::cli::{
-    Cctp, CctpSourceChain, Cli, Command, Debug, PortfolioSnapshot, Position, Read, RebuildableView,
-    RecheckTransferType, UsdcDirection, View,
+    Capital, Cctp, Cli, Command, Debug, HedgedChain, PortfolioSnapshot, Position, Read,
+    RebuildableView, RecheckTransferType, UsdcDirection, VaultArgs, View,
 };
 use crate::output::OutputError;
 use crate::target::Auth;
@@ -173,6 +173,7 @@ async fn dispatch<A: TokenSource + Sync>(
             client.get(&path, &args.params).await?
         }
         Command::Debug(debug) => send_debug(client, debug).await?,
+        Command::Capital(capital) => dispatch_capital(client, capital).await?,
     };
     output::print(&value).map_err(ApiError::from)
 }
@@ -360,22 +361,97 @@ async fn send_debug<A: TokenSource + Sync>(
             burn_tx,
             source_chain,
         }) => {
-            let source_chain = match source_chain {
-                CctpSourceChain::Ethereum => "ethereum",
-                CctpSourceChain::Base => "base",
-            };
             client
                 .post_json(
                     "/cctp/complete-mint",
                     &wire::CompleteCctpMintRequest {
                         burn_tx,
-                        source_chain,
+                        source_chain: source_chain.wire_name(),
                     },
                 )
                 .await?
         }
     };
     Ok(value)
+}
+
+/// Sends one `capital` verb through the write prefix and returns the bot's
+/// response for `dispatch` to print, like `send_debug` for the debug verbs.
+async fn dispatch_capital<A: TokenSource + Sync>(
+    client: &Client<A>,
+    capital: Capital,
+) -> Result<serde_json::Value, TransportError> {
+    match capital {
+        Capital::TransferUsdc {
+            direction,
+            amount,
+            chain,
+        } => {
+            client
+                .post_json(
+                    "/capital/transfer-usdc",
+                    &wire::TransferUsdcRequest {
+                        direction,
+                        amount,
+                        chain: chain.map(HedgedChain::wire_name),
+                    },
+                )
+                .await
+        }
+        Capital::VaultDeposit(args) => {
+            client
+                .post_json("/capital/vault-deposit", &vault_request(args))
+                .await
+        }
+        Capital::VaultWithdraw(args) => {
+            client
+                .post_json("/capital/vault-withdraw", &vault_request(args))
+                .await
+        }
+        Capital::VaultWithdrawUsdc { amount, network } => {
+            client
+                .post_json(
+                    "/capital/vault-withdraw-usdc",
+                    &wire::VaultWithdrawUsdcRequest {
+                        chain: network.wire_name(),
+                        amount,
+                    },
+                )
+                .await
+        }
+        Capital::CctpBridge { amount, all, from } => {
+            client
+                .post_json(
+                    "/capital/cctp-bridge",
+                    &wire::CctpBridgeRequest {
+                        from: from.wire_name(),
+                        amount,
+                        all,
+                    },
+                )
+                .await
+        }
+        Capital::ResetAllowance { network } => {
+            client
+                .post_json(
+                    "/capital/reset-allowance",
+                    &wire::ResetAllowanceRequest {
+                        chain: network.wire_name(),
+                    },
+                )
+                .await
+        }
+    }
+}
+
+/// The body `vault-deposit` and `vault-withdraw` share.
+fn vault_request(args: VaultArgs) -> wire::VaultTransferRequest {
+    wire::VaultTransferRequest {
+        chain: args.network.wire_name(),
+        token: args.token,
+        vault_id: args.vault_id,
+        amount: args.amount,
+    }
 }
 
 #[cfg(test)]
@@ -389,14 +465,14 @@ mod tests {
     use super::{ApiError, dispatch};
     use crate::auth::{AuthError, StaticToken};
     use crate::cli::{
-        Cctp, CctpSourceChain, Command, Debug, EquityTransferKind, HedgedChain, PortfolioSnapshot,
-        Position, Read, ReadResource, RebuildViewArgs, RebuildableView, RecheckTransferType,
-        ReleaseHedgeArgs, ResourceArgs, SetMarkArgs, SetPositionArgs, TradeEventsArgs,
-        TransferEventsArgs, UsdcDirection, View,
+        Capital, Cctp, CctpSourceChain, Command, Debug, EquityTransferKind, HedgedChain,
+        PortfolioSnapshot, Position, Read, ReadResource, RebuildViewArgs, RebuildableView,
+        RecheckTransferType, ReleaseHedgeArgs, ResourceArgs, SetMarkArgs, SetPositionArgs,
+        TradeEventsArgs, TransferEventsArgs, UsdcDirection, VaultArgs, View,
     };
     use crate::output::OutputError;
     use crate::transport::{Client, TransportError};
-    use crate::wire::ReconcileUsdcReason;
+    use crate::wire::{ReconcileUsdcReason, TransferUsdcDirection};
 
     /// Accepts one connection, captures the raw request bytes, and replies with
     /// an empty JSON object.
@@ -938,6 +1014,143 @@ mod tests {
             "POST /liquidity-write/views/rebalance-timing/rebuild HTTP/1.1"
         );
         assert_eq!(request_body(&request), serde_json::json!({ "all": true }));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn transfer_usdc_posts_the_direction_and_amount() -> Result<(), Box<dyn std::error::Error>>
+    {
+        for (direction, spelling) in [
+            (TransferUsdcDirection::ToRaindex, "to-raindex"),
+            (TransferUsdcDirection::ToAlpaca, "to-alpaca"),
+        ] {
+            let request = request_for(Command::Capital(Capital::TransferUsdc {
+                direction,
+                amount: "250.5".parse()?,
+                chain: None,
+            }))
+            .await?;
+            assert_eq!(
+                request_line(&request),
+                "POST /liquidity-write/capital/transfer-usdc HTTP/1.1"
+            );
+            assert_eq!(
+                request_body(&request),
+                serde_json::json!({ "direction": spelling, "amount": "250.5" })
+            );
+        }
+        let request = request_for(Command::Capital(Capital::TransferUsdc {
+            direction: TransferUsdcDirection::ToRaindex,
+            amount: "250.5".parse()?,
+            chain: Some(HedgedChain::Robinhood),
+        }))
+        .await?;
+        assert_eq!(
+            request_body(&request),
+            serde_json::json!({ "direction": "to-raindex", "amount": "250.5", "chain": "robinhood" })
+        );
+        Ok(())
+    }
+
+    /// Both vault verbs send the same camelCase body, each to its own route.
+    #[tokio::test]
+    async fn vault_verbs_post_the_chain_token_vault_and_amount()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let token = "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913";
+        let vault_id = "0x00000000000000000000000000000000000000000000000000000000000000a1";
+        let args = VaultArgs {
+            amount: "1.5".parse()?,
+            token: token.parse()?,
+            vault_id: vault_id.parse()?,
+            network: HedgedChain::Ethereum,
+        };
+        for (command, route) in [
+            (Capital::VaultDeposit(args.clone()), "vault-deposit"),
+            (Capital::VaultWithdraw(args), "vault-withdraw"),
+        ] {
+            let request = request_for(Command::Capital(command)).await?;
+            assert_eq!(
+                request_line(&request),
+                format!("POST /liquidity-write/capital/{route} HTTP/1.1")
+            );
+            assert_eq!(
+                request_body(&request),
+                serde_json::json!({
+                    "chain": "ethereum",
+                    "token": "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+                    "vaultId": "0x00000000000000000000000000000000000000000000000000000000000000a1",
+                    "amount": "1.5",
+                })
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn vault_withdraw_usdc_posts_the_chain_and_amount()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let request = request_for(Command::Capital(Capital::VaultWithdrawUsdc {
+            amount: "100".parse()?,
+            network: HedgedChain::Base,
+        }))
+        .await?;
+        assert_eq!(
+            request_line(&request),
+            "POST /liquidity-write/capital/vault-withdraw-usdc HTTP/1.1"
+        );
+        assert_eq!(
+            request_body(&request),
+            serde_json::json!({ "chain": "base", "amount": "100" })
+        );
+        Ok(())
+    }
+
+    /// The body carries either `amount` or `all: true`, never both keys and
+    /// never `all: false`.
+    #[tokio::test]
+    async fn cctp_bridge_posts_either_an_amount_or_all() -> Result<(), Box<dyn std::error::Error>> {
+        let amount = request_for(Command::Capital(Capital::CctpBridge {
+            amount: Some("100".parse()?),
+            all: false,
+            from: CctpSourceChain::Ethereum,
+        }))
+        .await?;
+        assert_eq!(
+            request_line(&amount),
+            "POST /liquidity-write/capital/cctp-bridge HTTP/1.1"
+        );
+        assert_eq!(
+            request_body(&amount),
+            serde_json::json!({ "from": "ethereum", "amount": "100" })
+        );
+
+        let all = request_for(Command::Capital(Capital::CctpBridge {
+            amount: None,
+            all: true,
+            from: CctpSourceChain::Base,
+        }))
+        .await?;
+        assert_eq!(
+            request_body(&all),
+            serde_json::json!({ "from": "base", "all": true })
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reset_allowance_posts_the_chain() -> Result<(), Box<dyn std::error::Error>> {
+        let request = request_for(Command::Capital(Capital::ResetAllowance {
+            network: HedgedChain::Hyperevm,
+        }))
+        .await?;
+        assert_eq!(
+            request_line(&request),
+            "POST /liquidity-write/capital/reset-allowance HTTP/1.1"
+        );
+        assert_eq!(
+            request_body(&request),
+            serde_json::json!({ "chain": "hyperevm" })
+        );
         Ok(())
     }
 

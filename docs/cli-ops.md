@@ -278,13 +278,15 @@ stox wrap-equity -s COIN -q 10 --network ethereum
 stox vault-deposit --amount 10 --token <wrapped-token> --vault-id <vault-id> --network ethereum
 ```
 
-For USDC, deposit the chain's canonical USDC into the cash vault the same way
+For cash, deposit the chain's settlement stable (USDC, or USDG on Robinhood)
+into the cash vault the same way
 (`vault-deposit --amount <amount> --network ethereum --token <usdc> --vault-id <cash-vault-id>`);
 `vault-withdraw-usdc --amount <amount> --network <chain>` reverses it and
-`reset-allowance --network <chain>` zeroes the orderbook's USDC allowance on
-that chain. `transfer-equity --network <chain>` records the chain it ran on, and
-the server resumes an interrupted transfer with that chain's wallet, vault and
-issuer. A resumed mint (`--issuer-request-id`) must be given the network it
+`reset-allowance --network <chain>` zeroes the orderbook's allowance of that
+settlement stable on that chain; both act on USDG on Robinhood despite the
+command names. `transfer-equity --network <chain>` records the chain it ran on,
+and the server resumes an interrupted transfer with that chain's wallet, vault
+and issuer. A resumed mint (`--issuer-request-id`) must be given the network it
 started on; a `--network` that disagrees with the record is refused, and the
 `transfer` recovery verbs carry no network at all.
 
@@ -296,6 +298,79 @@ disabled. A persisted mint that the issuer has no record of is not replayed on
 such a listing. The lookup is inconclusive, so the resume errors and leaves the
 mint at `MintRequested` with its reservation. Confirm with the issuer that it
 never received the request, then use `transfer fail --kind mint`.
+
+Without container access, the capital verbs run in the bot through IAP with
+`st0x-liquidity-client --env <env> capital <verb>`, which needs the write tier
+Workspace group and signs with the bot's own wallets:
+
+```bash
+st0x-liquidity-client --env <env> capital vault-deposit --amount 10 --token <wrapped-token> --vault-id <vault-id> --network ethereum
+st0x-liquidity-client --env <env> capital vault-withdraw --amount 10 --token <token> --vault-id <vault-id> --network ethereum
+st0x-liquidity-client --env <env> capital vault-withdraw-usdc --amount <amount> --network <chain>
+st0x-liquidity-client --env <env> capital reset-allowance --network <chain>
+# starts the transfer on the bot's worker and prints its id at once; --chain
+# picks the served corridor and may be left out while the bot serves one
+st0x-liquidity-client --env <env> capital transfer-usdc --direction <to-raindex|to-alpaca> --amount <amount> [--chain <chain>]
+# burns only and prints the burn tx; finish with debug cctp complete-mint
+st0x-liquidity-client --env <env> capital cctp-bridge --from <ethereum|base> --amount <amount>
+st0x-liquidity-client --env <env> debug cctp complete-mint --burn-tx <burn-tx> --source-chain <ethereum|base>
+```
+
+`--network` defaults to `base`, as in `st0x-cli`. `capital transfer-usdc` is
+refused with `409` while another USDC transfer is in flight or holds the
+corridor guard, so retrying it cannot start a second transfer alongside the
+first. Like the automatic rebalancer, it is also refused with `409` while a cash
+snapshot divergence is unresolved or the cash balance is restart tainted; retry
+once the inventory poller has cleared it. `capital vault-deposit` is refused
+with `409` while another `capital vault-deposit` runs; the lock does not cover
+the bot's own transfer deposits. `capital transfer-usdc` and
+`capital cctp-bridge` both answer `503` while the Base or Ethereum signing
+wallet cannot be shown to pay gas: fund a wallet that is below its gas
+threshold, or retry if the message says its balance could not be read.
+`capital cctp-bridge` waits for neither Circle nor the burn's receipt: it
+returns the burn tx as soon as the burn is broadcast, and
+`debug cctp complete-mint` fetches the attestation and mints once Circle has
+attested it.
+
+After answering, the bot keeps the recovery lock and the driver pause until the
+burn has the source chain's required confirmations (12 blocks on Ethereum in
+production, about two and a half minutes; 3 on Base) or the confirmation wait
+gives up, which takes up to 5 minutes for inclusion plus 30 minutes for the
+confirmations. Until then every verb that takes the recovery lock answers `409`:
+`debug resume`, `debug recheck`, `debug resume-usdc`, `debug reconcile-usdc`,
+`debug fail-usdc-transfer`, `debug fail-equity-transfer`,
+`capital transfer-usdc`, a second `capital cctp-bridge`, and
+`debug cctp complete-mint`. Most say
+`A resume or recheck operation is already in progress`; `debug resume` says
+`A resume operation is already in progress` and `debug fail-equity-transfer`
+says `A transfer recovery operation is already in progress`. `complete-mint`
+answers `502` instead while Circle has not attested the burn, since it fetches
+the attestation before it tries the lock; both mean retry. After the task
+finishes, confirmed or not, the lock is free again. The outcome is
+`CCTP burn confirmed via API`, or `CCTP burn broadcast via API did not confirm`,
+whose `error` field says why: a revert, a dropped tx, a missing CCTP
+`MessageSent` event, or a receipt wait that timed out or kept failing on RPC
+errors. A timed out receipt wait, or one that kept failing on RPC errors, does
+not prove the burn failed, so check the burn tx onchain before completing the
+mint or retrying; a burn that never confirmed never attests, and `complete-mint`
+keeps answering `502` for it.
+
+A request that times out on the client may still complete in the bot; check the
+bot logs and the chain for the transaction before retrying a vault or allowance
+verb. A retried `cctp-bridge` burns again, since the bot keeps no record of the
+burn. After a timeout, find `CCTP burn broadcast via API` in the bot logs and
+finish that burn with `complete-mint` instead of retrying. If instead the logs
+show `Capital route failed onchain` for `cctp-bridge` with no broadcast line,
+the burn was not broadcast cleanly. A revert broadcast no burn, but a transport
+error reads the same whichever step raised it (the balance read, the allowance
+approve, the Circle fee lookup, or the burn send itself), and only the burn send
+may still have landed. The bridge logs
+`Submitting depositForBurn (pending) for fast transfer` just before that send:
+if that line is present, treat the burn as possibly broadcast and check the
+source wallet's recent transactions onchain before retrying. Every capital verb
+answers `503` until the bot finishes starting. The tokenization and issuer verbs
+(`transfer-equity`, `wrap-equity`, `unwrap-equity`, `donate-equity`,
+`dividend-bump`) have no client subcommand and stay on `st0x-cli`.
 
 ### Orchestrator Rollout per Chain
 

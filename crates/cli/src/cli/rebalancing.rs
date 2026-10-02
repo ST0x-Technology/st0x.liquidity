@@ -4,7 +4,7 @@ use alloy::primitives::{Address, TxHash, U256};
 use alloy::providers::RootProvider;
 use anyhow::Context;
 use sqlx::SqlitePool;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::future::Future;
 use std::io::{self, Write};
 use std::path::PathBuf;
@@ -788,39 +788,6 @@ pub(super) async fn transfer_usdc_command<Writer: Write>(
     run_usdc_transfer(stdout, direction, id, amount, chain, ctx, pool).await
 }
 
-/// The served corridor a manual transfer runs on: the one on `chain`, or
-/// the only one when `chain` is left out. Several served corridors with no
-/// `chain`, or none on it, are refused with the choices named.
-fn transfer_usdc_corridor(
-    served: &BTreeSet<UsdcCorridor>,
-    chain: Option<Chain>,
-) -> anyhow::Result<UsdcCorridor> {
-    let candidates: Vec<UsdcCorridor> = served
-        .iter()
-        .copied()
-        .filter(|corridor| chain.is_none_or(|chain| corridor.chain() == chain))
-        .collect();
-    let served_list = served
-        .iter()
-        .map(ToString::to_string)
-        .collect::<Vec<_>>()
-        .join(", ");
-
-    match (candidates.as_slice(), chain) {
-        ([corridor], _) => Ok(*corridor),
-        ([], Some(chain)) => {
-            anyhow::bail!("no served USDC corridor runs on {chain}; served: {served_list}")
-        }
-        ([], None) => anyhow::bail!("this build serves no USDC corridor"),
-        (_, Some(chain)) => {
-            anyhow::bail!("several served USDC corridors run on {chain}: {served_list}")
-        }
-        (_, None) => anyhow::bail!(
-            "several USDC corridors are served ({served_list}); pass --chain to pick one"
-        ),
-    }
-}
-
 /// Resumes an interrupted manual USDC transfer by enqueueing it on the
 /// RUNNING bot's `/transfers/usdc/resume` endpoint. Resuming must run in the
 /// bot process so it shares the bot's single-flight gates (job-row dedupe,
@@ -981,7 +948,7 @@ async fn run_usdc_transfer<Writer: Write>(
 
     // The transfer runs on the served corridor's chain vault and signer.
     let rebalancing_ctx = &ctx.rebalancing;
-    let corridor = transfer_usdc_corridor(rebalancing_ctx.usdc.served(), chain)?;
+    let corridor = st0x_config::manual_transfer_corridor(rebalancing_ctx.usdc.served(), chain)?;
     let corridor_chain = corridor.chain();
     let hedged = ctx.chains.hedged_chain(corridor_chain).with_context(|| {
         format!("the {corridor} corridor needs a [chains.{corridor_chain}.trading] table")
@@ -3696,24 +3663,26 @@ mod tests {
         let two = BTreeSet::from([UsdcCorridor::BASE_CCTP, robinhood_relay]);
 
         assert_eq!(
-            transfer_usdc_corridor(&one, None).unwrap(),
+            st0x_config::manual_transfer_corridor(&one, None).unwrap(),
             UsdcCorridor::BASE_CCTP
         );
         assert_eq!(
-            transfer_usdc_corridor(&two, Some(Chain::Robinhood)).unwrap(),
+            st0x_config::manual_transfer_corridor(&two, Some(Chain::Robinhood)).unwrap(),
             robinhood_relay
         );
 
-        let unpicked = transfer_usdc_corridor(&two, None).unwrap_err().to_string();
+        let unpicked = st0x_config::manual_transfer_corridor(&two, None)
+            .unwrap_err()
+            .to_string();
         assert!(unpicked.contains("pass --chain"), "{unpicked}");
-        let unserved = transfer_usdc_corridor(&one, Some(Chain::HyperEvm))
+        let unserved = st0x_config::manual_transfer_corridor(&one, Some(Chain::HyperEvm))
             .unwrap_err()
             .to_string();
         assert!(
             unserved.starts_with("no served USDC corridor runs on"),
             "{unserved}"
         );
-        let none_served = transfer_usdc_corridor(&BTreeSet::new(), None)
+        let none_served = st0x_config::manual_transfer_corridor(&BTreeSet::new(), None)
             .unwrap_err()
             .to_string();
         assert_eq!(none_served, "this build serves no USDC corridor");
