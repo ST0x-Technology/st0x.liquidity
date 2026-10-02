@@ -52,6 +52,11 @@ redundant_pub_crate = "allow"
 [profile.dev]
 debug = "line-tables-only"
 
+# Third-party crates skip even line tables: file:line stays for our own code,
+# while every dependency rlib and every linked test/bin binary gets smaller.
+[profile.dev.package."*"]
+debug = false
+
 [workspace.dependencies]
 aes-gcm = "0.10.3"
 alloy = { version = "1.0.38", features = ["full", "rand", "node-bindings"] }
