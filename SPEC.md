@@ -6008,9 +6008,12 @@ transfer dispatch. It does not calculate cross-venue inventory imbalances.
   applied USDC block watermark, since a read already forced in past the deposit
   contains it and the view rejects any older read. A request already pending for
   the chain keeps its block when it is higher or when the new request has none;
-  the onchain equity request merges its block the same way. An event without the
-  block (a BaseToAlpaca deposit at Alpaca, or one recorded before the block was
-  captured) requests no read
+  the onchain equity request merges its block the same way. A fill that applies
+  its cash leg while the read is pending raises the read's floor to the fill's
+  block in the same inventory write, and a read is accepted only under that
+  write lock, so a read pinned below the fill cannot replace the balance it
+  changed. An event without the block (a BaseToAlpaca deposit at Alpaca, or one
+  recorded before the block was captured) requests no read
 - `UsdcRebalanceEvent::ConversionConfirmed` - Terminal success for BaseToAlpaca;
   moves from inflight to destination available
 - `UsdcRebalanceEvent::WithdrawalFailed`, BaseToAlpaca pre-burn

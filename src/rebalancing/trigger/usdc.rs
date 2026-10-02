@@ -1622,6 +1622,14 @@ impl RebalancingService {
         // A completed transfer re-arms the chain's under-funded page.
         self.underfunded_alerts.reset(chain);
 
+        // A vault credit requests a pinned read in the same inventory write
+        // as the credit. The gate's dispatch lock is taken first (lock
+        // order: dispatch, then inventory), so inventory writers never wait
+        // on a running USDC dispatch.
+        let cash_engagement = match vault_deposit_block {
+            Some(_) => Some(self.divergence_gate.lock_cash_engagement().await),
+            None => None,
+        };
         let mut inventory = self.inventory.write().await;
         let outcome = match inventory.clone().update_usdc_at(chain, update, now) {
             Ok(updated) => {
@@ -1636,13 +1644,13 @@ impl RebalancingService {
                 // since the view rejects anything older. The request is made
                 // under the same write as the credit, so no check reads the
                 // credit without it.
-                if let Some(block_number) = vault_deposit_block {
+                if let (Some(block_number), Some(cash_engagement)) =
+                    (vault_deposit_block, &cash_engagement)
+                {
                     let minimum_block = updated
                         .onchain_usdc_block_watermark(chain)
                         .map_or(block_number, |watermark| watermark.max(block_number));
-                    self.divergence_gate
-                        .request_onchain_cash_reconcile(chain, Some(minimum_block))
-                        .await;
+                    cash_engagement.request_onchain_cash_reconcile(chain, Some(minimum_block));
                 }
                 *inventory = updated;
                 UsdcSettlementOutcome::Reconciled
@@ -1690,6 +1698,7 @@ impl RebalancingService {
             Err(error) => return Err(error.into()),
         };
         drop(inventory);
+        drop(cash_engagement);
 
         Ok(outcome)
     }

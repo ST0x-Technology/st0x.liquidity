@@ -55,6 +55,48 @@ pub(crate) struct CashDispatch<'gate> {
     _held: tokio::sync::RwLockReadGuard<'gate, ()>,
 }
 
+/// The exclusive side of the gate's dispatch lock, taken by every cash
+/// engagement. Taken before the inventory lock when both are needed (see
+/// `InventoryDivergenceGate::cash_dispatch`), so a settlement can request
+/// its read in the same inventory write as its credit without making
+/// inventory writers wait on a dispatch.
+pub(crate) struct CashEngagement<'gate> {
+    gate: &'gate InventoryDivergenceGate,
+    _held: tokio::sync::RwLockWriteGuard<'gate, ()>,
+}
+
+impl CashEngagement<'_> {
+    pub(crate) fn engage_cash(&self, scope: InventoryScope) {
+        write_recovering(&self.gate.cash).insert(scope);
+        self.gate.publish_cash_engagement();
+    }
+
+    /// Requests a pinned onchain cash read at or past `minimum_block`. A
+    /// request already pending for the chain keeps its block when it is
+    /// higher, or when the new request has none: a fill that could not
+    /// apply its cash delta pins the request to its block, and lowering
+    /// that floor would let a read from a node below the fill clear the
+    /// gate. The claimed read is fetched after the newest request, which
+    /// covers a request without a block.
+    pub(crate) fn request_onchain_cash_reconcile(
+        &self,
+        chain: Chain,
+        minimum_block: Option<u64>,
+    ) -> ReconciliationGeneration {
+        let mut pending = self.gate.write_pending_onchain_cash();
+        let pending_block = pending
+            .get(&chain)
+            .and_then(|request| request.minimum_block);
+        let request = self
+            .gate
+            .new_reconciliation_request(pending_block.max(minimum_block));
+        pending.insert(chain, request);
+        drop(pending);
+        self.gate.publish_cash_engagement();
+        request.generation
+    }
+}
+
 /// Inventory scopes with a detected but unresolved snapshot
 /// divergence.
 ///
@@ -89,13 +131,15 @@ pub(crate) struct InventoryDivergenceGate {
     /// wrong amount and marks the venue busy, freezing the very counter
     /// that resolves the divergence.
     cash: RwLock<HashSet<InventoryScope>>,
-    /// Bumped by every cash engagement and every onchain cash read request,
-    /// so a dispatch admitted before one refuses even when the gate has
-    /// been released again since.
+    /// Bumped after every cash engagement and every onchain cash read
+    /// request is published, so a dispatch admitted before one refuses even
+    /// when the gate has been released again since.
     cash_epoch: AtomicU64,
     /// Orders cash engagements against USDC dispatches. A dispatch holds it
     /// shared from its last gate check through its enqueue, and every
-    /// engagement takes it exclusively, so none lands in between.
+    /// engagement takes it exclusively, so none lands in between. Lock
+    /// order: this lock before the inventory lock. A dispatch never touches
+    /// inventory while holding it shared.
     cash_dispatch: tokio::sync::RwLock<()>,
 }
 
@@ -131,11 +175,48 @@ impl InventoryDivergenceGate {
                 .any(|(_, pending_symbol)| pending_symbol == symbol)
     }
 
+    /// Takes the gate's dispatch lock exclusively, waiting for any USDC
+    /// dispatch that holds it. Take it before the inventory lock.
+    pub(crate) async fn lock_cash_engagement(&self) -> CashEngagement<'_> {
+        CashEngagement {
+            gate: self,
+            _held: self.cash_dispatch.write().await,
+        }
+    }
+
     pub(crate) async fn engage_cash(&self, scope: InventoryScope) {
-        let dispatch = self.cash_dispatch.write().await;
+        self.lock_cash_engagement().await.engage_cash(scope);
+    }
+
+    /// See [`CashEngagement::request_onchain_cash_reconcile`]; waits for any
+    /// USDC dispatch holding the gate.
+    pub(crate) async fn request_onchain_cash_reconcile(
+        &self,
+        chain: Chain,
+        minimum_block: Option<u64>,
+    ) -> ReconciliationGeneration {
+        self.lock_cash_engagement()
+            .await
+            .request_onchain_cash_reconcile(chain, minimum_block)
+    }
+
+    /// Raises the floor of the cash read pending for `chain`, if any, to
+    /// `block_number`. A fill that applied its cash delta at that block is
+    /// in the view but not in a read pinned below it, so such a read must
+    /// not replace the balance and release the gate. Keeps the generation,
+    /// so a read already claimed at or past the block still resolves it.
+    /// Needs no dispatch lock: the gate is already engaged.
+    pub(crate) fn raise_pending_onchain_cash_floor(&self, chain: Chain, block_number: u64) {
+        if let Some(request) = self.write_pending_onchain_cash().get_mut(&chain) {
+            request.minimum_block = request.minimum_block.max(Some(block_number));
+        }
+    }
+
+    /// Bumps the epoch after an engagement is visible, so an admission that
+    /// read the old epoch is refused at its hold, and one that reads the new
+    /// epoch also sees the engagement and is refused at once.
+    fn publish_cash_engagement(&self) {
         self.cash_epoch.fetch_add(1, Ordering::SeqCst);
-        write_recovering(&self.cash).insert(scope);
-        drop(dispatch);
     }
 
     pub(crate) fn release_cash(&self, scope: InventoryScope) {
@@ -149,8 +230,9 @@ impl InventoryDivergenceGate {
 
     /// The admission a USDC dispatch takes before it sizes the transfer, or
     /// `None` while the cash gate is engaged. The epoch is read before the
-    /// engagement state, and an engagement bumps it before engaging, so an
-    /// engagement racing this call is caught when the admission is held.
+    /// engagement state and an engagement bumps it only after it is
+    /// visible: an admission reading the old epoch is refused at its hold,
+    /// and one reading the new epoch sees the engagement and gets `None`.
     pub(crate) fn cash_admission(&self) -> Option<CashAdmission> {
         let epoch = self.cash_epoch.load(Ordering::SeqCst);
         (!self.is_cash_engaged()).then_some(CashAdmission(epoch))
@@ -317,33 +399,6 @@ impl InventoryDivergenceGate {
         {
             pending.remove(&key);
         }
-    }
-
-    /// Requests a pinned onchain cash read at or past `minimum_block`. A
-    /// request already pending for the chain keeps its block when it is
-    /// higher, or when the new request has none: a fill that could not apply
-    /// its cash delta pins the request to its block, and lowering that floor
-    /// would let a read from a node below the fill clear the gate. The
-    /// claimed read is fetched after the newest request, which covers a
-    /// request without a block. Like [`Self::engage_cash`], it waits for any
-    /// USDC dispatch holding the gate and bumps the cash epoch.
-    pub(crate) async fn request_onchain_cash_reconcile(
-        &self,
-        chain: Chain,
-        minimum_block: Option<u64>,
-    ) -> ReconciliationGeneration {
-        let dispatch = self.cash_dispatch.write().await;
-        self.cash_epoch.fetch_add(1, Ordering::SeqCst);
-        let mut pending = self.write_pending_onchain_cash();
-        let pending_block = pending
-            .get(&chain)
-            .and_then(|request| request.minimum_block);
-        let minimum_block = pending_block.max(minimum_block);
-        let request = self.new_reconciliation_request(minimum_block);
-        pending.insert(chain, request);
-        drop(pending);
-        drop(dispatch);
-        request.generation
     }
 
     pub(crate) fn claim_pending_onchain_cash_reconcile(

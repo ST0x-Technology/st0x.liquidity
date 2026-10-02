@@ -3059,6 +3059,10 @@ impl RebalancingService {
             }
             _ => None,
         };
+        // Reconciliation is evaluated under the inventory write lock: a fill
+        // raises a pending cash read's floor under the same lock, so a read
+        // accepted here cannot miss a fill already in the view.
+        let mut inventory = self.inventory.write().await;
         let SnapshotReconciliation {
             protected_onchain_equity_symbols,
             protected_offchain_equity_symbols,
@@ -3072,7 +3076,6 @@ impl RebalancingService {
             .cloned()
             .collect::<BTreeSet<_>>();
 
-        let mut inventory = self.inventory.write().await;
         let resolve_offchain_reconciliation = accepted_offchain_equity_reconciliation.is_some()
             && match &event {
                 OffchainEquityReconciled {
@@ -3820,6 +3823,15 @@ impl RebalancingService {
                             ),
                             timestamp,
                         )?;
+                    }
+                    // A cash read pending for this chain must not be resolved
+                    // by a read pinned below this fill: it would replace the
+                    // balance without the debit or credit just applied. The
+                    // floor is raised in the same inventory write, and the
+                    // snapshot reactor checks it under that lock too.
+                    if apply_usdc_leg && let Some(block_number) = *block_number {
+                        self.divergence_gate
+                            .raise_pending_onchain_cash_floor(trade_id.chain, block_number);
                     }
                     *inventory = updated;
                     drop(inventory);
@@ -18310,6 +18322,44 @@ mod tests {
 
         apply_pinned_base_usdc_read(&trigger, usdc(1050), 115).await;
         usdc::drain_pending_usdc_jobs(&trigger).await;
+        assert!(trigger.divergence_gate().is_cash_engaged());
+        assert_eq!(take_pending_usdc_transfer_jobs(&trigger).await, vec![]);
+
+        apply_pinned_base_usdc_read(&trigger, usdc(1050), 121).await;
+        assert_eq!(usdc::drain_pending_usdc_jobs(&trigger).await, 1);
+        assert!(!trigger.divergence_gate().is_cash_engaged());
+        assert_eq!(take_pending_usdc_transfer_jobs(&trigger).await, vec![]);
+    }
+
+    /// A fill that applies its cash leg cleanly while the deposit's read is
+    /// pending raises the read's floor to its block. A read pinned at block
+    /// 120 predates the block 121 spend, so it must not replace the balance
+    /// (1,050 after the spend) with 1,500 or release the gate; the read at
+    /// 121 contains the spend and does.
+    #[tokio::test]
+    async fn deposit_read_pinned_below_an_applied_fill_keeps_the_gate() {
+        let (trigger, harness, symbol) = settle_vault_credit_in_block_110().await;
+        usdc::drain_pending_usdc_jobs(&trigger).await;
+
+        harness
+            .receive::<Position>(
+                symbol,
+                make_onchain_fill_in_block(shares(3), Direction::Buy, Some(121)),
+            )
+            .await
+            .unwrap();
+        let onchain_usdc = || async {
+            trigger
+                .inventory
+                .read()
+                .await
+                .onchain_usdc_available_at(Chain::Base)
+        };
+        assert_eq!(onchain_usdc().await, Some(usdc(1050)));
+
+        apply_pinned_base_usdc_read(&trigger, usdc(1500), 120).await;
+        usdc::drain_pending_usdc_jobs(&trigger).await;
+        assert_eq!(onchain_usdc().await, Some(usdc(1050)));
         assert!(trigger.divergence_gate().is_cash_engaged());
         assert_eq!(take_pending_usdc_transfer_jobs(&trigger).await, vec![]);
 

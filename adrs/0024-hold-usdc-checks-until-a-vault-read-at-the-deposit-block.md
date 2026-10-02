@@ -70,6 +70,18 @@ at or past the deposit's block reaches the view.**
    or redemption settlement underflow without a block can both request a read of
    one symbol, so `request_onchain_equity_reconcile` merges the pending block
    exactly as the cash request does.
+6. **A fill applied while the read is pending raises its floor.** A fill that
+   applies its cash leg cleanly at block B is in the view but not in a read
+   pinned below B, so `raise_pending_onchain_cash_floor` moves the pending floor
+   to B in the same inventory write. The snapshot reactor evaluates acceptance
+   under that write lock too, so a read cannot be accepted between the fill and
+   its floor.
+7. **Dispatch is atomic with the gate.** A USDC dispatch takes a cash admission
+   before sizing and holds the gate's dispatch lock from its last check through
+   the enqueue. Every engagement and read request takes that lock exclusively
+   and bumps the cash epoch after it is published. Lock order is dispatch lock,
+   then inventory: the settlement takes the dispatch lock before its inventory
+   write, and a dispatch never touches inventory while it holds the lock.
 
 The request is in memory only. After a restart the view is rebuilt from
 snapshots, and a terminal event without tracking defers to the next snapshot
