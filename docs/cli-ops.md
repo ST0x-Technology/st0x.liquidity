@@ -311,9 +311,12 @@ st0x-liquidity-client --env <env> capital reset-allowance --network <chain>
 # starts the transfer on the bot's worker and prints its id at once; --chain
 # picks the served corridor and may be left out while the bot serves one
 st0x-liquidity-client --env <env> capital transfer-usdc --direction <to-raindex|to-alpaca> --amount <amount> [--chain <chain>]
-# burns only and prints the burn tx; finish with debug cctp complete-mint
-st0x-liquidity-client --env <env> capital cctp-bridge --from <ethereum|base> --amount <amount>
+# burns only and prints the burn tx and its status; it prints its operation id
+# to stderr first: rerun with --operation-id <id> to report that same burn
+st0x-liquidity-client --env <env> capital cctp-bridge --from <ethereum|base> --amount <amount> [--operation-id <id>]
 st0x-liquidity-client --env <env> debug cctp complete-mint --burn-tx <burn-tx> --source-chain <ethereum|base>
+# settles a pending burn whose nonce a cancel took (see below)
+st0x-liquidity-client --env <env> capital cctp-burn-supersede --operation-id <id> --superseding-tx <cancel-tx>
 ```
 
 `--network` defaults to `base`, as in `st0x-cli`. `capital transfer-usdc` is
@@ -335,6 +338,28 @@ receipt: it returns the burn tx as soon as the burn is broadcast, and
 `debug cctp complete-mint` fetches the attestation and mints once Circle has
 attested it.
 
+A bot release from before operation ids ignores the id and burns on every call,
+so the bot ships before this client: after deploy, and after a rollback of the
+bot, a rerun with `--operation-id` against an older bot burns again. The client
+warns when an answer does not echo the operation id and a `status`; then do not
+rerun, and finish that burn with `debug cctp complete-mint`. Every
+`capital cctp-bridge` run prints `operation id <id>` to stderr before it sends
+the request, and the bot records the signed burn under that id before
+broadcasting it. After a timeout, a `502`, any `500` except the one that says
+the bot cannot tell whether the burn was recorded (see below), or any other
+doubt, rerun the same command with `--operation-id <id>`: it never burns a
+second time, and it prints the burn tx of that id with its `status`. A pending
+burn that no node holds is sent again from its recorded bytes, under the
+recovery lock and the driver pause like a new burn, so that rerun can answer
+`409` while another operation holds the lock; retry it. A rerun must repeat the
+same `--from` and `--amount` (or `--all`), else it answers `409`. Without
+`--operation-id` the client generates a new id, which is a new burn. The
+`status` is `pending` (not mined with the required confirmations yet),
+`confirmed` (finish with `complete-mint`), `reverted` (it burned nothing; burn
+again with a new id), `superseded` (another tx took its nonce; it can never
+burn), or `replaced` (a fee bumped copy of the burn burned in its place; the
+printed `burnTx` is that copy, which is the one to pass to `complete-mint`).
+
 After answering, the bot keeps the recovery lock and the driver pause until the
 burn has the source chain's required confirmations (12 blocks on Ethereum in
 production, about two and a half minutes; 3 on Base) or the confirmation wait
@@ -342,21 +367,46 @@ gives up, which takes up to 5 minutes for inclusion plus 30 minutes for the
 confirmations. Until then every verb that takes the recovery lock answers `409`:
 `debug resume`, `debug recheck`, `debug resume-usdc`, `debug reconcile-usdc`,
 `debug fail-usdc-transfer`, `debug fail-equity-transfer`,
-`capital transfer-usdc`, a second `capital cctp-bridge`, and
+`capital transfer-usdc`, a `capital cctp-bridge` with a new operation id, and
 `debug cctp complete-mint`. Most say
 `A resume or recheck operation is already in progress`; `debug resume` says
 `A resume operation is already in progress` and `debug fail-equity-transfer`
 says `A transfer recovery operation is already in progress`. `complete-mint`
 answers `502` instead while Circle has not attested the burn, since it fetches
-the attestation before it tries the lock; both mean retry. After the task
-finishes, confirmed or not, the lock is free again. The outcome is
-`CCTP burn confirmed via API`, or `CCTP burn broadcast via API did not confirm`,
-whose `error` field says why: a revert, a dropped tx, a missing CCTP
-`MessageSent` event, or a receipt wait that timed out or kept failing on RPC
-errors. A timed out receipt wait, or one that kept failing on RPC errors, does
-not prove the burn failed, so check the burn tx onchain before completing the
-mint or retrying; a burn that never confirmed never attests, and `complete-mint`
-keeps answering `502` for it.
+the attestation before it tries the lock; both mean retry. A rerun with the
+burn's own operation id is answered at once while its burn is settled or a node
+holds it; one that must send the burn again waits for the lock like any other.
+After the task finishes, the lock is free again. The outcome is
+`CCTP burn confirmed via API`, `CCTP burn broadcast via API reverted`, or
+`CCTP burn broadcast via API is not confirmed yet` when the receipt wait timed
+out or a drop report or RPC errors left the burn unproven; a rerun with its
+operation id reports its status later. A burn that never confirmed never
+attests, and `complete-mint` keeps answering `502` for it.
+
+At startup the bot reserves the nonce of every pending burn and rebroadcasts it
+before any other send from its wallet (a burn the node already shows mined keeps
+its nonce and is not sent again). A pending burn that will not mine at its fee
+keeps its nonce, and later sends from that wallet queue behind it. To clear it,
+send a 0 value transfer from the bot wallet to itself, with no calldata, at the
+burn's nonce and a higher fee; once that cancel has the chain's required
+confirmations, run
+`capital cctp-burn-supersede --operation-id <id> --superseding-tx <cancel-tx>`.
+The bot checks the cancel is mined from the burn's signer at the burn's nonce
+and is a plain cancel or a revert, then records the burn `superseded` and frees
+its nonce. If a wallet speed up already sent a copy of the burn (the same
+calldata at the same nonce with a higher fee), name that copy instead: the bot
+checks it called the same TokenMessenger with the burn's exact calldata and
+emitted `MessageSent`, records the burn `replaced`, and prints the copy as the
+burn tx to pass to `complete-mint`. Any other successful tx at the nonce is
+refused with `409`, since it may have moved funds. A burn signed by a key the
+bot no longer uses (after a rotation) is never rebroadcast or restored: startup
+pages and skips that chain's approvals and revokes, and a rerun answers `502`.
+Cancel it with the old key at its nonce and settle it the same way: the bot
+checks the cancel against the burn's own signer.
+
+A burn whose receipt succeeded without the CCTP `MessageSent` event pages
+`emitted no MessageSent` and stays `pending`: Circle has nothing to attest, so
+check the configured TokenMessenger before anything else.
 
 `capital vault-deposit`, `capital vault-withdraw`, `capital vault-withdraw-usdc`
 and `capital reset-allowance` also print their tx as soon as it is broadcast,
@@ -370,49 +420,44 @@ Ethereum has none in staging or prod today. The outcome is
 `Orderbook allowance reset via API did not confirm` for `reset-allowance`, each
 with the tx hash. A vault verb whose confirmation hits any error that does not
 prove the tx's fate (a receipt timeout, a drop report, a transport failure, a
-JSON-RPC error reply) logs
-`Vault operation broadcast via API is not confirmed
-yet` and waits for the
-receipt again 30 seconds later, still holding its lock. A drop report keeps the
-lock because a lagging or load balanced RPC can report a tx dropped while it is
-still pending elsewhere. Each wait can take up to 5 minutes for inclusion plus
-30 minutes for the confirmations, so the `409` can last for hours. It ends only
-when the tx's own receipt at the required confirmations shows it succeeded or
-failed, or on a decoded revert, so a vault `did not confirm` line is final. A tx
-that never mines keeps the lock until a restart; check the wallet's nonce
-onchain. For `reset-allowance` it may also mean a timeout, so check the tx
-onchain before retrying. A `Vault operation confirmation panicked` line keeps
-the lock until a restart, and the 409 then says the outcome is unknown; check
-the vault and the wallet onchain before rerunning after the restart. A vault
-send that fails logs `Capital route failed onchain`, answers `500`, and frees
-the lock, but its tx may still have gone out, so check the vault and the wallet
-onchain before rerunning. When the allowance is short, `capital vault-deposit`
-first approves and waits for the approve to confirm, so a deposit of a token
-without the startup MAX grant can still time out on a chain that needs many
-confirmations. The answer does not wait for the onchain effect, so the vault
-balance or the allowance may not have changed yet when it arrives. A rerun of a
-vault verb that answered with a tx answers `409` until that tx's outcome line,
-so it cannot withdraw or deposit twice. The `409` then clears on either outcome
-line, so rerun only after a `did not confirm` line: after `confirmed via API`
-the move already happened. The locks live in memory, so after a bot restart
-check the vault onchain before rerunning. A rerun of `capital reset-allowance`
-sends a redundant `approve(0)`, which moves no funds.
+JSON-RPC error reply) logs that the vault operation broadcast via API is not
+confirmed yet and waits for the receipt again 30 seconds later, still holding
+its lock. A drop report keeps the lock because a lagging or load balanced RPC
+can report a tx dropped while it is still pending elsewhere. Each wait can take
+up to 5 minutes for inclusion plus 30 minutes for the confirmations, so the
+`409` can last for hours. It ends only when the tx's own receipt at the required
+confirmations shows it succeeded or failed, or on a decoded revert, so a vault
+`did not confirm` line is final. A tx that never mines keeps the lock until a
+restart; check the wallet's nonce onchain. For `reset-allowance` it may also
+mean a timeout, so check the tx onchain before retrying. A
+`Vault operation confirmation panicked` line keeps the lock until a restart, and
+the 409 then says the outcome is unknown; check the vault and the wallet onchain
+before rerunning after the restart. A vault send that fails logs
+`Capital route failed onchain`, answers `500`, and frees the lock, but its tx
+may still have gone out, so check the vault and the wallet onchain before
+rerunning. When the allowance is short, `capital vault-deposit` first approves
+and waits for the approve to confirm, so a deposit of a token without the
+startup MAX grant can still time out on a chain that needs many confirmations.
+The answer does not wait for the onchain effect, so the vault balance or the
+allowance may not have changed yet when it arrives. A rerun of a vault verb that
+answered with a tx answers `409` until that tx's outcome line, so it cannot
+withdraw or deposit twice. The `409` then clears on either outcome line, so
+rerun only after a `did not confirm` line: after `confirmed via API` the move
+already happened. The locks live in memory, so after a bot restart check the
+vault onchain before rerunning. A rerun of `capital reset-allowance` sends a
+redundant `approve(0)`, which moves no funds.
 
 A request that times out on the client may still complete in the bot; check the
 bot logs and the chain for the transaction before retrying a vault or allowance
-verb. A retried `cctp-bridge` burns again, since the bot keeps no record of the
-burn. After a timeout, find `CCTP burn broadcast via API` in the bot logs and
-finish that burn with `complete-mint` instead of retrying. If instead the logs
-show `Capital route failed onchain` for `cctp-bridge` with no broadcast line,
-the burn was not broadcast cleanly. A revert broadcast no burn, but a transport
-error reads the same whichever step raised it (the balance read, the allowance
-approve, the Circle fee lookup, or the burn send itself), and only the burn send
-may still have landed. The bridge logs
-`Submitting depositForBurn (pending) for fast transfer` just before that send:
-if that line is present, treat the burn as possibly broadcast and check the
-source wallet's recent transactions onchain before retrying. Every capital verb
-answers `503` until the bot finishes starting. The tokenization and issuer verbs
-(`transfer-equity`, `wrap-equity`, `unwrap-equity`, `donate-equity`,
+verb. A `cctp-bridge` rerun with the printed operation id is safe, as described
+above, against a bot that records operation ids. If the logs show
+`Capital route failed onchain` for `cctp-bridge`, the burn was not signed or
+recorded: the balance read, the allowance approve or the Circle fee lookup
+failed, and a rerun with the same operation id burns once. A `500` that says the
+bot cannot tell whether the burn was recorded keeps its nonce reserved until a
+restart: rerun with the same operation id only after the restart. Every capital
+verb answers `503` until the bot finishes starting. The tokenization and issuer
+verbs (`transfer-equity`, `wrap-equity`, `unwrap-equity`, `donate-equity`,
 `dividend-bump`) have no client subcommand and stay on `st0x-cli`.
 
 ### Orchestrator Rollout per Chain

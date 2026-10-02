@@ -42,6 +42,7 @@ use st0x_registry::SymbolCache;
 use st0x_tokenization::IssuerRequestId;
 
 use crate::AppState;
+use crate::cctp_burn::{CctpBurnOperation, CctpSourceChain};
 use crate::dashboard::pnl::{
     PnlError, PnlQuery, PnlResponse, acquire_pnl_report_permit, build_pnl_report_with_permit,
     validate_pnl_snapshot_rowid,
@@ -1355,6 +1356,10 @@ pub(crate) struct RecoveryHandle {
     /// to the durable outcome. A standalone store would bypass the reactor and
     /// leave the running bot latched with `guardHeld: false` reported.
     pub(crate) usdc_store: Arc<Store<UsdcRebalance>>,
+    /// The conductor-built `CctpBurnOperation` store: the capital
+    /// `cctp-bridge` route records each signed burn under its operation id
+    /// before broadcasting it, and the startup restore reads the same store.
+    pub(crate) cctp_burn_store: Arc<Store<CctpBurnOperation>>,
 }
 
 /// Shared handle backing the in-bot process-tx route: the broker order placer
@@ -2964,24 +2969,6 @@ struct CompleteCctpMintRequest {
     source_chain: CctpSourceChain,
 }
 
-/// The burn's chain, kebab-cased on the wire (`ethereum`, `base`), matching
-/// the CLI's `--source-chain` value.
-#[derive(Deserialize, Clone, Copy, Debug)]
-#[serde(rename_all = "kebab-case")]
-enum CctpSourceChain {
-    Ethereum,
-    Base,
-}
-
-impl CctpSourceChain {
-    const fn bridge_direction(self) -> BridgeDirection {
-        match self {
-            Self::Ethereum => BridgeDirection::EthereumToBase,
-            Self::Base => BridgeDirection::BaseToEthereum,
-        }
-    }
-}
-
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct CompleteCctpMintResponse {
@@ -4492,6 +4479,10 @@ fn ops_api_routes(ops_api: Option<&OpsApiConfig>) -> Router<AppState> {
         .route(
             "/liquidity-write/capital/cctp-bridge",
             post(capital::cctp_bridge),
+        )
+        .route(
+            "/liquidity-write/capital/cctp-burn-supersede",
+            post(capital::cctp_burn_supersede),
         )
         .route(
             "/liquidity-write/capital/reset-allowance",
@@ -7684,6 +7675,7 @@ mod tests {
             ("POST", "/liquidity-write/capital/vault-withdraw"),
             ("POST", "/liquidity-write/capital/vault-withdraw-usdc"),
             ("POST", "/liquidity-write/capital/cctp-bridge"),
+            ("POST", "/liquidity-write/capital/cctp-burn-supersede"),
             ("POST", "/liquidity-write/capital/reset-allowance"),
         ] {
             let response = app
@@ -7746,6 +7738,7 @@ mod tests {
             ("POST", "/liquidity-write/capital/vault-withdraw"),
             ("POST", "/liquidity-write/capital/vault-withdraw-usdc"),
             ("POST", "/liquidity-write/capital/cctp-bridge"),
+            ("POST", "/liquidity-write/capital/cctp-burn-supersede"),
             ("POST", "/liquidity-write/capital/reset-allowance"),
         ] {
             let response = app
@@ -8090,6 +8083,7 @@ mod tests {
                 cctp_mint_recovery: Arc::new(InconclusiveMint),
                 usdc_driver_pause: Arc::new(pause),
                 usdc_store,
+                cctp_burn_store: Arc::new(st0x_event_sorcery::test_store(state.pool.clone(), ())),
             })
             .ok()
             .expect("recovery cell must start empty");
@@ -8162,6 +8156,8 @@ mod tests {
     ) -> Json<Request> {
         Json(serde_json::from_value(body).unwrap())
     }
+
+    const TEST_OPERATION_ID: &str = "6f1c2a1e-6c39-4a77-9a8e-1f0b7d6e8c11";
 
     /// A zero, negative, or off-grid amount is refused as input before the
     /// resume lock is even tried: with the lock held, a 409 here would mean
@@ -8402,8 +8398,8 @@ mod tests {
         let state = empty_app_state(create_test_ctx_with_order_owner(Address::ZERO)).await;
 
         for body in [
-            serde_json::json!({"from": "base", "amount": "100", "all": true}),
-            serde_json::json!({"from": "base"}),
+            serde_json::json!({"operationId": TEST_OPERATION_ID, "from": "base", "amount": "100", "all": true}),
+            serde_json::json!({"operationId": TEST_OPERATION_ID, "from": "base"}),
         ] {
             let Err((status, Json(error))) =
                 capital::cctp_bridge(State(state.clone()), capital_request(body.clone())).await
@@ -8428,7 +8424,7 @@ mod tests {
 
         let Err((status, Json(body))) = capital::cctp_bridge(
             State(state.clone()),
-            capital_request(serde_json::json!({"from": "base", "amount": "100"})),
+            capital_request(serde_json::json!({"operationId": TEST_OPERATION_ID, "from": "base", "amount": "100"})),
         )
         .await
         else {
@@ -8475,7 +8471,7 @@ mod tests {
 
         let Err((status, Json(body))) = capital::cctp_bridge(
             State(state),
-            capital_request(serde_json::json!({"from": "base", "amount": "100"})),
+            capital_request(serde_json::json!({"operationId": TEST_OPERATION_ID, "from": "base", "amount": "100"})),
         )
         .await
         else {
@@ -8596,7 +8592,15 @@ mod tests {
         .await;
         let bridge = capital::cctp_bridge(
             State(state.clone()),
-            capital_request(serde_json::json!({"from": "base", "amount": "1"})),
+            capital_request(serde_json::json!({"operationId": TEST_OPERATION_ID, "from": "base", "amount": "1"})),
+        )
+        .await;
+        let supersede = capital::cctp_burn_supersede(
+            State(state.clone()),
+            capital_request(serde_json::json!({
+                "operationId": TEST_OPERATION_ID,
+                "supersedingTx": TxHash::ZERO,
+            })),
         )
         .await;
         let reset = capital::reset_allowance(
@@ -8611,6 +8615,7 @@ mod tests {
             ("vault-withdraw", withdraw.err()),
             ("vault-withdraw-usdc", withdraw_usdc.err()),
             ("cctp-bridge", bridge.err()),
+            ("cctp-burn-supersede", supersede.err()),
             ("reset-allowance", reset.err()),
         ] {
             let (status, Json(body)) = result.unwrap_or_else(|| panic!("{route} must refuse"));
@@ -9273,19 +9278,21 @@ mod tests {
         assert!(!logs_contain("confirmed via API"));
     }
 
-    /// End to end against CCTP V2 deployed on two Anvil nodes, reached
-    /// through the ctx's test overrides: an exact burn from Base reports the
-    /// route, the raw amount and the burn tx at the broadcast, keeps the
-    /// resume lock held until the burn confirms, and exactly that amount
-    /// leaves the bot's Base wallet. Nothing is minted, so no attestation is
-    /// involved; the Circle API only serves the fast transfer fee.
+    /// CCTP V2 deployed on two Anvil nodes with `starting_usdc` in the bot's
+    /// Base wallet, reached through the ctx's test overrides, and a Circle API
+    /// that only serves the fast transfer fee: nothing is minted, so no
+    /// attestation is involved.
     #[cfg(feature = "test-support")]
-    #[tokio::test]
-    async fn cctp_bridge_burns_the_exact_amount_from_the_source_wallet() {
-        let starting_usdc = U256::from(5_000_000_u64);
+    async fn cctp_burn_state(
+        starting_usdc: U256,
+    ) -> (
+        crate::test_utils::AnvilCctpPair,
+        httpmock::MockServer,
+        AppState,
+    ) {
         let cctp = crate::test_utils::deploy_anvil_cctp_pair(starting_usdc).await;
         let circle = httpmock::MockServer::start();
-        let _fees = circle.mock(|when, then| {
+        circle.mock(|when, then| {
             when.method(GET).path_includes("/v2/burn/USDC/fees/");
             then.status(200).json_body(serde_json::json!([
                 {"finalityThreshold": 1000, "minimumFee": 1},
@@ -9307,14 +9314,91 @@ mod tests {
         ctx.rebalancing.message_transmitter = cctp.message_transmitter;
         let (state, _gate) = recovery_state_for_ctx(ctx, EquityTransferServices::panicking()).await;
         state.health.set_ready();
+        (cctp, circle, state)
+    }
+
+    #[cfg(feature = "test-support")]
+    async fn burn_from_base(
+        state: &AppState,
+        operation_id: &str,
+        amount: &str,
+    ) -> Result<Json<capital::CctpBridgeResponse>, (StatusCode, Json<ErrorResponse>)> {
+        capital::cctp_bridge(
+            State(state.clone()),
+            capital_request(serde_json::json!({
+                "operationId": operation_id,
+                "from": "base",
+                "amount": amount,
+            })),
+        )
+        .await
+    }
+
+    /// Signs a burn of `amount` from Base and records it under `operation_id`
+    /// without broadcasting it, as a request that died between the record and
+    /// the broadcast, or a restart in between, leaves it.
+    #[cfg(feature = "test-support")]
+    async fn record_unbroadcast_burn(
+        state: &AppState,
+        operation_id: &str,
+        amount: U256,
+    ) -> st0x_evm::PreparedTransaction {
+        let wallets = state.ctx.wallet().unwrap();
+        let bridge = crate::cctp_burn::bot_cctp_bridge(&state.ctx, wallets).unwrap();
+        let prepared = bridge
+            .prepare_burn(
+                st0x_bridge::BridgeDirection::BaseToEthereum,
+                amount,
+                wallets.ethereum_wallet().address(),
+            )
+            .await
+            .unwrap();
+        state
+            .recovery
+            .get()
+            .unwrap()
+            .cctp_burn_store
+            .send(
+                &operation_id.parse().unwrap(),
+                crate::cctp_burn::CctpBurnOperationCommand::Prepare {
+                    source: CctpSourceChain::Base,
+                    requested: crate::cctp_burn::RequestedBurn::Exact { amount },
+                    amount,
+                    recipient: wallets.ethereum_wallet().address(),
+                    prepared: prepared.clone(),
+                },
+            )
+            .await
+            .unwrap();
+        prepared
+    }
+
+    #[cfg(feature = "test-support")]
+    async fn recorded_burn(state: &AppState, operation_id: &str) -> CctpBurnOperation {
+        state
+            .recovery
+            .get()
+            .unwrap()
+            .cctp_burn_store
+            .load(&operation_id.parse().unwrap())
+            .await
+            .unwrap()
+            .unwrap()
+    }
+
+    /// An exact burn from Base reports the operation id, the route, the raw
+    /// amount and the burn tx at the broadcast as pending, keeps the resume
+    /// lock held until the burn confirms, records the confirmation, and
+    /// exactly that amount leaves the bot's Base wallet.
+    #[cfg(feature = "test-support")]
+    #[tokio::test]
+    async fn cctp_bridge_burns_the_exact_amount_from_the_source_wallet() {
+        let starting_usdc = U256::from(5_000_000_u64);
+        let (cctp, _circle, state) = cctp_burn_state(starting_usdc).await;
 
         let body = capital_success(
             "cctp-bridge",
-            capital::cctp_bridge(
-                State(state.clone()),
-                capital_request(serde_json::json!({"from": "base", "amount": "1"})),
-            )
-            .await,
+            burn_from_base(&state, TEST_OPERATION_ID, "1").await,
         );
         // The request is answered at the broadcast while the task still awaits
         // the receipt, so the lock is held here, before anything else awaits.
@@ -9326,10 +9410,12 @@ mod tests {
         assert_eq!(
             body,
             serde_json::json!({
+                "operationId": TEST_OPERATION_ID,
                 "burnTx": burn_tx,
                 "sourceChain": "base",
                 "destinationChain": "ethereum",
                 "amountRaw": "1000000",
+                "status": "pending",
             })
         );
         state.detached_tasks.close();
@@ -9343,6 +9429,612 @@ mod tests {
             erc20_balance(&cctp.base_wallet, cctp.usdc, cctp.bot).await,
             starting_usdc - U256::from(1_000_000_u64)
         );
+        let recorded = recorded_burn(&state, TEST_OPERATION_ID).await;
+        assert_eq!(recorded.burn_tx(), burn_tx);
+        assert!(matches!(
+            recorded.outcome,
+            crate::cctp_burn::CctpBurnOutcome::Confirmed { .. }
+        ));
+    }
+
+    /// A request whose answer was lost after the broadcast, retried with the
+    /// same operation id while the first burn is still confirming, and again
+    /// after, gets the same burn tx each time and burns once. A new id burns
+    /// again.
+    #[cfg(feature = "test-support")]
+    #[tokio::test]
+    async fn a_retry_with_the_same_operation_id_burns_once_and_a_new_id_burns_again() {
+        let starting_usdc = U256::from(5_000_000_u64);
+        let (cctp, _circle, state) = cctp_burn_state(starting_usdc).await;
+        let one_usdc = U256::from(1_000_000_u64);
+
+        let first = capital_success(
+            "cctp-bridge",
+            burn_from_base(&state, TEST_OPERATION_ID, "1").await,
+        );
+        let while_confirming = capital_success(
+            "cctp-bridge",
+            burn_from_base(&state, TEST_OPERATION_ID, "1").await,
+        );
+        state.detached_tasks.close();
+        state.detached_tasks.wait().await;
+        state.detached_tasks.reopen();
+        let after = capital_success(
+            "cctp-bridge",
+            burn_from_base(&state, TEST_OPERATION_ID, "1").await,
+        );
+
+        assert_eq!(while_confirming["burnTx"], first["burnTx"]);
+        assert_eq!(after["burnTx"], first["burnTx"]);
+        assert_eq!(after["status"], "confirmed");
+        assert_eq!(
+            erc20_balance(&cctp.base_wallet, cctp.usdc, cctp.bot).await,
+            starting_usdc - one_usdc,
+            "the retries must not burn again"
+        );
+
+        let fresh = capital_success(
+            "cctp-bridge",
+            burn_from_base(&state, "0b6c6f47-3f52-4c2f-9f3c-6d1f2e0a9b44", "1").await,
+        );
+        state.detached_tasks.close();
+        state.detached_tasks.wait().await;
+        assert_ne!(fresh["burnTx"], first["burnTx"]);
+        assert_eq!(
+            erc20_balance(&cctp.base_wallet, cctp.usdc, cctp.bot).await,
+            starting_usdc - one_usdc - one_usdc,
+            "a new operation id burns again"
+        );
+    }
+
+    /// A burn recorded but never broadcast (the request died in between, or
+    /// the bot restarted) is adopted by the retry with its operation id: no
+    /// node holds it, so the retry sends the recorded bytes under the lock,
+    /// like a fresh burn. The burn tx is the recorded one, the burn confirms,
+    /// and the wallet burns once.
+    #[cfg(feature = "test-support")]
+    #[tokio::test]
+    async fn a_retry_broadcasts_a_burn_recorded_before_its_broadcast() {
+        let starting_usdc = U256::from(5_000_000_u64);
+        let (cctp, _circle, state) = cctp_burn_state(starting_usdc).await;
+        let one_usdc = U256::from(1_000_000_u64);
+        let prepared = record_unbroadcast_burn(&state, TEST_OPERATION_ID, one_usdc).await;
+        assert_eq!(
+            erc20_balance(&cctp.base_wallet, cctp.usdc, cctp.bot).await,
+            starting_usdc
+        );
+
+        let body = capital_success(
+            "cctp-bridge",
+            burn_from_base(&state, TEST_OPERATION_ID, "1").await,
+        );
+        let Err(_) = state.resume_lock.0.try_lock() else {
+            panic!("sending a recorded burn must hold the resume lock until it confirms");
+        };
+        state.detached_tasks.close();
+        state.detached_tasks.wait().await;
+
+        let burn_tx: TxHash = serde_json::from_value(body["burnTx"].clone()).unwrap();
+        assert_eq!(burn_tx, prepared.tx_hash());
+        assert_eq!(body["status"], "pending");
+        assert!(matches!(
+            recorded_burn(&state, TEST_OPERATION_ID).await.outcome,
+            crate::cctp_burn::CctpBurnOutcome::Confirmed { .. }
+        ));
+        assert_eq!(
+            erc20_balance(&cctp.base_wallet, cctp.usdc, cctp.bot).await,
+            starting_usdc - one_usdc
+        );
+    }
+
+    /// An operation id names one burn, so a request with another amount
+    /// under it is refused instead of reporting a burn it did not ask for.
+    #[cfg(feature = "test-support")]
+    #[tokio::test]
+    async fn a_different_burn_under_a_used_operation_id_is_refused() {
+        let (_cctp, _circle, state) = cctp_burn_state(U256::from(5_000_000_u64)).await;
+        capital_success(
+            "cctp-bridge",
+            burn_from_base(&state, TEST_OPERATION_ID, "1").await,
+        );
+
+        let Err((status, Json(body))) = burn_from_base(&state, TEST_OPERATION_ID, "2").await else {
+            panic!("another amount under a used operation id must be refused");
+        };
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert!(
+            body.error.contains("use a new operation id"),
+            "{}",
+            body.error
+        );
+    }
+
+    /// A recorded burn whose nonce a plain cancel took can never mine. A
+    /// retry before the burn is settled cannot send it, and answers `502`
+    /// pointing at the supersede route. That route refuses a tx at another
+    /// nonce, settles the burn on the cancel, and a retry with its operation
+    /// id then reports it superseded without burning.
+    #[cfg(feature = "test-support")]
+    #[tokio::test]
+    async fn a_burn_whose_nonce_a_cancel_took_is_settled_superseded() {
+        let starting_usdc = U256::from(5_000_000_u64);
+        let (cctp, _circle, state) = cctp_burn_state(starting_usdc).await;
+        let prepared =
+            record_unbroadcast_burn(&state, TEST_OPERATION_ID, U256::from(1_000_000_u64)).await;
+        // The operator's cancel: a 0 value self transfer with no calldata at
+        // the burn's nonce, which the bot's wallet frees for it here.
+        cctp.base_wallet.discard_prepared(prepared.tx_hash()).await;
+        let cancel = cctp
+            .base_wallet
+            .send(cctp.bot, alloy::primitives::Bytes::new(), "cancel")
+            .await
+            .unwrap();
+        let later = cctp
+            .base_wallet
+            .send(cctp.bot, alloy::primitives::Bytes::new(), "later")
+            .await
+            .unwrap();
+        let Err((status, Json(unsendable))) = burn_from_base(&state, TEST_OPERATION_ID, "1").await
+        else {
+            panic!("a burn whose nonce another tx took must not be reported in flight");
+        };
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert!(
+            unsendable.error.contains("cctp-burn-supersede"),
+            "{}",
+            unsendable.error
+        );
+        let Err((status, Json(refusal))) = supersede_burn(&state, later.transaction_hash).await
+        else {
+            panic!("a tx at another nonce must not settle the burn");
+        };
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert!(
+            refusal.error.contains("not the burn's nonce"),
+            "{}",
+            refusal.error
+        );
+
+        let settled = capital_success(
+            "cctp-burn-supersede",
+            supersede_burn(&state, cancel.transaction_hash).await,
+        );
+        assert_eq!(settled["status"], "superseded");
+
+        let retry = capital_success(
+            "cctp-bridge",
+            burn_from_base(&state, TEST_OPERATION_ID, "1").await,
+        );
+        assert_eq!(retry["status"], "superseded");
+        assert_eq!(
+            erc20_balance(&cctp.base_wallet, cctp.usdc, cctp.bot).await,
+            starting_usdc
+        );
+    }
+
+    /// At startup a pending burn is rebroadcast from its recorded bytes, so a
+    /// burn signed and recorded before a restart still lands once; the next
+    /// start finds it mined and records it instead of restoring it again.
+    #[cfg(feature = "test-support")]
+    #[tokio::test]
+    async fn startup_rebroadcasts_a_pending_burn_then_records_it_once_mined() {
+        let starting_usdc = U256::from(5_000_000_u64);
+        let (cctp, _circle, state) = cctp_burn_state(starting_usdc).await;
+        let one_usdc = U256::from(1_000_000_u64);
+        let prepared = record_unbroadcast_burn(&state, TEST_OPERATION_ID, one_usdc).await;
+        let wallets = state.ctx.wallet().unwrap();
+        let bridge = crate::cctp_burn::bot_cctp_bridge(&state.ctx, wallets).unwrap();
+        let store = &state.recovery.get().unwrap().cctp_burn_store;
+
+        let first_start = crate::cctp_burn::restore_pending_cctp_burns(
+            &state.pool,
+            store,
+            &bridge,
+            &state.ctx.chains,
+        )
+        .await;
+        assert_eq!(first_start.restored, 1);
+        // Whether the receipt is readable right after the rebroadcast depends
+        // on timing; a burn still unmined then gates its chain, as it should.
+        mined_receipt(&cctp.base_wallet, prepared.tx_hash()).await;
+        assert_eq!(
+            erc20_balance(&cctp.base_wallet, cctp.usdc, cctp.bot).await,
+            starting_usdc - one_usdc
+        );
+
+        let second_start = crate::cctp_burn::restore_pending_cctp_burns(
+            &state.pool,
+            store,
+            &bridge,
+            &state.ctx.chains,
+        )
+        .await;
+        assert_eq!((second_start.restored, second_start.settled), (0, 1));
+        assert!(matches!(
+            recorded_burn(&state, TEST_OPERATION_ID).await.outcome,
+            crate::cctp_burn::CctpBurnOutcome::Confirmed { .. }
+        ));
+    }
+
+    #[cfg(feature = "test-support")]
+    async fn supersede_burn(
+        state: &AppState,
+        superseding_tx: TxHash,
+    ) -> Result<Json<capital::CctpBridgeResponse>, (StatusCode, Json<ErrorResponse>)> {
+        capital::cctp_burn_supersede(
+            State(state.clone()),
+            capital_request(serde_json::json!({
+                "operationId": TEST_OPERATION_ID,
+                "supersedingTx": superseding_tx,
+            })),
+        )
+        .await
+    }
+
+    /// A wallet speed up sends the burn's exact calldata again at its nonce
+    /// with a higher fee, and that copy burns in the signed burn's place. The
+    /// supersede route adopts it as the replacement: the operation reports
+    /// `replaced` with the copy as its burn tx, and the wallet burned once.
+    #[cfg(feature = "test-support")]
+    #[tokio::test]
+    async fn a_fee_bumped_copy_of_the_burn_is_adopted_as_its_replacement() {
+        let starting_usdc = U256::from(5_000_000_u64);
+        let (cctp, _circle, state) = cctp_burn_state(starting_usdc).await;
+        let one_usdc = U256::from(1_000_000_u64);
+        let prepared = record_unbroadcast_burn(&state, TEST_OPERATION_ID, one_usdc).await;
+        cctp.base_wallet.discard_prepared(prepared.tx_hash()).await;
+        // A speed up pays a higher fee, so its signed bytes and hash differ.
+        {
+            use alloy::providers::Provider as _;
+            use alloy::providers::ext::AnvilApi as _;
+            let base_fee = cctp.base_wallet.provider().get_gas_price().await.unwrap();
+            cctp.base_wallet
+                .provider()
+                .anvil_set_next_block_base_fee_per_gas(base_fee * 4 + 1_000_000_000)
+                .await
+                .unwrap();
+            cctp.base_wallet
+                .provider()
+                .anvil_mine(Some(1), None)
+                .await
+                .unwrap();
+        }
+        let copy = cctp
+            .base_wallet
+            .send(cctp.token_messenger, prepared.input().unwrap(), "speed up")
+            .await
+            .unwrap();
+        assert_ne!(copy.transaction_hash, prepared.tx_hash());
+
+        let settled = capital_success(
+            "cctp-burn-supersede",
+            supersede_burn(&state, copy.transaction_hash).await,
+        );
+
+        assert_eq!(settled["status"], "replaced");
+        let burn_tx: TxHash = serde_json::from_value(settled["burnTx"].clone()).unwrap();
+        assert_eq!(burn_tx, copy.transaction_hash);
+        let retry = capital_success(
+            "cctp-bridge",
+            burn_from_base(&state, TEST_OPERATION_ID, "1").await,
+        );
+        assert_eq!(retry["status"], "replaced");
+        assert_eq!(retry["burnTx"], settled["burnTx"]);
+        assert_eq!(
+            erc20_balance(&cctp.base_wallet, cctp.usdc, cctp.bot).await,
+            starting_usdc - one_usdc
+        );
+    }
+
+    /// A successful tx at the burn's nonce that is neither a plain cancel nor
+    /// an exact copy of the burn may have moved funds, so it settles nothing
+    /// and the burn stays pending. The closest case: a `depositForBurn` of
+    /// another amount to the same TokenMessenger, which also emits
+    /// `MessageSent` but burned a different amount.
+    #[cfg(feature = "test-support")]
+    #[tokio::test]
+    async fn a_successful_tx_at_the_nonce_that_is_neither_cancel_nor_copy_is_refused() {
+        let (cctp, _circle, state) = cctp_burn_state(U256::from(5_000_000_u64)).await;
+        let prepared =
+            record_unbroadcast_burn(&state, TEST_OPERATION_ID, U256::from(1_000_000_u64)).await;
+        cctp.base_wallet.discard_prepared(prepared.tx_hash()).await;
+        // `depositForBurn`'s first argument is the amount: its last byte sits
+        // at offset 35 of the calldata, after the 4 byte selector.
+        let mut other_amount = prepared.input().unwrap().to_vec();
+        other_amount[35] ^= 1;
+        let other_burn = cctp
+            .base_wallet
+            .send(
+                cctp.token_messenger,
+                alloy::primitives::Bytes::from(other_amount),
+                "another burn",
+            )
+            .await
+            .unwrap();
+
+        let Err((status, Json(refusal))) =
+            supersede_burn(&state, other_burn.transaction_hash).await
+        else {
+            panic!("a burn of another amount must not settle the recorded burn");
+        };
+
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert!(
+            refusal.error.contains("neither a plain cancel"),
+            "{}",
+            refusal.error
+        );
+        assert_eq!(
+            recorded_burn(&state, TEST_OPERATION_ID).await.outcome,
+            crate::cctp_burn::CctpBurnOutcome::Pending
+        );
+    }
+
+    /// A recorded burn that mines and reverts burned nothing: the confirmation
+    /// records it `Reverted`, a retry reports `reverted` without burning, and
+    /// the wallet keeps its USDC. A TokenMessenger that always reverts makes
+    /// the burn revert.
+    #[cfg(feature = "test-support")]
+    #[tokio::test]
+    async fn a_reverted_burn_is_recorded_and_never_burns() {
+        use alloy::providers::ext::AnvilApi as _;
+        let starting_usdc = U256::from(5_000_000_u64);
+        let (cctp, _circle, state) = cctp_burn_state(starting_usdc).await;
+        record_unbroadcast_burn(&state, TEST_OPERATION_ID, U256::from(1_000_000_u64)).await;
+        cctp.base_wallet
+            .provider()
+            .anvil_set_code(cctp.token_messenger, alloy::primitives::bytes!("5f5ffd"))
+            .await
+            .unwrap();
+
+        capital_success(
+            "cctp-bridge",
+            burn_from_base(&state, TEST_OPERATION_ID, "1").await,
+        );
+        state.detached_tasks.close();
+        state.detached_tasks.wait().await;
+        state.detached_tasks.reopen();
+
+        assert!(matches!(
+            recorded_burn(&state, TEST_OPERATION_ID).await.outcome,
+            crate::cctp_burn::CctpBurnOutcome::Reverted { .. }
+        ));
+        let retry = capital_success(
+            "cctp-bridge",
+            burn_from_base(&state, TEST_OPERATION_ID, "1").await,
+        );
+        assert_eq!(retry["status"], "reverted");
+        assert_eq!(
+            erc20_balance(&cctp.base_wallet, cctp.usdc, cctp.bot).await,
+            starting_usdc
+        );
+    }
+
+    /// When the record of a signed burn fails to write and the reload shows
+    /// nothing recorded, the route answers `500` with nothing broadcast and
+    /// releases the signature's nonce: a later burn uses that nonce and
+    /// mines, instead of queuing behind a burn nobody will send.
+    #[cfg(feature = "test-support")]
+    #[tokio::test]
+    async fn a_signed_burn_that_fails_to_record_releases_its_nonce() {
+        let starting_usdc = U256::from(5_000_000_u64);
+        let (cctp, _circle, state) = cctp_burn_state(starting_usdc).await;
+        sqlx::query(
+            "CREATE TRIGGER refuse_burn_record BEFORE INSERT ON events \
+             WHEN NEW.event_type = 'CctpBurnOperationEvent::Prepared' \
+             BEGIN SELECT RAISE(ABORT, 'injected write failure'); END",
+        )
+        .execute(&state.pool)
+        .await
+        .unwrap();
+
+        let Err((status, Json(refusal))) = burn_from_base(&state, TEST_OPERATION_ID, "1").await
+        else {
+            panic!("a burn that cannot be recorded must not be broadcast");
+        };
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(
+            refusal.error.contains("nothing was broadcast"),
+            "{}",
+            refusal.error
+        );
+        assert!(
+            state
+                .recovery
+                .get()
+                .unwrap()
+                .cctp_burn_store
+                .load(&TEST_OPERATION_ID.parse().unwrap())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            erc20_balance(&cctp.base_wallet, cctp.usdc, cctp.bot).await,
+            starting_usdc
+        );
+
+        sqlx::query("DROP TRIGGER refuse_burn_record")
+            .execute(&state.pool)
+            .await
+            .unwrap();
+        let burned = capital_success(
+            "cctp-bridge",
+            burn_from_base(&state, TEST_OPERATION_ID, "1").await,
+        );
+        let burn_tx: TxHash = serde_json::from_value(burned["burnTx"].clone()).unwrap();
+        assert!(mined_receipt(&cctp.base_wallet, burn_tx).await.status());
+        assert_eq!(
+            erc20_balance(&cctp.base_wallet, cctp.usdc, cctp.bot).await,
+            starting_usdc - U256::from(1_000_000_u64)
+        );
+    }
+
+    /// A burn whose receipt succeeded without the CCTP `MessageSent` event
+    /// gave Circle nothing to attest, so it is paged and never recorded
+    /// confirmed. A TokenMessenger that only stops produces such a receipt.
+    #[cfg(feature = "test-support")]
+    #[tracing_test::traced_test]
+    #[tokio::test]
+    async fn a_burn_that_emitted_no_message_sent_is_never_recorded_confirmed() {
+        use alloy::providers::ext::AnvilApi as _;
+        let (cctp, _circle, state) = cctp_burn_state(U256::from(5_000_000_u64)).await;
+        cctp.base_wallet
+            .provider()
+            .anvil_set_code(cctp.token_messenger, alloy::primitives::bytes!("00"))
+            .await
+            .unwrap();
+
+        let body = capital_success(
+            "cctp-bridge",
+            burn_from_base(&state, TEST_OPERATION_ID, "1").await,
+        );
+        state.detached_tasks.close();
+        state.detached_tasks.wait().await;
+
+        let burn_tx: TxHash = serde_json::from_value(body["burnTx"].clone()).unwrap();
+        assert!(mined_receipt(&cctp.base_wallet, burn_tx).await.status());
+        assert_eq!(
+            recorded_burn(&state, TEST_OPERATION_ID).await.outcome,
+            crate::cctp_burn::CctpBurnOutcome::Pending
+        );
+        assert!(logs_contain("emitted no MessageSent"));
+        assert!(!logs_contain("CCTP burn confirmed via API"));
+    }
+
+    /// The supersede route never settles a burn that mined: its own receipt
+    /// is read before the named tx, so a mined burn whose receipt does not
+    /// decide it (here a success without `MessageSent`) is refused, the
+    /// operation stays pending, and its nonce is not released.
+    #[cfg(feature = "test-support")]
+    #[tokio::test]
+    async fn a_burn_that_mined_is_never_settled_as_superseded() {
+        use alloy::providers::ext::AnvilApi as _;
+        let (cctp, _circle, state) = cctp_burn_state(U256::from(5_000_000_u64)).await;
+        cctp.base_wallet
+            .provider()
+            .anvil_set_code(cctp.token_messenger, alloy::primitives::bytes!("00"))
+            .await
+            .unwrap();
+        capital_success(
+            "cctp-bridge",
+            burn_from_base(&state, TEST_OPERATION_ID, "1").await,
+        );
+        state.detached_tasks.close();
+        state.detached_tasks.wait().await;
+        let other = cctp
+            .base_wallet
+            .send(cctp.bot, alloy::primitives::Bytes::new(), "other")
+            .await
+            .unwrap();
+
+        let Err((status, Json(refusal))) = supersede_burn(&state, other.transaction_hash).await
+        else {
+            panic!("a burn that mined must not be settled as superseded");
+        };
+
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert!(
+            refusal.error.contains("itself is mined"),
+            "{}",
+            refusal.error
+        );
+        assert_eq!(
+            recorded_burn(&state, TEST_OPERATION_ID).await.outcome,
+            crate::cctp_burn::CctpBurnOutcome::Pending
+        );
+    }
+
+    /// A recorded burn signed by another key (a rotated wallet) never enters
+    /// this wallet's nonce bookkeeping: startup skips it and gates the chain,
+    /// and a retry answers `502` instead of reporting it in flight.
+    #[cfg(feature = "test-support")]
+    #[tokio::test]
+    async fn a_burn_signed_by_another_wallet_is_neither_restored_nor_rebroadcast() {
+        let (_cctp, _circle, state) = cctp_burn_state(U256::from(5_000_000_u64)).await;
+        let wallets = state.ctx.wallet().unwrap();
+        let one_usdc = U256::from(1_000_000_u64);
+        let store = &state.recovery.get().unwrap().cctp_burn_store;
+        store
+            .send(
+                &TEST_OPERATION_ID.parse().unwrap(),
+                crate::cctp_burn::CctpBurnOperationCommand::Prepare {
+                    source: CctpSourceChain::Base,
+                    requested: crate::cctp_burn::RequestedBurn::Exact { amount: one_usdc },
+                    amount: one_usdc,
+                    recipient: wallets.ethereum_wallet().address(),
+                    prepared: st0x_evm::PreparedTransaction::for_test(TxHash::repeat_byte(7), 0),
+                },
+            )
+            .await
+            .unwrap();
+        let bridge = crate::cctp_burn::bot_cctp_bridge(&state.ctx, wallets).unwrap();
+
+        let restored = crate::cctp_burn::restore_pending_cctp_burns(
+            &state.pool,
+            store,
+            &bridge,
+            &state.ctx.chains,
+        )
+        .await;
+        assert_eq!(restored.restored, 0);
+        assert!(restored.unmined_chains.contains(&Chain::Base));
+
+        let Err((status, Json(refusal))) = burn_from_base(&state, TEST_OPERATION_ID, "1").await
+        else {
+            panic!("a burn this wallet cannot broadcast must not be reported in flight");
+        };
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert!(
+            refusal.error.contains("was the key rotated"),
+            "{}",
+            refusal.error
+        );
+    }
+
+    /// A pending burn signed by a key the bot no longer uses can still be
+    /// settled: the old key cancels it at its nonce, and the supersede route
+    /// checks the cancel against the burn's own signer, not the bot's current
+    /// wallet.
+    #[cfg(feature = "test-support")]
+    #[tokio::test]
+    async fn a_burn_of_a_rotated_key_is_settled_by_that_keys_cancel() {
+        let (cctp, _circle, state) = cctp_burn_state(U256::from(5_000_000_u64)).await;
+        let rotated = &cctp.rotated_base_wallet;
+        let one_usdc = U256::from(1_000_000_u64);
+        let prepared = rotated
+            .prepare_pending(cctp.bot, alloy::primitives::Bytes::new(), "old burn")
+            .await
+            .unwrap();
+        state
+            .recovery
+            .get()
+            .unwrap()
+            .cctp_burn_store
+            .send(
+                &TEST_OPERATION_ID.parse().unwrap(),
+                crate::cctp_burn::CctpBurnOperationCommand::Prepare {
+                    source: CctpSourceChain::Base,
+                    requested: crate::cctp_burn::RequestedBurn::Exact { amount: one_usdc },
+                    amount: one_usdc,
+                    recipient: cctp.bot,
+                    prepared: prepared.clone(),
+                },
+            )
+            .await
+            .unwrap();
+        rotated.discard_prepared(prepared.tx_hash()).await;
+        let cancel = rotated
+            .send(rotated.address(), alloy::primitives::Bytes::new(), "cancel")
+            .await
+            .unwrap();
+
+        let settled = capital_success(
+            "cctp-burn-supersede",
+            supersede_burn(&state, cancel.transaction_hash).await,
+        );
+
+        assert_eq!(settled["status"], "superseded");
     }
 
     /// `UsdcResumeResponse` is the wire contract the CLI parses, so its

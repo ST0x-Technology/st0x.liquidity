@@ -74,6 +74,9 @@ use crate::bot_gas::{
     BotGasCostLedger, BotGasReceiptCost, BotGasReceiptCostEnqueuer, RecordBotGasReceiptCostCtx,
     RecordBotGasReceiptCostJobQueue,
 };
+use crate::cctp_burn::{
+    CctpBurnOperation, RestoredCctpBurns, bot_cctp_bridge, restore_pending_cctp_burns,
+};
 use crate::conductor::exit::{ConductorExit, ConductorExitError, MonitorTaskError};
 use crate::conductor::job::{BACKPRESSURE_RESCHEDULE_LIMIT, BackpressureStreak};
 use crate::conductor::monitor::order_fills::{CutoffProbe, probe_cutoff_block_support};
@@ -1151,6 +1154,7 @@ impl Conductor {
             cctp_mint_recovery,
             usdc_driver_pause,
             usdc_store: recovery_usdc_store,
+            cctp_burn_store,
             wrapped_equity_recovery_store,
             unwrapped_equity_recovery_store,
             mint_store,
@@ -1381,6 +1385,7 @@ impl Conductor {
             cctp_mint_recovery,
             usdc_driver_pause,
             usdc_store: recovery_usdc_store,
+            cctp_burn_store,
         });
 
         publish_process_tx_handle(
@@ -2028,6 +2033,9 @@ struct RebalancingInfrastructure {
     /// recovery handle so `fail-usdc-transfer` sends `FailBridging` through the
     /// live reactor rather than a standalone store.
     usdc_store: Arc<Store<UsdcRebalance>>,
+    /// The `CctpBurnOperation` store, published on the recovery handle for
+    /// the capital `cctp-bridge` route after the startup burn restore.
+    cctp_burn_store: Arc<Store<CctpBurnOperation>>,
     wrapped_equity_recovery_store: Arc<Store<WrappedEquityRecovery>>,
     unwrapped_equity_recovery_store: Arc<Store<UnwrappedEquityRecovery>>,
     mint_store: Arc<Store<TokenizedEquityMint>>,
@@ -2080,6 +2088,7 @@ struct PositionAndRebalancing {
     cctp_mint_recovery: Arc<dyn RecoverCctpMint>,
     usdc_driver_pause: Arc<UsdcDriverPause>,
     usdc_store: Arc<Store<UsdcRebalance>>,
+    cctp_burn_store: Arc<Store<CctpBurnOperation>>,
     wrapped_equity_recovery_store: Arc<Store<WrappedEquityRecovery>>,
     unwrapped_equity_recovery_store: Arc<Store<UnwrappedEquityRecovery>>,
     mint_store: Arc<Store<TokenizedEquityMint>>,
@@ -2345,6 +2354,7 @@ impl PositionAndRebalancing {
             cctp_mint_recovery: infra.cctp_mint_recovery,
             usdc_driver_pause: infra.usdc_driver_pause,
             usdc_store: infra.usdc_store,
+            cctp_burn_store: infra.cctp_burn_store,
             wrapped_equity_recovery_store: infra.wrapped_equity_recovery_store,
             unwrapped_equity_recovery_store: infra.unwrapped_equity_recovery_store,
             mint_store: infra.mint_store,
@@ -2965,6 +2975,43 @@ fn stale_allowance_revocations(ctx: &Ctx) -> BTreeMap<Chain, Vec<Address>> {
             (chain, tokens)
         })
         .collect()
+}
+
+/// Reserves the nonce of every pending capital CCTP burn and rebroadcasts it
+/// (`restore_pending_cctp_burns`), returning the chains whose startup
+/// approvals and revokes must wait: those with a restored burn not mined yet,
+/// or both corridor chains when the burns cannot be restored at all.
+async fn restore_capital_cctp_burns(
+    ctx: &Ctx,
+    pool: &SqlitePool,
+    store: &Store<CctpBurnOperation>,
+) -> BTreeSet<Chain> {
+    let wallets = match ctx.wallet() {
+        Ok(wallets) => wallets,
+        Err(error) => {
+            warn!(%error, "No signing wallet, so no capital CCTP burn can be pending; skipping their restore");
+            return BTreeSet::new();
+        }
+    };
+    let bridge = match bot_cctp_bridge(ctx, wallets) {
+        Ok(bridge) => bridge,
+        Err(error) => {
+            error!(target: "operational_alert", alert = true, ?error, "Could not build the CCTP bridge to restore pending capital CCTP burns; their nonces are not reserved, so startup skips Ethereum and Base token approvals and allowance revokes");
+            return BTreeSet::from([Chain::Ethereum, Chain::Base]);
+        }
+    };
+    let RestoredCctpBurns {
+        restored,
+        settled,
+        unmined_chains,
+    } = restore_pending_cctp_burns(pool, store, &bridge, &ctx.chains).await;
+    info!(
+        restored,
+        settled,
+        ?unmined_chains,
+        "Reserved the nonces of the pending capital CCTP burns at startup"
+    );
+    unmined_chains
 }
 
 /// Best-effort, per hedged chain: revoke any stale pre-migration allowance
@@ -3691,6 +3738,16 @@ fn spawn_rebalancing_infrastructure<Signer: Wallet + Clone>(
             )
             .await?;
 
+        // Reads only the recovery records and their job rows, so it refuses
+        // before the tokenization recovery below requeues jobs or rebroadcasts
+        // a signed withdrawal.
+        refuse_chainless_recoveries_on_non_base_primary(
+            &deps.pool,
+            &deps.apalis_pool,
+            deps.ctx.chains.primary().chain,
+        )
+        .await?;
+
         let mut resume_tokenization_queue = ResumeTokenizationJobQueue::new(&deps.apalis_pool);
 
         let mut unmined_restore_chains = recover_interrupted_tokenization_aggregates(
@@ -3701,13 +3758,6 @@ fn spawn_rebalancing_infrastructure<Signer: Wallet + Clone>(
             built.redemption.clone(),
             &equity_transfer_services,
             &mut resume_tokenization_queue,
-        )
-        .await?;
-
-        refuse_chainless_recoveries_on_non_base_primary(
-            &deps.pool,
-            &deps.apalis_pool,
-            deps.ctx.chains.primary().chain,
         )
         .await?;
 
@@ -3762,6 +3812,15 @@ fn spawn_rebalancing_infrastructure<Signer: Wallet + Clone>(
         if unmined > 0 {
             unmined_restore_chains.insert(Chain::Ethereum);
         }
+
+        // Likewise for the signed burns of the capital `cctp-bridge` route:
+        // a pending burn keeps its nonce on the Ethereum or Base wallet and
+        // is rebroadcast before any other send from that wallet.
+        let cctp_burn_store = StoreBuilder::<CctpBurnOperation>::new(deps.pool.clone())
+            .build(())
+            .await?;
+        unmined_restore_chains
+            .extend(restore_capital_cctp_burns(&deps.ctx, &deps.pool, &cctp_burn_store).await);
 
         // After the nonce restores and rebroadcasts above, so a revoke neither
         // takes the nonce of a signed send persisted before the restart nor
@@ -3835,6 +3894,7 @@ fn spawn_rebalancing_infrastructure<Signer: Wallet + Clone>(
             cctp_mint_recovery: usdc_handles.recover_cctp_mint,
             usdc_driver_pause,
             usdc_store: recovery_usdc_store,
+            cctp_burn_store,
             wrapped_equity_recovery_store,
             unwrapped_equity_recovery_store,
             mint_store: built.mint,

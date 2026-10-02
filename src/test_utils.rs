@@ -553,6 +553,9 @@ pub(crate) struct AnvilCctpPair {
     pub(crate) bot: Address,
     pub(crate) base_wallet: Arc<dyn Wallet<Provider = RootProvider>>,
     pub(crate) ethereum_wallet: Arc<dyn Wallet<Provider = RootProvider>>,
+    /// A funded Base wallet on another key, standing in for a key the bot
+    /// used before a rotation.
+    pub(crate) rotated_base_wallet: Arc<dyn Wallet<Provider = RootProvider>>,
 }
 
 /// Deploys an [`AnvilCctpPair`] with `base_usdc` of USDC in the bot's Base
@@ -570,6 +573,7 @@ pub(crate) async fn deploy_anvil_cctp_pair(base_usdc: U256) -> AnvilCctpPair {
     let ethereum_endpoint = ethereum_anvil.endpoint();
     let bot_key = B256::from_slice(&base_anvil.keys()[0].to_bytes());
     let deployer_key = B256::from_slice(&base_anvil.keys()[1].to_bytes());
+    let rotated_key = B256::from_slice(&base_anvil.keys()[2].to_bytes());
     // Only a mint checks the attestation, and no burn test mints.
     let attester = Address::repeat_byte(0xA7);
 
@@ -590,6 +594,7 @@ pub(crate) async fn deploy_anvil_cctp_pair(base_usdc: U256) -> AnvilCctpPair {
     .unwrap();
 
     let base_wallet = anvil_wallet(base_anvil.endpoint_url(), &bot_key);
+    let rotated_base_wallet = anvil_wallet(base_anvil.endpoint_url(), &rotated_key);
     let ethereum_wallet = anvil_wallet(ethereum_anvil.endpoint_url(), &bot_key);
     let bot = base_wallet.address();
     mint_usdc(&base_endpoint, &deployer_key, base.usdc, bot, base_usdc)
@@ -605,6 +610,7 @@ pub(crate) async fn deploy_anvil_cctp_pair(base_usdc: U256) -> AnvilCctpPair {
         bot,
         base_wallet,
         ethereum_wallet,
+        rotated_base_wallet,
     }
 }
 

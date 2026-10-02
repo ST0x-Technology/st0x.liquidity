@@ -568,26 +568,31 @@ impl WrappedEquityRecoveryJob {
                 )
                 .await
                 .map_err(Into::into),
+            // Every step's error goes through `finish`, so a missing chain
+            // service reschedules and a bot-gas enqueue failure redrives,
+            // whichever step raised it.
             DispatchDecision::Orphan => {
-                ctx.store
-                    .send(
-                        &self.recovery_id,
-                        WrappedEquityRecoveryCommand::SubmitOrphanDeposit,
-                    )
-                    .await?;
-                if let Some(agg) = ctx.store.load(&self.recovery_id).await?
-                    && agg.is_terminal()
-                {
-                    Ok(())
-                } else {
+                async {
+                    ctx.store
+                        .send(
+                            &self.recovery_id,
+                            WrappedEquityRecoveryCommand::SubmitOrphanDeposit,
+                        )
+                        .await?;
+                    if let Some(agg) = ctx.store.load(&self.recovery_id).await?
+                        && agg.is_terminal()
+                    {
+                        return Ok(());
+                    }
                     ctx.store
                         .send(
                             &self.recovery_id,
                             WrappedEquityRecoveryCommand::ConfirmOrphanDeposit,
                         )
-                        .await
-                        .map_err(Into::into)
+                        .await?;
+                    Ok::<_, WrappedEquityRecoveryJobError>(())
                 }
+                .await
             }
             DispatchDecision::Conflict {
                 mint_id,

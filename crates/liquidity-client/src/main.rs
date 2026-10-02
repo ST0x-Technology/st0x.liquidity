@@ -419,14 +419,51 @@ async fn dispatch_capital<A: TokenSource + Sync>(
                 )
                 .await
         }
-        Capital::CctpBridge { amount, all, from } => {
-            client
+        Capital::CctpBridge {
+            amount,
+            all,
+            from,
+            operation_id,
+        } => {
+            let operation_id = operation_id.unwrap_or_else(uuid::Uuid::new_v4);
+            // Printed before the request, so it survives a timeout or an
+            // interrupted run: the id is what makes the rerun safe.
+            eprintln!(
+                "operation id {operation_id}: after a failure or a timeout, rerun with \
+                 --operation-id {operation_id} to report this burn instead of burning again \
+                 (only against a bot that records operation ids, see below)"
+            );
+            let answer = client
                 .post_json(
                     "/capital/cctp-bridge",
                     &wire::CctpBridgeRequest {
+                        operation_id,
                         from: from.wire_name(),
                         amount,
                         all,
+                    },
+                )
+                .await?;
+            if !records_operation(&answer, operation_id) {
+                eprintln!(
+                    "WARNING: the bot did not answer with operation id {operation_id} and a \
+                     status, so it predates operation ids and did not record this burn. A \
+                     rerun, even with --operation-id, burns again: do not rerun, finish this \
+                     burn with debug cctp complete-mint"
+                );
+            }
+            Ok(answer)
+        }
+        Capital::CctpBurnSupersede {
+            operation_id,
+            superseding_tx,
+        } => {
+            client
+                .post_json(
+                    "/capital/cctp-burn-supersede",
+                    &wire::CctpBurnSupersedeRequest {
+                        operation_id,
+                        superseding_tx,
                     },
                 )
                 .await
@@ -442,6 +479,21 @@ async fn dispatch_capital<A: TokenSource + Sync>(
                 .await
         }
     }
+}
+
+/// Whether a `cctp-bridge` answer comes from a bot that records operation
+/// ids: it echoes this run's id and a status. An older bot ignores the id and
+/// burns on every call, so a rerun with the same id is only safe when this
+/// holds.
+fn records_operation(answer: &serde_json::Value, operation_id: uuid::Uuid) -> bool {
+    let echoed = answer
+        .get("operationId")
+        .and_then(serde_json::Value::as_str)
+        == Some(operation_id.to_string().as_str());
+    echoed
+        && answer
+            .get("status")
+            .is_some_and(serde_json::Value::is_string)
 }
 
 /// The body `vault-deposit` and `vault-withdraw` share.
@@ -462,7 +514,7 @@ mod tests {
     use std::sync::mpsc::{Receiver, channel};
     use std::time::Duration;
 
-    use super::{ApiError, dispatch};
+    use super::{ApiError, dispatch, records_operation};
     use crate::auth::{AuthError, StaticToken};
     use crate::cli::{
         Capital, Cctp, CctpSourceChain, Command, Debug, EquityTransferKind, HedgedChain,
@@ -1105,34 +1157,65 @@ mod tests {
         Ok(())
     }
 
-    /// The body carries either `amount` or `all: true`, never both keys and
-    /// never `all: false`.
+    /// The body carries the operation id and either `amount` or `all: true`,
+    /// never both keys and never `all: false`. A run without
+    /// `--operation-id` sends a fresh id; one with it sends that id.
     #[tokio::test]
     async fn cctp_bridge_posts_either_an_amount_or_all() -> Result<(), Box<dyn std::error::Error>> {
         let amount = request_for(Command::Capital(Capital::CctpBridge {
             amount: Some("100".parse()?),
             all: false,
             from: CctpSourceChain::Ethereum,
+            operation_id: None,
         }))
         .await?;
         assert_eq!(
             request_line(&amount),
             "POST /liquidity-write/capital/cctp-bridge HTTP/1.1"
         );
+        let mut body = request_body(&amount);
+        let generated = body
+            .as_object_mut()
+            .and_then(|body| body.remove("operationId"))
+            .and_then(|id| id.as_str().map(str::parse::<uuid::Uuid>))
+            .transpose()?;
+        assert!(generated.is_some_and(|id| id.get_version_num() == 4));
         assert_eq!(
-            request_body(&amount),
+            body,
             serde_json::json!({ "from": "ethereum", "amount": "100" })
         );
 
+        let id: uuid::Uuid = "6f1c2a1e-6c39-4a77-9a8e-1f0b7d6e8c11".parse()?;
         let all = request_for(Command::Capital(Capital::CctpBridge {
             amount: None,
             all: true,
             from: CctpSourceChain::Base,
+            operation_id: Some(id),
         }))
         .await?;
         assert_eq!(
             request_body(&all),
-            serde_json::json!({ "from": "base", "all": true })
+            serde_json::json!({ "operationId": id.to_string(), "from": "base", "all": true })
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cctp_burn_supersede_posts_the_operation_and_the_superseding_tx()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let id: uuid::Uuid = "6f1c2a1e-6c39-4a77-9a8e-1f0b7d6e8c11".parse()?;
+        let request = request_for(Command::Capital(Capital::CctpBurnSupersede {
+            operation_id: id,
+            superseding_tx: "0xabc".to_owned(),
+        }))
+        .await?;
+        assert_eq!(
+            request_line(&request),
+            "POST /liquidity-write/capital/cctp-burn-supersede HTTP/1.1"
+        );
+        assert_eq!(
+            request_body(&request),
+            serde_json::json!({ "operationId": id.to_string(), "supersedingTx": "0xabc" })
         );
         Ok(())
     }
@@ -1151,6 +1234,35 @@ mod tests {
             request_body(&request),
             serde_json::json!({ "chain": "hyperevm" })
         );
+        Ok(())
+    }
+
+    /// Only an answer that echoes this run's operation id and a status comes
+    /// from a bot that records the burn; an older bot's answer, or one for
+    /// another id, must trigger the do not rerun warning.
+    #[test]
+    fn only_an_answer_echoing_the_operation_id_and_a_status_is_recorded()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let id: uuid::Uuid = "6f1c2a1e-6c39-4a77-9a8e-1f0b7d6e8c11".parse()?;
+        let recorded = serde_json::json!({
+            "operationId": id.to_string(),
+            "burnTx": "0x01",
+            "status": "pending",
+        });
+        let old_bot = serde_json::json!({
+            "burnTx": "0x01",
+            "sourceChain": "base",
+            "destinationChain": "ethereum",
+            "amountRaw": "1000000",
+        });
+        let other_id = serde_json::json!({
+            "operationId": uuid::Uuid::new_v4().to_string(),
+            "status": "pending",
+        });
+
+        assert!(records_operation(&recorded, id));
+        assert!(!records_operation(&old_bot, id));
+        assert!(!records_operation(&other_id, id));
         Ok(())
     }
 
