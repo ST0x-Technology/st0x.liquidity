@@ -6712,32 +6712,70 @@ effect rather than a generic intent:
   the burn tx as soon as the burn is broadcast, not when it confirms: an approve
   plus the burn's confirmations can outlast the 60 second load balancer cut, and
   a request that timed out after the broadcast would leave the operator without
-  the burn tx. The detached task then awaits the receipt, still holding the lock
-  and the pause, until the burn has the source chain's required confirmations or
-  the wait gives up (up to 5 minutes for inclusion plus 30 minutes for the
-  confirmations), and logs the outcome. Meanwhile every route that takes the
-  recovery lock answers `409`, and `cctp complete-mint` answers `502` until
-  Circle attests the burn and `409` once it has, since it fetches the
-  attestation before it tries the lock. A failure to confirm includes a receipt
-  timeout, so it does not prove the burn failed. The operator finishes with
-  `cctp complete-mint`. It records no operation id, so it is not idempotent: a
-  retried request burns again, and the second burn's USDC lands in the bot's
-  wallet on the other chain once minted. The vault verbs and `reset-allowance`
-  take neither the lock nor the pause, like the `st0x-cli` verbs: pausing the
-  driver would refuse every vault operation for the length of each USDC
-  transfer. `vault-deposit` does take its own lock (`409` while another
-  `vault-deposit` request runs): the deposit reads the allowance and approves
-  exactly the amount when it is short, so two concurrent requests for a token
-  without the startup MAX grant could overwrite each other's approval. The lock
-  covers these requests only: without the MAX grant, a request can still use up
-  the exact approval of a USDC transfer worker's deposit, which then reverts and
-  needs a redrive. `vault-withdraw` and `vault-withdraw-usdc` share a withdraw
-  lock of their own (`409` while either runs), held until the outcome of the tx
-  it answered with is known, for the rerun reason below; it does not cover the
-  bot's own transfer withdrawals. Every capital route refuses with `503` until
-  startup completes, like `process-tx`, since the startup preflights (each
-  chain's id, the inventory `OPERATOR_ROLE`) have not passed before then. Each
-  route that sends a transaction runs it on a tracked detached task, like
+  the burn tx. Every request carries the client's operation id (a UUID, which
+  `st0x-liquidity-client` generates per run and prints before sending), and an
+  id holds at most one burn: the `CctpBurnOperation` aggregate (ADR 0023). After
+  the lock, the pause and the amount, the route signs the burn without
+  broadcasting it, records the signed bytes under the id (`Prepared`), and only
+  then broadcasts them, so the burn is on record before it can exist onchain. A
+  request whose id already holds a burn is answered before the gas check and the
+  locks, since it sends nothing new: it reports the recorded burn tx and its
+  status, after broadcasting a pending burn's recorded bytes again (a burn no
+  node holds after a restart or a drop goes out, one already known is
+  untouched). Its `from` and amount (or `all`) must match the recorded burn's,
+  else `409`. Under the lock the route looks the id up again, so two concurrent
+  requests with one id burn once, and the aggregate refuses a second `Prepare`
+  for an id. A failed record releases the signature's nonce when a reload shows
+  nothing recorded (`500`, nothing broadcast), adopts the burn another request
+  recorded, and keeps the nonce reserved when the reload fails too (`500`, rerun
+  with the same id). A failed broadcast of a recorded burn answers `502`; a
+  rerun with the same id broadcasts the same bytes. The response carries the
+  operation id, the burn tx, both chains, the raw amount and a `status`:
+  `pending`, `confirmed`, `reverted` or `superseded`. The detached task then
+  awaits the receipt, still holding the lock and the pause, until the burn has
+  the source chain's required confirmations or the wait gives up (up to 5
+  minutes for inclusion plus 30 minutes for the confirmations), and records the
+  outcome its own canonical receipt proves at those confirmations: `Confirmed`,
+  or `Reverted` (which burned nothing). A receipt timeout, a drop report, an RPC
+  error or a shallower receipt proves nothing, so the burn stays pending and a
+  rerun with its id reports it and broadcasts it again. Meanwhile every route
+  that takes the recovery lock answers `409`, and `cctp complete-mint` answers
+  `502` until Circle attests the burn and `409` once it has, since it fetches
+  the attestation before it tries the lock. The operator finishes with
+  `cctp complete-mint`. A reverted burn is final: a rerun with its id reports
+  `reverted` and burns nothing, and burning again takes a new id. A signed burn
+  is never resigned or fee bumped. At startup, next to the signed deposit sends
+  and before any startup approval or revoke, the bot records the outcome of
+  every pending burn whose receipt now decides, and reserves the nonce of every
+  other one and rebroadcasts its exact bytes; a chain with such a burn not mined
+  yet skips its startup approvals and revokes, as for a deposit send. A pending
+  burn that will not mine at its fee keeps its nonce on the source wallet, and
+  later sends from that wallet queue behind it, until it mines or the operator
+  cancels it with a plain 0 value transfer to the wallet itself, with no
+  calldata and a higher fee, at the burn's nonce, then settles it with
+  `POST /liquidity-write/capital/cctp-burn-supersede` (`operationId`,
+  `supersedingTx`). That route records `Superseded` and releases the nonce once
+  the chain shows the named tx mined from the burn's signer at the burn's nonce
+  with the source chain's required confirmations, the burn itself unmined, and
+  the tx either reverted or a plain cancel (a successful tx at the nonce could
+  be a fee bumped copy of the burn); any other tx is refused with `409`, a
+  failed chain read with `502`, and an unknown id with `404`. A burn whose own
+  receipt already decides reports that status instead. The vault verbs and
+  `reset-allowance` take neither the lock nor the pause, like the `st0x-cli`
+  verbs: pausing the driver would refuse every vault operation for the length of
+  each USDC transfer. `vault-deposit` does take its own lock (`409` while
+  another `vault-deposit` request runs): the deposit reads the allowance and
+  approves exactly the amount when it is short, so two concurrent requests for a
+  token without the startup MAX grant could overwrite each other's approval. The
+  lock covers these requests only: without the MAX grant, a request can still
+  use up the exact approval of a USDC transfer worker's deposit, which then
+  reverts and needs a redrive. `vault-withdraw` and `vault-withdraw-usdc` share
+  a withdraw lock of their own (`409` while either runs), held until the outcome
+  of the tx it answered with is known, for the rerun reason below; it does not
+  cover the bot's own transfer withdrawals. Every capital route refuses with
+  `503` until startup completes, like `process-tx`, since the startup preflights
+  (each chain's id, the inventory `OPERATOR_ROLE`) have not passed before then.
+  Each route that sends a transaction runs it on a tracked detached task, like
   `process-tx`, so a client or load balancer timeout cannot drop a transaction
   between its broadcast and its receipt, graceful shutdown waits for it, and the
   task logs its own outcome. The vault verbs and `reset-allowance` answer at the

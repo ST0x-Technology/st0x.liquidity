@@ -419,14 +419,41 @@ async fn dispatch_capital<A: TokenSource + Sync>(
                 )
                 .await
         }
-        Capital::CctpBridge { amount, all, from } => {
+        Capital::CctpBridge {
+            amount,
+            all,
+            from,
+            operation_id,
+        } => {
+            let operation_id = operation_id.unwrap_or_else(uuid::Uuid::new_v4);
+            // Printed before the request, so it survives a timeout or an
+            // interrupted run: the id is what makes the rerun safe.
+            eprintln!(
+                "operation id {operation_id}: after a failure or a timeout, rerun with \
+                 --operation-id {operation_id} to report this burn instead of burning again"
+            );
             client
                 .post_json(
                     "/capital/cctp-bridge",
                     &wire::CctpBridgeRequest {
+                        operation_id,
                         from: from.wire_name(),
                         amount,
                         all,
+                    },
+                )
+                .await
+        }
+        Capital::CctpBurnSupersede {
+            operation_id,
+            superseding_tx,
+        } => {
+            client
+                .post_json(
+                    "/capital/cctp-burn-supersede",
+                    &wire::CctpBurnSupersedeRequest {
+                        operation_id,
+                        superseding_tx,
                     },
                 )
                 .await
@@ -1105,34 +1132,65 @@ mod tests {
         Ok(())
     }
 
-    /// The body carries either `amount` or `all: true`, never both keys and
-    /// never `all: false`.
+    /// The body carries the operation id and either `amount` or `all: true`,
+    /// never both keys and never `all: false`. A run without
+    /// `--operation-id` sends a fresh id; one with it sends that id.
     #[tokio::test]
     async fn cctp_bridge_posts_either_an_amount_or_all() -> Result<(), Box<dyn std::error::Error>> {
         let amount = request_for(Command::Capital(Capital::CctpBridge {
             amount: Some("100".parse()?),
             all: false,
             from: CctpSourceChain::Ethereum,
+            operation_id: None,
         }))
         .await?;
         assert_eq!(
             request_line(&amount),
             "POST /liquidity-write/capital/cctp-bridge HTTP/1.1"
         );
+        let mut body = request_body(&amount);
+        let generated = body
+            .as_object_mut()
+            .and_then(|body| body.remove("operationId"))
+            .and_then(|id| id.as_str().map(str::parse::<uuid::Uuid>))
+            .transpose()?;
+        assert!(generated.is_some_and(|id| id.get_version_num() == 4));
         assert_eq!(
-            request_body(&amount),
+            body,
             serde_json::json!({ "from": "ethereum", "amount": "100" })
         );
 
+        let id: uuid::Uuid = "6f1c2a1e-6c39-4a77-9a8e-1f0b7d6e8c11".parse()?;
         let all = request_for(Command::Capital(Capital::CctpBridge {
             amount: None,
             all: true,
             from: CctpSourceChain::Base,
+            operation_id: Some(id),
         }))
         .await?;
         assert_eq!(
             request_body(&all),
-            serde_json::json!({ "from": "base", "all": true })
+            serde_json::json!({ "operationId": id.to_string(), "from": "base", "all": true })
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cctp_burn_supersede_posts_the_operation_and_the_superseding_tx()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let id: uuid::Uuid = "6f1c2a1e-6c39-4a77-9a8e-1f0b7d6e8c11".parse()?;
+        let request = request_for(Command::Capital(Capital::CctpBurnSupersede {
+            operation_id: id,
+            superseding_tx: "0xabc".to_owned(),
+        }))
+        .await?;
+        assert_eq!(
+            request_line(&request),
+            "POST /liquidity-write/capital/cctp-burn-supersede HTTP/1.1"
+        );
+        assert_eq!(
+            request_body(&request),
+            serde_json::json!({ "operationId": id.to_string(), "supersedingTx": "0xabc" })
         );
         Ok(())
     }

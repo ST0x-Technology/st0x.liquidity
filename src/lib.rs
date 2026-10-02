@@ -48,6 +48,7 @@ pub mod bindings;
 #[cfg(not(any(test, feature = "test-support")))]
 pub(crate) mod bindings;
 mod bot_gas;
+mod cctp_burn;
 mod conductor;
 pub(crate) mod dashboard;
 mod database_file_lock;

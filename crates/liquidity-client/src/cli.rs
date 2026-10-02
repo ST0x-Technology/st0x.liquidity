@@ -2,6 +2,7 @@
 //! command and resource enums, and their fixed API path mappings.
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
+use uuid::Uuid;
 
 use crate::target::Env;
 use crate::wire::{DecimalAmount, EvmAddress, ReconcileUsdcReason, TransferUsdcDirection, VaultId};
@@ -449,10 +450,12 @@ pub(crate) enum Capital {
         network: HedgedChain,
     },
     /// Burn USDC on Ethereum or Base for a CCTP transfer to the other chain.
-    /// Returns the burn tx as soon as the burn is broadcast, without waiting
-    /// for its receipt or Circle's attestation; finish with
-    /// `debug cctp complete-mint` once it is attested. Not idempotent: a retry
-    /// burns again, so after a timeout find the burn in the bot logs instead.
+    /// Returns the burn tx and its status as soon as the burn is broadcast,
+    /// without waiting for its receipt or Circle's attestation; finish with
+    /// `debug cctp complete-mint` once it is attested. Every run sends an
+    /// operation id, printed to stderr before the request: rerunning with
+    /// `--operation-id <id>` after a failure or a timeout reports that same
+    /// burn and its status instead of burning again.
     CctpBridge {
         /// Amount of USDC to bridge, as a decimal (omit to use --all).
         #[arg(
@@ -469,6 +472,25 @@ pub(crate) enum Capital {
         /// Source chain to burn from; the mint lands on the other one.
         #[arg(long, value_enum)]
         from: CctpSourceChain,
+        /// The operation id an earlier run printed, to report its burn
+        /// instead of burning again. Omit for a new burn: a fresh id is
+        /// generated. A rerun must repeat the same `--from` and amount.
+        #[arg(long)]
+        operation_id: Option<Uuid>,
+    },
+    /// Settle a pending `cctp-bridge` burn that can never mine because
+    /// another tx from the source wallet took its nonce: first cancel it with
+    /// a 0 value transfer to the wallet itself, with no calldata, at the
+    /// burn's nonce and a higher fee, then pass that tx once it has the
+    /// chain's required confirmations. Startup then stops rebroadcasting the
+    /// burn. A burn whose own receipt already decides reports that status.
+    CctpBurnSupersede {
+        /// The operation id the burn's `cctp-bridge` run printed.
+        #[arg(long)]
+        operation_id: Uuid,
+        /// The mined tx that took the burn's nonce.
+        #[arg(long)]
+        superseding_tx: String,
     },
     /// Reset the bot wallet's settlement stable allowance (USDC, or USDG on
     /// Robinhood) for the orderbook to zero. Returns the revoke tx as soon as
@@ -1062,7 +1084,9 @@ mod tests {
                 Capital::VaultDeposit(args) | Capital::VaultWithdraw(args) => args.network,
                 Capital::VaultWithdrawUsdc { network, .. }
                 | Capital::ResetAllowance { network } => network,
-                Capital::TransferUsdc { .. } | Capital::CctpBridge { .. } => {
+                Capital::TransferUsdc { .. }
+                | Capital::CctpBridge { .. }
+                | Capital::CctpBurnSupersede { .. } => {
                     panic!("{argv:?} takes no --network")
                 }
             };
@@ -1071,7 +1095,7 @@ mod tests {
     }
 
     /// `cctp-bridge` takes exactly one of `--amount` and `--all`, refused by
-    /// clap before the bot's own check.
+    /// clap before the bot's own check, and an optional `--operation-id`.
     #[test]
     fn cctp_bridge_requires_exactly_one_of_amount_and_all() {
         assert!(matches!(
@@ -1080,15 +1104,18 @@ mod tests {
                 amount: Some(amount),
                 all: false,
                 from: CctpSourceChain::Ethereum,
+                operation_id: None,
             } if amount == self::amount("100")
         ));
+        let id = "6f1c2a1e-6c39-4a77-9a8e-1f0b7d6e8c11";
         assert!(matches!(
-            capital(&["cctp-bridge", "--from", "base", "--all"]).unwrap(),
+            capital(&["cctp-bridge", "--from", "base", "--all", "--operation-id", id]).unwrap(),
             Capital::CctpBridge {
                 amount: None,
                 all: true,
                 from: CctpSourceChain::Base,
-            }
+                operation_id: Some(operation_id),
+            } if operation_id.to_string() == id
         ));
 
         let Err(error) = capital(&["cctp-bridge", "--from", "base", "--amount", "1", "--all"])

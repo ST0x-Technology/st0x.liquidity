@@ -6,6 +6,7 @@
 use std::str::FromStr;
 
 use serde::Serialize;
+use uuid::Uuid;
 
 /// A positive decimal amount as the user typed it: ASCII digits with at most
 /// one `.` that has digits on both sides, and at least one nonzero digit.
@@ -218,10 +219,12 @@ pub(crate) struct VaultWithdrawUsdcRequest {
     pub(crate) amount: DecimalAmount,
 }
 
-/// Body of `POST /capital/cctp-bridge`: exactly one of `amount` or `all`.
+/// Body of `POST /capital/cctp-bridge`: the run's operation id and exactly
+/// one of `amount` or `all`.
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct CctpBridgeRequest {
+    pub(crate) operation_id: Uuid,
     pub(crate) from: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) amount: Option<DecimalAmount>,
@@ -229,6 +232,14 @@ pub(crate) struct CctpBridgeRequest {
     /// carries either `amount` or `all: true`, never both keys.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub(crate) all: bool,
+}
+
+/// Body of `POST /capital/cctp-burn-supersede`.
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct CctpBurnSupersedeRequest {
+    pub(crate) operation_id: Uuid,
+    pub(crate) superseding_tx: String,
 }
 
 /// Body of `POST /capital/reset-allowance`.

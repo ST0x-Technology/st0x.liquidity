@@ -574,6 +574,59 @@ impl<W: Wallet> CctpEndpoint<W> {
             .await?)
     }
 
+    /// Signs `depositForBurn` without broadcasting it, reserving its nonce, so
+    /// the caller can persist the signed burn first. Every later broadcast of
+    /// it ([`broadcast_burn`](Self::broadcast_burn)) sends the same bytes, so
+    /// no second burn can exist for that record.
+    pub(super) async fn prepare_deposit_for_burn(
+        &self,
+        amount: U256,
+        recipient: Address,
+        direction: BridgeDirection,
+        max_fee: U256,
+    ) -> Result<PreparedTransaction, CctpError> {
+        info!(target: "bridge", %max_fee, %amount, "Signing depositForBurn for fast transfer");
+
+        Ok(self
+            .wallet
+            .prepare_pending(
+                self.token_messenger_address,
+                Bytes::from(
+                    self.deposit_for_burn_call(amount, recipient, direction, max_fee)
+                        .abi_encode(),
+                ),
+                "depositForBurn",
+            )
+            .await?)
+    }
+
+    /// Broadcasts a burn signed by
+    /// [`prepare_deposit_for_burn`](Self::prepare_deposit_for_burn).
+    /// Idempotent: a repeat sends the same bytes, and "already known" is
+    /// success.
+    pub(super) async fn broadcast_burn(
+        &self,
+        prepared: &PreparedTransaction,
+    ) -> Result<TxHash, EvmError> {
+        self.wallet
+            .broadcast_prepared(prepared, "depositForBurn")
+            .await
+    }
+
+    pub(super) async fn discard_burn(&self, prepared: &PreparedTransaction) {
+        self.wallet.discard_prepared(prepared.tx_hash()).await;
+    }
+
+    pub(super) async fn restore_burn(&self, prepared: &PreparedTransaction) {
+        self.wallet.restore_prepared(prepared).await;
+    }
+
+    /// Releases the nonce of a signed burn another mined tx superseded, so
+    /// the wallet stops holding it.
+    pub(super) async fn release_superseded_burn(&self, prepared: &PreparedTransaction) {
+        self.wallet.release_superseded(prepared.tx_hash()).await;
+    }
+
     /// Awaits the receipt of a burn broadcast via
     /// [`submit_deposit_for_burn`](Self::submit_deposit_for_burn), decoding a
     /// revert, and validates the CCTP `MessageSent` event is present. `amount` is
@@ -1645,6 +1698,10 @@ impl<W: Wallet> CctpEndpoint<W> {
     #[cfg(test)]
     pub(super) fn owner(&self) -> Address {
         self.wallet.address()
+    }
+
+    pub(super) const fn token_messenger(&self) -> Address {
+        self.token_messenger_address
     }
 
     #[cfg(test)]
