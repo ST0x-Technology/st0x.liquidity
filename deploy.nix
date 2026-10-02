@@ -84,9 +84,26 @@ let
         '';
         stagedConfigPath = "/run/st0x/${name}.config.staged";
         stagedSecretPath = "/run/st0x/${name}.secrets.staged";
-        validateCommand = "${cfg.profilePath}/bin/validate-config --config ${stagedConfigPath} --secrets ${stagedSecretPath}";
-        verifyApprovalsCommand = "${cfg.profilePath}/bin/verify-approvals --config ${stagedConfigPath} --secrets ${stagedSecretPath}";
-        verifyMigrationsCommand = "if [ -f /mnt/data/${name}.db ]; then ${cfg.profilePath}/bin/verify-migrations --db /mnt/data/${name}.db --config ${stagedConfigPath}; else ${cfg.profilePath}/bin/verify-migrations --config ${stagedConfigPath}; fi";
+        registryStatePath = "/mnt/data/registry";
+        registryHoldPath = "${registryStatePath}/hold";
+        registryHoldCommand = ''
+          install -d -m 0750 -o st0x -g st0x ${registryStatePath}
+          touch ${registryStatePath}/apply.lock
+          chmod 0660 ${registryStatePath}/apply.lock
+          chown st0x:st0x ${registryStatePath}/apply.lock
+          exec {registry_lock_fd}>${registryStatePath}/apply.lock
+          flock --exclusive "$registry_lock_fd"
+          registry_hold_tmp=$(mktemp ${registryStatePath}/hold.XXXXXX)
+          printf '{"deploy_id":"${gitRev}","created_at":%s}\n' "$(date +%s)" > "$registry_hold_tmp"
+          chmod 0640 "$registry_hold_tmp"
+          chown st0x:st0x "$registry_hold_tmp"
+          mv "$registry_hold_tmp" ${registryHoldPath}
+          flock --unlock "$registry_lock_fd"
+          exec {registry_lock_fd}>&-
+        '';
+        validateCommand = "${cfg.profilePath}/bin/validate-config --config ${stagedConfigPath} --secrets ${stagedSecretPath} --registry-state ${registryStatePath}";
+        verifyApprovalsCommand = "${cfg.profilePath}/bin/verify-approvals --config ${stagedConfigPath} --secrets ${stagedSecretPath} --registry-state ${registryStatePath}";
+        verifyMigrationsCommand = "if [ -f /mnt/data/${name}.db ]; then ${cfg.profilePath}/bin/verify-migrations --db /mnt/data/${name}.db --config ${stagedConfigPath} --registry-state ${registryStatePath}; else ${cfg.profilePath}/bin/verify-migrations --config ${stagedConfigPath} --registry-state ${registryStatePath}; fi";
         readinessPrerequisiteCommand = ''
           if ! systemctl show --property Environment --value ${name} 2>/dev/null \
             | grep --fixed-strings --quiet 'ST0X_STARTUP_READY_FILE=${startupReadyFile}'; then
@@ -113,11 +130,14 @@ let
           # Stage and validate the candidate files while the old service is
           # still running. The EXIT trap removes the decrypted staged secret on
           # every success/failure path.
-          "trap 'rm -f ${stagedConfigPath} ${stagedSecretPath}' EXIT"
+          "trap 'rm -f ${stagedConfigPath} ${stagedSecretPath} ${registryHoldPath}' EXIT"
+          "trap 'exit 130' INT"
+          "trap 'exit 143' TERM"
           "install -D -m 0640 -o root -g st0x ${configFile} ${stagedConfigPath}"
         ]
         ++ stageSecretCommands
         ++ [
+          registryHoldCommand
           validateCommand
           # Query Turnkey policies read-only before stopping the old process.
           # Missing coverage exits non-zero, leaving both the running bot and
@@ -158,6 +178,12 @@ let
           ) "st0x activation must stop waiting when the restarted unit cannot become ready";
           assert lib.assertMsg (builtins.elem readinessPrerequisiteCommand beforeStopCommands)
             "st0x activation must verify the systemd readiness environment before stopping the service";
+          assert lib.assertMsg (
+            builtins.elem registryHoldCommand beforeStopCommands
+            && lib.hasInfix "--registry-state ${registryStatePath}" validateCommand
+            && lib.hasInfix "--registry-state ${registryStatePath}" verifyApprovalsCommand
+            && lib.hasInfix "--registry-state ${registryStatePath}" verifyMigrationsCommand
+          ) "st0x activation must hold registry reloads and validate persisted boot candidates";
           assert lib.assertMsg (builtins.elem verifyApprovalsCommand beforeStopCommands)
             "st0x activation must verify Turnkey approval policies before stopping the service";
           assert lib.assertMsg (

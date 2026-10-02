@@ -2,6 +2,11 @@
 //! and trade processing. [`Conductor::run`] is the entry point.
 
 mod builder;
+mod completion;
+mod registry_candidate;
+pub(crate) use registry_candidate::{
+    CandidateContractError, validate_registry_candidate_contracts,
+};
 
 pub use builder::configured_equity_symbols;
 mod exit;
@@ -1675,6 +1680,33 @@ fn base_wallet_wrapped_equity_token_addresses(ctx: &Ctx) -> HashMap<Symbol, Addr
         .collect()
 }
 
+fn completion_wallet_token_addresses(
+    ctx: &Ctx,
+    unfinished: &completion::UnfinishedListings,
+) -> anyhow::Result<(HashMap<Symbol, Address>, HashMap<Symbol, Address>)> {
+    let mut unwrapped_equity_token_addresses = base_wallet_unwrapped_equity_token_addresses(ctx);
+    let mut wrapped_equity_token_addresses = base_wallet_wrapped_equity_token_addresses(ctx);
+    for (chain, symbol) in unfinished {
+        if *chain != Chain::Base {
+            continue;
+        }
+        let assets = &ctx
+            .chains
+            .hedged_chain(*chain)
+            .context("unfinished Base equity work requires a hedged Base chain")?
+            .assets;
+        let asset = assets.equities.symbols.get(symbol).with_context(|| {
+            format!("unfinished equity work requires the {symbol} listing on {chain}")
+        })?;
+        unwrapped_equity_token_addresses.insert(symbol.clone(), asset.tokenized_equity);
+        wrapped_equity_token_addresses.insert(symbol.clone(), asset.tokenized_equity_derivative);
+    }
+    Ok((
+        unwrapped_equity_token_addresses,
+        wrapped_equity_token_addresses,
+    ))
+}
+
 /// The startup approval targets of every hedged chain, keyed by chain: its
 /// settlement stable and, where the chain rebalances equity, each enabled
 /// equity's wrap and deposit grants -- the deposit grants against the spender
@@ -2132,18 +2164,41 @@ type HedgedChainTokenizations =
 /// is logged as such. A chain carrying the leg without its own redemption
 /// wallet refuses startup naming the chain, rather than borrowing the
 /// primary's: tokens sent to another chain's issuer address are lost.
+#[cfg(test)]
 fn build_chain_tokenizations(
     ctx: &Ctx,
     wallet_ctx: &OnchainWalletCtx,
 ) -> anyhow::Result<HedgedChainTokenizations> {
+    build_chain_tokenizations_for_completion(ctx, wallet_ctx, &BTreeSet::new())
+}
+
+fn build_chain_tokenizations_for_completion(
+    ctx: &Ctx,
+    wallet_ctx: &OnchainWalletCtx,
+    unfinished: &completion::UnfinishedListings,
+) -> anyhow::Result<HedgedChainTokenizations> {
     let BrokerCtx::AlpacaBrokerApi(alpaca_auth) = &ctx.broker;
+    for (chain, symbol) in unfinished {
+        let hedged = ctx
+            .chains
+            .hedged_chain(*chain)
+            .with_context(|| format!("unfinished equity work requires a hedged {chain} chain"))?;
+        anyhow::ensure!(
+            hedged.assets.equities.symbols.contains_key(symbol),
+            "unfinished equity work requires the {symbol} listing on {chain}"
+        );
+    }
 
     ctx.chains
         .hedged_with_roles()
         .map(|(role, hedged)| {
             let chain = hedged.chain;
             let wallet = chain_wallet(wallet_ctx, chain)?.clone();
-            let equity = if role.rebalances_equity(&hedged.assets) {
+            let equity = if role.rebalances_equity(&hedged.assets)
+                || unfinished
+                    .iter()
+                    .any(|(unfinished_chain, _)| *unfinished_chain == chain)
+            {
                 EquityTokenization::Rebalancing(build_equity_tokenization_services(
                     ctx,
                     alpaca_auth,
@@ -2223,17 +2278,35 @@ impl PositionAndRebalancing {
 
         let wallet_ctx = deps.ctx.wallet()?;
         let wallets = ChainWallets::from_wallet_ctx(wallet_ctx);
-        let tokenizations = build_chain_tokenizations(&deps.ctx, wallet_ctx)?;
+        let unfinished = completion::unfinished_listings(&deps.pool).await?;
+        let completion_only = unfinished
+            .iter()
+            .filter(|(chain, symbol)| {
+                deps.ctx.chains.hedged_chain(*chain).is_some_and(|hedged| {
+                    !hedged.assets.rebalancing_mode(symbol).keeps_services()
+                        && !hedged.assets.is_wrapped_equity_recovery_enabled(symbol)
+                })
+            })
+            .count();
+        metrics::gauge!("conductor_completion_only_symbols").set(f64::from(
+            u32::try_from(completion_only).context("completion listing count exceeds u32")?,
+        ));
+        let tokenizations =
+            build_chain_tokenizations_for_completion(&deps.ctx, wallet_ctx, &unfinished)?;
 
         // Computed before `deps` is moved into the spawn call, since
         // `WalletPollingCtx` below also needs the config behind `deps.ctx`.
-        let unwrapped_equity_token_addresses =
-            base_wallet_unwrapped_equity_token_addresses(&deps.ctx);
-        let wrapped_equity_token_addresses = base_wallet_wrapped_equity_token_addresses(&deps.ctx);
+        let (unwrapped_equity_token_addresses, wrapped_equity_token_addresses) =
+            completion_wallet_token_addresses(&deps.ctx, &unfinished)?;
 
-        let infra =
-            spawn_rebalancing_infrastructure(rebalancing_ctx, tokenizations, wallets.clone(), deps)
-                .await?;
+        let infra = spawn_rebalancing_infrastructure(
+            rebalancing_ctx,
+            tokenizations,
+            wallets.clone(),
+            deps,
+            unfinished,
+        )
+        .await?;
 
         // Seed the position_shares gauge for already-open positions: a
         // normal restart does not replay current positions through evolve(),
@@ -2684,15 +2757,16 @@ async fn confirm_configured_assets_respond<P: Provider + Clone + 'static>(
         // A token at another precision answers this read and then mis-scales
         // all of them, so a wrong precision is a config error, not a variant
         // to honour.
-        anyhow::ensure!(
-            decimals == TOKENIZED_EQUITY_DECIMALS,
-            "startup read canary failed: [chains.{chain}] equity {symbol}'s {field} at \
-             {token} reports {decimals} decimals, but every equity amount the bot \
-             scales is {TOKENIZED_EQUITY_DECIMALS}-decimal share-wei; this address is \
-             not the configured equity's token",
-            chain = hedged.chain,
-            field = probed.field(),
-        );
+        if decimals != TOKENIZED_EQUITY_DECIMALS {
+            return Err(registry_candidate::ContractMismatch::Decimals {
+                chain: hedged.chain,
+                symbol: symbol.clone(),
+                token,
+                decimals,
+                field: probed.field(),
+            }
+            .into());
+        }
 
         // A live 18-decimal contract is still any contract: a typo landing on
         // another token answers both reads above and only surfaces when the
@@ -2715,14 +2789,16 @@ async fn confirm_configured_assets_respond<P: Provider + Clone + 'static>(
                         )
                     })?;
 
-                anyhow::ensure!(
-                    attested == underlying,
-                    "startup read canary failed: [chains.{chain}] equity {symbol}'s \
-                     tokenized_equity_derivative at {token} wraps {attested}, but its \
-                     tokenized_equity is {underlying}; this vault belongs to a different \
-                     equity",
-                    chain = hedged.chain,
-                );
+                if attested != underlying {
+                    return Err(registry_candidate::ContractMismatch::Underlying {
+                        chain: hedged.chain,
+                        symbol: symbol.clone(),
+                        token,
+                        expected: underlying,
+                        actual: attested,
+                    }
+                    .into());
+                }
             }
             ProbedToken::UnwrappedEquity => {}
         }
@@ -3180,15 +3256,26 @@ struct EquityGasChain<'chain, Signer: Wallet> {
 /// startup by name rather than admitting transfers against a balance nothing
 /// checks. A chain that rebalances nothing gets no entry at all, so its
 /// `Unwired` readiness refuses a transfer there fail-closed.
+#[cfg(test)]
 fn build_equity_gas_readiness<Signer: Wallet>(
     alerts: &AlertsCtx,
     chains: &[EquityGasChain<'_, Signer>],
     base_wallet: &Signer,
     ethereum_wallet: &Signer,
 ) -> anyhow::Result<BTreeMap<Chain, ConfiguredGasReadiness>> {
+    build_equity_gas_readiness_selected(alerts, chains, base_wallet, ethereum_wallet, false)
+}
+
+fn build_equity_gas_readiness_selected<Signer: Wallet>(
+    alerts: &AlertsCtx,
+    chains: &[EquityGasChain<'_, Signer>],
+    base_wallet: &Signer,
+    ethereum_wallet: &Signer,
+    completion: bool,
+) -> anyhow::Result<BTreeMap<Chain, ConfiguredGasReadiness>> {
     chains
         .iter()
-        .filter(|entry| entry.assets.rebalances_equity())
+        .filter(|entry| completion || entry.assets.rebalances_equity())
         .map(|entry| {
             let readiness = GasReadiness::for_equity_chain(
                 alerts,
@@ -3315,6 +3402,7 @@ fn build_hedged_equity_services<Signer: Wallet + Clone + 'static>(
     vault_registry_projection: &Arc<Projection<VaultRegistry>>,
     tokenizations: &BTreeMap<Chain, ChainTokenization<Signer>>,
     wallets: &ChainWallets<Signer>,
+    unfinished: &completion::UnfinishedListings,
 ) -> anyhow::Result<HedgedEquityServices> {
     let hedged_chain = |chain: Chain| {
         ctx.chains.hedged_chain(chain).with_context(|| {
@@ -3324,6 +3412,13 @@ fn build_hedged_equity_services<Signer: Wallet + Clone + 'static>(
 
     let mut gas_chains = Vec::new();
     for (chain, tokenization) in tokenizations {
+        if !hedged_chain(*chain)?.assets.rebalances_equity()
+            && !unfinished
+                .iter()
+                .any(|(unfinished_chain, _)| unfinished_chain == chain)
+        {
+            continue;
+        }
         gas_chains.push(EquityGasChain {
             chain: *chain,
             assets: &hedged_chain(*chain)?.assets,
@@ -3332,13 +3427,14 @@ fn build_hedged_equity_services<Signer: Wallet + Clone + 'static>(
     }
 
     let (EthereumWallet(ethereum_wallet), BaseWallet(base_wallet)) = wallets.clone().into_parts();
-    let gas_readiness = build_equity_gas_readiness(
+    let gas_readiness = build_equity_gas_readiness_selected(
         ctx.alerts
             .as_ref()
             .context("rebalancing requires [alerts] gas thresholds")?,
         &gas_chains,
         &base_wallet,
         &ethereum_wallet,
+        true,
     )?;
     drop(gas_chains);
 
@@ -3482,6 +3578,7 @@ fn spawn_rebalancing_infrastructure<Signer: Wallet + Clone>(
     tokenizations: BTreeMap<Chain, ChainTokenization<Signer>>,
     wallets: ChainWallets<Signer>,
     deps: RebalancingDeps,
+    unfinished: completion::UnfinishedListings,
 ) -> Pin<Box<dyn Future<Output = anyhow::Result<RebalancingInfrastructure>> + Send>> {
     let rebalancing_ctx = Arc::new(rebalancing_ctx);
 
@@ -3507,6 +3604,7 @@ fn spawn_rebalancing_infrastructure<Signer: Wallet + Clone>(
             &deps.vault_registry_projection,
             &tokenizations,
             &wallets,
+            &unfinished,
         )?;
 
         let (EthereumWallet(ethereum_wallet), _) = wallets.clone().into_parts();
@@ -10765,6 +10863,7 @@ mod tests {
             &projection,
             &tokenizations,
             &ChainWallets::from_wallet_ctx(&wallet_ctx),
+            &BTreeSet::new(),
         )
         .unwrap();
         let mut secondary = built.chains[&Chain::Ethereum].clone();
@@ -20429,6 +20528,62 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn unfinished_disabled_recovery_keeps_wallet_balance_polling() {
+        let mut ctx = create_test_ctx_with_order_owner(Address::ZERO);
+        let symbol = Symbol::new("AAPL").unwrap();
+        let token = Address::repeat_byte(0xa5);
+        let wrapped = Address::repeat_byte(0xa6);
+        let mut asset = equity_asset(token, wrapped);
+        asset.trading = OperationMode::Disabled;
+        ctx.chains
+            .primary_mut()
+            .assets
+            .equities
+            .symbols
+            .insert(symbol.clone(), asset);
+        let unfinished = BTreeSet::from([(Chain::Base, symbol.clone())]);
+        let (unwrapped, derivatives) =
+            completion_wallet_token_addresses(&ctx, &unfinished).unwrap();
+        assert_eq!(unwrapped[&symbol], token);
+        assert_eq!(derivatives[&symbol], wrapped);
+        assert!(!base_wallet_equity_recovery_enabled(&ctx, &symbol));
+        assert!(!base_wallet_unwrapped_equity_token_addresses(&ctx).contains_key(&symbol));
+    }
+
+    #[test]
+    fn disabled_secondary_retains_services_for_unfinished_work_without_admission() {
+        let mut ctx = create_test_ctx_with_order_owner(Address::ZERO);
+        ctx.broker = alpaca_broker_ctx();
+        ctx.chains.primary_mut().redemption_wallet = Some(Address::repeat_byte(0xb1));
+        ctx.chains.insert_secondary(ethereum_hedged_chain(
+            Some(Address::repeat_byte(0xe1)),
+            RebalancingMode::Disabled,
+            ETHEREUM_INVENTORY,
+        ));
+        let symbol = Symbol::new("TSLA").unwrap();
+        let unfinished = BTreeSet::from([(Chain::Ethereum, symbol)]);
+        let tokenizations =
+            build_chain_tokenizations_for_completion(&ctx, &OnchainWalletCtx::stub(), &unfinished)
+                .unwrap();
+        assert!(matches!(
+            tokenizations[&Chain::Ethereum].equity,
+            EquityTokenization::Rebalancing(_)
+        ));
+        assert!(
+            !ctx.chains
+                .hedged_chain(Chain::Ethereum)
+                .unwrap()
+                .assets
+                .rebalances_equity()
+        );
+        assert!(
+            startup_approval_targets(&ctx)[&Chain::Ethereum]
+                .iter()
+                .all(|target| target.symbol.is_none())
+        );
+    }
+
     /// A hedged chain that rebalances equity without its own issuer
     /// redemption wallet cannot redeem, so building its services fails
     /// startup naming that chain rather than borrowing the primary's wallet.
@@ -20701,6 +20856,33 @@ mod tests {
             Duration::from_secs(30),
             Duration::from_secs(300),
         )
+    }
+
+    #[test]
+    fn completion_equity_gas_readiness_is_wired_with_admission_disabled() {
+        let base = st0x_evm::StubWallet::stub(Address::with_last_byte(1));
+        let ethereum = st0x_evm::StubWallet::stub(Address::with_last_byte(2));
+        let mut assets = rebalancing_equity_assets();
+        for asset in assets.equities.symbols.values_mut() {
+            asset.rebalancing = RebalancingMode::Disabled;
+        }
+        let readiness = build_equity_gas_readiness_selected(
+            &gas_threshold_alerts(),
+            &[EquityGasChain {
+                chain: Chain::Ethereum,
+                assets: &assets,
+                wallet: &ethereum,
+            }],
+            &base,
+            &ethereum,
+            true,
+        )
+        .unwrap();
+        assert!(matches!(
+            readiness[&Chain::Ethereum],
+            ConfiguredGasReadiness::Wired(_)
+        ));
+        assert!(!assets.rebalances_equity());
     }
 
     /// A chain whose equities opt into rebalancing must carry its own

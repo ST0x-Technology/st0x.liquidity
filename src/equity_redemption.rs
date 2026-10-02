@@ -3632,21 +3632,59 @@ pub(crate) async fn interrupted_redemption_ids(
         .fetch_all(pool)
         .await?;
 
-    Ok(rows
-        .into_iter()
-        .filter_map(|aggregate_id| {
+    rows.into_iter()
+        .map(|aggregate_id| {
             aggregate_id
                 .parse::<RedemptionAggregateId>()
-                .inspect_err(|error| {
-                    warn!(target: "rebalance",
-                        %error,
-                        %aggregate_id,
-                        "Interrupted redemption has invalid aggregate id, skipping"
-                    );
-                })
-                .ok()
+                .map_err(|error| sqlx::Error::Decode(Box::new(error)))
         })
-        .collect())
+        .collect()
+}
+
+/// Returns redemption aggregate IDs that failed after their tokens left the
+/// wallet and are not yet recovered or reconciled. The provider may still
+/// settle them, so provider-completion recovery needs their chain's
+/// tokenization services.
+pub(crate) async fn failed_sent_redemption_ids(
+    pool: &SqlitePool,
+) -> Result<Vec<RedemptionAggregateId>, sqlx::Error> {
+    let rows: Vec<String> = sqlx::query_scalar(
+        "
+        WITH latest AS (
+            SELECT aggregate_id, MAX(sequence) AS max_seq
+            FROM events
+            WHERE aggregate_type = 'EquityRedemption'
+            GROUP BY aggregate_id
+        )
+        SELECT latest.aggregate_id
+        FROM events last_ev
+        INNER JOIN latest
+            ON last_ev.aggregate_id = latest.aggregate_id
+           AND last_ev.sequence = latest.max_seq
+        WHERE last_ev.aggregate_type = 'EquityRedemption'
+          AND (
+            last_ev.event_type IN (
+                'EquityRedemptionEvent::DetectionFailed',
+                'EquityRedemptionEvent::RedemptionRejected'
+            )
+            OR (
+                last_ev.event_type = 'EquityRedemptionEvent::TransferFailed'
+                AND json_extract(last_ev.payload, '$.TransferFailed.tx_hash') IS NOT NULL
+            )
+          )
+        ORDER BY latest.aggregate_id
+        ",
+    )
+    .fetch_all(pool)
+    .await?;
+
+    rows.into_iter()
+        .map(|aggregate_id| {
+            aggregate_id
+                .parse::<RedemptionAggregateId>()
+                .map_err(|error| sqlx::Error::Decode(Box::new(error)))
+        })
+        .collect()
 }
 
 fn parse_stuck_symbol(aggregate_id: &str, raw: Option<String>) -> Option<Symbol> {
@@ -6330,6 +6368,19 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn interrupted_redemption_ids_refuses_invalid_durable_identity() {
+        let pool = crate::test_utils::setup_test_db().await;
+        sqlx::query(
+            "INSERT INTO events (aggregate_type, aggregate_id, sequence, event_type, event_version, payload, metadata) \
+             VALUES ('EquityRedemption', 'invalid-id', 1, 'EquityRedemptionEvent::WithdrawnFromRaindex', '1', ?, '{}')",
+        ).bind(withdrawn_payload("AAPL")).execute(&pool).await.unwrap();
+        assert!(matches!(
+            interrupted_redemption_ids(&pool).await,
+            Err(sqlx::Error::Decode(_))
+        ));
+    }
+
+    #[tokio::test]
     async fn interrupted_redemption_ids_returns_only_non_terminal_redemptions() {
         let pool = crate::test_utils::setup_test_db().await;
 
@@ -6369,6 +6420,91 @@ mod tests {
 
         let result = interrupted_redemption_ids(&pool).await.unwrap();
         assert_eq!(result, vec![redemption_aggregate_id("resume-me")]);
+    }
+
+    #[tokio::test]
+    async fn failed_sent_redemption_ids_keeps_only_unresolved_sent_failures() {
+        let pool = crate::test_utils::setup_test_db().await;
+        let sent = r#"{"TokensSent":{"redemption_wallet":"0x0000000000000000000000000000000000000001","redemption_tx":"0x0000000000000000000000000000000000000000000000000000000000000002","sent_at":"2026-01-01T00:00:00Z"}}"#;
+        let detection_failed =
+            r#"{"DetectionFailed":{"failure":"Timeout","failed_at":"2026-01-01T00:00:00Z"}}"#;
+        for (name, tail) in [
+            (
+                "rejected",
+                vec![(
+                    "EquityRedemptionEvent::RedemptionRejected",
+                    r#"{"RedemptionRejected":{"reason":"no","rejected_at":"2026-01-01T00:00:00Z"}}"#,
+                )],
+            ),
+            (
+                "undetected",
+                vec![("EquityRedemptionEvent::DetectionFailed", detection_failed)],
+            ),
+            (
+                "reconciled",
+                vec![
+                    ("EquityRedemptionEvent::DetectionFailed", detection_failed),
+                    (
+                        "EquityRedemptionEvent::OperatorReconciled",
+                        r#"{"OperatorReconciled":{"reason":"done","reconciled_at":"2026-01-01T00:00:00Z"}}"#,
+                    ),
+                ],
+            ),
+        ] {
+            let id = redemption_aggregate_id(name);
+            insert_event(
+                &pool,
+                &id,
+                0,
+                "EquityRedemptionEvent::WithdrawnFromRaindex",
+                &withdrawn_payload("AAPL"),
+            )
+            .await;
+            insert_event(&pool, &id, 1, "EquityRedemptionEvent::TokensSent", sent).await;
+            for (offset, (event_type, payload)) in tail.into_iter().enumerate() {
+                insert_event(
+                    &pool,
+                    &id,
+                    2 + i64::try_from(offset).unwrap(),
+                    event_type,
+                    payload,
+                )
+                .await;
+            }
+        }
+        for (name, tx_hash) in [
+            (
+                "send-landed",
+                r#""0x0000000000000000000000000000000000000000000000000000000000000003""#,
+            ),
+            ("never-sent", "null"),
+        ] {
+            let id = redemption_aggregate_id(name);
+            insert_event(
+                &pool,
+                &id,
+                0,
+                "EquityRedemptionEvent::WithdrawnFromRaindex",
+                &withdrawn_payload("TSLA"),
+            )
+            .await;
+            insert_event(
+                &pool,
+                &id,
+                1,
+                "EquityRedemptionEvent::TransferFailed",
+                &format!(r#"{{"TransferFailed":{{"tx_hash":{tx_hash},"failed_at":"2026-01-01T00:00:00Z"}}}}"#),
+            )
+            .await;
+        }
+
+        let mut want = vec![
+            redemption_aggregate_id("rejected"),
+            redemption_aggregate_id("send-landed"),
+            redemption_aggregate_id("undetected"),
+        ];
+        want.sort_by_key(ToString::to_string);
+        assert_eq!(failed_sent_redemption_ids(&pool).await.unwrap(), want);
     }
 
     #[tokio::test]

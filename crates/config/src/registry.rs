@@ -1017,10 +1017,24 @@ pub fn describe_change(live: &Projection, fresh: &Projection) -> Option<String> 
 /// What the bot keeps after boot, so the refresh loop can compare.
 #[derive(Debug, Clone)]
 pub struct RegistryLive {
+    /// Opaque boot inputs used to validate registry candidates.
+    pub(crate) inputs: Option<std::sync::Arc<crate::loader::RegistryInputs>>,
     pub source: RegistrySource,
     /// The config table as parsed from disk, BEFORE the merge.
     pub static_config: Table,
     pub live: Projection,
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl RegistryLive {
+    pub fn for_test(source: RegistrySource, static_config: Table, live: Projection) -> Self {
+        Self {
+            source,
+            static_config,
+            live,
+            inputs: None,
+        }
+    }
 }
 
 #[cfg(test)]
