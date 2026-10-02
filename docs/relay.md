@@ -4,7 +4,8 @@ Relay moves the Robinhood corridor's cash between USDG on Robinhood (chain 4663)
 and USDC on Ethereum (chain 1). We approve and deposit on the origin chain into
 Relay's depository; Relay's solver pays the recipient on the destination chain
 from its own funds. The client is `st0x_bridge::relay`, behind the `relay`
-feature.
+feature: `RelayClient` speaks the HTTP API, and `RelayBridge` (the `SwapBridge`
+implementation) signs the deposit and proves the payment on chain.
 
 Facts here come from live quotes and status reads (2026-09-22) and the funded
 test of 2026-10-01 (RAI-2586: 5 USDG to Ethereum, the USDC back, one forced
@@ -185,4 +186,77 @@ would refuse an honest quote.
   was paid on the origin chain in USDG: 2.995154 USDG 15 s after the quote, with
   `failReason: DEPOSITED_AMOUNT_TOO_LOW_TO_FILL`.
 
-Both fills paid exactly the quoted expected amount, in 32 and 59 s.
+Both fills paid exactly the quoted expected amount, in 32 and 59 s. The fill and
+refund txs and the deposit receipts are pinned in
+`crates/bridge/relay-fixtures/` (`fill_*`, `refund_*`, `deposit_receipt_*`).
+
+## RelayBridge
+
+`RelayBridge<EthWallet, ChainWallet>` holds the Ethereum hub and one corridor
+chain, and serves both directions (`HopDirection::ToHub`, `FromHub`).
+
+### Deposit
+
+`prepare_deposit` signs the approve and the deposit on the origin chain without
+broadcasting them, at consecutive nonces, and returns both
+`PreparedTransaction`s (`PreparedSwap::Deposit`) for the caller to persist. It
+refuses a step for another chain than the wallet's, a step that calls another
+contract than the origin's stable (approve) or depository (deposit), and a
+deposit that credits another depositor than the signing wallet.
+
+- The approve is estimated and padded as usual. With no approve step in the
+  quote, the bridge reads the allowance and signs its own exact
+  `approve(depository, amount)` when it falls short.
+- The deposit cannot be estimated while its approve is unmined, so it is signed
+  with a pinned `RELAY_DEPOSIT_GAS_LIMIT` of 57,114, the larger `gasUsed` of the
+  funded test's deposits (49,083 on Ethereum), padded by the wallet to 85,671.
+
+Another send from the same wallet between the two signs takes the nonce in
+between. Then `prepare_deposit` discards only the deposit and returns
+`PreparedSwap::ApproveOnly`: the caller persists the approve, sends it alone
+with `broadcast_approve` and prepares the deposit again. Discarding the approve
+too would leave its nonce as a gap that the other send waits behind and that a
+retry, rewound to it, splits again. An approve to our own pinned depository is
+harmless alone; the retry finds the allowance and signs only the deposit, or
+signs a fresh pair. `broadcast_deposit` sends the approve and then the deposit,
+refusing a pair that is not consecutive with `PairNonces`; a repeat sends the
+same bytes. `confirm_deposit` waits for the origin chain's confirmations and
+requires a `RelayErc20Deposit` from our wallet, in the origin stable, for the
+order id.
+
+`find_recent_deposits` scans the depository's logs from a captured
+`origin_block` in 10,000-block chunks, decodes each, and returns our deposits
+for any of a set of order ids, with the last block it scanned. The scan stops at
+the newest block with the origin chain's confirmations, counting the inclusion
+block (`RelayCtx` takes each end's count, at least 1, the same its wallet waits
+for): a lagging load-balanced node may not have indexed the newest blocks, and a
+deposit there is not confirmed yet. Orders stay fillable for about a week
+(`RelayQuote::deadline`), so the scan takes whatever floor the caller gives it;
+no shorter window is assumed.
+
+### Proofs
+
+`verify_fill` and `verify_refund` take the txs Relay names
+(`IntentStatusReport::txs`) and require exactly one. The tx is looked up on both
+chains; a tx on neither is `RelayBridgeError::TxNotFound` (retry later, the node
+may lag). The bridge waits for that chain's configured confirmations, then
+requires:
+
+- receipt success;
+- the tx calls that side's stable, with exactly `transferFrom` + one trailing
+  word of calldata;
+- the calldata `to` is our wallet on that chain and the trailing word is the
+  order id;
+- the calldata `from` is not our wallet and the amount is not zero, so neither a
+  transfer of our own funds back to us nor an empty `transferFrom` anyone can
+  send with any order id passes;
+- exactly one `Transfer` of that stable to our wallet, from the calldata's
+  `from`, whose amount equals the calldata amount.
+
+A fill must be on the destination chain and pay at least the quote's
+`minimum_out`. A refund may be on either chain, checked against that chain's
+stable and wallet, and must not exceed the deposited amount (both stables have 6
+decimals, so the amounts compare unit for unit; Relay quotes a refund minimum of
+0). A refund paid on the destination chain looks exactly like a fill, so the
+side alone does not tell them apart: Relay's status does. A failed check is
+`FillUnverified` or `RefundUnverified` with an `UnverifiedReason`.
