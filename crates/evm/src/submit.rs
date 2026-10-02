@@ -187,11 +187,15 @@ const FEE_BUMP_PCT_PER_ATTEMPT: u64 = 15;
 /// whole padded limit, and the node admits a transaction only when the
 /// sender holds `gas_limit * max_fee_per_gas`. Raising this raises both.
 ///
-/// The padded limit is not capped at the chain's per-transaction or block gas
-/// limit. Every call we send estimates far below either, so a padded limit
-/// cannot reach them; a call estimating above two thirds of a cap would be
-/// rejected by the node.
+/// A padded estimate is not capped: every call we send estimates far below
+/// [`MAX_TX_GAS_LIMIT`]. A pinned limit is bounds-checked instead.
 const GAS_LIMIT_HEADROOM_PCT: u64 = 50;
+
+/// Intrinsic gas of any transaction; a lower gas limit cannot be included.
+const INTRINSIC_GAS: u64 = 21_000;
+
+/// EIP-7825 per-transaction gas cap (2^24); the node rejects a larger limit.
+const MAX_TX_GAS_LIMIT: u64 = 1 << 24;
 
 /// Minimum absolute headroom, in gas, added on top of `eth_estimateGas`.
 ///
@@ -217,8 +221,20 @@ pub(crate) fn pad_gas_estimate(estimate: u64) -> Result<u64, EvmError> {
         .ok_or(EvmError::GasLimitOverflow { estimate })
 }
 
-/// Pin `tx`'s gas limit to the padded `eth_estimateGas` result (see
-/// [`pad_gas_estimate`]).
+/// Where a transaction's unpadded gas limit comes from; either way the signed
+/// limit is the [`pad_gas_estimate`] of it.
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum GasLimitSource {
+    /// `eth_estimateGas` against current state.
+    Estimate,
+    /// A caller-supplied unpadded limit, for a call whose estimate would revert
+    /// because a transaction it depends on has not mined yet. Refused below
+    /// [`INTRINSIC_GAS`] or when padded past [`MAX_TX_GAS_LIMIT`].
+    Pinned(u64),
+}
+
+/// Pin `tx`'s gas limit to the padded `eth_estimateGas` result, or to the
+/// padded caller-supplied limit (see [`pad_gas_estimate`]).
 ///
 /// The estimate runs before the filler chain, so `tx` must carry `from`
 /// itself. `FillProvider::estimate_gas` sets it only when the provider has a
@@ -233,13 +249,23 @@ pub(crate) fn pad_gas_estimate(estimate: u64) -> Result<u64, EvmError> {
 async fn pin_padded_gas_limit<F, P>(
     provider: &FillProvider<F, P, Ethereum>,
     tx: TransactionRequest,
+    gas_limit: GasLimitSource,
 ) -> Result<TransactionRequest, EvmError>
 where
     F: TxFiller<Ethereum>,
     P: Provider<Ethereum>,
 {
-    let estimate = provider.estimate_gas(tx.clone()).await?;
-    Ok(tx.gas_limit(pad_gas_estimate(estimate)?))
+    let padded = match gas_limit {
+        GasLimitSource::Estimate => pad_gas_estimate(provider.estimate_gas(tx.clone()).await?)?,
+        GasLimitSource::Pinned(unpadded) => {
+            let padded = pad_gas_estimate(unpadded)?;
+            if unpadded < INTRINSIC_GAS || padded > MAX_TX_GAS_LIMIT {
+                return Err(EvmError::PinnedGasLimitOutOfBounds { unpadded, padded });
+            }
+            padded
+        }
+    };
+    Ok(tx.gas_limit(padded))
 }
 
 /// Scale a fee value up by `pct` percent with checked arithmetic, rounding
@@ -324,7 +350,7 @@ where
     P: Provider<Ethereum>,
 {
     async fn submit(&self, tx: TransactionRequest) -> Result<TxHash, EvmError> {
-        let tx = pin_padded_gas_limit(self, tx).await?;
+        let tx = pin_padded_gas_limit(self, tx, GasLimitSource::Estimate).await?;
 
         // `FillProvider::fill` runs the filler chain until all dependencies are
         // satisfied, then returns the signed envelope without broadcasting.
@@ -381,6 +407,7 @@ pub(crate) async fn prepare_with_nonce<F, P>(
     address: Address,
     contract: Address,
     calldata: Bytes,
+    gas_limit: GasLimitSource,
 ) -> Result<PreparedTransaction, EvmError>
 where
     F: TxFiller<Ethereum>,
@@ -396,7 +423,7 @@ where
         .input(calldata.into())
         .nonce(nonce);
     let envelope_result: Result<_, EvmError> = async {
-        let tx = pin_padded_gas_limit(submitter, tx).await?;
+        let tx = pin_padded_gas_limit(submitter, tx, gas_limit).await?;
         let sendable = submitter.fill(tx).await?;
         sendable
             .try_into_envelope()

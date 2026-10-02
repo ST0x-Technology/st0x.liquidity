@@ -1456,6 +1456,16 @@ mod tests {
             )))
         }
 
+        async fn prepare_pending_with_gas_limit(
+            &self,
+            _contract: Address,
+            _calldata: Bytes,
+            _unpadded_gas_limit: u64,
+            _note: &str,
+        ) -> Result<PreparedTransaction, EvmError> {
+            unreachable!("prepare_withdraw must not pin a gas limit")
+        }
+
         async fn broadcast_prepared(
             &self,
             _prepared: &PreparedTransaction,

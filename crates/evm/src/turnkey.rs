@@ -44,8 +44,8 @@ use crate::gcp_kms_stamper::{GcpKmsStamper, GcpKmsStamperError};
 use crate::inflight_nonces::{DiscardedNonce, InFlightNonces};
 use crate::nonce::ResettableNonceManager;
 use crate::submit::{
-    broadcast_prepared, discard_prepared, prepare_with_nonce, release_in_flight_after_wait,
-    restore_prepared, restore_transaction, send_with_recovery,
+    GasLimitSource, broadcast_prepared, discard_prepared, pad_gas_estimate, prepare_with_nonce,
+    release_in_flight_after_wait, restore_prepared, restore_transaction, send_with_recovery,
 };
 use crate::{Evm, EvmError, PreparedTransaction, TryIntoWallet, Wallet, WalletCtx};
 
@@ -1166,6 +1166,35 @@ where
             self.address,
             contract,
             calldata,
+            GasLimitSource::Estimate,
+        )
+        .await
+    }
+
+    async fn prepare_pending_with_gas_limit(
+        &self,
+        contract: Address,
+        calldata: Bytes,
+        unpadded_gas_limit: u64,
+        note: &str,
+    ) -> Result<PreparedTransaction, EvmError> {
+        info!(
+            target: "wallet",
+            %contract,
+            unpadded_gas_limit,
+            padded_gas_limit = ?pad_gas_estimate(unpadded_gas_limit).ok(),
+            note,
+            "Preparing Turnkey contract call with a pinned gas limit"
+        );
+        prepare_with_nonce(
+            &self.signing_provider,
+            &self.nonce_manager,
+            &self.in_flight,
+            &self.send_lock,
+            self.address,
+            contract,
+            calldata,
+            GasLimitSource::Pinned(unpadded_gas_limit),
         )
         .await
     }

@@ -22,8 +22,8 @@ use tracing::info;
 use crate::inflight_nonces::{DiscardedNonce, InFlightNonces};
 use crate::nonce::ResettableNonceManager;
 use crate::submit::{
-    broadcast_prepared, discard_prepared, prepare_with_nonce, release_in_flight_after_wait,
-    restore_prepared, restore_transaction, send_with_recovery,
+    GasLimitSource, broadcast_prepared, discard_prepared, pad_gas_estimate, prepare_with_nonce,
+    release_in_flight_after_wait, restore_prepared, restore_transaction, send_with_recovery,
 };
 use crate::{Evm, EvmError, PreparedTransaction, TryIntoWallet, Wallet, WalletCtx};
 
@@ -207,6 +207,35 @@ where
             self.address(),
             contract,
             calldata,
+            GasLimitSource::Estimate,
+        )
+        .await
+    }
+
+    async fn prepare_pending_with_gas_limit(
+        &self,
+        contract: Address,
+        calldata: Bytes,
+        unpadded_gas_limit: u64,
+        note: &str,
+    ) -> Result<PreparedTransaction, EvmError> {
+        info!(
+            target: "wallet",
+            %contract,
+            unpadded_gas_limit,
+            padded_gas_limit = ?pad_gas_estimate(unpadded_gas_limit).ok(),
+            note,
+            "Preparing local contract call with a pinned gas limit"
+        );
+        prepare_with_nonce(
+            &self.signing_provider,
+            &self.nonce_manager,
+            &self.in_flight,
+            &self.send_lock,
+            self.address(),
+            contract,
+            calldata,
+            GasLimitSource::Pinned(unpadded_gas_limit),
         )
         .await
     }
@@ -323,7 +352,8 @@ where
 
 #[cfg(test)]
 mod tests {
-    use alloy::consensus::Transaction as _;
+    use alloy::consensus::{Transaction as _, TxEnvelope};
+    use alloy::eips::eip2718::Decodable2718 as _;
     use alloy::node_bindings::{Anvil, AnvilInstance};
     use alloy::primitives::U256;
     use alloy::providers::ext::AnvilApi as _;
@@ -333,7 +363,7 @@ mod tests {
     use alloy::sol_types::SolCall as _;
 
     use crate::inflight_nonces::NonceOwnership;
-    use crate::submit::{GAS_LIMIT_HEADROOM_MIN, pad_gas_estimate, release_in_flight_after_wait};
+    use crate::submit::{GAS_LIMIT_HEADROOM_MIN, release_in_flight_after_wait};
     use crate::{NoOpErrorRegistry, ReceiptWaitConfig, wait_for_receipt_with_config};
 
     use super::*;
@@ -621,6 +651,202 @@ mod tests {
             .unwrap()
             .gas_limit();
         assert_eq!(gas_limit, pad_gas_estimate(unpadded_estimate).unwrap());
+    }
+
+    /// Calldata for `transferFrom(wallet, recipient, amount)` sent by the wallet itself, which
+    /// spends its own allowance: it reverts until a matching approve has mined.
+    fn self_transfer_from_calldata(owner: Address, recipient: Address, amount: U256) -> Bytes {
+        Bytes::from(
+            IERC20::transferFromCall {
+                from: owner,
+                to: recipient,
+                amount,
+            }
+            .abi_encode(),
+        )
+    }
+
+    #[tokio::test]
+    async fn prepared_pair_holds_consecutive_nonces() {
+        let (anvil, wallet, token_address, signer_address) = setup_anvil_with_token().await;
+        let recipient = anvil.addresses()[1];
+        let amount = U256::from(1000);
+        let approve_calldata = Bytes::from(
+            IERC20::approveCall {
+                spender: signer_address,
+                amount,
+            }
+            .abi_encode(),
+        );
+
+        let approve = wallet
+            .prepare_pending(token_address, approve_calldata, "approve")
+            .await
+            .unwrap();
+        let deposit = wallet
+            .prepare_pending_with_gas_limit(
+                token_address,
+                self_transfer_from_calldata(signer_address, recipient, amount),
+                100_000,
+                "dependent transfer",
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(deposit.nonce(), approve.nonce() + 1);
+        assert_eq!(
+            wallet.in_flight.ownership(signer_address, approve.nonce()),
+            NonceOwnership::Ours
+        );
+        assert_eq!(
+            wallet.in_flight.ownership(signer_address, deposit.nonce()),
+            NonceOwnership::Ours
+        );
+
+        wallet
+            .broadcast_prepared(&approve, "approve")
+            .await
+            .unwrap();
+        wallet
+            .broadcast_prepared(&deposit, "dependent transfer")
+            .await
+            .unwrap();
+        let approve_receipt = wallet.await_receipt(approve.tx_hash()).await.unwrap();
+        let deposit_receipt = wallet.await_receipt(deposit.tx_hash()).await.unwrap();
+        assert!(approve_receipt.status(), "approve must succeed");
+        assert!(
+            deposit_receipt.status(),
+            "the pinned limit must carry the dependent transfer once its approve mined"
+        );
+        let balance: U256 = wallet
+            .call::<NoOpErrorRegistry, _>(
+                token_address,
+                IERC20::balanceOfCall { account: recipient },
+            )
+            .await
+            .unwrap();
+        assert_eq!(balance, amount);
+    }
+
+    #[tokio::test]
+    async fn pinned_gas_limit_is_not_reestimated() {
+        let (anvil, wallet, token_address, signer_address) = setup_anvil_with_token().await;
+        let calldata =
+            self_transfer_from_calldata(signer_address, anvil.addresses()[1], U256::from(1000));
+        let estimate_error = wallet
+            .provider()
+            .estimate_gas(
+                TransactionRequest::default()
+                    .from(signer_address)
+                    .to(token_address)
+                    .input(calldata.clone().into()),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            estimate_error
+                .as_error_resp()
+                .is_some_and(|payload| payload.message.contains("execution reverted")),
+            "without an approve the estimate must revert, got {estimate_error:?}"
+        );
+        let pinned = 70_000;
+
+        let prepared = wallet
+            .prepare_pending_with_gas_limit(token_address, calldata, pinned, "dependent transfer")
+            .await
+            .unwrap();
+
+        let envelope = TxEnvelope::decode_2718_exact(prepared.raw().as_ref()).unwrap();
+        assert_eq!(envelope.gas_limit(), pad_gas_estimate(pinned).unwrap());
+        wallet.discard_prepared(prepared.tx_hash()).await;
+    }
+
+    #[tokio::test]
+    async fn pinned_gas_limit_overflow_rolls_back_nonce() {
+        let (_anvil, wallet, token_address, signer_address) = setup_anvil_with_token().await;
+        let nonce = wallet
+            .provider()
+            .get_transaction_count(signer_address)
+            .await
+            .unwrap();
+
+        let error = wallet
+            .prepare_pending_with_gas_limit(token_address, Bytes::new(), u64::MAX, "overflow")
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(error, EvmError::GasLimitOverflow { estimate: u64::MAX }),
+            "expected GasLimitOverflow, got {error:?}"
+        );
+        assert_eq!(
+            wallet.nonce_manager.peek_next_nonce(signer_address).await,
+            Some(nonce),
+            "the failed preparation must roll back its nonce reservation"
+        );
+    }
+
+    #[tokio::test]
+    async fn pinned_gas_limit_below_intrinsic_gas_rolls_back_nonce() {
+        let (_anvil, wallet, token_address, signer_address) = setup_anvil_with_token().await;
+        let nonce = wallet
+            .provider()
+            .get_transaction_count(signer_address)
+            .await
+            .unwrap();
+
+        let error = wallet
+            .prepare_pending_with_gas_limit(token_address, Bytes::new(), 0, "below intrinsic")
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                EvmError::PinnedGasLimitOutOfBounds {
+                    unpadded: 0,
+                    padded: 20_000
+                }
+            ),
+            "expected PinnedGasLimitOutOfBounds, got {error:?}"
+        );
+        assert_eq!(
+            wallet.nonce_manager.peek_next_nonce(signer_address).await,
+            Some(nonce),
+            "the failed preparation must roll back its nonce reservation"
+        );
+    }
+
+    #[tokio::test]
+    async fn pinned_gas_limit_padded_past_the_tx_cap_rolls_back_nonce() {
+        let (_anvil, wallet, token_address, signer_address) = setup_anvil_with_token().await;
+        let nonce = wallet
+            .provider()
+            .get_transaction_count(signer_address)
+            .await
+            .unwrap();
+
+        // 1.5x of 11,184,811 rounds up to 16,777,217: one gas over the 2^24 cap.
+        let error = wallet
+            .prepare_pending_with_gas_limit(token_address, Bytes::new(), 11_184_811, "past cap")
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                EvmError::PinnedGasLimitOutOfBounds {
+                    unpadded: 11_184_811,
+                    padded: 16_777_217
+                }
+            ),
+            "expected PinnedGasLimitOutOfBounds, got {error:?}"
+        );
+        assert_eq!(
+            wallet.nonce_manager.peek_next_nonce(signer_address).await,
+            Some(nonce),
+            "the failed preparation must roll back its nonce reservation"
+        );
     }
 
     #[tokio::test]
