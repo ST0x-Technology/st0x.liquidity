@@ -135,7 +135,7 @@ use crate::rebalancing::trigger::{FillPriceOrMark, GUARD_GENERATION, GuardGenera
 use crate::rebalancing::usdc::{
     RecheckUsdcDeposit, RecoverCctpMint, RestoredDepositSends, TransferUsdcToHedging,
     TransferUsdcToHedgingCtx, TransferUsdcToMarketMaking, TransferUsdcToMarketMakingCtx,
-    UsdcDriverPause, UsdcSettlementParams,
+    UnrecordedGuardRelease, UsdcDriverPause, UsdcSettlementParams,
 };
 use crate::rebalancing::{
     BaseWallet, ChainRebalancingConfig, ChainWallets, EthereumWallet, RebalancerServices,
@@ -3758,12 +3758,21 @@ fn spawn_rebalancing_infrastructure<Signer: Wallet + Clone>(
             job_queue: mint_authorization.queue.clone(),
         });
 
+        // Each worker frees the corridor guard of a transfer whose job dies
+        // before recording any event, so both share the service's guards and
+        // the store those events would be in.
+        let unrecorded_guards = || UnrecordedGuardRelease {
+            guards: Arc::clone(&rebalancing_service.usdc_guards),
+            store: Arc::clone(&recovery_usdc_store),
+        };
+
         let transfer_usdc_to_market_making_ctx = Arc::new(TransferUsdcToMarketMakingCtx {
             transfer: usdc_handles.resume_alpaca_to_base,
             job_queue: deps.schedulers.transfer_usdc_to_market_making.clone(),
             max_burn_revert_redrives: rebalancing_ctx.max_burn_revert_redrives,
             notifier: deps.notifier.clone(),
             driver_gate: usdc_driver_gate.clone(),
+            unrecorded_guards: Some(unrecorded_guards()),
         });
 
         let transfer_usdc_to_hedging_ctx = Arc::new(TransferUsdcToHedgingCtx {
@@ -3773,6 +3782,7 @@ fn spawn_rebalancing_infrastructure<Signer: Wallet + Clone>(
             max_burn_revert_redrives: rebalancing_ctx.max_burn_revert_redrives,
             notifier: deps.notifier.clone(),
             driver_gate: usdc_driver_gate,
+            unrecorded_guards: Some(unrecorded_guards()),
         });
 
         let transfer_equity_to_market_making_ctx = Arc::new(TransferEquityToMarketMakingCtx {

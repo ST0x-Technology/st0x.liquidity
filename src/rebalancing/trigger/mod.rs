@@ -12,6 +12,7 @@ pub(crate) use equity::{
     FillPriceOrMark, GUARD_GENERATION, GuardGeneration, GuardState, HedgeCapacity, LastPriceReader,
     RecoveryGuard, claim_guard_for_recovery_or_orphan, remove_active_transfer,
 };
+pub(crate) use usdc_guard::UsdcCashGuards;
 
 use alloy::primitives::{Address, TxHash};
 use async_trait::async_trait;
@@ -56,7 +57,7 @@ use self::allocation::{
 };
 use self::freeze::FreezeStatusReader;
 use self::usdc::UsdcRebalanceOperation;
-use self::usdc_guard::{ClaimRefusal, UsdcCashGuards};
+use self::usdc_guard::ClaimRefusal;
 #[cfg(test)]
 use crate::alerts::LogNotifier;
 #[cfg(test)]
@@ -9056,6 +9057,7 @@ mod tests {
     use crate::inventory::{ActiveUsdcRebalance, InventoryError, InventoryView, TransferOp, Venue};
     use crate::mint_authorization::ConfiguredMintAuthorizer;
     use crate::native_gas::GasReadiness;
+    use crate::native_gas::GasReadinessFailure;
     use crate::offchain::order::OffchainOrderId;
     use crate::onchain::mock::MockRaindex;
     use crate::position::{
@@ -9068,7 +9070,8 @@ mod tests {
         TransferEquityToMarketMakingJobError,
     };
     use crate::rebalancing::usdc::{
-        ResumeBaseToAlpaca, TransferUsdcToHedgingCtx, UsdcTransferError,
+        ResumeAlpacaToBase, ResumeBaseToAlpaca, TransferUsdcToHedgingCtx,
+        TransferUsdcToMarketMakingCtx, UnrecordedGuardRelease, UsdcTransferError,
     };
     use crate::test_utils::rebalancing_enabled_equities;
     use crate::tokenized_equity_mint::TokenizedEquityMintCommand;
@@ -19115,6 +19118,291 @@ mod tests {
             "got {error:?}"
         );
         assert!(market_making_job_rows(&trigger).await.is_empty());
+    }
+
+    /// Fails every attempt of an Alpaca to Base transfer the way a refused
+    /// gas check does: with no retry interval, so apalis spends the whole
+    /// retry budget. With `record_start` it first records the transfer's
+    /// start (`InitiateConversion`) for its id, as a failure after the first
+    /// event would leave it.
+    struct FailingAlpacaToBase {
+        record_start: Option<Arc<Store<UsdcRebalance>>>,
+    }
+
+    #[async_trait]
+    impl ResumeAlpacaToBase for FailingAlpacaToBase {
+        async fn resume_alpaca_to_base(
+            &self,
+            id: &UsdcRebalanceId,
+            amount: Usdc,
+            corridor: UsdcCorridor,
+        ) -> Result<(), UsdcTransferError> {
+            if let Some(store) = &self.record_start
+                && store.load(id).await.unwrap().is_none()
+            {
+                store
+                    .send(
+                        id,
+                        UsdcRebalanceCommand::InitiateConversion {
+                            corridor,
+                            direction: RebalanceDirection::AlpacaToBase,
+                            amount,
+                            order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
+                        },
+                    )
+                    .await
+                    .unwrap();
+            }
+            Err(UsdcTransferError::GasReadiness(
+                GasReadinessFailure::Unwired,
+            ))
+        }
+    }
+
+    /// Runs the market making worker, with the release wired to `trigger`'s
+    /// guards and `store`, until its one job row is a dead letter.
+    async fn run_market_making_job_until_dead_letter(
+        trigger: &RebalancingService,
+        store: &Arc<Store<UsdcRebalance>>,
+        transfer: FailingAlpacaToBase,
+    ) {
+        let queue = trigger.transfer_usdc_to_market_making_queue.clone();
+        let notifier: Arc<dyn crate::alerts::Notifier> = Arc::new(LogNotifier);
+        let ctx = Arc::new(TransferUsdcToMarketMakingCtx {
+            transfer: Arc::new(transfer),
+            job_queue: queue.clone(),
+            max_burn_revert_redrives: 1,
+            notifier: Arc::clone(&notifier),
+            driver_gate: crate::rebalancing::usdc::UsdcDriverGate::unpaused(),
+            unrecorded_guards: Some(UnrecordedGuardRelease {
+                guards: Arc::clone(&trigger.usdc_guards),
+                store: Arc::clone(store),
+            }),
+        });
+        let worker_queue = queue.clone();
+        let monitor = apalis::prelude::Monitor::new()
+            .should_restart(|_ctx, _error, _attempt| false)
+            .register(move |index| {
+                crate::conductor::job::build_best_effort_worker!(
+                    ::<TransferUsdcToMarketMakingCtx, TransferUsdcToMarketMaking>,
+                    index,
+                    worker_queue.clone(),
+                    ctx.clone(),
+                    notifier.clone(),
+                    crate::conductor::job::FailureInjector::new(),
+                )
+            });
+        let monitor_handle = tokio::spawn(async move { monitor.run().await });
+
+        crate::test_utils::wait_for_terminal_job::<TransferUsdcToMarketMaking>(queue.pool()).await;
+        monitor_handle.abort();
+    }
+
+    /// A transfer whose job exhausts its retries before recording any event
+    /// frees its corridor guard on the last attempt, so the next start on
+    /// that corridor is not refused until a restart.
+    #[tokio::test]
+    async fn a_transfer_job_dead_before_its_first_event_frees_the_corridor_guard() {
+        let (trigger, pool, store) = make_resume_trigger().await;
+        let first = trigger
+            .start_manual_usdc_transfer(
+                &pool,
+                RebalanceDirection::AlpacaToBase,
+                positive_usdc(250),
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(trigger.usdc_guards.is_held(Chain::Base));
+
+        run_market_making_job_until_dead_letter(
+            &trigger,
+            &store,
+            FailingAlpacaToBase { record_start: None },
+        )
+        .await;
+
+        assert_eq!(
+            store.load(&first).await.unwrap(),
+            None,
+            "the dead job must have recorded nothing"
+        );
+        assert!(
+            !trigger.usdc_guards.is_held(Chain::Base),
+            "a transfer that recorded nothing must free its corridor guard"
+        );
+        let second = trigger
+            .start_manual_usdc_transfer(
+                &pool,
+                RebalanceDirection::AlpacaToBase,
+                positive_usdc(250),
+                None,
+            )
+            .await
+            .unwrap_or_else(|error| panic!("the corridor must take a new start: {error:?}"));
+        assert_ne!(second, first);
+    }
+
+    /// A transfer that recorded its start before its job died keeps the
+    /// corridor guard: something may already have moved, so only the reactor,
+    /// the sweep, or the operator may free it, and a new start is refused.
+    #[tokio::test]
+    async fn a_transfer_job_dead_after_its_first_event_keeps_the_corridor_guard() {
+        let (trigger, pool, store) = make_resume_trigger().await;
+        let first = trigger
+            .start_manual_usdc_transfer(
+                &pool,
+                RebalanceDirection::AlpacaToBase,
+                positive_usdc(250),
+                None,
+            )
+            .await
+            .unwrap();
+
+        run_market_making_job_until_dead_letter(
+            &trigger,
+            &store,
+            FailingAlpacaToBase {
+                record_start: Some(Arc::clone(&store)),
+            },
+        )
+        .await;
+
+        let recorded = store.load(&first).await.unwrap();
+        assert!(
+            matches!(recorded, Some(UsdcRebalance::Converting { .. })),
+            "the dead job must have recorded the transfer's start, got {recorded:?}"
+        );
+        assert!(
+            trigger.usdc_guards.is_held(Chain::Base),
+            "a transfer that recorded its start must keep its corridor guard"
+        );
+        let error = trigger
+            .start_manual_usdc_transfer(
+                &pool,
+                RebalanceDirection::AlpacaToBase,
+                positive_usdc(250),
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, UsdcResumeError::GuardHeldElsewhere),
+            "got {error:?}"
+        );
+    }
+
+    /// Fails every attempt of a Base to Alpaca transfer the way a refused gas
+    /// check does, with no retry interval, so apalis spends the whole budget.
+    struct FailingBaseToAlpaca;
+
+    #[async_trait]
+    impl ResumeBaseToAlpaca for FailingBaseToAlpaca {
+        async fn resume_base_to_alpaca(
+            &self,
+            _id: &UsdcRebalanceId,
+            _amount: Usdc,
+            _corridor: UsdcCorridor,
+        ) -> Result<(), UsdcTransferError> {
+            Err(UsdcTransferError::GasReadiness(
+                GasReadinessFailure::Unwired,
+            ))
+        }
+    }
+
+    /// The hedging direction's terminal attempt frees the guard of a transfer
+    /// that recorded nothing, like the market making one.
+    #[tokio::test]
+    async fn a_base_to_alpaca_job_dead_before_its_first_event_frees_the_corridor_guard() {
+        let (trigger, pool, store) = make_resume_trigger().await;
+        let first = trigger
+            .start_manual_usdc_transfer(
+                &pool,
+                RebalanceDirection::BaseToAlpaca,
+                positive_usdc(75),
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(trigger.usdc_guards.is_held(Chain::Base));
+
+        let queue = trigger.transfer_usdc_to_hedging_queue.clone();
+        let notifier: Arc<dyn crate::alerts::Notifier> = Arc::new(LogNotifier);
+        let ctx = Arc::new(TransferUsdcToHedgingCtx {
+            transfer: Arc::new(FailingBaseToAlpaca),
+            timeout: Duration::from_secs(60),
+            job_queue: queue.clone(),
+            max_burn_revert_redrives: 1,
+            notifier: Arc::clone(&notifier),
+            driver_gate: crate::rebalancing::usdc::UsdcDriverGate::unpaused(),
+            unrecorded_guards: Some(UnrecordedGuardRelease {
+                guards: Arc::clone(&trigger.usdc_guards),
+                store: Arc::clone(&store),
+            }),
+        });
+        let worker_queue = queue.clone();
+        let monitor = apalis::prelude::Monitor::new()
+            .should_restart(|_ctx, _error, _attempt| false)
+            .register(move |index| {
+                crate::conductor::job::build_best_effort_worker!(
+                    ::<TransferUsdcToHedgingCtx, TransferUsdcToHedging>,
+                    index,
+                    worker_queue.clone(),
+                    ctx.clone(),
+                    notifier.clone(),
+                    crate::conductor::job::FailureInjector::new(),
+                )
+            });
+        let monitor_handle = tokio::spawn(async move { monitor.run().await });
+        crate::test_utils::wait_for_terminal_job::<TransferUsdcToHedging>(queue.pool()).await;
+        monitor_handle.abort();
+
+        assert_eq!(store.load(&first).await.unwrap(), None);
+        assert!(
+            !trigger.usdc_guards.is_held(Chain::Base),
+            "a Base to Alpaca transfer that recorded nothing must free its corridor guard"
+        );
+    }
+
+    /// The terminal attempt keeps the guard while another live job row still
+    /// drives the same id, even though nothing was recorded: that row will
+    /// run the transfer, so freeing the guard would let a second one start.
+    #[tokio::test]
+    async fn a_terminal_attempt_keeps_the_guard_while_another_row_drives_the_id() {
+        let (trigger, pool, store) = make_resume_trigger().await;
+        let id = trigger
+            .start_manual_usdc_transfer(
+                &pool,
+                RebalanceDirection::AlpacaToBase,
+                positive_usdc(250),
+                None,
+            )
+            .await
+            .unwrap();
+        let rows = market_making_job_rows(&trigger).await;
+        let job: TransferUsdcToMarketMaking = serde_json::from_slice(&rows[0].1).unwrap();
+        let ctx = TransferUsdcToMarketMakingCtx {
+            transfer: Arc::new(FailingAlpacaToBase { record_start: None }),
+            job_queue: trigger.transfer_usdc_to_market_making_queue.clone(),
+            max_burn_revert_redrives: 1,
+            notifier: Arc::new(LogNotifier),
+            driver_gate: crate::rebalancing::usdc::UsdcDriverGate::unpaused(),
+            unrecorded_guards: Some(UnrecordedGuardRelease {
+                guards: Arc::clone(&trigger.usdc_guards),
+                store: Arc::clone(&store),
+            }),
+        };
+
+        // The enqueued row is still pending and is not the dying one.
+        Job::on_terminal_attempt(&job, &ctx, &TaskIdentity::for_test("the-dying-row"))
+            .await
+            .unwrap();
+
+        assert_eq!(job.id, id);
+        assert!(
+            trigger.usdc_guards.is_held(Chain::Base),
+            "a live sibling row for the same id must keep the guard"
+        );
     }
 
     #[tokio::test]
@@ -38083,6 +38371,7 @@ mod tests {
             max_burn_revert_redrives: 5,
             notifier: notifier.clone(),
             driver_gate: UsdcDriverGate::unpaused(),
+            unrecorded_guards: None,
         };
         job.perform(&unserved_build).await.unwrap();
 

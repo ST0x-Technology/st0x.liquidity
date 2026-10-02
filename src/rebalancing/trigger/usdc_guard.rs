@@ -47,7 +47,7 @@ impl UsdcCashGuards {
     }
 
     /// Frees whatever `id` holds; other holders keep their guards.
-    pub(super) fn release(&self, id: &UsdcRebalanceId) {
+    pub(crate) fn release(&self, id: &UsdcRebalanceId) {
         self.state().holders.retain(|_, holders| {
             holders.remove(id);
             !holders.is_empty()

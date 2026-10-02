@@ -10,16 +10,22 @@
 //! dispatch fall out of the standard transfer lifecycle.
 //!
 //! The transfer's corridor guard is released event-driven when the
-//! aggregate reaches a terminal state (success or a recorded failure), not by
-//! this worker. A transient failure that only schedules a retry, or an
-//! indeterminate failure that leaves the aggregate mid-flight (e.g. stalled at
-//! `WithdrawalSubmitting`/`BridgingSubmitting`), keeps the guard latched so
-//! automation does not re-arm a fresh transfer on top of a partial one.
+//! aggregate reaches a terminal state (success or a recorded failure). A
+//! transient failure that only schedules a retry, or an indeterminate failure
+//! that leaves the aggregate in flight (for example stalled at
+//! `WithdrawalSubmitting` or `BridgingSubmitting`), keeps the guard latched so
+//! automation does not start a fresh transfer on top of a partial one. The
+//! one release this worker makes is for a job that exhausts its retries before
+//! the transfer recorded any event: no event means nothing was withdrawn,
+//! converted, or burned, and neither the reactor nor the timeout sweep would
+//! ever see that id, so the guard would otherwise stay held until a restart
+//! (see [`UnrecordedGuardRelease`]).
 
 use std::ops::ControlFlow;
 use std::sync::Arc;
 use std::time::Duration;
 
+use apalis_core::error::BoxDynError;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use serde::de::DeserializeOwned;
@@ -29,6 +35,7 @@ use tracing::{error, info, warn};
 
 use st0x_bridge::cctp::CctpError;
 use st0x_bridge::corridor::{UsdcCorridor, legacy_base_cctp};
+use st0x_event_sorcery::Store;
 use st0x_evm::Wallet;
 use st0x_execution::{AlpacaWalletError, Backpressure};
 use st0x_finance::Usdc;
@@ -40,10 +47,11 @@ use crate::alerts::Notifier;
 use crate::bot_gas::redrive::{BotGasFailureClassifier, redrive_on_bot_gas_failure};
 use crate::conductor::job::{
     BACKPRESSURE_ALERT_STREAK, BACKPRESSURE_RESCHEDULE_LIMIT, BackpressureOutcome,
-    BackpressureStep, BackpressureStreak, Job, JobQueue, Label, QueuePushError,
-    advance_backpressure, apply_backpressure_step, find_backpressure,
+    BackpressureStep, BackpressureStreak, Job, JobQueue, Label, QueuePushError, TaskIdentity,
+    advance_backpressure, apply_backpressure_step, find_backpressure, has_live_sibling_job,
 };
-use crate::usdc_rebalance::UsdcRebalanceId;
+use crate::rebalancing::trigger::UsdcCashGuards;
+use crate::usdc_rebalance::{UsdcRebalance, UsdcRebalanceId};
 
 const ATTESTATION_REDRIVE_DELAY: Duration = Duration::from_secs(60);
 
@@ -663,6 +671,69 @@ where
     }
 }
 
+/// What a transfer job's terminal attempt needs to free the corridor guard
+/// of a transfer that recorded no event: the guards the trigger or the
+/// manual start claimed it in, and the store that shows whether anything was
+/// recorded for its id.
+pub(crate) struct UnrecordedGuardRelease {
+    pub(crate) guards: Arc<UsdcCashGuards>,
+    pub(crate) store: Arc<Store<UsdcRebalance>>,
+}
+
+impl UnrecordedGuardRelease {
+    /// Frees `id`'s corridor guard when its job's last attempt failed before
+    /// the transfer recorded any event. Only the reactor (on a terminal
+    /// event) and the timeout sweep (over ids it tracks once a transfer
+    /// records its start) release a guard, and neither ever sees an id with
+    /// no events, so without this the guard stays held until a restart and
+    /// both the trigger and `capital transfer-usdc` refuse the corridor.
+    ///
+    /// No event means nothing was withdrawn, converted, or burned, so the
+    /// release cannot let a second transfer run beside a partial one. Any
+    /// recorded state keeps the guard for the reactor, the sweep, or the
+    /// operator, as does another job row that still drives the same id. A
+    /// load error keeps it too. Idempotent, as `Job::on_terminal_attempt`
+    /// requires.
+    async fn release_if_unrecorded<TaskJob: DeserializeOwned>(
+        &self,
+        pool: &apalis_sqlite::SqlitePool,
+        id: &UsdcRebalanceId,
+        task_identity: &TaskIdentity,
+        same_transfer: impl Fn(&TaskJob) -> bool,
+    ) -> Result<(), BoxDynError> {
+        if self.store.load(id).await?.is_some() {
+            warn!(
+                target: "rebalance",
+                %id,
+                %task_identity,
+                "Terminal USDC transfer attempt kept its corridor guard: the transfer recorded \
+                 events, so its recovery owns the guard"
+            );
+            return Ok(());
+        }
+        if has_live_sibling_job::<TaskJob>(pool, task_identity, same_transfer).await? {
+            warn!(
+                target: "rebalance",
+                %id,
+                %task_identity,
+                "Terminal USDC transfer attempt kept its corridor guard: another job row still \
+                 drives the transfer"
+            );
+            return Ok(());
+        }
+
+        self.guards.release(id);
+        warn!(
+            target: "rebalance",
+            %id,
+            %task_identity,
+            "Released the corridor guard of a USDC transfer whose job failed before recording \
+             any event"
+        );
+        Ok(())
+    }
+}
+
 /// Dependencies the job needs to resume the transfer.
 pub(crate) struct TransferUsdcToHedgingCtx {
     pub(crate) transfer: Arc<dyn ResumeBaseToAlpaca>,
@@ -679,6 +750,12 @@ pub(crate) struct TransferUsdcToHedgingCtx {
     /// Pause gate shared with the API: an operator operation quiesces the
     /// driver through it before mutating a transfer this worker could advance.
     pub(crate) driver_gate: UsdcDriverGate,
+    /// Frees the corridor guard of a transfer whose job exhausts its retries
+    /// before recording any event. Production always sets it. `None` makes
+    /// the terminal attempt hook a no op that leaves the guard alone, for
+    /// tests that do not wire the service's guards and store, including ones
+    /// that drive a row to a dead letter.
+    pub(crate) unrecorded_guards: Option<UnrecordedGuardRelease>,
 }
 
 /// Errors emitted by [`TransferUsdcToHedging::perform`].
@@ -1044,6 +1121,24 @@ impl Job<TransferUsdcToHedgingCtx> for TransferUsdcToHedging {
         }
 
         Ok(())
+    }
+
+    async fn on_terminal_attempt(
+        &self,
+        ctx: &TransferUsdcToHedgingCtx,
+        task_identity: &TaskIdentity,
+    ) -> Result<(), BoxDynError> {
+        let Some(release) = &ctx.unrecorded_guards else {
+            return Ok(());
+        };
+        release
+            .release_if_unrecorded::<Self>(
+                ctx.job_queue.pool(),
+                &self.id,
+                task_identity,
+                |sibling| sibling.id == self.id,
+            )
+            .await
     }
 }
 
@@ -1458,6 +1553,10 @@ pub(crate) struct TransferUsdcToMarketMakingCtx {
     /// Pause gate shared with the API: an operator operation quiesces the
     /// driver through it before mutating a transfer this worker could advance.
     pub(crate) driver_gate: UsdcDriverGate,
+    /// Frees the corridor guard of a transfer whose job exhausts its retries
+    /// before recording any event; see
+    /// [`TransferUsdcToHedgingCtx::unrecorded_guards`].
+    pub(crate) unrecorded_guards: Option<UnrecordedGuardRelease>,
 }
 
 /// Errors emitted by [`TransferUsdcToMarketMaking::perform`].
@@ -1576,6 +1675,24 @@ impl Job<TransferUsdcToMarketMakingCtx> for TransferUsdcToMarketMaking {
         };
 
         self.settle_transfer_outcome(ctx, result).await
+    }
+
+    async fn on_terminal_attempt(
+        &self,
+        ctx: &TransferUsdcToMarketMakingCtx,
+        task_identity: &TaskIdentity,
+    ) -> Result<(), BoxDynError> {
+        let Some(release) = &ctx.unrecorded_guards else {
+            return Ok(());
+        };
+        release
+            .release_if_unrecorded::<Self>(
+                ctx.job_queue.pool(),
+                &self.id,
+                task_identity,
+                |sibling| sibling.id == self.id,
+            )
+            .await
     }
 }
 
@@ -2371,6 +2488,7 @@ mod tests {
             job_queue: TransferUsdcToHedgingJobQueue::new(pool),
             max_burn_revert_redrives: 5,
             notifier: Arc::new(LogNotifier),
+            unrecorded_guards: None,
         }
     }
 
@@ -3039,6 +3157,7 @@ mod tests {
             job_queue: TransferUsdcToHedgingJobQueue::new(&pool),
             max_burn_revert_redrives: 5,
             notifier: Arc::new(LogNotifier),
+            unrecorded_guards: None,
         };
         let job = TransferUsdcToHedging {
             corridor: UsdcCorridor::BASE_CCTP,
@@ -3093,6 +3212,7 @@ mod tests {
             job_queue: TransferUsdcToHedgingJobQueue::new(&pool),
             max_burn_revert_redrives: 3,
             notifier: Arc::new(LogNotifier),
+            unrecorded_guards: None,
         };
         // Simulate a job that has already used all its redrive budget.
         let job = TransferUsdcToHedging {
@@ -3130,6 +3250,7 @@ mod tests {
             job_queue: TransferUsdcToMarketMakingJobQueue::new(pool),
             max_burn_revert_redrives: 5,
             notifier: Arc::new(LogNotifier),
+            unrecorded_guards: None,
         }
     }
 
@@ -3389,6 +3510,7 @@ mod tests {
             job_queue: TransferUsdcToHedgingJobQueue::new(&pool),
             max_burn_revert_redrives: 5,
             notifier: notifier.clone(),
+            unrecorded_guards: None,
         };
         // `revert_redrive_attempts` starts nonzero and distinct from
         // `backpressure_streak` so a copy-paste swap of which counter
@@ -3433,6 +3555,7 @@ mod tests {
             job_queue: TransferUsdcToHedgingJobQueue::new(&pool),
             max_burn_revert_redrives: 5,
             notifier: notifier.clone(),
+            unrecorded_guards: None,
         };
         let job = TransferUsdcToHedging {
             corridor: UsdcCorridor::BASE_CCTP,
@@ -3477,6 +3600,7 @@ mod tests {
             job_queue: TransferUsdcToHedgingJobQueue::new(&pool),
             max_burn_revert_redrives: 5,
             notifier: notifier.clone(),
+            unrecorded_guards: None,
         };
         let job = TransferUsdcToHedging {
             corridor: UsdcCorridor::BASE_CCTP,
@@ -3546,6 +3670,7 @@ mod tests {
             job_queue: TransferUsdcToMarketMakingJobQueue::new(&pool),
             max_burn_revert_redrives: 5,
             notifier: notifier.clone(),
+            unrecorded_guards: None,
         };
         // See the hedging-direction sibling test: a nonzero, distinct
         // `revert_redrive_attempts` closes the swap-risk gap between the two
@@ -3586,6 +3711,7 @@ mod tests {
             job_queue: TransferUsdcToMarketMakingJobQueue::new(&pool),
             max_burn_revert_redrives: 5,
             notifier: notifier.clone(),
+            unrecorded_guards: None,
         };
         let job = TransferUsdcToMarketMaking {
             corridor: UsdcCorridor::BASE_CCTP,
@@ -3627,6 +3753,7 @@ mod tests {
             job_queue: TransferUsdcToMarketMakingJobQueue::new(&pool),
             max_burn_revert_redrives: 5,
             notifier: notifier.clone(),
+            unrecorded_guards: None,
         };
         let job = TransferUsdcToMarketMaking {
             corridor: UsdcCorridor::BASE_CCTP,
@@ -3689,6 +3816,7 @@ mod tests {
             job_queue: TransferUsdcToMarketMakingJobQueue::new(&pool),
             max_burn_revert_redrives: 5,
             notifier: notifier.clone(),
+            unrecorded_guards: None,
         };
         // `backpressure_streak` starts nonzero: this non-429 inconclusive
         // poll error routes through `handle_withdrawal_poll_inconclusive`
@@ -3768,6 +3896,7 @@ mod tests {
             job_queue: TransferUsdcToMarketMakingJobQueue::new(&pool),
             max_burn_revert_redrives: 5,
             notifier: notifier.clone(),
+            unrecorded_guards: None,
         };
         let job = TransferUsdcToMarketMaking {
             corridor: UsdcCorridor::BASE_CCTP,
@@ -3828,6 +3957,7 @@ mod tests {
             job_queue: TransferUsdcToMarketMakingJobQueue::new(&pool),
             max_burn_revert_redrives: 5,
             notifier: notifier.clone(),
+            unrecorded_guards: None,
         };
         let job = TransferUsdcToMarketMaking {
             corridor: UsdcCorridor::BASE_CCTP,
@@ -3873,6 +4003,7 @@ mod tests {
             job_queue: TransferUsdcToMarketMakingJobQueue::new(&pool),
             max_burn_revert_redrives: 5,
             notifier: notifier.clone(),
+            unrecorded_guards: None,
         };
         let job = TransferUsdcToMarketMaking {
             corridor: UsdcCorridor::BASE_CCTP,
@@ -3909,6 +4040,7 @@ mod tests {
             job_queue: TransferUsdcToMarketMakingJobQueue::new(&pool),
             max_burn_revert_redrives: 5,
             notifier: notifier.clone(),
+            unrecorded_guards: None,
         };
         let job = TransferUsdcToMarketMaking {
             corridor: UsdcCorridor::BASE_CCTP,
@@ -3955,6 +4087,7 @@ mod tests {
             job_queue: TransferUsdcToMarketMakingJobQueue::new(&pool),
             max_burn_revert_redrives: 5,
             notifier: notifier.clone(),
+            unrecorded_guards: None,
         };
         let job = TransferUsdcToMarketMaking {
             corridor: UsdcCorridor::BASE_CCTP,
@@ -4040,6 +4173,7 @@ mod tests {
             job_queue: TransferUsdcToMarketMakingJobQueue::new(&pool),
             max_burn_revert_redrives: 5,
             notifier: notifier.clone(),
+            unrecorded_guards: None,
         };
         let job = TransferUsdcToMarketMaking {
             corridor: UsdcCorridor::BASE_CCTP,
@@ -4116,6 +4250,7 @@ mod tests {
             job_queue: TransferUsdcToMarketMakingJobQueue::new(&pool),
             max_burn_revert_redrives: 5,
             notifier: notifier.clone(),
+            unrecorded_guards: None,
         };
         let job = TransferUsdcToMarketMaking {
             corridor: UsdcCorridor::BASE_CCTP,
@@ -4176,6 +4311,7 @@ mod tests {
             job_queue: TransferUsdcToMarketMakingJobQueue::new(&pool),
             max_burn_revert_redrives: 5,
             notifier: notifier.clone(),
+            unrecorded_guards: None,
         };
         let job = TransferUsdcToMarketMaking {
             corridor: UsdcCorridor::BASE_CCTP,
@@ -4236,6 +4372,7 @@ mod tests {
             job_queue: TransferUsdcToMarketMakingJobQueue::new(&pool),
             max_burn_revert_redrives: 5,
             notifier: notifier.clone(),
+            unrecorded_guards: None,
         };
         let job = TransferUsdcToMarketMaking {
             corridor: UsdcCorridor::BASE_CCTP,
@@ -4325,6 +4462,7 @@ mod tests {
             job_queue: TransferUsdcToHedgingJobQueue::new(&pool),
             max_burn_revert_redrives: 5,
             notifier: notifier.clone(),
+            unrecorded_guards: None,
         };
         let job = TransferUsdcToHedging {
             corridor: UsdcCorridor::BASE_CCTP,
@@ -4381,6 +4519,7 @@ mod tests {
             job_queue: TransferUsdcToHedgingJobQueue::new(&pool),
             max_burn_revert_redrives: 5,
             notifier: notifier.clone(),
+            unrecorded_guards: None,
         };
         let job = TransferUsdcToHedging {
             corridor: UsdcCorridor::BASE_CCTP,
@@ -4594,6 +4733,7 @@ mod tests {
             job_queue: TransferUsdcToHedgingJobQueue::new(&pool),
             max_burn_revert_redrives: 5,
             notifier: notifier.clone(),
+            unrecorded_guards: None,
         };
         let job = TransferUsdcToHedging {
             corridor: UsdcCorridor::BASE_CCTP,
@@ -4646,6 +4786,7 @@ mod tests {
             job_queue: TransferUsdcToMarketMakingJobQueue::new(&pool),
             max_burn_revert_redrives: 5,
             notifier: notifier.clone(),
+            unrecorded_guards: None,
         };
         let job = TransferUsdcToMarketMaking {
             corridor: UsdcCorridor::BASE_CCTP,
@@ -5202,6 +5343,7 @@ mod tests {
             job_queue: TransferUsdcToHedgingJobQueue::new(&pool),
             max_burn_revert_redrives: 5,
             notifier: notifier.clone(),
+            unrecorded_guards: None,
         };
         let job = TransferUsdcToHedging {
             corridor: UsdcCorridor::BASE_CCTP,
@@ -5284,6 +5426,7 @@ mod tests {
             job_queue: TransferUsdcToHedgingJobQueue::new(&pool),
             max_burn_revert_redrives: 5,
             notifier: notifier.clone(),
+            unrecorded_guards: None,
         };
         let job = TransferUsdcToHedging {
             corridor: UsdcCorridor::BASE_CCTP,
@@ -5343,6 +5486,7 @@ mod tests {
             job_queue: TransferUsdcToHedgingJobQueue::new(&pool),
             max_burn_revert_redrives: 5,
             notifier: notifier.clone(),
+            unrecorded_guards: None,
         };
         let job = TransferUsdcToHedging {
             corridor: UsdcCorridor::BASE_CCTP,
@@ -5428,6 +5572,7 @@ mod tests {
             max_burn_revert_redrives: 5,
             notifier: notifier.clone(),
             driver_gate: UsdcDriverGate::unpaused(),
+            unrecorded_guards: None,
         };
         let job = TransferUsdcToHedging {
             corridor: UsdcCorridor::BASE_CCTP,
@@ -5640,6 +5785,7 @@ mod tests {
             job_queue: TransferUsdcToHedgingJobQueue::new(&pool),
             max_burn_revert_redrives: 5,
             notifier: notifier.clone(),
+            unrecorded_guards: None,
         };
         let job = TransferUsdcToHedging {
             corridor: UsdcCorridor::BASE_CCTP,
@@ -5711,6 +5857,7 @@ mod tests {
             job_queue: TransferUsdcToHedgingJobQueue::new(&pool),
             max_burn_revert_redrives: 1,
             notifier: Arc::new(FailingNotifier),
+            unrecorded_guards: None,
         };
         // attempts=0 -> next=1 == max=1: limit alert fires (and is swallowed), redrive enqueued
         let job = TransferUsdcToHedging {
@@ -5746,6 +5893,7 @@ mod tests {
             job_queue: TransferUsdcToMarketMakingJobQueue::new(&pool),
             max_burn_revert_redrives: 5,
             notifier: Arc::new(FailingNotifier),
+            unrecorded_guards: None,
         };
         let job = TransferUsdcToMarketMaking {
             corridor: UsdcCorridor::BASE_CCTP,
@@ -5782,6 +5930,7 @@ mod tests {
             job_queue: TransferUsdcToMarketMakingJobQueue::new(&pool),
             max_burn_revert_redrives: 5,
             notifier: notifier.clone(),
+            unrecorded_guards: None,
         };
         let job = TransferUsdcToMarketMaking {
             corridor: UsdcCorridor::BASE_CCTP,
@@ -5927,6 +6076,7 @@ mod tests {
             job_queue: TransferUsdcToHedgingJobQueue::new(&pool),
             max_burn_revert_redrives: 3,
             notifier: Arc::new(LogNotifier),
+            unrecorded_guards: None,
         };
         let job = TransferUsdcToHedging {
             corridor: UsdcCorridor::BASE_CCTP,
@@ -5993,6 +6143,7 @@ mod tests {
             job_queue: TransferUsdcToHedgingJobQueue::new(&pool),
             max_burn_revert_redrives: 5,
             notifier: notifier.clone(),
+            unrecorded_guards: None,
         };
         let job = TransferUsdcToHedging {
             corridor: UsdcCorridor::BASE_CCTP,
@@ -6025,6 +6176,7 @@ mod tests {
             job_queue: TransferUsdcToHedgingJobQueue::new(&pool),
             max_burn_revert_redrives: 5,
             notifier: notifier.clone(),
+            unrecorded_guards: None,
         };
         // attempts=2 -> next=3 == 5/2+1 == 3: exactly at threshold
         let job = TransferUsdcToHedging {
@@ -6074,6 +6226,7 @@ mod tests {
             job_queue: TransferUsdcToHedgingJobQueue::new(&pool),
             max_burn_revert_redrives: 3,
             notifier: notifier.clone(),
+            unrecorded_guards: None,
         };
         // attempts=2 -> next=3 == max=3: last allowed redrive, alert fires
         let job = TransferUsdcToHedging {
@@ -6122,6 +6275,7 @@ mod tests {
             job_queue: TransferUsdcToHedgingJobQueue::new(&pool),
             max_burn_revert_redrives: 3,
             notifier: notifier.clone(),
+            unrecorded_guards: None,
         };
         // attempts=3 -> next=4 > max=3: over-limit, returns Err, no alert
         let job = TransferUsdcToHedging {
@@ -6167,6 +6321,7 @@ mod tests {
             job_queue: TransferUsdcToHedgingJobQueue::new(&pool),
             max_burn_revert_redrives: 1,
             notifier: notifier.clone(),
+            unrecorded_guards: None,
         };
         // attempts=0 -> next=1 == max=1: last allowed redrive, limit alert fires
         let job = TransferUsdcToHedging {
@@ -6211,6 +6366,7 @@ mod tests {
             job_queue: TransferUsdcToHedgingJobQueue::new(&pool),
             max_burn_revert_redrives: 2,
             notifier: notifier.clone(),
+            unrecorded_guards: None,
         };
         // attempts=1 -> next=2 == max=2: last allowed redrive, limit alert fires
         let job = TransferUsdcToHedging {
@@ -6250,6 +6406,7 @@ mod tests {
             job_queue: TransferUsdcToHedgingJobQueue::new(&pool),
             max_burn_revert_redrives: 3,
             notifier: notifier.clone(),
+            unrecorded_guards: None,
         };
         // attempts=2 -> next=3 == max=3: last allowed timeout redrive, alert fires
         let job = TransferUsdcToHedging {
@@ -6298,6 +6455,7 @@ mod tests {
             job_queue: TransferUsdcToHedgingJobQueue::new(&pool),
             max_burn_revert_redrives: 3,
             notifier: notifier.clone(),
+            unrecorded_guards: None,
         };
         // attempts=3 -> next=4 > max=3: over-limit, returns Err, no alert
         let job = TransferUsdcToHedging {
@@ -6342,6 +6500,7 @@ mod tests {
             job_queue: TransferUsdcToHedgingJobQueue::new(&pool),
             max_burn_revert_redrives: 5,
             notifier: notifier.clone(),
+            unrecorded_guards: None,
         };
         // attempts=2 -> next=3 == 5/2+1: exactly at threshold
         let job = TransferUsdcToHedging {
@@ -6459,6 +6618,7 @@ mod tests {
             job_queue: TransferUsdcToMarketMakingJobQueue::new(&pool),
             max_burn_revert_redrives: 3,
             notifier: Arc::new(LogNotifier),
+            unrecorded_guards: None,
         };
         let job = TransferUsdcToMarketMaking {
             corridor: UsdcCorridor::BASE_CCTP,
@@ -6497,6 +6657,7 @@ mod tests {
             job_queue: TransferUsdcToMarketMakingJobQueue::new(&pool),
             max_burn_revert_redrives: 5,
             notifier: notifier.clone(),
+            unrecorded_guards: None,
         };
         // attempts=2 -> next=3 == 5/2+1: exactly at threshold
         let job = TransferUsdcToMarketMaking {
@@ -6544,6 +6705,7 @@ mod tests {
             job_queue: TransferUsdcToMarketMakingJobQueue::new(&pool),
             max_burn_revert_redrives: 3,
             notifier: notifier.clone(),
+            unrecorded_guards: None,
         };
         // attempts=2 -> next=3 == max=3: last allowed redrive, alert fires
         let job = TransferUsdcToMarketMaking {
@@ -6591,6 +6753,7 @@ mod tests {
             job_queue: TransferUsdcToMarketMakingJobQueue::new(&pool),
             max_burn_revert_redrives: 3,
             notifier: notifier.clone(),
+            unrecorded_guards: None,
         };
         // attempts=3 -> next=4 > max=3: over-limit, Err, no alert
         let job = TransferUsdcToMarketMaking {
@@ -6649,6 +6812,7 @@ mod tests {
             job_queue: TransferUsdcToMarketMakingJobQueue::new(&pool),
             max_burn_revert_redrives: 5,
             notifier: notifier.clone(),
+            unrecorded_guards: None,
         };
         let job = TransferUsdcToMarketMaking {
             corridor: UsdcCorridor::BASE_CCTP,
@@ -6680,6 +6844,7 @@ mod tests {
             job_queue: TransferUsdcToHedgingJobQueue::new(&pool),
             max_burn_revert_redrives: 5,
             notifier: notifier.clone(),
+            unrecorded_guards: None,
         };
         let job = TransferUsdcToHedging {
             corridor: UsdcCorridor::BASE_CCTP,
@@ -6717,6 +6882,7 @@ mod tests {
             job_queue: TransferUsdcToMarketMakingJobQueue::new(&pool),
             max_burn_revert_redrives: 5,
             notifier: notifier.clone(),
+            unrecorded_guards: None,
         };
         let job = TransferUsdcToMarketMaking {
             corridor: UsdcCorridor::BASE_CCTP,
@@ -6780,6 +6946,7 @@ mod tests {
             job_queue: TransferUsdcToHedgingJobQueue::new(&pool),
             max_burn_revert_redrives: 5,
             notifier: notifier.clone(),
+            unrecorded_guards: None,
         };
         let job = TransferUsdcToHedging {
             corridor: UsdcCorridor::BASE_CCTP,
@@ -6838,6 +7005,7 @@ mod tests {
             job_queue: TransferUsdcToMarketMakingJobQueue::new(&pool),
             max_burn_revert_redrives: 5,
             notifier: notifier.clone(),
+            unrecorded_guards: None,
         };
         let job = TransferUsdcToMarketMaking {
             corridor: UsdcCorridor::BASE_CCTP,
@@ -6881,6 +7049,7 @@ mod tests {
             job_queue: TransferUsdcToMarketMakingJobQueue::new(&pool),
             max_burn_revert_redrives: 5,
             notifier: notifier.clone(),
+            unrecorded_guards: None,
         };
         let job = TransferUsdcToMarketMaking {
             corridor: UsdcCorridor::BASE_CCTP,
@@ -6917,6 +7086,7 @@ mod tests {
             job_queue: TransferUsdcToMarketMakingJobQueue::new(&pool),
             max_burn_revert_redrives: 5,
             notifier: notifier.clone(),
+            unrecorded_guards: None,
         };
         let job = TransferUsdcToMarketMaking {
             corridor: UsdcCorridor::BASE_CCTP,
@@ -6961,6 +7131,7 @@ mod tests {
             job_queue: TransferUsdcToMarketMakingJobQueue::new(&pool),
             max_burn_revert_redrives: 5,
             notifier: notifier.clone(),
+            unrecorded_guards: None,
         };
         let job = TransferUsdcToMarketMaking {
             corridor: UsdcCorridor::BASE_CCTP,
@@ -7022,6 +7193,7 @@ mod tests {
             max_burn_revert_redrives: 5,
             notifier: notifier.clone(),
             driver_gate: UsdcDriverGate::unpaused(),
+            unrecorded_guards: None,
         };
         let market_making = TransferUsdcToMarketMakingCtx {
             transfer: Arc::new(TerminalAlpacaToBase(TerminalOutcome::CorridorMismatch)),
@@ -7029,6 +7201,7 @@ mod tests {
             max_burn_revert_redrives: 5,
             notifier: notifier.clone(),
             driver_gate: UsdcDriverGate::unpaused(),
+            unrecorded_guards: None,
         };
         let id = UsdcRebalanceId(Uuid::new_v4());
         let amount = Usdc::new(float!(100));

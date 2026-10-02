@@ -27,9 +27,7 @@ use st0x_event_sorcery::SendError;
 use st0x_execution::Symbol;
 use st0x_tokenization::IssuerRequestId;
 
-use super::job::{
-    PositionReservationAuthority, has_live_sibling_equity_transfer, restore_position_reservation,
-};
+use super::job::{PositionReservationAuthority, restore_position_reservation};
 use super::{
     CrossVenueEquityTransfer, MintError, RedemptionError, WITHDRAWAL_RECONCILIATION_REDRIVE_DELAY,
     withdrawal_reconciliation_redrive_delay,
@@ -39,7 +37,7 @@ use crate::alerts::Notifier;
 use crate::bot_gas::BotGasReceiptCostEnqueuer;
 use crate::bot_gas::redrive::{BotGasFailureClassifier, redrive_on_bot_gas_failure};
 use crate::conductor::job::{
-    BackpressureStreak, Job, JobQueue, Label, QueuePushError, TaskIdentity,
+    BackpressureStreak, Job, JobQueue, Label, QueuePushError, TaskIdentity, has_live_sibling_job,
 };
 use crate::equity_redemption::RedemptionAggregateId;
 use crate::position::{EquityTransferReservationId, Position, PositionCommand};
@@ -315,11 +313,9 @@ impl Job<ResumeTokenizationCtx> for ResumeTokenizationAggregate {
             );
             return Ok(());
         }
-        if has_live_sibling_equity_transfer::<Self>(
-            ctx.job_queue.pool(),
-            task_identity,
-            |sibling| sibling.target == self.target,
-        )
+        if has_live_sibling_job::<Self>(ctx.job_queue.pool(), task_identity, |sibling| {
+            sibling.target == self.target
+        })
         .await?
         {
             warn!(

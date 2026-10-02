@@ -749,6 +749,31 @@ pub(crate) async fn setup_test_apalis_pool() -> apalis_sqlite::SqlitePool {
     setup_test_pools().await.1
 }
 
+/// Waits until the one job of type `Task` in `apalis_pool` is a dead letter:
+/// failed with its whole retry budget spent.
+#[cfg(test)]
+pub(crate) async fn wait_for_terminal_job<Task: 'static>(apalis_pool: &apalis_sqlite::SqlitePool) {
+    tokio::time::timeout(Duration::from_secs(15), async {
+        loop {
+            let terminal_count: i64 = sqlx_apalis::query_scalar(
+                "SELECT COUNT(*) FROM Jobs \
+                 WHERE job_type = ? AND status IN ('Failed', 'Killed') \
+                 AND attempts >= max_attempts",
+            )
+            .bind(std::any::type_name::<Task>())
+            .fetch_one(apalis_pool)
+            .await
+            .unwrap();
+            if terminal_count == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("the poison job must reach a visible terminal state");
+}
+
 /// Centralized test database setup to eliminate duplication across test files.
 /// Creates an in-memory SQLite database with all migrations applied.
 #[cfg(test)]
