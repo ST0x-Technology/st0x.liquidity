@@ -76,6 +76,7 @@ mod registry_boot;
 mod registry_reload;
 mod startup;
 mod telemetry;
+mod tls;
 mod trading;
 mod trading_schedule;
 #[cfg(feature = "mock")]
@@ -92,6 +93,7 @@ pub use registry_boot::report_boot as report_registry_boot;
 pub use st0x_config::{
     ExtraLayer, FileLogGuard, TelemetryError, TelemetryGuard, mk_env_filter, setup_tracing,
 };
+pub use tls::install_tls_crypto_provider;
 
 #[cfg(any(test, feature = "test-support"))]
 pub use offchain::order::{OffchainOrder, OffchainOrderId};
