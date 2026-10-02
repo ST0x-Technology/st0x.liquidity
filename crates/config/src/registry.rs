@@ -264,7 +264,93 @@ impl Projection {
             .flat_map(|(chain, rows)| rows.keys().map(move |symbol| format!("{chain}/{symbol}")))
             .collect()
     }
+
+    /// The projection as a token file holding only the bot's keys, which
+    /// [`project`] reads back to the same projection. A persisted record
+    /// stores this, so a boot from a record runs every check a boot from
+    /// the bucket runs.
+    pub fn to_token_file(&self) -> String {
+        let mut chains = Table::new();
+        for (chain, rows) in &self.chain_rows {
+            let equities: Table = rows
+                .iter()
+                .map(|(symbol, row)| (symbol.clone(), Value::Table(row.clone())))
+                .collect();
+            let mut assets = Table::new();
+            assets.insert("equities".into(), Value::Table(equities));
+            let mut chain_table = Table::new();
+            chain_table.insert("assets".into(), Value::Table(assets));
+            chains.insert(chain.clone(), Value::Table(chain_table));
+        }
+        let policies: Table = self
+            .policies
+            .iter()
+            .map(|(symbol, policy)| (symbol.clone(), Value::Table(policy.clone())))
+            .collect();
+        let mut assets = Table::new();
+        assets.insert("equities".into(), Value::Table(policies));
+
+        let mut file = Table::new();
+        file.insert("schema_version".into(), Value::Integer(SCHEMA_VERSION));
+        file.insert("chains".into(), Value::Table(chains));
+        file.insert("assets".into(), Value::Table(assets));
+        file.to_string()
+    }
+
+    /// This projection plus every listing (chain, symbol) of `previous`
+    /// that it lacks, each kept with its trading, rebalancing and
+    /// wrapped-equity recovery switched off. A symbol's hedge policy that
+    /// this projection lacks is kept too, with extended-hours counter
+    /// trading off, since a symbol that trades nowhere may not enable it.
+    ///
+    /// No new work starts for a carried listing, yet every durable record
+    /// that names it (positions, vaults, transfers in flight) still
+    /// resolves. A config release that retires the symbol drops it.
+    #[must_use]
+    pub fn carry_forward(mut self, previous: &Self) -> Carried {
+        let mut listings = BTreeSet::new();
+        for (chain, rows) in &previous.chain_rows {
+            let kept = self.chain_rows.entry(chain.clone()).or_default();
+            for (symbol, row) in rows {
+                if kept.contains_key(symbol) {
+                    continue;
+                }
+                let mut row = row.clone();
+                for key in ["trading", "rebalancing", "wrapped_equity_recovery"] {
+                    row.insert(key.into(), Value::String(DISABLED.into()));
+                }
+                kept.insert(symbol.clone(), row);
+                listings.insert(format!("{chain}/{symbol}"));
+            }
+        }
+        self.chain_rows.retain(|_, rows| !rows.is_empty());
+        for (symbol, policy) in &previous.policies {
+            if self.policies.contains_key(symbol) {
+                continue;
+            }
+            let mut policy = policy.clone();
+            policy.insert(
+                "extended_hours_counter_trading".into(),
+                Value::String(DISABLED.into()),
+            );
+            self.policies.insert(symbol.clone(), policy);
+        }
+        Carried {
+            projection: self,
+            listings,
+        }
+    }
 }
+
+/// What [`Projection::carry_forward`] kept.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Carried {
+    pub projection: Projection,
+    /// `chain/SYMBOL` of every listing kept from the previous projection.
+    pub listings: BTreeSet<String>,
+}
+
+const DISABLED: &str = "disabled";
 
 pub fn source_of(config: &Table) -> Result<Option<RegistrySource>, RegistryError> {
     match config.get("registry") {
@@ -815,15 +901,58 @@ async fn load_from(
     source: &RegistrySource,
     budget: Duration,
 ) -> Result<Vec<u8>, RegistryError> {
+    within_boot_budget(&source.url, budget, || {
+        fetch_from(http, endpoints, &source.url, source.generation)
+    })
+    .await
+}
+
+/// The copy boot records from the bucket: the pinned generation, or the
+/// latest version checked against its metadata. Bounded as a whole like
+/// [`load_bytes`].
+pub async fn load_copy(source: &RegistrySource) -> Result<TokenCopy, RegistryError> {
+    load_copy_from(&http_client()?, GOOGLE, source, BOOT_READ_BUDGET).await
+}
+
+async fn load_copy_from(
+    http: &reqwest::Client,
+    endpoints: Endpoints<'_>,
+    source: &RegistrySource,
+    budget: Duration,
+) -> Result<TokenCopy, RegistryError> {
+    within_boot_budget(&source.url, budget, || async {
+        if let Some(generation) = source.generation {
+            fetch_from(http, endpoints, &source.url, Some(generation))
+                .await
+                .map(|bytes| TokenCopy { generation, bytes })
+        } else {
+            let version = fetch_metadata_from(http, endpoints, &source.url).await?;
+            fetch_version_from(http, endpoints, &source.url, &version).await
+        }
+    })
+    .await
+}
+
+/// Up to three attempts of `read`, backing off between them, all within
+/// `budget`, so a wedged read cannot stall the roll's health gate.
+async fn within_boot_budget<Read, Reading, Output>(
+    url: &str,
+    budget: Duration,
+    mut read: Read,
+) -> Result<Output, RegistryError>
+where
+    Read: FnMut() -> Reading,
+    Reading: Future<Output = Result<Output, RegistryError>>,
+{
     // No tracing subscriber exists yet at boot, so a failed attempt is kept
     // for the error rather than logged: the budget running out still names
     // why the attempts before it failed.
     let mut last = None;
-    let read = async {
+    let attempts = async {
         let mut attempt = 1;
         loop {
-            match fetch_from(http, endpoints, &source.url, source.generation).await {
-                Ok(bytes) => break Ok(bytes),
+            match read().await {
+                Ok(output) => break Ok(output),
                 Err(error) if attempt < 3 => {
                     last = Some(Box::new(error));
                     tokio::time::sleep(Duration::from_secs(1 << attempt)).await;
@@ -833,9 +962,9 @@ async fn load_from(
             }
         }
     };
-    let outcome = tokio::time::timeout(budget, read).await;
+    let outcome = tokio::time::timeout(budget, attempts).await;
     outcome.map_err(|_| RegistryError::BootTimeout {
-        url: source.url.clone(),
+        url: url.to_string(),
         last,
     })?
 }
@@ -1375,6 +1504,94 @@ mod tests {
             describe_change(&live, &fresh).as_deref(),
             Some("hedge policies changed")
         );
+    }
+
+    /// A record's effective tables are a token file that projects back to
+    /// exactly the tables it was made from.
+    #[test]
+    fn a_projection_round_trips_through_its_token_file() {
+        for tokens in [
+            fixtures::pinned_production_tokens(),
+            fixtures::read("tokens-staging.toml"),
+        ] {
+            let projection = project(&parse(&tokens).unwrap()).unwrap();
+            let rendered = projection.to_token_file();
+            assert_eq!(
+                project(&parse(rendered.as_bytes()).unwrap()).unwrap(),
+                projection
+            );
+        }
+    }
+
+    /// A listing the fresh copy drops keeps its last row with every switch
+    /// off, per chain: a symbol leaving one chain keeps trading on the
+    /// other, and only a symbol that trades nowhere has its policy carried,
+    /// with extended hours off.
+    #[test]
+    fn a_dropped_listing_is_carried_switched_off() {
+        let running = project(&parse(&fixtures::pinned_production_tokens()).unwrap()).unwrap();
+        assert_eq!(
+            running.policies["AAPL"]["extended_hours_counter_trading"],
+            Value::String("enabled".into())
+        );
+        let mut fresh = running.clone();
+        fresh.chain_rows.get_mut("base").unwrap().remove("AAPL");
+        fresh.policies.remove("AAPL");
+        let robinhood_before = fresh.chain_rows["robinhood"].get("AAPL").cloned();
+
+        let carried = fresh.carry_forward(&running);
+
+        assert_eq!(carried.listings, BTreeSet::from(["base/AAPL".to_string()]));
+        let row = &carried.projection.chain_rows["base"]["AAPL"];
+        for key in ["trading", "rebalancing", "wrapped_equity_recovery"] {
+            assert_eq!(row[key], Value::String("disabled".into()), "{key}");
+        }
+        assert_eq!(
+            row["tokenized_equity"],
+            running.chain_rows["base"]["AAPL"]["tokenized_equity"]
+        );
+        assert_eq!(
+            carried.projection.chain_rows["robinhood"]
+                .get("AAPL")
+                .cloned(),
+            robinhood_before,
+            "a listing the fresh copy keeps is its own"
+        );
+        assert_eq!(
+            carried.projection.policies["AAPL"]["extended_hours_counter_trading"],
+            Value::String("disabled".into())
+        );
+    }
+
+    /// A re-added listing takes the fresh copy's row, and a retired symbol
+    /// is dropped by the merge whatever was carried.
+    #[test]
+    fn a_readded_listing_takes_the_fresh_row() {
+        let running = project(&parse(&fixtures::read("tokens-staging.toml")).unwrap()).unwrap();
+        let mut fresh = running.clone();
+        fresh
+            .chain_rows
+            .get_mut("base")
+            .unwrap()
+            .get_mut("FGI")
+            .unwrap()
+            .insert("trading".into(), Value::String("disabled".into()));
+
+        let carried = fresh.clone().carry_forward(&running);
+
+        assert_eq!(carried.projection, fresh);
+        assert!(carried.listings.is_empty());
+
+        let config: Table =
+            toml::from_str("[assets.equities]\nretired_symbols = [\"FGI\"]\n").unwrap();
+        let mut dropped = running.clone();
+        dropped.chain_rows.get_mut("base").unwrap().remove("FGI");
+        let retired = dropped
+            .carry_forward(&running)
+            .projection
+            .without_retired(&config);
+        assert!(!retired.slots().contains("base/FGI"));
+        assert!(!retired.policies.contains_key("FGI"));
     }
 
     /// A copy that is gone or refused to the service account fails every

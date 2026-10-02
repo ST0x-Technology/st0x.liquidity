@@ -17,6 +17,7 @@ mod order_poller;
 mod pricing;
 mod rebalancing;
 pub mod registry;
+pub mod registry_state;
 mod telemetry;
 mod threshold;
 mod trading_schedule;
