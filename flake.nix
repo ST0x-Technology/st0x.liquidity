@@ -568,19 +568,20 @@
             # this build's `verify-migrations` binary against it. Lives here
             # rather than in infra/default.nix because it needs `rust.st0x-liquidity`
             # (the compiled binary), which that module doesn't have access to.
-            # The config's `[registry]` token file is read here with the
-            # operator's gcloud credentials (the pinned generation when there
-            # is one, as `gs://bucket/object#generation`, see
-            # https://cloud.google.com/storage/docs/using-versioned-objects#gcloud-cli),
-            # since the binary can reach the bucket only on the VM.
-            # REGISTRY_FILE points at a local copy instead.
+            # The token files are the ones the bot would boot: its persisted
+            # registry state (/mnt/data/registry), copied off the VM next to
+            # the snapshot and checked with `--registry-state`. That covers
+            # symbols carried forward as disabled, which the raw bucket copy
+            # no longer lists. With no state on the host, the latest bucket
+            # copy is read with the operator's gcloud credentials, since the
+            # binary can reach the bucket only on the VM. REGISTRY_FILE points
+            # at a local copy instead.
             verifyMigrationsPkgs = builtins.listToAttrs (
               map (
                 env:
                 let
                   inherit (builtins.fromTOML (builtins.readFile ./config/${env}/st0x-hedge.toml)) registry;
-                  tokenObject =
-                    registry.url + pkgs.lib.optionalString (registry ? generation) "#${toString registry.generation}";
+                  tokenObject = registry.url;
                 in
                 {
                   name = "${env}VerifyMigrations";
@@ -589,18 +590,32 @@
                     runtimeInputs = [
                       rust.st0x-liquidity
                       pkgs.google-cloud-sdk
+                      pkgs.gnutar
                     ];
                     text = ''
-                      registry_file="''${REGISTRY_FILE:-}"
-                      if [ -z "$registry_file" ]; then
-                        registry_file="$(mktemp)"
-                        trap 'rm -f "$registry_file"' EXIT
-                        gcloud storage cp ${pkgs.lib.escapeShellArg tokenObject} "$registry_file"
-                      fi
                       local_snapshot="$(${infraPkgs.packages.${env + "DbSnapshot"}}/bin/${env}-db-snapshot "$@")"
+                      if [ -n "''${REGISTRY_FILE:-}" ]; then
+                        registry_args=(--registry-file "$REGISTRY_FILE")
+                      else
+                        state_dir="$(dirname "$local_snapshot")/registry"
+                        rm -rf "$state_dir"
+                        mkdir -p "$state_dir"
+                        echo "Copying ${env}'s registry state to $state_dir..." >&2
+                        ${infraPkgs.packages.${env + "Remote"}}/bin/${env}-remote \
+                          'if [ -d /mnt/data/registry ]; then tar -C /mnt/data/registry -cf - .; else tar -cf - -T /dev/null; fi' \
+                          | tar -xf - -C "$state_dir"
+                        if [ -f "$state_dir/state.json" ]; then
+                          registry_args=(--registry-state "$state_dir")
+                        else
+                          echo "No registry state on ${env}; checking the latest bucket copy." >&2
+                          registry_file="$state_dir/latest-tokens.toml"
+                          gcloud storage cp ${pkgs.lib.escapeShellArg tokenObject} "$registry_file"
+                          registry_args=(--registry-file "$registry_file")
+                        fi
+                      fi
                       echo "Verifying migrations against $local_snapshot..." >&2
                       verify-migrations --db "$local_snapshot" --config ${./config/${env}/st0x-hedge.toml} \
-                        --registry-file "$registry_file"
+                        "''${registry_args[@]}"
                     '';
                   };
                 }

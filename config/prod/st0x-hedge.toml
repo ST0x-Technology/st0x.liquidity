@@ -333,6 +333,17 @@ retired_symbols = []
 
 # The per-symbol tables ([chains.<c>.trading.assets.equities.<SYM>] and
 # [assets.equities.<SYM>]) come from st0x.registry's token file in the bucket.
+# The bot follows the latest copy: there is no pin, and it refuses a
+# `generation` key. It reads the bucket's metadata every 10 seconds and judges
+# each new copy (config validation, contract probes, approval coverage). It
+# saves an accepted copy under /mnt/data/registry and restarts gracefully onto
+# it, at most once every 2 minutes. A restart boots the saved copy, not the
+# bucket. A refused copy leaves the running tables in place and sets
+# `registry_invalid`. A token change is a st0x.registry merge, not a release
+# here; see docs/how-to-add-new-asset.md, "4b. Publish and verify adoption".
+# Removing the pin unpins production at the first release of this file,
+# config-only included: the #1599-#1601 binary already follows the latest
+# copy when `generation` is absent. Run no config-only production release
+# between that merge and the tagged roll that adopts it.
 [registry]
 url = "gs://t0-artifacts-tokens/production/tokens.toml"
-generation = 1790782803062872

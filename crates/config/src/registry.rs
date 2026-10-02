@@ -60,19 +60,20 @@ const POLICY_KEYS: [&str; 2] = ["extended_hours_counter_trading", "hedge_floor_s
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RegistrySource {
-    /// `gs://bucket/object`, read with the VM's service account.
+    /// `gs://bucket/object`, read with the VM's service account. The bot
+    /// follows the latest copy; there is no pin.
     pub url: String,
-    /// Pin to one object generation, so every roll of a release runs the
-    /// same tokens and a change ships only with a release. Absent = the
-    /// latest copy.
-    #[serde(default)]
-    pub generation: Option<u64>,
 }
 
 #[derive(Debug, Error)]
 pub enum RegistryError {
-    #[error("[registry] takes `url` and, optionally, `generation`; nothing else")]
+    #[error("[registry] takes `url` and nothing else")]
     Source(#[source] toml::de::Error),
+    #[error(
+        "[registry] generation: the bot follows the latest copy of the token file; \
+         remove `generation`"
+    )]
+    Pinned,
     #[error("[registry] url {url:?} must be gs://<bucket>/<object>")]
     Url { url: String },
     #[error("token file is not UTF-8")]
@@ -158,6 +159,7 @@ impl RegistryError {
             ),
             Self::TooLarge { .. } => true,
             Self::Source(_)
+            | Self::Pinned
             | Self::Url { .. }
             | Self::Utf8(_)
             | Self::Toml(_)
@@ -185,9 +187,9 @@ impl RegistryError {
 ///
 /// Two production copies exist on purpose. `tokens-production-migration.toml`
 /// is frozen beside `production-inline.toml`, the pair that proves the
-/// projection reproduces the inline tables the day they were replaced. The
-/// copy production runs is the one `config/prod`'s pin names,
-/// `tokens-production-<generation>.toml`; a pin bump adds that file.
+/// projection reproduces the inline tables the day they were replaced.
+/// `tokens-production.toml` is a recent copy of the production token file,
+/// refreshed by hand when a test needs a newer listing.
 #[cfg(test)]
 pub(crate) mod fixtures {
     use std::path::{Path, PathBuf};
@@ -201,24 +203,9 @@ pub(crate) mod fixtures {
             .unwrap_or_else(|error| panic!("tests/fixtures/{name}: {error}"))
     }
 
-    /// The copy `config/prod` pins, by generation.
-    pub(crate) fn pinned_production_tokens() -> Vec<u8> {
-        let deployed: toml::Table = toml::from_str(
-            &std::fs::read_to_string(root().join("config/prod/st0x-hedge.toml")).unwrap(),
-        )
-        .unwrap();
-        let pinned = super::source_of(&deployed)
-            .unwrap()
-            .unwrap()
-            .generation
-            .expect("config/prod pins a generation");
-        let name = format!("tokens-production-{pinned}.toml");
-        assert!(
-            root().join("tests/fixtures").join(&name).is_file(),
-            "config/prod pins generation {pinned}; copy that object to tests/fixtures/{name} \
-             (gcloud storage cp 'gs://t0-artifacts-tokens/production/tokens.toml#{pinned}' ...)"
-        );
-        read(&name)
+    /// A recent copy of the production token file.
+    pub(crate) fn production_tokens() -> Vec<u8> {
+        read("tokens-production.toml")
     }
 }
 
@@ -352,7 +339,21 @@ pub struct Carried {
 
 const DISABLED: &str = "disabled";
 
+/// Refuses `[registry].generation`. Checked before the config itself is
+/// deserialized, where `deny_unknown_fields` would otherwise report it as
+/// an unknown field rather than say to remove it.
+pub fn refuse_pin(config: &Table) -> Result<(), RegistryError> {
+    if config
+        .get("registry")
+        .is_some_and(|registry| registry.get("generation").is_some())
+    {
+        return Err(RegistryError::Pinned);
+    }
+    Ok(())
+}
+
 pub fn source_of(config: &Table) -> Result<Option<RegistrySource>, RegistryError> {
+    refuse_pin(config)?;
     match config.get("registry") {
         None => Ok(None),
         Some(value) => {
@@ -902,14 +903,13 @@ async fn load_from(
     budget: Duration,
 ) -> Result<Vec<u8>, RegistryError> {
     within_boot_budget(&source.url, budget, || {
-        fetch_from(http, endpoints, &source.url, source.generation)
+        fetch_from(http, endpoints, &source.url, None)
     })
     .await
 }
 
-/// The copy boot records from the bucket: the pinned generation, or the
-/// latest version checked against its metadata. Bounded as a whole like
-/// [`load_bytes`].
+/// The copy boot records from the bucket: the latest version, checked
+/// against its metadata. Bounded as a whole like [`load_bytes`].
 pub async fn load_copy(source: &RegistrySource) -> Result<TokenCopy, RegistryError> {
     load_copy_from(&http_client()?, GOOGLE, source, BOOT_READ_BUDGET).await
 }
@@ -921,14 +921,8 @@ async fn load_copy_from(
     budget: Duration,
 ) -> Result<TokenCopy, RegistryError> {
     within_boot_budget(&source.url, budget, || async {
-        if let Some(generation) = source.generation {
-            fetch_from(http, endpoints, &source.url, Some(generation))
-                .await
-                .map(|bytes| TokenCopy { generation, bytes })
-        } else {
-            let version = fetch_metadata_from(http, endpoints, &source.url).await?;
-            fetch_version_from(http, endpoints, &source.url, &version).await
-        }
+        let version = fetch_metadata_from(http, endpoints, &source.url).await?;
+        fetch_version_from(http, endpoints, &source.url, &version).await
     })
     .await
 }
@@ -1123,7 +1117,7 @@ mod tests {
 
     #[test]
     fn a_priced_only_slot_is_not_the_bots() {
-        let projection = project(&parse(&fixtures::pinned_production_tokens()).unwrap()).unwrap();
+        let projection = project(&parse(&fixtures::production_tokens()).unwrap()).unwrap();
         // Ethereum FTF is priced and quoted, but liquidity does not hedge it.
         assert!(!projection.slots().contains("ethereum/FTF"));
         assert!(projection.slots().contains("base/FGI"));
@@ -1410,6 +1404,23 @@ mod tests {
     }
 
     #[test]
+    fn a_pinned_generation_is_refused() {
+        let config: Table =
+            toml::from_str("[registry]\nurl = \"gs://b/o\"\ngeneration = 1790782803062872\n")
+                .unwrap();
+
+        let error = source_of(&config).unwrap_err();
+
+        assert!(matches!(error, RegistryError::Pinned), "{error:?}");
+        assert!(
+            error
+                .to_string()
+                .contains("the bot follows the latest copy of the token file; remove `generation`"),
+            "{error}"
+        );
+    }
+
+    #[test]
     fn a_change_of_address_case_alone_is_not_a_change() {
         let projection =
             project(&parse(fixture("tokens-staging.toml").as_bytes()).unwrap()).unwrap();
@@ -1525,7 +1536,7 @@ mod tests {
     #[test]
     fn a_projection_round_trips_through_its_token_file() {
         for tokens in [
-            fixtures::pinned_production_tokens(),
+            fixtures::production_tokens(),
             fixtures::read("tokens-staging.toml"),
         ] {
             let projection = project(&parse(&tokens).unwrap()).unwrap();
@@ -1543,7 +1554,7 @@ mod tests {
     /// with extended hours off.
     #[test]
     fn a_dropped_listing_is_carried_switched_off() {
-        let running = project(&parse(&fixtures::pinned_production_tokens()).unwrap()).unwrap();
+        let running = project(&parse(&fixtures::production_tokens()).unwrap()).unwrap();
         assert_eq!(
             running.policies["AAPL"]["extended_hours_counter_trading"],
             Value::String("enabled".into())
@@ -1632,10 +1643,7 @@ mod tests {
     const OBJECT: &str = "gs://t0-artifacts-tokens/staging/tokens.toml";
 
     fn source() -> RegistrySource {
-        RegistrySource {
-            url: OBJECT.into(),
-            generation: None,
-        }
+        RegistrySource { url: OBJECT.into() }
     }
 
     fn endpoints(server: &httpmock::MockServer) -> (String, String) {

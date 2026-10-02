@@ -93,7 +93,9 @@ to finish durable work. `registry_reload_held_seconds` exposes deployment hold
 age; the watcher ignores holds older than fifteen minutes.
 `registry_fetch_errors_total` counts transient token-file access failures.
 
-Production remains pinned during the state-seeding rollout. Its watcher does not
-apply updates until the separate unpin release and matching t0.devops gate
-changes land. Alert rules for invalid content, startup failure and fallback are
-owned by the infrastructure follow-up.
+Staging and production both follow the latest copy; no config pins a generation.
+After a publish, `registry_applied_generation` moves to the new generation once
+the restart completes. If it does not move, check `registry_invalid`,
+`registry_reloads_total{result}` and `registry_reload_held_seconds`. Alert rules
+for invalid content, startup failure and fallback are owned by the
+infrastructure follow-up.

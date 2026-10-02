@@ -31,7 +31,7 @@ use sqlx::sqlite::SqliteConnectOptions;
 use thiserror::Error;
 use toml::Table;
 
-use crate::registry::{self, RegistryError, RegistrySource, sha256_hex};
+use crate::registry::{self, RegistryError, sha256_hex};
 
 /// How long a booted record must stay up before it becomes `last_good`. A
 /// copy that starts and then crashes inside this window falls back.
@@ -441,9 +441,6 @@ pub enum BootOutcome {
     LocalFile,
     /// An in-memory database: the bucket copy, no state.
     NoStateDir { generation: Option<u64> },
-    /// The config pins a generation; boot reads it from the bucket and
-    /// records it.
-    Pinned { record: RecordId, generation: u64 },
     /// No state yet: the latest bucket copy, now recorded.
     Seeded { record: RecordId, generation: u64 },
     /// The record that ran before. `discarded` names a pending record
@@ -480,13 +477,13 @@ pub enum BootOutcome {
 /// Chooses and claims the token file a server boots. Only the server calls
 /// this; it is the one boot step that writes state.
 ///
-/// `--registry-file` and an in-memory database bypass the state. A pinned
-/// config boots its pin and records it. Otherwise, in order: a pending
-/// copy with attempts left (one more attempt charged, unless the last
-/// process exited cleanly on it); a pending copy out of attempts, which
-/// boots a fallback built from the last good tables; the record that ran
-/// before; and, with no state at all, the latest bucket copy. A deploy
-/// hold is left in place: the activation that wrote it removes it.
+/// `--registry-file` and an in-memory database bypass the state. Otherwise,
+/// in order: a pending copy with attempts left (one more attempt charged,
+/// unless the last process exited cleanly on it); a pending copy out of
+/// attempts, which boots a fallback built from the last good tables; the
+/// record that ran before; and, with no state at all, the latest bucket
+/// copy. A deploy hold is left in place: the activation that wrote it
+/// removes it.
 pub async fn claim_for_boot(
     config: &Table,
     registry_file: Option<&Path>,
@@ -522,17 +519,13 @@ pub async fn claim_for_boot(
         });
     };
     let state = RegistryState::open(&dir)?;
-    claim_with(&state, &source, config, now, || {
-        registry::load_copy(&source)
-    })
-    .await
+    claim_with(&state, config, now, || registry::load_copy(&source)).await
 }
 
 /// [`claim_for_boot`] once the state is open, with the bucket read
 /// injected so tests can see whether boot touched the bucket.
 async fn claim_with<Load, Loading>(
     state: &RegistryState,
-    source: &RegistrySource,
     config: &Table,
     now: i64,
     load: Load,
@@ -541,19 +534,6 @@ where
     Load: FnOnce() -> Loading,
     Loading: Future<Output = Result<registry::TokenCopy, RegistryError>>,
 {
-    if source.generation.is_some() {
-        let copy = load().await?;
-        let record = record_for_copy(state, &copy)?;
-        return Ok(boot(
-            state,
-            &record,
-            BootOutcome::Pinned {
-                record: record.id,
-                generation: copy.generation,
-            },
-        ));
-    }
-
     let choice = state.update(|manifest| choose(state, manifest, config, now))?;
     let (record, outcome) = if let Some(chosen) = choice {
         chosen
@@ -998,13 +978,6 @@ mod tests {
         file.to_string().into_bytes()
     }
 
-    fn unpinned() -> RegistrySource {
-        RegistrySource {
-            url: "gs://t0-artifacts-tokens/staging/tokens.toml".into(),
-            generation: None,
-        }
-    }
-
     fn config() -> Table {
         toml::from_str("[chains.base.trading]\n[chains.robinhood.trading]\n").unwrap()
     }
@@ -1019,12 +992,11 @@ mod tests {
     /// `bytes` as `generation`.
     async fn claim_boot(
         state: &RegistryState,
-        source: &RegistrySource,
         bytes: &[u8],
         generation: u64,
         reads: &AtomicU32,
     ) -> BootClaim {
-        claim_with(state, source, &config(), 1_000, || {
+        claim_with(state, &config(), 1_000, || {
             reads.fetch_add(1, Ordering::Relaxed);
             let copy = TokenCopy {
                 generation,
@@ -1133,7 +1105,7 @@ mod tests {
         let (_dir, state) = open();
         let reads = AtomicU32::new(0);
 
-        let claim = claim_boot(&state, &unpinned(), &staging(), 11, &reads).await;
+        let claim = claim_boot(&state, &staging(), 11, &reads).await;
 
         assert_eq!(reads.load(Ordering::Relaxed), 1);
         assert_eq!(
@@ -1154,43 +1126,31 @@ mod tests {
     /// them. The activation removes its own hold; a stale one expires.
     #[tokio::test]
     async fn a_successful_boot_leaves_the_deploy_hold() {
-        for generation in [None, Some(11)] {
-            let (_dir, state) = open();
-            let source = RegistrySource {
-                generation,
-                ..unpinned()
-            };
-            let hold = state.dir().join("hold");
-            std::fs::write(&hold, b"deploy").unwrap();
-            let reads = AtomicU32::new(0);
-            for _ in 0..2 {
-                let claim = claim_boot(&state, &source, &staging(), 11, &reads).await;
-                assert_eq!(std::fs::read(&hold).unwrap(), b"deploy");
-                state.mark_running(claim.booted.unwrap().record).unwrap();
-            }
+        let (_dir, state) = open();
+        let hold = state.dir().join("hold");
+        std::fs::write(&hold, b"deploy").unwrap();
+        let reads = AtomicU32::new(0);
+        for _ in 0..2 {
+            let claim = claim_boot(&state, &staging(), 11, &reads).await;
+            assert_eq!(std::fs::read(&hold).unwrap(), b"deploy");
+            state.mark_running(claim.booted.unwrap().record).unwrap();
         }
     }
 
     #[tokio::test]
     async fn a_failed_boot_leaves_the_deploy_hold() {
-        for generation in [None, Some(11)] {
-            let (_dir, state) = open();
-            let source = RegistrySource {
-                generation,
-                ..unpinned()
-            };
-            let hold = state.dir().join("hold");
-            std::fs::write(&hold, b"deploy").unwrap();
-            let claim = claim_with(&state, &source, &config(), 1_000, || async {
-                Ok(TokenCopy {
-                    generation: 11,
-                    bytes: b"invalid toml [".to_vec(),
-                })
+        let (_dir, state) = open();
+        let hold = state.dir().join("hold");
+        std::fs::write(&hold, b"deploy").unwrap();
+        let claim = claim_with(&state, &config(), 1_000, || async {
+            Ok(TokenCopy {
+                generation: 11,
+                bytes: b"invalid toml [".to_vec(),
             })
-            .await;
-            assert!(claim.is_err());
-            assert_eq!(std::fs::read(&hold).unwrap(), b"deploy");
-        }
+        })
+        .await;
+        assert!(claim.is_err());
+        assert_eq!(std::fs::read(&hold).unwrap(), b"deploy");
     }
 
     /// Once a record runs, boot does not read the bucket: an outage or a
@@ -1204,7 +1164,7 @@ mod tests {
         state.mark_running(id).unwrap();
         let reads = AtomicU32::new(0);
 
-        let claim = claim_boot(&state, &unpinned(), b"not read", 12, &reads).await;
+        let claim = claim_boot(&state, b"not read", 12, &reads).await;
 
         assert_eq!(reads.load(Ordering::Relaxed), 0);
         assert_eq!(
@@ -1238,7 +1198,7 @@ mod tests {
         let reads = AtomicU32::new(0);
 
         for attempt in 1..=2 {
-            let claim = claim_boot(&state, &unpinned(), b"", 0, &reads).await;
+            let claim = claim_boot(&state, b"", 0, &reads).await;
             assert_eq!(
                 claim.outcome,
                 BootOutcome::Pending {
@@ -1248,7 +1208,7 @@ mod tests {
                 }
             );
         }
-        let claim = claim_boot(&state, &unpinned(), b"", 0, &reads).await;
+        let claim = claim_boot(&state, b"", 0, &reads).await;
         let BootOutcome::Fallback {
             record: fallback,
             generation: 10,
@@ -1288,7 +1248,7 @@ mod tests {
             projection(&without_fgi).chain_rows["base"]["RKLB"]
         );
 
-        let again = claim_boot(&state, &unpinned(), b"", 0, &reads).await;
+        let again = claim_boot(&state, b"", 0, &reads).await;
         assert_eq!(
             again.outcome,
             BootOutcome::FallbackAgain {
@@ -1316,7 +1276,7 @@ mod tests {
         set_pending(&state, pending);
         let reads = AtomicU32::new(0);
         for _ in 0..=MAX_BOOT_ATTEMPTS {
-            claim_boot(&state, &unpinned(), b"", 0, &reads).await;
+            claim_boot(&state, b"", 0, &reads).await;
         }
         let retry_at = state.manifest().unwrap().pending.unwrap().retry_at.unwrap();
 
@@ -1362,7 +1322,7 @@ mod tests {
         let reads = AtomicU32::new(0);
 
         for _ in 0..3 {
-            let claim = claim_boot(&state, &unpinned(), b"", 0, &reads).await;
+            let claim = claim_boot(&state, b"", 0, &reads).await;
             assert_eq!(
                 claim.outcome,
                 BootOutcome::Pending {
@@ -1391,7 +1351,7 @@ mod tests {
         std::fs::write(state.dir().join("records/2/source.toml"), b"tampered").unwrap();
         let reads = AtomicU32::new(0);
 
-        let claim = claim_boot(&state, &unpinned(), b"", 0, &reads).await;
+        let claim = claim_boot(&state, b"", 0, &reads).await;
 
         assert_eq!(
             claim.outcome,
@@ -1404,32 +1364,27 @@ mod tests {
         assert_eq!(state.manifest().unwrap().pending, None);
     }
 
-    /// While the config pins a generation, boot reads that generation and
-    /// records it, so the state is seeded from the reviewed pin. A restart
-    /// on the same pin reuses the record.
+    /// A config that still pins a generation stops boot before it reads
+    /// the bucket or touches the state.
     #[tokio::test]
-    async fn a_pinned_config_boots_and_records_its_pin() {
-        let (_dir, state) = open();
-        let pinned = RegistrySource {
-            generation: Some(11),
-            ..unpinned()
-        };
-        let reads = AtomicU32::new(0);
+    async fn a_pinned_config_is_refused_before_boot_reads_anything() {
+        let dir = tempfile::tempdir().unwrap();
+        let database = dir.path().join("hedge.db");
+        let config: Table = toml::from_str(&format!(
+            "database_url = \"sqlite://{}\"\n\
+             [registry]\nurl = \"gs://t0-artifacts-tokens/production/tokens.toml\"\n\
+             generation = 11\n",
+            database.display()
+        ))
+        .unwrap();
 
-        let first = claim_boot(&state, &pinned, &staging(), 11, &reads).await;
-        assert_eq!(
-            first.outcome,
-            BootOutcome::Pinned {
-                record: RecordId(1),
-                generation: 11
-            }
+        let error = claim_for_boot(&config, None, 1_000).await.unwrap_err();
+
+        assert!(
+            matches!(error, RegistryStateError::Registry(RegistryError::Pinned)),
+            "{error:?}"
         );
-        state.mark_running(RecordId(1)).unwrap();
-        let second = claim_boot(&state, &pinned, &staging(), 11, &reads).await;
-
-        assert_eq!(second.outcome, first.outcome);
-        assert_eq!(reads.load(Ordering::Relaxed), 2);
-        assert_eq!(record_ids(state.dir()).unwrap(), vec![RecordId(1)]);
+        assert!(!dir.path().join("registry").exists());
     }
 
     /// A record becomes last good only while it still runs, and a pending
@@ -1552,7 +1507,7 @@ mod tests {
             })
             .unwrap();
         let reads = AtomicU32::new(0);
-        let claim = claim_boot(&state, &unpinned(), &source, 3, &reads).await;
+        let claim = claim_boot(&state, &source, 3, &reads).await;
         assert_eq!(reads.load(Ordering::Relaxed), 0);
         assert_eq!(claim.booted.unwrap().record, pending);
         assert!(
@@ -1659,7 +1614,7 @@ mod tests {
         state.mark_running(pending).unwrap();
         std::fs::write(state.dir().join("records/2/source.toml"), b"tampered").unwrap();
         let reads = AtomicU32::new(0);
-        let claim = claim_boot(&state, &unpinned(), b"", 0, &reads).await;
+        let claim = claim_boot(&state, b"", 0, &reads).await;
         assert!(
             matches!(claim.outcome, BootOutcome::Running { record, discarded: Some(discarded), .. } if record == good && discarded == pending)
         );
@@ -1700,7 +1655,7 @@ mod tests {
             );
 
             let reads = AtomicU32::new(0);
-            let claim = claim_boot(&state, &unpinned(), b"", 0, &reads).await;
+            let claim = claim_boot(&state, b"", 0, &reads).await;
 
             assert_eq!(
                 claim.outcome,
@@ -1714,22 +1669,18 @@ mod tests {
         }
     }
 
-    /// A process that crashes before `mark_running` reboots the same pin
+    /// A process that crashes before `mark_running` reboots the same copy
     /// without adding a record per boot.
     #[tokio::test]
     async fn a_crash_loop_before_running_reuses_its_record() {
         let (_dir, state) = open();
-        let pinned = RegistrySource {
-            generation: Some(11),
-            ..unpinned()
-        };
         let reads = AtomicU32::new(0);
 
         for _ in 0..3 {
-            let claim = claim_boot(&state, &pinned, &staging(), 11, &reads).await;
+            let claim = claim_boot(&state, &staging(), 11, &reads).await;
             assert_eq!(
                 claim.outcome,
-                BootOutcome::Pinned {
+                BootOutcome::Seeded {
                     record: RecordId(1),
                     generation: 11
                 }
@@ -1756,7 +1707,7 @@ mod tests {
         set_pending(&state, pending);
         let reads = AtomicU32::new(0);
         for _ in 0..3 {
-            claim_boot(&state, &unpinned(), b"", 0, &reads).await;
+            claim_boot(&state, b"", 0, &reads).await;
         }
         let first = state.manifest().unwrap().pending.unwrap();
         let damaged = first.fallback.unwrap();
@@ -1772,7 +1723,7 @@ mod tests {
         let gate = gate_effective(state.dir(), &config()).unwrap();
         assert_eq!(gate, vec![effective(&staging()), tables.clone()]);
 
-        let claim = claim_boot(&state, &unpinned(), b"", 0, &reads).await;
+        let claim = claim_boot(&state, b"", 0, &reads).await;
         let BootOutcome::Fallback {
             record: rebuilt,
             generation: 10,

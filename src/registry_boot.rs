@@ -21,11 +21,6 @@ pub fn report_boot(outcome: &BootOutcome) {
             ?generation,
             "token file: read from the bucket; an in-memory database keeps no registry state"
         ),
-        BootOutcome::Pinned { record, generation } => info!(
-            %record,
-            generation,
-            "token file: booting the generation the config pins"
-        ),
         BootOutcome::Seeded { record, generation } => info!(
             %record,
             generation,
