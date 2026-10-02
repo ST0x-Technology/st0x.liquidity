@@ -1377,8 +1377,10 @@ pub(crate) struct ProcessTxHandle {
 }
 
 /// Serializes operator transfer-recovery requests so they cannot race through
-/// duplicate or conflicting mint/redemption flows.
-pub(crate) struct ResumeLock(pub(crate) Mutex<()>);
+/// duplicate or conflicting mint/redemption flows. The mutex sits behind an
+/// `Arc` so a detached task can own its guard past the request:
+/// `capital cctp-bridge` holds it until its burn confirms.
+pub(crate) struct ResumeLock(pub(crate) Arc<Mutex<()>>);
 
 /// The operator request asking to pause the USDC driver, logged when the pause
 /// is refused so the refusal is traceable to that request.
@@ -4055,6 +4057,69 @@ where
     })
 }
 
+/// Runs a route's work through [`spawn_detached`] in two phases, for a route
+/// that answers at a broadcast rather than at the outcome. `broadcast` runs
+/// up to the transaction's broadcast and returns the answer together with
+/// the confirmation to run next; this helper sends that answer to the request
+/// at once, then awaits the confirmation on the same task. A refusal from
+/// `broadcast` is the answer instead, and nothing runs after it. So a
+/// confirmation slower than the 60 second load balancer cut still reaches the
+/// operator with the tx hash, and every path through the task answers.
+/// Whatever the confirmation future owns (a lock guard, a driver pause) stays
+/// held until it completes.
+///
+/// The request cannot be the one to join the task, since it returns before
+/// the task ends, so a tracked watcher joins it: a panic in either phase still
+/// reaches the join failure log of [`spawn_detached`], after the answer or a
+/// dropped request alike.
+async fn answer_from_detached<Answer, Subject, Broadcast, Confirm>(
+    detached_tasks: &TaskTracker,
+    operation: &'static str,
+    subject: Subject,
+    broadcast: Broadcast,
+) -> Result<Answer, OpsError>
+where
+    Answer: Send + 'static,
+    Subject: std::fmt::Display + Send + 'static,
+    Broadcast: Future<Output = Result<(Answer, Confirm), OpsError>> + Send + 'static,
+    Confirm: Future<Output = ()> + Send + 'static,
+{
+    let (answer, answered) = tokio::sync::oneshot::channel();
+    // Held until the watcher is spawned too, as `spawn_detached` holds its own
+    // across its spawn: otherwise a worker that ends at once could leave the
+    // tracker empty for a shutdown drain to return before the watcher exists,
+    // and a panic's join failure log would be lost.
+    let admission = detached_tasks.token();
+    let worker = spawn_detached(detached_tasks, operation, subject, async move {
+        // A dropped request has no receiver left, so a failed send is fine.
+        match broadcast.await {
+            Ok((reply, confirm)) => {
+                let _ = answer.send(Ok(reply));
+                confirm.await;
+            }
+            Err(refusal) => {
+                let _ = answer.send(Err(refusal));
+            }
+        }
+    })?;
+    detached_tasks.spawn(async move {
+        let _joined = worker.await;
+    });
+    drop(admission);
+
+    match answered.await {
+        Ok(answer) => answer,
+        // Every path through the task answers, so a dropped sender means the
+        // broadcast phase panicked; the watcher logs the join failure.
+        Err(_panicked) => Err((
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: format!("{operation} worker task failed"),
+            }),
+        )),
+    }
+}
+
 /// Runs the process-tx workload through [`spawn_detached`], mapping
 /// the operator error to an HTTP response. The detached task keeps the
 /// in flight broker placement alive after a client disconnect, and the
@@ -4603,9 +4668,9 @@ mod tests {
     };
     use crate::rebalancing::{RebalancingSchedulers, RebalancingServiceConfig};
     use crate::test_utils::{
-        AnvilRaindexChain, TEST_POLL_INTERVAL, erc20_allowance, erc20_balance, get_test_order,
-        mined_receipt, reserving_counter_trade_preflight, seed_get_test_order_token_symbols,
-        setup_test_pools,
+        AnvilRaindexChain, HeldReceiptWallet, ReceiptGate, TEST_POLL_INTERVAL, erc20_allowance,
+        erc20_balance, get_test_order, mined_receipt, reserving_counter_trade_preflight,
+        seed_get_test_order_token_symbols, setup_test_pools,
     };
     use crate::tokenized_equity_mint::TokenizedEquityMint;
     use crate::usdc_rebalance::{ConversionAmounts, RebalanceDirection, TransferRef};
@@ -4631,8 +4696,9 @@ mod tests {
             ),
             recovery: Arc::new(tokio::sync::OnceCell::new()),
             process_tx: Arc::new(tokio::sync::OnceCell::new()),
-            resume_lock: Arc::new(ResumeLock(Mutex::new(()))),
+            resume_lock: Arc::new(ResumeLock(Arc::new(Mutex::new(())))),
             vault_deposit_lock: Arc::new(Mutex::new(())),
+            vault_withdraw_lock: Arc::new(Mutex::new(())),
             projection_maintenance: Arc::new(
                 crate::conductor::projection_pause::ProjectionMaintenance::for_test(),
             ),
@@ -8454,7 +8520,41 @@ mod tests {
         assert_eq!(status, StatusCode::CONFLICT);
         assert_eq!(
             body.error,
-            "Another vault deposit is in progress; retry once it finishes"
+            "Another vault deposit is in progress or its outcome is unknown; check the bot \
+             logs for it before retrying"
+        );
+    }
+
+    /// `vault-withdraw-usdc` shares the withdraw lock with `vault-withdraw`:
+    /// while either holds it, a request refuses with 409 before any chain call.
+    #[tokio::test]
+    async fn vault_withdraw_usdc_returns_409_while_another_withdrawal_holds_the_lock() {
+        let mut ctx = create_test_ctx_with_order_owner(Address::ZERO);
+        ctx.wallet = Some(st0x_config::OnchainWalletCtx::stub());
+        ctx.chains.primary_mut().assets.cash = Some(ChainCashAsset {
+            vault_ids: vec![B256::with_last_byte(7)],
+            rebalancing: OperationMode::Disabled,
+            operational_limit: None,
+        });
+        let (state, _gate) = recovery_state_for_ctx(ctx, EquityTransferServices::panicking()).await;
+        state.health.set_ready();
+        let withdraw_lock = Arc::clone(&state.vault_withdraw_lock);
+        let _held = withdraw_lock.try_lock().unwrap();
+
+        let Err((status, Json(body))) = capital::vault_withdraw_usdc(
+            State(state),
+            capital_request(serde_json::json!({"chain": "base", "amount": "1"})),
+        )
+        .await
+        else {
+            panic!("a held withdraw lock must refuse the withdrawal");
+        };
+
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(
+            body.error,
+            "Another vault withdrawal is in progress or its outcome is unknown; check the bot \
+             logs for it before retrying"
         );
     }
 
@@ -8551,43 +8651,76 @@ mod tests {
     }
 
     /// A ctx whose Base trading table is `chain`'s orderbook in Legacy mode,
-    /// where the bot's own vaults live, with every signer the bot's wallet
-    /// on that node.
-    fn capital_ctx_on(chain: &AnvilRaindexChain) -> Ctx {
+    /// where the bot's own vaults live, with every signer the bot's wallet on
+    /// that node behind a [`HeldReceiptWallet`]: each route's confirmation
+    /// waits until the returned gate moves, so the tests can observe a route
+    /// that answered at the broadcast while its confirmation is still pending.
+    fn capital_ctx_on(chain: &AnvilRaindexChain) -> (Ctx, tokio::sync::watch::Sender<ReceiptGate>) {
+        let (wallet, gate) = HeldReceiptWallet::wrap(Arc::clone(&chain.bot_wallet));
         let mut ctx = create_test_ctx_with_order_owner(chain.bot);
         let primary = ctx.chains.primary_mut();
         primary.rpc_url = chain.endpoint.clone();
         primary.orderbook = chain.orderbook;
         ctx.wallet = Some(st0x_config::OnchainWalletCtx::from_wallets(
-            Arc::clone(&chain.bot_wallet),
-            Arc::clone(&chain.bot_wallet),
-            Arc::clone(&chain.bot_wallet),
-            Arc::clone(&chain.bot_wallet),
+            Arc::clone(&wallet),
+            Arc::clone(&wallet),
+            Arc::clone(&wallet),
+            wallet,
         ));
-        ctx
+        (ctx, gate)
+    }
+
+    /// Checks that the capital route that just answered is still awaiting its
+    /// held confirmation, then releases it and waits until every capital task
+    /// has finished, leaving the gate held again for the next route.
+    async fn confirm_after_the_answer(
+        state: &AppState,
+        gate: &tokio::sync::watch::Sender<ReceiptGate>,
+    ) {
+        state.detached_tasks.close();
+        let Err(_still_confirming) =
+            tokio::time::timeout(Duration::from_millis(200), state.detached_tasks.wait()).await
+        else {
+            panic!("the route's task must keep running until its confirmation");
+        };
+        gate.send_replace(ReceiptGate::Released);
+        state.detached_tasks.wait().await;
+        state.detached_tasks.reopen();
+        gate.send_replace(ReceiptGate::Held);
     }
 
     /// End to end through the handler against a deployed orderbook: the
     /// amount is scaled by the decimals read onchain, the response reports the
-    /// mined deposit, and exactly the reported raw amount moves from the bot's
-    /// wallet into its vault.
+    /// deposit tx at its broadcast while the deposit lock stays held until the
+    /// deposit confirms, and exactly the reported raw amount moves from the
+    /// bot's wallet into its vault.
+    #[tracing_test::traced_test]
     #[tokio::test]
     async fn vault_deposit_moves_the_scaled_amount_into_the_bots_vault() {
         let chain = AnvilRaindexChain::deploy().await;
         let supply = U256::from(1_000_u64) * U256::from(10_u64).pow(U256::from(18_u64));
         let token = chain.deploy_bot_token(18, supply).await;
         let vault_id = B256::with_last_byte(3);
-        let state = empty_app_state(capital_ctx_on(&chain)).await;
+        let (ctx, gate) = capital_ctx_on(&chain);
+        let state = empty_app_state(ctx).await;
         state.health.set_ready();
 
         let body = capital_success(
             "vault-deposit",
             capital::vault_deposit(
-                State(state),
+                State(state.clone()),
                 capital_request(vault_request(token, vault_id, "1.5")),
             )
             .await,
         );
+        let Err(_) = state.vault_deposit_lock.try_lock() else {
+            panic!("the deposit must hold the deposit lock until it confirms");
+        };
+        confirm_after_the_answer(&state, &gate).await;
+        let Ok(_released) = state.vault_deposit_lock.try_lock() else {
+            panic!("the confirmed deposit must release the deposit lock");
+        };
+        assert!(logs_contain("Vault operation confirmed via API"));
 
         let deposit_tx: TxHash = serde_json::from_value(body["depositTx"].clone()).unwrap();
         assert_eq!(
@@ -8613,15 +8746,19 @@ mod tests {
         );
     }
 
-    /// After a deposit, a partial withdraw returns exactly the reported raw
-    /// amount from the vault to the bot's wallet.
+    /// After a deposit, a partial withdraw answers with its tx at the
+    /// broadcast, a rerun of it refuses with 409 while the bot still waits for
+    /// that withdraw's receipt (the gate holds the wait; Anvil has already
+    /// mined it), and exactly the reported raw amount returns from the vault
+    /// to the bot's wallet, once.
     #[tokio::test]
     async fn vault_withdraw_moves_the_scaled_amount_back_to_the_bots_wallet() {
         let chain = AnvilRaindexChain::deploy().await;
         let supply = U256::from(1_000_u64) * U256::from(10_u64).pow(U256::from(18_u64));
         let token = chain.deploy_bot_token(18, supply).await;
         let vault_id = B256::with_last_byte(4);
-        let state = empty_app_state(capital_ctx_on(&chain)).await;
+        let (ctx, gate) = capital_ctx_on(&chain);
+        let state = empty_app_state(ctx).await;
         state.health.set_ready();
         capital_success(
             "vault-deposit",
@@ -8631,15 +8768,34 @@ mod tests {
             )
             .await,
         );
+        confirm_after_the_answer(&state, &gate).await;
 
         let body = capital_success(
             "vault-withdraw",
             capital::vault_withdraw(
-                State(state),
+                State(state.clone()),
                 capital_request(vault_request(token, vault_id, "0.25")),
             )
             .await,
         );
+        let Err((status, Json(rerun))) = capital::vault_withdraw(
+            State(state.clone()),
+            capital_request(vault_request(token, vault_id, "0.25")),
+        )
+        .await
+        else {
+            panic!("a rerun before the confirmation must not withdraw again");
+        };
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(
+            rerun.error,
+            "Another vault withdrawal is in progress or its outcome is unknown; check the bot \
+             logs for it before retrying"
+        );
+        confirm_after_the_answer(&state, &gate).await;
+        let Ok(_released) = state.vault_withdraw_lock.try_lock() else {
+            panic!("the confirmed withdraw must release the withdraw lock");
+        };
 
         let withdraw_tx: TxHash = serde_json::from_value(body["withdrawTx"].clone()).unwrap();
         assert_eq!(
@@ -8670,9 +8826,10 @@ mod tests {
     }
 
     /// The USDC withdraw resolves the chain's settlement stable and the first
-    /// configured cash vault on its own: the response names both, the reported
-    /// raw amount (6 decimals) leaves that vault for the bot's wallet, and the
-    /// second configured cash vault is untouched.
+    /// configured cash vault on its own: the response names both and answers
+    /// at the broadcast, the reported raw amount (6 decimals) leaves that vault
+    /// for the bot's wallet, and the second configured cash vault is
+    /// untouched.
     #[tokio::test]
     async fn vault_withdraw_usdc_withdraws_the_stable_from_the_first_cash_vault() {
         let chain = AnvilRaindexChain::deploy().await;
@@ -8682,7 +8839,7 @@ mod tests {
             .await;
         let cash_vault = B256::with_last_byte(7);
         let second_cash_vault = B256::with_last_byte(8);
-        let mut ctx = capital_ctx_on(&chain);
+        let (mut ctx, gate) = capital_ctx_on(&chain);
         ctx.chains.primary_mut().assets.cash = Some(ChainCashAsset {
             vault_ids: vec![cash_vault, second_cash_vault],
             rebalancing: OperationMode::Disabled,
@@ -8698,15 +8855,17 @@ mod tests {
             )
             .await,
         );
+        confirm_after_the_answer(&state, &gate).await;
 
         let body = capital_success(
             "vault-withdraw-usdc",
             capital::vault_withdraw_usdc(
-                State(state),
+                State(state.clone()),
                 capital_request(serde_json::json!({"chain": "base", "amount": "2.5"})),
             )
             .await,
         );
+        confirm_after_the_answer(&state, &gate).await;
 
         let withdraw_tx: TxHash = serde_json::from_value(body["withdrawTx"].clone()).unwrap();
         assert_eq!(
@@ -8739,8 +8898,10 @@ mod tests {
     }
 
     /// A standing settlement stable allowance to the orderbook is revoked by
-    /// a mined approve on the stable, reported with its tx; a second reset
-    /// finds it already zero and sends nothing.
+    /// an approve on the stable, reported with its tx at the broadcast and
+    /// confirmed afterwards; a second reset finds it already zero and sends
+    /// nothing.
+    #[tracing_test::traced_test]
     #[tokio::test]
     async fn reset_allowance_revokes_a_standing_allowance_then_reports_already_zero() {
         let chain = AnvilRaindexChain::deploy().await;
@@ -8749,7 +8910,8 @@ mod tests {
         chain
             .approve_from_bot(usdc, chain.orderbook, U256::from(5_000_000_u64))
             .await;
-        let state = empty_app_state(capital_ctx_on(&chain)).await;
+        let (ctx, gate) = capital_ctx_on(&chain);
+        let state = empty_app_state(ctx).await;
         state.health.set_ready();
 
         let revoked = capital_success(
@@ -8760,6 +8922,8 @@ mod tests {
             )
             .await,
         );
+        confirm_after_the_answer(&state, &gate).await;
+        assert!(logs_contain("Orderbook allowance reset confirmed via API"));
 
         let revoke_tx: TxHash = serde_json::from_value(revoked["tx"].clone()).unwrap();
         assert_eq!(
@@ -8798,6 +8962,315 @@ mod tests {
                 "tx": null,
             })
         );
+    }
+
+    /// A route that answered at the broadcast and then panics while awaiting
+    /// the confirmation still reaches the join failure log through the
+    /// tracked watcher, since the request is long gone by then.
+    #[tracing_test::traced_test]
+    #[tokio::test]
+    async fn a_panic_after_the_answer_still_reaches_the_join_failure_log() {
+        let chain = AnvilRaindexChain::deploy().await;
+        let usdc = Chain::Base.settlement_stable().address;
+        chain.etch_bot_stable(usdc, U256::ZERO).await;
+        chain
+            .approve_from_bot(usdc, chain.orderbook, U256::from(5_000_000_u64))
+            .await;
+        let (ctx, gate) = capital_ctx_on(&chain);
+        gate.send_replace(ReceiptGate::Panic);
+        let state = empty_app_state(ctx).await;
+        state.health.set_ready();
+
+        let revoked = capital_success(
+            "reset-allowance",
+            capital::reset_allowance(
+                State(state.clone()),
+                capital_request(serde_json::json!({"chain": "base"})),
+            )
+            .await,
+        );
+        assert_eq!(revoked["outcome"], "revoked");
+
+        state.detached_tasks.close();
+        state.detached_tasks.wait().await;
+        assert!(logs_contain("reset-allowance worker task failed"));
+        assert!(!logs_contain("Orderbook allowance reset confirmed via API"));
+    }
+
+    /// A confirmation that fails after the answer is logged as not confirmed
+    /// with the tx the route answered with, for a vault verb and for
+    /// `reset-allowance` alike, and the failed deposit still releases the
+    /// deposit lock. Anvil does not mine, so the gate's revert is the only
+    /// outcome either route sees.
+    #[tracing_test::traced_test]
+    #[tokio::test]
+    async fn a_failed_confirmation_is_logged_with_the_answered_tx() {
+        let chain = AnvilRaindexChain::deploy().await;
+        let supply = U256::from(1_000_u64) * U256::from(10_u64).pow(U256::from(18_u64));
+        let token = chain.deploy_bot_token(18, supply).await;
+        let usdc = Chain::Base.settlement_stable().address;
+        chain.etch_bot_stable(usdc, U256::ZERO).await;
+        chain
+            .approve_from_bot(usdc, chain.orderbook, U256::from(5_000_000_u64))
+            .await;
+        // Pre-approve the deposit, whose approve would otherwise wait for a
+        // block that never comes.
+        chain
+            .approve_from_bot(token, chain.orderbook, U256::MAX)
+            .await;
+        chain.set_automine(false).await;
+        let (ctx, gate) = capital_ctx_on(&chain);
+        gate.send_replace(ReceiptGate::Fail);
+        let state = empty_app_state(ctx).await;
+        state.health.set_ready();
+
+        let deposit = capital_success(
+            "vault-deposit",
+            capital::vault_deposit(
+                State(state.clone()),
+                capital_request(vault_request(token, B256::with_last_byte(3), "1.5")),
+            )
+            .await,
+        );
+        let reset = capital_success(
+            "reset-allowance",
+            capital::reset_allowance(
+                State(state.clone()),
+                capital_request(serde_json::json!({"chain": "base"})),
+            )
+            .await,
+        );
+        state.detached_tasks.close();
+        state.detached_tasks.wait().await;
+
+        let Ok(_released) = state.vault_deposit_lock.try_lock() else {
+            panic!("a deposit whose confirmation failed must release the deposit lock");
+        };
+        let deposit_tx: TxHash = serde_json::from_value(deposit["depositTx"].clone()).unwrap();
+        let reset_tx: TxHash = serde_json::from_value(reset["tx"].clone()).unwrap();
+        logs_assert(|lines| {
+            for (message, tx) in [
+                (
+                    "Vault operation broadcast via API did not confirm",
+                    deposit_tx,
+                ),
+                (
+                    "Orderbook allowance reset via API did not confirm",
+                    reset_tx,
+                ),
+            ] {
+                let tx_field = format!("tx={tx}");
+                if !lines
+                    .iter()
+                    .any(|line| line.contains(message) && line.contains(&tx_field))
+                {
+                    return Err(format!("no `{message}` line names {tx_field}"));
+                }
+            }
+            Ok(())
+        });
+        assert!(!logs_contain("confirmed via API"));
+    }
+
+    /// Deposits into a vault, stops Anvil from mining so the next tx stays
+    /// pending, then withdraws with the receipt gate set to `gate`, waits until
+    /// `outcome_logged` sees the confirmation's outcome, and returns the chain,
+    /// the state, and the refusal of an immediate rerun of the same withdraw.
+    /// Panics if the rerun is not refused.
+    async fn rerun_after_withdraw_outcome(
+        gate: ReceiptGate,
+        outcome_logged: impl Fn() -> bool + Send + Sync,
+    ) -> (AnvilRaindexChain, AppState, (StatusCode, ErrorResponse)) {
+        let chain = AnvilRaindexChain::deploy().await;
+        let supply = U256::from(1_000_u64) * U256::from(10_u64).pow(U256::from(18_u64));
+        let token = chain.deploy_bot_token(18, supply).await;
+        let vault_id = B256::with_last_byte(4);
+        let (ctx, receipts) = capital_ctx_on(&chain);
+        let state = empty_app_state(ctx).await;
+        state.health.set_ready();
+        capital_success(
+            "vault-deposit",
+            capital::vault_deposit(
+                State(state.clone()),
+                capital_request(vault_request(token, vault_id, "1.5")),
+            )
+            .await,
+        );
+        confirm_after_the_answer(&state, &receipts).await;
+        // The route reads the tx's own receipt when the gate fails the wait,
+        // so the tx must really be unmined for the outcome to be unknown.
+        chain.set_automine(false).await;
+        receipts.send_replace(gate);
+
+        capital_success(
+            "vault-withdraw",
+            capital::vault_withdraw(
+                State(state.clone()),
+                capital_request(vault_request(token, vault_id, "0.25")),
+            )
+            .await,
+        );
+        // Wait until the task has handled the gate's outcome, whichever way,
+        // so the rerun below is what decides the test.
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !outcome_logged() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the confirmation must reach an outcome");
+
+        let Err((status, Json(rerun))) = capital::vault_withdraw(
+            State(state.clone()),
+            capital_request(vault_request(token, vault_id, "0.25")),
+        )
+        .await
+        else {
+            panic!("a rerun before the withdraw's fate is proven must not withdraw again");
+        };
+        (chain, state, (status, rerun))
+    }
+
+    fn assert_withdraw_lock_refusal((status, refusal): (StatusCode, ErrorResponse)) {
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(
+            refusal.error,
+            "Another vault withdrawal is in progress or its outcome is unknown; check the bot \
+             logs for it before retrying"
+        );
+    }
+
+    /// A receipt timeout does not prove the withdraw failed: the tx can still
+    /// land. The route keeps the withdraw lock and waits again, so a rerun
+    /// still answers 409 instead of broadcasting a second withdraw.
+    #[tracing_test::traced_test]
+    #[tokio::test]
+    async fn a_withdraw_whose_receipt_times_out_keeps_its_lock() {
+        let (_chain, _state, refusal) = rerun_after_withdraw_outcome(ReceiptGate::TimeOut, || {
+            logs_contain("is not confirmed yet") || logs_contain("did not confirm")
+        })
+        .await;
+
+        assert_withdraw_lock_refusal(refusal);
+        assert!(!logs_contain(
+            "Vault operation broadcast via API did not confirm"
+        ));
+    }
+
+    /// A formal JSON-RPC error reply to the receipt poll proves nothing about
+    /// the tx either, so it keeps the lock like a timeout does.
+    #[tracing_test::traced_test]
+    #[tokio::test]
+    async fn a_withdraw_whose_receipt_poll_errors_keeps_its_lock() {
+        let (_chain, _state, refusal) = rerun_after_withdraw_outcome(ReceiptGate::RpcError, || {
+            logs_contain("is not confirmed yet") || logs_contain("did not confirm")
+        })
+        .await;
+
+        assert_withdraw_lock_refusal(refusal);
+        assert!(!logs_contain(
+            "Vault operation broadcast via API did not confirm"
+        ));
+    }
+
+    /// A panic while confirming leaves the tx's fate unknown, so the lock is
+    /// kept until a restart and the panic still reaches the join failure log.
+    #[tracing_test::traced_test]
+    #[tokio::test]
+    async fn a_withdraw_whose_confirmation_panics_keeps_its_lock() {
+        let (_chain, _state, refusal) = rerun_after_withdraw_outcome(ReceiptGate::Panic, || {
+            logs_contain("vault-withdraw worker task failed")
+        })
+        .await;
+
+        assert_withdraw_lock_refusal(refusal);
+        assert!(logs_contain(
+            "Vault operation confirmation panicked; keeping its lock until a restart"
+        ));
+    }
+
+    /// A drop report does not prove the withdraw can never land: the node the
+    /// wallet asked may just not have it. The lock stays held, a rerun still
+    /// answers 409, and once the tx mines its receipt confirms it and frees
+    /// the lock, though the wallet still reports a drop.
+    #[tracing_test::traced_test]
+    #[tokio::test]
+    async fn a_withdraw_reported_dropped_keeps_its_lock_until_it_mines() {
+        let (chain, state, refusal) = rerun_after_withdraw_outcome(ReceiptGate::Dropped, || {
+            logs_contain("is not confirmed yet") || logs_contain("did not confirm")
+        })
+        .await;
+
+        assert_withdraw_lock_refusal(refusal);
+        assert!(!logs_contain(
+            "Vault operation broadcast via API did not confirm"
+        ));
+
+        chain.mine().await;
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while state.vault_withdraw_lock.try_lock().is_err() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the mined withdraw must free the withdraw lock");
+        logs_assert(|lines| {
+            let confirmed = lines
+                .iter()
+                .filter(|line| line.contains("Vault operation confirmed via API"))
+                .count();
+            // One for the deposit, one for the withdraw that mined.
+            (confirmed == 2)
+                .then_some(())
+                .ok_or_else(|| format!("expected 2 confirmed lines, got {confirmed}"))
+        });
+    }
+
+    /// A deposit that mines with a status 0 receipt, while the replay that
+    /// would decode its revert fails as it does on a node with pruned state,
+    /// is still a proven failure: its own receipt shows it mined and failed.
+    /// The route logs it as not confirmed and frees the deposit lock instead
+    /// of waiting forever.
+    #[tracing_test::traced_test]
+    #[tokio::test]
+    async fn a_mined_failure_whose_replay_decodes_nothing_frees_its_lock() {
+        let chain = AnvilRaindexChain::deploy().await;
+        let supply = U256::from(1_000_u64) * U256::from(10_u64).pow(U256::from(18_u64));
+        let token = chain.deploy_bot_token(18, supply).await;
+        chain
+            .approve_from_bot(token, chain.orderbook, U256::MAX)
+            .await;
+        chain.set_automine(false).await;
+        let (ctx, gate) = capital_ctx_on(&chain);
+        gate.send_replace(ReceiptGate::Unreplayable);
+        let state = empty_app_state(ctx).await;
+        state.health.set_ready();
+
+        capital_success(
+            "vault-deposit",
+            capital::vault_deposit(
+                State(state.clone()),
+                capital_request(vault_request(token, B256::with_last_byte(5), "1.5")),
+            )
+            .await,
+        );
+        // The pending deposit's token transfer now reverts, so the block
+        // mines it with a status 0 receipt.
+        chain.make_always_revert(token).await;
+        chain.mine().await;
+
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while state.vault_deposit_lock.try_lock().is_err() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the mined failure must free the deposit lock");
+        assert!(logs_contain(
+            "Vault operation broadcast via API did not confirm"
+        ));
+        assert!(logs_contain("missing trie node"));
+        assert!(!logs_contain("confirmed via API"));
     }
 
     /// End to end against CCTP V2 deployed on two Anvil nodes, reached
@@ -10791,7 +11264,7 @@ mod tests {
     /// unpaused, and only the (never reached) mint submission would take them.
     #[tokio::test]
     async fn complete_cctp_mint_poll_does_not_park_usdc_work_while_unattested() {
-        let resume_lock = Arc::new(ResumeLock(Mutex::new(())));
+        let resume_lock = Arc::new(ResumeLock(Arc::new(Mutex::new(()))));
         let (pause, gate) = usdc_driver_pause();
         let lock_free = Arc::new(AtomicBool::new(false));
         let driver_free = Arc::new(AtomicBool::new(false));
@@ -10939,7 +11412,7 @@ mod tests {
     /// mint failure.
     #[tokio::test]
     async fn complete_cctp_mint_reports_an_inconclusive_mint_as_retryable() {
-        let resume_lock = Arc::new(ResumeLock(Mutex::new(())));
+        let resume_lock = Arc::new(ResumeLock(Arc::new(Mutex::new(()))));
         let (pause, _gate) = usdc_driver_pause();
 
         let resp = complete_cctp_mint_recovery(
@@ -11001,7 +11474,7 @@ mod tests {
     /// reports the raw values and the conversion error rather than nulls.
     #[tokio::test]
     async fn complete_cctp_mint_reports_undecodable_amounts_with_the_error() {
-        let resume_lock = Arc::new(ResumeLock(Mutex::new(())));
+        let resume_lock = Arc::new(ResumeLock(Arc::new(Mutex::new(()))));
         let (pause, _gate) = usdc_driver_pause();
 
         let Ok(Json(body)) = complete_cctp_mint_recovery(

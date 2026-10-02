@@ -322,13 +322,16 @@ corridor guard, so retrying it cannot start a second transfer alongside the
 first. Like the automatic rebalancer, it is also refused with `409` while a cash
 snapshot divergence is unresolved or the cash balance is restart tainted; retry
 once the inventory poller has cleared it. `capital vault-deposit` is refused
-with `409` while another `capital vault-deposit` runs; the lock does not cover
-the bot's own transfer deposits. `capital transfer-usdc` and
-`capital cctp-bridge` both answer `503` while the Base or Ethereum signing
-wallet cannot be shown to pay gas: fund a wallet that is below its gas
-threshold, or retry if the message says its balance could not be read.
-`capital cctp-bridge` waits for neither Circle nor the burn's receipt: it
-returns the burn tx as soon as the burn is broadcast, and
+with `409` while another `capital vault-deposit` that answered with a tx waits
+for that tx's outcome; the lock does not cover the bot's own transfer deposits.
+Likewise `capital vault-withdraw` and `capital vault-withdraw-usdc` share one
+lock: either is refused with `409` while the other, or a rerun of itself, waits
+for the outcome of the tx it answered with. A verb that answered `500` holds no
+lock. `capital transfer-usdc` and `capital cctp-bridge` both answer `503` while
+the Base or Ethereum signing wallet cannot be shown to pay gas: fund a wallet
+that is below its gas threshold, or retry if the message says its balance could
+not be read. `capital cctp-bridge` waits for neither Circle nor the burn's
+receipt: it returns the burn tx as soon as the burn is broadcast, and
 `debug cctp complete-mint` fetches the attestation and mints once Circle has
 attested it.
 
@@ -354,6 +357,46 @@ errors. A timed out receipt wait, or one that kept failing on RPC errors, does
 not prove the burn failed, so check the burn tx onchain before completing the
 mint or retrying; a burn that never confirmed never attests, and `complete-mint`
 keeps answering `502` for it.
+
+`capital vault-deposit`, `capital vault-withdraw`, `capital vault-withdraw-usdc`
+and `capital reset-allowance` also print their tx as soon as it is broadcast,
+and the bot confirms it afterwards, so they answer within the load balancer cut
+even on a chain that needs many confirmations, such as Ethereum's 12. They
+refuse a chain without a `[chains.<name>.trading]` table with `400`, and
+Ethereum has none in staging or prod today. The outcome is
+`Vault operation confirmed via API` or
+`Vault operation broadcast via API did not confirm` for the vault verbs, and
+`Orderbook allowance reset confirmed via API` or
+`Orderbook allowance reset via API did not confirm` for `reset-allowance`, each
+with the tx hash. A vault verb whose confirmation hits any error that does not
+prove the tx's fate (a receipt timeout, a drop report, a transport failure, a
+JSON-RPC error reply) logs
+`Vault operation broadcast via API is not confirmed
+yet` and waits for the
+receipt again 30 seconds later, still holding its lock. A drop report keeps the
+lock because a lagging or load balanced RPC can report a tx dropped while it is
+still pending elsewhere. Each wait can take up to 5 minutes for inclusion plus
+30 minutes for the confirmations, so the `409` can last for hours. It ends only
+when the tx's own receipt at the required confirmations shows it succeeded or
+failed, or on a decoded revert, so a vault `did not confirm` line is final. A tx
+that never mines keeps the lock until a restart; check the wallet's nonce
+onchain. For `reset-allowance` it may also mean a timeout, so check the tx
+onchain before retrying. A `Vault operation confirmation panicked` line keeps
+the lock until a restart, and the 409 then says the outcome is unknown; check
+the vault and the wallet onchain before rerunning after the restart. A vault
+send that fails logs `Capital route failed onchain`, answers `500`, and frees
+the lock, but its tx may still have gone out, so check the vault and the wallet
+onchain before rerunning. When the allowance is short, `capital vault-deposit`
+first approves and waits for the approve to confirm, so a deposit of a token
+without the startup MAX grant can still time out on a chain that needs many
+confirmations. The answer does not wait for the onchain effect, so the vault
+balance or the allowance may not have changed yet when it arrives. A rerun of a
+vault verb that answered with a tx answers `409` until that tx's outcome line,
+so it cannot withdraw or deposit twice. The `409` then clears on either outcome
+line, so rerun only after a `did not confirm` line: after `confirmed via API`
+the move already happened. The locks live in memory, so after a bot restart
+check the vault onchain before rerunning. A rerun of `capital reset-allowance`
+sends a redundant `approve(0)`, which moves no funds.
 
 A request that times out on the client may still complete in the bot; check the
 bot logs and the chain for the transaction before retrying a vault or allowance
