@@ -40,7 +40,7 @@ use chrono::{DateTime, Utc};
 use rain_math_float::Float;
 use sqlx::SqlitePool;
 use std::collections::BTreeMap;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 use std::time::Duration;
 use thiserror::Error;
 use tracing::{debug, error, info, instrument, warn};
@@ -951,6 +951,20 @@ pub struct ChainServicesMissing {
 }
 
 impl EquityTransferServices {
+    /// Missing chains and listings cannot start new equity operations.
+    pub fn rebalancing_mode(&self, chain: Chain, symbol: &Symbol) -> st0x_config::RebalancingMode {
+        let Some(services) = self.chains.get(&chain) else {
+            return st0x_config::RebalancingMode::Disabled;
+        };
+        services
+            .equities
+            .symbols
+            .get(symbol)
+            .map_or(st0x_config::RebalancingMode::Disabled, |asset| {
+                asset.rebalancing
+            })
+    }
+
     /// The services for `chain`, or the chain by name.
     pub fn for_chain(&self, chain: Chain) -> Result<&ChainEquityServices, ChainServicesMissing> {
         self.chains
@@ -1307,6 +1321,12 @@ impl Wrapper for PanickingWrapper {
 
 #[derive(Debug, Error)]
 pub enum MintError {
+    #[error("Equity rebalancing is {mode} for {symbol} on {chain}; new operations require enabled")]
+    RebalancingNotEnabled {
+        chain: Chain,
+        symbol: Symbol,
+        mode: st0x_config::RebalancingMode,
+    },
     #[error(transparent)]
     ChainServicesMissing(#[from] ChainServicesMissing),
     #[error(transparent)]
@@ -1406,7 +1426,8 @@ impl BotGasFailureClassifier for MintError {
     fn is_bot_gas_enqueue_failure(&self) -> bool {
         match self {
             Self::BotGasEnqueue(_) => true,
-            Self::ChainServicesMissing(_)
+            Self::RebalancingNotEnabled { .. }
+            | Self::ChainServicesMissing(_)
             | Self::GasReadiness(_)
             | Self::Aggregate(_)
             | Self::Wrapper(_)
@@ -1481,6 +1502,12 @@ fn classify_mint_resume_error(
 
 #[derive(Debug, Error)]
 pub enum RedemptionError {
+    #[error("Equity rebalancing is {mode} for {symbol} on {chain}; new operations require enabled")]
+    RebalancingNotEnabled {
+        chain: Chain,
+        symbol: Symbol,
+        mode: st0x_config::RebalancingMode,
+    },
     #[error(transparent)]
     ChainServicesMissing(#[from] ChainServicesMissing),
     #[error(transparent)]
@@ -1546,7 +1573,8 @@ impl BotGasFailureClassifier for RedemptionError {
                 EquityRedemptionError::BotGasEnqueueFailed(_),
             )))
             | Self::BotGasEnqueue(_) => true,
-            Self::ChainServicesMissing(_)
+            Self::RebalancingNotEnabled { .. }
+            | Self::ChainServicesMissing(_)
             | Self::GasReadiness(_)
             | Self::Send(_)
             | Self::Raindex(_)
@@ -1600,6 +1628,7 @@ pub struct CrossVenueEquityTransfer {
     /// [`ConfiguredMintAuthorization::Wired`] via
     /// [`Self::with_mint_authorization`].
     mint_authorization: ConfiguredMintAuthorization,
+    rebalancing: Option<Weak<RebalancingService>>,
 }
 
 /// Whether this transfer can produce and deliver MintAuthV1 recipient
@@ -1642,6 +1671,24 @@ impl CrossVenueEquityTransfer {
             mint_store,
             redemption_store,
             mint_authorization: ConfiguredMintAuthorization::VaultDirectOnly,
+            rebalancing: None,
+        }
+    }
+
+    /// Links fresh-transfer cleanup to the service's deferred startup restores.
+    pub(crate) fn with_rebalancing_service(mut self, service: &Arc<RebalancingService>) -> Self {
+        self.rebalancing = Some(Arc::downgrade(service));
+        self
+    }
+
+    async fn cancel_deferred_restore(
+        &self,
+        reservation_id: crate::position::EquityTransferReservationId,
+    ) {
+        if let Some(service) = self.rebalancing.as_ref().and_then(Weak::upgrade) {
+            service
+                .cancel_pending_equity_transfer_reservation_restore(reservation_id)
+                .await;
         }
     }
 
@@ -3198,6 +3245,21 @@ impl CrossVenueEquityTransfer {
             .map_err(MintError::from)
             .map_err(MintTransferError::PreReceipt)?;
 
+        let mode = self.services.rebalancing_mode(chain, symbol);
+        if !mode.starts_operations() {
+            self.cancel_deferred_restore(crate::position::EquityTransferReservationId::from_uuid(
+                issuer_request_id.0,
+            ))
+            .await;
+            return Err(MintTransferError::PreReceipt(
+                MintError::RebalancingNotEnabled {
+                    chain,
+                    symbol: symbol.clone(),
+                    mode,
+                },
+            ));
+        }
+
         chain_services
             .gas_readiness
             .ensure_ready(TransferGasRoute::Equity)
@@ -3325,6 +3387,19 @@ impl CrossVenueEquityTransfer {
         quantity: FractionalShares,
     ) -> Result<(), RedemptionError> {
         let chain_services = self.services.for_chain(chain)?;
+        let mode = self.services.rebalancing_mode(chain, symbol);
+        if !mode.starts_operations() {
+            self.cancel_deferred_restore(crate::position::EquityTransferReservationId::from_uuid(
+                aggregate_id.0,
+            ))
+            .await;
+            return Err(RedemptionError::RebalancingNotEnabled {
+                chain,
+                symbol: symbol.clone(),
+                mode,
+            });
+        }
+
         chain_services
             .gas_readiness
             .ensure_ready(TransferGasRoute::Equity)
@@ -3374,8 +3449,10 @@ mod tests {
     use std::time::Duration;
     use tokio::sync::{Notify, broadcast};
 
-    use st0x_bridge::corridor::UsdcCorridor;
-    use st0x_config::{AllocationCtx, ChainAssets, ChainEquities, ChainEquityAsset, OperationMode};
+    use st0x_config::{
+        AllocationCtx, ChainAssets, ChainEquities, ChainEquityAsset, OperationMode,
+        RebalancingMode, UsdcCorridors,
+    };
     use st0x_dto::Statement;
     use st0x_event_sorcery::{
         AggregateError, EntityList, LifecycleError, Never, Reactor, StoreBuilder, deps, test_store,
@@ -3454,7 +3531,7 @@ mod tests {
             wrapper: Arc::new(MockWrapper::new()),
             mint_authorizer: ConfiguredMintAuthorizer::Disabled,
             gas_readiness: ConfiguredGasReadiness::Unwired,
-            equities: ChainEquities::default(),
+            equities: enabled_transfer_listings(),
         }
     }
 
@@ -3510,7 +3587,7 @@ mod tests {
                 wrapper: self.wrapper.clone(),
                 mint_authorizer: ConfiguredMintAuthorizer::Disabled,
                 gas_readiness: ConfiguredGasReadiness::Unwired,
-                equities: ChainEquities::default(),
+                equities: enabled_transfer_listings(),
             }
         }
 
@@ -3854,6 +3931,14 @@ mod tests {
         );
     }
 
+    fn enabled_transfer_listings() -> ChainEquities {
+        let mut equities = equities_listing("AAPL", Address::ZERO);
+        equities
+            .symbols
+            .extend(equities_listing("TEST", Address::ZERO).symbols);
+        equities
+    }
+
     fn mock_services() -> EquityTransferServices {
         EquityTransferServices {
             chains: BTreeMap::from([(
@@ -3866,7 +3951,7 @@ mod tests {
                     wrapper: Arc::new(MockWrapper::new()),
                     mint_authorizer: ConfiguredMintAuthorizer::Disabled,
                     gas_readiness: ConfiguredGasReadiness::Unwired,
-                    equities: ChainEquities::default(),
+                    equities: enabled_transfer_listings(),
                 },
             )]),
             bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
@@ -4037,13 +4122,12 @@ mod tests {
 
         let service = Arc::new(RebalancingService::new(
             RebalancingServiceConfig {
-                served_usdc_corridor: UsdcCorridor::BASE_CCTP,
                 poll_freshness: PollFreshness::always_fresh(),
                 inventory_staleness_bound: Duration::from_secs(300),
                 cash_reserved: None,
                 hedge_floor: st0x_execution::HedgeFloor::default(),
                 allocation: AllocationCtx::base_test(),
-                usdc: None,
+                usdc: UsdcCorridors::base_cctp_disabled(),
                 transfer_timeout: Duration::from_secs(1800),
                 chains: BTreeMap::from([(
                     Chain::Base,
@@ -4195,13 +4279,12 @@ mod tests {
 
         let service = Arc::new(RebalancingService::new(
             RebalancingServiceConfig {
-                served_usdc_corridor: UsdcCorridor::BASE_CCTP,
                 poll_freshness: PollFreshness::always_fresh(),
                 inventory_staleness_bound: Duration::from_secs(300),
                 cash_reserved: None,
                 hedge_floor: st0x_execution::HedgeFloor::default(),
                 allocation: AllocationCtx::base_test(),
-                usdc: None,
+                usdc: UsdcCorridors::base_cctp_disabled(),
                 transfer_timeout: Duration::from_secs(1800),
                 chains: BTreeMap::from([(
                     Chain::Base,
@@ -4397,6 +4480,101 @@ mod tests {
 
         assert_eq!(tokenizer.mint_lookup_call_count(), 1);
         assert_eq!(tokenizer.mint_request_call_count(), 0);
+    }
+
+    /// Services listing AAPL on Base as paused, driven by `tokenizer`, as
+    /// after a restart into `paused` with mints already persisted.
+    fn paused_aapl_services(tokenizer: &Arc<MockTokenizer>) -> EquityTransferServices {
+        let mut services = mock_services();
+        let mut equities = equities_listing("AAPL", Address::ZERO);
+        equities
+            .symbols
+            .get_mut(&Symbol::new("AAPL").unwrap())
+            .unwrap()
+            .rebalancing = RebalancingMode::Paused;
+        let base = services.chains.get_mut(&Chain::Base).unwrap();
+        base.equities = equities;
+        base.tokenizer = tokenizer.clone();
+        services
+    }
+
+    #[tokio::test]
+    async fn requested_mint_on_paused_listing_stays_requested_without_replaying_the_request() {
+        let tokenizer = Arc::new(MockTokenizer::new());
+        let transfer = create_equity_transfer_with_services(paused_aapl_services(&tokenizer)).await;
+        let id = issuer_request_id("ISS-REQUESTED-PAUSED");
+        let symbol = Symbol::new("AAPL").unwrap();
+        let quantity = FractionalShares::new(float!(10));
+        seed_requested_mint(&transfer, &id, symbol.clone(), quantity).await;
+
+        let error = transfer
+            .resume_equity_to_market_making(&id, &symbol, Chain::Base, quantity)
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(error, MintTransferError::PreReceipt(_)),
+            "an inconclusive lookup must surface as a pre-receipt retry, got: {error:?}"
+        );
+        assert_eq!(tokenizer.mint_lookup_call_count(), 1);
+        assert_eq!(tokenizer.mint_request_call_count(), 0);
+        let entity = transfer.mint_store.load(&id).await.unwrap().unwrap();
+        assert!(
+            matches!(entity, TokenizedEquityMint::MintRequested { .. }),
+            "an inconclusive lookup on a paused listing must keep the mint requested, got: {entity:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn requested_mint_on_paused_listing_adopts_a_provider_match() {
+        let id = issuer_request_id("ISS-REQUESTED-PAUSED-MATCH");
+        let mut existing_request = TokenizationRequest::mock(TokenizationRequestStatus::Pending);
+        existing_request.r#type = Some(TokenizationRequestType::Mint);
+        existing_request.underlying_symbol = Symbol::new("AAPL").unwrap();
+        existing_request.quantity = FractionalShares::new(float!(10));
+        existing_request.client_request_id = Some(ClientRequestId::from(&id));
+        let tokenizer =
+            Arc::new(MockTokenizer::new().with_pending_requests(vec![existing_request]));
+        let transfer = create_equity_transfer_with_services(paused_aapl_services(&tokenizer)).await;
+        seed_requested_mint(
+            &transfer,
+            &id,
+            Symbol::new("AAPL").unwrap(),
+            FractionalShares::new(float!(10)),
+        )
+        .await;
+
+        transfer.resume_mint(&id).await.unwrap();
+
+        assert_eq!(tokenizer.mint_request_call_count(), 0);
+        let entity = transfer.mint_store.load(&id).await.unwrap().unwrap();
+        assert!(
+            matches!(entity, TokenizedEquityMint::DepositedIntoRaindex { .. }),
+            "a mint the provider already holds must keep resuming while paused, got: {entity:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn accepted_mint_on_paused_listing_keeps_resuming() {
+        let tokenizer = Arc::new(MockTokenizer::new());
+        let transfer = create_equity_transfer_with_services(paused_aapl_services(&tokenizer)).await;
+        let id = issuer_request_id("ISS-ACCEPTED-PAUSED");
+        let symbol = Symbol::new("AAPL").unwrap();
+        let quantity = FractionalShares::new(float!(10));
+        seed_requested_mint(&transfer, &id, symbol.clone(), quantity).await;
+        submit_requested_mint(&transfer, &id).await;
+
+        transfer
+            .resume_equity_to_market_making(&id, &symbol, Chain::Base, quantity)
+            .await
+            .unwrap();
+
+        assert_eq!(tokenizer.mint_request_call_count(), 1);
+        let entity = transfer.mint_store.load(&id).await.unwrap().unwrap();
+        assert!(
+            matches!(entity, TokenizedEquityMint::DepositedIntoRaindex { .. }),
+            "an accepted mint must keep resuming while paused, got: {entity:?}"
+        );
     }
 
     /// A reconciled redemption is terminal: `resume_redemption` must be a clean
@@ -4606,13 +4784,12 @@ mod tests {
         ));
         let service = Arc::new(RebalancingService::new(
             RebalancingServiceConfig {
-                served_usdc_corridor: UsdcCorridor::BASE_CCTP,
                 poll_freshness: PollFreshness::always_fresh(),
                 inventory_staleness_bound: Duration::from_secs(300),
                 cash_reserved: None,
                 hedge_floor: st0x_execution::HedgeFloor::default(),
                 allocation: AllocationCtx::base_test(),
-                usdc: None,
+                usdc: UsdcCorridors::base_cctp_disabled(),
                 transfer_timeout: Duration::from_secs(1800),
                 chains: BTreeMap::from([(
                     Chain::Base,
@@ -4744,7 +4921,7 @@ mod tests {
     /// Builds a transfer wired to a real `RebalancingService` sharing the same
     /// command stores, so a seeded aggregate is visible to the `recover_*`
     /// recheck entry points.
-    async fn transfer_with_rebalancing_service() -> (
+    pub(super) async fn transfer_with_rebalancing_service() -> (
         CrossVenueEquityTransfer,
         Arc<RebalancingService>,
         SqlitePool,
@@ -4758,13 +4935,12 @@ mod tests {
 
         let service = Arc::new(RebalancingService::new(
             RebalancingServiceConfig {
-                served_usdc_corridor: UsdcCorridor::BASE_CCTP,
                 poll_freshness: PollFreshness::always_fresh(),
                 inventory_staleness_bound: Duration::from_secs(300),
                 cash_reserved: None,
                 hedge_floor: st0x_execution::HedgeFloor::default(),
                 allocation: AllocationCtx::base_test(),
-                usdc: None,
+                usdc: UsdcCorridors::base_cctp_disabled(),
                 transfer_timeout: Duration::from_secs(1800),
                 chains: BTreeMap::from([(
                     Chain::Base,
@@ -4809,7 +4985,8 @@ mod tests {
             )
             .await;
 
-        let transfer = CrossVenueEquityTransfer::new(services, mint_store, redemption_store);
+        let transfer = CrossVenueEquityTransfer::new(services, mint_store, redemption_store)
+            .with_rebalancing_service(&service);
 
         (transfer, service, pool)
     }
@@ -5496,6 +5673,85 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn fresh_queued_jobs_for_a_disabled_listing_start_no_aggregate() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let mut services = mock_services();
+        let mut equities = equities_listing("AAPL", Address::ZERO);
+        equities.symbols.get_mut(&symbol).unwrap().rebalancing = RebalancingMode::Disabled;
+        services.chains.get_mut(&Chain::Base).unwrap().equities = equities;
+        let transfer = create_equity_transfer_with_services(services).await;
+        let mint_id = issuer_request_id("queued-disabled-mint");
+        let redemption_id = redemption_aggregate_id("queued-disabled-redemption");
+        let quantity = FractionalShares::new(float!(10));
+        assert!(matches!(
+            transfer
+                .resume_equity_to_market_making(&mint_id, &symbol, Chain::Base, quantity)
+                .await,
+            Err(MintTransferError::PreReceipt(
+                MintError::RebalancingNotEnabled { .. }
+            ))
+        ));
+        assert!(transfer.mint_store.load(&mint_id).await.unwrap().is_none());
+        assert!(matches!(
+            transfer
+                .resume_equity_to_hedging(&redemption_id, &symbol, Chain::Base, quantity)
+                .await,
+            Err(RedemptionError::RebalancingNotEnabled { .. })
+        ));
+        assert!(
+            transfer
+                .redemption_store
+                .load(&redemption_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn queued_transfers_do_not_start_when_the_listing_is_paused() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let mut services = mock_services();
+        let mut equities = equities_listing("AAPL", Address::ZERO);
+        equities.symbols.get_mut(&symbol).unwrap().rebalancing = RebalancingMode::Paused;
+        services.chains.get_mut(&Chain::Base).unwrap().equities = equities;
+        let transfer = create_equity_transfer_with_services(services).await;
+        let mint_id = issuer_request_id("queued-paused-mint");
+        let redemption_id = redemption_aggregate_id("queued-paused-redemption");
+        let quantity = FractionalShares::new(float!(10));
+
+        assert!(matches!(
+            transfer
+                .resume_equity_to_market_making(&mint_id, &symbol, Chain::Base, quantity)
+                .await,
+            Err(MintTransferError::PreReceipt(
+                MintError::RebalancingNotEnabled {
+                    chain: Chain::Base,
+                    ..
+                }
+            ))
+        ));
+        assert!(transfer.mint_store.load(&mint_id).await.unwrap().is_none());
+        assert!(matches!(
+            transfer
+                .resume_equity_to_hedging(&redemption_id, &symbol, Chain::Base, quantity)
+                .await,
+            Err(RedemptionError::RebalancingNotEnabled {
+                chain: Chain::Base,
+                ..
+            })
+        ));
+        assert!(
+            transfer
+                .redemption_store
+                .load(&redemption_id)
+                .await
+                .unwrap()
+                .is_none()
+        );
+    }
+
     /// A chain's equity table listing one symbol at `tokenized_equity`.
     fn equities_listing(symbol: &str, tokenized_equity: Address) -> ChainEquities {
         ChainEquities {
@@ -5507,7 +5763,7 @@ mod tests {
                     tokenized_equity_derivative: Address::ZERO,
                     vault_ids: Vec::new(),
                     trading: OperationMode::Enabled,
-                    rebalancing: OperationMode::Enabled,
+                    rebalancing: RebalancingMode::Enabled,
                     wrapped_equity_recovery: OperationMode::Disabled,
                     operational_limit: None,
                     target_share: None,
@@ -5888,7 +6144,7 @@ mod tests {
     /// rather than re-requesting the mint from Alpaca.
     #[tokio::test]
     async fn resume_equity_to_market_making_resumes_existing_aggregate_despite_low_gas() {
-        let transfer = create_equity_transfer_with_services(mock_services_with_gas_readiness(
+        let mut transfer = create_equity_transfer_with_services(mock_services_with_gas_readiness(
             &crate::native_gas::GasReadiness::for_test(
                 U256::ZERO,
                 U256::from(1_u64),
@@ -5900,6 +6156,15 @@ mod tests {
 
         let id = issuer_request_id("ISS-CRASH-RESUME");
         let symbol = Symbol::new("AAPL").unwrap();
+
+        let mut equities = equities_listing("AAPL", Address::ZERO);
+        equities.symbols.get_mut(&symbol).unwrap().rebalancing = RebalancingMode::Paused;
+        transfer
+            .services
+            .chains
+            .get_mut(&Chain::Base)
+            .unwrap()
+            .equities = equities;
 
         // First attempt crashes after the mint request was accepted: the
         // aggregate is persisted in MintAccepted.
@@ -6185,7 +6450,7 @@ mod tests {
                     wrapper: Arc::new(MockWrapper::new()),
                     mint_authorizer: ConfiguredMintAuthorizer::Disabled,
                     gas_readiness: ConfiguredGasReadiness::Unwired,
-                    equities: ChainEquities::default(),
+                    equities: equities_listing("TEST", Address::ZERO),
                 },
             )]),
             bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Enabled(queue),
@@ -6255,7 +6520,7 @@ mod tests {
                     wrapper: Arc::new(MockWrapper::new()),
                     mint_authorizer: ConfiguredMintAuthorizer::Disabled,
                     gas_readiness: ConfiguredGasReadiness::Unwired,
-                    equities: ChainEquities::default(),
+                    equities: equities_listing("AAPL", Address::ZERO),
                 },
             )]),
             bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Enabled(queue),
@@ -6329,6 +6594,13 @@ mod tests {
         for chain_services in services.chains.values_mut() {
             chain_services.gas_readiness = ConfiguredGasReadiness::Wired(readiness.clone());
         }
+        let mut equities = equities_listing("TEST", Address::ZERO);
+        equities
+            .symbols
+            .get_mut(&Symbol::new("TEST").unwrap())
+            .unwrap()
+            .rebalancing = RebalancingMode::Paused;
+        services.chains.get_mut(&Chain::Base).unwrap().equities = equities;
         let transfer = create_equity_transfer_with_services(services).await;
 
         let id = redemption_aggregate_id("redeem-crash-resume");

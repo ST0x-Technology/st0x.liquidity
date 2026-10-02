@@ -108,11 +108,11 @@ extended_hours_counter_trading = "disabled"
 # a chain with no fill watcher cannot trade, and one whose gas token is not
 # ETH cannot be "active" until a price source for it exists.
 lifecycle = "active"
-# Block-confirmation depth required before a transaction this bot submits is
-# treated as settled (the primary gate for USDC rebalancing withdrawals). This
-# does NOT govern order-fill ingestion: the fill monitor caps the backfill range
-# at the configured ingestion_cutoff block, not this depth. Set explicitly per
-# chain based on observed confirmation behavior.
+# Block-confirmation depth required before a transaction this bot submits on
+# this chain is treated as settled. This does NOT govern order-fill ingestion:
+# the fill monitor caps the backfill range at the configured ingestion_cutoff
+# block, not this depth. Set explicitly per chain based on observed
+# confirmation behavior.
 required_confirmations = 3
 
 [chains.base.trading]
@@ -177,7 +177,7 @@ primary = true
 # sending them to another chain's issuer address would burn them.
 #
 # Required when [rebalancing] is configured on the primary chain and on every
-# secondary with an equity that has rebalancing = "enabled": startup builds
+# secondary with an equity that has rebalancing = "enabled" or "paused": startup builds
 # those chains' tokenization services and refuses, naming the chain, without
 # its wallet. A hedge-only secondary (every equity rebalancing = "disabled")
 # needs none, and no wrapper vault either. Also used by the alpaca-redeem and
@@ -194,6 +194,8 @@ redemption_wallet = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 # Holds and moves USDC for the corridor; it runs no orderbook, so it has
 # no [trading] table.
 lifecycle = "active"
+# Also the depth the Alpaca withdrawal tx needs before its USDC is used in a
+# USDC rebalancing transfer, whichever chain the corridor serves.
 required_confirmations = 12
 
 # HyperEVM, same shape as Ethereum.
@@ -296,8 +298,10 @@ chainlink_feed = "0x71041dddad3595F9CEd3DcCFBe3D1F4b0a16Bb70"
 # base = "0xcccccccccccccccccccccccccccccccccccccccc"
 
 # Required: the bot does not start without this section. To pause rebalancing
-# work, use the narrow controls instead: per-asset `rebalancing = "disabled"`,
-# the issuance freeze, or `[rebalancing.usdc] mode = "disabled"`.
+# work, use the narrow controls instead: per-asset `rebalancing = "paused"`
+# (starts nothing new, still finishes and recovers work under way; set
+# `"disabled"` only once nothing is in flight), the issuance freeze, or
+# `[rebalancing.usdc] mode = "disabled"`.
 [rebalancing]
 # Transfer timeout in seconds before stuck inflight state is tombstoned and cleared.
 # 1800 = 30 minutes.

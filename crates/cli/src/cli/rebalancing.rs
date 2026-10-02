@@ -558,6 +558,24 @@ pub(super) async fn transfer_equity_command<Writer: Write>(
         }
     }
 
+    if !existing_mint {
+        let listing = ctx
+            .chains
+            .hedged_chain(chain)
+            .with_context(|| format!("{chain} has no trading services"))?
+            .assets
+            .equities
+            .symbols
+            .get(&symbol)
+            .with_context(|| format!("no equity listing for {symbol} on {chain}"))?;
+        if !listing.rebalancing.starts_operations() {
+            anyhow::bail!(
+                "equity rebalancing is {} for {symbol} on {chain}; new operations require enabled",
+                listing.rebalancing
+            );
+        }
+    }
+
     let direction_str = match direction {
         TransferDirection::ToRaindex => "Alpaca → Raindex (mint)",
         TransferDirection::ToAlpaca => "Raindex → Alpaca (redeem)",
@@ -739,7 +757,8 @@ fn is_bot_resumable_wait(error: &UsdcTransferError) -> bool {
         | UsdcTransferError::BurnTxDropped { .. }
         | UsdcTransferError::DepositSendUnresolved { .. }
         | UsdcTransferError::DepositSendTaskPanicked { .. }
-        | UsdcTransferError::DepositSendLookup { .. } => false,
+        | UsdcTransferError::DepositSendLookup { .. }
+        | UsdcTransferError::EthereumChainMissing(_) => false,
     }
 }
 
@@ -751,6 +770,7 @@ pub(super) async fn transfer_usdc_command<Writer: Write>(
     stdout: &mut Writer,
     direction: TransferDirection,
     amount: Usdc,
+    chain: Option<Chain>,
     ctx: &Ctx,
     pool: &SqlitePool,
 ) -> anyhow::Result<()> {
@@ -765,7 +785,7 @@ pub(super) async fn transfer_usdc_command<Writer: Write>(
     // story depends on the operator still having this id if the process is killed
     // after burning, and buffered/redirected stdout could otherwise lose it.
     stdout.flush()?;
-    run_usdc_transfer(stdout, direction, id, amount, ctx, pool).await
+    run_usdc_transfer(stdout, direction, id, amount, chain, ctx, pool).await
 }
 
 /// Resumes an interrupted manual USDC transfer by enqueueing it on the
@@ -907,6 +927,7 @@ async fn run_usdc_transfer<Writer: Write>(
     direction: TransferDirection,
     id: UsdcRebalanceId,
     amount: Usdc,
+    chain: Option<Chain>,
     ctx: &Ctx,
     pool: &SqlitePool,
 ) -> anyhow::Result<()> {
@@ -925,10 +946,9 @@ async fn run_usdc_transfer<Writer: Write>(
 
     let wallet_ctx = ctx.wallet()?;
 
-    // The corridor the CCTP bridge below carries: the transfer runs on that
-    // chain's vault and signer.
+    // The transfer runs on the served corridor's chain vault and signer.
     let rebalancing_ctx = &ctx.rebalancing;
-    let corridor = rebalancing_ctx.cctp_corridor.usdc_corridor();
+    let corridor = st0x_config::manual_transfer_corridor(rebalancing_ctx.usdc.served(), chain)?;
     let corridor_chain = corridor.chain();
     let hedged = ctx.chains.hedged_chain(corridor_chain).with_context(|| {
         format!("the {corridor} corridor needs a [chains.{corridor_chain}.trading] table")
@@ -1033,26 +1053,15 @@ async fn run_usdc_transfer<Writer: Write>(
         vault_service,
         usdc_store,
         MarketMakingUsdcEndpoints::new(corridor, owner, RaindexVaultId(usdc_vault_id)),
-        &UsdcSettlementParams {
-            attestation_retry_deadline: rebalancing_ctx.attestation_retry_deadline,
-            settlement_retry_deadline: rebalancing_ctx.settlement_retry_deadline,
-            required_confirmations: ctx.chains.primary().required_confirmations,
-            ethereum_required_confirmations: Some(deposit_send_required_confirmations(
-                &ctx.chains,
-            )?),
-            reserved_cash: ctx
-                .assets
+        &UsdcSettlementParams::for_chains(
+            rebalancing_ctx,
+            &ctx.chains,
+            ctx.assets
                 .cash
                 .as_ref()
                 .map(|cash| cash.reserved)
                 .map(Positive::inner),
-            #[cfg(any(test, feature = "test-support"))]
-            circle_api_base: rebalancing_ctx.circle_api_base.clone(),
-            #[cfg(any(test, feature = "test-support"))]
-            token_messenger: rebalancing_ctx.token_messenger,
-            #[cfg(any(test, feature = "test-support"))]
-            message_transmitter: rebalancing_ctx.message_transmitter,
-        },
+        ),
         BotGasReceiptCostEnqueuer::Disabled,
     )
     .with_gas_readiness(gas_readiness)
@@ -2267,13 +2276,13 @@ mod tests {
     use alloy::primitives::{Address, B256, address, b256};
     use chrono::Utc;
     use rain_math_float::Float;
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
     use uuid::uuid;
 
     use st0x_bridge::cctp::CctpError;
-    use st0x_bridge::corridor::UsdcCorridor;
+    use st0x_bridge::corridor::{HopKind, UsdcCorridor};
     use st0x_config::AlertsCtx;
     use st0x_config::ChainRegistry;
     use st0x_config::CtxError;
@@ -2283,7 +2292,7 @@ mod tests {
     use st0x_config::create_test_issuance_ctx;
     use st0x_config::{
         ChainAssets, ChainCashAsset, ChainEquities, ChainEquityAsset, LogFormat, LogLevel,
-        OperationMode,
+        OperationMode, RebalancingMode,
     };
     use st0x_config::{HedgedChain, InventoryMode};
     use st0x_event_sorcery::{AggregateError, LifecycleError};
@@ -3042,6 +3051,54 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn fresh_cli_equity_transfers_refuse_stopped_listings_before_wallet_access() {
+        for mode in [
+            st0x_config::RebalancingMode::Paused,
+            st0x_config::RebalancingMode::Disabled,
+        ] {
+            let mut ctx = create_base_test_ctx();
+            let symbol = Symbol::new("AAPL").unwrap();
+            ctx.chains.primary_mut().assets.equities.symbols.insert(
+                symbol.clone(),
+                st0x_config::ChainEquityAsset {
+                    tokenized_equity: Address::ZERO,
+                    tokenized_equity_derivative: Address::ZERO,
+                    vault_ids: vec![],
+                    trading: st0x_config::OperationMode::Disabled,
+                    rebalancing: mode,
+                    wrapped_equity_recovery: st0x_config::OperationMode::Disabled,
+                    operational_limit: None,
+                    target_share: None,
+                },
+            );
+            let pool = setup_test_db().await;
+            for direction in [TransferDirection::ToRaindex, TransferDirection::ToAlpaca] {
+                let error = transfer_equity_command(
+                    &mut Vec::new(),
+                    TransferEquity {
+                        direction,
+                        symbol: symbol.clone(),
+                        quantity: FractionalShares::new(float!(1)),
+                        issuer_request_id: None,
+                        redemption_wallet: None,
+                        network: TokenizationNetwork::Base,
+                    },
+                    &ctx,
+                    &pool,
+                )
+                .await
+                .unwrap_err();
+                assert_eq!(
+                    error.to_string(),
+                    format!(
+                        "equity rebalancing is {mode} for AAPL on base; new operations require enabled"
+                    )
+                );
+            }
+        }
+    }
+
     fn create_base_test_ctx() -> Ctx {
         Ctx {
             database_url: ":memory:".to_string(),
@@ -3218,12 +3275,20 @@ mod tests {
     #[tokio::test]
     async fn test_transfer_equity_requires_tokenization_config() {
         let mut ctx = create_alpaca_test_ctx();
-        // The trading table is now resolved first, and resolving it needs a
-        // wallet, so the missing redemption wallet is what refuses only once
-        // a wallet exists.
+        // A listing that starts operations is required before the command
+        // looks up the chain's redemption wallet. Without it, this would
+        // fail on "no equity listing" and never reach the wallet check.
         ctx.wallet = Some(OnchainWalletCtx::stub());
         let pool = setup_test_db().await;
         let symbol = Symbol::new("AAPL").unwrap();
+        let mut listing = equity_asset(Address::ZERO);
+        listing.rebalancing = RebalancingMode::Enabled;
+        ctx.chains
+            .primary_mut()
+            .assets
+            .equities
+            .symbols
+            .insert(symbol.clone(), listing);
         let quantity = FractionalShares::new(Float::parse("10.5".to_string()).unwrap());
 
         let mut stdout = Vec::new();
@@ -3586,6 +3651,43 @@ mod tests {
         );
     }
 
+    /// `--chain` picks the served corridor on that chain; it may be left out
+    /// only while one corridor is served, and an unserved chain is refused.
+    #[test]
+    fn transfer_usdc_runs_on_the_served_corridor_its_chain_names() {
+        let robinhood_relay = UsdcCorridor::HubRouted {
+            chain: Chain::Robinhood,
+            hop: HopKind::Relay,
+        };
+        let one = BTreeSet::from([UsdcCorridor::BASE_CCTP]);
+        let two = BTreeSet::from([UsdcCorridor::BASE_CCTP, robinhood_relay]);
+
+        assert_eq!(
+            st0x_config::manual_transfer_corridor(&one, None).unwrap(),
+            UsdcCorridor::BASE_CCTP
+        );
+        assert_eq!(
+            st0x_config::manual_transfer_corridor(&two, Some(Chain::Robinhood)).unwrap(),
+            robinhood_relay
+        );
+
+        let unpicked = st0x_config::manual_transfer_corridor(&two, None)
+            .unwrap_err()
+            .to_string();
+        assert!(unpicked.contains("pass --chain"), "{unpicked}");
+        let unserved = st0x_config::manual_transfer_corridor(&one, Some(Chain::HyperEvm))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            unserved.starts_with("no served USDC corridor runs on"),
+            "{unserved}"
+        );
+        let none_served = st0x_config::manual_transfer_corridor(&BTreeSet::new(), None)
+            .unwrap_err()
+            .to_string();
+        assert_eq!(none_served, "this build serves no USDC corridor");
+    }
+
     #[tokio::test]
     async fn test_transfer_usdc_requires_wallet_config() {
         let mut ctx = create_alpaca_test_ctx();
@@ -3604,6 +3706,7 @@ mod tests {
             &mut stdout,
             TransferDirection::ToRaindex,
             amount,
+            None,
             &ctx,
             &pool,
         )
@@ -3627,6 +3730,7 @@ mod tests {
             &mut stdout,
             TransferDirection::ToRaindex,
             amount,
+            None,
             &ctx,
             &pool,
         )
@@ -3707,6 +3811,7 @@ mod tests {
             &mut stdout,
             TransferDirection::ToRaindex,
             amount,
+            None,
             &ctx,
             &pool,
         )
@@ -3734,6 +3839,7 @@ mod tests {
             &mut stdout,
             TransferDirection::ToRaindex,
             amount,
+            None,
             &ctx,
             &pool,
         )
@@ -3764,6 +3870,7 @@ mod tests {
             &mut stdout,
             TransferDirection::ToRaindex,
             amount,
+            None,
             &ctx,
             &pool,
         )
@@ -5535,7 +5642,7 @@ mod tests {
                 tokenized_equity_derivative: Address::ZERO,
                 vault_ids: Vec::new(),
                 trading: OperationMode::Enabled,
-                rebalancing: OperationMode::Disabled,
+                rebalancing: RebalancingMode::Disabled,
                 wrapped_equity_recovery: OperationMode::Disabled,
                 operational_limit: None,
                 target_share: None,
@@ -5788,7 +5895,7 @@ mod tests {
             tokenized_equity_derivative: Address::ZERO,
             vault_ids: Vec::new(),
             trading: OperationMode::Enabled,
-            rebalancing: OperationMode::Disabled,
+            rebalancing: RebalancingMode::Disabled,
             wrapped_equity_recovery: OperationMode::Disabled,
             operational_limit: None,
             target_share: None,

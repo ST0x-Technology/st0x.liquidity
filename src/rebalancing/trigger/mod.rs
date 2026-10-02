@@ -16,6 +16,7 @@ pub(crate) use equity::{
 use alloy::primitives::{Address, TxHash};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use itertools::Itertools;
 use metrics::counter;
 use sqlx::SqlitePool;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
@@ -30,8 +31,8 @@ use uuid::Uuid;
 use rain_math_float::Float;
 use st0x_bridge::corridor::{UsdcCorridor, legacy_base_cctp};
 use st0x_config::{
-    AllocationCtx, ChainAssets, ChainEquityAsset, ExecutionThreshold, OperationMode, TargetShare,
-    UsdcCorridorCtx,
+    AllocationCtx, ChainAssets, ChainEquityAsset, ExecutionThreshold, OperationMode,
+    RebalancingMode, TargetShare, UsdcCorridorCtx, UsdcCorridors,
 };
 #[cfg(test)]
 use st0x_config::{ChainCashAsset, ChainEquities};
@@ -50,8 +51,8 @@ use st0x_tokenization::{ClientRequestId, IssuerRequestId, TokenizationRequestId}
 use st0x_wrapper::{Wrapper, WrapperError};
 
 use self::allocation::{
-    ChainSlot, DeclineReason, EquityPlan, EquityPlanInput, PlannedDirection, PlannedOperation,
-    plan_equity_operation,
+    ChainSlot, DeclineReason, EquityPlan, EquityPlanInput, Participation, PlannedDirection,
+    PlannedOperation, plan_equity_operation,
 };
 use self::freeze::FreezeStatusReader;
 use self::usdc::UsdcRebalanceOperation;
@@ -247,13 +248,16 @@ pub(crate) enum UsdcResumeError {
     CashRestartTainted,
     #[error(
         "USDC transfer corridor mismatch: transfer {id} runs on the {recorded} corridor, \
-         this build serves {served}; nothing was enqueued"
+         this build serves {}; nothing was enqueued",
+        .served.iter().join(", ")
     )]
     CorridorNotServed {
         id: UsdcRebalanceId,
         recorded: UsdcCorridor,
-        served: UsdcCorridor,
+        served: BTreeSet<UsdcCorridor>,
     },
+    #[error("{0}; nothing was enqueued")]
+    CorridorChoice(#[from] st0x_config::ManualCorridorError),
     #[error("aggregate error: {0}")]
     Aggregate(#[source] Box<st0x_event_sorcery::SendError<UsdcRebalance>>),
     #[error(transparent)]
@@ -315,12 +319,10 @@ pub(crate) struct RebalancingServiceConfig {
     /// Bound on the age of a chain's inventory snapshot before that chain's
     /// imbalance evaluations are skipped as stale.
     pub(crate) inventory_staleness_bound: Duration,
-    /// The corridor new cash transfers run on and its band; `None` while
-    /// USDC mode is disabled.
-    pub(crate) usdc: Option<UsdcCorridorCtx>,
-    /// The corridor this build's cash transfer service carries, whatever the
-    /// USDC mode. A transfer recorded on another one is held, never re-armed.
-    pub(crate) served_usdc_corridor: UsdcCorridor,
+    /// The corridors new cash transfers run on, each with its band, and the
+    /// ones this build's cash transfer services carry whatever the USDC mode.
+    /// A transfer recorded on an unserved one is held, never re-armed.
+    pub(crate) usdc: UsdcCorridors,
     pub(crate) transfer_timeout: Duration,
     /// Every hedged chain's asset table and minimum. The planner slots a
     /// symbol on each chain that rebalances it; the USDC trigger reads the
@@ -338,18 +340,21 @@ pub(crate) struct RebalancingServiceConfig {
 impl RebalancingServiceConfig {
     /// Whitelist gate for the equity rebalancing trigger: a symbol is
     /// planned only when some hedged chain lists it with
-    /// `rebalancing = "enabled"`. Symbols observed in inventory but absent
-    /// from every table are skipped cleanly instead of falling through to
-    /// the `WrapperService` `SymbolNotConfigured` error backstop.
+    /// `rebalancing = "enabled"` or `"paused"`; the planner never starts an
+    /// operation on a paused listing but still counts its inventory.
+    /// Symbols observed in inventory but absent from every table are
+    /// skipped cleanly instead of falling through to the `WrapperService`
+    /// `SymbolNotConfigured` error backstop.
     fn rebalances_equity(&self, symbol: &Symbol) -> bool {
         self.chains
             .values()
-            .any(|chain| chain.assets.is_rebalancing_enabled(symbol))
+            .any(|chain| chain.assets.rebalancing_mode(symbol).keeps_services())
     }
 
-    /// Every hedged chain whose listing of `symbol` rebalances it. A
-    /// hedge-only listing (`rebalancing = "disabled"`) is neither slotted
-    /// nor counted: its prefunded inventory is outside the planner's total.
+    /// Every hedged chain whose listing of `symbol` rebalances it, enabled or
+    /// paused. A hedge-only listing (`rebalancing = "disabled"`) is neither
+    /// slotted nor counted: its prefunded inventory is outside the planner's
+    /// total.
     fn rebalancing_listings<'config>(
         &'config self,
         symbol: &'config Symbol,
@@ -366,7 +371,7 @@ impl RebalancingServiceConfig {
                 .equities
                 .symbols
                 .get(symbol)
-                .filter(|listing| listing.rebalancing == OperationMode::Enabled)
+                .filter(|listing| listing.rebalancing.keeps_services())
                 .map(|listing| (*chain, config, listing))
         })
     }
@@ -1053,10 +1058,10 @@ enum UsdcTimeoutCleanup {
 /// guard: `Reconciled`, or a state holding no guard on a corridor this build
 /// does not serve (an operator failed it before its burn, say), which no
 /// other path would ever release.
-fn releases_tracked_guard(state: &UsdcRebalance, served_corridor: UsdcCorridor) -> bool {
+fn releases_tracked_guard(state: &UsdcRebalance, corridors: &UsdcCorridors) -> bool {
     match state {
         UsdcRebalance::Reconciled { .. } => true,
-        held => held.corridor() != served_corridor && !held.holds_rebalance_guard(),
+        held => !corridors.serves(held.corridor()) && !held.holds_rebalance_guard(),
     }
 }
 
@@ -1486,7 +1491,7 @@ impl RebalancingService {
         Ok(())
     }
 
-    async fn retry_pending_equity_transfer_reservation_restores(
+    pub(super) async fn retry_pending_equity_transfer_reservation_restores(
         &self,
     ) -> Result<(), RebalancingServiceError> {
         if self
@@ -2265,7 +2270,7 @@ impl RebalancingService {
             return;
         }
 
-        let served = self.config.served_usdc_corridor;
+        let served = self.config.usdc.served().iter().join(", ");
         let outbound = match direction {
             RebalanceDirection::AlpacaToBase => {
                 " Alpaca-outbound transfers are blocked on every corridor until it clears."
@@ -2275,7 +2280,7 @@ impl RebalancingService {
         let message = format!(
             "USDC transfer corridor mismatch: transfer {id} runs on the {corridor} corridor, \
              which this build does not serve (it serves {served}). It holds the {corridor} \
-             guard and is not re-armed; deploy a build that serves {corridor} \
+             guard and is not re-armed; deploy a build and config that serve {corridor} \
              (docs/cli-ops.md).{outbound}"
         );
 
@@ -2627,7 +2632,6 @@ impl RebalancingService {
         };
 
         if tracking.is_post_burn() {
-            let served_corridor = self.config.served_usdc_corridor;
             // Post-burn: check durable state FIRST, regardless of elapsed time.
             // The Reconciled check is always safe: it only fires when the
             // aggregate is actually Reconciled and clearing the guard at that
@@ -2638,7 +2642,7 @@ impl RebalancingService {
             let usdc_store = self.usdc_store.read().await.as_ref().map(Arc::clone);
             if let Some(store) = usdc_store {
                 match store.load(id).await {
-                    Ok(Some(state)) if releases_tracked_guard(&state, served_corridor) => {
+                    Ok(Some(state)) if releases_tracked_guard(&state, &self.config.usdc) => {
                         // Durable state is Reconciled (or, on a corridor this
                         // build does not serve, any state that holds no guard):
                         // the CLI's separate-process
@@ -2709,7 +2713,8 @@ impl RebalancingService {
                         return Ok(Some(UsdcTimeoutCleanup::Cleared { tracking, elapsed }));
                     }
                     Ok(Some(state))
-                        if state.corridor() != served_corridor && state.holds_rebalance_guard() =>
+                        if !self.config.usdc.serves(state.corridor())
+                            && state.holds_rebalance_guard() =>
                     {
                         return Ok(Some(UsdcTimeoutCleanup::HeldForUnservedCorridor {
                             corridor: state.corridor(),
@@ -4183,7 +4188,8 @@ impl RebalancingService {
     /// Reserves `symbol` for the planned `direction`. A redemption brings the
     /// broker shares, so it also carries how many shares the broker can sell
     /// today: the Position then admits it over a due sell hedge that the
-    /// broker cannot fill, which otherwise waits for this very redemption.
+    /// broker can place none of, which otherwise waits for this very
+    /// redemption.
     /// With no broker reading the capacity is unknown, so the redemption keeps
     /// the strict rule.
     async fn try_reserve_equity_transfer(
@@ -4232,6 +4238,13 @@ impl RebalancingService {
                         | PositionError::EquityTransferHedgeEligibilityUnknown { .. }
                 ) =>
             {
+                // A due hedge holding a redemption back is otherwise
+                // indistinguishable from an idle symbol, so it is counted next
+                // to the planner's own decline reasons.
+                if matches!(error, PositionError::EquityTransferBlockedByHedge { .. }) {
+                    counter!("equity_plan_declined_total", "reason" => "blocked_by_hedge")
+                        .increment(1);
+                }
                 debug!(
                     target: "rebalance",
                     %symbol,
@@ -4318,18 +4331,25 @@ impl RebalancingService {
             let target = listing
                 .target_share
                 .or_else(|| self.config.allocation.targets.get(&chain).copied());
-            let (enabled, target) = target.map_or_else(
+            let (participation, target) = target.map_or_else(
                 || {
                     error!(
                         target: "rebalance",
                         %symbol,
                         %chain,
-                        "A rebalancing-enabled listing has no target share; treating it as \
+                        "A rebalancing listing (enabled or paused) has no target share; treating it as \
                          disabled -- config validation should have refused this"
                     );
-                    (false, TargetShare::ZERO)
+                    (Participation::NoTarget, TargetShare::ZERO)
                 },
-                |target| (true, target),
+                |target| {
+                    let participation = match listing.rebalancing {
+                        RebalancingMode::Enabled => Participation::Plans,
+                        RebalancingMode::Paused => Participation::Paused,
+                        RebalancingMode::Disabled => Participation::NoTarget,
+                    };
+                    (participation, target)
+                },
             );
 
             onchain.insert(
@@ -4344,7 +4364,7 @@ impl RebalancingService {
                     // Both probed only once the planner picks the chain.
                     gas_ready: true,
                     registry_known: true,
-                    enabled,
+                    participation,
                 },
             );
         }
@@ -4461,8 +4481,8 @@ impl RebalancingService {
     /// chain: a fill on a chain whose listing rebalances the symbol moves
     /// that chain's slot, so it schedules the symbol's check, while a
     /// hedge-only listing is prefunded and outside the planner's total. USDC
-    /// rebalances on the configured corridor's chain, so only a fill there
-    /// schedules its check. A clamped leg waits for the next pinned snapshot
+    /// rebalances on each active corridor's chain, so only a fill on one of
+    /// them schedules its check. A clamped leg waits for the next pinned snapshot
     /// instead of sizing a transfer from an acknowledged intermediate balance.
     async fn schedule_fill_checks(
         &self,
@@ -4482,8 +4502,8 @@ impl RebalancingService {
         let on_corridor_chain = self
             .config
             .usdc
-            .as_ref()
-            .is_some_and(|usdc| usdc.corridor.chain() == fill_chain);
+            .active()
+            .any(|usdc| usdc.corridor.chain() == fill_chain);
         if on_corridor_chain && usdc_reconciled {
             self.usdc_scheduler.enqueue_check().await;
         }
@@ -4538,7 +4558,8 @@ impl RebalancingService {
             (
                 DeclineReason::BelowMinimum { chain }
                 | DeclineReason::NoGas { chain }
-                | DeclineReason::CoolingDown { chain },
+                | DeclineReason::CoolingDown { chain }
+                | DeclineReason::Paused { chain },
                 _,
             ) => {
                 info!(
@@ -5200,11 +5221,12 @@ impl RebalancingService {
         Ok(registry.token_by_symbol(symbol))
     }
 
-    /// Returns USDC rebalancing parameters if rebalancing is enabled in
-    /// config, reading the cash asset of the corridor's chain.
-    fn usdc_rebalancing_params(&self) -> Option<(UsdcCorridorCtx, Option<Usdc>, Option<Usd>)> {
-        let usdc = self.config.usdc?;
-
+    /// Returns `usdc`'s rebalancing parameters if its chain's cash asset
+    /// rebalances: that chain's per-transfer limit and the broker reserve.
+    fn usdc_rebalancing_params(
+        &self,
+        usdc: &UsdcCorridorCtx,
+    ) -> Option<(Option<Usdc>, Option<Usd>)> {
         let cash = self
             .config
             .chains
@@ -5219,7 +5241,7 @@ impl RebalancingService {
         let usdc_limit = cash.operational_limit.map(Positive::inner);
         let reserved = self.config.cash_reserved.map(Positive::inner);
 
-        Some((usdc, usdc_limit, reserved))
+        Some((usdc_limit, reserved))
     }
 
     /// Sizes the transfer the corridor's imbalance calls for, if any.
@@ -5241,7 +5263,8 @@ impl RebalancingService {
         .ok()
     }
 
-    /// Checks inventory for USDC imbalance and triggers operation if needed.
+    /// Checks every active corridor, in chain order, for a USDC imbalance
+    /// and triggers the operation each one needs.
     pub(crate) async fn check_and_trigger_usdc(&self) {
         // Hold a claim on the driver for the whole check so an operator
         // operation's pause waits for an active check. A check already queued
@@ -5252,10 +5275,15 @@ impl RebalancingService {
 
         self.expire_stuck_operations_with_logging().await;
 
-        let Some((usdc, usdc_limit, reserved)) = self.usdc_rebalancing_params() else {
+        let corridors: Vec<_> = self
+            .config
+            .usdc
+            .active()
+            .filter_map(|usdc| Some((usdc, self.usdc_rebalancing_params(usdc)?)))
+            .collect();
+        if corridors.is_empty() {
             return;
-        };
-        let chain = usdc.corridor.chain();
+        }
 
         // A pending cash divergence means the Hedging USDC balance the
         // imbalance math reads is suspect: a bridge sized off it moves the
@@ -5281,6 +5309,22 @@ impl RebalancingService {
             return;
         }
 
+        for (usdc, (usdc_limit, reserved)) in corridors {
+            self.check_and_trigger_usdc_corridor(usdc, usdc_limit, reserved)
+                .await;
+        }
+    }
+
+    /// Checks one corridor for a USDC imbalance and dispatches the transfer
+    /// it needs under that corridor's guard.
+    async fn check_and_trigger_usdc_corridor(
+        &self,
+        usdc: &UsdcCorridorCtx,
+        usdc_limit: Option<Usdc>,
+        reserved: Option<Usd>,
+    ) {
+        let chain = usdc.corridor.chain();
+
         // Cross-chain staleness rule, mirroring the equity trigger: the
         // bridge must not be sized off a chain with no recent successful
         // USDC poll (PollFreshness, not snapshot stamps: a static USDC
@@ -5303,7 +5347,7 @@ impl RebalancingService {
             return;
         }
 
-        let Some(sized) = self.size_usdc_operation(&usdc, usdc_limit, reserved).await else {
+        let Some(sized) = self.size_usdc_operation(usdc, usdc_limit, reserved).await else {
             return;
         };
 
@@ -5326,7 +5370,7 @@ impl RebalancingService {
         // Size again under the claim: a holder released between the read
         // above and the claim may have settled funds that read did not see.
         // A dropped claim releases on return.
-        let Some(operation) = self.size_usdc_operation(&usdc, usdc_limit, reserved).await else {
+        let Some(operation) = self.size_usdc_operation(usdc, usdc_limit, reserved).await else {
             return;
         };
         if operation.direction() != sized.direction() {
@@ -5829,11 +5873,11 @@ impl RebalancingService {
             });
         }
 
-        if state.corridor() != self.config.served_usdc_corridor {
+        if !self.config.usdc.serves(state.corridor()) {
             return Err(UsdcResumeError::CorridorNotServed {
                 id: id.clone(),
                 recorded: state.corridor(),
-                served: self.config.served_usdc_corridor,
+                served: self.config.usdc.served().clone(),
             });
         }
 
@@ -6007,27 +6051,30 @@ impl RebalancingService {
         }
     }
 
-    /// Starts a new manual USDC transfer of `amount` in `direction` on the
-    /// served corridor, under a freshly minted id, for the apalis worker to
-    /// drive. The worker treats the id's empty state as a fresh transfer,
-    /// exactly as it does for a trigger enqueue. Shares the single flight
-    /// gates of [`Self::resume_usdc_transfer`] in the same order, so a manual
-    /// start cannot race the trigger, a resume, or a transfer in flight, and
-    /// then applies the trigger's fresh dispatch gates (no engaged cash
-    /// divergence, no restart tainted cash balance, gas readiness) before the
-    /// corridor claim, since unlike a resume it starts a fresh transfer.
+    /// Starts a new manual USDC transfer of `amount` in `direction` under a
+    /// freshly minted id, for the apalis worker to drive, on the served
+    /// corridor `chain` names (it may be left out while the build serves one
+    /// corridor), picked the way `st0x-cli transfer-usdc` picks it. The worker
+    /// treats the id's empty state as a fresh transfer, exactly as it does for
+    /// a trigger enqueue. Shares the single flight gates of
+    /// [`Self::resume_usdc_transfer`] in the same order, so a manual start
+    /// cannot race the trigger, a resume, or a transfer in flight, and then
+    /// applies the trigger's fresh dispatch gates (no engaged cash divergence,
+    /// no restart tainted cash balance, gas readiness) before the corridor
+    /// claim, since unlike a resume it starts a fresh transfer.
     pub(crate) async fn start_manual_usdc_transfer(
         &self,
         pool: &SqlitePool,
         direction: RebalanceDirection,
         amount: Positive<Usdc>,
+        chain: Option<Chain>,
     ) -> Result<UsdcRebalanceId, UsdcResumeError> {
         // The operator supplies the amount (a resume reads the persisted
         // one), so `Positive` refuses a zero or negative amount before any
         // gate runs.
         let amount = amount.inner();
         let id = UsdcRebalanceId(Uuid::new_v4());
-        let corridor = self.config.served_usdc_corridor;
+        let corridor = st0x_config::manual_transfer_corridor(self.config.usdc.served(), chain)?;
         let chain = corridor.chain();
 
         let store = self.usdc_store.read().await.as_ref().map(Arc::clone);
@@ -6750,7 +6797,7 @@ impl RebalancingService {
         false
     }
 
-    async fn cancel_pending_equity_transfer_reservation_restore(
+    pub(super) async fn cancel_pending_equity_transfer_reservation_restore(
         &self,
         reservation_id: EquityTransferReservationId,
     ) {
@@ -7173,7 +7220,7 @@ impl RebalancingService {
                 // it retries the page and releases the guard once reconciled.
                 Ok(Some(entity))
                     if entity.holds_rebalance_guard()
-                        && entity.corridor() != self.config.served_usdc_corridor =>
+                        && !self.config.usdc.serves(entity.corridor()) =>
                 {
                     self.page_unserved_corridor_once(&id, entity.corridor(), entity.direction())
                         .await;
@@ -8866,12 +8913,9 @@ pub(crate) async fn wire_usdc_reactor_store(
         poll_freshness: PollFreshness::always_fresh(),
         inventory_staleness_bound: Duration::from_secs(300),
         allocation: AllocationCtx::base_test(),
-        usdc: Some(UsdcCorridorCtx {
-            corridor: UsdcCorridor::BASE_CCTP,
-            threshold: st0x_config::ImbalanceThreshold {
-                target: float!(0.5),
-                deviation: float!(0.2),
-            },
+        usdc: UsdcCorridors::base_cctp(st0x_config::ImbalanceThreshold {
+            target: float!(0.5),
+            deviation: float!(0.2),
         }),
         transfer_timeout: Duration::from_secs(30 * 60),
         chains: BTreeMap::from([(
@@ -8887,7 +8931,6 @@ pub(crate) async fn wire_usdc_reactor_store(
         )]),
         cash_reserved: None,
         hedge_floor: HedgeFloor::default(),
-        served_usdc_corridor: UsdcCorridor::BASE_CCTP,
     };
     let service = Arc::new(RebalancingService::new(
         config,
@@ -8940,7 +8983,8 @@ impl HedgeCapacity for RebalancingService {
     /// shares truncated to whole shares, less the floor rounded up to whole
     /// shares. That is never above what the broker would sell, so a starved
     /// hedge always reads as starved. For a fractional asset it can read low,
-    /// which only lets a redemption go ahead of a partial hedge. An unpolled
+    /// down to zero under one whole share, which lets a redemption go ahead of
+    /// a sell of that fraction. An unpolled
     /// broker is unknown, not empty.
     async fn hedgeable_shares(
         &self,
@@ -8972,7 +9016,7 @@ mod tests {
     use st0x_bridge::corridor::HopKind;
     use st0x_config::{
         ChainCashAsset, ChainEquities, ChainEquityAsset, ExecutionThreshold, ImbalanceThreshold,
-        OperationMode,
+        OperationMode, RebalancingMode,
     };
     use st0x_dto::Statement;
     use st0x_event_sorcery::{
@@ -9102,18 +9146,14 @@ mod tests {
 
     fn test_config() -> RebalancingServiceConfig {
         RebalancingServiceConfig {
-            served_usdc_corridor: UsdcCorridor::BASE_CCTP,
             poll_freshness: PollFreshness::always_fresh(),
             inventory_staleness_bound: Duration::from_secs(300),
             cash_reserved: None,
             hedge_floor: HedgeFloor::default(),
             allocation: AllocationCtx::base_test(),
-            usdc: Some(UsdcCorridorCtx {
-                corridor: UsdcCorridor::BASE_CCTP,
-                threshold: ImbalanceThreshold {
-                    target: float!(0.5),
-                    deviation: float!(0.2),
-                },
+            usdc: UsdcCorridors::base_cctp(ImbalanceThreshold {
+                target: float!(0.5),
+                deviation: float!(0.2),
             }),
             transfer_timeout: Duration::from_secs(30 * 60),
             chains: BTreeMap::from([(
@@ -9195,7 +9235,7 @@ mod tests {
                     tokenized_equity_derivative: Address::random(),
                     vault_ids: Vec::new(),
                     trading: OperationMode::Enabled,
-                    rebalancing: OperationMode::Enabled,
+                    rebalancing: RebalancingMode::Enabled,
                     wrapped_equity_recovery: OperationMode::Enabled,
                     operational_limit: None,
                     target_share: None,
@@ -9266,7 +9306,7 @@ mod tests {
                     tokenized_equity_derivative: Address::random(),
                     vault_ids: Vec::new(),
                     trading: OperationMode::Disabled,
-                    rebalancing: OperationMode::Disabled,
+                    rebalancing: RebalancingMode::Disabled,
                     wrapped_equity_recovery: OperationMode::Enabled,
                     operational_limit: None,
                     target_share: None,
@@ -9337,7 +9377,7 @@ mod tests {
                     tokenized_equity_derivative: Address::random(),
                     vault_ids: Vec::new(),
                     trading: OperationMode::Disabled,
-                    rebalancing: OperationMode::Disabled,
+                    rebalancing: RebalancingMode::Disabled,
                     wrapped_equity_recovery: OperationMode::Disabled,
                     operational_limit: None,
                     target_share: None,
@@ -9467,7 +9507,7 @@ mod tests {
                                 tokenized_equity_derivative: Address::ZERO,
                                 vault_ids: Vec::new(),
                                 trading: OperationMode::Disabled,
-                                rebalancing: OperationMode::Enabled,
+                                rebalancing: RebalancingMode::Enabled,
                                 wrapped_equity_recovery: OperationMode::Enabled,
                                 operational_limit: None,
                                 target_share: None,
@@ -12228,13 +12268,12 @@ mod tests {
 
         let trigger = RebalancingService::new(
             RebalancingServiceConfig {
-                served_usdc_corridor: UsdcCorridor::BASE_CCTP,
                 poll_freshness: PollFreshness::always_fresh(),
                 inventory_staleness_bound: Duration::from_secs(300),
                 cash_reserved: None,
                 hedge_floor: HedgeFloor::default(),
                 allocation: test_config().allocation,
-                usdc: None,
+                usdc: UsdcCorridors::base_cctp_disabled(),
                 transfer_timeout: test_config().transfer_timeout,
                 chains: BTreeMap::from([(
                     Chain::Base,
@@ -12331,7 +12370,7 @@ mod tests {
             .symbols
             .get_mut(&symbol)
             .expect("AAPL is configured")
-            .rebalancing = OperationMode::Disabled;
+            .rebalancing = RebalancingMode::Disabled;
 
         let trigger = make_imbalanced_trigger_with_equities(&symbol, equities).await;
 
@@ -12347,6 +12386,103 @@ mod tests {
             0,
             "Disabled asset should not trigger equity rebalancing"
         );
+    }
+
+    /// A symbol configured with `rebalancing = "paused"` passes the whitelist
+    /// and is planned, but the imbalance starts no job: the planner records a
+    /// `paused` decline for the chain instead.
+    #[tracing_test::traced_test]
+    #[tokio::test]
+    async fn paused_asset_starts_no_equity_operation() {
+        let symbol = Symbol::new("AAPL").unwrap();
+
+        let mut equities = rebalancing_enabled_equities(&["AAPL"]);
+        equities
+            .symbols
+            .get_mut(&symbol)
+            .expect("AAPL is configured")
+            .rebalancing = RebalancingMode::Paused;
+
+        let trigger = make_imbalanced_trigger_with_equities(&symbol, equities).await;
+
+        trigger.check_and_trigger_equity(&symbol).await.unwrap();
+
+        assert_eq!(count_pending_equity_mint_jobs(&trigger).await, 0);
+        assert_eq!(count_pending_equity_redemption_jobs(&trigger).await, 0);
+        assert!(
+            logs_contain("reason=\"paused\"") && logs_contain("chain=base"),
+            "the paused listing must be planned and declined by name"
+        );
+    }
+
+    #[tokio::test]
+    async fn restarted_trigger_dispatches_again_after_enabled_paused_enabled_cycle() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let mut trigger =
+            make_imbalanced_trigger_with_equities(&symbol, rebalancing_enabled_equities(&["AAPL"]))
+                .await;
+        let queue_pool = trigger
+            .transfer_equity_to_market_making_queue
+            .pool()
+            .clone();
+        let (position, threshold) = trigger.position_authority().await.unwrap();
+        let projection = trigger.position_projection.read().await.clone().unwrap();
+
+        for (mode, expected_jobs) in [
+            (RebalancingMode::Enabled, 1),
+            (RebalancingMode::Paused, 0),
+            (RebalancingMode::Enabled, 1),
+        ] {
+            let mut config = trigger.config.clone();
+            config
+                .chains
+                .get_mut(&Chain::Base)
+                .unwrap()
+                .assets
+                .equities
+                .symbols
+                .get_mut(&symbol)
+                .unwrap()
+                .rebalancing = mode;
+            let restarted = Arc::new(RebalancingService::new(
+                config,
+                trigger.vault_registry.clone(),
+                trigger.registry_ids.clone(),
+                trigger.inventory.clone(),
+                trigger.wrappers.clone(),
+                RebalancingSchedulers::new(&queue_pool),
+                trigger.notifier.clone(),
+            ));
+            restarted
+                .set_position_authority(position.clone(), projection.clone(), threshold)
+                .await;
+            restarted
+                .set_last_price_reader(Arc::new(StubLastPrice(float!(100))))
+                .await;
+            drop(trigger);
+            trigger = restarted;
+
+            trigger.check_and_trigger_equity(&symbol).await.unwrap();
+
+            let jobs = take_pending_equity_mint_jobs(&trigger).await;
+            assert_eq!(jobs.len(), expected_jobs, "restarted in {mode} mode");
+            assert_eq!(count_pending_equity_redemption_jobs(&trigger).await, 0);
+            for job in jobs {
+                assert_eq!(job.symbol, symbol);
+                assert_eq!(job.chain, Chain::Base);
+                // Drain the admitted queue work before the next restart, leaving
+                // the same imbalance so the next mode is what decides dispatch.
+                assert!(
+                    trigger
+                        .release_terminal_equity_transfer(
+                            &symbol,
+                            EquityTransferReservationId::from_uuid(job.issuer_request_id.0),
+                        )
+                        .await
+                        .unwrap()
+                );
+            }
+        }
     }
 
     /// A symbol observed in inventory but absent from the equity assets
@@ -12417,7 +12553,7 @@ mod tests {
             .symbols
             .get_mut(&symbol)
             .expect("AAPL is configured")
-            .rebalancing = OperationMode::Disabled;
+            .rebalancing = RebalancingMode::Disabled;
         let config = RebalancingServiceConfig {
             chains: BTreeMap::from([
                 (
@@ -12460,6 +12596,86 @@ mod tests {
         assert_eq!(jobs.len(), 1, "Base alone is under its target");
         assert_eq!(jobs[0].chain, Chain::Base);
         assert_eq!(jobs[0].quantity, shares(30));
+    }
+
+    /// A paused listing still counts in the planner's total, so its chain
+    /// must stay polled: a stale paused Robinhood slot declines the symbol
+    /// even though Base is fresh and under its target.
+    #[tracing_test::traced_test]
+    #[tokio::test]
+    async fn stale_paused_secondary_declines_the_symbol() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let inventory = InventoryView::default()
+            .with_equity(symbol.clone(), shares(20), shares(80))
+            .update_equity_at(
+                &symbol,
+                Chain::Robinhood,
+                Inventory::available(Venue::MarketMaking, Operator::Add, shares(100)),
+                Utc::now(),
+            )
+            .unwrap();
+        let mut paused = rebalancing_enabled_equities(&["AAPL"]);
+        paused
+            .symbols
+            .get_mut(&symbol)
+            .expect("AAPL is configured")
+            .rebalancing = RebalancingMode::Paused;
+        let freshness = PollFreshness::new();
+        freshness.set_observed(
+            PortfolioLocation::MarketMaking(Chain::Base),
+            PortfolioAsset::Equity(symbol.clone()),
+            Utc::now(),
+        );
+        freshness.set_observed(
+            PortfolioLocation::MarketMaking(Chain::Robinhood),
+            PortfolioAsset::Equity(symbol.clone()),
+            Utc::now() - chrono::Duration::seconds(301),
+        );
+        let config = RebalancingServiceConfig {
+            poll_freshness: freshness,
+            inventory_staleness_bound: Duration::from_secs(300),
+            chains: BTreeMap::from([
+                (
+                    Chain::Base,
+                    ChainRebalancingConfig::for_test(ChainAssets {
+                        equities: rebalancing_enabled_equities(&["AAPL"]),
+                        cash: None,
+                    }),
+                ),
+                (
+                    Chain::Robinhood,
+                    ChainRebalancingConfig::for_test(ChainAssets {
+                        equities: paused,
+                        cash: None,
+                    }),
+                ),
+            ]),
+            ..test_config()
+        };
+        let trigger = make_trigger_with_inventory_registry_and_wrappers(
+            inventory,
+            &symbol,
+            BTreeMap::from([
+                (
+                    Chain::Base,
+                    Arc::new(MockWrapper::new()) as Arc<dyn Wrapper>,
+                ),
+                (
+                    Chain::Robinhood,
+                    Arc::new(MockWrapper::new()) as Arc<dyn Wrapper>,
+                ),
+            ]),
+            config,
+        )
+        .await;
+
+        trigger.check_and_trigger_equity(&symbol).await.unwrap();
+
+        assert_eq!(count_pending_equity_mint_jobs(&trigger).await, 0);
+        assert!(
+            logs_contain("chain_stale") && logs_contain("chain=robinhood"),
+            "the stale paused chain must decline the symbol by name"
+        );
     }
 
     /// Cross-chain staleness rule: an equity evaluation must not run off a
@@ -13217,6 +13433,21 @@ mod tests {
         .fetch_one(service.transfer_usdc_to_market_making_queue.pool())
         .await
         .expect("count pending TransferUsdcToMarketMaking jobs")
+    }
+
+    async fn pending_transfer_usdc_to_hedging_job(
+        service: &RebalancingService,
+    ) -> TransferUsdcToHedging {
+        let job_type = std::any::type_name::<TransferUsdcToHedging>();
+        let payload: Vec<u8> = sqlx_apalis::query_scalar(
+            "SELECT job FROM Jobs WHERE status = 'Pending' AND job_type = ?",
+        )
+        .bind(job_type)
+        .fetch_one(service.transfer_usdc_to_hedging_queue.pool())
+        .await
+        .expect("fetch pending TransferUsdcToHedging job");
+
+        serde_json::from_slice(&payload).expect("deserialize TransferUsdcToHedging")
     }
 
     async fn pending_transfer_usdc_to_market_making_job(
@@ -15952,7 +16183,7 @@ mod tests {
                 .symbols
                 .get_mut(&symbol)
                 .expect("AAPL is configured")
-                .rebalancing = OperationMode::Disabled;
+                .rebalancing = RebalancingMode::Disabled;
             let mut config = test_config();
             config.chains.insert(
                 Chain::Robinhood,
@@ -16040,16 +16271,40 @@ mod tests {
     async fn corridor_chain_fill_schedules_the_usdc_check() {
         let symbol = Symbol::new("AAPL").unwrap();
         let config = RebalancingServiceConfig {
-            usdc: Some(UsdcCorridorCtx {
-                corridor: UsdcCorridor::HubRouted {
-                    chain: Chain::HyperEvm,
-                    hop: HopKind::Relay,
-                },
-                threshold: ImbalanceThreshold {
-                    target: float!(0.5),
-                    deviation: float!(0.2),
-                },
-            }),
+            usdc: UsdcCorridors::for_test(
+                OperationMode::Enabled,
+                [UsdcCorridorCtx {
+                    corridor: UsdcCorridor::HubRouted {
+                        chain: Chain::HyperEvm,
+                        hop: HopKind::Relay,
+                    },
+                    threshold: ImbalanceThreshold {
+                        target: float!(0.5),
+                        deviation: float!(0.2),
+                    },
+                }],
+            ),
+            ..test_config()
+        };
+
+        let trigger = hyperevm_fill_trigger(&symbol, config).await;
+
+        assert_eq!(count_pending_usdc_check_jobs(&trigger).await, 1);
+    }
+
+    /// With several active corridors, a fill on any of their chains, not
+    /// just the first, schedules the USDC check.
+    #[tokio::test]
+    async fn fill_on_an_active_corridor_chain_schedules_the_usdc_check() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let config = RebalancingServiceConfig {
+            usdc: UsdcCorridors::for_test(
+                OperationMode::Enabled,
+                [
+                    active_corridor(Chain::Base, HopKind::Cctp),
+                    active_corridor(Chain::HyperEvm, HopKind::Relay),
+                ],
+            ),
             ..test_config()
         };
 
@@ -18596,7 +18851,12 @@ mod tests {
         let (trigger, pool, _store) = make_resume_trigger().await;
 
         let id = trigger
-            .start_manual_usdc_transfer(&pool, RebalanceDirection::AlpacaToBase, positive_usdc(250))
+            .start_manual_usdc_transfer(
+                &pool,
+                RebalanceDirection::AlpacaToBase,
+                positive_usdc(250),
+                None,
+            )
             .await
             .unwrap();
 
@@ -18641,7 +18901,12 @@ mod tests {
         let (trigger, pool, _store) = make_resume_trigger().await;
 
         let id = trigger
-            .start_manual_usdc_transfer(&pool, RebalanceDirection::BaseToAlpaca, positive_usdc(75))
+            .start_manual_usdc_transfer(
+                &pool,
+                RebalanceDirection::BaseToAlpaca,
+                positive_usdc(75),
+                None,
+            )
             .await
             .unwrap();
 
@@ -18680,7 +18945,12 @@ mod tests {
             .unwrap();
 
         let error = trigger
-            .start_manual_usdc_transfer(&pool, RebalanceDirection::AlpacaToBase, positive_usdc(250))
+            .start_manual_usdc_transfer(
+                &pool,
+                RebalanceDirection::AlpacaToBase,
+                positive_usdc(250),
+                None,
+            )
             .await
             .unwrap_err();
 
@@ -18704,7 +18974,12 @@ mod tests {
             .hold(Chain::Base, &other, RebalanceDirection::BaseToAlpaca);
 
         let error = trigger
-            .start_manual_usdc_transfer(&pool, RebalanceDirection::BaseToAlpaca, positive_usdc(250))
+            .start_manual_usdc_transfer(
+                &pool,
+                RebalanceDirection::BaseToAlpaca,
+                positive_usdc(250),
+                None,
+            )
             .await
             .unwrap_err();
 
@@ -18728,7 +19003,12 @@ mod tests {
         trigger.recover_usdc_guard(&pool, &store).await.unwrap();
 
         let error = trigger
-            .start_manual_usdc_transfer(&pool, RebalanceDirection::AlpacaToBase, positive_usdc(250))
+            .start_manual_usdc_transfer(
+                &pool,
+                RebalanceDirection::AlpacaToBase,
+                positive_usdc(250),
+                None,
+            )
             .await
             .unwrap_err();
 
@@ -18747,7 +19027,7 @@ mod tests {
         let (trigger, pool, _store) = make_resume_trigger().await;
         trigger
             .set_usdc_gas_readiness(BTreeMap::from([(
-                trigger.config.served_usdc_corridor.chain(),
+                Chain::Base,
                 ConfiguredGasReadiness::Wired(crate::native_gas::GasReadiness::for_test(
                     U256::MAX,
                     U256::from(1_u64),
@@ -18758,7 +19038,12 @@ mod tests {
             .await;
 
         let error = trigger
-            .start_manual_usdc_transfer(&pool, RebalanceDirection::AlpacaToBase, positive_usdc(250))
+            .start_manual_usdc_transfer(
+                &pool,
+                RebalanceDirection::AlpacaToBase,
+                positive_usdc(250),
+                None,
+            )
             .await
             .unwrap_err();
 
@@ -18768,9 +19053,7 @@ mod tests {
         );
         assert!(market_making_job_rows(&trigger).await.is_empty());
         assert!(
-            !trigger
-                .usdc_guards
-                .is_held(trigger.config.served_usdc_corridor.chain()),
+            !trigger.usdc_guards.is_held(Chain::Base),
             "a gas refusal must leave no corridor guard claimed"
         );
     }
@@ -18786,7 +19069,12 @@ mod tests {
             .engage_cash(InventoryScope::Hedging);
 
         let error = trigger
-            .start_manual_usdc_transfer(&pool, RebalanceDirection::AlpacaToBase, positive_usdc(250))
+            .start_manual_usdc_transfer(
+                &pool,
+                RebalanceDirection::AlpacaToBase,
+                positive_usdc(250),
+                None,
+            )
             .await
             .unwrap_err();
 
@@ -18813,7 +19101,12 @@ mod tests {
             )]));
 
         let error = trigger
-            .start_manual_usdc_transfer(&pool, RebalanceDirection::AlpacaToBase, positive_usdc(250))
+            .start_manual_usdc_transfer(
+                &pool,
+                RebalanceDirection::AlpacaToBase,
+                positive_usdc(250),
+                None,
+            )
             .await
             .unwrap_err();
 
@@ -23300,7 +23593,7 @@ mod tests {
                     tokenized_equity_derivative: Address::ZERO,
                     vault_ids: Vec::new(),
                     trading: OperationMode::Disabled,
-                    rebalancing: OperationMode::Enabled,
+                    rebalancing: RebalancingMode::Enabled,
                     wrapped_equity_recovery: OperationMode::Enabled,
                     operational_limit: None,
                     target_share: None,
@@ -29467,21 +29760,20 @@ mod tests {
 
     #[tokio::test]
     async fn usdc_rebalancing_disabled_when_cash_ratio_absent() {
-        // Regression: when usdc is None, startup must not require assets.cash.vault_id.
-        // The trigger returns no USDC rebalancing params, so no USDC vault lookup occurs.
+        // No cash table on the corridor's chain returns no params, so startup needs no
+        // cash vault_id.
         let (pool, apalis_pool) = crate::test_utils::setup_test_pools().await;
         let wrapper = Arc::new(MockWrapper::new());
 
         let schedulers = RebalancingSchedulers::new(&apalis_pool);
         let trigger = RebalancingService::new(
             RebalancingServiceConfig {
-                served_usdc_corridor: UsdcCorridor::BASE_CCTP,
                 poll_freshness: PollFreshness::always_fresh(),
                 inventory_staleness_bound: Duration::from_secs(300),
                 cash_reserved: None,
                 hedge_floor: HedgeFloor::default(),
                 allocation: AllocationCtx::base_test(),
-                usdc: None,
+                usdc: UsdcCorridors::base_cctp_disabled(),
                 transfer_timeout: Duration::from_secs(30 * 60),
                 chains: BTreeMap::from([(
                     Chain::Base,
@@ -29509,8 +29801,16 @@ mod tests {
             Arc::new(crate::alerts::LogNotifier),
         );
 
+        let base_cctp = UsdcCorridorCtx {
+            corridor: UsdcCorridor::BASE_CCTP,
+            threshold: ImbalanceThreshold {
+                target: float!(0.5),
+                deviation: float!(0.2),
+            },
+        };
+        assert_eq!(trigger.config.usdc.active().count(), 0);
         assert!(
-            trigger.usdc_rebalancing_params().is_none(),
+            trigger.usdc_rebalancing_params(&base_cctp).is_none(),
             "Expected usdc_rebalancing_params to be None when cash ratio is absent"
         );
     }
@@ -29529,8 +29829,9 @@ mod tests {
             .as_mut()
             .unwrap()
             .rebalancing = OperationMode::Disabled;
+        let base_cctp = *trigger.config.usdc.active().next().unwrap();
 
-        assert!(trigger.usdc_rebalancing_params().is_none());
+        assert!(trigger.usdc_rebalancing_params(&base_cctp).is_none());
     }
 
     /// Spy reactor that records all dispatched events for verification.
@@ -33743,14 +34044,15 @@ mod tests {
             .unwrap();
     }
 
-    /// The production deadlock: the broker holds one share, so the due sell
-    /// hedge of 50 cannot fill, and the over-target vault's redemption is what
-    /// brings the broker those shares.
+    /// The production deadlock: the broker holds no share above its floor, so
+    /// it can place none of the due sell hedge of 50, and the over-target
+    /// vault's redemption is what brings the broker those shares. (A broker
+    /// that can sell some places that partial hedge first.)
     #[tokio::test]
     async fn equity_check_redeems_to_fund_a_sell_hedge_the_broker_cannot_fill() {
         let symbol = Symbol::new("AAPL").unwrap();
         let inventory = InventoryView::default()
-            .with_equity(symbol.clone(), shares(80), shares(1))
+            .with_equity(symbol.clone(), shares(80), shares(0))
             .with_usdc(usdc(1_000_000), usdc(1_000_000));
         let trigger = make_trigger_with_inventory_and_registry(inventory, &symbol).await;
         acknowledge_onchain_buy(&trigger, &symbol, 50).await;
@@ -33840,23 +34142,38 @@ mod tests {
         assert_eq!(count_pending_equity_mint_jobs(&trigger).await, 0);
     }
 
-    /// Prices every symbol at 100 and, on its first read, which falls between
-    /// the two plans of one check, replaces the inventory with `moved_to`, as
-    /// onchain activity can between them.
+    /// Prices every symbol at 100. On its first read, in the first plan of a
+    /// check, it replaces the inventory with `moved_to`, as onchain activity
+    /// can between the two plans. On its second read, in the plan after the
+    /// reservation, it records whether the Position held a reservation then.
     struct InventoryMovingPrice {
         inventory: Arc<BroadcastingInventory>,
+        position: Arc<Store<Position>>,
         moved_to: tokio::sync::Mutex<Option<InventoryView>>,
+        reads: std::sync::atomic::AtomicU32,
+        reserved_during_replan: tokio::sync::Mutex<Option<bool>>,
     }
 
     #[async_trait]
     impl LastPriceReader for InventoryMovingPrice {
         async fn last_price(
             &self,
-            _symbol: &Symbol,
+            symbol: &Symbol,
         ) -> Result<Option<crate::position::PriceObservation>, ProjectionError<Position>> {
-            let moved_to = self.moved_to.lock().await.take();
-            if let Some(moved_to) = moved_to {
-                *self.inventory.write().await = moved_to;
+            let read = self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if read == 0 {
+                let moved_to = self.moved_to.lock().await.take();
+                if let Some(moved_to) = moved_to {
+                    *self.inventory.write().await = moved_to;
+                }
+            } else if read == 1 {
+                let reserved = self
+                    .position
+                    .load(symbol)
+                    .await
+                    .unwrap()
+                    .is_some_and(|position| position.equity_transfer_reservation.is_some());
+                *self.reserved_during_replan.lock().await = Some(reserved);
             }
             Ok(Some(crate::position::PriceObservation {
                 price: float!(100),
@@ -33866,26 +34183,32 @@ mod tests {
     }
 
     /// The reservation was admitted for a redemption over a due sell hedge
-    /// the broker cannot fill. When the plan after the reservation is a mint,
-    /// nothing is dispatched and the reservation is released: a mint would
-    /// take the shares that hedge needs.
+    /// the broker can place none of. When the plan after the reservation is a
+    /// mint, nothing is dispatched and the reservation is released: a mint
+    /// would take the shares that hedge needs. The broker holds 0.9 shares,
+    /// which its whole share count reads as none, so the reservation is
+    /// admitted, yet the fraction is enough for the second plan to mint.
     #[tokio::test]
     async fn equity_check_does_not_mint_on_a_reservation_admitted_for_a_redemption() {
         let symbol = Symbol::new("AAPL").unwrap();
+        let broker = FractionalShares::new(float!(0.9));
         let redemption_inventory = InventoryView::default()
-            .with_equity(symbol.clone(), shares(80), shares(1))
+            .with_equity(symbol.clone(), shares(80), broker)
             .with_usdc(usdc(1_000_000), usdc(1_000_000));
         let mint_inventory = InventoryView::default()
-            .with_equity(symbol.clone(), shares(20), shares(80))
+            .with_equity(symbol.clone(), FractionalShares::ZERO, broker)
             .with_usdc(usdc(1_000_000), usdc(1_000_000));
         let trigger = make_trigger_with_inventory_and_registry(redemption_inventory, &symbol).await;
         acknowledge_onchain_buy(&trigger, &symbol, 500).await;
-        trigger
-            .set_last_price_reader(Arc::new(InventoryMovingPrice {
-                inventory: Arc::clone(&trigger.inventory),
-                moved_to: tokio::sync::Mutex::new(Some(mint_inventory)),
-            }))
-            .await;
+        let (store, _) = trigger.position_authority().await.unwrap();
+        let price = Arc::new(InventoryMovingPrice {
+            inventory: Arc::clone(&trigger.inventory),
+            position: Arc::clone(&store),
+            moved_to: tokio::sync::Mutex::new(Some(mint_inventory)),
+            reads: std::sync::atomic::AtomicU32::new(0),
+            reserved_during_replan: tokio::sync::Mutex::new(None),
+        });
+        trigger.set_last_price_reader(price.clone()).await;
 
         EquityRebalancingCheck {
             symbol: symbol.clone(),
@@ -33894,9 +34217,13 @@ mod tests {
         .await
         .unwrap();
 
+        assert_eq!(
+            *price.reserved_during_replan.lock().await,
+            Some(true),
+            "the redemption must have been admitted before the plan turned into a mint"
+        );
         assert_eq!(count_pending_equity_mint_jobs(&trigger).await, 0);
         assert_eq!(count_pending_equity_redemption_jobs(&trigger).await, 0);
-        let (store, _) = trigger.position_authority().await.unwrap();
         assert_eq!(
             store
                 .load(&symbol)
@@ -37317,25 +37644,225 @@ mod tests {
         };
         let base = test_config();
         let config = RebalancingServiceConfig {
-            usdc: Some(UsdcCorridorCtx {
-                corridor,
-                threshold: ImbalanceThreshold {
-                    target: float!(0.5),
-                    deviation: float!(0.2),
-                },
-            }),
+            usdc: UsdcCorridors::for_test(
+                OperationMode::Enabled,
+                [UsdcCorridorCtx {
+                    corridor,
+                    threshold: ImbalanceThreshold {
+                        target: float!(0.5),
+                        deviation: float!(0.2),
+                    },
+                }],
+            ),
             chains: BTreeMap::from([(Chain::Robinhood, base.chains[&Chain::Base].clone())]),
             ..base
         };
-        let inventory = InventoryView::for_primary_chain(Chain::Robinhood)
-            .with_usdc(usdc(100), usdc(900))
+        // Base, the primary, sits on target: only Robinhood's own USDC is
+        // under its band.
+        let inventory = InventoryView::default()
+            .with_usdc(usdc(900), usdc(900))
             .with_withdrawable_cash_cents(90_000);
+        let inventory = with_onchain_usdc(inventory, Chain::Robinhood, usdc(100));
         let trigger = make_trigger_with_inventory_config(inventory, config).await;
 
         trigger.check_and_trigger_usdc().await;
 
         let job = pending_transfer_usdc_to_market_making_job(&trigger).await;
         assert_eq!(job.corridor, corridor);
+    }
+
+    fn active_corridor(chain: Chain, hop: HopKind) -> UsdcCorridorCtx {
+        UsdcCorridorCtx {
+            corridor: UsdcCorridor::HubRouted { chain, hop },
+            threshold: ImbalanceThreshold {
+                target: float!(0.5),
+                deviation: float!(0.2),
+            },
+        }
+    }
+
+    /// `base`'s cash table on each of `chains` besides Base.
+    fn with_cash_on(
+        mut config: RebalancingServiceConfig,
+        chains: &[Chain],
+    ) -> RebalancingServiceConfig {
+        let base = config.chains[&Chain::Base].clone();
+        for chain in chains {
+            config.chains.insert(*chain, base.clone());
+        }
+
+        config
+    }
+
+    fn with_onchain_usdc(inventory: InventoryView, chain: Chain, balance: Usdc) -> InventoryView {
+        let now = Utc::now();
+
+        inventory
+            .apply_snapshot_event(
+                &InventorySnapshotEvent::OnchainUsdc {
+                    chain,
+                    usdc_balance: balance,
+                    fetched_at: now,
+                    block_number: None,
+                },
+                now,
+            )
+            .unwrap()
+    }
+
+    /// One check runs every active corridor in chain order, each against its
+    /// own band: Base over its band sends to Alpaca, HyperEVM under its band
+    /// takes the one Alpaca-outbound slot, and Robinhood, also under its
+    /// band, is refused by the guard until that transfer ends.
+    #[tokio::test]
+    async fn usdc_check_runs_every_active_corridor() {
+        let config = RebalancingServiceConfig {
+            usdc: UsdcCorridors::for_test(
+                OperationMode::Enabled,
+                [
+                    active_corridor(Chain::Base, HopKind::Cctp),
+                    active_corridor(Chain::HyperEvm, HopKind::Relay),
+                    active_corridor(Chain::Robinhood, HopKind::Relay),
+                ],
+            ),
+            ..with_cash_on(test_config(), &[Chain::HyperEvm, Chain::Robinhood])
+        };
+        let inventory = InventoryView::default()
+            .with_usdc(usdc(9000), usdc(1000))
+            .with_withdrawable_cash_cents(100_000);
+        let inventory = with_onchain_usdc(inventory, Chain::HyperEvm, usdc(100));
+        let inventory = with_onchain_usdc(inventory, Chain::Robinhood, usdc(100));
+        let trigger = make_trigger_with_inventory_config(inventory, config).await;
+
+        trigger.check_and_trigger_usdc().await;
+
+        let to_hedging = pending_transfer_usdc_to_hedging_job(&trigger).await;
+        assert_eq!(to_hedging.corridor.chain(), Chain::Base);
+        assert_eq!(
+            count_pending_transfer_usdc_to_hedging_jobs(&trigger).await,
+            1
+        );
+        let to_market_making = pending_transfer_usdc_to_market_making_job(&trigger).await;
+        assert_eq!(to_market_making.corridor.chain(), Chain::HyperEvm);
+        assert_eq!(
+            count_pending_transfer_usdc_to_market_making_jobs(&trigger).await,
+            1
+        );
+        assert!(trigger.usdc_guards.is_held(Chain::Base));
+        assert!(trigger.usdc_guards.is_held(Chain::HyperEvm));
+        assert!(
+            !trigger.usdc_guards.is_held(Chain::Robinhood),
+            "a second Alpaca-outbound corridor must be refused while one runs"
+        );
+    }
+
+    /// A corridor table on a chain other than Base is looked up by its own
+    /// chain: its gas check gates its transfers, not Base's.
+    #[tokio::test]
+    async fn non_base_corridor_table_checks_its_own_chains_gas() {
+        let config = RebalancingServiceConfig {
+            usdc: UsdcCorridors::for_test(
+                OperationMode::Enabled,
+                [active_corridor(Chain::Robinhood, HopKind::Relay)],
+            ),
+            ..with_cash_on(test_config(), &[Chain::Robinhood])
+        };
+        let inventory = InventoryView::default()
+            .with_usdc(usdc(900), usdc(900))
+            .with_withdrawable_cash_cents(90_000);
+        let inventory = with_onchain_usdc(inventory, Chain::Robinhood, usdc(100));
+        let trigger = make_trigger_with_inventory_config(inventory, config).await;
+        let low_gas = || {
+            ConfiguredGasReadiness::Wired(crate::native_gas::GasReadiness::for_test(
+                U256::ZERO,
+                U256::from(1_u64),
+                U256::MAX,
+                U256::from(1_u64),
+            ))
+        };
+        let ready = || {
+            ConfiguredGasReadiness::Wired(crate::native_gas::GasReadiness::always_ready_for_test())
+        };
+
+        trigger
+            .set_usdc_gas_readiness(BTreeMap::from([
+                (Chain::Base, ready()),
+                (Chain::Robinhood, low_gas()),
+            ]))
+            .await;
+        trigger.check_and_trigger_usdc().await;
+
+        assert_eq!(
+            count_pending_transfer_usdc_to_market_making_jobs(&trigger).await,
+            0
+        );
+
+        trigger
+            .set_usdc_gas_readiness(BTreeMap::from([
+                (Chain::Base, low_gas()),
+                (Chain::Robinhood, ready()),
+            ]))
+            .await;
+        trigger.check_and_trigger_usdc().await;
+
+        let job = pending_transfer_usdc_to_market_making_job(&trigger).await;
+        assert_eq!(job.corridor, ROBINHOOD_RELAY);
+    }
+
+    /// A transfer on a non-Base corridor table is served: a manual resume
+    /// enqueues its job and latches that chain's guard.
+    #[tokio::test]
+    async fn non_base_corridor_table_is_served_on_manual_resume() {
+        let config = RebalancingServiceConfig {
+            usdc: UsdcCorridors::for_test(
+                OperationMode::Enabled,
+                [active_corridor(Chain::Robinhood, HopKind::Relay)],
+            ),
+            ..with_cash_on(test_config(), &[Chain::Robinhood])
+        };
+        let pool = crate::test_utils::setup_test_db().await;
+        let store = Arc::new(test_store::<UsdcRebalance>(pool.clone(), ()));
+        let inventory = with_onchain_usdc(
+            InventoryView::default().with_usdc(usdc(900), usdc(900)),
+            Chain::Robinhood,
+            usdc(500),
+        );
+        let trigger = make_trigger_with_inventory_config(inventory, config).await;
+        trigger
+            .set_stores(
+                Arc::new(test_store::<TokenizedEquityMint>(
+                    pool.clone(),
+                    crate::rebalancing::equity::EquityTransferServices::panicking(),
+                )),
+                Arc::new(test_store::<EquityRedemption>(
+                    pool.clone(),
+                    crate::rebalancing::equity::EquityTransferServices::panicking(),
+                )),
+                store.clone(),
+            )
+            .await;
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        store
+            .send(
+                &id,
+                UsdcRebalanceCommand::InitiateConversion {
+                    corridor: ROBINHOOD_RELAY,
+                    direction: RebalanceDirection::AlpacaToBase,
+                    amount: usdc(400),
+                    order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
+                },
+            )
+            .await
+            .unwrap();
+
+        trigger
+            .resume_usdc_transfer(&pool, &id, RebalanceDirection::AlpacaToBase)
+            .await
+            .unwrap();
+
+        assert!(trigger.usdc_guards.is_held(Chain::Robinhood));
+        let job = pending_transfer_usdc_to_market_making_job(&trigger).await;
+        assert_eq!(job.corridor, ROBINHOOD_RELAY);
     }
 
     const ROBINHOOD_RELAY: UsdcCorridor = UsdcCorridor::HubRouted {
@@ -37376,6 +37903,11 @@ mod tests {
         let pages = corridor_pages(&notifier);
         assert_eq!(pages.len(), 1, "got {pages:?}");
         assert!(pages[0].contains(&id.to_string()), "{}", pages[0]);
+        assert!(
+            pages[0].contains("deploy a build and config that serve"),
+            "{}",
+            pages[0]
+        );
         assert!(
             pages[0].contains("Alpaca-outbound transfers are blocked on every corridor"),
             "a held Alpaca-outbound transfer blocks every corridor's outbound claims: {}",
@@ -37511,7 +38043,16 @@ mod tests {
         let serving = make_trigger_with_inventory_config_and_notifier(
             InventoryView::default(),
             RebalancingServiceConfig {
-                served_usdc_corridor: ROBINHOOD_RELAY,
+                usdc: UsdcCorridors::for_test(
+                    OperationMode::Disabled,
+                    [UsdcCorridorCtx {
+                        corridor: ROBINHOOD_RELAY,
+                        threshold: ImbalanceThreshold {
+                            target: float!(0.5),
+                            deviation: float!(0.2),
+                        },
+                    }],
+                ),
                 ..test_config()
             },
             notifier.clone(),

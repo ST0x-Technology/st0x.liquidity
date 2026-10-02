@@ -119,6 +119,9 @@ and the system proves market fit.
     `[rebalancing.usdc.corridors.<chain>]` with its `hop`, `target` and
     `deviation`; the chain's cash vault, per-transfer limit and confirmations
     come from the chain's own tables. Today the only corridor is Base via CCTP.
+  - Each corridor's transfers run on its own chain's orderbook, vault, wallet
+    and gas check, and the USDC check runs every active corridor in chain order,
+    each against its own band.
   - The corridor is recorded on each transfer when it starts. A transfer
     recorded before corridors existed reads as Base via CCTP, the only route
     there was.
@@ -126,6 +129,11 @@ and the system proves market fit.
     either direction, and at most one Alpaca-outbound transfer across all
     corridors, because Alpaca's withdrawable cash and its USDC inflight are
     shared. Releasing a transfer frees only the guard that transfer held.
+  - Each corridor's band is computed against the full Alpaca balance, and
+    chain-to-Alpaca transfers on different corridors are not yet sized against
+    each other, so two corridors in one tick can both move cash to Alpaca and
+    overshoot. A second corridor needs that sizing before it loads (part 3 of
+    the Robinhood corridor work).
 - **Complete Audit Trail**: All rebalancing operations tracked as events
   (CrossVenueEquityTransfer, CrossVenueCashTransfer)
 - **Integration**: Uses Alpaca for share/USDC management, Circle CCTP for
@@ -143,8 +151,43 @@ transfer stores and workers, and interrupted-transfer recovery — always starts
 
 Operators pause rebalancing with narrow, explicit controls:
 
+- **Per-asset `rebalancing = "paused"`**: the chain keeps everything the listing
+  needs to finish transfers already under way -- its equity services and startup
+  approvals -- and its inventory still counts in the planner's total, but the
+  planner starts no new mint or redemption on it (`paused`). In-flight
+  transfers, their resume jobs and recovery run to completion, and startup with
+  an unfinished transfer on a paused chain succeeds. A mint persisted but never
+  received by the issuer is the exception: the bot does not replay its request
+  on a paused chain, because that would start a new mint. A lookup that finds no
+  mint does not prove the issuer never got it, so the mint stays `MintRequested`
+  with its reservation, the resume job errors until its retries run out and
+  pages, and the operator confirms with the issuer before
+  `transfer fail --kind mint`. Wallet polling and orphan recovery continue where
+  already wired (currently the primary chain); pause does not add secondary
+  recovery coverage. Switching between `enabled` and `paused` needs only a
+  restart. This is the switch to stop a chain's equity operations without
+  stranding anything. Because a paused chain's inventory still counts, the chain
+  must stay polled and readable: a stale or unpolled paused slot declines the
+  whole symbol (`chain_stale`/`chain_unpolled`), and a failed ratio read on it
+  fails that symbol's check. To take a chain with a degraded RPC or indexer out
+  of the total, pause it, wait until its in-flight transfers finish, and then
+  set it to `disabled`. Pausing does not move the chain's equity: the planner
+  skips paused chains and `transfer-equity` refuses a new transfer on them. To
+  move that equity elsewhere first, use the manual vault, unwrap, and redeem
+  commands (`vault-withdraw`, `unwrap-equity`, then `alpaca-redeem` with the
+  unwrapped quantity, see docs/cli-ops.md). The Raindex vault holds the wrapped
+  derivative; redeeming without unwrap sends the wrong token. Publish
+  `rebalancing = "paused"` only after this order: deploy the bot that reads
+  `paused`, merge the `t0/check.jq` validator change, then publish `paused`. On
+  rollback, restore the token value before downgrading the binary. The dashboard
+  currently shows paused and disabled listings with the same red rebalancing
+  indicator; verify the registry mode before you set `disabled`. It displays
+  settings for the primary chain only.
 - **Per-asset `rebalancing = "disabled"`**: removes the asset from the trigger
-  whitelist. New equity rebalancing flows do not start for that asset.
+  whitelist. New equity rebalancing flows do not start for that asset. On a
+  secondary chain where no equity is `enabled` or `paused`, the chain's equity
+  services are not built, so startup refuses an unfinished transfer there; pause
+  first and let the work finish.
 - **Issuance freeze (`Frozen`)**: stops new mints for the asset during
   maintenance or corporate actions. When `freeze_check = "enabled"`, the freeze
   also stops new liquidity-initiated rebalancing flows for the asset. When
@@ -157,8 +200,10 @@ Operators pause rebalancing with narrow, explicit controls:
 - **Circuit breakers**: stop a transfer after repeated failures and alert the
   operator.
 
-None of these controls disable hedging, inventory visibility, or the recovery of
-in-flight transfers. A pause stops new rebalancing work only.
+None of these controls disable hedging or inventory visibility. They also keep
+the recovery of in-flight transfers, except on a secondary chain where every
+equity is `disabled`: there the equity services are not built, as described
+above. A pause stops new rebalancing work only.
 
 ##### Chain Roles: Hedged (Primary or Secondary) and Transport
 
@@ -168,43 +213,46 @@ config carries a `[chains.<name>.trading]` table is a **hedged** chain: the bot
 runs a fill watcher against its order book, accounts its fills and hedges them
 with offsetting broker orders. Exactly one hedged chain must set
 `primary = true` on that table -- the **primary** chain anchors the operator
-defaults (Base), and for now it is the only chain a cash corridor may be keyed
-by. The corridor table names the cash chain; the cash transfer executor runs on
-that chain's orderbook, vault, wallet and gas check. The cash inventory state is
-kept per corridor chain too: its trigger, inflight and busy marker address that
-chain's vault; equity rebalancing, hedging and vault balance polling happen on
-every hedged chain. Vault balance polling runs once per hedged chain, each on
-that chain's own Raindex service, its own chain-qualified vault registry and one
-pinned block, so every hedged chain's inventory slot is seeded and corrected. A
-secondary chain's fill updates that chain's own inventory slot: inventory is not
-fungible across chains. It schedules the symbol's equity check when that chain's
-listing rebalances the symbol, and the USDC check only when that chain is the
-cash corridor's chain; a hedge-only listing is prefunded and schedules neither.
-The distinction exists so that fill watching and inventory polling can go
+defaults (Base). The corridor table names the cash chain, whichever hedged chain
+it is; the cash transfer executor runs on that chain's orderbook, vault, wallet
+and gas check. The cash inventory state is kept per corridor chain too: its
+trigger, inflight and busy marker address that chain's vault; equity
+rebalancing, hedging and vault balance polling happen on every hedged chain.
+Vault balance polling runs once per hedged chain, each on that chain's own
+Raindex service, its own chain-qualified vault registry and one pinned block, so
+every hedged chain's inventory slot is seeded and corrected. A secondary chain's
+fill updates that chain's own inventory slot: inventory is not fungible across
+chains. It schedules the symbol's equity check when that chain's listing
+rebalances the symbol, and the USDC check only when that chain is an active cash
+corridor's chain; a hedge-only listing is prefunded and schedules neither. The
+distinction exists so that fill watching and inventory polling can go
 multi-chain before rebalancing does: it names the chain the still-single-chain
-paths use. Equity rebalancing is already per chain (see Equity Allocation
-Planner); once the USDC corridors are too, `primary` shrinks to the operator's
-default chain, or is removed. Zero or multiple primary claimants fail startup
-with a named error. Chains without a trading table are **transport** chains
-(RPC + confirmations only, e.g. Ethereum while it only carries CCTP transfers).
-Watch settings are per chain: poll interval, ingestion cutoff, asset tables with
-per-chain enable/disable flags. The periodic position check sweeps a symbol when
-any hedged chain enables it and sizes the hedge with the tightest operational
-limit among those chains (one `Position` per symbol cannot say which chain its
-fills came from; the remainder is hedged on a later tick). Startup verifies
-every hedged chain (chain-id identity, cutoff support, and each token address
-the chain's role uses answering `decimals()` on that chain's own endpoint: every
-equity's wrapped share, plus the unwrapped token of each equity the chain
-rebalances) and any failure is fatal; degraded per-chain startup is deferred to
-the chain-disable work. Each probed equity token must report 18 decimals: every
-equity quantity the bot scales is 18-decimal share-wei, so a token at another
-precision is refused by name rather than honoured. The settlement stable is not
-probed: its decimals are pinned in code beside its address. Each wrapped share
-must additionally report the equity's configured unwrapped token as its ERC-4626
-`asset()` — the same attestation the tokenization preflight makes, which a
-hedge-only chain never reaches and a rebalancing secondary makes only for the
-equities that opt in — so a typo landing on another live token refuses startup
-instead of surfacing as the first unresolvable fill.
+paths use. Equity and cash rebalancing are per chain (see Equity Allocation
+Planner and USDC Rebalancing), so `primary` is otherwise only the operator's
+default chain. For now the primary must be Base, and any other primary fails
+startup with a named error: equity wallet polling and recovery read the Base
+wallet with the primary's token addresses. Zero or multiple primary claimants
+fail startup with a named error. Chains without a trading table are
+**transport** chains (RPC + confirmations only, e.g. Ethereum while it only
+carries CCTP transfers). Watch settings are per chain: poll interval, ingestion
+cutoff, asset tables with per-chain enable/disable flags. The periodic position
+check sweeps a symbol when any hedged chain enables it and sizes the hedge with
+the tightest operational limit among those chains (one `Position` per symbol
+cannot say which chain its fills came from; the remainder is hedged on a later
+tick). Startup verifies every hedged chain (chain-id identity, cutoff support,
+and each token address the chain's role uses answering `decimals()` on that
+chain's own endpoint: every equity's wrapped share, plus the unwrapped token of
+each equity the chain rebalances) and any failure is fatal; degraded per-chain
+startup is deferred to the chain-disable work. Each probed equity token must
+report 18 decimals: every equity quantity the bot scales is 18-decimal
+share-wei, so a token at another precision is refused by name rather than
+honoured. The settlement stable is not probed: its decimals are pinned in code
+beside its address. Each wrapped share must additionally report the equity's
+configured unwrapped token as its ERC-4626 `asset()` — the same attestation the
+tokenization preflight makes, which a hedge-only chain never reaches and a
+rebalancing secondary makes only for the equities that opt in — so a typo
+landing on another live token refuses startup instead of surfacing as the first
+unresolvable fill.
 
 The lifecycle is a strict ceiling over the chain's asset settings. The hedged
 chain with `primary = true` must be `active`; startup rejects an observe-only or
@@ -239,39 +287,39 @@ parent-chain finality.
 
 The tokenization services are built per hedged chain, never once for Base, on
 the chain's own signing wallet. The primary, and every secondary with at least
-one rebalancing-enabled equity (the same per-asset flags that make the chain
-require the equity-rebalancing capability), get the full set: an issuer client,
-wrapper and mint authorizer bound to that chain's wallet, orderbook, asset table
-and issuer redemption wallet, plus that chain's `[orchestrator.addresses]` entry
-when the section carries one; without the entry the chain's mint authorizer is
-disabled with a startup warning and only an orchestrator-mode mint fails (see
-Mint Recipient Authorization). Such a chain must have its own redemption wallet,
-or startup fails naming the chain. A **hedge-only** secondary -- a trading table
-whose equities all have `rebalancing = "disabled"` -- needs no issuer client,
-redemption wallet or mint authorizer: only its signer is kept, for the startup
-allowance work, and startup logs the chain as hedge-only. It still gets the
-read-only ERC-4626 ratio reader over its own asset table, because vault polling
-reads its market-making vaults like any hedged chain's and those hold wrapped
-vault shares the daily portfolio capture values in underlying units. The
-rebalancing trigger plans across every hedged chain's entry and dispatches each
-operation with its chain (see Equity Allocation Planner); the portfolio snapshot
-and the wrapped- and unwrapped-equity orphan-recovery aggregates still consume
-the primary chain's entry. A secondary listing that sets
-`wrapped_equity_recovery = "enabled"` is refused at load, naming the chain and
-symbol, since no recovery would claim its stranded tokens. A mint or redemption
-transfer resolves the entry of the chain its record names (see below). The
-tokenization preflight (below) runs once per hedged chain with that chain's
-wallet, orderbook and settlement stable, as does the stale-allowance revoke on
-each chain in managed inventory mode. The startup MAX approvals run on every
-hedged chain in either mode, but only the settlement-stable grant is
-unconditional: the equity grants (underlying to wrapper vault, wrapped token to
-the deposit spender) are made only on chains that rebalance equity, since a
-hedge-only secondary has no wrapper to approve. Both deposit grants name the
-spender that chain settles deposits through -- its orderbook in legacy inventory
-mode, its `RaindexInventory` in managed mode -- so the same two token identities
-are approved, and proved by the deploy gate, in either inventory mode. A hedged
-chain for which this build has no pinned settlement stable fails startup rather
-than borrowing another chain's address.
+one equity whose rebalancing is `enabled` or `paused` (the same per-asset flags
+that make the chain require the equity-rebalancing capability), get the full
+set: an issuer client, wrapper and mint authorizer bound to that chain's wallet,
+orderbook, asset table and issuer redemption wallet, plus that chain's
+`[orchestrator.addresses]` entry when the section carries one; without the entry
+the chain's mint authorizer is disabled with a startup warning and only an
+orchestrator-mode mint fails (see Mint Recipient Authorization). Such a chain
+must have its own redemption wallet, or startup fails naming the chain. A
+**hedge-only** secondary -- a trading table whose equities all have
+`rebalancing = "disabled"` -- needs no issuer client, redemption wallet or mint
+authorizer: only its signer is kept, for the startup allowance work, and startup
+logs the chain as hedge-only. It still gets the read-only ERC-4626 ratio reader
+over its own asset table, because vault polling reads its market-making vaults
+like any hedged chain's and those hold wrapped vault shares the daily portfolio
+capture values in underlying units. The rebalancing trigger plans across every
+hedged chain's entry and dispatches each operation with its chain (see Equity
+Allocation Planner); the portfolio snapshot and the wrapped- and
+unwrapped-equity orphan-recovery aggregates still consume the primary chain's
+entry. A secondary listing that sets `wrapped_equity_recovery = "enabled"` is
+refused at load, naming the chain and symbol, since no recovery would claim its
+stranded tokens. A mint or redemption transfer resolves the entry of the chain
+its record names (see below). The tokenization preflight (below) runs once per
+hedged chain with that chain's wallet, orderbook and settlement stable, as does
+the stale-allowance revoke on each chain in managed inventory mode. The startup
+MAX approvals run on every hedged chain in either mode, but only the
+settlement-stable grant is unconditional: the equity grants (underlying to
+wrapper vault, wrapped token to the deposit spender) are made only on chains
+that rebalance equity, since a hedge-only secondary has no wrapper to approve.
+Both deposit grants name the spender that chain settles deposits through -- its
+orderbook in legacy inventory mode, its `RaindexInventory` in managed mode -- so
+the same two token identities are approved, and proved by the deploy gate, in
+either inventory mode. A hedged chain for which this build has no pinned
+settlement stable fails startup rather than borrowing another chain's address.
 
 The operator CLI selects its chain the same way. Every command that itself
 submits an onchain operation takes `--network` (default `base`) and runs on that
@@ -690,37 +738,37 @@ grants the one-time MAX approvals on every hedged chain with that chain's
 wallet: that chain's settlement stable to its deposit spender on every hedged
 chain, and each wrapped equity's underlying to its wrapper vault and wrapped to
 that same deposit spender -- the chain's orderbook in legacy inventory mode, its
-`RaindexInventory` in managed mode: on the primary every equity with trading or
-rebalancing enabled, on a secondary only the equities with rebalancing enabled,
-the same selection its tokenization preflight attests (a hedge-only secondary
-has no wrapper to approve, so its allowance work is the settlement-stable grant
-alone). Only when rebalancing is configured does it also revoke any stale
-orderbook allowance, per chain in managed inventory mode, the same way (also
-after those nonce restores), and a tokenization preflight runs per hedged chain,
-read-only: the chain's issuer redemption wallet must be configured, and every
-preflighted equity's configured vault must report the configured underlying as
-its `asset()` (the same attestation a redemption's unwrap step performs). The
-preflighted equities are, on the primary, every trading- or rebalancing-enabled
-equity (the bot may wrap or redeem any of them there), and on a secondary only
-its rebalancing-enabled equities; a hedge-only secondary is skipped with a log
-line and has no redemption-wallet requirement. Each failure is fatal and names
-the chain and, where one applies, the symbol. Then, on every preflighted chain
-with no `[orchestrator.addresses]` entry, the preflight asks issuance's
-per-asset status endpoint (the freeze gate's endpoint, through the same client)
-for each preflighted equity's `vault_mode` and refuses startup naming the chain
-and symbol when one is orchestrator-mode: its first mint would stall at the
-signing step. Chains with an entry are not queried: the entry is the only
-prerequisite this bot can see, and the Turnkey `MintAuth` policy for that chain
-stays invisible at startup, so a missing policy fails the first
-orchestrator-mode mint at signing rather than at preflight. An indeterminate
-mode (issuance unreachable, asset unknown to issuance) is warned about per chain
-and symbol rather than refused: rebalancing mode never requires issuance to be
-reachable at startup (the freeze gate fails closed per cycle and has its own
-`freeze_check` escape hatch for an issuance outage), and the per-mint mode read
-fails closed on its own: a mint whose mode cannot be read stops at mode
-discovery, before any signing. The signing-step failure is the last line only
-for a known orchestrator-mode mint without its chain's entry or `MintAuth`
-policy.
+`RaindexInventory` in managed mode: on the primary every equity with trading
+enabled or rebalancing enabled or paused, on a secondary only the equities with
+rebalancing enabled or paused, the same selection its tokenization preflight
+attests (a hedge-only secondary has no wrapper to approve, so its allowance work
+is the settlement-stable grant alone). Only when rebalancing is configured does
+it also revoke any stale orderbook allowance, per chain in managed inventory
+mode, the same way (also after those nonce restores), and a tokenization
+preflight runs per hedged chain, read-only: the chain's issuer redemption wallet
+must be configured, and every preflighted equity's configured vault must report
+the configured underlying as its `asset()` (the same attestation a redemption's
+unwrap step performs). The preflighted equities are, on the primary, every
+equity with trading enabled or rebalancing enabled or paused (the bot may wrap
+or redeem any of them there), and on a secondary only its equities with
+rebalancing enabled or paused; a hedge-only secondary is skipped with a log line
+and has no redemption-wallet requirement. Each failure is fatal and names the
+chain and, where one applies, the symbol. Then, on every preflighted chain with
+no `[orchestrator.addresses]` entry, the preflight asks issuance's per-asset
+status endpoint (the freeze gate's endpoint, through the same client) for each
+preflighted equity's `vault_mode` and refuses startup naming the chain and
+symbol when one is orchestrator-mode: its first mint would stall at the signing
+step. Chains with an entry are not queried: the entry is the only prerequisite
+this bot can see, and the Turnkey `MintAuth` policy for that chain stays
+invisible at startup, so a missing policy fails the first orchestrator-mode mint
+at signing rather than at preflight. An indeterminate mode (issuance
+unreachable, asset unknown to issuance) is warned about per chain and symbol
+rather than refused: rebalancing mode never requires issuance to be reachable at
+startup (the freeze gate fails closed per cycle and has its own `freeze_check`
+escape hatch for an issuance outage), and the per-mint mode read fails closed on
+its own: a mint whose mode cannot be read stops at mode discovery, before any
+signing. The signing-step failure is the last line only for a known
+orchestrator-mode mint without its chain's entry or `MintAuth` policy.
 
 Right after it restores each of those signed sends, startup rebroadcasts its
 exact bytes ("already known" is success; it does not wait for a confirmation),
@@ -1938,13 +1986,21 @@ edit that only the deployed service can judge is a config edit whose first check
 is a bot that will not boot, which is what the `validate-config` binary exists
 to prevent.
 
-`validate-config --config <path> [--secrets <path>] [--registry-file <path>]`
+`validate-config --config <path> [--secrets <path>] [--registry-file <path>]
+[--registry-state <dir>]`
 runs the boot path's validation and exits 0 or 1, writing a plain-text report to
-stdout and the failure with its cause chain to stderr. It starts no server,
-opens no database, and reaches no external service in either mode. A config that
-names `[registry]` keeps its per-symbol tables in the token file in the bucket;
-`--registry-file` supplies a local copy so they are checked too. Without it the
-config is judged without them and the report says so.
+stdout and the failure with its cause chain to stderr. It starts no server and
+opens no database. A config that names `[registry]` keeps its per-symbol tables
+in the token file in the bucket; `--registry-file` supplies a local copy so they
+are checked too. Without either registry option the config is judged without
+them and the report says so; config-only validation and `--registry-file` checks
+reach no external service.
+
+`--registry-state` judges the copies a restart would boot: the running record,
+or a pending record together with the fallback that would keep its added
+listings. It reads the state without writing it. It reads the bucket only when
+the config pins a `generation` (the pin is what boots) or the state directory
+holds no record yet (the latest copy is what a first boot records).
 
 The two modes differ only in how much of the input they have:
 
@@ -1986,10 +2042,12 @@ rule fails startup with a named error:
 6. `hop = "relay"` on any chain: this build has no Relay hop.
 7. USDC mode enabled and a chain that is not disabled, whose cash table enables
    rebalancing, has no corridor table: there is no implicit corridor.
-8. A corridor chain other than the primary chain, until the trigger checks every
-   corridor and the executors' Ethereum-tx checks use Ethereum's own depth. With
-   no corridor table the served corridor is Base via CCTP, so the primary must
-   then be Base.
+8. No served corridor while a hedged chain has a cash table. The build serves
+   every corridor table, whatever the mode, and Base via CCTP whenever Base is a
+   hedged chain with a cash vault, so in-flight Base transfers always recover. A
+   config that holds cash but serves neither has no service to move it; one with
+   no cash table at all (the s01 CLI config) loads, and the bot refuses it at
+   startup.
 9. Transitional: `target` or `deviation` still set directly under
    `[rebalancing.usdc]` and different from the corridor's value. The released
    image reads those two keys and ignores the corridor tables, so both stay in
@@ -2024,23 +2082,55 @@ config's TOML table before it is deserialized, so every rule in
 `retired_symbols` is dropped at the merge, so retiring is one config change and
 the file's rows can go afterwards.
 
-Production pins `generation`: every roll of a release runs the same object, and
-a token change ships only with a release that bumps the pin. Staging reads the
-latest copy at every start, a crash restart included, so a staging token change
-takes effect without the deploy gates: `verify-migrations` does not run, and
-nothing refuses a file that drops a symbol the database still references. The
-order in "Retiring an asset" in `docs/how-to-add-new-asset.md` (retire in the
-config first, remove the rows after) is the only guard. A refresh loop reads the
-bucket every 60 s and never applies a change; it reports
-`registry_pending_restart` (the latest published copy differs from the running
-tables), `registry_invalid` (the copy the next start would read, the pin in
-production and the latest in staging, is gone, refused to the service account
-with a 401 or 403, too large, or would be refused), `registry_latest_refused`
-(the latest copy would be refused at boot; with a pin it is the copy a pin bump
-would move to) and `registry_fetch_errors_total` (transient read failures: the
-metadata token, 429, 5xx, the network). `verify-migrations` and
-`verify-approvals` read the same file, from the bucket on the VM or from
-`--registry-file` elsewhere.
+Token-file updates use a validated graceful process restart, so every model,
+poller, cache, subscription and per-asset service is rebuilt from one copy. The
+watcher polls bucket metadata every 10 seconds, downloads the exact observed
+generation and verifies its size and MD5. It runs boot config validation,
+refuses an existing listing's token-address changes, probes newly configured
+contracts and newly selected tokenization routes, and verifies changed startup
+approval targets read-only. Invalid bytes are refused per generation; transient
+RPC failures and missing Turnkey coverage are deferred and retried.
+
+A listing removed from the file is carried forward with trading, rebalancing,
+wrapped-equity recovery and extended-hours counter-trading disabled. Carried
+rows survive subsequent reloads and restarts until a reviewed `retired_symbols`
+config release removes them. New work follows the switches immediately; durable
+transfers and recoveries already admitted retain the services they need to
+finish. Already queued hedges still cover their accepted fills.
+
+The accepted source and effective token files are immutable, hash-verified
+records in `registry/` beside the database, with an atomically replaced
+manifest. The server alone claims boot attempts and writes this state. An
+accepted copy becomes pending before the SIGTERM drain path requests process
+exit 75; the container supervisor restarts it. Boot reads the persisted copy
+rather than the bucket's latest content. After startup and ten minutes of uptime
+it becomes last-good. Two failed pending boots fall back to last-good plus
+disabled listings added by pending, retaining durable references. Clean
+shutdowns during the soak do not consume another attempt. Failed candidates can
+retry after backoff. Effective no-ops advance the generation without restarting,
+and reloads are separated by at least two minutes.
+
+The CLI reads running state without writing it. Deploy gates accept
+`--registry-state /mnt/data/registry`: they validate both pending and its
+fallback when pending exists, and running otherwise. The deployment writes a
+hold containing its id and creation timestamp before gates, preventing a new
+pending copy between validation and shutdown. The activation that wrote the hold
+removes it on exit, after the new service reports readiness or after a failure.
+Server boot leaves it in place, so an old service that restarts during the gates
+cannot accept a publication behind them. Holds expire after fifteen minutes. A
+local `--registry-file` overrides state for offline checks.
+
+Rollout retains the production generation pin while the persisted state and
+reload code are seeded from the reviewed pin; the pinned watcher remains
+report-only. Removing the pin is a separate release after the t0.devops compose
+gates pass the state path and create/clean up holds. The final configuration
+follows latest and refuses the generation key. Until that release, production
+still needs a pin bump to apply new token rows.
+
+Metrics expose applied generation, invalid latest content, reload outcomes and
+last outcome timestamps, carried-forward rows, completion-only services,
+deployment hold age and transient fetch errors. Refused content, failed startup
+and fallback log the generation, hash and reason. See `docs/observability.md`.
 
 #### Tools
 
@@ -2102,31 +2192,31 @@ systemd unit:
   chain's settlement stable to its deposit spender -- its orderbook in legacy
   inventory mode, its `RaindexInventory` in managed mode -- plus equity token to
   wrapper and wrapper to that same deposit spender for every equity the chain
-  wraps in its role: trading or rebalancing enabled on the primary, rebalancing
-  enabled on a secondary) is covered by an allow policy whose consensus the
-  authenticated API user can satisfy alone and whose target condition provably
-  applies on that chain's id. Applicable deny policies take precedence; unknown
-  allow or deny applicability, unsupported consensus, a hedged chain with no
-  pinned settlement stable, and missing coverage fail closed, naming the chain,
-  symbol, token contract, and spender. Only after both gates pass may activation
-  stop the old process and install the candidate files, so a policy or config
-  failure leaves the running bot untouched; a failed stop aborts before
-  candidate files are installed. It then verifies migrations, chowns data files,
-  writes the git-rev marker, touches the activation marker, and restarts the
-  unit. The server writes its PID to a systemd-managed runtime-directory file
-  only after Conductor has completed startup initialization and every essential
-  supervised runtime task has reached a pending run state. Activation waits for
-  that PID to match the unit's live main process with a bounded startup timeout.
-  If the process exits, readiness reporting fails, or the timeout expires first,
-  activation prints the unit status and recent journal, exits non-zero, and
-  deploy-rs rolls the profile back. The unit remains `Type=simple` so automatic
-  rollback stays compatible with service generations from before the readiness
-  handshake was introduced. The first rollout requires deploying the system
-  profile before the service profile; a service-only deploy verifies the
-  installed unit exposes the expected ready file before stopping the running bot
-  and otherwise fails immediately with the required rollout order. Outside
-  systemd, the server uses a no-op readiness notifier so local runs remain
-  available.
+  wraps in its role: trading enabled or rebalancing enabled or paused on the
+  primary, rebalancing enabled or paused on a secondary) is covered by an allow
+  policy whose consensus the authenticated API user can satisfy alone and whose
+  target condition provably applies on that chain's id. Applicable deny policies
+  take precedence; unknown allow or deny applicability, unsupported consensus, a
+  hedged chain with no pinned settlement stable, and missing coverage fail
+  closed, naming the chain, symbol, token contract, and spender. Only after both
+  gates pass may activation stop the old process and install the candidate
+  files, so a policy or config failure leaves the running bot untouched; a
+  failed stop aborts before candidate files are installed. It then verifies
+  migrations, chowns data files, writes the git-rev marker, touches the
+  activation marker, and restarts the unit. The server writes its PID to a
+  systemd-managed runtime-directory file only after Conductor has completed
+  startup initialization and every essential supervised runtime task has reached
+  a pending run state. Activation waits for that PID to match the unit's live
+  main process with a bounded startup timeout. If the process exits, readiness
+  reporting fails, or the timeout expires first, activation prints the unit
+  status and recent journal, exits non-zero, and deploy-rs rolls the profile
+  back. The unit remains `Type=simple` so automatic rollback stays compatible
+  with service generations from before the readiness handshake was introduced.
+  The first rollout requires deploying the system profile before the service
+  profile; a service-only deploy verifies the installed unit exposes the
+  expected ready file before stopping the running bot and otherwise fails
+  immediately with the required rollout order. Outside systemd, the server uses
+  a no-op readiness notifier so local runs remain available.
 - `dashboard` (kind = `static`) - frontend assets served by nginx; the deploy
   step is `systemctl reload nginx` and there is no managed systemd unit.
 - `datasette` (kind = `plain`) - read-only SQLite explorer over the hedge DB.
@@ -3088,21 +3178,27 @@ enum TriggerReason {
   A nonzero position whose dollar threshold cannot be valued is rejected
   fail-closed.
 - One exception to the hedge threshold: a redemption is admitted over a due sell
-  hedge that the broker cannot fill. The trigger passes the broker's sell
+  hedge that the broker can place none of. The trigger passes the broker's sell
   capacity, counted as the broker counts it for an asset it trades only in whole
   shares: available shares truncated to whole shares, less the hedge floor
   rounded up to whole shares. That count is never above what the broker would
   sell, so a starved hedge always reads as starved. The aggregate admits the
-  redemption when the count is below the live net. The redemption brings the
-  broker the shares that sell needs, so blocking it would leave both waiting on
-  each other. The hedge still waits for the reservation to release. A mint, a
-  buy hedge, or a sell the broker can fill keeps the strict rule. A redemption
-  that released its reservation to wait for gas restores it under the same
-  exception. With no broker reading the capacity is unknown, not zero: the
-  trigger reserves under the strict rule and a restoring job waits and retries.
-  A job reads the capacity only to recreate a missing reservation, so one that
-  still holds its reservation never depends on that read, and a failed read
-  defers the job instead of failing it.
+  redemption only when the count is zero. While the broker can sell some, that
+  partial hedge goes first; once it fills, the count reads zero and the
+  redemption that brings the rest of the shares is admitted, so neither waits on
+  the other. The hedge still waits for the reservation to release. A mint, a buy
+  hedge, or a sell the broker can place any of keeps the strict rule. A
+  redemption that released its reservation to wait for gas restores it under the
+  same rule: the gas refusal comes before the redemption exists, so it is no
+  active transfer and the position checks still place the partial hedge first.
+  With no broker reading the capacity is unknown, not zero: the trigger reserves
+  under the strict rule and a restoring job waits and retries. A job reads the
+  capacity only to recreate a missing reservation, so one that still holds its
+  reservation never depends on that read, and a failed read defers the job
+  instead of failing it.
+- Each trigger reservation that Position rejects for a needed hedge increments
+  `equity_plan_declined_total{reason="blocked_by_hedge"}`, so a symbol held
+  behind a hedge is visible apart from an idle one.
 - `PlaceOffChainOrder` is rejected while any transfer reservation owns the
   symbol. A newly committed onchain fill invalidates an unconfirmed reservation;
   confirmation of that exact ID must succeed immediately before the transfer job
@@ -4198,21 +4294,22 @@ action that already succeeded. Each phase records its intent (and the relevant
 chain head) before the action, so resume can scan the chain to adopt an
 already-submitted action instead of re-issuing it.
 
-A cash transfer service serves one corridor, fixed by what the build wires
-(today Base via CCTP), whether or not USDC mode is enabled, so in-flight
-transfers always recover. A fresh transfer must ask for that corridor and
-records it on its originating command. A resume or recheck of a transfer
-recorded on another corridor, or a fresh transfer asking for another corridor,
-fails closed before any send and leaves the transfer untouched; the error starts
-with "USDC transfer corridor mismatch" and names both corridors. Automation
-treats a recorded transfer on another corridor as permanent for the build: its
-job re-queues itself every 10 minutes without a retry cost, so a build that
-serves the corridor finds a job to resume it, until the transfer holds no guard
+One cash transfer service runs per served corridor (every corridor table, and
+Base via CCTP while Base holds a cash vault; see Cash corridor rules), whether
+or not USDC mode is enabled, so in-flight transfers always recover. A fresh
+transfer must ask for a served corridor and records it on its originating
+command. A resume or recheck of a transfer recorded on a corridor the build does
+not serve, or a fresh transfer asking for one, fails closed before any send and
+leaves the transfer untouched; the error starts with "USDC transfer corridor
+mismatch" and names the recorded corridor and the served ones. Automation treats
+a recorded transfer on another corridor as permanent for the build: its job
+re-queues itself every 10 minutes without a retry cost, so a build that serves
+the corridor finds a job to resume it, until the transfer holds no guard
 (reconciled, say), when the job ends; startup recovery (even while a job is
 live) and the timeout sweep never re-arm it, and its corridor's guard stays
 held. Other corridors keep running, with two limits: an Alpaca-outbound held
 transfer blocks Alpaca-outbound claims on every corridor (its page says so), and
-because guards are keyed by chain, an unserved corridor on the served chain with
+because guards are keyed by chain, an unserved corridor on a served chain with
 another hop holds the served corridor's own guard. A fresh job asking for
 another corridor has no transfer to hold: it retries, dead-letters, and its
 dead-letter alert pages once. Startup recovery pages once per transfer per run
@@ -5578,7 +5675,9 @@ minimum operation size, whether its vault registry knows the token and whether
 its wallet is gas-ready), the floors, the cooling chains and the symbol's price.
 A hedge-only listing (`rebalancing = "disabled"`) is neither slotted nor
 counted: its prefunded inventory is outside the planner's total, so it never
-moves the other chains' targets.
+moves the other chains' targets. A paused listing (`rebalancing = "paused"`) is
+slotted and counted like an enabled one, but is never chosen: a candidate on it
+is skipped and recorded as `paused`.
 
 - Guards, in order: the broker venue unpolled, no chain slot at all, a
   rebalancing chain without a slot, or any transfer in flight for the symbol
@@ -6510,56 +6609,59 @@ effect rather than a generic intent:
   instead of running a second one. The ops load balancer times a request out
   after 60 seconds, so no route waits on CCTP attestation or USDC settlement.
   `transfer-usdc` starts a fresh transfer on the bot's own transfer worker, the
-  path the rebalancer uses, and returns its new id at once: an amount that is
-  not positive or is finer than USDC's six decimals is refused with `400` before
-  anything else, then it refuses with `503` until startup completes, then it
-  takes the recovery lock (`409`), quiesces the USDC rebalancing driver (`503`),
-  then applies the single flight gates of `transfer resume --kind usdc` in
-  order: an every corridor latch, a live USDC job row, or a durable guard holder
-  refuses with `409`; then, like the trigger before every fresh transfer, it
-  refuses with `409` while a cash snapshot divergence is engaged or the cash
-  balance is restart tainted (the transfer would mark the cash venue busy and
-  keep the poller from resolving either), and with `503` while the Base or
-  Ethereum signing wallet cannot be shown to pay gas; last, a corridor guard
-  held in memory refuses the claim with `409`. A retried request can therefore
-  not start a second transfer while the first is in flight. Everything after the
-  startup gate runs on a tracked detached task, so a dropped request cannot
-  release the corridor claim after the job is queued. `cctp-bridge` only burns:
-  it applies the same corridor gas check (`503`) as `transfer-usdc`, since the
-  burn and the mint that completes it spend both wallets' gas, then holds the
-  recovery lock and the driver pause around the burn like `cctp complete-mint`
-  does around the mint, and returns the burn tx as soon as the burn is
-  broadcast, not when it confirms: an approve plus the burn's confirmations can
-  outlast the 60 second load balancer cut, and a request that timed out after
-  the broadcast would leave the operator without the burn tx. The detached task
-  then awaits the receipt, still holding the lock and the pause, until the burn
-  has the source chain's required confirmations or the wait gives up (up to 5
-  minutes for inclusion plus 30 minutes for the confirmations), and logs the
-  outcome. Meanwhile every route that takes the recovery lock answers `409`, and
-  `cctp complete-mint` answers `502` until Circle attests the burn and `409`
-  once it has, since it fetches the attestation before it tries the lock. A
-  failure to confirm includes a receipt timeout, so it does not prove the burn
-  failed. The operator finishes with `cctp complete-mint`. It records no
-  operation id, so it is not idempotent: a retried request burns again, and the
-  second burn's USDC lands in the bot's wallet on the other chain once minted.
-  The vault verbs and `reset-allowance` take neither the lock nor the pause,
-  like the `st0x-cli` verbs: pausing the driver would refuse every vault
-  operation for the length of each USDC transfer. `vault-deposit` does take its
-  own lock (`409` while another `vault-deposit` request runs): the deposit reads
-  the allowance and approves exactly the amount when it is short, so two
-  concurrent requests for a token without the startup MAX grant could overwrite
-  each other's approval. The lock covers these requests only: without the MAX
-  grant, a request can still use up the exact approval of a USDC transfer
-  worker's deposit, which then reverts and needs a redrive. Every capital route
-  refuses with `503` until startup completes, like `process-tx`, since the
-  startup preflights (each chain's id, the inventory `OPERATOR_ROLE`) have not
-  passed before then. Each route that sends a transaction runs it on a tracked
-  detached task, like `process-tx`, so a client or load balancer timeout cannot
-  drop a transaction between its broadcast and its receipt, graceful shutdown
-  waits for it, and the task logs its own outcome. The tokenization and issuer
-  verbs (`transfer-equity`, `wrap-equity`, `unwrap-equity`, `donate-equity`,
-  `dividend-bump`) have no route: they touch tokenization and the issuer wallet,
-  not liquidity capital.
+  path the rebalancer uses, and returns its new id at once. It runs on the
+  served corridor its optional `chain` names, picked by the same rule as
+  `st0x-cli transfer-usdc --chain`: `chain` may be left out while the build
+  serves one corridor, and a missing or ambiguous choice is refused with `422`.
+  An amount that is not positive or is finer than USDC's six decimals is refused
+  with `400` before anything else, then it refuses with `503` until startup
+  completes, then it takes the recovery lock (`409`), quiesces the USDC
+  rebalancing driver (`503`), then applies the single flight gates of
+  `transfer resume --kind usdc` in order: an every corridor latch, a live USDC
+  job row, or a durable guard holder refuses with `409`; then, like the trigger
+  before every fresh transfer, it refuses with `409` while a cash snapshot
+  divergence is engaged or the cash balance is restart tainted (the transfer
+  would mark the cash venue busy and keep the poller from resolving either), and
+  with `503` while the Base or Ethereum signing wallet cannot be shown to pay
+  gas; last, a corridor guard held in memory refuses the claim with `409`. A
+  retried request can therefore not start a second transfer while the first is
+  in flight. Everything after the startup gate runs on a tracked detached task,
+  so a dropped request cannot release the corridor claim after the job is
+  queued. `cctp-bridge` only burns: it applies the same corridor gas check
+  (`503`) as `transfer-usdc`, since the burn and the mint that completes it
+  spend both wallets' gas, then holds the recovery lock and the driver pause
+  around the burn like `cctp complete-mint` does around the mint, and returns
+  the burn tx as soon as the burn is broadcast, not when it confirms: an approve
+  plus the burn's confirmations can outlast the 60 second load balancer cut, and
+  a request that timed out after the broadcast would leave the operator without
+  the burn tx. The detached task then awaits the receipt, still holding the lock
+  and the pause, until the burn has the source chain's required confirmations or
+  the wait gives up (up to 5 minutes for inclusion plus 30 minutes for the
+  confirmations), and logs the outcome. Meanwhile every route that takes the
+  recovery lock answers `409`, and `cctp complete-mint` answers `502` until
+  Circle attests the burn and `409` once it has, since it fetches the
+  attestation before it tries the lock. A failure to confirm includes a receipt
+  timeout, so it does not prove the burn failed. The operator finishes with
+  `cctp complete-mint`. It records no operation id, so it is not idempotent: a
+  retried request burns again, and the second burn's USDC lands in the bot's
+  wallet on the other chain once minted. The vault verbs and `reset-allowance`
+  take neither the lock nor the pause, like the `st0x-cli` verbs: pausing the
+  driver would refuse every vault operation for the length of each USDC
+  transfer. `vault-deposit` does take its own lock (`409` while another
+  `vault-deposit` request runs): the deposit reads the allowance and approves
+  exactly the amount when it is short, so two concurrent requests for a token
+  without the startup MAX grant could overwrite each other's approval. The lock
+  covers these requests only: without the MAX grant, a request can still use up
+  the exact approval of a USDC transfer worker's deposit, which then reverts and
+  needs a redrive. Every capital route refuses with `503` until startup
+  completes, like `process-tx`, since the startup preflights (each chain's id,
+  the inventory `OPERATOR_ROLE`) have not passed before then. Each route that
+  sends a transaction runs it on a tracked detached task, like `process-tx`, so
+  a client or load balancer timeout cannot drop a transaction between its
+  broadcast and its receipt, graceful shutdown waits for it, and the task logs
+  its own outcome. The tokenization and issuer verbs (`transfer-equity`,
+  `wrap-equity`, `unwrap-equity`, `donate-equity`, `dividend-bump`) have no
+  route: they touch tokenization and the issuer wallet, not liquidity capital.
 - **`transfer resume --kind usdc` routes through the running bot.** The CLI
   posts to `POST /transfers/usdc/resume/{direction}/{id}`. The endpoint
   validates server-side (unknown id refuses -- a mistyped id must never start a
@@ -6574,10 +6676,11 @@ effect rather than a generic intent:
   aggregate's persisted amount. Routing through the bot closes the CLI-vs-server
   race: the CLI process never drives an aggregate the bot's worker may also
   drive. The manual `transfer-usdc` command still starts a fresh transfer
-  directly, but hands off to this endpoint at the FIRST bot-resumable wait
-  (attestation timeout, settlement lag, inconclusive poll); when the bot is
-  unreachable, the transfer is durable -- a bot restart re-arms it
-  automatically. Like the whole `server_port` recovery surface
+  directly, on the served corridor `--chain` names (optional while the build
+  serves one corridor), but hands off to this endpoint at the FIRST
+  bot-resumable wait (attestation timeout, settlement lag, inconclusive poll);
+  when the bot is unreachable, the transfer is durable -- a bot restart re-arms
+  it automatically. Like the whole `server_port` recovery surface
   (`/transfers/resume`, `/transfers/recheck`, `/transfers/fail`), its bare path
   is restricted to loopback callers for the in-container CLI. Network operators
   use the IAP-verified `/liquidity-write/transfers/*` mounts.

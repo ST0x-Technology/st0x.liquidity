@@ -594,10 +594,11 @@ impl SeedVaultRegistryCtx {
     /// Builds a seeding context from configuration, one entry per hedged
     /// chain.
     ///
-    /// Validates that every rebalancing-enabled equity has at least
-    /// one configured `vault_id`. Returns [`CtxError::MissingEquityVaultId`]
-    /// if any rebalancing-enabled equity lacks a vault, so config errors
-    /// fail fast at construction rather than being retried by apalis.
+    /// Validates that every equity that keeps rebalancing services
+    /// (enabled or paused) has at least one configured `vault_id`.
+    /// Returns [`CtxError::MissingEquityVaultId`] if any such listing
+    /// lacks a vault, so config errors fail fast at construction rather
+    /// than being retried by apalis.
     pub(crate) fn from_config(
         vault_registry: Arc<Store<VaultRegistry>>,
         ctx: &Ctx,
@@ -633,7 +634,7 @@ impl ChainVaultSeeds {
     /// real on several chains, and each chain's vault ids are its own.
     fn from_chain(hedged: &st0x_config::HedgedChain) -> Result<Self, Box<CtxError>> {
         for (symbol, equity_config) in &hedged.assets.equities.symbols {
-            if equity_config.vault_ids.is_empty() && hedged.assets.is_rebalancing_enabled(symbol) {
+            if equity_config.vault_ids.is_empty() && equity_config.rebalancing.keeps_services() {
                 return Err(Box::new(CtxError::MissingEquityVaultId {
                     symbol: symbol.clone(),
                 }));
@@ -829,7 +830,7 @@ mod tests {
 
     use st0x_config::{
         ChainAssets, ChainCashAsset, ChainEquities, ChainEquityAsset, HedgedChain, OperationMode,
-        create_test_ctx_with_order_owner,
+        RebalancingMode, create_test_ctx_with_order_owner,
     };
 
     use st0x_event_sorcery::{EntityList, Reactor, StoreBuilder, TestHarness, deps, replay};
@@ -1707,7 +1708,7 @@ mod tests {
                 tokenized_equity_derivative: TEST_TOKEN,
                 vault_ids: vec![TEST_VAULT_ID],
                 trading: OperationMode::Disabled,
-                rebalancing: OperationMode::Enabled,
+                rebalancing: RebalancingMode::Enabled,
                 wrapped_equity_recovery: OperationMode::Disabled,
                 operational_limit: None,
                 target_share: None,
@@ -1761,7 +1762,7 @@ mod tests {
                 tokenized_equity_derivative: Address::ZERO,
                 vault_ids: vec![TEST_VAULT_ID],
                 trading: OperationMode::Disabled,
-                rebalancing: OperationMode::Enabled,
+                rebalancing: RebalancingMode::Enabled,
                 wrapped_equity_recovery: OperationMode::Disabled,
                 operational_limit: None,
                 target_share: None,
@@ -1774,7 +1775,7 @@ mod tests {
                 tokenized_equity_derivative: Address::ZERO,
                 vault_ids: Vec::new(),
                 trading: OperationMode::Disabled,
-                rebalancing: OperationMode::Enabled,
+                rebalancing: RebalancingMode::Enabled,
                 wrapped_equity_recovery: OperationMode::Disabled,
                 operational_limit: None,
                 target_share: None,
@@ -1888,7 +1889,7 @@ mod tests {
                                 tokenized_equity_derivative: ethereum_token,
                                 vault_ids: vec![ethereum_vault_id],
                                 trading: OperationMode::Enabled,
-                                rebalancing: OperationMode::Disabled,
+                                rebalancing: RebalancingMode::Disabled,
                                 wrapped_equity_recovery: OperationMode::Disabled,
                                 operational_limit: None,
                                 target_share: None,

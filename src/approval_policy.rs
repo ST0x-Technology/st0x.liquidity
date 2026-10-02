@@ -4,7 +4,7 @@ use std::fmt::{Display, Formatter};
 use std::path::Path;
 
 use alloy::primitives::Address;
-use st0x_config::{ChainApprovalInputs, Ctx, TokenFile, fetch_token_file};
+use st0x_config::{ChainApprovalInputs, Ctx, TokenFile};
 use st0x_evm::Chain;
 use st0x_evm::turnkey::{
     TurnkeyPolicy, TurnkeyPolicyClient, TurnkeyPolicyEffect, TurnkeyPolicyError,
@@ -92,14 +92,66 @@ pub enum ChainCoverageError {
 pub async fn verify_turnkey_approval_policies(
     config_path: &Path,
     secrets_path: &Path,
-    registry_file: Option<&Path>,
+    tokens: TokenFile<'_>,
 ) -> Result<ApprovalPolicyVerification, ApprovalPolicyVerificationError> {
-    let tokens = fetch_token_file(config_path, registry_file).await?;
-    let tokens = tokens
-        .as_deref()
-        .map_or(TokenFile::Skipped, TokenFile::Bytes);
-    let Some(inputs) = Ctx::load_turnkey_approval_policy_inputs(config_path, secrets_path, tokens)?
-    else {
+    let inputs = Ctx::load_turnkey_approval_policy_inputs(config_path, secrets_path, tokens)?;
+    verify_approval_inputs(inputs).await
+}
+
+/// Registry changes that need no new grants must not depend on Turnkey availability.
+pub(crate) async fn verify_registry_approval_inputs(
+    running: Option<st0x_config::TurnkeyApprovalPolicyInputs>,
+    candidate: Option<st0x_config::TurnkeyApprovalPolicyInputs>,
+) -> Result<(), ApprovalPolicyVerificationError> {
+    if let (Some(running), Some(candidate)) = (&running, &candidate)
+        && running.wallet_address == candidate.wallet_address
+        && running.organization_id.as_str() == candidate.organization_id.as_str()
+        && !additional_approval_targets(&running.hedged, &candidate.hedged)
+    {
+        return Ok(());
+    }
+    verify_approval_inputs(candidate).await?;
+    Ok(())
+}
+
+fn additional_approval_targets(
+    running: &[ChainApprovalInputs],
+    candidate: &[ChainApprovalInputs],
+) -> bool {
+    candidate.iter().any(|chain| {
+        let targets = build_approval_targets(
+            chain.role,
+            chain.inventory,
+            &chain.assets,
+            chain.orderbook,
+            chain.chain.settlement_stable().address,
+        );
+        let previous = running
+            .iter()
+            .find(|previous| previous.chain == chain.chain);
+        let previous_targets = previous.map(|previous| {
+            build_approval_targets(
+                previous.role,
+                previous.inventory,
+                &previous.assets,
+                previous.orderbook,
+                previous.chain.settlement_stable().address,
+            )
+        });
+        targets.iter().any(|target| {
+            previous_targets.as_ref().is_none_or(|previous| {
+                !previous
+                    .iter()
+                    .any(|old| old.token == target.token && old.spender == target.spender)
+            })
+        })
+    })
+}
+
+pub(crate) async fn verify_approval_inputs(
+    inputs: Option<st0x_config::TurnkeyApprovalPolicyInputs>,
+) -> Result<ApprovalPolicyVerification, ApprovalPolicyVerificationError> {
+    let Some(inputs) = inputs else {
         return Ok(ApprovalPolicyVerification::SkippedNonTurnkey);
     };
     let client = TurnkeyPolicyClient::new(
@@ -496,6 +548,7 @@ mod tests {
 
     use st0x_config::{
         ChainAssets, ChainEquities, ChainEquityAsset, ChainRole, InventoryMode, OperationMode,
+        RebalancingMode,
     };
     use st0x_evm::turnkey::{TurnkeyPolicy, TurnkeyPolicyEffect, TurnkeyPolicySnapshot};
     use st0x_evm::{USDC_BASE, USDC_ETHEREUM, USDC_HYPEREVM};
@@ -929,7 +982,7 @@ mod tests {
                             ),
                             vault_ids: Vec::new(),
                             trading: OperationMode::Enabled,
-                            rebalancing: OperationMode::Disabled,
+                            rebalancing: RebalancingMode::Disabled,
                             wrapped_equity_recovery: OperationMode::Disabled,
                             operational_limit: None,
                             target_share: None,
@@ -939,6 +992,73 @@ mod tests {
                 cash: None,
             },
         }
+    }
+
+    #[tokio::test]
+    async fn registry_approval_removals_do_not_query_turnkey() {
+        let running = st0x_config::TurnkeyApprovalPolicyInputs {
+            organization_id: st0x_evm::turnkey::TurnkeyOrganizationId::new("offline".into()),
+            kms_api_key: None,
+            api_private_key: None,
+            wallet_address: Address::ZERO,
+            hedged: vec![chain_inputs(
+                Chain::Base,
+                ChainRole::Primary,
+                InventoryMode::Legacy,
+            )],
+        };
+        let mut candidate = running.clone();
+        let asset = candidate.hedged[0]
+            .assets
+            .equities
+            .symbols
+            .values_mut()
+            .next()
+            .unwrap();
+        asset.trading = OperationMode::Disabled;
+        verify_registry_approval_inputs(Some(running.clone()), Some(running.clone()))
+            .await
+            .unwrap();
+        verify_registry_approval_inputs(Some(running.clone()), Some(candidate.clone()))
+            .await
+            .unwrap();
+        let error = verify_registry_approval_inputs(Some(candidate), Some(running))
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            ApprovalPolicyVerificationError::Turnkey(TurnkeyPolicyError::MissingCredentials)
+        ));
+    }
+
+    #[test]
+    fn registry_approval_additions_are_compared_on_the_actual_chain_and_spender() {
+        let running = vec![chain_inputs(
+            Chain::Base,
+            ChainRole::Primary,
+            InventoryMode::Legacy,
+        )];
+        let mut candidate = running.clone();
+        candidate[0].inventory = InventoryMode::Managed {
+            inventory: address!("0x4444444444444444444444444444444444444444"),
+        };
+        assert!(additional_approval_targets(&running, &candidate));
+        let candidate = vec![chain_inputs(
+            Chain::Ethereum,
+            ChainRole::Primary,
+            InventoryMode::Legacy,
+        )];
+        assert!(additional_approval_targets(&running, &candidate));
+        let mut disabled = running.clone();
+        disabled[0]
+            .assets
+            .equities
+            .symbols
+            .values_mut()
+            .next()
+            .unwrap()
+            .trading = OperationMode::Disabled;
+        assert!(additional_approval_targets(&disabled, &running));
     }
 
     /// Each hedged chain's targets are checked on that chain's own id: a

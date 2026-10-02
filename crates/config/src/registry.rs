@@ -20,10 +20,14 @@
 //! one file.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use base64::prelude::*;
+use md5::{Digest, Md5};
 use serde::Deserialize;
+use sha2::Sha256;
 use thiserror::Error;
 use toml::{Table, Value};
 use url::Url;
@@ -81,6 +85,8 @@ pub enum RegistryError {
     NotATable { what: String },
     #[error("token file: {what}.{key} must be \"enabled\" or \"disabled\"")]
     BadSwitch { what: String, key: &'static str },
+    #[error("token file: {what}.rebalancing must be \"enabled\", \"paused\" or \"disabled\"")]
+    BadRebalancingMode { what: String },
     #[error("token file: {what}.{key} missing")]
     MissingAddress { what: String, key: &'static str },
     #[error("token file: no slot carries the bot's keys; refusing an empty universe")]
@@ -120,6 +126,16 @@ pub enum RegistryError {
     },
     #[error("reading {url}: larger than {MAX_BODY} bytes")]
     TooLarge { url: String },
+    #[error("reading {url}: the metadata is not an object resource")]
+    Metadata {
+        url: String,
+        #[source]
+        source: serde_json::Error,
+    },
+    #[error("reading {url}: the metadata's {field} is not a number")]
+    MetadataField { url: String, field: &'static str },
+    #[error("reading {url}#{generation}: the content does not match its size and MD5")]
+    Integrity { url: String, generation: u64 },
     #[error("reading {url}: boot read exceeded {}s", BOOT_READ_BUDGET.as_secs())]
     BootTimeout {
         url: String,
@@ -148,6 +164,7 @@ impl RegistryError {
             | Self::SchemaVersion { .. }
             | Self::NotATable { .. }
             | Self::BadSwitch { .. }
+            | Self::BadRebalancingMode { .. }
             | Self::MissingAddress { .. }
             | Self::EmptyUniverse
             | Self::UndeclaredChain { .. }
@@ -156,6 +173,9 @@ impl RegistryError {
             | Self::Client(_)
             | Self::MetadataToken(_)
             | Self::Http { .. }
+            | Self::Metadata { .. }
+            | Self::MetadataField { .. }
+            | Self::Integrity { .. }
             | Self::BootTimeout { .. } => false,
         }
     }
@@ -244,7 +264,93 @@ impl Projection {
             .flat_map(|(chain, rows)| rows.keys().map(move |symbol| format!("{chain}/{symbol}")))
             .collect()
     }
+
+    /// The projection as a token file holding only the bot's keys, which
+    /// [`project`] reads back to the same projection. A persisted record
+    /// stores this, so a boot from a record runs every check a boot from
+    /// the bucket runs.
+    pub fn to_token_file(&self) -> String {
+        let mut chains = Table::new();
+        for (chain, rows) in &self.chain_rows {
+            let equities: Table = rows
+                .iter()
+                .map(|(symbol, row)| (symbol.clone(), Value::Table(row.clone())))
+                .collect();
+            let mut assets = Table::new();
+            assets.insert("equities".into(), Value::Table(equities));
+            let mut chain_table = Table::new();
+            chain_table.insert("assets".into(), Value::Table(assets));
+            chains.insert(chain.clone(), Value::Table(chain_table));
+        }
+        let policies: Table = self
+            .policies
+            .iter()
+            .map(|(symbol, policy)| (symbol.clone(), Value::Table(policy.clone())))
+            .collect();
+        let mut assets = Table::new();
+        assets.insert("equities".into(), Value::Table(policies));
+
+        let mut file = Table::new();
+        file.insert("schema_version".into(), Value::Integer(SCHEMA_VERSION));
+        file.insert("chains".into(), Value::Table(chains));
+        file.insert("assets".into(), Value::Table(assets));
+        file.to_string()
+    }
+
+    /// This projection plus every listing (chain, symbol) of `previous`
+    /// that it lacks, each kept with its trading, rebalancing and
+    /// wrapped-equity recovery switched off. A symbol's hedge policy that
+    /// this projection lacks is kept too, with extended-hours counter
+    /// trading off, since a symbol that trades nowhere may not enable it.
+    ///
+    /// No new work starts for a carried listing, yet every durable record
+    /// that names it (positions, vaults, transfers in flight) still
+    /// resolves. A config release that retires the symbol drops it.
+    #[must_use]
+    pub fn carry_forward(mut self, previous: &Self) -> Carried {
+        let mut listings = BTreeSet::new();
+        for (chain, rows) in &previous.chain_rows {
+            let kept = self.chain_rows.entry(chain.clone()).or_default();
+            for (symbol, row) in rows {
+                if kept.contains_key(symbol) {
+                    continue;
+                }
+                let mut row = row.clone();
+                for key in ["trading", "rebalancing", "wrapped_equity_recovery"] {
+                    row.insert(key.into(), Value::String(DISABLED.into()));
+                }
+                kept.insert(symbol.clone(), row);
+                listings.insert(format!("{chain}/{symbol}"));
+            }
+        }
+        self.chain_rows.retain(|_, rows| !rows.is_empty());
+        for (symbol, policy) in &previous.policies {
+            if self.policies.contains_key(symbol) {
+                continue;
+            }
+            let mut policy = policy.clone();
+            policy.insert(
+                "extended_hours_counter_trading".into(),
+                Value::String(DISABLED.into()),
+            );
+            self.policies.insert(symbol.clone(), policy);
+        }
+        Carried {
+            projection: self,
+            listings,
+        }
+    }
 }
+
+/// What [`Projection::carry_forward`] kept.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Carried {
+    pub projection: Projection,
+    /// `chain/SYMBOL` of every listing kept from the previous projection.
+    pub listings: BTreeSet<String>,
+}
+
+const DISABLED: &str = "disabled";
 
 pub fn source_of(config: &Table) -> Result<Option<RegistrySource>, RegistryError> {
     match config.get("registry") {
@@ -284,6 +390,13 @@ fn table<'a>(value: Option<&'a Value>, what: &str) -> Result<&'a Table, Registry
 
 fn is_switch(value: Option<&Value>) -> bool {
     matches!(value.and_then(Value::as_str), Some("enabled" | "disabled"))
+}
+
+fn is_rebalancing_mode(value: Option<&Value>) -> bool {
+    matches!(
+        value.and_then(Value::as_str),
+        Some("enabled" | "paused" | "disabled")
+    )
 }
 
 /// Turn the token file into the bot's per-symbol tables.
@@ -335,10 +448,13 @@ pub fn project(file: &Table) -> Result<Projection, RegistryError> {
             if !ours {
                 continue;
             }
-            for key in ["trading", "rebalancing", "wrapped_equity_recovery"] {
+            for key in ["trading", "wrapped_equity_recovery"] {
                 if !is_switch(slot.get(key)) {
                     return Err(RegistryError::BadSwitch { what, key });
                 }
+            }
+            if !is_rebalancing_mode(slot.get("rebalancing")) {
+                return Err(RegistryError::BadRebalancingMode { what });
             }
             for key in ["tokenized_equity", "tokenized_equity_derivative"] {
                 if slot.get(key).and_then(Value::as_str).is_none() {
@@ -510,6 +626,35 @@ pub fn merge(config: &mut Table, projection: &Projection) -> Result<(), Registry
     Ok(())
 }
 
+/// One version of the token file object, as its `objects.get` metadata
+/// names it. Reading the metadata downloads nothing, so a poll that finds
+/// the generation it already has costs one small request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObjectVersion {
+    pub generation: u64,
+    pub size: u64,
+    /// The base64 MD5 digest of the content, as Cloud Storage reports it.
+    pub md5_hash: String,
+}
+
+/// The bytes of one generation of the token file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TokenCopy {
+    pub generation: u64,
+    pub bytes: Vec<u8>,
+}
+
+/// The lowercase hex SHA-256 of `bytes`: how the bot names the exact
+/// content it runs, whatever generation carried it.
+pub fn sha256_hex(bytes: &[u8]) -> String {
+    Sha256::digest(bytes)
+        .iter()
+        .fold(String::with_capacity(64), |mut hex, byte| {
+            let _ = write!(hex, "{byte:02x}");
+            hex
+        })
+}
+
 /// Where the metadata server and Cloud Storage answer.
 #[derive(Debug, Clone, Copy)]
 struct Endpoints<'a> {
@@ -522,15 +667,19 @@ const GOOGLE: Endpoints<'static> = Endpoints {
     storage: "https://storage.googleapis.com",
 };
 
-/// The JSON API URL of one object: `/b/<bucket>/o/<object>?alt=media`, the
-/// object name as one path segment (`/` in it becomes `%2F`), plus
-/// `generation` when pinned.
-fn object_url(
-    storage: &str,
-    bucket: &str,
-    object: &str,
-    generation: Option<u64>,
-) -> Result<Url, RegistryError> {
+/// Which `objects.get` answer a read asks for.
+#[derive(Debug, Clone, Copy)]
+enum Read {
+    /// The object's metadata as JSON.
+    Metadata,
+    /// The content (`alt=media`): of one generation, or of the latest.
+    Media(Option<u64>),
+}
+
+/// The JSON API URL of one object: `/b/<bucket>/o/<object>`, the object
+/// name as one path segment (`/` in it becomes `%2F`), with `alt=media` for
+/// the content and `generation` when pinned.
+fn object_url(storage: &str, bucket: &str, object: &str, read: Read) -> Result<Url, RegistryError> {
     let mut url =
         Url::parse(&format!("{storage}/storage/v1/")).map_err(|_| RegistryError::Url {
             url: format!("gs://{bucket}/{object}"),
@@ -541,11 +690,14 @@ fn object_url(
         })?
         .pop_if_empty()
         .extend(["b", bucket, "o", object]);
-    {
-        let mut query = url.query_pairs_mut();
-        query.append_pair("alt", "media");
-        if let Some(generation) = generation {
-            query.append_pair("generation", &generation.to_string());
+    match read {
+        Read::Metadata => {}
+        Read::Media(generation) => {
+            let mut query = url.query_pairs_mut();
+            query.append_pair("alt", "media");
+            if let Some(generation) = generation {
+                query.append_pair("generation", &generation.to_string());
+            }
         }
     }
     Ok(url)
@@ -595,20 +747,103 @@ pub async fn fetch(
     fetch_from(http, GOOGLE, gs_url, generation).await
 }
 
+/// The latest version's metadata: its generation, size and MD5, without
+/// the content.
+pub async fn fetch_metadata(
+    http: &reqwest::Client,
+    gs_url: &str,
+) -> Result<ObjectVersion, RegistryError> {
+    fetch_metadata_from(http, GOOGLE, gs_url).await
+}
+
+/// The content of exactly `version`, checked against the size and MD5 its
+/// metadata reported, so what is judged is what was published.
+pub async fn fetch_version(
+    http: &reqwest::Client,
+    gs_url: &str,
+    version: &ObjectVersion,
+) -> Result<TokenCopy, RegistryError> {
+    fetch_version_from(http, GOOGLE, gs_url, version).await
+}
+
 async fn fetch_from(
     http: &reqwest::Client,
     endpoints: Endpoints<'_>,
     gs_url: &str,
     generation: Option<u64>,
 ) -> Result<Vec<u8>, RegistryError> {
+    get(http, endpoints, gs_url, Read::Media(generation)).await
+}
+
+async fn fetch_metadata_from(
+    http: &reqwest::Client,
+    endpoints: Endpoints<'_>,
+    gs_url: &str,
+) -> Result<ObjectVersion, RegistryError> {
+    /// The fields of the JSON object resource the bot reads. Cloud Storage
+    /// sends the 64-bit numbers as strings.
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct ObjectResource {
+        generation: String,
+        size: String,
+        md5_hash: String,
+    }
+
+    let body = get(http, endpoints, gs_url, Read::Metadata).await?;
+    let resource: ObjectResource =
+        serde_json::from_slice(&body).map_err(|source| RegistryError::Metadata {
+            url: gs_url.to_string(),
+            source,
+        })?;
+    let number = |value: &str, field: &'static str| {
+        value
+            .parse::<u64>()
+            .map_err(|_| RegistryError::MetadataField {
+                url: gs_url.to_string(),
+                field,
+            })
+    };
+    Ok(ObjectVersion {
+        generation: number(&resource.generation, "generation")?,
+        size: number(&resource.size, "size")?,
+        md5_hash: resource.md5_hash,
+    })
+}
+
+async fn fetch_version_from(
+    http: &reqwest::Client,
+    endpoints: Endpoints<'_>,
+    gs_url: &str,
+    version: &ObjectVersion,
+) -> Result<TokenCopy, RegistryError> {
+    let bytes = fetch_from(http, endpoints, gs_url, Some(version.generation)).await?;
+    let md5_hash = BASE64_STANDARD.encode(Md5::digest(&bytes));
+    if bytes.len() as u64 != version.size || md5_hash != version.md5_hash {
+        return Err(RegistryError::Integrity {
+            url: gs_url.to_string(),
+            generation: version.generation,
+        });
+    }
+    Ok(TokenCopy {
+        generation: version.generation,
+        bytes,
+    })
+}
+
+/// One authenticated `objects.get`, its body bounded by [`MAX_BODY`].
+async fn get(
+    http: &reqwest::Client,
+    endpoints: Endpoints<'_>,
+    gs_url: &str,
+    read: Read,
+) -> Result<Vec<u8>, RegistryError> {
     let (bucket, object) = parse_gs_url(gs_url)?;
-    let url = object_url(endpoints.storage, bucket, object, generation)?;
+    let url = object_url(endpoints.storage, bucket, object, read)?;
     let token = access_token(http, endpoints.metadata).await?;
-    let named = || {
-        generation.map_or_else(
-            || gs_url.to_string(),
-            |generation| format!("{gs_url}#{generation}"),
-        )
+    let named = || match read {
+        Read::Media(Some(generation)) => format!("{gs_url}#{generation}"),
+        Read::Media(None) | Read::Metadata => gs_url.to_string(),
     };
     let http_error = |source| RegistryError::Http {
         url: named(),
@@ -666,15 +901,58 @@ async fn load_from(
     source: &RegistrySource,
     budget: Duration,
 ) -> Result<Vec<u8>, RegistryError> {
+    within_boot_budget(&source.url, budget, || {
+        fetch_from(http, endpoints, &source.url, source.generation)
+    })
+    .await
+}
+
+/// The copy boot records from the bucket: the pinned generation, or the
+/// latest version checked against its metadata. Bounded as a whole like
+/// [`load_bytes`].
+pub async fn load_copy(source: &RegistrySource) -> Result<TokenCopy, RegistryError> {
+    load_copy_from(&http_client()?, GOOGLE, source, BOOT_READ_BUDGET).await
+}
+
+async fn load_copy_from(
+    http: &reqwest::Client,
+    endpoints: Endpoints<'_>,
+    source: &RegistrySource,
+    budget: Duration,
+) -> Result<TokenCopy, RegistryError> {
+    within_boot_budget(&source.url, budget, || async {
+        if let Some(generation) = source.generation {
+            fetch_from(http, endpoints, &source.url, Some(generation))
+                .await
+                .map(|bytes| TokenCopy { generation, bytes })
+        } else {
+            let version = fetch_metadata_from(http, endpoints, &source.url).await?;
+            fetch_version_from(http, endpoints, &source.url, &version).await
+        }
+    })
+    .await
+}
+
+/// Up to three attempts of `read`, backing off between them, all within
+/// `budget`, so a wedged read cannot stall the roll's health gate.
+async fn within_boot_budget<Read, Reading, Output>(
+    url: &str,
+    budget: Duration,
+    mut read: Read,
+) -> Result<Output, RegistryError>
+where
+    Read: FnMut() -> Reading,
+    Reading: Future<Output = Result<Output, RegistryError>>,
+{
     // No tracing subscriber exists yet at boot, so a failed attempt is kept
     // for the error rather than logged: the budget running out still names
     // why the attempts before it failed.
     let mut last = None;
-    let read = async {
+    let attempts = async {
         let mut attempt = 1;
         loop {
-            match fetch_from(http, endpoints, &source.url, source.generation).await {
-                Ok(bytes) => break Ok(bytes),
+            match read().await {
+                Ok(output) => break Ok(output),
                 Err(error) if attempt < 3 => {
                     last = Some(Box::new(error));
                     tokio::time::sleep(Duration::from_secs(1 << attempt)).await;
@@ -684,9 +962,9 @@ async fn load_from(
             }
         }
     };
-    let outcome = tokio::time::timeout(budget, read).await;
+    let outcome = tokio::time::timeout(budget, attempts).await;
     outcome.map_err(|_| RegistryError::BootTimeout {
-        url: source.url.clone(),
+        url: url.to_string(),
         last,
     })?
 }
@@ -739,10 +1017,24 @@ pub fn describe_change(live: &Projection, fresh: &Projection) -> Option<String> 
 /// What the bot keeps after boot, so the refresh loop can compare.
 #[derive(Debug, Clone)]
 pub struct RegistryLive {
+    /// Opaque boot inputs used to validate registry candidates.
+    pub(crate) inputs: Option<std::sync::Arc<crate::loader::RegistryInputs>>,
     pub source: RegistrySource,
     /// The config table as parsed from disk, BEFORE the merge.
     pub static_config: Table,
     pub live: Projection,
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl RegistryLive {
+    pub fn for_test(source: RegistrySource, static_config: Table, live: Projection) -> Self {
+        Self {
+            source,
+            static_config,
+            live,
+            inputs: None,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -837,6 +1129,24 @@ mod tests {
         assert!(projection.slots().contains("base/FGI"));
     }
 
+    /// A paused row passes the projection and reaches the loader as
+    /// `RebalancingMode::Paused`, so the pause switch works on the token-file
+    /// path that prod and staging use.
+    #[test]
+    fn a_paused_rebalancing_row_is_projected() {
+        let mut file = parse(fixture("tokens-staging.toml").as_bytes()).unwrap();
+        file["chains"]["base"]["assets"]["equities"]["FGI"]
+            .as_table_mut()
+            .unwrap()
+            .insert("rebalancing".into(), Value::String("paused".into()));
+
+        let projection = project(&file).unwrap();
+        let row = projection.chain_rows["base"]["FGI"].clone();
+        let asset: crate::ChainEquityAsset = Value::Table(row).try_into().unwrap();
+
+        assert_eq!(asset.rebalancing, crate::RebalancingMode::Paused);
+    }
+
     #[test]
     fn a_bad_switch_a_wrong_schema_and_an_undeclared_chain_are_refused() {
         let mut file = parse(fixture("tokens-staging.toml").as_bytes()).unwrap();
@@ -847,6 +1157,16 @@ mod tests {
         assert!(matches!(
             project(&file).unwrap_err(),
             RegistryError::BadSwitch { key: "trading", .. }
+        ));
+
+        let mut file = parse(fixture("tokens-staging.toml").as_bytes()).unwrap();
+        file["chains"]["base"]["assets"]["equities"]["FGI"]
+            .as_table_mut()
+            .unwrap()
+            .insert("rebalancing".into(), Value::String("pause".into()));
+        assert!(matches!(
+            project(&file).unwrap_err(),
+            RegistryError::BadRebalancingMode { .. }
         ));
 
         let mut file = parse(fixture("tokens-staging.toml").as_bytes()).unwrap();
@@ -1045,12 +1365,23 @@ mod tests {
             GOOGLE.storage,
             "t0-artifacts-tokens",
             "production/tokens.toml",
-            Some(7),
+            Read::Media(Some(7)),
         )
         .unwrap();
         assert_eq!(
             url.as_str(),
             "https://storage.googleapis.com/storage/v1/b/t0-artifacts-tokens/o/production%2Ftokens.toml?alt=media&generation=7"
+        );
+        let url = object_url(
+            GOOGLE.storage,
+            "t0-artifacts-tokens",
+            "production/tokens.toml",
+            Read::Metadata,
+        )
+        .unwrap();
+        assert_eq!(
+            url.as_str(),
+            "https://storage.googleapis.com/storage/v1/b/t0-artifacts-tokens/o/production%2Ftokens.toml"
         );
     }
 
@@ -1189,6 +1520,94 @@ mod tests {
         );
     }
 
+    /// A record's effective tables are a token file that projects back to
+    /// exactly the tables it was made from.
+    #[test]
+    fn a_projection_round_trips_through_its_token_file() {
+        for tokens in [
+            fixtures::pinned_production_tokens(),
+            fixtures::read("tokens-staging.toml"),
+        ] {
+            let projection = project(&parse(&tokens).unwrap()).unwrap();
+            let rendered = projection.to_token_file();
+            assert_eq!(
+                project(&parse(rendered.as_bytes()).unwrap()).unwrap(),
+                projection
+            );
+        }
+    }
+
+    /// A listing the fresh copy drops keeps its last row with every switch
+    /// off, per chain: a symbol leaving one chain keeps trading on the
+    /// other, and only a symbol that trades nowhere has its policy carried,
+    /// with extended hours off.
+    #[test]
+    fn a_dropped_listing_is_carried_switched_off() {
+        let running = project(&parse(&fixtures::pinned_production_tokens()).unwrap()).unwrap();
+        assert_eq!(
+            running.policies["AAPL"]["extended_hours_counter_trading"],
+            Value::String("enabled".into())
+        );
+        let mut fresh = running.clone();
+        fresh.chain_rows.get_mut("base").unwrap().remove("AAPL");
+        fresh.policies.remove("AAPL");
+        let robinhood_before = fresh.chain_rows["robinhood"].get("AAPL").cloned();
+
+        let carried = fresh.carry_forward(&running);
+
+        assert_eq!(carried.listings, BTreeSet::from(["base/AAPL".to_string()]));
+        let row = &carried.projection.chain_rows["base"]["AAPL"];
+        for key in ["trading", "rebalancing", "wrapped_equity_recovery"] {
+            assert_eq!(row[key], Value::String("disabled".into()), "{key}");
+        }
+        assert_eq!(
+            row["tokenized_equity"],
+            running.chain_rows["base"]["AAPL"]["tokenized_equity"]
+        );
+        assert_eq!(
+            carried.projection.chain_rows["robinhood"]
+                .get("AAPL")
+                .cloned(),
+            robinhood_before,
+            "a listing the fresh copy keeps is its own"
+        );
+        assert_eq!(
+            carried.projection.policies["AAPL"]["extended_hours_counter_trading"],
+            Value::String("disabled".into())
+        );
+    }
+
+    /// A re-added listing takes the fresh copy's row, and a retired symbol
+    /// is dropped by the merge whatever was carried.
+    #[test]
+    fn a_readded_listing_takes_the_fresh_row() {
+        let running = project(&parse(&fixtures::read("tokens-staging.toml")).unwrap()).unwrap();
+        let mut fresh = running.clone();
+        fresh
+            .chain_rows
+            .get_mut("base")
+            .unwrap()
+            .get_mut("FGI")
+            .unwrap()
+            .insert("trading".into(), Value::String("disabled".into()));
+
+        let carried = fresh.clone().carry_forward(&running);
+
+        assert_eq!(carried.projection, fresh);
+        assert!(carried.listings.is_empty());
+
+        let config: Table =
+            toml::from_str("[assets.equities]\nretired_symbols = [\"FGI\"]\n").unwrap();
+        let mut dropped = running.clone();
+        dropped.chain_rows.get_mut("base").unwrap().remove("FGI");
+        let retired = dropped
+            .carry_forward(&running)
+            .projection
+            .without_retired(&config);
+        assert!(!retired.slots().contains("base/FGI"));
+        assert!(!retired.policies.contains_key("FGI"));
+    }
+
     /// A copy that is gone or refused to the service account fails every
     /// boot until someone acts; a rate limit or a server error may not.
     #[test]
@@ -1270,6 +1689,179 @@ mod tests {
 
         assert_eq!(read(&server).await.unwrap(), b"schema_version = 1");
         object.assert_async().await;
+    }
+
+    fn serve_metadata<'server>(
+        server: &'server httpmock::MockServer,
+        status: u16,
+        body: &str,
+    ) -> httpmock::Mock<'server> {
+        server.mock(|when, then| {
+            when.method(httpmock::Method::GET)
+                .path("/storage/v1/b/t0-artifacts-tokens/o/staging%2Ftokens.toml")
+                .query_param_missing("alt")
+                .header("authorization", "Bearer vm-token");
+            then.status(status)
+                .header("content-type", "application/json")
+                .body(body);
+        })
+    }
+
+    async fn read_metadata(server: &httpmock::MockServer) -> Result<ObjectVersion, RegistryError> {
+        let (metadata, storage) = endpoints(server);
+        fetch_metadata_from(
+            &http_client().unwrap(),
+            Endpoints {
+                metadata: &metadata,
+                storage: &storage,
+            },
+            OBJECT,
+        )
+        .await
+    }
+
+    async fn read_version(
+        server: &httpmock::MockServer,
+        version: &ObjectVersion,
+    ) -> Result<TokenCopy, RegistryError> {
+        let (metadata, storage) = endpoints(server);
+        fetch_version_from(
+            &http_client().unwrap(),
+            Endpoints {
+                metadata: &metadata,
+                storage: &storage,
+            },
+            OBJECT,
+            version,
+        )
+        .await
+    }
+
+    /// The MD5 Cloud Storage reports for `schema_version = 1`, as
+    /// `gcloud storage objects describe` prints it.
+    const BODY_MD5: &str = "omc/TsRplPfcUe8sQDyy/A==";
+
+    #[tokio::test]
+    async fn the_metadata_names_the_latest_version_without_its_content() {
+        let server = httpmock::MockServer::start_async().await;
+        serve_token(&server);
+        let metadata = serve_metadata(
+            &server,
+            200,
+            r#"{"kind":"storage#object","name":"staging/tokens.toml",
+               "generation":"1790782803062872","size":"18","md5Hash":"omc/TsRplPfcUe8sQDyy/A=="}"#,
+        );
+
+        assert_eq!(
+            read_metadata(&server).await.unwrap(),
+            ObjectVersion {
+                generation: 1_790_782_803_062_872,
+                size: 18,
+                md5_hash: BODY_MD5.to_string(),
+            }
+        );
+        metadata.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn metadata_that_is_gone_is_unusable_and_malformed_metadata_is_refused() {
+        let server = httpmock::MockServer::start_async().await;
+        serve_token(&server);
+        serve_metadata(&server, 404, "{}");
+        let error = read_metadata(&server).await.unwrap_err();
+        assert!(error.copy_is_unusable(), "{error:?}");
+
+        let server = httpmock::MockServer::start_async().await;
+        serve_token(&server);
+        serve_metadata(
+            &server,
+            200,
+            r#"{"generation":"one","size":"18","md5Hash":"x"}"#,
+        );
+        let error = read_metadata(&server).await.unwrap_err();
+        assert!(
+            matches!(
+                error,
+                RegistryError::MetadataField {
+                    field: "generation",
+                    ..
+                }
+            ),
+            "{error:?}"
+        );
+
+        let server = httpmock::MockServer::start_async().await;
+        serve_token(&server);
+        serve_metadata(&server, 200, r#"{"generation":"1"}"#);
+        let error = read_metadata(&server).await.unwrap_err();
+        assert!(matches!(error, RegistryError::Metadata { .. }), "{error:?}");
+    }
+
+    #[tokio::test]
+    async fn a_version_read_returns_the_content_its_metadata_describes() {
+        let server = httpmock::MockServer::start_async().await;
+        serve_token(&server);
+        let object = server.mock(|when, then| {
+            when.method(httpmock::Method::GET)
+                .path_includes("/storage/v1/b/t0-artifacts-tokens/o/")
+                .query_param("alt", "media")
+                .query_param("generation", "42");
+            then.status(200).body("schema_version = 1");
+        });
+        let version = ObjectVersion {
+            generation: 42,
+            size: 18,
+            md5_hash: BODY_MD5.to_string(),
+        };
+
+        assert_eq!(
+            read_version(&server, &version).await.unwrap(),
+            TokenCopy {
+                generation: 42,
+                bytes: b"schema_version = 1".to_vec(),
+            }
+        );
+        object.assert_async().await;
+    }
+
+    /// Content that does not match its metadata is not what was published:
+    /// it is never judged, whatever it holds.
+    #[tokio::test]
+    async fn content_that_does_not_match_its_metadata_is_refused() {
+        for version in [
+            ObjectVersion {
+                generation: 42,
+                size: 18,
+                md5_hash: "1B2M2Y8AsgTpgAmY7PhCfg==".to_string(),
+            },
+            ObjectVersion {
+                generation: 42,
+                size: 19,
+                md5_hash: BODY_MD5.to_string(),
+            },
+        ] {
+            let server = httpmock::MockServer::start_async().await;
+            serve_token(&server);
+            serve_object(&server, 200, b"schema_version = 1".to_vec());
+
+            let error = read_version(&server, &version).await.unwrap_err();
+            assert!(
+                matches!(error, RegistryError::Integrity { generation: 42, .. }),
+                "{version:?}: {error:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn sha256_names_the_content() {
+        assert_eq!(
+            sha256_hex(b"schema_version = 1"),
+            "b7bd3a4ef3d4f76daaba11c506459e2671b423580f507b3796cd06575a81ddd6"
+        );
+        assert_eq!(
+            sha256_hex(b""),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
     }
 
     #[tokio::test]

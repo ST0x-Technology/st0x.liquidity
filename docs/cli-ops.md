@@ -249,12 +249,12 @@ automated path for this, the operator deposits it. Prerequisites, all per chain:
 - A `[chains.<name>.trading]` table with the chain's orderbook, inventory, vault
   owner, asset table and `redemption_wallet`. The wallet and a deployed wrapper
   vault per equity are required only when the chain rebalances equity (the
-  primary, or a secondary with an equity that has `rebalancing = "enabled"`);
-  the bot fails startup without them there. A hedge-only secondary (every equity
-  `rebalancing = "disabled"`) needs neither: its fills are hedged and nothing is
-  minted, wrapped or redeemed on it, so its startup MAX approvals (and the
-  Turnkey policies `verify-approvals` demands for them) are the single USDC
-  grant alone, with no wrapper to approve. That grant names the chain's
+  primary, or a secondary with an equity that has `rebalancing = "enabled"` or
+  `"paused"`); the bot fails startup without them there. A hedge-only secondary
+  (every equity `rebalancing = "disabled"`) needs neither: its fills are hedged
+  and nothing is minted, wrapped or redeemed on it, so its startup MAX approvals
+  (and the Turnkey policies `verify-approvals` demands for them) are the single
+  USDC grant alone, with no wrapper to approve. That grant names the chain's
   orderbook when its `inventory_mode` is `legacy`, and its configured
   `inventory` when it is `managed`.
 - A signing wallet for the chain in `[wallet]`, funded with native gas, and an
@@ -290,6 +290,15 @@ and issuer. A resumed mint (`--issuer-request-id`) must be given the network it
 started on; a `--network` that disagrees with the record is refused, and the
 `transfer` recovery verbs carry no network at all.
 
+Fresh `transfer-equity` mints and redemptions require the listing on the
+selected chain to have `rebalancing = "enabled"`. Paused or disabled listings
+refuse new operations, including manually requested transfers. Resuming a
+persisted mint with `--issuer-request-id` remains available while paused or
+disabled. A persisted mint that the issuer has no record of is not replayed on
+such a listing. The lookup is inconclusive, so the resume errors and leaves the
+mint at `MintRequested` with its reservation. Confirm with the issuer that it
+never received the request, then use `transfer fail --kind mint`.
+
 Without container access, the capital verbs run in the bot through IAP with
 `st0x-liquidity-client --env <env> capital <verb>`, which needs the write tier
 Workspace group and signs with the bot's own wallets:
@@ -299,8 +308,9 @@ st0x-liquidity-client --env <env> capital vault-deposit --amount 10 --token <wra
 st0x-liquidity-client --env <env> capital vault-withdraw --amount 10 --token <token> --vault-id <vault-id> --network ethereum
 st0x-liquidity-client --env <env> capital vault-withdraw-usdc --amount <amount> --network <chain>
 st0x-liquidity-client --env <env> capital reset-allowance --network <chain>
-# starts the transfer on the bot's worker and prints its id at once
-st0x-liquidity-client --env <env> capital transfer-usdc --direction <to-raindex|to-alpaca> --amount <amount>
+# starts the transfer on the bot's worker and prints its id at once; --chain
+# picks the served corridor and may be left out while the bot serves one
+st0x-liquidity-client --env <env> capital transfer-usdc --direction <to-raindex|to-alpaca> --amount <amount> [--chain <chain>]
 # burns only and prints the burn tx; finish with debug cctp complete-mint
 st0x-liquidity-client --env <env> capital cctp-bridge --from <ethereum|base> --amount <amount>
 st0x-liquidity-client --env <env> debug cctp complete-mint --burn-tx <burn-tx> --source-chain <ethereum|base>
@@ -505,8 +515,12 @@ Not covered by `transfer recheck` yet:
 - Provider rejections. These remain failed unless an operator performs a
   separate manual reconciliation.
 - USDC rebalancing failures. Those use the USDC/CCTP state machine and have
-  their own recovery commands. A manual `transfer-usdc` prints its transfer id
-  and, if interrupted mid-flight, is resumed with
+  their own recovery commands. A manual `transfer-usdc` runs on the served
+  corridor that `--chain <chain>` names; the flag may be left out only while the
+  build serves one corridor, and with several the command refuses and lists
+  them. Only Base via CCTP can execute in this build: on any other served
+  corridor the command refuses before any transfer starts. It prints its
+  transfer id and, if interrupted mid-flight, is resumed with
   `stox transfer resume --kind usdc --id <id> --direction <to-raindex|to-alpaca>`.
   This covers post-burn interruptions and the resumable pre-burn states (a
   BaseToAlpaca `WithdrawalSubmitting`, an AlpacaToBase `Withdrawing` with a

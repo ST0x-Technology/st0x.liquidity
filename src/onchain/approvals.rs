@@ -371,7 +371,9 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::time::Duration;
 
-    use st0x_config::{ChainAssets, ChainEquities, ChainEquityAsset, OperationMode};
+    use st0x_config::{
+        ChainAssets, ChainEquities, ChainEquityAsset, OperationMode, RebalancingMode,
+    };
     use st0x_evm::Evm;
     use st0x_evm::local::RawPrivateKeyWallet;
 
@@ -500,7 +502,7 @@ mod tests {
         underlying: Address,
         derivative: Address,
         trading: OperationMode,
-        rebalancing: OperationMode,
+        rebalancing: RebalancingMode,
     ) -> ChainEquityAsset {
         ChainEquityAsset {
             tokenized_equity: underlying,
@@ -542,7 +544,7 @@ mod tests {
                 underlying,
                 derivative,
                 OperationMode::Enabled,
-                OperationMode::Disabled,
+                RebalancingMode::Disabled,
             ),
         )]);
 
@@ -595,7 +597,7 @@ mod tests {
                 underlying,
                 derivative,
                 OperationMode::Enabled,
-                OperationMode::Disabled,
+                RebalancingMode::Disabled,
             ),
         )]);
 
@@ -645,7 +647,7 @@ mod tests {
                 Address::random(),
                 Address::random(),
                 OperationMode::Enabled,
-                OperationMode::Disabled,
+                RebalancingMode::Disabled,
             ),
         )]);
 
@@ -682,7 +684,7 @@ mod tests {
                 underlying,
                 derivative,
                 OperationMode::Disabled,
-                OperationMode::Enabled,
+                RebalancingMode::Enabled,
             ),
         )]);
 
@@ -727,7 +729,7 @@ mod tests {
                     tsla_underlying,
                     tsla_derivative,
                     OperationMode::Enabled,
-                    OperationMode::Disabled,
+                    RebalancingMode::Disabled,
                 ),
             ),
             (
@@ -736,7 +738,7 @@ mod tests {
                     aapl_underlying,
                     aapl_derivative,
                     OperationMode::Disabled,
-                    OperationMode::Enabled,
+                    RebalancingMode::Enabled,
                 ),
             ),
         ]);
@@ -823,7 +825,7 @@ mod tests {
                     tsla_underlying,
                     tsla_derivative,
                     OperationMode::Disabled,
-                    OperationMode::Enabled,
+                    RebalancingMode::Enabled,
                 ),
             ),
             (
@@ -832,7 +834,7 @@ mod tests {
                     Address::random(),
                     Address::random(),
                     OperationMode::Disabled,
-                    OperationMode::Disabled,
+                    RebalancingMode::Disabled,
                 ),
             ),
             (
@@ -841,7 +843,7 @@ mod tests {
                     aapl_underlying,
                     aapl_derivative,
                     OperationMode::Enabled,
-                    OperationMode::Disabled,
+                    RebalancingMode::Disabled,
                 ),
             ),
         ]);

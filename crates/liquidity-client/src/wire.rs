@@ -184,6 +184,8 @@ pub(crate) struct SetEquityMarkRequest {
 pub(crate) struct TransferUsdcRequest {
     pub(crate) direction: TransferUsdcDirection,
     pub(crate) amount: DecimalAmount,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) chain: Option<&'static str>,
 }
 
 /// The venue a USDC transfer moves funds to, kebab cased on the wire exactly

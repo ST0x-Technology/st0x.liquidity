@@ -275,6 +275,7 @@ mod tests {
     use st0x_config::create_test_issuance_ctx;
     use st0x_config::{
         ChainAssets, ChainEquities, ChainEquityAsset, HedgedChain, InventoryMode, OperationMode,
+        RebalancingMode,
     };
     use st0x_config::{Ctx, LogFormat, LogLevel};
     use st0x_evm::Chain;
@@ -403,7 +404,7 @@ mod tests {
                 tokenized_equity_derivative: derivative,
                 vault_ids: vec![],
                 trading: OperationMode::Enabled,
-                rebalancing: OperationMode::Disabled,
+                rebalancing: RebalancingMode::Disabled,
                 wrapped_equity_recovery: OperationMode::Disabled,
                 operational_limit: None,
                 target_share: None,
@@ -450,7 +451,7 @@ mod tests {
                 tokenized_equity_derivative: Address::repeat_byte(0x22),
                 vault_ids: vec![],
                 trading: OperationMode::Enabled,
-                rebalancing: OperationMode::Disabled,
+                rebalancing: RebalancingMode::Disabled,
                 wrapped_equity_recovery: OperationMode::Disabled,
                 operational_limit: None,
                 target_share: None,
@@ -941,7 +942,7 @@ mod tests {
                 tokenized_equity_derivative: ethereum_wrapper,
                 vault_ids: vec![],
                 trading: OperationMode::Enabled,
-                rebalancing: OperationMode::Disabled,
+                rebalancing: RebalancingMode::Disabled,
                 wrapped_equity_recovery: OperationMode::Disabled,
                 operational_limit: None,
                 target_share: None,

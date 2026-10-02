@@ -145,14 +145,25 @@ which is independent of any chain -- there is one broker account and one
 position per symbol. Other services own other keys on the same tables (the
 file's header lists them). The bot takes its own keys and ignores the others;
 which keys may appear, and their spelling, is checked by `st0x.registry`'s CI
-(`t0/check.jq`) before the file is published, not by the bot.
+(`t0/check.jq`) before the file is published, not by the bot. Publishing
+`rebalancing = "paused"` needs this order so an older binary never reads a token
+file it cannot load:
+
+1. Deploy the bot that reads `paused`.
+2. Merge the `t0/check.jq` validator change that accepts `paused`.
+3. Publish `paused` in the token file.
+
+On rollback, restore the token value before downgrading the binary. If the
+validator lands first and someone publishes `paused`, a restart of an older
+binary (staging loads the latest token file on every restart) refuses the
+registry and stops hedging.
 
 ```toml
 [chains.base.assets.equities.SGOV]
 trading = "disabled"                          # "enabled" or "disabled"
-rebalancing = "disabled"                      # "enabled" or "disabled"
+rebalancing = "disabled"                      # "enabled", "paused" or "disabled"
 wrapped_equity_recovery = "disabled"          # "enabled" or "disabled"
-vault_ids = ["0xfab"]                         # Raindex vault IDs (required when rebalancing = "enabled")
+vault_ids = ["0xfab"]                         # Raindex vault IDs (required when rebalancing = "enabled" or "paused")
 tokenized_equity = "0xc941C1506B7555Ba8C506Fb6c9b9CC259902d612"
 tokenized_equity_derivative = "0x78c31580c97101694c70022c83d570150c11e935"
 
@@ -173,20 +184,21 @@ chain's signing wallet, orderbook, `redemption_wallet` and
 (Base included), check before enabling the asset:
 
 - On a redemption-capable chain -- the primary, and a secondary where at least
-  one equity sets `rebalancing = "enabled"` -- `[chains.<name>.trading]` carries
-  a `redemption_wallet` (the issuer's wallet on that chain). Startup builds that
-  chain's tokenization services and refuses, naming the chain, without it. A
-  hedge-only secondary, where every equity has `rebalancing = "disabled"`, needs
-  no redemption wallet, issuer client or mint authorizer, and gets no wrap or
-  deposit approvals.
+  one equity sets `rebalancing = "enabled"` or `"paused"` --
+  `[chains.<name>.trading]` carries a `redemption_wallet` (the issuer's wallet
+  on that chain). Startup builds that chain's tokenization services and refuses,
+  naming the chain, without it. A hedge-only secondary, where every equity has
+  `rebalancing = "disabled"`, needs no redemption wallet, issuer client or mint
+  authorizer, and gets no wrap or deposit approvals.
 - Every chain that lists the asset, hedge-only secondaries included, needs its
   own `tokenized_equity_derivative`: that address is the token its vaults hold
   and the one its fills are checked against, and the daily portfolio capture
   reads that chain's vault ratio to value those balances in underlying shares.
 - The vault at `tokenized_equity_derivative` reports `tokenized_equity` as its
   `asset()`. Startup attests this on each redemption-capable chain -- every
-  trading- or rebalancing-enabled equity on the primary, the rebalancing-enabled
-  ones on a secondary -- and fails naming the chain and symbol otherwise.
+  equity with trading enabled or rebalancing enabled or paused on the primary,
+  those with rebalancing enabled or paused on a secondary -- and fails naming
+  the chain and symbol otherwise.
 - The Turnkey policies allow the startup approvals on that chain's id: the
   approvals (underlying to vault, vault to that chain's deposit spender, that
   chain's USDC to the same deposit spender) are granted per hedged chain, and
@@ -224,7 +236,19 @@ chain's signing wallet, orderbook, `redemption_wallet` and
   it is disabled on purpose and hedged by hand, silence the alert for that chain
   and symbol.
 - `rebalancing`: Whether the bot auto-rebalances this asset between venues.
-  Usually `"disabled"` at first.
+  Usually `"disabled"` at first. `"paused"` starts no new mint or redemption but
+  keeps the chain's equity transfer services, so work already under way
+  finishes. Before you disable a listing that may have a transfer in flight,
+  pause it and wait until its in-flight transfers finish. Pausing does not move
+  the chain's equity: the planner skips a paused chain and `transfer-equity`
+  refuses a new transfer on it. To move that equity first, use the manual vault,
+  unwrap, and redeem commands (`vault-withdraw`, `unwrap-equity`, then
+  `alpaca-redeem` with the unwrapped quantity, see [cli-ops.md](cli-ops.md)). A
+  paused chain still counts in the planner's total, so it must stay polled and
+  readable: a stale paused chain stops equity rebalancing for the symbol on
+  every chain until it is fresh again or set to `"disabled"`. Wallet polling and
+  wallet recovery run where the chain already has them (the primary chain
+  today); pausing does not add them to a secondary.
 - `wrapped_equity_recovery`: Explicit opt-in for recovery of wrapped-equity
   positions. Set to `"enabled"` to allow the bot to recover wrapped equity;
   `"disabled"` skips recovery for this asset. Must be specified for every equity
@@ -234,57 +258,55 @@ chain's signing wallet, orderbook, `redemption_wallet` and
   bot to place offsetting broker trades outside regular market hours;
   `"disabled"` restricts counter-trading to regular session only. Must be
   specified for every equity entry.
-- `vault_ids`: The Raindex vault IDs. Required when `rebalancing = "enabled"`:
-  the bot refuses a token file with a rebalancing row that has none. With
-  rebalancing disabled they can be omitted, and the bot discovers the vaults
-  from its trade events.
+- `vault_ids`: The Raindex vault IDs. Required when `rebalancing` is `"enabled"`
+  or `"paused"`: the bot refuses a token file with a rebalancing row that has
+  none. With rebalancing disabled they can be omitted, and the bot discovers the
+  vaults from its trade events.
 - `tokenized_equity`: The base token contract address.
 - `tokenized_equity_derivative`: The wrapped token contract address.
 
-### 4b. Publish, then roll the bot
+### 4b. Publish and verify adoption
 
-Merge the `st0x.registry` change; its CI publishes the file. The bot never
-applies a new copy while it runs: its `registry_pending_restart` gauge goes to 1
-when the latest published copy differs from the one it runs, and
-`registry_invalid` goes to 1 when the copy its next start would read (the pinned
-generation in production, the latest copy in staging) would be refused.
-`registry_latest_refused` goes to 1 when the latest copy would be refused, so in
-production a bad copy shows before the pin is bumped to it. In production a
-restart alone changes nothing: it loads the pinned generation again, so the
-gauge stays at 1 until the pin is bumped and released.
+Merge the `st0x.registry` change; its CI publishes the token file. After the
+unpinned reload release, the bot polls every ten seconds and validates each
+observed generation before a graceful restart. No liquidity pin-bump PR or
+config-only release is needed. Start with a disabled listing, verify adoption,
+then enable trading in a second publish. Newly configured contracts are probed
+including disabled rows; newly selected tokenization routes and changed startup
+approval targets are checked too. Missing Turnkey coverage or transient RPC
+failures defer adoption until the dependency is fixed, without a republish.
 
-- **Staging** reads the latest copy on every start, so the next restart picks
-  the asset up. That includes a crash restart, and no deploy gate runs on it:
-  whatever is published is what the next staging start runs.
-- **Production** pins `generation` under `[registry]` in
-  `config/prod/st0x-hedge.toml`. Set it to the new generation
-  (`gcloud storage objects describe gs://t0-artifacts-tokens/production/tokens.toml`)
-  in a liquidity PR and release it. In the same PR copy that object to
-  `tests/fixtures/tokens-production-<generation>.toml`
-  (`gcloud storage cp 'gs://t0-artifacts-tokens/production/tokens.toml#<generation>' tests/fixtures/tokens-production-<generation>.toml`):
-  the tests that describe what production runs read the fixture the pin names,
-  and CI fails without it. `tokens-production-migration.toml` stays as it is; it
-  is the frozen proof of the move from inline tables.
+Check `registry_applied_generation`, the structured generation/hash logs and
+`registry_reloads_total{result}`. A refused copy sets `registry_invalid` and
+leaves the current configuration running. Promotion to last-good requires ten
+minutes of uptime; two failed boots fall back to the previous good set plus new
+listings disabled. Reloads are debounced for two minutes.
 
-Before a release, check the pinned copy against the config offline:
+During rollout production still pins `generation`, and the watcher only reports
+changes. Release the state-seeding code first, verify last-good exists on the
+data disk, then remove the pin in a second release. The t0.devops compose gates
+must pass `--registry-state /mnt/data/registry` and manage the deployment hold
+before that second release. Keep the production fixture aligned with the pin
+until it is removed; `tokens-production-migration.toml` stays frozen.
 
-```bash
-cargo run --bin validate-config -- --config config/prod/st0x-hedge.toml \
-  --registry-file tests/fixtures/tokens-production-<generation>.toml
-```
+Offline checks continue to accept `--registry-file`. Deployment checks accept
+`--registry-state` and judge pending plus fallback, or running. These readers
+never change boot attempts or promote state.
 
 ### Retiring an asset
 
-One config change. List the symbol under `[assets.equities] retired_symbols` in
-the bot's config and release that. From then on the bot ignores the token file's
-rows for that symbol, so the merged config never has it both configured and
-retired, and `verify-migrations` still finds every symbol the database
-references either configured or retired. Remove its rows from `t0/<env>.toml` in
-`st0x.registry` whenever convenient afterwards; for production that lands with
-the next `generation` bump. Never remove the rows first: the database would then
-reference a symbol that is neither configured nor retired. Nothing enforces this
-order. Staging loads the latest copy on any restart without a deploy gate, so
-rows removed too early take effect at the next staging start.
+Removing a listing from the token file carries its previous row forward with
+trading, rebalancing and wrapped-equity recovery disabled. The same applies to a
+listing removed on one chain while the symbol stays on another. Existing
+transfers and recoveries finish; new work stops. Already queued hedges still
+cover fills accepted before the disable.
+
+To remove the retained runtime row, list the symbol in `retired_symbols` of the
+`[assets.equities]` table in the bot's config and release it. The migration gate
+refuses retirement while unfinished work still needs configuration. Durable
+registry and snapshot residue may then remain covered by the retirement
+exception. Token-address changes under an existing listing are refused: retire
+first and add the replacement identity through the reviewed asset process.
 
 **Tip:** Start with `trading = "disabled"` first. Publish, verify the bot sees
 the asset, then enable trading in a follow-up change.
@@ -309,15 +331,15 @@ For adding asset **XYZ**:
       `tokenized_equity_derivative`, and Turnkey approval policies for that
       chain's id
 - [ ] On each redemption-capable chain that lists it -- the primary, and a
-      secondary where at least one equity sets `rebalancing = "enabled"` --
-      `redemption_wallet` and, before the asset is cut over to orchestrator
-      mode, the orchestrator entry for that chain (see step 4a) and the Turnkey
-      `MintAuth` policy for that chain's id and orchestrator; the first
-      orchestrator-mode mint fails at signing without it
-- [ ] Restart staging, verify bot sees the asset
-- [ ] Enable trading in the token file, restart again
-- [ ] Repeat for production when staging looks good, bumping `generation` in
-      `config/prod/st0x-hedge.toml` in a release
+      secondary where at least one equity sets `rebalancing = "enabled"` or
+      `"paused"` -- `redemption_wallet` and, before the asset is cut over to
+      orchestrator mode, the orchestrator entry for that chain (see step 4a) and
+      the Turnkey `MintAuth` policy for that chain's id and orchestrator; the
+      first orchestrator-mode mint fails at signing without it
+- [ ] Verify staging applied the disabled asset generation
+- [ ] Enable trading in the token file and verify adoption
+- [ ] Repeat for production when staging looks good (during pinned rollout,
+      apply a reviewed generation bump and release)
 
 ---
 

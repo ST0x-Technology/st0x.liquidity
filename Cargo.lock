@@ -3076,8 +3076,8 @@ dependencies = [
 
 [[package]]
 name = "event-sorcery"
-version = "0.3.0"
-source = "git+https://github.com/ST0x-Technology/event-sorcery.git?tag=v0.3.0#5f88f1498aa565510fe20d9d0092f48a2f5b0615"
+version = "0.3.1"
+source = "git+https://github.com/ST0x-Technology/event-sorcery.git?tag=v0.3.1#ff7ce271d77d23d2633d7ec176c50a6264517d74"
 dependencies = [
  "async-trait",
  "cqrs-es",
@@ -6997,8 +6997,8 @@ dependencies = [
 
 [[package]]
 name = "sqlite-es"
-version = "0.3.0"
-source = "git+https://github.com/ST0x-Technology/event-sorcery.git?tag=v0.3.0#5f88f1498aa565510fe20d9d0092f48a2f5b0615"
+version = "0.3.1"
+source = "git+https://github.com/ST0x-Technology/event-sorcery.git?tag=v0.3.1#ff7ce271d77d23d2633d7ec176c50a6264517d74"
 dependencies = [
  "chrono",
  "cqrs-es",
@@ -7487,11 +7487,13 @@ dependencies = [
  "alloy",
  "alloy-primitives",
  "async-trait",
+ "base64 0.22.1",
  "bon",
  "chrono",
  "clap",
  "httpmock",
  "itertools 0.14.0",
+ "md-5 0.10.6",
  "opentelemetry",
  "opentelemetry-appender-tracing",
  "opentelemetry-otlp",
@@ -7502,6 +7504,7 @@ dependencies = [
  "reqwest 0.12.28",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "sqlx 0.9.0",
  "st0x-bridge",
  "st0x-evm",

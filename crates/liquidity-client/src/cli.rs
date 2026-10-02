@@ -410,6 +410,10 @@ pub(crate) enum Capital {
         /// Amount of USDC to transfer, as a decimal.
         #[arg(short = 'a', long, allow_negative_numbers = true)]
         amount: DecimalAmount,
+        /// Chain of the served cash corridor to run on; may be left out only
+        /// while the bot serves one corridor.
+        #[arg(long, value_enum)]
+        chain: Option<HedgedChain>,
     },
     /// Deposit tokens from the bot's wallet into a Raindex vault: approves,
     /// then deposits, resolving token decimals from onchain metadata.
@@ -943,13 +947,16 @@ mod tests {
             Capital::TransferUsdc {
                 direction: TransferUsdcDirection::ToRaindex,
                 amount,
+                chain: None,
             } if amount == self::amount("250.5")
         ));
         assert!(matches!(
-            capital(&["transfer-usdc", "-d", "to-alpaca", "-a", "10"]).unwrap(),
+            capital(&["transfer-usdc", "-d", "to-alpaca", "-a", "10", "--chain", "robinhood"])
+                .unwrap(),
             Capital::TransferUsdc {
                 direction: TransferUsdcDirection::ToAlpaca,
                 amount,
+                chain: Some(super::HedgedChain::Robinhood),
             } if amount == self::amount("10")
         ));
 

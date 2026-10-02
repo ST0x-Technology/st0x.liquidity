@@ -358,7 +358,9 @@ impl Job<ResumeTokenizationCtx> for ResumeTokenizationAggregate {
 mod tests {
     use alloy::primitives::{Address, B256, TxHash, U256};
     use serde_json::json;
-    use st0x_config::{ChainEquities, ExecutionThreshold};
+    use st0x_config::{
+        ChainEquities, ChainEquityAsset, ExecutionThreshold, OperationMode, RebalancingMode,
+    };
     use st0x_event_sorcery::test_store;
     use st0x_evm::Chain;
     use st0x_execution::{Direction, FractionalShares, Positive, SupportedExecutor};
@@ -367,7 +369,7 @@ mod tests {
     use st0x_tokenization::mock::{MockCompletionOutcome, MockDetectionOutcome, MockTokenizer};
     use st0x_tokenization::{ClientRequestId, issuer_request_id, tokenization_request_id};
     use st0x_wrapper::{MockWrapper, Wrapper};
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, HashMap};
 
     use super::*;
     use crate::equity_redemption::{
@@ -626,6 +628,106 @@ mod tests {
             tokenizer.call_count(),
             calls_before,
             "failed mint aggregate must not invoke any tokenizer method during resume"
+        );
+    }
+
+    /// A provider lookup that finds no mint is inconclusive, so a
+    /// `MintRequested` mint on a paused listing stays requested and keeps its
+    /// Position reservation; the job errors for an apalis retry of the lookup.
+    #[tokio::test]
+    async fn perform_keeps_a_requested_mint_on_a_paused_listing_and_its_reservation() {
+        let tokenizer = Arc::new(MockTokenizer::new());
+        let (pool, apalis_pool) = crate::test_utils::setup_test_pools().await;
+        let raindex: Arc<dyn Raindex> = Arc::new(MockRaindex::new());
+        let wrapper: Arc<dyn Wrapper> = Arc::new(MockWrapper::new());
+        let vault_lookup =
+            Arc::new(MockVaultLookup::new().with_default_vault(RaindexVaultId(B256::ZERO)));
+        let symbol = st0x_execution::Symbol::new("AAPL").unwrap();
+        let equities = ChainEquities {
+            operational_limit: None,
+            symbols: HashMap::from([(
+                symbol.clone(),
+                ChainEquityAsset {
+                    tokenized_equity: Address::ZERO,
+                    tokenized_equity_derivative: Address::ZERO,
+                    vault_ids: Vec::new(),
+                    trading: OperationMode::Enabled,
+                    rebalancing: RebalancingMode::Paused,
+                    wrapped_equity_recovery: OperationMode::Disabled,
+                    operational_limit: None,
+                    target_share: None,
+                },
+            )]),
+        };
+        let transfer_services = EquityTransferServices {
+            chains: BTreeMap::from([(
+                Chain::Base,
+                ChainEquityServices {
+                    wallet: Address::ZERO,
+                    raindex,
+                    vault_lookup,
+                    tokenizer: tokenizer.clone(),
+                    wrapper,
+                    mint_authorizer: ConfiguredMintAuthorizer::Disabled,
+                    gas_readiness: ConfiguredGasReadiness::Unwired,
+                    equities,
+                },
+            )]),
+            bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
+        };
+        let mint_store = Arc::new(test_store(pool.clone(), transfer_services.clone()));
+        let redemption_store = Arc::new(test_store(pool.clone(), transfer_services.clone()));
+        let position_store = Arc::new(test_store(pool, ()));
+        let transfer = Arc::new(CrossVenueEquityTransfer::new(
+            transfer_services,
+            mint_store.clone(),
+            redemption_store,
+        ));
+        let id = issuer_request_id("resume-mint-paused-requested");
+        mint_store
+            .send(
+                &id,
+                TokenizedEquityMintCommand::RequestMint {
+                    chain: Chain::Base,
+                    issuer_request_id: id.clone(),
+                    symbol: symbol.clone(),
+                    quantity: float!(1.0),
+                    wallet: Address::ZERO,
+                },
+            )
+            .await
+            .unwrap();
+
+        let ctx = ResumeTokenizationCtx {
+            transfer,
+            position_authority: (position_store.clone(), ExecutionThreshold::whole_share()),
+            job_queue: ResumeTokenizationJobQueue::new(&apalis_pool),
+            notifier: Arc::new(crate::alerts::LogNotifier),
+        };
+        let job = ResumeTokenizationAggregate {
+            target: ResumeTokenizationTarget::Mint(id.clone()),
+            symbol: Some(symbol.clone()),
+            backpressure_streak: BackpressureStreak::default(),
+            position_reservation_retry_attempts: 0,
+        };
+
+        let error = Job::perform(&job, &ctx).await.unwrap_err();
+
+        assert!(
+            error.to_string().contains("not replaying the request"),
+            "an unreplayed paused mint must error for a retry, got: {error}"
+        );
+        assert_eq!(tokenizer.mint_request_call_count(), 0);
+        assert_eq!(tokenizer.mint_lookup_call_count(), 1);
+        let entity = mint_store.load(&id).await.unwrap().unwrap();
+        assert!(
+            matches!(entity, TokenizedEquityMint::MintRequested { .. }),
+            "an inconclusive lookup must keep the mint requested, got: {entity:?}"
+        );
+        let position = position_store.load(&symbol).await.unwrap().unwrap();
+        assert!(
+            position.equity_transfer_reservation.is_some(),
+            "an inconclusive lookup must keep the Position reservation"
         );
     }
 

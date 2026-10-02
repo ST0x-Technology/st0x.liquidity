@@ -28,7 +28,7 @@ use std::sync::Arc;
 use tracing::info;
 use uuid::Uuid;
 
-use st0x_config::{Ctx, Env};
+use st0x_config::{Ctx, Env, TokenSource};
 use st0x_evm::{Chain, OpenChainErrorRegistry, PreparedTransaction};
 use st0x_execution::alpaca_broker_api::AlpacaLimitPrice;
 use st0x_execution::{AlpacaAccountId, Direction, FractionalShares, Positive, Symbol, TimeInForce};
@@ -514,7 +514,7 @@ pub enum Commands {
     /// Transfer USDC between trading venues (Raindex <-> Alpaca)
     ///
     /// Requires Alpaca broker and rebalancing environment variables.
-    /// Uses Ethereum mainnet and Base mainnet.
+    /// Runs on a served cash corridor through the Ethereum hub.
     TransferUsdc {
         /// Direction of transfer
         #[arg(short = 'd', long = "direction")]
@@ -522,6 +522,10 @@ pub enum Commands {
         /// Amount of USDC to transfer
         #[arg(short = 'a', long = "amount")]
         amount: Usdc,
+        /// Chain of the served cash corridor to run on; may be left out only
+        /// while the build serves one corridor
+        #[arg(long = "chain", value_enum)]
+        chain: Option<TokenizationNetwork>,
     },
 
     /// Mark a pre-burn USDC rebalance as failed, clearing the in-progress guard.
@@ -1066,12 +1070,11 @@ impl CliEnv {
 
     /// Load config and secrets from the file paths parsed from CLI arguments.
     pub(crate) async fn load(self) -> anyhow::Result<(Ctx, Commands)> {
-        let ctx = Ctx::load_files(
-            &self.env.config,
-            &self.env.secrets,
-            self.env.registry_file.as_deref(),
-        )
-        .await?;
+        let source = TokenSource::Running {
+            registry_file: self.env.registry_file.as_deref(),
+            registry_state: self.env.registry_state.as_deref(),
+        };
+        let ctx = Ctx::load_files(&self.env.config, &self.env.secrets, source).await?;
         Ok((ctx, self.command))
     }
 }
@@ -1267,6 +1270,7 @@ enum ProviderCommand {
     TransferUsdc {
         direction: TransferDirection,
         amount: Usdc,
+        chain: Option<Chain>,
     },
     ResumeUsdcTransfer {
         id: Uuid,
@@ -1492,9 +1496,15 @@ fn classify_command(command: Commands) -> anyhow::Result<CommandRoute> {
         Commands::ProcessTx { tx_hash, network } => {
             CommandRoute::Provider(ProviderCommand::ProcessTx { tx_hash, network })
         }
-        Commands::TransferUsdc { direction, amount } => {
-            CommandRoute::Provider(ProviderCommand::TransferUsdc { direction, amount })
-        }
+        Commands::TransferUsdc {
+            direction,
+            amount,
+            chain,
+        } => CommandRoute::Provider(ProviderCommand::TransferUsdc {
+            direction,
+            amount,
+            chain: chain.map(Chain::from),
+        }),
         Commands::VaultDeposit {
             amount,
             token,
@@ -2133,9 +2143,11 @@ async fn run_provider_command<W: Write + Send>(
             )
             .await
         }
-        ProviderCommand::TransferUsdc { direction, amount } => {
-            rebalancing::transfer_usdc_command(stdout, direction, amount, ctx, pool).await
-        }
+        ProviderCommand::TransferUsdc {
+            direction,
+            amount,
+            chain,
+        } => rebalancing::transfer_usdc_command(stdout, direction, amount, chain, ctx, pool).await,
         ProviderCommand::ResumeUsdcTransfer { id, direction } => {
             rebalancing::resume_usdc_transfer_command(stdout, id, direction, ctx).await
         }

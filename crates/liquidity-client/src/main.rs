@@ -13,8 +13,8 @@ use std::process::ExitCode;
 
 use crate::auth::{AuthError, StaticToken, TokenSource};
 use crate::cli::{
-    Capital, Cctp, Cli, Command, Debug, PortfolioSnapshot, Position, Read, RebuildableView,
-    RecheckTransferType, UsdcDirection, VaultArgs, View,
+    Capital, Cctp, Cli, Command, Debug, HedgedChain, PortfolioSnapshot, Position, Read,
+    RebuildableView, RecheckTransferType, UsdcDirection, VaultArgs, View,
 };
 use crate::output::OutputError;
 use crate::target::Auth;
@@ -382,11 +382,19 @@ async fn dispatch_capital<A: TokenSource + Sync>(
     capital: Capital,
 ) -> Result<serde_json::Value, TransportError> {
     match capital {
-        Capital::TransferUsdc { direction, amount } => {
+        Capital::TransferUsdc {
+            direction,
+            amount,
+            chain,
+        } => {
             client
                 .post_json(
                     "/capital/transfer-usdc",
-                    &wire::TransferUsdcRequest { direction, amount },
+                    &wire::TransferUsdcRequest {
+                        direction,
+                        amount,
+                        chain: chain.map(HedgedChain::wire_name),
+                    },
                 )
                 .await
         }
@@ -1019,6 +1027,7 @@ mod tests {
             let request = request_for(Command::Capital(Capital::TransferUsdc {
                 direction,
                 amount: "250.5".parse()?,
+                chain: None,
             }))
             .await?;
             assert_eq!(
@@ -1030,6 +1039,16 @@ mod tests {
                 serde_json::json!({ "direction": spelling, "amount": "250.5" })
             );
         }
+        let request = request_for(Command::Capital(Capital::TransferUsdc {
+            direction: TransferUsdcDirection::ToRaindex,
+            amount: "250.5".parse()?,
+            chain: Some(HedgedChain::Robinhood),
+        }))
+        .await?;
+        assert_eq!(
+            request_body(&request),
+            serde_json::json!({ "direction": "to-raindex", "amount": "250.5", "chain": "robinhood" })
+        );
         Ok(())
     }
 

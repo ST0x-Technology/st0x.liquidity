@@ -59,6 +59,9 @@ pub struct AssetSettings {
     #[ts(type = "string")]
     pub symbol: Symbol,
     pub counter_trading: CounterTrading,
+    /// Whether the bot starts new rebalancing operations for this asset.
+    /// A paused listing (`rebalancing = "paused"`) reads `false`, like a
+    /// disabled one, although it still finishes and recovers work under way.
     pub rebalancing: bool,
     pub operational_limit: Option<String>,
 }

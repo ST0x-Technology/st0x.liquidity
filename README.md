@@ -175,10 +175,20 @@ cargo run --bin validate-config -- --config config/prod/st0x-hedge.toml
 cargo run --bin validate-config -- --config path/to/config.toml --secrets path/to/secrets.toml
 ```
 
-A config that names `[registry]` keeps its per-symbol tables in the token file
-in the bucket. `validate-config` never reads the bucket: pass a local copy with
-`--registry-file tokens.toml` to check those tables too. Without it the config
-is judged without them, and the report says so.
+A config that names `[registry]` keeps its per-symbol tables in the token file.
+Pass `--registry-file tokens.toml` to check those tables offline. Without a file
+or state path, `validate-config` judges config alone and reports the omission.
+The deploy gates accept `--registry-state /mnt/data/registry` and validate
+pending plus fallback, or running; they never mutate the manifest. With an
+explicit state path but no seeded state, gates fetch the token file.
+
+After the separate unpin release, accepted token changes apply by a validated
+graceful restart, with ten-second metadata polling, immutable disk records,
+ten-minute last-good promotion and fallback after two failed boots. Removed
+listings persist disabled so durable work can finish. During the first rollout,
+production remains pinned and the watcher reports changes only. See
+[asset publication](docs/how-to-add-new-asset.md#4b-publish-and-verify-adoption)
+and [registry metrics](docs/observability.md#registry-reloads).
 
 Without `--secrets` it judges the config file alone: schema (unknown keys are
 rejected), the port, chain, asset and `[rebalancing]` cross-field rules, and

@@ -66,6 +66,11 @@ pub(super) struct TransferUsdcRequest {
     direction: TransferDirectionWire,
     /// Decimal USDC amount; must be positive.
     amount: String,
+    /// Chain of the served cash corridor to run on, as for
+    /// `st0x-cli transfer-usdc --chain`; may be left out while the build
+    /// serves one corridor.
+    #[serde(default)]
+    chain: Option<Chain>,
 }
 
 #[derive(Serialize)]
@@ -218,7 +223,7 @@ pub(super) async fn transfer_usdc(
 
         let transfer_id = handle
             .rebalancing_service
-            .start_manual_usdc_transfer(&state.pool, direction, amount)
+            .start_manual_usdc_transfer(&state.pool, direction, amount, request.chain)
             .await
             .map_err(|error| {
                 error!(?error, ?direction, %amount, "Failed to start manual USDC transfer");

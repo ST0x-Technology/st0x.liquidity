@@ -443,6 +443,10 @@ pub enum UsdcTransferError {
         required: u64,
         actual: u64,
     },
+    /// No `[chains.ethereum]` entry, so the withdrawal tx has no depth to
+    /// reach: refused before any burn.
+    #[error(transparent)]
+    EthereumChainMissing(#[from] EthereumChainMissing),
     /// An RPC call in the settlement phase (confirmation re-check, balance read,
     /// or burn scan) failed transiently. The aggregate is in
     /// `WithdrawalComplete` or `BridgingSubmitting` -- a durable, resumable
@@ -686,7 +690,8 @@ impl UsdcTransferError {
             | Self::DepositSendUnresolved { .. }
             | Self::DepositSendReconciliationPending { .. }
             | Self::DepositSendTaskPanicked { .. }
-            | Self::DepositSendLookup { .. } => None,
+            | Self::DepositSendLookup { .. }
+            | Self::EthereumChainMissing(_) => None,
         }
     }
 }
@@ -749,7 +754,8 @@ impl BotGasFailureClassifier for UsdcTransferError {
             | Self::DepositSendUnresolved { .. }
             | Self::DepositSendReconciliationPending { .. }
             | Self::DepositSendTaskPanicked { .. }
-            | Self::DepositSendLookup { .. } => false,
+            | Self::DepositSendLookup { .. }
+            | Self::EthereumChainMissing(_) => false,
         }
     }
 }

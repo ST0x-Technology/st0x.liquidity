@@ -22,7 +22,7 @@ use super::usdc::{
     UsdcCorridorTransfers, UsdcDriverGate, UsdcSettlementParams,
 };
 use crate::bot_gas::BotGasReceiptCostEnqueuer;
-use crate::native_gas::GasReadiness;
+use crate::native_gas::{ConfiguredGasReadiness, GasReadiness};
 use crate::telemetry::broker::InstrumentedAlpacaBroker;
 use crate::usdc_rebalance::UsdcRebalance;
 
@@ -39,6 +39,14 @@ pub(crate) enum SpawnRebalancerError {
     NoCorridor,
     #[error("the {corridor} corridor is listed twice")]
     DuplicateCorridor { corridor: UsdcCorridor },
+    #[error(
+        "the {corridor} corridor runs on {chain}, where another served corridor already runs: \
+         {chain} has one USDC gas check"
+    )]
+    SharedCorridorChain {
+        chain: Chain,
+        corridor: UsdcCorridor,
+    },
 }
 
 /// Adapts the config-layer equity asset map to the narrow per-symbol token pairs
@@ -85,6 +93,29 @@ pub(crate) struct UsdcCorridorEndpoints<Signer> {
     pub(crate) vault_id: RaindexVaultId,
     /// The USDC route's gas check: this chain's wallet and the Ethereum hub.
     pub(crate) gas_readiness: Arc<GasReadiness>,
+}
+
+/// Each served corridor's gas check, keyed by its chain as the transfer
+/// admission guard looks it up. A second corridor on one chain would replace
+/// the first's check, so it is refused by name.
+pub(crate) fn usdc_gas_readiness_by_chain<Signer>(
+    corridors: &[UsdcCorridorEndpoints<Signer>],
+) -> Result<BTreeMap<Chain, ConfiguredGasReadiness>, SpawnRebalancerError> {
+    let mut by_chain = BTreeMap::new();
+
+    for endpoints in corridors {
+        let chain = endpoints.corridor.chain();
+        let readiness = ConfiguredGasReadiness::Wired(endpoints.gas_readiness.clone());
+
+        if by_chain.insert(chain, readiness).is_some() {
+            return Err(SpawnRebalancerError::SharedCorridorChain {
+                chain,
+                corridor: endpoints.corridor,
+            });
+        }
+    }
+
+    Ok(by_chain)
 }
 
 #[derive(Clone)]
@@ -269,7 +300,7 @@ mod tests {
     use std::collections::{BTreeMap, HashMap};
     use uuid::Uuid;
 
-    use st0x_config::{AllocationCtx, OperationMode, RebalancingCtx};
+    use st0x_config::{AllocationCtx, OperationMode, RebalancingCtx, RebalancingMode};
     use st0x_event_sorcery::test_store;
     use st0x_evm::local::RawPrivateKeyWallet;
     use st0x_evm::test_chain::evm_mapping_slot;
@@ -306,7 +337,7 @@ mod tests {
                 tokenized_equity_derivative: derivative,
                 vault_ids: Vec::new(),
                 trading: OperationMode::Enabled,
-                rebalancing: OperationMode::Disabled,
+                rebalancing: RebalancingMode::Disabled,
                 wrapped_equity_recovery: OperationMode::Disabled,
                 operational_limit: None,
                 target_share: None,
@@ -402,7 +433,6 @@ mod tests {
         UsdcSettlementParams {
             attestation_retry_deadline: rebalancing_ctx.attestation_retry_deadline,
             settlement_retry_deadline: rebalancing_ctx.settlement_retry_deadline,
-            required_confirmations: 0,
             ethereum_required_confirmations: Some(0),
             reserved_cash: None,
             #[cfg(feature = "test-support")]
@@ -419,7 +449,6 @@ mod tests {
         let ctx = make_ctx();
 
         let trigger_config = RebalancingServiceConfig {
-            served_usdc_corridor: UsdcCorridor::BASE_CCTP,
             poll_freshness: PollFreshness::always_fresh(),
             inventory_staleness_bound: std::time::Duration::from_secs(300),
             cash_reserved: None,
@@ -451,7 +480,6 @@ mod tests {
         let ctx = make_ctx();
 
         let trigger_config = RebalancingServiceConfig {
-            served_usdc_corridor: UsdcCorridor::BASE_CCTP,
             poll_freshness: PollFreshness::always_fresh(),
             inventory_staleness_bound: std::time::Duration::from_secs(300),
             cash_reserved: None,
@@ -462,7 +490,11 @@ mod tests {
             chains: BTreeMap::new(),
         };
 
-        let usdc_threshold = trigger_config.usdc.expect("USDC threshold should be Some");
+        let usdc_threshold = trigger_config
+            .usdc
+            .active()
+            .next()
+            .expect("one active corridor");
         assert!(usdc_threshold.threshold.target.eq(float!(0.6)).unwrap());
         assert!(usdc_threshold.threshold.deviation.eq(float!(0.15)).unwrap());
     }
@@ -701,6 +733,36 @@ mod tests {
                 SpawnRebalancerError::DuplicateCorridor {
                     corridor: UsdcCorridor::BASE_CCTP
                 }
+            ),
+            "got {error:?}"
+        );
+    }
+
+    /// The admission guard keeps one gas check per chain, so a second served
+    /// corridor on a chain is refused rather than replacing the first's check.
+    #[tokio::test]
+    async fn second_corridor_on_one_chain_refuses_its_gas_check() {
+        let server = MockServer::start();
+        let (_services, chain_wallet) = make_services_with_mock_wallet(&server).await;
+        let base_relay = UsdcCorridor::HubRouted {
+            chain: Chain::Base,
+            hop: HopKind::Relay,
+        };
+
+        let Err(error) = usdc_gas_readiness_by_chain(&[
+            corridor_endpoints(UsdcCorridor::BASE_CCTP, chain_wallet.clone()),
+            corridor_endpoints(base_relay, chain_wallet),
+        ]) else {
+            panic!("a second corridor on one chain must be refused");
+        };
+
+        assert!(
+            matches!(
+                error,
+                SpawnRebalancerError::SharedCorridorChain {
+                    chain: Chain::Base,
+                    corridor,
+                } if corridor == base_relay
             ),
             "got {error:?}"
         );

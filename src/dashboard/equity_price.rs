@@ -128,11 +128,33 @@ impl EquityPriceStore {
         }
     }
 
-    /// Attaches the listener told when a symbol gains a usable mark. Only the
-    /// first listener is kept.
-    pub(crate) fn notify_marks_to(&self, listener: Arc<dyn MarkListener>) {
-        if self.mark_listener.set(listener).is_err() {
+    /// Attaches the listener told when a symbol gains a usable mark, and tells
+    /// it at once about every symbol already holding one: the price monitor
+    /// runs before the listener exists, and a mark that arrived first never
+    /// notifies again while it stays usable. Only the first listener is kept.
+    pub(crate) async fn notify_marks_to(&self, listener: Arc<dyn MarkListener>) {
+        if self.mark_listener.set(listener.clone()).is_err() {
             warn!(target: "dashboard", "A mark listener is already attached; keeping the first");
+            return;
+        }
+
+        // Read after attaching: a mark stored before this read is replayed
+        // here, and one stored after it notifies through `update`.
+        let now = Utc::now();
+        let marked: Vec<Symbol> = self
+            .prices
+            .read()
+            .await
+            .iter()
+            .filter(|(_, price)| {
+                price.as_ref().is_some_and(|price| {
+                    price.underlying_price_usd.is_some() && price.expires_at > now
+                })
+            })
+            .map(|(symbol, _)| symbol.clone())
+            .collect();
+        for symbol in &marked {
+            listener.mark_available(symbol).await;
         }
     }
 
@@ -833,7 +855,7 @@ mod tests {
     };
     use url::Url;
 
-    use st0x_config::{ChainEquities, ChainEquityAsset, OperationMode};
+    use st0x_config::{ChainEquities, ChainEquityAsset, OperationMode, RebalancingMode};
 
     use super::*;
 
@@ -900,7 +922,7 @@ mod tests {
                         tokenized_equity_derivative: TEST_DERIVATIVE,
                         vault_ids: Vec::new(),
                         trading: OperationMode::Enabled,
-                        rebalancing: OperationMode::Disabled,
+                        rebalancing: RebalancingMode::Disabled,
                         wrapped_equity_recovery: OperationMode::Disabled,
                         operational_limit: None,
                         target_share: None,
@@ -974,7 +996,7 @@ mod tests {
             mark_listener: Arc::default(),
         };
         let listener = Arc::new(RecordingMarkListener::default());
-        store.notify_marks_to(listener.clone());
+        store.notify_marks_to(listener.clone()).await;
         let start = Utc::now();
 
         assert!(store.update(&symbol, price_with_mark(start, false)).await);
@@ -1017,7 +1039,7 @@ mod tests {
             mark_listener: Arc::default(),
         };
         let listener = Arc::new(RecordingMarkListener::default());
-        store.notify_marks_to(listener.clone());
+        store.notify_marks_to(listener.clone()).await;
         assert!(
             store.mark(&symbol, Utc::now()).await.is_none(),
             "the held mark has expired"
@@ -1030,6 +1052,41 @@ mod tests {
         );
 
         assert_eq!(*listener.0.lock().await, vec![symbol]);
+    }
+
+    /// The price monitor starts before the conductor attaches the listener,
+    /// and a mark that is already usable never notifies again, so attaching
+    /// replays every symbol holding a usable mark, and only those.
+    #[tokio::test]
+    async fn attaching_the_listener_replays_marks_that_arrived_first() {
+        let now = Utc::now();
+        let (marked, unpriced, priced_without_mark, expired) = (
+            Symbol::new("SPY").unwrap(),
+            Symbol::new("AAPL").unwrap(),
+            Symbol::new("FGI").unwrap(),
+            Symbol::new("SPYM").unwrap(),
+        );
+        let stale = now - TimeDelta::seconds(60);
+        let store = EquityPriceStore {
+            prices: Arc::new(RwLock::new(HashMap::from([
+                (marked.clone(), Some(price_with_mark(now, true))),
+                (unpriced, None),
+                (priced_without_mark, Some(price_with_mark(now, false))),
+                (
+                    expired,
+                    Some(AvailablePrice {
+                        expires_at: stale + TimeDelta::seconds(30),
+                        ..price_with_mark(stale, true)
+                    }),
+                ),
+            ]))),
+            mark_listener: Arc::default(),
+        };
+        let listener = Arc::new(RecordingMarkListener::default());
+
+        store.notify_marks_to(listener.clone()).await;
+
+        assert_eq!(*listener.0.lock().await, vec![marked]);
     }
 
     #[tokio::test]

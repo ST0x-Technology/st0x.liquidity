@@ -731,7 +731,7 @@ impl ChainRole {
     /// Whether a chain in this role rebalances equity on `assets`, and so
     /// needs a wrapper vault, issuer client, redemption wallet and the equity
     /// MAX approvals there. The primary always does; a secondary only when one
-    /// of its equities opts in.
+    /// of its equities opts in, enabled or paused.
     pub fn rebalances_equity(self, assets: &ChainAssets) -> bool {
         match self {
             Self::Primary => true,
@@ -741,8 +741,9 @@ impl ChainRole {
 
     /// The equities a chain in this role wraps and redeems on `assets`, in
     /// symbol order so approval grants and preflight failures are
-    /// deterministic: on the primary every equity with trading or rebalancing
-    /// enabled; on a secondary only the equities that opt into rebalancing,
+    /// deterministic: on the primary every equity with trading enabled or
+    /// rebalancing enabled or paused; on a secondary only the equities that
+    /// opt into rebalancing, enabled or paused,
     /// so a trading-only equity there is hedged but never wrapped, and a
     /// hedge-only secondary lists none.
     pub fn rebalanced_equities(self, assets: &ChainAssets) -> Vec<(&Symbol, &ChainEquityAsset)> {
@@ -752,10 +753,9 @@ impl ChainRole {
             .iter()
             .filter(|(_, equity)| match self {
                 Self::Primary => {
-                    equity.trading == OperationMode::Enabled
-                        || equity.rebalancing == OperationMode::Enabled
+                    equity.trading == OperationMode::Enabled || equity.rebalancing.keeps_services()
                 }
-                Self::Secondary => equity.rebalancing == OperationMode::Enabled,
+                Self::Secondary => equity.rebalancing.keeps_services(),
             })
             .collect::<Vec<_>>();
         equities.sort_by_key(|(symbol, _)| *symbol);
@@ -836,8 +836,8 @@ impl ChainRegistry {
     }
 
     /// Runs every `[chains.<name>]` check that reads the config file alone,
-    /// and hands back the primary chain's table so the caller can keep
-    /// validating against it.
+    /// and hands back the primary chain and its table so the caller can keep
+    /// validating against them.
     ///
     /// [`Self::new`] performs these same checks plus the config/secrets
     /// pairing (each chain's `rpc_url`), which is why the secrets-free
@@ -845,9 +845,10 @@ impl ChainRegistry {
     /// fails here fails startup too, whatever the secrets file holds.
     pub fn validate_configs(
         configs: &BTreeMap<Chain, ChainConfig>,
-    ) -> Result<&TradingConfig, ChainRegistryError> {
+    ) -> Result<(Chain, &TradingConfig), ChainRegistryError> {
         let EnabledChains {
             enabled,
+            primary_chain,
             trading_table,
             ..
         } = enabled_chains(configs)?;
@@ -860,7 +861,7 @@ impl ChainRegistry {
             }
         }
 
-        Ok(trading_table)
+        Ok((primary_chain, trading_table))
     }
 
     /// THE primary chain: the one the bot rebalances automatically. Every
@@ -914,6 +915,13 @@ impl ChainRegistry {
         self.secondary.insert(chain.chain, chain);
     }
 
+    /// Adds a transport chain (RPC and depth only), so a fixture can give
+    /// Ethereum its own confirmation depth.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn insert_transport(&mut self, chain: ChainCtx) {
+        self.transport.insert(chain.chain, chain);
+    }
+
     /// A registry holding one primary chain and nothing else.
     ///
     /// Test and fixture construction only: production registries come from
@@ -961,7 +969,7 @@ mod tests {
     use st0x_float_macro::float;
 
     use super::*;
-    use crate::assets::ChainEquities;
+    use crate::assets::{ChainEquities, RebalancingMode};
 
     #[derive(Debug, Deserialize)]
     struct CutoffWrapper {
@@ -982,7 +990,7 @@ mod tests {
                         tokenized_equity_derivative: Address::repeat_byte(0xa6),
                         vault_ids: Vec::new(),
                         trading: OperationMode::Disabled,
-                        rebalancing: OperationMode::Enabled,
+                        rebalancing: RebalancingMode::Enabled,
                         wrapped_equity_recovery: OperationMode::Disabled,
                         operational_limit: None,
                         target_share: None,
@@ -1000,10 +1008,11 @@ mod tests {
     }
 
     /// The primary wraps every equity that trades or rebalances; a secondary
-    /// only those that opt into rebalancing, in symbol order on both.
+    /// only those that opt into rebalancing, enabled or paused, in symbol
+    /// order on both.
     #[test]
     fn role_rebalanced_equities_narrow_to_opted_in_equities_on_a_secondary() {
-        let equity = |trading: OperationMode, rebalancing: OperationMode| ChainEquityAsset {
+        let equity = |trading: OperationMode, rebalancing: RebalancingMode| ChainEquityAsset {
             tokenized_equity: Address::repeat_byte(0xa5),
             tokenized_equity_derivative: Address::repeat_byte(0xa6),
             vault_ids: Vec::new(),
@@ -1018,15 +1027,19 @@ mod tests {
                 symbols: HashMap::from([
                     (
                         Symbol::new("TSLA").unwrap(),
-                        equity(OperationMode::Enabled, OperationMode::Disabled),
+                        equity(OperationMode::Enabled, RebalancingMode::Disabled),
                     ),
                     (
                         Symbol::new("NVDA").unwrap(),
-                        equity(OperationMode::Disabled, OperationMode::Disabled),
+                        equity(OperationMode::Disabled, RebalancingMode::Disabled),
                     ),
                     (
                         Symbol::new("AAPL").unwrap(),
-                        equity(OperationMode::Disabled, OperationMode::Enabled),
+                        equity(OperationMode::Disabled, RebalancingMode::Enabled),
+                    ),
+                    (
+                        Symbol::new("MSFT").unwrap(),
+                        equity(OperationMode::Disabled, RebalancingMode::Paused),
                     ),
                 ]),
                 operational_limit: None,
@@ -1040,8 +1053,8 @@ mod tests {
                 .collect::<Vec<_>>()
         };
 
-        assert_eq!(symbols(ChainRole::Primary), vec!["AAPL", "TSLA"]);
-        assert_eq!(symbols(ChainRole::Secondary), vec!["AAPL"]);
+        assert_eq!(symbols(ChainRole::Primary), vec!["AAPL", "MSFT", "TSLA"]);
+        assert_eq!(symbols(ChainRole::Secondary), vec!["AAPL", "MSFT"]);
         assert!(
             ChainRole::Secondary
                 .rebalanced_equities(&ChainAssets::default())
@@ -1574,7 +1587,7 @@ mod tests {
                 tokenized_equity_derivative: Address::ZERO,
                 vault_ids: Vec::new(),
                 trading: OperationMode::Disabled,
-                rebalancing: OperationMode::Disabled,
+                rebalancing: RebalancingMode::Disabled,
                 wrapped_equity_recovery: OperationMode::Enabled,
                 operational_limit: None,
                 target_share: None,
