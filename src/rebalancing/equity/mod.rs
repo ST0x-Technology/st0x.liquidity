@@ -1400,9 +1400,13 @@ impl MintError {
     /// broader match keeps this predicate correct for any `MintError`
     /// regardless of call site.
     fn is_insufficient_balance_revert(&self) -> bool {
-        let (Self::Raindex(RaindexError::Evm(EvmError::Transport(rpc_error)))
-        | Self::Wrapper(WrapperError::Evm(EvmError::Transport(rpc_error)))) = self
+        let (Self::Raindex(RaindexError::Evm(evm_error))
+        | Self::Wrapper(WrapperError::Evm(evm_error))) = self
         else {
+            return false;
+        };
+
+        let EvmError::Transport(rpc_error) = evm_error.underlying() else {
             return false;
         };
 
@@ -7671,6 +7675,34 @@ mod tests {
                 )))
             ),
             "expected PostReceipt(Wrapper(NodeBehindRequiredBlock)), got: {error:?}"
+        );
+    }
+
+    #[test]
+    fn insufficient_balance_revert_is_recognized_when_rejected_before_broadcast() {
+        let revert = || {
+            EvmError::Transport(alloy::transports::RpcError::ErrorResp(
+                alloy::rpc::json_rpc::ErrorPayload {
+                    code: 3,
+                    message: "execution reverted".into(),
+                    data: Some(
+                        serde_json::value::to_raw_value(&format!(
+                            "{ERC20_INSUFFICIENT_BALANCE_SELECTOR}00"
+                        ))
+                        .unwrap(),
+                    ),
+                },
+            ))
+        };
+
+        assert!(MintError::Raindex(RaindexError::Evm(revert())).is_insufficient_balance_revert());
+        assert!(
+            MintError::Raindex(RaindexError::Evm(EvmError::RejectedBeforeBroadcast {
+                source: Box::new(revert()),
+            }))
+            .is_insufficient_balance_revert(),
+            "a deposit whose gas estimate reverted is rejected before broadcast, and the \
+             recovery must still recognize the insufficient-balance revert"
         );
     }
 }

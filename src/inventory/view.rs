@@ -1791,6 +1791,14 @@ impl InventoryView {
         self
     }
 
+    /// The block of the last onchain USDC snapshot the view applied for
+    /// `chain`, if any carried a block.
+    pub(crate) fn onchain_usdc_block_watermark(&self, chain: Chain) -> Option<u64> {
+        self.onchain_usdc_snapshot_block_watermark
+            .get(&chain)
+            .copied()
+    }
+
     /// Advance the venue-level onchain USDC block watermark after an
     /// `OnchainUsdc` snapshot applied.
     fn record_onchain_usdc_block_watermark(

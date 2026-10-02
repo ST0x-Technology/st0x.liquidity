@@ -299,6 +299,9 @@ pub(crate) trait TxSubmitter: Send + Sync {
     /// success with that local hash: the exact signed envelope is known before
     /// broadcast, so callers never lose transaction identity or retry the
     /// business operation at a later nonce.
+    ///
+    /// A failure before the raw send (gas estimation, filling, signing) is
+    /// returned as [`EvmError::RejectedBeforeBroadcast`].
     async fn submit(&self, tx: TransactionRequest) -> Result<TxHash, EvmError>;
 
     /// Assigns the next nonce for `address` via `nonce_manager`, mirroring
@@ -350,14 +353,21 @@ where
     P: Provider<Ethereum>,
 {
     async fn submit(&self, tx: TransactionRequest) -> Result<TxHash, EvmError> {
-        let tx = pin_padded_gas_limit(self, tx, GasLimitSource::Estimate).await?;
+        let envelope = async {
+            let tx = pin_padded_gas_limit(self, tx, GasLimitSource::Estimate).await?;
 
-        // `FillProvider::fill` runs the filler chain until all dependencies are
-        // satisfied, then returns the signed envelope without broadcasting.
-        let sendable = self.fill(tx).await?;
-        let envelope = sendable
-            .try_into_envelope()
-            .map_err(|_| EvmError::TransactionPreparation)?;
+            // `FillProvider::fill` runs the filler chain until all dependencies
+            // are satisfied, then returns the signed envelope without
+            // broadcasting.
+            let sendable = self.fill(tx).await?;
+            sendable
+                .try_into_envelope()
+                .map_err(|_| EvmError::TransactionPreparation)
+        }
+        .await
+        .map_err(|source| EvmError::RejectedBeforeBroadcast {
+            source: Box::new(source),
+        })?;
         let encoded = envelope.encoded_2718();
         let tx_hash = keccak256(&encoded);
 
@@ -633,6 +643,10 @@ where
 /// `in_flight` its [`InFlightNonces`] record of its own unconfirmed sends,
 /// and `send_lock` serializes all sends from this wallet.
 ///
+/// Only a first attempt rejected before its raw send comes back as
+/// [`EvmError::RejectedBeforeBroadcast`]. Nonce and fee recovery drop the
+/// marker: the raw send that triggered recovery may have been accepted.
+///
 /// The nonce is assigned explicitly via [`TxSubmitter::assign_nonce`] and
 /// pinned onto the request before it is submitted, rather than left for the
 /// signing provider's own filler to assign invisibly: this is what makes the
@@ -689,7 +703,7 @@ where
             contract,
             calldata,
             note,
-            error,
+            error.into_underlying(),
         )
         .await;
     }
@@ -1107,7 +1121,11 @@ where
             .input(calldata.clone().into())
             .nonce(retry_nonce);
 
-        match submitter.submit(retry_tx).await {
+        match submitter
+            .submit(retry_tx)
+            .await
+            .map_err(EvmError::into_underlying)
+        {
             Ok(tx_hash) => {
                 info!(target: "wallet", %tx_hash, note, attempt, nonce = retry_nonce, "Transaction submitted");
                 in_flight.record(address, retry_nonce, tx_hash);
@@ -1263,7 +1281,11 @@ where
             "Resubmitting stuck transaction with bumped fee"
         );
 
-        let error = match submitter.submit(tx).await {
+        let error = match submitter
+            .submit(tx)
+            .await
+            .map_err(EvmError::into_underlying)
+        {
             Ok(tx_hash) => {
                 info!(target: "wallet", %tx_hash, note, attempt, "Replacement transaction accepted");
                 in_flight.record(address, nonce, tx_hash);
@@ -1432,6 +1454,12 @@ mod tests {
 
     fn reverted() -> EvmError {
         rpc_error("execution reverted")
+    }
+
+    fn unsent(source: EvmError) -> EvmError {
+        EvmError::RejectedBeforeBroadcast {
+            source: Box::new(source),
+        }
     }
 
     fn prepared_tx_hash() -> TxHash {
@@ -3255,6 +3283,136 @@ mod tests {
             "expected the original revert surfaced verbatim, got {error:?}"
         );
         assert_eq!(mock.sent().len(), 1, "no resubmit for a hard revert");
+    }
+
+    #[tokio::test]
+    async fn first_send_rejected_before_broadcast_keeps_the_marker() {
+        const SEEDED_SENTINEL_NONCE: u64 = 888_888;
+        let mock = MockSubmitter::new(vec![Err(unsent(reverted()))]);
+
+        let (result, nonce_manager) = run_with_seeded_manager(&mock, SEEDED_SENTINEL_NONCE).await;
+
+        let error = result.unwrap_err();
+        assert!(error.was_never_broadcast(), "got {error:?}");
+        assert!(error.is_revert(), "the marker must not hide the revert");
+        assert_eq!(mock.sent().len(), 1, "no resubmit for a hard revert");
+        assert_eq!(
+            nonce_manager.peek_next_nonce(WALLET).await,
+            None,
+            "a rejected first send still invalidates the nonce cache"
+        );
+    }
+
+    #[tokio::test]
+    async fn first_send_rejected_by_the_raw_send_is_not_marked() {
+        let mock = MockSubmitter::new(vec![Err(reverted())]);
+
+        let error = run(&mock).await.unwrap_err();
+
+        assert!(!error.was_never_broadcast(), "got {error:?}");
+    }
+
+    #[tokio::test]
+    async fn first_send_marked_nonce_too_low_still_recovers() {
+        let hash = TxHash::repeat_byte(0x34);
+        let mock = MockSubmitter::new(vec![Err(unsent(nonce_too_low_with_hint())), Ok(hash)]);
+
+        let result = run(&mock).await;
+
+        assert_eq!(result.unwrap(), hash);
+        assert_eq!(mock.sent()[1].nonce, Some(HINTED_NONCE));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn nonce_too_low_retry_rejected_before_broadcast_is_not_marked() {
+        let mock = MockSubmitter::new(vec![
+            Err(nonce_too_low_with_hint()),
+            Err(unsent(reverted())),
+        ]);
+
+        let error = run(&mock).await.unwrap_err();
+
+        assert!(
+            !error.was_never_broadcast(),
+            "the base send may have been accepted before its nonce-too-low \
+             rejection, so the retry's error must not claim nothing was \
+             broadcast; got {error:?}"
+        );
+        assert!(error.is_revert());
+        assert_eq!(mock.sent().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn fee_bumped_resubmit_rejected_before_broadcast_is_not_marked() {
+        let mock = MockSubmitter::new(vec![Err(underpriced()), Err(unsent(reverted()))]);
+
+        let error = run(&mock).await.unwrap_err();
+
+        assert!(
+            !error.was_never_broadcast(),
+            "a transaction already occupied the nonce, so the resubmit's error \
+             must not claim nothing was broadcast; got {error:?}"
+        );
+        assert_eq!(mock.sent().len(), 2);
+    }
+
+    #[cfg(feature = "local-signer")]
+    #[tokio::test]
+    async fn signing_provider_marks_an_estimate_revert_as_never_broadcast() {
+        let asserter = Asserter::new();
+        asserter.push_failure(ErrorPayload {
+            code: 3,
+            message: Cow::Borrowed("execution reverted"),
+            data: Some(serde_json::value::to_raw_value("0xdeadbeef").expect("valid JSON")),
+        });
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+        let private_key = alloy::primitives::B256::repeat_byte(1);
+        let wallet = crate::local::RawPrivateKeyWallet::new(&private_key, provider, 1).unwrap();
+        let tx = TransactionRequest::default()
+            .from(wallet.address())
+            .to(CONTRACT)
+            .nonce(0)
+            .with_chain_id(1)
+            .max_fee_per_gas(1_000_000_000)
+            .max_priority_fee_per_gas(100_000_000);
+
+        let error = TxSubmitter::submit(wallet.signing_provider(), tx)
+            .await
+            .unwrap_err();
+
+        assert!(error.was_never_broadcast(), "got {error:?}");
+        assert_eq!(
+            error.revert_data(),
+            Some(Bytes::from_static(&[0xde, 0xad, 0xbe, 0xef]))
+        );
+    }
+
+    #[cfg(feature = "local-signer")]
+    #[tokio::test]
+    async fn signing_provider_does_not_mark_a_raw_send_rejection() {
+        let asserter = Asserter::new();
+        asserter.push_success(&U64::from(21_000));
+        asserter.push_failure(ErrorPayload {
+            code: -32000,
+            message: Cow::Borrowed("insufficient funds for gas * price + value"),
+            data: None,
+        });
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+        let private_key = alloy::primitives::B256::repeat_byte(1);
+        let wallet = crate::local::RawPrivateKeyWallet::new(&private_key, provider, 1).unwrap();
+        let tx = TransactionRequest::default()
+            .from(wallet.address())
+            .to(CONTRACT)
+            .nonce(0)
+            .with_chain_id(1)
+            .max_fee_per_gas(1_000_000_000)
+            .max_priority_fee_per_gas(100_000_000);
+
+        let error = TxSubmitter::submit(wallet.signing_provider(), tx)
+            .await
+            .unwrap_err();
+
+        assert!(!error.was_never_broadcast(), "got {error:?}");
     }
 
     #[tokio::test]

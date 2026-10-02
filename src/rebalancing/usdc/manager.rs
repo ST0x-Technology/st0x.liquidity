@@ -36,7 +36,7 @@ use st0x_execution::{
 };
 use st0x_finance::{HasZero, Usd, Usdc};
 use st0x_float_macro::float;
-use st0x_raindex::{Raindex, RaindexError, RaindexService, RaindexVaultId};
+use st0x_raindex::{Raindex, RaindexError, RaindexService, RaindexVaultId, WithdrawBroadcast};
 
 use super::driver_pause::UsdcDriverGate;
 use super::{
@@ -325,22 +325,30 @@ impl<EthWallet: Wallet, BaseWallet: Wallet> UsdcBridgeHelper for CctpBridge<EthW
     }
 }
 
-/// Classifies a failed vault `withdraw`. An atomic
-/// [`RaindexError::InsufficientVaultLiquidity`] revert means the vault could not
-/// cover the request; it withdrew nothing (atomic revert), so retrying only
-/// reverts again until the vault is refunded. It is surfaced as a distinct,
+/// Classifies a failed vault `withdraw` that `withdraw_from_vault` did not
+/// fail outright. A [`RaindexError::InsufficientVaultLiquidity`] revert means
+/// the vault could not cover the request, but here a withdraw for this
+/// transfer may have been broadcast (a mined revert, or a resend after the
+/// first raw send may have been accepted). It is surfaced as a distinct,
 /// contextful error the job latches for operator reconciliation (no auto-retry)
 /// rather than the opaque `Vault` wrap, which the job redrives. Any other error
 /// keeps the opaque wrap and the normal redrive path.
-fn classify_vault_withdrawal_error(error: RaindexError) -> UsdcTransferError {
+fn classify_vault_withdrawal_error(
+    id: &UsdcRebalanceId,
+    from_block: u64,
+    error: RaindexError,
+) -> UsdcTransferError {
     match error {
         RaindexError::InsufficientVaultLiquidity {
             token,
             requested,
             received,
+            broadcast,
         } => {
-            warn!(target: "rebalance", %token, %requested, %received, "Vault under-funded on withdraw; latching for operator reconciliation (no auto-retry)");
+            warn!(target: "rebalance", %id, from_block, %token, %requested, %received, %broadcast, "Vault under-funded on withdraw; latching for operator reconciliation (no auto-retry)");
             UsdcTransferError::InsufficientVaultLiquidity {
+                id: id.clone(),
+                from_block,
                 token,
                 requested,
                 received,
@@ -5275,10 +5283,82 @@ impl<
             .await
         {
             Ok(tx) => tx,
-            Err(error) => return Err(classify_vault_withdrawal_error(error)),
+            Err(RaindexError::InsufficientVaultLiquidity {
+                token,
+                requested,
+                received,
+                broadcast: WithdrawBroadcast::NotBroadcast,
+            }) => {
+                return Err(self
+                    .reject_unsent_withdrawal(id, from_block, token, requested, received)
+                    .await);
+            }
+            Err(error) => return Err(classify_vault_withdrawal_error(id, from_block, error)),
         };
 
         self.record_vault_withdrawal(id, amount, withdraw_tx).await
+    }
+
+    /// Fails a transfer whose vault withdraw the vault could not cover and the
+    /// evm layer proved was rejected before broadcast. This is the only call
+    /// that issues this transfer's withdraw, and `BeginWithdrawal` precedes
+    /// it, so no withdraw for this transfer exists anywhere and failing it is
+    /// safe. The guard then clears and rebalancing plans again from fresh
+    /// balances instead of resuming into a scan that can never find a
+    /// withdrawal.
+    ///
+    /// If `RejectWithdrawal` cannot be confirmed, the transfer latches as for
+    /// any other under-funded withdraw: a redrive would only scan.
+    async fn reject_unsent_withdrawal(
+        &self,
+        id: &UsdcRebalanceId,
+        from_block: u64,
+        token: Address,
+        requested: U256,
+        received: U256,
+    ) -> UsdcTransferError {
+        warn!(target: "rebalance", %id, %token, %requested, %received, "Vault under-funded; withdraw rejected before broadcast; failing the transfer");
+
+        let rejected = UsdcTransferError::WithdrawalRejectedUnderfunded {
+            id: id.clone(),
+            token,
+            requested,
+            received,
+        };
+        let Err(error) = self
+            .cqrs
+            .send(
+                id,
+                UsdcRebalanceCommand::RejectWithdrawal {
+                    reason: format!(
+                        "inventory vault under-funded: requested {requested} of {token}, vault \
+                         could cover {received}; withdraw rejected before broadcast"
+                    ),
+                },
+            )
+            .await
+        else {
+            return rejected;
+        };
+
+        // A reactor error can surface after the event committed.
+        if let Ok(Some(UsdcRebalance::WithdrawalFailed {
+            withdrawal_ref: None,
+            ..
+        })) = self.cqrs.load(id).await
+        {
+            warn!(target: "rebalance", %id, ?error, "RejectWithdrawal committed but reported an error");
+            return rejected;
+        }
+
+        error!(target: "rebalance", %id, ?error, "Failed to record RejectWithdrawal; latching at WithdrawalSubmitting");
+        UsdcTransferError::InsufficientVaultLiquidity {
+            id: id.clone(),
+            from_block,
+            token,
+            requested,
+            received,
+        }
     }
 
     /// Resumes a transfer stalled at `WithdrawalSubmitting` by adopting the
@@ -24897,6 +24977,99 @@ mod tests {
         assert_eq!(jobs[0].symbol, None, "USDC paths carry no symbol");
     }
 
+    /// Runtime bytecode that reverts every call with `revert_data`.
+    fn always_reverting_code(revert_data: &[u8]) -> Bytes {
+        let length = u8::try_from(revert_data.len()).unwrap();
+        let mut code = Vec::new();
+        for (index, word) in revert_data.chunks(32).enumerate() {
+            let mut padded = [0u8; 32];
+            padded[..word.len()].copy_from_slice(word);
+            code.push(0x7f); // PUSH32 word
+            code.extend_from_slice(&padded);
+            code.push(0x60); // PUSH1 offset
+            code.push(u8::try_from(index * 32).unwrap());
+            code.push(0x52); // MSTORE
+        }
+        code.extend_from_slice(&[0x60, length, 0x60, 0x00, 0xfd]); // REVERT(0, length)
+        Bytes::from(code)
+    }
+
+    /// The production incident: the inventory vault cannot cover the
+    /// withdraw, so its gas estimate reverts and nothing is sent. The
+    /// transfer must fail (guard released), and a resume must find a
+    /// terminal state instead of scanning for a withdrawal that never existed.
+    #[tokio::test]
+    async fn under_funded_withdraw_rejected_before_broadcast_fails_the_transfer() {
+        let pool = SqlitePool::connect(":memory:").await.unwrap();
+        sqlx::migrate!().run(&pool).await.unwrap();
+        let cqrs = Arc::new(test_store(pool, ()));
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let amount = usdc("1971.318665");
+        let amount_u256 = usdc_to_u256(amount).unwrap();
+
+        let (_anvil, endpoint, private_key) = setup_anvil();
+        let wallet = create_test_wallet(&endpoint, &private_key);
+        let revert = sol_types::SolError::abi_encode(
+            &crate::bindings::IRaindexInventory::InsufficientVaultLiquidity {
+                token: Chain::Base.settlement_stable().address,
+                requested: amount_u256,
+                received: U256::ZERO,
+            },
+        );
+        wallet
+            .provider()
+            .anvil_set_code(ORDERBOOK_ADDRESS, always_reverting_code(&revert))
+            .await
+            .unwrap();
+        let (manager, _apalis_pool, _server) =
+            manager_with_bot_gas_queue(cqrs.clone(), wallet.clone(), MockBridge::new()).await;
+
+        let error = manager
+            .withdraw_from_vault(&id, amount, amount_u256)
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                &error,
+                UsdcTransferError::WithdrawalRejectedUnderfunded { id: error_id, requested, received, .. }
+                    if *error_id == id && *requested == amount_u256 && *received == U256::ZERO
+            ),
+            "expected WithdrawalRejectedUnderfunded, got {error:?}"
+        );
+        let state = cqrs.load(&id).await.unwrap().unwrap();
+        assert!(
+            matches!(
+                state,
+                UsdcRebalance::WithdrawalFailed {
+                    withdrawal_ref: None,
+                    ..
+                }
+            ),
+            "expected WithdrawalFailed with no withdrawal, got {state:?}"
+        );
+        assert!(!state.holds_rebalance_guard());
+        assert_eq!(
+            wallet
+                .provider()
+                .get_transaction_count(wallet.address())
+                .await
+                .unwrap(),
+            0,
+            "no withdraw transaction may have been sent"
+        );
+
+        let resumed = manager
+            .resume_base_to_alpaca(&id, amount, UsdcCorridor::BASE_CCTP)
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(resumed, UsdcTransferError::PreviouslyFailedAggregate { .. }),
+            "a resume must end at the terminal failure, not scan; got {resumed:?}"
+        );
+    }
+
     /// A corridor off Base scans its own chain's stable for the withdrawal
     /// it adopts and books that withdrawal's gas on its own chain.
     #[tokio::test]
@@ -27435,18 +27608,25 @@ mod tests {
     }
 
     #[test]
-    fn under_funded_vault_withdraw_surfaces_distinct_terminal_error() {
-        // An atomic InsufficientVaultLiquidity revert withdrew nothing, so it
-        // must surface the distinct terminal variant (which the job latches for
-        // operator reconciliation, no auto-retry) rather than the opaque Vault
-        // wrap the job redrives.
-        let error = classify_vault_withdrawal_error(RaindexError::InsufficientVaultLiquidity {
-            token: USDC_BASE,
-            requested: U256::from(1_000_000u64),
-            received: U256::from(400_000u64),
-        });
+    fn under_funded_vault_withdraw_that_may_have_broadcast_latches() {
+        // A revert that may follow an accepted broadcast must surface the
+        // distinct latch variant (no auto-retry, no failure recorded) rather
+        // than the opaque Vault wrap the job redrives.
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let error = classify_vault_withdrawal_error(
+            &id,
+            52_027_377,
+            RaindexError::InsufficientVaultLiquidity {
+                token: USDC_BASE,
+                requested: U256::from(1_000_000u64),
+                received: U256::from(400_000u64),
+                broadcast: WithdrawBroadcast::MayHaveBroadcast,
+            },
+        );
 
         let UsdcTransferError::InsufficientVaultLiquidity {
+            id: error_id,
+            from_block,
             token,
             requested,
             received,
@@ -27454,6 +27634,8 @@ mod tests {
         else {
             panic!("under-funded revert must surface the distinct terminal error, got: {error:?}");
         };
+        assert_eq!(error_id, id);
+        assert_eq!(from_block, 52_027_377);
         assert_eq!(token, USDC_BASE);
         assert_eq!(requested, U256::from(1_000_000u64));
         assert_eq!(received, U256::from(400_000u64));
@@ -27463,7 +27645,11 @@ mod tests {
     fn non_under_funded_vault_withdraw_wraps_opaquely_for_redrive() {
         // Any other RaindexError keeps the opaque Vault wrap so the caller's
         // normal redrive path still runs.
-        let error = classify_vault_withdrawal_error(RaindexError::ZeroAmount);
+        let error = classify_vault_withdrawal_error(
+            &UsdcRebalanceId(Uuid::new_v4()),
+            0,
+            RaindexError::ZeroAmount,
+        );
 
         assert!(
             matches!(error, UsdcTransferError::Vault(RaindexError::ZeroAmount)),

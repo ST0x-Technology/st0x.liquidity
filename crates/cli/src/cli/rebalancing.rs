@@ -717,6 +717,7 @@ fn is_bot_resumable_wait(error: &UsdcTransferError) -> bool {
         | UsdcTransferError::BurnRevert(_)
         | UsdcTransferError::Vault(_)
         | UsdcTransferError::InsufficientVaultLiquidity { .. }
+        | UsdcTransferError::WithdrawalRejectedUnderfunded { .. }
         | UsdcTransferError::Aggregate(_)
         | UsdcTransferError::WithdrawalFailed { .. }
         | UsdcTransferError::DepositFailed { .. }
@@ -1168,6 +1169,44 @@ fn classify_fail_bridging_reload(state: Option<&UsdcRebalance>) -> FailBridgingO
     }
 }
 
+/// Fails a BaseToAlpaca transfer at `WithdrawalSubmitting` with
+/// `RejectWithdrawal`. Its vault withdraw was never recorded as initiated, so
+/// failing it moves no inventory and clears the guard. The command cannot
+/// prove the withdraw never landed: the operator confirms on chain first that
+/// the bot wallet made no `OperatorWithdraw` after `from_block`.
+async fn reject_unsent_usdc_withdrawal<Writer: Write>(
+    stdout: &mut Writer,
+    usdc_store: &Store<UsdcRebalance>,
+    id: &UsdcRebalanceId,
+    reason: &AuditReason,
+    from_block: u64,
+) -> anyhow::Result<()> {
+    writeln!(
+        stdout,
+        "Transfer {id} is a Base->Alpaca transfer at WithdrawalSubmitting (withdrawal scan \
+         from block {from_block}). Failing it as a withdrawal that never reached the chain."
+    )?;
+
+    usdc_store
+        .send(
+            id,
+            UsdcRebalanceCommand::RejectWithdrawal {
+                reason: reason.to_string(),
+            },
+        )
+        .await?;
+
+    writeln!(
+        stdout,
+        "USDC transfer {id} transitioned to WithdrawalFailed (no withdrawal recorded). The \
+         rebalancing guard will clear on the next bot restart. If an OperatorWithdraw by the \
+         bot wallet did land after block {from_block}, its USDC is in the bot wallet and \
+         must be reconciled by hand."
+    )?;
+
+    Ok(())
+}
+
 /// Drive a pre-burn `BridgingSubmitting` or `WithdrawalComplete` USDC rebalance
 /// to `BridgingFailed { burn_tx_hash: None }`.
 ///
@@ -1201,7 +1240,13 @@ fn classify_fail_bridging_reload(state: Option<&UsdcRebalance>) -> FailBridgingO
 /// the bot running, use the live `st0x-liquidity-client debug fail-usdc-transfer`
 /// command instead; that route quiesces the USDC driver and sends through the
 /// wired store so the in memory guard is updated immediately. The live route
-/// refuses BaseToAlpaca transfers, which stay with this command.
+/// refuses BaseToAlpaca transfers past their vault withdrawal, which stay with
+/// this command.
+///
+/// A BaseToAlpaca transfer at `WithdrawalSubmitting` is failed with
+/// `RejectWithdrawal` instead (see `reject_unsent_usdc_withdrawal`), on either
+/// surface. The operator first verifies on chain that the bot wallet made no
+/// `OperatorWithdraw` after the transfer's `from_block`.
 pub(super) async fn fail_usdc_transfer_command<Writer: Write>(
     stdout: &mut Writer,
     id: Uuid,
@@ -1221,6 +1266,15 @@ pub(super) async fn fail_usdc_transfer_command<Writer: Write>(
              check the id and that you are pointed at the right database."
         );
     };
+
+    if let UsdcRebalance::WithdrawalSubmitting {
+        direction: RebalanceDirection::BaseToAlpaca,
+        from_block,
+        ..
+    } = state
+    {
+        return reject_unsent_usdc_withdrawal(stdout, &usdc_store, &id, reason, from_block).await;
+    }
 
     match state.pre_burn_fail_eligibility() {
         PreBurnFailEligibility::Eligible => {}
@@ -1259,8 +1313,9 @@ pub(super) async fn fail_usdc_transfer_command<Writer: Write>(
         // a clear error instead of surfacing the internal aggregate error.
         PreBurnFailEligibility::NotAtBridgeBoundary => {
             anyhow::bail!(
-                "fail-usdc-transfer is only valid from BridgingSubmitting (no recorded burn) \
-                 or WithdrawalComplete; transfer {id} is in {state:?}. Refusing to act."
+                "fail-usdc-transfer is only valid from BridgingSubmitting (no recorded burn), \
+                 WithdrawalComplete, or a BaseToAlpaca WithdrawalSubmitting; transfer {id} is \
+                 in {state:?}. Refusing to act."
             );
         }
     }
@@ -4715,7 +4770,8 @@ mod tests {
         let err_msg = result.unwrap_err().to_string();
         assert!(
             err_msg.contains(
-                "only valid from BridgingSubmitting (no recorded burn) or WithdrawalComplete"
+                "only valid from BridgingSubmitting (no recorded burn), WithdrawalComplete, or a \
+                 BaseToAlpaca WithdrawalSubmitting"
             ),
             "Converting state must be rejected as not in bridging phase; got: {err_msg}"
         );
@@ -4867,6 +4923,58 @@ mod tests {
         assert!(
             output.contains("restart"),
             "success message must mention 'restart'; got: {output}"
+        );
+    }
+
+    /// A Base->Alpaca transfer latched at `WithdrawalSubmitting` whose withdraw
+    /// never reached the chain must be failable: no other tool can free it.
+    #[tokio::test]
+    async fn fail_usdc_transfer_succeeds_on_base_to_alpaca_withdrawal_submitting() {
+        let pool = setup_test_db().await;
+        let id = Uuid::from_u128(0xBEEF_2843);
+        let (store, _projection) = StoreBuilder::<UsdcRebalance>::new(pool.clone())
+            .build(())
+            .await
+            .unwrap();
+        store
+            .send(
+                &UsdcRebalanceId(id),
+                UsdcRebalanceCommand::BeginWithdrawal {
+                    direction: RebalanceDirection::BaseToAlpaca,
+                    corridor: UsdcCorridor::BASE_CCTP,
+                    amount: Usdc::new(Float::parse("1971.318665".to_string()).unwrap()),
+                    from_block: 52_027_377,
+                },
+            )
+            .await
+            .unwrap();
+
+        let mut stdout = Vec::new();
+        fail_usdc_transfer_command(
+            &mut stdout,
+            id,
+            &"no withdraw landed".parse().unwrap(),
+            &pool,
+        )
+        .await
+        .expect("fail_usdc_transfer must succeed from a Base->Alpaca WithdrawalSubmitting");
+
+        let state = store.load(&UsdcRebalanceId(id)).await.unwrap().unwrap();
+        let UsdcRebalance::WithdrawalFailed {
+            ref withdrawal_ref,
+            ref reason,
+            ..
+        } = state
+        else {
+            panic!("Expected WithdrawalFailed state, got: {state:?}");
+        };
+        assert_eq!(*withdrawal_ref, None);
+        assert_eq!(reason, "no withdraw landed");
+        assert!(!state.holds_rebalance_guard());
+        let output = String::from_utf8(stdout).unwrap();
+        assert!(
+            output.contains("52027377") && output.contains("restart"),
+            "output must name the scan block and the restart; got: {output}"
         );
     }
 
@@ -5567,7 +5675,8 @@ mod tests {
         let err_msg = result.unwrap_err().to_string();
         assert!(
             err_msg.contains(
-                "only valid from BridgingSubmitting (no recorded burn) or WithdrawalComplete"
+                "only valid from BridgingSubmitting (no recorded burn), WithdrawalComplete, or a \
+                 BaseToAlpaca WithdrawalSubmitting"
             ),
             "ConversionFailed{{AlpacaToBase}} must be rejected as not in bridging phase; \
              got: {err_msg}"
@@ -5625,7 +5734,8 @@ mod tests {
         let err_msg = result.unwrap_err().to_string();
         assert!(
             err_msg.contains(
-                "only valid from BridgingSubmitting (no recorded burn) or WithdrawalComplete"
+                "only valid from BridgingSubmitting (no recorded burn), WithdrawalComplete, or a \
+                 BaseToAlpaca WithdrawalSubmitting"
             ),
             "WithdrawalFailed state must be rejected as not in bridging phase; got: {err_msg}"
         );

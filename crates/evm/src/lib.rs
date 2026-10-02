@@ -294,9 +294,45 @@ pub enum EvmError {
         required_block: u64,
         attempts: u32,
     },
+    /// A send's first attempt failed while filling or signing (for example
+    /// an `eth_estimateGas` revert), so no `eth_sendRawTransaction` was made
+    /// for that send. Only the first attempt is marked: once a send enters
+    /// nonce or fee recovery, an earlier raw send may have been accepted even
+    /// though the client saw an error. Every classifier answers for `source`.
+    #[error("rejected before broadcast: {source}")]
+    RejectedBeforeBroadcast {
+        #[source]
+        source: Box<Self>,
+    },
 }
 
 impl EvmError {
+    /// `true` when this send provably made no `eth_sendRawTransaction`: see
+    /// [`Self::RejectedBeforeBroadcast`].
+    pub fn was_never_broadcast(&self) -> bool {
+        matches!(self, Self::RejectedBeforeBroadcast { .. })
+    }
+
+    /// The error with any [`Self::RejectedBeforeBroadcast`] marker removed,
+    /// for callers that inspect the error's shape.
+    pub fn underlying(&self) -> &Self {
+        match self {
+            Self::RejectedBeforeBroadcast { source } => source.underlying(),
+            other => other,
+        }
+    }
+
+    /// Drops the [`Self::RejectedBeforeBroadcast`] marker. Nonce and fee
+    /// recovery use it, because a raw send before theirs may have been
+    /// accepted.
+    #[cfg(any(feature = "turnkey", feature = "local-signer"))]
+    pub(crate) fn into_underlying(self) -> Self {
+        match self {
+            Self::RejectedBeforeBroadcast { source } => source.into_underlying(),
+            other => other,
+        }
+    }
+
     /// `true` if this error represents an EVM transaction revert (as opposed
     /// to a transport failure or other non-revert error).
     ///
@@ -349,6 +385,7 @@ impl EvmError {
             #[cfg(feature = "turnkey")]
             Self::Turnkey(_) => false,
             Self::NodeBehindRequiredBlock { .. } => false,
+            Self::RejectedBeforeBroadcast { source } => source.is_revert(),
         }
     }
 
@@ -387,6 +424,7 @@ impl EvmError {
             #[cfg(feature = "turnkey")]
             Self::Turnkey(_) => false,
             Self::NodeBehindRequiredBlock { .. } => false,
+            Self::RejectedBeforeBroadcast { source } => source.is_transaction_dropped(),
         }
     }
 
@@ -429,6 +467,7 @@ impl EvmError {
             Self::InvalidPrivateKey(_) => false,
             #[cfg(feature = "turnkey")]
             Self::Turnkey(_) => false,
+            Self::RejectedBeforeBroadcast { source } => source.is_confirmation_pending(),
         }
     }
 
@@ -480,6 +519,7 @@ impl EvmError {
             Self::InvalidPrivateKey(_) => None,
             #[cfg(feature = "turnkey")]
             Self::Turnkey(_) => None,
+            Self::RejectedBeforeBroadcast { source } => source.revert_data(),
         }
     }
 }
@@ -502,7 +542,7 @@ impl EvmError {
     /// and what does its payload say) come from one traversal.
     #[cfg(any(feature = "turnkey", feature = "local-signer"))]
     fn nonce_too_low_payload(&self) -> Option<&alloy::rpc::json_rpc::ErrorPayload> {
-        let Self::Transport(rpc_error) = self else {
+        let Self::Transport(rpc_error) = self.underlying() else {
             return None;
         };
 
@@ -570,7 +610,7 @@ impl EvmError {
 
     #[cfg(any(feature = "turnkey", feature = "local-signer"))]
     fn already_known_payload(&self) -> Option<&alloy::rpc::json_rpc::ErrorPayload> {
-        let Self::Transport(rpc_error) = self else {
+        let Self::Transport(rpc_error) = self.underlying() else {
             return None;
         };
 
@@ -595,7 +635,7 @@ impl EvmError {
     /// needlessly replace an already-accepted transaction.
     #[cfg(any(feature = "turnkey", feature = "local-signer"))]
     pub(crate) fn is_replacement_underpriced(&self) -> bool {
-        match self {
+        match self.underlying() {
             Self::Transport(rpc_error) => rpc_error.as_error_resp().is_some_and(|payload| {
                 payload
                     .message
@@ -1791,6 +1831,37 @@ mod tests {
         assert!(
             EvmError::Transport(TransportErrorKind::backend_gone()).is_confirmation_pending(),
             "a transport failure may recover once a backend becomes visible"
+        );
+    }
+
+    #[test]
+    fn rejected_before_broadcast_classifies_as_its_source() {
+        use alloy::rpc::json_rpc::ErrorPayload;
+        use alloy::transports::{RpcError, TransportErrorKind};
+
+        let revert = || {
+            EvmError::Transport(RpcError::ErrorResp(ErrorPayload {
+                code: 3,
+                message: "execution reverted".into(),
+                data: Some(serde_json::value::to_raw_value("0xdeadbeef").unwrap()),
+            }))
+        };
+        let marked = EvmError::RejectedBeforeBroadcast {
+            source: Box::new(revert()),
+        };
+
+        assert!(marked.was_never_broadcast());
+        assert!(!revert().was_never_broadcast());
+        assert!(marked.is_revert());
+        assert_eq!(marked.revert_data(), revert().revert_data());
+        assert!(matches!(marked.underlying(), EvmError::Transport(_)));
+        assert!(!marked.is_transaction_dropped());
+        assert!(!marked.is_confirmation_pending());
+        assert!(
+            EvmError::RejectedBeforeBroadcast {
+                source: Box::new(EvmError::Transport(TransportErrorKind::backend_gone())),
+            }
+            .is_confirmation_pending()
         );
     }
 

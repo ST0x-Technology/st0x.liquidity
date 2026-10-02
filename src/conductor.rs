@@ -3859,6 +3859,7 @@ fn spawn_rebalancing_infrastructure<Signer: Wallet + Clone>(
             notifier: deps.notifier.clone(),
             driver_gate: usdc_driver_gate,
             unrecorded_guards: Some(unrecorded_guards()),
+            underfunded_alerts: rebalancing_service.underfunded_alerts().clone(),
         });
 
         let transfer_equity_to_market_making_ctx = Arc::new(TransferEquityToMarketMakingCtx {

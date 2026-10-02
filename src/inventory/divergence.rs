@@ -275,6 +275,25 @@ impl InventoryDivergenceGate {
         request.generation
     }
 
+    /// Requests a fresh onchain cash reconcile whose read must reach at least
+    /// `minimum_block`, keeping the higher floor of a request already
+    /// pending: a fill that could not apply its cash delta pins the request
+    /// to its block, and lowering that floor would let a read from a node
+    /// below the fill clear the gate. With no floor on either side, only a
+    /// read fetched after now is admitted.
+    pub(crate) fn request_onchain_cash_reconcile_at_least(
+        &self,
+        chain: Chain,
+        minimum_block: Option<u64>,
+    ) {
+        let mut pending = self.write_pending_onchain_cash();
+        let pending_floor = pending
+            .get(&chain)
+            .and_then(|request| request.minimum_block);
+        let request = self.new_reconciliation_request(pending_floor.max(minimum_block));
+        pending.insert(chain, request);
+    }
+
     pub(crate) fn claim_pending_onchain_cash_reconcile(
         &self,
         chain: Chain,
@@ -565,6 +584,58 @@ mod tests {
             !gate.is_cash_engaged(),
             "releasing the last engaged venue lifts cash suppression"
         );
+    }
+
+    /// A rejected withdraw must not lower the floor a fill pinned to its
+    /// block: a read below that block would then clear the gate.
+    #[test]
+    fn reconcile_at_least_keeps_the_higher_pending_floor() {
+        let gate = InventoryDivergenceGate::default();
+        gate.request_onchain_cash_reconcile(Chain::Base, Some(101));
+
+        gate.request_onchain_cash_reconcile_at_least(Chain::Base, Some(90));
+
+        let current = gate
+            .claim_pending_onchain_cash_reconcile(Chain::Base)
+            .expect("a pending request");
+        assert!(
+            !gate.accepts_onchain_cash_reconcile(Chain::Base, current, Utc::now(), Some(100)),
+            "a read below the fill's block must still be refused"
+        );
+        assert!(gate.accepts_onchain_cash_reconcile(Chain::Base, current, Utc::now(), Some(101)));
+    }
+
+    /// A floor above the pending one (the view's watermark) wins.
+    #[test]
+    fn reconcile_at_least_raises_the_floor() {
+        let gate = InventoryDivergenceGate::default();
+        gate.request_onchain_cash_reconcile(Chain::Base, Some(101));
+
+        gate.request_onchain_cash_reconcile_at_least(Chain::Base, Some(120));
+
+        let current = gate
+            .claim_pending_onchain_cash_reconcile(Chain::Base)
+            .expect("a pending request");
+        assert!(!gate.accepts_onchain_cash_reconcile(Chain::Base, current, Utc::now(), Some(119)));
+        assert!(gate.accepts_onchain_cash_reconcile(Chain::Base, current, Utc::now(), Some(120)));
+    }
+
+    /// With no floor on either side, the request needs a read fetched after
+    /// it.
+    #[test]
+    fn reconcile_at_least_without_a_floor_needs_a_later_read() {
+        let gate = InventoryDivergenceGate::default();
+        let earlier = gate.request_onchain_cash_reconcile(Chain::Base, None);
+        let before = Utc::now();
+
+        gate.request_onchain_cash_reconcile_at_least(Chain::Base, None);
+
+        let current = gate
+            .claim_pending_onchain_cash_reconcile(Chain::Base)
+            .expect("a pending request");
+        assert_ne!(current, earlier);
+        assert!(!gate.accepts_onchain_cash_reconcile(Chain::Base, current, before, None));
+        assert!(gate.is_cash_engaged());
     }
 
     #[test]

@@ -2299,11 +2299,12 @@ mod tests {
             .unwrap_err();
 
         // Turnkey signer errors surface through alloy's transport
-        // layer as Transport(LocalUsageError(Signer(Other(...)))) --
-        // the signer failure happens inside `send_transaction`.
+        // layer as Transport(LocalUsageError(Signer(Other(...)))). The
+        // signer fails while filling, before any raw send, so the error is
+        // marked as never broadcast.
         assert!(
-            matches!(error, EvmError::Transport(_)),
-            "expected Transport error wrapping signer failure, got: {error:?}"
+            error.was_never_broadcast() && matches!(error.underlying(), EvmError::Transport(_)),
+            "expected a never-broadcast Transport error wrapping signer failure, got: {error:?}"
         );
         let error_str = format!("{error:?}");
         assert!(
