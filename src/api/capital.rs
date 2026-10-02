@@ -2,10 +2,14 @@
 //! of `st0x-cli`, run inside the bot so they sign with its own wallets and
 //! share their nonce state instead of building a second signer.
 //!
-//! No route waits on CCTP attestation or on USDC settlement, since the ops
-//! load balancer times out first: `transfer-usdc` enqueues the transfer on
-//! the bot's own worker and returns its id, and `cctp-bridge` returns its burn
-//! tx at the broadcast. The routes that send transactions, and the
+//! No route waits on CCTP attestation, on USDC settlement, or on the
+//! confirmations of the transaction it answers with, since the ops load
+//! balancer times out first: `transfer-usdc` enqueues the transfer on the
+//! bot's own worker and returns its id, and every route that sends a
+//! transaction answers at its broadcast through `answer_from_detached` and
+//! confirms it on the task. Only a prerequisite approve, when an allowance is
+//! short, is awaited before that broadcast. The routes that
+//! send transactions, and the
 //! `transfer-usdc` enqueue, run through `spawn_detached`, so a dropped request
 //! cannot cancel them midway (between broadcast and receipt, or between the
 //! enqueue and the corridor claim it keeps), and graceful shutdown waits for
@@ -20,6 +24,7 @@ use alloy::providers::RootProvider;
 use axum::Json;
 use axum::extract::State;
 use axum::http::StatusCode;
+use futures_util::FutureExt as _;
 use rain_math_float::Float;
 use serde::{Deserialize, Serialize};
 use tracing::{error, info, warn};
@@ -28,14 +33,14 @@ use st0x_bridge::Bridge;
 use st0x_bridge::cctp::{CctpBridge, CctpCtx};
 use st0x_bridge::corridor::UsdcCorridor;
 use st0x_config::{HedgedChain, OnchainWalletCtx};
-use st0x_evm::{Chain, Evm, IERC20, OpenChainErrorRegistry, Wallet};
+use st0x_evm::{Chain, Evm, IERC20, MinedTx, OpenChainErrorRegistry, Wallet};
 use st0x_finance::{HasZero, Positive, Usdc};
 use st0x_float_serde::format_float_with_fallback;
-use st0x_raindex::{Raindex, RaindexService, RaindexVaultId, RevokeOutcome};
+use st0x_raindex::{Raindex, RaindexError, RaindexService, RaindexVaultId, RevokeOutcome};
 
 use super::{
-    CctpSourceChain, ErrorResponse, OpsError, UsdcDriverPauseRequest, ops_precondition_error,
-    quiesce_usdc_driver, spawn_detached, usdc_resume_error_response,
+    CctpSourceChain, ErrorResponse, OpsError, UsdcDriverPauseRequest, answer_from_detached,
+    ops_precondition_error, quiesce_usdc_driver, spawn_detached, usdc_resume_error_response,
 };
 use crate::AppState;
 use crate::rebalancing::UsdcResumeError;
@@ -489,126 +494,99 @@ pub(super) async fn cctp_bridge(
         )
     })?;
 
-    let resume_lock = Arc::clone(&state.resume_lock);
+    let resume_lock = Arc::clone(&state.resume_lock.0);
     let driver_pause = Arc::clone(&handle.usdc_driver_pause);
-    let (respond, response) =
-        tokio::sync::oneshot::channel::<Result<CctpBridgeResponse, OpsError>>();
-    let worker = spawn_detached(
+    answer_from_detached(
         &state.detached_tasks,
         "cctp-bridge",
         source_chain,
         async move {
-            let broadcast = async {
-                let guard = resume_lock.0.try_lock().map_err(|_| {
-                    (
-                        StatusCode::CONFLICT,
-                        Json(ErrorResponse {
-                            error: "A resume or recheck operation is already in progress".to_string(),
-                        }),
-                    )
-                })?;
-                let driver_paused = quiesce_usdc_driver(
-                    &driver_pause,
-                    UsdcDriverPauseRequest::CctpBurn { direction },
+            let resume_guard = resume_lock.try_lock_owned().map_err(|_| {
+                (
+                    StatusCode::CONFLICT,
+                    Json(ErrorResponse {
+                        error: "A resume or recheck operation is already in progress".to_string(),
+                    }),
                 )
-                .await?;
+            })?;
+            let driver_paused = quiesce_usdc_driver(
+                &driver_pause,
+                UsdcDriverPauseRequest::CctpBurn { direction },
+            )
+            .await?;
 
-                let amount = match &amount {
-                    BurnAmount::Exact(amount) => *amount,
-                    // Read under the driver pause, so no transfer spends the
-                    // balance between this read and the burn.
-                    BurnAmount::All => {
-                        let balance = source_wallet
-                            .call::<OpenChainErrorRegistry, _>(
-                                source_usdc,
-                                IERC20::balanceOfCall {
-                                    account: source_wallet.address(),
-                                },
-                            )
-                            .await
-                            .map_err(|error| onchain_failure("cctp-bridge", source_chain, &error))?;
-                        if balance.is_zero() {
-                            warn!(%source_chain, "CCTP burn of the whole balance refused: it is zero");
-                            return Err(ops_precondition_error(format!(
-                                "the {source_chain} wallet's USDC balance is zero"
-                            )));
-                        }
-                        balance
+            let amount = match &amount {
+                BurnAmount::Exact(amount) => *amount,
+                // Read under the driver pause, so no transfer spends the balance
+                // between this read and the burn.
+                BurnAmount::All => {
+                    let balance = source_wallet
+                        .call::<OpenChainErrorRegistry, _>(
+                            source_usdc,
+                            IERC20::balanceOfCall {
+                                account: source_wallet.address(),
+                            },
+                        )
+                        .await
+                        .map_err(|error| onchain_failure("cctp-bridge", source_chain, &error))?;
+                    if balance.is_zero() {
+                        warn!(%source_chain, "CCTP burn of the whole balance refused: it is zero");
+                        return Err(ops_precondition_error(format!(
+                            "the {source_chain} wallet's USDC balance is zero"
+                        )));
                     }
-                };
-
-                let burn_tx = bridge
-                    .submit_burn(direction, amount, recipient)
-                    .await
-                    .map_err(|error| onchain_failure("cctp-bridge", source_chain, &error))?;
-                info!(%burn_tx, ?direction, %amount, "CCTP burn broadcast via API");
-                Ok::<_, OpsError>((guard, driver_paused, amount, burn_tx))
-            }
-            .await;
-
-            // The lock and the pause stay held through the confirmation below.
-            let (_guard, _driver_paused, amount, burn_tx) = match broadcast {
-                Ok(broadcast) => broadcast,
-                Err(refusal) => {
-                    // A refusal, the balance read, or a reverted send broadcast
-                    // nothing. A transport error from `submit_burn` may have
-                    // broadcast anyway, which is why `onchain_failure` tells the
-                    // operator to check the chain before retrying. A dropped
-                    // request has no receiver left.
-                    let _ = respond.send(Err(refusal));
-                    return;
+                    balance
                 }
             };
-            let _ = respond.send(Ok(CctpBridgeResponse {
+
+            // A refusal, the balance read, or a reverted send broadcast nothing.
+            // A transport error from `submit_burn` may have broadcast anyway,
+            // which is why `onchain_failure` tells the operator to check the chain
+            // before retrying.
+            let burn_tx = bridge
+                .submit_burn(direction, amount, recipient)
+                .await
+                .map_err(|error| onchain_failure("cctp-bridge", source_chain, &error))?;
+            info!(%burn_tx, ?direction, %amount, "CCTP burn broadcast via API");
+
+            let confirm = async move {
+                // The lock and the pause stay held until the burn confirms.
+                let _held = (resume_guard, driver_paused);
+                match bridge.confirm_burn(direction, burn_tx, amount).await {
+                    Ok(receipt) => info!(
+                        burn_tx = %receipt.tx,
+                        ?direction,
+                        amount = %receipt.amount,
+                        "CCTP burn confirmed via API"
+                    ),
+                    Err(error) => error!(
+                        %burn_tx,
+                        ?direction,
+                        %amount,
+                        ?error,
+                        "CCTP burn broadcast via API did not confirm; check the tx onchain \
+                         before completing the mint or retrying"
+                    ),
+                }
+            };
+            let response = CctpBridgeResponse {
                 burn_tx,
                 source_chain,
                 destination_chain,
                 amount_raw: amount.to_string(),
-            }));
-
-            match bridge.confirm_burn(direction, burn_tx, amount).await {
-                Ok(receipt) => info!(
-                    burn_tx = %receipt.tx,
-                    ?direction,
-                    amount = %receipt.amount,
-                    "CCTP burn confirmed via API"
-                ),
-                Err(error) => error!(
-                    %burn_tx,
-                    ?direction,
-                    %amount,
-                    ?error,
-                    "CCTP burn broadcast via API did not confirm; check the tx onchain \
-                     before completing the mint or retrying"
-                ),
-            }
+            };
+            Ok::<_, OpsError>((response, confirm))
         },
-    )?;
-
-    // The task answers at the broadcast and keeps running to confirm the burn,
-    // so the request cannot be the one to join it: a tracked watcher does, and
-    // a panic in either phase still reaches the join failure log of
-    // `spawn_detached`, after the response or a dropped request alike.
-    state.detached_tasks.spawn(async move {
-        let _joined = worker.await;
-    });
-
-    match response.await {
-        Ok(answer) => answer.map(Json),
-        // The task dropped its sender without answering: it panicked before
-        // the broadcast, and the watcher logs the join failure.
-        Err(_answerless) => Err((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(ErrorResponse {
-                error: "cctp-bridge worker task failed".to_string(),
-            }),
-        )),
-    }
+    )
+    .await
+    .map(Json)
 }
 
 /// Zeroes the chosen chain's settlement stable allowance for that chain's
-/// orderbook, through `RaindexService::revoke_orderbook_allowance` like the
-/// startup revoke. Mirrors `st0x-cli reset-allowance`.
+/// orderbook through `RaindexService::submit_revoke_orderbook_allowance`, the
+/// broadcast half of the startup revoke. Mirrors `st0x-cli reset-allowance`.
+/// Like the vault routes, it answers at the broadcast and confirms the revoke
+/// on the detached task.
 pub(super) async fn reset_allowance(
     State(state): State<AppState>,
     Json(request): Json<ResetAllowanceRequest>,
@@ -622,20 +600,31 @@ pub(super) async fn reset_allowance(
     let owner = wallet.address();
     let raindex = RaindexService::new(wallet, contracts, owner);
 
-    let outcome = spawn_detached(
-        &state.detached_tasks,
-        "reset-allowance",
-        chain,
-        async move {
-            let outcome = raindex
-                .revoke_orderbook_allowance::<OpenChainErrorRegistry>(token)
-                .await
-                .map_err(|error| onchain_failure("reset-allowance", chain, &error))?;
-            info!(%chain, %token, %spender, ?outcome, "Orderbook allowance reset via API");
-            Ok::<_, (StatusCode, Json<ErrorResponse>)>(outcome)
-        },
-    )?
-    .await??;
+    let outcome = answer_from_detached(&state.detached_tasks, "reset-allowance", chain, async move {
+        let outcome = raindex
+            .submit_revoke_orderbook_allowance::<OpenChainErrorRegistry>(token)
+            .await
+            .map_err(|error| onchain_failure("reset-allowance", chain, &error))?;
+        info!(%chain, %token, %spender, ?outcome, "Orderbook allowance reset via API");
+
+        let confirm = async move {
+            let RevokeOutcome::Revoked { tx } = outcome else {
+                return;
+            };
+            match raindex.confirm_tx(tx).await {
+                Ok(()) => {
+                    info!(%chain, %token, %spender, %tx, "Orderbook allowance reset confirmed via API");
+                }
+                Err(error) => error!(
+                    %chain, %token, %spender, %tx, ?error,
+                    "Orderbook allowance reset via API did not confirm; check the tx onchain \
+                     before retrying"
+                ),
+            }
+        };
+        Ok::<_, OpsError>((outcome, confirm))
+    })
+    .await?;
 
     let (outcome, tx) = match outcome {
         RevokeOutcome::Revoked { tx } => (ResetAllowanceOutcome::Revoked, Some(tx)),
@@ -816,11 +805,79 @@ struct VaultOutcome {
     tx: TxHash,
 }
 
+/// How long a vault route waits before it awaits its tx's confirmation again
+/// after an inconclusive outcome (a receipt timeout, a drop report, or an RPC
+/// failure). The graceful shutdown drain has its own timeout, so the wait
+/// never blocks exit.
+#[cfg(not(test))]
+const VAULT_CONFIRM_RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(30);
+#[cfg(test)]
+const VAULT_CONFIRM_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// What a vault tx's confirmation attempt proved.
+#[derive(Debug, PartialEq, Eq)]
+enum VaultTxFate {
+    Confirmed,
+    /// The tx mined and failed: a status 0 receipt at the chain's required
+    /// confirmations, or a decoded revert, which the wallet only produces from
+    /// such a receipt.
+    Failed,
+    /// Nothing proven: the tx may still mine. A drop report is in here too:
+    /// the wallet calls a tx dropped when the node it asks has no receipt and
+    /// no pending tx for it, which a lagging or load balanced node also says
+    /// of a tx another node still holds.
+    Unknown,
+}
+
+/// Decides a vault tx's fate after `confirm_tx` failed with `error`, from the
+/// error and from `mined`, the tx's own canonical receipt as the node shows it
+/// now. The receipt decides whenever it has `required_confirmations`, so a
+/// revert whose replay cannot be decoded (no revert data, or pruned state)
+/// still ends the wait.
+fn vault_tx_fate(
+    error: &RaindexError,
+    mined: Option<&MinedTx>,
+    required_confirmations: u64,
+) -> VaultTxFate {
+    if let Some(mined) = mined
+        && mined.confirmations >= required_confirmations
+    {
+        return if mined.succeeded {
+            VaultTxFate::Confirmed
+        } else {
+            VaultTxFate::Failed
+        };
+    }
+    match error {
+        RaindexError::Evm(evm) if evm.is_revert() => VaultTxFate::Failed,
+        RaindexError::InsufficientVaultLiquidity { .. } => VaultTxFate::Failed,
+        RaindexError::Evm(_)
+        | RaindexError::Contract(_)
+        | RaindexError::Float(_)
+        | RaindexError::ZeroAmount
+        | RaindexError::RpcTransport(_)
+        | RaindexError::SolType(_)
+        | RaindexError::ScanInconclusive { .. }
+        | RaindexError::ScanAnomalousLog { .. }
+        | RaindexError::MissingOperatorRole { .. } => VaultTxFate::Unknown,
+    }
+}
+
 /// Reads the token's decimals, scales the amount to the token's smallest unit
 /// like the CLI's `float_to_u256`, and runs the operation through the chain's
 /// `RaindexService`, built from the bot's signer like the startup revoke. The
 /// reads run in the detached task too, so the whole sequence is one tracked
 /// unit.
+///
+/// Answers as soon as the vault transaction is broadcast, like `cctp_bridge`:
+/// the chain's required confirmations (12 on Ethereum in production) outlast
+/// the 60 second load balancer cut. The task then awaits the confirmation
+/// through `Raindex::confirm_tx`, as the USDC transfer worker does after its
+/// own `submit_deposit`, waits again while the outcome is inconclusive, and
+/// logs the outcome. The verb's lock is held until then. A deposit still
+/// awaits its approve's confirmation before the broadcast when the allowance
+/// is short, so only a deposit of a token without the startup MAX grant can
+/// still wait that long.
 async fn run_vault_operation(
     state: &AppState,
     operation: VaultOperation,
@@ -833,6 +890,7 @@ async fn run_vault_operation(
         crate::onchain::raindex_contracts(trading),
         wallet.address(),
     );
+    let required_confirmations = trading.required_confirmations;
     let VaultTarget {
         chain,
         token,
@@ -841,24 +899,36 @@ async fn run_vault_operation(
     } = target;
     let route = operation.route();
 
-    let deposit_lock = Arc::clone(&state.vault_deposit_lock);
-    spawn_detached(&state.detached_tasks, route, token, async move {
-        // Held for the whole approve then deposit sequence, inside the task so
-        // a dropped request cannot release it early; see
-        // `AppState::vault_deposit_lock`. Withdrawals approve nothing.
-        let _deposit_guard = match operation {
-            VaultOperation::Deposit => Some(deposit_lock.try_lock().map_err(|_| {
-                warn!(route, %chain, %token, "Vault deposit refused: another deposit is in progress");
-                (
-                    StatusCode::CONFLICT,
-                    Json(ErrorResponse {
-                        error: "Another vault deposit is in progress; retry once it finishes"
-                            .to_string(),
-                    }),
-                )
-            })?),
-            VaultOperation::Withdraw | VaultOperation::WithdrawUsdc => None,
-        };
+    // Each vault verb holds its lock from before its first read until its tx's
+    // fate is proven (confirmed, or mined and failed), inside the task so a
+    // dropped request cannot release it early; see `AppState::vault_deposit_lock`
+    // and `AppState::vault_withdraw_lock`. A tx that never gets a receipt, or a
+    // panic while confirming, leaves the fate unknown, so it keeps the lock
+    // until a restart. A failed send frees it, like `st0x-cli`: its error
+    // cannot tell whether the tx went out, which `onchain_failure` tells the
+    // operator to check before retrying.
+    let (lock, refusal) = match operation {
+        VaultOperation::Deposit => (
+            Arc::clone(&state.vault_deposit_lock),
+            "Another vault deposit is in progress or its outcome is unknown; check the bot \
+             logs for it before retrying",
+        ),
+        VaultOperation::Withdraw | VaultOperation::WithdrawUsdc => (
+            Arc::clone(&state.vault_withdraw_lock),
+            "Another vault withdrawal is in progress or its outcome is unknown; check the bot \
+             logs for it before retrying",
+        ),
+    };
+    answer_from_detached(&state.detached_tasks, route, token, async move {
+        let vault_guard = lock.try_lock_owned().map_err(|_| {
+            warn!(route, %chain, %token, "Vault operation refused: {refusal}");
+            (
+                StatusCode::CONFLICT,
+                Json(ErrorResponse {
+                    error: refusal.to_string(),
+                }),
+            )
+        })?;
         let decimals = wallet
             .call::<OpenChainErrorRegistry, _>(token, IERC20::decimalsCall {})
             .await
@@ -874,30 +944,91 @@ async fn run_vault_operation(
         let submitted = match operation {
             VaultOperation::Deposit => {
                 raindex
-                    .deposit::<OpenChainErrorRegistry>(
-                        token,
-                        RaindexVaultId(vault_id),
-                        amount_raw,
-                        decimals,
-                    )
+                    .submit_deposit(token, RaindexVaultId(vault_id), amount_raw, decimals)
                     .await
             }
             VaultOperation::Withdraw | VaultOperation::WithdrawUsdc => {
                 raindex
-                    .withdraw(token, RaindexVaultId(vault_id), amount_raw, decimals)
+                    .submit_withdraw(token, RaindexVaultId(vault_id), amount_raw, decimals)
                     .await
             }
         };
         let tx = submitted.map_err(|error| onchain_failure(route, chain, &error))?;
-        info!(route, %chain, %token, %vault_id, %amount_raw, %tx, "Vault operation completed via API");
+        info!(route, %chain, %token, %vault_id, %amount_raw, %tx, "Vault operation broadcast via API");
 
-        Ok::<_, (StatusCode, Json<ErrorResponse>)>(VaultOutcome {
+        let confirm = async move {
+            let wait = async {
+                loop {
+                    let error = match raindex.confirm_tx(tx).await {
+                        Ok(()) => {
+                            info!(
+                                route, %chain, %token, %vault_id, %amount_raw, %tx,
+                                "Vault operation confirmed via API"
+                            );
+                            return;
+                        }
+                        Err(error) => error,
+                    };
+                    // The tx's own receipt decides when the error does not:
+                    // a revert whose replay cannot be decoded still mined.
+                    let mined = raindex.mined_tx(tx).await.unwrap_or_else(|read_error| {
+                        warn!(route, %chain, %tx, ?read_error, "Could not read the vault tx's receipt");
+                        None
+                    });
+                    match vault_tx_fate(&error, mined.as_ref(), required_confirmations) {
+                        VaultTxFate::Confirmed => {
+                            info!(
+                                route, %chain, %token, %vault_id, %amount_raw, %tx, ?error,
+                                "Vault operation confirmed via API"
+                            );
+                            return;
+                        }
+                        VaultTxFate::Failed => {
+                            error!(
+                                route, %chain, %token, %vault_id, %amount_raw, %tx, ?error,
+                                "Vault operation broadcast via API did not confirm"
+                            );
+                            return;
+                        }
+                        // A receipt timeout, a drop report, or an RPC failure
+                        // proves nothing: the tx can still land, and releasing
+                        // the lock would let a rerun send a second one.
+                        VaultTxFate::Unknown => {
+                            warn!(
+                                route, %chain, %token, %vault_id, %amount_raw, %tx, ?error,
+                                "Vault operation broadcast via API is not confirmed yet; keeping \
+                                 its lock and waiting again"
+                            );
+                            tokio::time::sleep(VAULT_CONFIRM_RETRY_DELAY).await;
+                        }
+                    }
+                }
+            };
+            // A panic would unwind through the guard and free the lock while
+            // the tx's fate is unknown, so it is caught here, the guard is
+            // kept until a restart, and the panic resumes for the watcher's
+            // join failure log.
+            match std::panic::AssertUnwindSafe(wait).catch_unwind().await {
+                Ok(()) => drop(vault_guard),
+                Err(panic) => {
+                    error!(
+                        route, %chain, %token, %vault_id, %amount_raw, %tx,
+                        "Vault operation confirmation panicked; keeping its lock until a \
+                         restart. Check the tx onchain before retrying"
+                    );
+                    std::mem::forget(vault_guard);
+                    std::panic::resume_unwind(panic);
+                }
+            }
+        };
+        let outcome = VaultOutcome {
             decimals,
             amount_raw,
             tx,
-        })
-    })?
-    .await?
+        };
+        Ok::<_, OpsError>((outcome, confirm))
+    })
+    .await
 }
 
 /// Records an onchain failure inside a capital route's detached task, where
@@ -923,6 +1054,83 @@ fn onchain_failure(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use st0x_evm::EvmError;
+
+    fn mined(succeeded: bool, confirmations: u64) -> MinedTx {
+        MinedTx {
+            from: Address::ZERO,
+            to: Some(Address::ZERO),
+            nonce: 0,
+            value: U256::ZERO,
+            input: alloy::primitives::Bytes::new(),
+            tx_type: 2,
+            succeeded,
+            emitted_logs: succeeded,
+            confirmations,
+        }
+    }
+
+    fn dropped() -> RaindexError {
+        RaindexError::Evm(EvmError::TransactionDropped {
+            tx_hash: TxHash::ZERO,
+            elapsed_secs: 0,
+        })
+    }
+
+    fn unreplayable() -> RaindexError {
+        RaindexError::Evm(EvmError::Transport(alloy::transports::RpcError::ErrorResp(
+            alloy::rpc::json_rpc::ErrorPayload {
+                code: -32000,
+                message: "missing trie node".into(),
+                data: None,
+            },
+        )))
+    }
+
+    /// A drop report proves nothing while the node shows no receipt: the tx
+    /// may still be pending on another node.
+    #[test]
+    fn a_drop_report_without_a_receipt_leaves_the_fate_unknown() {
+        assert_eq!(vault_tx_fate(&dropped(), None, 3), VaultTxFate::Unknown);
+    }
+
+    /// The tx's own receipt at the required depth decides over the error,
+    /// whichever way it went.
+    #[test]
+    fn a_receipt_at_the_required_depth_decides_the_fate() {
+        assert_eq!(
+            vault_tx_fate(&dropped(), Some(&mined(true, 3)), 3),
+            VaultTxFate::Confirmed
+        );
+        assert_eq!(
+            vault_tx_fate(&unreplayable(), Some(&mined(false, 3)), 3),
+            VaultTxFate::Failed
+        );
+    }
+
+    /// A receipt short of the required depth can still be reorged out, so
+    /// only a decoded revert decides then.
+    #[test]
+    fn a_shallow_receipt_does_not_decide_the_fate() {
+        assert_eq!(
+            vault_tx_fate(&unreplayable(), Some(&mined(false, 2)), 3),
+            VaultTxFate::Unknown
+        );
+        assert_eq!(
+            vault_tx_fate(&dropped(), Some(&mined(true, 2)), 3),
+            VaultTxFate::Unknown
+        );
+        assert_eq!(
+            vault_tx_fate(
+                &RaindexError::Evm(EvmError::Reverted {
+                    tx_hash: TxHash::ZERO
+                }),
+                None,
+                3
+            ),
+            VaultTxFate::Failed
+        );
+    }
 
     #[test]
     fn transfer_request_parses_the_cli_direction_spelling_and_a_string_amount() {

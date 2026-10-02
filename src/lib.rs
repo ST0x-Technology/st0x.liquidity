@@ -181,14 +181,29 @@ pub(crate) struct AppState {
     pub(crate) process_tx: Arc<tokio::sync::OnceCell<api::ProcessTxHandle>>,
     pub(crate) resume_lock: Arc<api::ResumeLock>,
     /// Serializes `capital vault-deposit` requests against each other, and
-    /// nothing else. `RaindexService::deposit` reads the allowance, approves
-    /// exactly the amount when it is short, then deposits, so two concurrent
+    /// nothing else, from before the decimals read until the deposit's fate is
+    /// proven (it confirmed, or mined and failed; a drop report proves
+    /// neither), or until a restart after a panic while confirming; see
+    /// `vault_withdraw_lock`.
+    /// `Raindex::submit_deposit` reads the allowance, approves exactly the
+    /// amount when it is short, then deposits, so two concurrent
     /// requests for a token without the startup MAX grant could overwrite each
     /// other's approval. The bot's own deposits (the USDC transfer workers) do
     /// not take this lock, so a request can still use up a worker's exact
     /// approval when the MAX grant is missing; the worker's deposit then
     /// reverts and its transfer needs a redrive.
     pub(crate) vault_deposit_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Serializes `capital vault-withdraw` and `capital vault-withdraw-usdc`
+    /// requests against each other, from before the decimals read until the
+    /// withdraw's fate is proven (it confirmed, or mined and failed; a drop
+    /// report proves neither), or until a restart after a panic while
+    /// confirming. A failed send frees it, since
+    /// its error cannot tell whether the tx went out. Both answer at the
+    /// broadcast, often before the vault balance moves, so without it a rerun
+    /// on the strength of that balance would withdraw a second time. It lives
+    /// in memory, so a restart frees it. The bot's own
+    /// withdrawals (the USDC transfer workers) do not take this lock.
+    pub(crate) vault_withdraw_lock: Arc<tokio::sync::Mutex<()>>,
     pub(crate) projection_maintenance: Arc<conductor::projection_pause::ProjectionMaintenance>,
     pub(crate) pnl_report_admission: dashboard::pnl::PnlReportAdmission,
     pub(crate) pnl_ledger: Arc<dashboard::pnl::PnlLedger>,
@@ -310,7 +325,7 @@ async fn run_bot_session_inner(
     let shutdown_token = CancellationToken::new();
     let recovery_cell = Arc::new(tokio::sync::OnceCell::new());
     let process_tx_cell = Arc::new(tokio::sync::OnceCell::new());
-    let resume_lock = Arc::new(api::ResumeLock(tokio::sync::Mutex::new(())));
+    let resume_lock = Arc::new(api::ResumeLock(Arc::new(tokio::sync::Mutex::new(()))));
 
     // Pre-bind both server ports synchronously so a port-in-use failure
     // surfaces at startup instead of looping in the supervisor.
@@ -348,6 +363,7 @@ async fn run_bot_session_inner(
         process_tx: process_tx_cell.clone(),
         resume_lock,
         vault_deposit_lock: Arc::new(tokio::sync::Mutex::new(())),
+        vault_withdraw_lock: Arc::new(tokio::sync::Mutex::new(())),
         projection_maintenance: projection_maintenance.clone(),
         pnl_report_admission: dashboard::pnl::pnl_report_admission(),
         pnl_ledger: pnl_ledger.clone(),
