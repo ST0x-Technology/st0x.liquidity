@@ -3820,7 +3820,11 @@ impl RebalancingService {
                             timestamp,
                         )?;
                     }
-                    *inventory = updated;
+                    // The fill is now handled for USDC whichever way its
+                    // cash leg went, so a transfer credit at or before its
+                    // block no longer waits on it.
+                    *inventory =
+                        updated.record_onchain_usdc_fill_block(trade_id.chain, *block_number);
                     drop(inventory);
                     (equity_reconciled, usdc_reconciled)
                 };
@@ -5271,14 +5275,18 @@ impl RebalancingService {
         Some((usdc_limit, reserved))
     }
 
-    /// Sizes the transfer the corridor's imbalance calls for, if any.
+    /// Sizes the transfer the corridor's imbalance calls for, if any. A
+    /// corridor held behind a transfer credit that fills have not caught up
+    /// with reschedules the check: the check the releasing fill or snapshot
+    /// enqueues is best effort and a later terminal transfer cancels it, so
+    /// a skip alone could drop the imbalance.
     async fn size_usdc_operation(
         &self,
         usdc: &UsdcCorridorCtx,
         usdc_limit: Option<Usdc>,
         reserved: Option<Usd>,
     ) -> Option<UsdcRebalanceOperation> {
-        usdc::check_imbalance_and_build_operation(
+        let skip = match usdc::check_imbalance_and_build_operation(
             usdc.corridor.chain(),
             &usdc.threshold,
             &self.inventory,
@@ -5286,8 +5294,27 @@ impl RebalancingService {
             reserved,
         )
         .await
-        .inspect_err(|skip| debug!(target: "rebalance", ?skip, "Skipped USDC trigger"))
-        .ok()
+        {
+            Ok(operation) => return Some(operation),
+            Err(skip) => skip,
+        };
+
+        if let usdc::UsdcTriggerSkip::CreditAheadOfFills(credit) = skip {
+            info!(
+                target: "rebalance",
+                corridor = %usdc.corridor,
+                credit_block = credit.credit,
+                last_fill_block = ?credit.last_fill,
+                last_snapshot_block = ?credit.last_snapshot,
+                "Skipped USDC trigger: a transfer credit is ahead of the applied \
+                 fills; rescheduling the check"
+            );
+            self.usdc_scheduler.reschedule_check().await;
+        } else {
+            debug!(target: "rebalance", ?skip, "Skipped USDC trigger");
+        }
+
+        None
     }
 
     /// Checks every active corridor, in chain order, for a USDC imbalance
@@ -18059,6 +18086,190 @@ mod tests {
         );
     }
 
+    fn make_vault_deposit_confirmed_in_block(vault_deposit_block: u64) -> UsdcRebalanceEvent {
+        UsdcRebalanceEvent::DepositConfirmed {
+            direction: RebalanceDirection::AlpacaToBase,
+            deposit_confirmed_at: Utc::now(),
+            vault_deposit_block: Some(vault_deposit_block),
+        }
+    }
+
+    /// Seeds a Base vault read pinned at block 100 holding 1,000 USDC against
+    /// 1,000 at Alpaca, then settles a 500 USDC AlpacaToBase transfer whose
+    /// vault deposit is in block 110. The view then reads 1,500 onchain
+    /// against 500 offchain (75% onchain, past the 70% band) until the fills
+    /// up to block 110 reach it. The settlement's check is left queued.
+    async fn settle_vault_credit_in_block_110() -> (
+        Arc<RebalancingService>,
+        ReactorHarness<Arc<RebalancingService>>,
+        Symbol,
+    ) {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let inventory = InventoryView::default()
+            .with_equity(symbol.clone(), shares(50), shares(50))
+            .with_usdc(usdc(1000), usdc(1000));
+        let trigger = make_trigger_with_inventory_and_registry(inventory, &symbol).await;
+        let harness = ReactorHarness::new(Arc::clone(&trigger));
+
+        apply_and_dispatch_snapshot(
+            Arc::clone(&trigger),
+            InventorySnapshotId {
+                orderbook: TEST_ORDERBOOK,
+                owner: TEST_ORDER_OWNER,
+            },
+            InventorySnapshotEvent::OnchainUsdc {
+                chain: Chain::Base,
+                usdc_balance: usdc(1000),
+                fetched_at: Utc::now(),
+                block_number: Some(100),
+            },
+        )
+        .await
+        .unwrap();
+        usdc::drain_pending_usdc_jobs(&trigger).await;
+
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        for event in [
+            make_usdc_initiated(RebalanceDirection::AlpacaToBase, usdc(500)),
+            make_usdc_bridged_with_amounts(usdc(500), Usdc::ZERO),
+            make_vault_deposit_confirmed_in_block(110),
+        ] {
+            harness
+                .receive::<UsdcRebalance>(id.clone(), event)
+                .await
+                .unwrap();
+        }
+
+        (trigger, harness, symbol)
+    }
+
+    /// A fill in the vault deposit's own block spent the credit before the
+    /// fill reader delivered it. The check the settlement enqueues must not
+    /// plan a transfer off the credited balance, and once the spend applies
+    /// the balance (1,050 onchain against 500) is inside the band.
+    #[tokio::test]
+    async fn same_block_deposit_and_spend_plans_no_transfer() {
+        let (trigger, harness, symbol) = settle_vault_credit_in_block_110().await;
+
+        assert_eq!(usdc::drain_pending_usdc_jobs(&trigger).await, 1);
+        assert_eq!(take_pending_usdc_transfer_jobs(&trigger).await, vec![]);
+        assert_eq!(
+            usdc::count_delayed_usdc_check_jobs(&trigger).await,
+            1,
+            "the held check must reschedule itself"
+        );
+
+        harness
+            .receive::<Position>(
+                symbol,
+                make_onchain_fill_in_block(shares(3), Direction::Buy, Some(110)),
+            )
+            .await
+            .unwrap();
+        usdc::make_delayed_usdc_checks_due(&trigger).await;
+        assert_eq!(usdc::drain_pending_usdc_jobs(&trigger).await, 2);
+
+        assert_eq!(take_pending_usdc_transfer_jobs(&trigger).await, vec![]);
+        assert_eq!(usdc::count_delayed_usdc_check_jobs(&trigger).await, 0);
+    }
+
+    /// A fill from before the credit's block reaching the reactor inside the
+    /// gap triggers a check that must plan nothing. Once the credit block's
+    /// fill applies, its check plans off the spent balance: 1,350 onchain
+    /// against 500, not the 1,500 the credit alone shows.
+    #[tokio::test]
+    async fn fill_triggered_check_waits_for_the_credit_blocks_fills() {
+        let (trigger, harness, symbol) = settle_vault_credit_in_block_110().await;
+        usdc::drain_pending_usdc_jobs(&trigger).await;
+
+        harness
+            .receive::<Position>(
+                symbol.clone(),
+                make_onchain_fill_in_block(shares(1), Direction::Sell, Some(105)),
+            )
+            .await
+            .unwrap();
+        assert_eq!(usdc::drain_pending_usdc_jobs(&trigger).await, 1);
+        assert_eq!(take_pending_usdc_transfer_jobs(&trigger).await, vec![]);
+
+        harness
+            .receive::<Position>(
+                symbol,
+                make_onchain_fill_in_block(shares(2), Direction::Buy, Some(110)),
+            )
+            .await
+            .unwrap();
+        assert_eq!(usdc::drain_pending_usdc_jobs(&trigger).await, 1);
+
+        assert_eq!(
+            take_pending_usdc_transfer_jobs(&trigger).await,
+            vec![UsdcRebalanceOperation::BaseToAlpaca { amount: usdc(425) }]
+        );
+    }
+
+    /// A periodic snapshot inside the gap triggers a check that must plan
+    /// nothing. A vault read pinned at the credit's block contains the
+    /// spend, so it releases the hold before the fill reader delivers it.
+    #[tokio::test]
+    async fn snapshot_triggered_check_waits_for_a_read_at_the_credit_block() {
+        let (trigger, _harness, _symbol) = settle_vault_credit_in_block_110().await;
+        usdc::drain_pending_usdc_jobs(&trigger).await;
+        let snapshot_id = InventorySnapshotId {
+            orderbook: TEST_ORDERBOOK,
+            owner: TEST_ORDER_OWNER,
+        };
+
+        apply_and_dispatch_snapshot(
+            Arc::clone(&trigger),
+            snapshot_id.clone(),
+            InventorySnapshotEvent::OffchainCashWithdrawable {
+                cash_withdrawable_cents: Some(50_000),
+                fetched_at: Utc::now(),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(usdc::drain_pending_usdc_jobs(&trigger).await, 1);
+        assert_eq!(take_pending_usdc_transfer_jobs(&trigger).await, vec![]);
+
+        apply_and_dispatch_snapshot(
+            Arc::clone(&trigger),
+            snapshot_id,
+            InventorySnapshotEvent::OnchainUsdc {
+                chain: Chain::Base,
+                usdc_balance: usdc(1350),
+                fetched_at: Utc::now(),
+                block_number: Some(110),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(usdc::drain_pending_usdc_jobs(&trigger).await, 1);
+
+        assert_eq!(
+            take_pending_usdc_transfer_jobs(&trigger).await,
+            vec![UsdcRebalanceOperation::BaseToAlpaca { amount: usdc(425) }]
+        );
+    }
+
+    /// Held checks keep exactly one recheck waiting, and a recheck that is
+    /// still held when it runs schedules the next one, so the hold is polled
+    /// until it lifts even when nothing else triggers a check.
+    #[tokio::test]
+    async fn held_checks_keep_one_recheck_waiting() {
+        let (trigger, _harness, _symbol) = settle_vault_credit_in_block_110().await;
+        usdc::drain_pending_usdc_jobs(&trigger).await;
+
+        trigger.check_and_trigger_usdc().await;
+        trigger.check_and_trigger_usdc().await;
+        assert_eq!(usdc::count_delayed_usdc_check_jobs(&trigger).await, 1);
+
+        usdc::make_delayed_usdc_checks_due(&trigger).await;
+        assert_eq!(usdc::drain_pending_usdc_jobs(&trigger).await, 1);
+        assert_eq!(usdc::count_delayed_usdc_check_jobs(&trigger).await, 1);
+        assert_eq!(take_pending_usdc_transfer_jobs(&trigger).await, vec![]);
+    }
+
     #[tokio::test]
     async fn alpaca_to_base_usdc_lifecycle_tracks_started_and_cleared_inflight() {
         let inventory = InventoryView::default().with_usdc(usdc(100), usdc(900));
@@ -21729,6 +21940,7 @@ mod tests {
         UsdcRebalanceEvent::DepositConfirmed {
             direction,
             deposit_confirmed_at: Utc::now(),
+            vault_deposit_block: None,
         }
     }
 
@@ -27242,7 +27454,12 @@ mod tests {
             .await
             .unwrap();
         store
-            .send(&id, UsdcRebalanceCommand::ConfirmDeposit)
+            .send(
+                &id,
+                UsdcRebalanceCommand::ConfirmDeposit {
+                    vault_deposit_block: None,
+                },
+            )
             .await
             .unwrap();
         store
@@ -29983,7 +30200,9 @@ mod tests {
             UsdcRebalanceCommand::InitiateDeposit {
                 deposit: TransferRef::OnchainTx(mint_tx),
             },
-            UsdcRebalanceCommand::ConfirmDeposit,
+            UsdcRebalanceCommand::ConfirmDeposit {
+                vault_deposit_block: None,
+            },
             UsdcRebalanceCommand::InitiatePostDepositConversion {
                 order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
                 amount: usdc(399),
@@ -30459,7 +30678,12 @@ mod tests {
             .unwrap();
 
         store
-            .send(&id, UsdcRebalanceCommand::ConfirmDeposit)
+            .send(
+                &id,
+                UsdcRebalanceCommand::ConfirmDeposit {
+                    vault_deposit_block: None,
+                },
+            )
             .await
             .unwrap();
 
@@ -30553,7 +30777,12 @@ mod tests {
             .unwrap();
 
         store
-            .send(&id, UsdcRebalanceCommand::ConfirmDeposit)
+            .send(
+                &id,
+                UsdcRebalanceCommand::ConfirmDeposit {
+                    vault_deposit_block: None,
+                },
+            )
             .await
             .unwrap();
 
@@ -30790,6 +31019,7 @@ mod tests {
                 UsdcRebalanceEvent::DepositConfirmed {
                     direction: RebalanceDirection::AlpacaToBase,
                     deposit_confirmed_at: chrono::Utc::now(),
+                    vault_deposit_block: None,
                 },
             )
             .await
@@ -30878,7 +31108,12 @@ mod tests {
             .unwrap();
 
         store
-            .send(&id, UsdcRebalanceCommand::ConfirmDeposit)
+            .send(
+                &id,
+                UsdcRebalanceCommand::ConfirmDeposit {
+                    vault_deposit_block: None,
+                },
+            )
             .await
             .unwrap();
 
@@ -33783,6 +34018,7 @@ mod tests {
                 UsdcRebalanceEvent::DepositConfirmed {
                     direction: RebalanceDirection::AlpacaToBase,
                     deposit_confirmed_at: Utc::now(),
+                    vault_deposit_block: None,
                 },
             )
             .await

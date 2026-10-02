@@ -671,6 +671,18 @@ const PORTFOLIO_EQUITY_TRANSIT_LOCATIONS: [InFlightEquityLocation; 2] = [
     InFlightEquityLocation::BaseWalletWrapped,
 ];
 
+/// A transfer credit on a chain's MarketMaking USDC slot whose block no
+/// applied onchain fill and no pinned USDC snapshot has reached.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct UsdcCreditAheadOfFills {
+    /// Block of the credit.
+    pub(crate) credit: u64,
+    /// Highest block of a fill handled on the chain.
+    pub(crate) last_fill: Option<u64>,
+    /// Block of the latest pinned USDC snapshot applied on the chain.
+    pub(crate) last_snapshot: Option<u64>,
+}
+
 /// Cross-aggregate projection tracking inventory across venues.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub(crate) struct InventoryView {
@@ -828,6 +840,18 @@ pub(crate) struct InventoryView {
     /// Venue-level: the USDC balance is one number per venue.
     #[serde(default)]
     onchain_usdc_snapshot_block_watermark: BTreeMap<Chain, u64>,
+    /// Highest block of an onchain fill the reactor has handled against each
+    /// chain's MarketMaking USDC slot, whether its cash leg applied, was
+    /// absorbed by a pinned snapshot, or was deferred to a forced reconcile.
+    #[serde(default)]
+    onchain_usdc_fill_block: BTreeMap<Chain, u64>,
+    /// Block of the latest transfer credit applied to each chain's
+    /// MarketMaking USDC slot (an AlpacaToBase vault deposit). While it is
+    /// past both `onchain_usdc_fill_block` and the snapshot watermark, a fill
+    /// at or before the credit's block may not be applied yet, so the
+    /// balance can count funds that fill already spent.
+    #[serde(default)]
+    onchain_usdc_credit_block: BTreeMap<Chain, u64>,
     /// Symbols whose hydrated Hedging balance is ambiguous because a hedge
     /// order was open across the restart. The aggregate records every poll
     /// -- including mid-order reads the live view's guards refused -- and
@@ -1232,6 +1256,8 @@ impl Default for InventoryView {
             last_updated: Utc::now(),
             onchain_equity_snapshot_block_watermarks: HashMap::new(),
             onchain_usdc_snapshot_block_watermark: BTreeMap::new(),
+            onchain_usdc_fill_block: BTreeMap::new(),
+            onchain_usdc_credit_block: BTreeMap::new(),
             last_offchain_cash_fill_applied_at: None,
             offchain_equity_snapshot_skip_streaks: HashMap::new(),
             onchain_equity_snapshot_skip_streaks: HashMap::new(),
@@ -1648,6 +1674,8 @@ impl InventoryView {
             last_offchain_fill_applied_at: self.last_offchain_fill_applied_at,
             onchain_equity_snapshot_block_watermarks: self.onchain_equity_snapshot_block_watermarks,
             onchain_usdc_snapshot_block_watermark: self.onchain_usdc_snapshot_block_watermark,
+            onchain_usdc_fill_block: self.onchain_usdc_fill_block,
+            onchain_usdc_credit_block: self.onchain_usdc_credit_block,
             last_offchain_cash_fill_applied_at: self.last_offchain_cash_fill_applied_at,
             offchain_equity_snapshot_skip_streaks: self.offchain_equity_snapshot_skip_streaks,
             onchain_equity_snapshot_skip_streaks: self.onchain_equity_snapshot_skip_streaks,
@@ -1700,6 +1728,8 @@ impl InventoryView {
             last_offchain_fill_applied_at: self.last_offchain_fill_applied_at,
             onchain_equity_snapshot_block_watermarks: self.onchain_equity_snapshot_block_watermarks,
             onchain_usdc_snapshot_block_watermark: self.onchain_usdc_snapshot_block_watermark,
+            onchain_usdc_fill_block: self.onchain_usdc_fill_block,
+            onchain_usdc_credit_block: self.onchain_usdc_credit_block,
             last_offchain_cash_fill_applied_at: self.last_offchain_cash_fill_applied_at,
             offchain_equity_snapshot_skip_streaks: self.offchain_equity_snapshot_skip_streaks,
             onchain_equity_snapshot_skip_streaks: self.onchain_equity_snapshot_skip_streaks,
@@ -1820,6 +1850,70 @@ impl InventoryView {
         }
 
         self
+    }
+
+    /// Records that the reactor handled an onchain fill at `block_number`
+    /// against `chain`'s MarketMaking USDC slot. Monotonic; a legacy fill
+    /// without a block records nothing.
+    pub(crate) fn record_onchain_usdc_fill_block(
+        mut self,
+        chain: Chain,
+        block_number: Option<u64>,
+    ) -> Self {
+        let Some(block_number) = block_number else {
+            return self;
+        };
+
+        let fill_block = self
+            .onchain_usdc_fill_block
+            .entry(chain)
+            .or_insert(block_number);
+        *fill_block = (*fill_block).max(block_number);
+
+        self
+    }
+
+    /// Records that a transfer credit at `block_number` was applied to
+    /// `chain`'s MarketMaking USDC slot. Monotonic.
+    pub(crate) fn record_onchain_usdc_credit_block(
+        mut self,
+        chain: Chain,
+        block_number: u64,
+    ) -> Self {
+        let credit_block = self
+            .onchain_usdc_credit_block
+            .entry(chain)
+            .or_insert(block_number);
+        *credit_block = (*credit_block).max(block_number);
+
+        self
+    }
+
+    /// The transfer credit on `chain` that no applied fill and no pinned
+    /// snapshot has reached yet, if any. A fill in the credit's block or
+    /// earlier may still be on its way to the reactor, so the MarketMaking
+    /// USDC balance can count funds that fill already spent onchain. Clears
+    /// once a fill at the credit's block or later applies, or a snapshot
+    /// pinned at or past it (which contains every such fill) applies.
+    pub(crate) fn onchain_usdc_credit_ahead_of_fills(
+        &self,
+        chain: Chain,
+    ) -> Option<UsdcCreditAheadOfFills> {
+        let credit = *self.onchain_usdc_credit_block.get(&chain)?;
+        let last_fill = self.onchain_usdc_fill_block.get(&chain).copied();
+        let last_snapshot = self
+            .onchain_usdc_snapshot_block_watermark
+            .get(&chain)
+            .copied();
+
+        last_fill
+            .max(last_snapshot)
+            .is_none_or(|covered| covered < credit)
+            .then_some(UsdcCreditAheadOfFills {
+                credit,
+                last_fill,
+                last_snapshot,
+            })
     }
 
     /// Records an applied Hedging cash snapshot's `fetched_at`, keeping the
@@ -2769,6 +2863,8 @@ impl InventoryView {
             last_offchain_fill_applied_at: self.last_offchain_fill_applied_at,
             onchain_equity_snapshot_block_watermarks: self.onchain_equity_snapshot_block_watermarks,
             onchain_usdc_snapshot_block_watermark: self.onchain_usdc_snapshot_block_watermark,
+            onchain_usdc_fill_block: self.onchain_usdc_fill_block,
+            onchain_usdc_credit_block: self.onchain_usdc_credit_block,
             last_offchain_cash_fill_applied_at: self.last_offchain_cash_fill_applied_at,
             offchain_equity_snapshot_skip_streaks: self.offchain_equity_snapshot_skip_streaks,
             onchain_equity_snapshot_skip_streaks: self.onchain_equity_snapshot_skip_streaks,
@@ -2814,6 +2910,8 @@ impl InventoryView {
             last_offchain_fill_applied_at: self.last_offchain_fill_applied_at,
             onchain_equity_snapshot_block_watermarks: self.onchain_equity_snapshot_block_watermarks,
             onchain_usdc_snapshot_block_watermark: self.onchain_usdc_snapshot_block_watermark,
+            onchain_usdc_fill_block: self.onchain_usdc_fill_block,
+            onchain_usdc_credit_block: self.onchain_usdc_credit_block,
             last_offchain_cash_fill_applied_at: self.last_offchain_cash_fill_applied_at,
             offchain_equity_snapshot_skip_streaks: self.offchain_equity_snapshot_skip_streaks,
             onchain_equity_snapshot_skip_streaks: self.onchain_equity_snapshot_skip_streaks,
@@ -4101,6 +4199,8 @@ mod tests {
             restart_tainted_offchain_symbols: HashSet::new(),
             restart_tainted_offchain_cash: false,
             primary_chain: Chain::Base,
+            onchain_usdc_fill_block: BTreeMap::new(),
+            onchain_usdc_credit_block: BTreeMap::new(),
         }
     }
 
@@ -4146,6 +4246,8 @@ mod tests {
             restart_tainted_offchain_symbols: HashSet::new(),
             restart_tainted_offchain_cash: false,
             primary_chain: Chain::Base,
+            onchain_usdc_fill_block: BTreeMap::new(),
+            onchain_usdc_credit_block: BTreeMap::new(),
         }
     }
 
@@ -6281,6 +6383,8 @@ mod tests {
             restart_tainted_offchain_symbols: HashSet::new(),
             restart_tainted_offchain_cash: false,
             primary_chain: Chain::Base,
+            onchain_usdc_fill_block: BTreeMap::new(),
+            onchain_usdc_credit_block: BTreeMap::new(),
         };
 
         let dto = view.to_dto();
@@ -6348,6 +6452,8 @@ mod tests {
             restart_tainted_offchain_symbols: HashSet::new(),
             restart_tainted_offchain_cash: false,
             primary_chain: Chain::Base,
+            onchain_usdc_fill_block: BTreeMap::new(),
+            onchain_usdc_credit_block: BTreeMap::new(),
         };
 
         let dto = view.to_dto();
@@ -8461,6 +8567,65 @@ mod tests {
         assert_eq!(
             view.onchain_usdc_snapshot_skip_streaks.get(&Chain::Base),
             Some(&1)
+        );
+    }
+
+    /// A transfer credit holds its chain until a fill in its own block or
+    /// later is handled there, or a read pinned at or past its block
+    /// applies. A fill or read on another chain says nothing about it.
+    #[test]
+    fn transfer_credit_holds_until_its_block_is_reached_on_its_chain() {
+        let now = Utc::now();
+        let credited = InventoryView::default().record_onchain_usdc_credit_block(Chain::Base, 110);
+        let held = |view: &InventoryView| view.onchain_usdc_credit_ahead_of_fills(Chain::Base);
+
+        assert_eq!(
+            held(&credited),
+            Some(UsdcCreditAheadOfFills {
+                credit: 110,
+                last_fill: None,
+                last_snapshot: None,
+            })
+        );
+
+        let other_chain = credited
+            .clone()
+            .record_onchain_usdc_fill_block(Chain::HyperEvm, Some(200));
+        assert_eq!(
+            held(&other_chain).map(|credit| credit.last_fill),
+            Some(None)
+        );
+
+        let earlier_fill = credited
+            .clone()
+            .record_onchain_usdc_fill_block(Chain::Base, Some(109));
+        assert_eq!(
+            held(&earlier_fill).map(|credit| credit.last_fill),
+            Some(Some(109))
+        );
+        assert_eq!(
+            held(&earlier_fill.record_onchain_usdc_fill_block(Chain::Base, Some(110))),
+            None
+        );
+
+        let read_at = |block_number| InventorySnapshotEvent::OnchainUsdc {
+            chain: Chain::Base,
+            usdc_balance: usdc_cents(500),
+            fetched_at: now,
+            block_number: Some(block_number),
+        };
+        let earlier_read = credited.apply_snapshot_event(&read_at(109), now).unwrap();
+        assert_eq!(
+            held(&earlier_read).map(|credit| credit.last_snapshot),
+            Some(Some(109))
+        );
+        assert_eq!(
+            held(
+                &earlier_read
+                    .apply_snapshot_event(&read_at(110), now)
+                    .unwrap()
+            ),
+            None
         );
     }
 

@@ -5987,7 +5987,21 @@ transfer dispatch. It does not calculate cross-venue inventory imbalances.
 - `UsdcRebalanceEvent::WithdrawalConfirmed` - Moves USDC to inflight (leaving
   source)
 - `UsdcRebalanceEvent::DepositConfirmed` - Terminal success for AlpacaToBase;
-  moves from inflight to destination available
+  moves from inflight to destination available. The event carries the vault
+  deposit's block (`vault_deposit_block`, from the deposit receipt), recorded as
+  the corridor chain's latest transfer credit block in the same inventory write
+  as the credit. Every USDC check (transfer triggered, fill triggered, snapshot
+  triggered) skips a corridor whose credit block is past both the highest block
+  of an onchain fill the reactor has handled on that chain and the onchain USDC
+  snapshot block watermark: a fill in the credit's block or earlier may have
+  spent the credit onchain while the order fill reader, which trails the chain
+  tip, has not delivered it yet. The skipped check reschedules itself 10 seconds
+  later (one waiting row at a time), so the held imbalance is not dropped when
+  the check enqueued by the releasing fill or snapshot is lost or cancelled by a
+  later terminal transfer. The hold lifts once a fill at or past the credit's
+  block is handled or a snapshot pinned at or past it applies (ADR 0024). An
+  event without the block (a BaseToAlpaca deposit at Alpaca, or one recorded
+  before the block was captured) sets no hold
 - `UsdcRebalanceEvent::ConversionConfirmed` - Terminal success for BaseToAlpaca;
   moves from inflight to destination available
 - `UsdcRebalanceEvent::WithdrawalFailed`, BaseToAlpaca pre-burn

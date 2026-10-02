@@ -5298,7 +5298,12 @@ mod tests {
     async fn seed_to_deposit_confirmed(store: &st0x_event_sorcery::Store<UsdcRebalance>, id: Uuid) {
         seed_to_deposit_initiated(store, id).await;
         store
-            .send(&UsdcRebalanceId(id), UsdcRebalanceCommand::ConfirmDeposit)
+            .send(
+                &UsdcRebalanceId(id),
+                UsdcRebalanceCommand::ConfirmDeposit {
+                    vault_deposit_block: None,
+                },
+            )
             .await
             .unwrap();
     }
