@@ -85,11 +85,10 @@ use crate::dashboard::pnl::{LedgerHead, PnlLedger, PnlLedgerReactor};
 use crate::dashboard::{Broadcaster, DashboardTradeDelivery};
 use crate::database_file_lock::{DatabaseFileLock, acquire_database_file_lock};
 use crate::equity_redemption::{
-    EquityRedemption, RedemptionAggregateId, interrupted_redemption_ids,
-    symbols_with_stuck_redemptions,
+    EquityRedemption, RedemptionAggregateId, interrupted_redemption_ids, stuck_redemptions,
 };
 use crate::inventory::{
-    BroadcastingInventory, EquityWalletPolling, Inventory, InventorySnapshot, PollFreshness, Venue,
+    BroadcastingInventory, EquityWalletPolling, InventorySnapshot, PollFreshness,
 };
 use crate::mint_authorization::{
     ConfiguredMintAuthorizer, MintAuthorizationService, VaultModeReader,
@@ -4015,23 +4014,25 @@ async fn build_equity_recovery_stores(
 ///
 /// Redemptions that ended in `DetectionFailed` or `RedemptionRejected` have
 /// tokens physically in Alpaca's wallet with no snapshot source. Setting their
-/// inflight directly prevents the system from re-triggering operations for
-/// tokens it no longer holds.
+/// inflight directly, on the chain each withdrew from, prevents the system
+/// from re-triggering operations for tokens it no longer holds.
 async fn recover_stuck_redemptions(
     pool: &SqlitePool,
     inventory: &BroadcastingInventory,
 ) -> anyhow::Result<()> {
-    let stuck_redemptions = symbols_with_stuck_redemptions(pool).await?;
+    let stuck_redemptions = stuck_redemptions(pool).await?;
 
     if stuck_redemptions.is_empty() {
         return Ok(());
     }
 
     let mut view = inventory.write().await;
-    for (symbol, quantity) in &stuck_redemptions {
-        *view = view.clone().update_equity(
-            symbol,
-            Inventory::set_inflight(Venue::MarketMaking, *quantity),
+    for (id, stranded) in &stuck_redemptions {
+        *view = view.clone().seed_stranded_redemption(
+            id,
+            &stranded.symbol,
+            stranded.chain,
+            stranded.quantity,
             Utc::now(),
         )?;
     }

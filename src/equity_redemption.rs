@@ -3292,18 +3292,34 @@ impl EquityRedemption {
     }
 }
 
-/// Returns symbols and quantities from `EquityRedemption` aggregates that
-/// ended in `DetectionFailed` or `RedemptionRejected`.
+/// Unreconciled shares stranded by one failed redemption.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub(crate) struct StrandedRedemption {
+    pub(crate) symbol: Symbol,
+    pub(crate) chain: Chain,
+    pub(crate) quantity: FractionalShares,
+}
+
+/// Returns each stranded redemption's symbol, chain and quantity by its ID from `EquityRedemption`
+/// aggregates that ended in `DetectionFailed` or `RedemptionRejected`. The
+/// chain is the one the redemption withdrew from, Base for a redemption
+/// recorded before chains were tracked.
 ///
 /// `DetectionFailed` leaves tokens physically in Alpaca's redemption wallet.
 /// `RedemptionRejected` has uncertain disposition -- tokens may or may not
 /// have been returned. In both cases, no snapshot source tracks the actual
 /// location. The caller should set their inflight balance directly so the
 /// system does not re-trigger redemptions for tokens it no longer holds.
-pub(crate) async fn symbols_with_stuck_redemptions(
+pub(crate) async fn stuck_redemptions(
     pool: &SqlitePool,
-) -> Result<HashMap<Symbol, FractionalShares>, StuckRedemptionRecoveryError> {
-    type StuckRedemptionRow = (String, Option<String>, Option<String>, Option<String>);
+) -> Result<HashMap<RedemptionAggregateId, StrandedRedemption>, StuckRedemptionRecoveryError> {
+    type StuckRedemptionRow = (
+        String,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+        Option<String>,
+    );
 
     let rows: Vec<StuckRedemptionRow> = sqlx::query_as(
         "WITH latest AS ( \
@@ -3345,7 +3361,11 @@ pub(crate) async fn symbols_with_stuck_redemptions(
                     json_extract(first_ev.payload, '$.VaultWithdrawSubmitted.quantity'), \
                     json_extract(first_ev.payload, '$.WithdrawnFromRaindex.quantity') \
                 ), \
-                json_extract(unwrapped_ev.payload, '$.TokensUnwrapped.unwrapped_amount') \
+                json_extract(unwrapped_ev.payload, '$.TokensUnwrapped.unwrapped_amount'), \
+                COALESCE( \
+                    json_extract(first_ev.payload, '$.VaultWithdrawPending.chain'), \
+                    json_extract(first_ev.payload, '$.VaultWithdrawSubmitting.chain') \
+                ) \
          FROM events last_ev \
          INNER JOIN latest \
              ON last_ev.aggregate_id = latest.aggregate_id \
@@ -3381,9 +3401,9 @@ pub(crate) async fn symbols_with_stuck_redemptions(
     .fetch_all(pool)
     .await?;
 
-    let mut result: HashMap<Symbol, FractionalShares> = HashMap::new();
+    let mut result = HashMap::new();
 
-    for (raw_aggregate_id, raw_symbol, raw_quantity, raw_wrapped_amount) in rows {
+    for (raw_aggregate_id, raw_symbol, raw_quantity, raw_wrapped_amount, raw_chain) in rows {
         let Ok(aggregate_id) = RedemptionAggregateId::from_str(&raw_aggregate_id) else {
             warn!(target: "rebalance",
                 %raw_aggregate_id,
@@ -3396,23 +3416,22 @@ pub(crate) async fn symbols_with_stuck_redemptions(
             continue;
         };
 
-        let Some(quantity) = parse_stuck_quantity(aggregate_id, raw_quantity, raw_wrapped_amount)?
+        let chain = parse_stuck_chain(&aggregate_id, raw_chain)?;
+
+        let Some(quantity) =
+            parse_stuck_quantity(aggregate_id.clone(), raw_quantity, raw_wrapped_amount)?
         else {
             continue;
         };
 
-        let entry = result.entry(symbol).or_insert(FractionalShares::ZERO);
-        match *entry + quantity {
-            Ok(sum) => *entry = sum,
-            Err(error) => {
-                warn!(target: "rebalance",
-                    %error,
-                    %raw_aggregate_id,
-                    "Float overflow summing stuck redemption quantities, \
-                     keeping accumulated value"
-                );
-            }
-        }
+        result.insert(
+            aggregate_id,
+            StrandedRedemption {
+                symbol,
+                chain,
+                quantity,
+            },
+        );
     }
 
     Ok(result)
@@ -3426,6 +3445,30 @@ pub(crate) enum StuckRedemptionRecoveryError {
     InvalidActualWrappedAmount { aggregate_id: RedemptionAggregateId },
     #[error("stuck redemption {aggregate_id} has invalid requested quantity")]
     InvalidRequestedQuantity { aggregate_id: RedemptionAggregateId },
+    #[error("stuck redemption {aggregate_id} has an invalid chain: {source}")]
+    InvalidChain {
+        aggregate_id: RedemptionAggregateId,
+        source: serde_json::Error,
+    },
+}
+
+/// The chain a stuck redemption withdrew from: its genesis event's chain,
+/// or the legacy chain for a redemption recorded before chains were
+/// tracked.
+fn parse_stuck_chain(
+    aggregate_id: &RedemptionAggregateId,
+    raw_chain: Option<String>,
+) -> Result<Chain, StuckRedemptionRecoveryError> {
+    let Some(raw_chain) = raw_chain else {
+        return Ok(crate::onchain::legacy_chain());
+    };
+
+    serde_json::from_value(serde_json::Value::String(raw_chain)).map_err(|source| {
+        StuckRedemptionRecoveryError::InvalidChain {
+            aggregate_id: aggregate_id.clone(),
+            source,
+        }
+    })
 }
 
 /// The redemption other than `except` that already records `tx` as its vault
@@ -3863,6 +3906,20 @@ mod tests {
     use crate::native_gas::ConfiguredGasReadiness;
     use crate::onchain::mock::{ConfirmTxBehavior, MockRaindex};
     use crate::vault_lookup::MockVaultLookup;
+
+    /// Sums `stuck_redemptions` by symbol and chain.
+    async fn symbols_with_stuck_redemptions(
+        pool: &SqlitePool,
+    ) -> Result<HashMap<(Symbol, Chain), FractionalShares>, StuckRedemptionRecoveryError> {
+        let mut result = HashMap::new();
+        for (_, stranded) in stuck_redemptions(pool).await? {
+            let entry = result
+                .entry((stranded.symbol, stranded.chain))
+                .or_insert(FractionalShares::ZERO);
+            *entry = (*entry + stranded.quantity).unwrap();
+        }
+        Ok(result)
+    }
 
     fn mock_vault_lookup() -> MockVaultLookup {
         MockVaultLookup::new().with_default_vault(RaindexVaultId(B256::ZERO))
@@ -6116,12 +6173,100 @@ mod tests {
 
         let result = symbols_with_stuck_redemptions(&pool).await.unwrap();
         assert_eq!(result.len(), 1);
-        let aapl = Symbol::new("AAPL").unwrap();
+        let aapl = (Symbol::new("AAPL").unwrap(), Chain::Base);
         assert!(result.contains_key(&aapl));
         assert!(
             result[&aapl].inner().eq(float!("10")).unwrap(),
             "Recovered quantity should be 10, got {:?}",
             result[&aapl]
+        );
+    }
+
+    fn pending_payload(symbol: &str, chain: &str, quantity: &str) -> String {
+        format!(
+            r#"{{"VaultWithdrawPending":{{"symbol":"{symbol}","chain":"{chain}","quantity":"{quantity}","token":"0x0000000000000000000000000000000000000001","wrapped_amount":"0","pending_at":"2026-01-01T00:00:00Z"}}}}"#
+        )
+    }
+
+    async fn insert_detection_failed_redemption(pool: &SqlitePool, id: &str, genesis: &str) {
+        let aggregate_id = redemption_aggregate_id(id);
+        insert_event(
+            pool,
+            &aggregate_id,
+            0,
+            "EquityRedemptionEvent::VaultWithdrawPending",
+            genesis,
+        )
+        .await;
+        insert_event(
+            pool,
+            &aggregate_id,
+            1,
+            "EquityRedemptionEvent::DetectionFailed",
+            r#"{"DetectionFailed":{"failure":"Timeout","failed_at":"2026-01-01T00:00:00Z"}}"#,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn stuck_redemptions_of_one_symbol_on_two_chains_stay_apart() {
+        let pool = crate::test_utils::setup_test_db().await;
+        insert_detection_failed_redemption(&pool, "base", &pending_payload("AAPL", "base", "4"))
+            .await;
+        insert_detection_failed_redemption(
+            &pool,
+            "robinhood",
+            &pending_payload("AAPL", "robinhood", "6"),
+        )
+        .await;
+
+        let result = symbols_with_stuck_redemptions(&pool).await.unwrap();
+
+        let aapl = Symbol::new("AAPL").unwrap();
+        assert_eq!(result.len(), 2, "got {result:?}");
+        let by_id = stuck_redemptions(&pool).await.unwrap();
+        assert_eq!(by_id.len(), 2);
+        assert_eq!(by_id[&redemption_aggregate_id("base")].chain, Chain::Base);
+        assert_eq!(
+            by_id[&redemption_aggregate_id("base")].quantity,
+            FractionalShares::new(float!(4))
+        );
+        assert_eq!(
+            by_id[&redemption_aggregate_id("robinhood")].chain,
+            Chain::Robinhood
+        );
+        assert_eq!(
+            by_id[&redemption_aggregate_id("robinhood")].quantity,
+            FractionalShares::new(float!(6))
+        );
+        assert!(
+            result[&(aapl.clone(), Chain::Base)]
+                .inner()
+                .eq(float!(4))
+                .unwrap()
+        );
+        assert!(
+            result[&(aapl, Chain::Robinhood)]
+                .inner()
+                .eq(float!(6))
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn stuck_redemption_naming_an_unknown_chain_is_an_error() {
+        let pool = crate::test_utils::setup_test_db().await;
+        insert_detection_failed_redemption(&pool, "unknown", &pending_payload("AAPL", "mars", "4"))
+            .await;
+
+        let error = symbols_with_stuck_redemptions(&pool).await.unwrap_err();
+
+        assert!(
+            matches!(
+                &error,
+                StuckRedemptionRecoveryError::InvalidChain { source, .. } if source.is_data()
+            ),
+            "got {error:?}"
         );
     }
 
@@ -6156,7 +6301,7 @@ mod tests {
 
         let result = symbols_with_stuck_redemptions(&pool).await.unwrap();
         assert_eq!(result.len(), 1);
-        let coin = Symbol::new("COIN").unwrap();
+        let coin = (Symbol::new("COIN").unwrap(), Chain::Base);
         assert!(
             result[&coin].inner().eq(float!("7.5")).unwrap(),
             "Recovered quantity should use actual unwrapped quantity, got {:?}",
@@ -6225,7 +6370,7 @@ mod tests {
 
         let result = symbols_with_stuck_redemptions(&pool).await.unwrap();
         assert_eq!(result.len(), 1);
-        let tsla = Symbol::new("TSLA").unwrap();
+        let tsla = (Symbol::new("TSLA").unwrap(), Chain::Base);
         assert!(result.contains_key(&tsla));
         assert!(
             result[&tsla].inner().eq(float!("10")).unwrap(),
@@ -6294,7 +6439,7 @@ mod tests {
 
         let result = symbols_with_stuck_redemptions(&pool).await.unwrap();
         assert_eq!(result.len(), 1, "Only AAPL should be stuck: {result:?}");
-        let aapl = Symbol::new("AAPL").unwrap();
+        let aapl = (Symbol::new("AAPL").unwrap(), Chain::Base);
         assert!(result.contains_key(&aapl));
         assert!(
             result[&aapl].inner().eq(float!("10")).unwrap(),
@@ -6360,9 +6505,9 @@ mod tests {
             1,
             "only the un-reconciled DetectionFailed redemption should seed inflight: {result:?}"
         );
-        assert!(result.contains_key(&Symbol::new("AAPL").unwrap()));
+        assert!(result.contains_key(&(Symbol::new("AAPL").unwrap(), Chain::Base)));
         assert!(
-            !result.contains_key(&Symbol::new("MSFT").unwrap()),
+            !result.contains_key(&(Symbol::new("MSFT").unwrap(), Chain::Base)),
             "an operator-reconciled redemption must not re-seed stranded inflight"
         );
     }
@@ -6581,7 +6726,7 @@ mod tests {
             1,
             "Only valid AAPL should be recovered, got: {result:?}"
         );
-        let aapl = Symbol::new("AAPL").unwrap();
+        let aapl = (Symbol::new("AAPL").unwrap(), Chain::Base);
         assert!(result.contains_key(&aapl));
         assert!(
             result[&aapl].inner().eq(float!("10")).unwrap(),
