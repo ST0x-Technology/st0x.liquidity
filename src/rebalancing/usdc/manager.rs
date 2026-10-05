@@ -67,11 +67,11 @@ const BURN_RECORD_RETRY_BACKOFF: Duration = Duration::from_millis(100);
 /// Alpaca accepts USD conversion notionals only to whole-cent precision.
 const USD_CONVERSION_NOTIONAL_DECIMAL_PLACES: u8 = 2;
 
-/// A definitive Alpaca `40310000` placement rejection creates no order, so it
-/// is safe to retry this many times inside one durable conversion attempt. The
-/// 2026-08-25 incident missed the balance eleven times and succeeded on the
-/// twelfth; keeping the bound here beside the resize rule makes that operational
-/// contract explicit.
+/// A definitive Alpaca insufficient-balance placement rejection creates no
+/// order, so it is safe to retry this many times inside one durable conversion
+/// attempt. The 2026-08-25 incident missed the balance eleven times and
+/// succeeded on the twelfth; keeping the bound here beside the resize rule makes
+/// that operational contract explicit.
 const USD_CONVERSION_PLACEMENT_ATTEMPTS: u32 = 12;
 
 /// Upper bound on the whole `submit_burn` call -- the allowance check, fee query,
@@ -1646,6 +1646,9 @@ impl<
                 .await
             {
                 Ok(order) => break order,
+                // Only an insufficient-balance rejection can succeed with a
+                // smaller notional. Any other Alpaca rejection, including a
+                // `40310000` "no available quote", takes the fail-once arm below.
                 Err(error @ AlpacaBrokerApiError::UsdConversionInsufficientBalance { .. }) => {
                     if attempt >= USD_CONVERSION_PLACEMENT_ATTEMPTS {
                         warn!(
@@ -9860,6 +9863,56 @@ mod tests {
             Some(UsdcRebalance::ConversionFailed { .. })
         ));
         assert!(logs_contain(
+            "USD to USDC conversion failed after exhausting insufficient-balance placement attempts"
+        ));
+    }
+
+    /// Alpaca returned this body for every `USDCUSD` buy on 2026-10-05 while
+    /// the book had no asks. A smaller notional cannot help.
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn no_available_quote_fails_conversion_once_without_resizing() {
+        const NO_AVAILABLE_QUOTE: &str = "order has been rejected due to no available quote for symbol. please reenter with a limit";
+
+        let server = MockServer::start();
+        let withdrawable_cash = create_withdrawable_cash_mock(&server, "100");
+        let (manager, cqrs, _anvil) = make_resume_test_manager(&server).await;
+        let rejected = server.mock(|when, then| {
+            when.method(POST)
+                .path("/v1/trading/accounts/904837e3-3b76-47ec-b432-046db621571b/orders");
+            then.status(403)
+                .header("content-type", "application/json")
+                .json_body(json!({
+                    "code": 40_310_000,
+                    "message": NO_AVAILABLE_QUOTE
+                }));
+        });
+
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let error = manager
+            .execute_usd_to_usdc_conversion(&id, usdc("69.38"))
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                UsdcTransferError::AlpacaBrokerApi(AlpacaBrokerApiError::ApiError {
+                    alpaca_code: Some(40_310_000),
+                    ..
+                })
+            ),
+            "expected the raw Alpaca rejection, got {error:?}"
+        );
+        rejected.assert_calls(1);
+        // The broker's startup account read only: no resize re-read.
+        withdrawable_cash.assert_calls(1);
+        let Some(UsdcRebalance::ConversionFailed { reason, .. }) = cqrs.load(&id).await.unwrap()
+        else {
+            panic!("expected ConversionFailed");
+        };
+        assert!(reason.contains(NO_AVAILABLE_QUOTE), "reason: {reason}");
+        assert!(!logs_contain(
             "USD to USDC conversion failed after exhausting insufficient-balance placement attempts"
         ));
     }
