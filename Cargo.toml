@@ -148,6 +148,12 @@ git = "https://github.com/ST0x-Technology/event-sorcery.git"
 tag = "v0.3.1"
 package = "event-sorcery"
 
+# Same repository and tag as st0x-event-sorcery: tests compare this crate's
+# event store schema against the one sqlite-es's migrations create.
+[workspace.dependencies.sqlite-es]
+git = "https://github.com/ST0x-Technology/event-sorcery.git"
+tag = "v0.3.1"
+
 [patch."https://github.com/rainlanguage/rain.math.float"]
 # Keep this path checkout at st0x-finance v0.3.0's pinned revision:
 # e226e5a27125e75208e3e709e1c5eee128bd8b3b.
@@ -299,6 +305,7 @@ reqwest_alpaca = { version = "0.13", package = "reqwest", default-features = fal
 ] }
 rsa.workspace = true
 serial_test.workspace = true
+sqlite-es.workspace = true
 st0x-bridge = { workspace = true, features = ["mock"] }
 st0x-event-sorcery = { workspace = true, features = ["test-support"] }
 st0x-evm = { workspace = true, features = ["mock", "test-support"] }

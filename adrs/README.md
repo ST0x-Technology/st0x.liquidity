@@ -131,3 +131,4 @@ decision.
 | [0022](0022-process-tx-checks-admission-before-claiming.md)              | `process-tx` checks broker admission before claiming the position                    | Proposed               |
 | [0023](0023-record-capital-cctp-burns-by-client-operation-id.md)         | Record each capital CCTP burn in an aggregate keyed by a client operation id         | Proposed               |
 | [0024](0024-hold-usdc-checks-until-a-vault-read-at-the-deposit-block.md) | Hold USDC checks after a vault deposit until a vault read at the deposit block       | Proposed               |
+| [0025](0025-never-reuse-event-rowids.md)                                 | Never reuse event rowids                                                             | Proposed               |

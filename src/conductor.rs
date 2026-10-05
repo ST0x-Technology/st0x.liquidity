@@ -1105,7 +1105,13 @@ impl Conductor {
         let onchain_trade =
             setup_onchain_trade_store(&pool, dashboard_delivery.broadcaster.clone()).await?;
 
-        let pnl_ledger_reactor = setup_pnl_ledger(pnl_ledger).await?;
+        // Operational alerts are structured ERROR logs; delivery to humans
+        // happens downstream in the log pipeline, so there is no per-channel
+        // transport to configure and nothing here that can fail.
+        let notifier: Arc<dyn Notifier> = Arc::new(LogNotifier);
+        info!("Operational alerts will be emitted as structured logs");
+
+        let pnl_ledger_reactor = setup_pnl_ledger(pnl_ledger, notifier.as_ref()).await;
 
         let (record_bot_gas_receipt_cost_queue, record_bot_gas_receipt_cost_ctx) =
             setup_bot_gas_receipt_cost(&pool, &apalis_pool, &ctx, pnl_ledger_reactor.clone())
@@ -1125,12 +1131,6 @@ impl Conductor {
         // their snapshots; a deferred read-to-write upgrade can fail
         // immediately instead of waiting for the current writer.
         catch_up_lifecycle_failures(&pool).await?;
-
-        // Operational alerts are structured ERROR logs; delivery to humans
-        // happens downstream in the log pipeline, so there is no per-channel
-        // transport to configure and nothing here that can fail.
-        let notifier: Arc<dyn Notifier> = Arc::new(LogNotifier);
-        info!("Operational alerts will be emitted as structured logs");
 
         // One freshness tracker shared by the inventory poller (writer), the
         // daily portfolio capture gate, and the rebalancing staleness guard
@@ -1587,21 +1587,59 @@ impl Drop for Conductor {
 /// shared with `AppState` (the /pnl handler calls `catch_up` per request);
 /// sharing keeps ingestion serialized on the instance's internal mutex. The
 /// startup catch-up performs first-deploy backfill and `LEDGER_VERSION`
-/// rebuilds here, at boot, so that cost can never land inside a command
-/// dispatch or a /pnl request; on a normal restart it is a no-op (the bot is
-/// the sole writer of its database, so no events accumulate while it is
-/// down).
-async fn setup_pnl_ledger(ledger: Arc<PnlLedger>) -> anyhow::Result<Arc<PnlLedgerReactor>> {
+/// rebuilds here, at boot, so that cost stays out of command dispatches and
+/// /pnl requests; on a normal restart it is a no-op (the bot is the sole
+/// writer of its database, so no events accumulate while it is down).
+///
+/// A failed catch up does not stop startup: the ledger is a read model and
+/// must never keep the bot from hedging. The failure pages the operator, is
+/// counted in `pnl_ledger_catch_up_failures_total`, and /pnl answers 500 and
+/// logs the ingestion error until ingestion recovers. The next caller of
+/// `catch_up` retries: the reactor inside the command dispatch of each source
+/// event, and every /pnl request. After a transient failure during a rebuild,
+/// that caller carries the rest of it: a dispatch for up to about a minute, a
+/// /pnl request for up to `PNL_CATCH_UP_TIMEOUT` before it answers 503.
+async fn setup_pnl_ledger(
+    ledger: Arc<PnlLedger>,
+    notifier: &dyn Notifier,
+) -> Arc<PnlLedgerReactor> {
     let started_at = Instant::now();
-    let LedgerHead(head) = ledger.catch_up().await?;
-    info!(
-        target: "startup",
-        head,
-        elapsed = ?started_at.elapsed(),
-        "PnL ledger caught up at startup"
-    );
+    match ledger.catch_up().await {
+        Ok(LedgerHead(head)) => info!(
+            target: "startup",
+            head,
+            elapsed = ?started_at.elapsed(),
+            "PnL ledger caught up at startup"
+        ),
+        Err(error) => {
+            // The top level message of `Database` and `Stream` hides the
+            // SQLite or payload error the operator needs; render the chain.
+            let error = format!("{:#}", anyhow::Error::from(error));
+            error!(
+                target: "startup",
+                %error,
+                elapsed = ?started_at.elapsed(),
+                "PnL ledger failed to catch up at startup; starting without it"
+            );
+            if let Err(alert_error) = notifier
+                .notify(&format!(
+                    "PnL ledger failed to catch up at startup ({error}). The bot started \
+                     without it and keeps hedging; /pnl fails until ingestion recovers. \
+                     Watch pnl_ledger_catch_up_failures_total and \
+                     pnl_ledger_checkpoint_lag_events."
+                ))
+                .await
+            {
+                warn!(
+                    target: "startup",
+                    %alert_error,
+                    "Failed to deliver PnL ledger startup alert"
+                );
+            }
+        }
+    }
 
-    Ok(Arc::new(PnlLedgerReactor::new(ledger)))
+    Arc::new(PnlLedgerReactor::new(ledger))
 }
 
 /// Builds the bot-gas cost-recording wiring (ADR 0020): the event store, the
@@ -8517,6 +8555,37 @@ mod tests {
         Arc::new(PnlLedgerReactor::new(Arc::new(PnlLedger::new(
             pool.clone(),
         ))))
+    }
+
+    /// A ledger that cannot catch up must not keep the bot from starting:
+    /// startup continues with the reactor wired and pages the operator with
+    /// the underlying cause, not only the ledger's top level message.
+    #[tokio::test]
+    async fn ledger_startup_failure_pages_and_does_not_stop_startup() {
+        let pool = setup_test_db().await;
+        sqlx::query(
+            "INSERT INTO events (aggregate_type, aggregate_id, sequence, \
+             event_type, event_version, payload, metadata) \
+             VALUES ('Position', 'AAPL', 1, 'PositionEvent::OnChainOrderFilled', '1.0', \
+             '{not-json', '{}')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let notifier = CapturingNotifier::default();
+
+        setup_pnl_ledger(Arc::new(PnlLedger::new(pool.clone())), &notifier).await;
+
+        let alerts = notifier.messages();
+        assert_eq!(alerts.len(), 1, "{alerts:?}");
+        assert!(
+            alerts[0].contains("PnL ledger failed to catch up at startup"),
+            "{alerts:?}"
+        );
+        assert!(
+            alerts[0].contains("Undeserializable Position event payload at events rowid 1"),
+            "{alerts:?}"
+        );
     }
 
     /// Test-only mirror of the manifest's Position wiring (broadcaster,

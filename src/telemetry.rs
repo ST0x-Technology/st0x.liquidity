@@ -494,9 +494,8 @@ mod tests {
 
     use alloy::primitives::address;
     use chrono::TimeZone;
-    use sqlx::migrate::{Migration, Migrator};
 
-    use crate::test_utils::setup_test_db;
+    use crate::test_utils::{pool_migrated_up_to, setup_test_db};
 
     use super::*;
 
@@ -581,25 +580,6 @@ mod tests {
     /// keyed by chain, reproducing the legacy `poll_cycle_samples` shape
     /// (monitor and orderbook, no chain).
     const LAST_MIGRATION_BEFORE_PER_CHAIN_POLL_SAMPLES: i64 = 20_260_910_124_753;
-
-    async fn pool_migrated_up_to(version: i64) -> SqlitePool {
-        let pool = SqlitePool::connect(":memory:").await.unwrap();
-        let migrator = sqlx::migrate!();
-        let legacy_migrations: Vec<Migration> = migrator
-            .iter()
-            .filter(|migration| migration.version <= version)
-            .cloned()
-            .collect();
-        Migrator {
-            migrations: Cow::Owned(legacy_migrations),
-            ..migrator
-        }
-        .run(&pool)
-        .await
-        .unwrap();
-
-        pool
-    }
 
     /// Every sample written before samples were keyed by chain came from the
     /// Base watcher, the only one that existed: the migration files them

@@ -2621,6 +2621,14 @@ Eligible aggregate types:
 
 All other aggregates retain events unless this section is updated first.
 
+Compaction deletes event rows, so the event store never reuses a rowid: `events`
+takes its rowid from `AUTOINCREMENT`, and a number handed out after the
+migration that introduced it is never handed out again. Readers may use
+`events.rowid` as a global cursor (the PnL ledger checkpoint, `asOfRowid`)
+without knowing which aggregates compact. Numbers deleted before that migration
+above both the highest surviving rowid and the ledger checkpoint may be handed
+out once more (ADR 0025).
+
 **Grafana Dashboard Strategy**: Views use SQLite generated columns to expose
 JSON fields as queryable columns. Specialized views can pre-compute complex
 metrics, simplifying dashboard queries.

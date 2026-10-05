@@ -7686,6 +7686,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serial_test",
+ "sqlite-es",
  "sqlx 0.8.6",
  "sqlx 0.9.0",
  "st0x-bridge",
