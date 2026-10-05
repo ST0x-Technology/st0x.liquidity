@@ -46,7 +46,7 @@ use crate::usdc_rebalance::{UsdcRebalance, UsdcRebalanceEvent};
 /// mismatch against the persisted `pnl_ledger_checkpoint.ledger_version`
 /// truncates every ledger table and resets the checkpoint to zero, making
 /// rebuild the same code path as first-deploy backfill.
-pub(crate) const LEDGER_VERSION: i64 = 3;
+pub(crate) const LEDGER_VERSION: i64 = 2;
 
 /// Rows fetched per entity per ingest batch. Bounds peak memory during
 /// backfill; each batch's rows and checkpoint advance commit atomically, so
@@ -1062,21 +1062,57 @@ mod tests {
         );
     }
 
-    /// The upgrade can find the ledger checkpoint above every surviving
-    /// rowid, because compaction deleted the rows it was set on. Events
-    /// written after the upgrade must land above that checkpoint.
+    async fn event_rows(pool: &SqlitePool) -> Vec<(i64, String, String, i64)> {
+        sqlx::query_as(
+            "SELECT rowid, aggregate_type, aggregate_id, sequence FROM events ORDER BY rowid",
+        )
+        .fetch_all(pool)
+        .await
+        .unwrap()
+    }
+
+    /// On the old schema the ledger checkpoints on the newest row and
+    /// compaction then deletes it, along with rows between surviving ones.
+    /// The upgrade must keep every surviving rowid and hand the next event a
+    /// number above that checkpoint, which no surviving row reaches.
     #[tokio::test]
-    async fn upgrade_starts_new_rowids_above_a_checkpoint_on_deleted_rows() {
+    async fn upgrade_keeps_rowids_and_starts_above_a_checkpoint_on_deleted_rows() {
         let pool = pool_migrated_up_to(LAST_MIGRATION_BEFORE_UNIQUE_EVENT_ROWIDS).await;
-        let ledger = PnlLedger::new(pool.clone());
         persist_event::<Position>(&pool, "AAPL", 1, &onchain_fill(1, 0)).await;
         persist_compactable_inventory_event(&pool, 1).await;
+        persist_event::<Position>(&pool, "AAPL", 2, &onchain_fill(2, 0)).await;
         persist_compactable_inventory_event(&pool, 2).await;
-        ledger.catch_up().await.unwrap();
-        assert_eq!(compact_events::<InventorySnapshot>(&pool).await.unwrap(), 2);
+        persist_compactable_inventory_event(&pool, 3).await;
+        let LedgerHead(checkpoint) = PnlLedger::new(pool.clone()).catch_up().await.unwrap();
+        assert_eq!(compact_events::<InventorySnapshot>(&pool).await.unwrap(), 3);
+        let surviving = event_rows(&pool).await;
 
         sqlx::migrate!().run(&pool).await.unwrap();
-        persist_wrapped_fill(&pool, 7, 2).await;
+
+        assert_eq!(event_rows(&pool).await, surviving);
+        persist_event::<Position>(&pool, "AAPL", 3, &onchain_fill(3, 0)).await;
+        let next_rowid = event_rows(&pool).await.last().unwrap().0;
+        assert!(
+            next_rowid > checkpoint,
+            "next rowid {next_rowid} must be above checkpoint {checkpoint}"
+        );
+    }
+
+    /// A ledger that already skipped an event below its checkpoint is
+    /// rebuilt after the upgrade, by this release or by the previous one
+    /// after a rollback: both run `LEDGER_VERSION` 2.
+    #[tokio::test]
+    async fn upgrade_rebuilds_a_ledger_that_skipped_an_event() {
+        let pool = pool_migrated_up_to(LAST_MIGRATION_BEFORE_UNIQUE_EVENT_ROWIDS).await;
+        let ledger = PnlLedger::new(pool.clone());
+        persist_wrapped_fill(&pool, 7, 1).await;
+        ledger.catch_up().await.unwrap();
+        sqlx::query("DELETE FROM pnl_onchain_fill")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        sqlx::migrate!().run(&pool).await.unwrap();
         ledger.catch_up().await.unwrap();
 
         assert_eq!(
