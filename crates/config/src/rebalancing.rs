@@ -54,6 +54,13 @@ pub enum RebalancingCtxError {
     ZeroAttestationRetryDeadline,
     #[error("rebalancing settlement_retry_deadline_secs must be non-zero")]
     ZeroSettlementRetryDeadline,
+    #[error("[rebalancing.usdc] conversion_failure_cooldown_secs must be non-zero")]
+    ZeroUsdcConversionFailureCooldown,
+    #[error(
+        "[rebalancing.usdc] conversion_failure_cooldown_secs is {secs}, above the \
+         maximum of {MAX_USDC_CONVERSION_FAILURE_COOLDOWN_SECS}"
+    )]
+    UsdcConversionFailureCooldownTooLong { secs: u64 },
     #[error(
         "rebalancing max_burn_revert_redrives must be non-zero when USDC rebalancing \
          is enabled; set it to the maximum number of burn-revert redrive attempts \
@@ -137,7 +144,23 @@ pub struct UsdcRebalancing {
         deserialize_with = "st0x_float_serde::deserialize_option_float_from_number_or_string"
     )]
     pub deviation: Option<Float>,
+    /// How long a USD->USDC conversion that failed before the Alpaca
+    /// withdrawal holds Alpaca->Base planning on every corridor. The book is
+    /// Alpaca's, shared by every corridor, so an immediate retry would meet
+    /// the same cause. Must be non-zero and at most one day; defaults to 300
+    /// when absent.
+    #[serde(default = "default_usdc_conversion_failure_cooldown_secs")]
+    pub conversion_failure_cooldown_secs: u64,
 }
+
+fn default_usdc_conversion_failure_cooldown_secs() -> u64 {
+    5 * 60
+}
+
+/// Upper bound on `conversion_failure_cooldown_secs`: one day. A longer hold
+/// would stop Alpaca->Base rebalancing for longer than an operator would
+/// leave it unattended.
+const MAX_USDC_CONVERSION_FAILURE_COOLDOWN_SECS: u64 = 24 * 60 * 60;
 
 /// One `[rebalancing.usdc.corridors.<chain>]` table. Every key is required.
 #[derive(Debug, Clone, Copy, Deserialize)]
@@ -177,6 +200,7 @@ pub struct UsdcCorridors {
     mode: OperationMode,
     by_chain: BTreeMap<Chain, UsdcCorridorCtx>,
     served: BTreeSet<UsdcCorridor>,
+    conversion_failure_cooldown: Duration,
 }
 
 impl UsdcCorridors {
@@ -195,6 +219,13 @@ impl UsdcCorridors {
 
     pub fn serves(&self, corridor: UsdcCorridor) -> bool {
         self.served.contains(&corridor)
+    }
+
+    /// How long a failed pre-withdrawal USD->USDC conversion holds
+    /// Alpaca->Base planning. See
+    /// [`UsdcRebalancing::conversion_failure_cooldown_secs`].
+    pub const fn conversion_failure_cooldown(&self) -> Duration {
+        self.conversion_failure_cooldown
     }
 }
 
@@ -264,6 +295,9 @@ impl UsdcCorridors {
             mode: OperationMode::Disabled,
             by_chain: BTreeMap::new(),
             served: BTreeSet::from([UsdcCorridor::BASE_CCTP]),
+            conversion_failure_cooldown: Duration::from_secs(
+                default_usdc_conversion_failure_cooldown_secs(),
+            ),
         }
     }
 
@@ -282,7 +316,17 @@ impl UsdcCorridors {
             mode,
             by_chain,
             served,
+            conversion_failure_cooldown: Duration::from_secs(
+                default_usdc_conversion_failure_cooldown_secs(),
+            ),
         }
+    }
+
+    /// The same corridors with `cooldown` as the conversion-failure cooldown.
+    #[must_use]
+    pub const fn with_conversion_failure_cooldown(mut self, cooldown: Duration) -> Self {
+        self.conversion_failure_cooldown = cooldown;
+        self
     }
 }
 
@@ -294,6 +338,16 @@ impl UsdcRebalancing {
         &self,
         base_cash_vault: BaseCashVault,
     ) -> Result<UsdcCorridors, RebalancingCtxError> {
+        if self.conversion_failure_cooldown_secs == 0 {
+            return Err(RebalancingCtxError::ZeroUsdcConversionFailureCooldown);
+        }
+
+        if self.conversion_failure_cooldown_secs > MAX_USDC_CONVERSION_FAILURE_COOLDOWN_SECS {
+            return Err(RebalancingCtxError::UsdcConversionFailureCooldownTooLong {
+                secs: self.conversion_failure_cooldown_secs,
+            });
+        }
+
         let by_chain = self
             .corridors
             .iter()
@@ -318,6 +372,7 @@ impl UsdcRebalancing {
             mode: self.mode,
             by_chain,
             served,
+            conversion_failure_cooldown: Duration::from_secs(self.conversion_failure_cooldown_secs),
         })
     }
 
@@ -1641,6 +1696,83 @@ mod tests {
         assert_eq!(usdc.corridor, UsdcCorridor::BASE_CCTP);
         assert!(usdc.threshold.target.eq(float!(0.6)).unwrap());
         assert!(usdc.threshold.deviation.eq(float!(0.05)).unwrap());
+    }
+
+    #[test]
+    fn conversion_failure_cooldown_defaults_to_five_minutes() {
+        let ctx = RebalancingCtx::new(
+            &with_usdc(
+                r#"
+            [usdc]
+            mode = "disabled"
+            "#,
+            ),
+            BaseCashVault::Held,
+        )
+        .unwrap();
+
+        assert_eq!(
+            ctx.usdc.conversion_failure_cooldown(),
+            Duration::from_secs(300)
+        );
+    }
+
+    #[test]
+    fn conversion_failure_cooldown_is_read_from_the_usdc_table() {
+        let ctx = RebalancingCtx::new(
+            &with_usdc(
+                r#"
+            [usdc]
+            mode = "disabled"
+            conversion_failure_cooldown_secs = 120
+            "#,
+            ),
+            BaseCashVault::Held,
+        )
+        .unwrap();
+
+        assert_eq!(
+            ctx.usdc.conversion_failure_cooldown(),
+            Duration::from_secs(120)
+        );
+    }
+
+    #[test]
+    fn zero_conversion_failure_cooldown_is_refused() {
+        let error = corridor_error(
+            r#"
+            [usdc]
+            mode = "disabled"
+            conversion_failure_cooldown_secs = 0
+            "#,
+        );
+
+        assert!(
+            matches!(
+                error,
+                RebalancingCtxError::ZeroUsdcConversionFailureCooldown
+            ),
+            "got {error:?}"
+        );
+    }
+
+    #[test]
+    fn conversion_failure_cooldown_above_one_day_is_refused() {
+        let error = corridor_error(
+            r#"
+            [usdc]
+            mode = "disabled"
+            conversion_failure_cooldown_secs = 86401
+            "#,
+        );
+
+        assert!(
+            matches!(
+                error,
+                RebalancingCtxError::UsdcConversionFailureCooldownTooLong { secs: 86_401 }
+            ),
+            "got {error:?}"
+        );
     }
 
     #[test]

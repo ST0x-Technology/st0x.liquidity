@@ -3562,6 +3562,7 @@ pub fn default_test_rebalancing_ctx() -> Box<RebalancingCtx> {
             corridors: BTreeMap::new(),
             target: None,
             deviation: None,
+            conversion_failure_cooldown_secs: 300,
         },
         inventory_staleness_bound_secs: 300,
         transfer_timeout_secs: 1800,

@@ -180,6 +180,27 @@ pub(crate) const USDC_WITHDRAW_REJECTION_COOLDOWN: Duration = Duration::from_sec
 /// land a moment before the cooldown ends.
 const COOLDOWN_EXPIRY_CHECK_MARGIN: Duration = Duration::from_secs(5);
 
+/// What is left at `now` of a `cooldown` that started at `started_at`, or
+/// `None` once it has run out. A start after `now` (clock skew, or a stamp
+/// taken after `now` was read) leaves the time to `started_at + cooldown`,
+/// so a check queued for the end does not run while the hold is still on.
+fn cooldown_remaining(
+    started_at: DateTime<Utc>,
+    cooldown: Duration,
+    now: DateTime<Utc>,
+) -> Option<Duration> {
+    now.signed_duration_since(started_at).to_std().map_or_else(
+        |_| {
+            let ahead = started_at
+                .signed_duration_since(now)
+                .to_std()
+                .unwrap_or_default();
+            Some(cooldown.saturating_add(ahead))
+        },
+        |age| cooldown.checked_sub(age).filter(|left| !left.is_zero()),
+    )
+}
+
 /// Whether a terminal USDC settlement event reconciled the in-memory
 /// inventory ledger. `DeferredToSnapshot` means the settlement was accepted
 /// as authoritative (the durable event proves funds arrived) but the
@@ -203,8 +224,26 @@ pub(super) enum UsdcSettlementOutcome {
     Reconciled,
     DeferredToSnapshot,
     /// A `WithdrawalFailed` with no tracking: deferred like
-    /// `DeferredToSnapshot`, and a withdraw cooldown started at this time.
-    HeldByWithdrawCooldown(DateTime<Utc>),
+    /// `DeferredToSnapshot`, and a withdraw cooldown started.
+    HeldByWithdrawCooldown,
+}
+
+/// Whether a terminal event (USDC, mint or redemption) left the in-memory
+/// cash ledger reconciled, or stale until the next snapshot poll heals it.
+#[derive(Debug, Clone, Copy)]
+pub(super) enum CashLedgerState {
+    Reconciled,
+    AwaitingSnapshot,
+}
+
+impl From<UsdcSettlementOutcome> for CashLedgerState {
+    fn from(outcome: UsdcSettlementOutcome) -> Self {
+        match outcome {
+            UsdcSettlementOutcome::Reconciled => Self::Reconciled,
+            UsdcSettlementOutcome::DeferredToSnapshot
+            | UsdcSettlementOutcome::HeldByWithdrawCooldown => Self::AwaitingSnapshot,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -647,7 +686,8 @@ impl RebalancingService {
         // the post-rebalance inventory.
         if is_clearable_terminal {
             self.equity_scheduler.cancel_pending().await;
-            self.usdc_scheduler.cancel_pending().await;
+            self.cancel_pending_usdc_checks(settlement_outcome.into())
+                .await;
             match settlement_outcome {
                 UsdcSettlementOutcome::Reconciled => {
                     self.usdc_scheduler.enqueue_check().await;
@@ -666,15 +706,15 @@ impl RebalancingService {
                          in-memory inventory was not reconciled by this terminal event"
                     );
                 }
-                UsdcSettlementOutcome::HeldByWithdrawCooldown(rejected_at) => {
+                UsdcSettlementOutcome::HeldByWithdrawCooldown => {
                     // Deferred as above, and planning is held until the
-                    // withdraw cooldown ends: check again then.
+                    // withdraw cooldown ends: the hold queued the check for
+                    // then, and the cancel above kept it.
                     debug!(
                         target: "rebalance",
                         id = %id,
                         "Deferring the fresh USDC imbalance check to the withdraw cooldown's end"
                     );
-                    self.enqueue_cooldown_expiry_check(rejected_at).await;
                 }
             }
         }
@@ -1068,10 +1108,35 @@ impl RebalancingService {
                 self.cancel_tracked_usdc_rebalance(id).await?
             }
             WithdrawalFailed { .. } => self.defer_untracked_withdrawal_failure(id).await,
+            // A cleared ConversionFailed is AlpacaToBase's pre-withdrawal leg
+            // (BaseToAlpaca's conversion is post-deposit, so the classifier
+            // preserves it): nothing left Alpaca, but the cause may persist,
+            // so the conversion cooldown holds Alpaca->Base planning. The
+            // fresh check still runs, for the other direction and corridors.
+            ConversionFailed { reason, failed_at }
+                if terminal_action != UsdcTerminalAction::PreservePostBurn =>
+            {
+                let outcome = self.cancel_tracked_usdc_rebalance(id).await?;
+                self.hold_after_conversion_failure(*failed_at).await;
+                let cooldown = self.config.usdc.conversion_failure_cooldown();
+                self.enqueue_cooldown_expiry_check(*failed_at, cooldown)
+                    .await;
+                warn!(
+                    target: "rebalance",
+                    %id,
+                    %reason,
+                    %failed_at,
+                    cooldown_secs = cooldown.as_secs(),
+                    "USD->USDC conversion failed before the Alpaca withdrawal; holding \
+                     Alpaca->Base planning on every corridor for the cooldown"
+                );
+                outcome
+            }
             // These failures may be pre- or post-burn (BridgingFailed by burn
-            // stage; ConversionFailed by direction -- BaseToAlpaca's conversion
-            // is post-deposit; DepositFailed is always post-mint). The classifier
-            // decides: preserve post-burn, otherwise reconcile to source.
+            // stage; DepositFailed is always post-mint). The classifier
+            // decides: preserve post-burn, otherwise reconcile to source. A
+            // ConversionFailed reaches this arm only when preserved (the
+            // cleared one is handled above).
             BridgingFailed { .. } | DepositFailed { .. } | ConversionFailed { .. } => {
                 if terminal_action == UsdcTerminalAction::PreservePostBurn {
                     // Preservation is achieved by NOT cancelling: the tracking
@@ -1485,8 +1550,10 @@ impl RebalancingService {
         warn!(target: "rebalance", %id, ?chain, "Untracked failed withdrawal: holding Base->Alpaca planning for the cooldown (every chain when the chain is unknown)");
         let rejected_at = Utc::now();
         self.hold_after_withdraw_rejection(chain, rejected_at).await;
+        self.enqueue_cooldown_expiry_check(rejected_at, USDC_WITHDRAW_REJECTION_COOLDOWN)
+            .await;
 
-        UsdcSettlementOutcome::HeldByWithdrawCooldown(rejected_at)
+        UsdcSettlementOutcome::HeldByWithdrawCooldown
     }
 
     /// Installs the gates of a withdraw rejected at `rejected_at` on `chain`
@@ -1499,8 +1566,8 @@ impl RebalancingService {
     ///   the cash gate holds dispatch on every corridor);
     ///
     /// The caller queues the delayed check for the cooldown's end
-    /// ([`Self::enqueue_cooldown_expiry_check`]): the reactor cancels pending
-    /// checks after a terminal event, so it queues that check afterwards.
+    /// ([`Self::enqueue_cooldown_expiry_check`]); a later terminal event keeps
+    /// it ([`Self::cancel_pending_usdc_checks`]).
     pub(super) async fn hold_after_withdraw_rejection(
         &self,
         chain: Option<Chain>,
@@ -1535,19 +1602,69 @@ impl RebalancingService {
         }
     }
 
-    /// Queues a USDC check for the end of a withdraw cooldown that started at
-    /// `rejected_at`: a quiet market queues no other check then, and planning
+    /// Queues a USDC check for the end of a `cooldown` that started at
+    /// `started_at`: a quiet market queues no other check then, and planning
     /// would otherwise wait for the next fill or balance change.
-    pub(super) async fn enqueue_cooldown_expiry_check(&self, rejected_at: DateTime<Utc>) {
-        let remaining = Utc::now()
-            .signed_duration_since(rejected_at)
-            .to_std()
-            .map_or(USDC_WITHDRAW_REJECTION_COOLDOWN, |age| {
-                USDC_WITHDRAW_REJECTION_COOLDOWN.saturating_sub(age)
-            });
+    pub(super) async fn enqueue_cooldown_expiry_check(
+        &self,
+        started_at: DateTime<Utc>,
+        cooldown: Duration,
+    ) {
+        let remaining = cooldown_remaining(started_at, cooldown, Utc::now()).unwrap_or_default();
         self.usdc_scheduler
-            .enqueue_check_after(remaining + COOLDOWN_EXPIRY_CHECK_MARGIN)
+            .enqueue_check_after(remaining.saturating_add(COOLDOWN_EXPIRY_CHECK_MARGIN))
             .await;
+    }
+
+    /// Drops the pending USDC checks a terminal event made stale, and keeps
+    /// the delayed ones, such as each cooldown's check for its end. The
+    /// caller queues the fresh check it needs.
+    ///
+    /// With a reconciled `ledger`, the checks already due are dropped: the
+    /// caller's fresh check replaces them. While the `ledger` awaits a
+    /// snapshot, no pending check runs sooner than the inventory staleness
+    /// bound: by then the check either reads an onchain USDC poll taken after
+    /// the terminal event or skips the stale chain. Broker cash freshness is
+    /// not checked here.
+    pub(super) async fn cancel_pending_usdc_checks(&self, ledger: CashLedgerState) {
+        match ledger {
+            CashLedgerState::Reconciled => self.usdc_scheduler.cancel_due().await,
+            CashLedgerState::AwaitingSnapshot => {
+                // The margin covers the whole-second rounding of `run_at`.
+                self.usdc_scheduler
+                    .defer_pending(
+                        self.config
+                            .inventory_staleness_bound
+                            .saturating_add(COOLDOWN_EXPIRY_CHECK_MARGIN),
+                    )
+                    .await;
+            }
+        }
+    }
+
+    /// Holds Alpaca->Base planning on every corridor for the conversion
+    /// cooldown, from `failed_at` of a USD->USDC conversion that failed
+    /// before its Alpaca withdrawal, keeping the later of two failure times.
+    /// The delayed check for the cooldown's end is queued apart, as for
+    /// [`Self::hold_after_withdraw_rejection`].
+    pub(super) async fn hold_after_conversion_failure(&self, failed_at: DateTime<Utc>) {
+        let mut held_from = self.usdc_conversion_failed_at.write().await;
+        *held_from = Some(held_from.map_or(failed_at, |held| held.max(failed_at)));
+    }
+
+    /// Whether Alpaca->Base planning is held because a USD->USDC conversion
+    /// failed before its withdrawal less than the conversion cooldown ago. An
+    /// expired failure is dropped.
+    pub(super) async fn usdc_conversion_cooling_down(&self, now: DateTime<Utc>) -> bool {
+        let cooldown = self.config.usdc.conversion_failure_cooldown();
+        let mut failed_at = self.usdc_conversion_failed_at.write().await;
+        // A failure stamped after `now` (taken before this lock) is still
+        // cooling down.
+        if failed_at.is_some_and(|at| cooldown_remaining(at, cooldown, now).is_none()) {
+            *failed_at = None;
+        }
+
+        failed_at.is_some()
     }
 
     /// Whether Base->Alpaca planning on `chain` is held because a vault
@@ -1792,8 +1909,14 @@ impl UsdcRebalancingCheckScheduler {
         }
     }
 
-    pub(super) async fn cancel_pending(&self) {
-        self.queue.cancel_all_pending().await;
+    /// Drops the checks already due and keeps the delayed ones.
+    pub(super) async fn cancel_due(&self) {
+        self.queue.cancel_due_pending().await;
+    }
+
+    /// Moves every pending check to run no sooner than `not_before`.
+    pub(super) async fn defer_pending(&self, not_before: Duration) {
+        self.queue.defer_pending(not_before).await;
     }
 }
 
@@ -1875,6 +1998,33 @@ mod tests {
                 .await;
 
         assert_eq!(result, Err(UsdcTriggerSkip::NoImbalance));
+    }
+
+    #[test]
+    fn cooldown_started_in_the_future_lasts_until_its_end() {
+        let now = Utc.with_ymd_and_hms(2026, 10, 5, 15, 0, 0).unwrap();
+        let cooldown = Duration::from_secs(300);
+        let started_at = now + chrono::Duration::seconds(60);
+
+        assert_eq!(
+            cooldown_remaining(started_at, cooldown, now),
+            Some(Duration::from_secs(360))
+        );
+    }
+
+    #[test]
+    fn cooldown_started_in_the_past_counts_down() {
+        let now = Utc.with_ymd_and_hms(2026, 10, 5, 15, 0, 0).unwrap();
+        let cooldown = Duration::from_secs(300);
+
+        assert_eq!(
+            cooldown_remaining(now - chrono::Duration::seconds(60), cooldown, now),
+            Some(Duration::from_secs(240))
+        );
+        assert_eq!(
+            cooldown_remaining(now - chrono::Duration::seconds(300), cooldown, now),
+            None
+        );
     }
 
     /// The floor exists to keep a transfer from converting into a balance
@@ -3275,6 +3425,21 @@ mod tests {
         .expect("count pending usdc-check jobs")
     }
 
+    async fn count_usdc_checks_delayed_at_least(
+        apalis_pool: &apalis_sqlite::SqlitePool,
+        secs: i64,
+    ) -> i64 {
+        sqlx_apalis::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM Jobs WHERE status = 'Pending' AND job_type = ? \
+             AND run_at >= strftime('%s', 'now') + ?",
+        )
+        .bind(std::any::type_name::<UsdcRebalancingCheck>())
+        .bind(secs)
+        .fetch_one(apalis_pool)
+        .await
+        .expect("count delayed usdc-check jobs")
+    }
+
     #[tokio::test]
     async fn usdc_scheduler_enqueue_check_inserts_pending_row() {
         let apalis_pool = crate::test_utils::setup_test_apalis_pool().await;
@@ -3286,7 +3451,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn usdc_scheduler_cancel_pending_marks_pending_rows_done() {
+    async fn usdc_scheduler_cancel_due_marks_due_rows_done() {
         let apalis_pool = crate::test_utils::setup_test_apalis_pool().await;
         let scheduler = UsdcRebalancingCheckScheduler::new(&apalis_pool);
 
@@ -3294,12 +3459,57 @@ mod tests {
         scheduler.enqueue_check().await;
         assert_eq!(count_pending_usdc_check_jobs(&apalis_pool).await, 2);
 
-        scheduler.cancel_pending().await;
+        scheduler.cancel_due().await;
 
         assert_eq!(
             count_pending_usdc_check_jobs(&apalis_pool).await,
             0,
-            "cancel_pending must drain all pending rows"
+            "cancel_due must drain every pending row that is due"
+        );
+    }
+
+    #[tokio::test]
+    async fn usdc_scheduler_cancel_due_keeps_delayed_rows() {
+        let apalis_pool = crate::test_utils::setup_test_apalis_pool().await;
+        let scheduler = UsdcRebalancingCheckScheduler::new(&apalis_pool);
+
+        scheduler.enqueue_check().await;
+        scheduler
+            .enqueue_check_after(Duration::from_secs(300))
+            .await;
+
+        scheduler.cancel_due().await;
+
+        assert_eq!(
+            (
+                count_pending_usdc_check_jobs(&apalis_pool).await,
+                count_usdc_checks_delayed_at_least(&apalis_pool, 290).await,
+            ),
+            (1, 1),
+            "only the delayed row is left"
+        );
+    }
+
+    #[tokio::test]
+    async fn usdc_scheduler_defer_pending_moves_rows_due_sooner_only() {
+        let apalis_pool = crate::test_utils::setup_test_apalis_pool().await;
+        let scheduler = UsdcRebalancingCheckScheduler::new(&apalis_pool);
+
+        scheduler.enqueue_check().await;
+        scheduler
+            .enqueue_check_after(Duration::from_secs(1000))
+            .await;
+
+        scheduler.defer_pending(Duration::from_secs(300)).await;
+
+        assert_eq!(
+            (
+                count_pending_usdc_check_jobs(&apalis_pool).await,
+                count_usdc_checks_delayed_at_least(&apalis_pool, 295).await,
+                count_usdc_checks_delayed_at_least(&apalis_pool, 990).await,
+            ),
+            (2, 2, 1),
+            "the due row moves to the deferral, the later row keeps its time"
         );
     }
 
@@ -3309,7 +3519,7 @@ mod tests {
         let scheduler = UsdcRebalancingCheckScheduler::new(&apalis_pool);
 
         scheduler.enqueue_check().await;
-        scheduler.cancel_pending().await;
+        scheduler.cancel_due().await;
         scheduler.enqueue_check().await;
 
         assert_eq!(count_pending_usdc_check_jobs(&apalis_pool).await, 1);

@@ -2084,22 +2084,51 @@ pub(crate) async fn interrupted_usdc_rebalance_ids(
     Ok(InterruptedUsdcRebalances { ids, unparseable })
 }
 
-/// The `UsdcRebalance` aggregates that recorded `WithdrawalFailed` less than
-/// `max_age` before `now`, so startup can restore the withdraw cooldown of a
-/// rejection the process did not live through. A row whose id or `failed_at`
-/// cannot be read is skipped with a warning.
-pub(crate) async fn recent_withdrawal_failures(
+/// A terminal failure whose recent occurrences startup reads back to restore
+/// the cooldown it starts.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum CooldownFailure {
+    /// `WithdrawalFailed`, which starts the withdraw cooldown.
+    Withdrawal,
+    /// `ConversionFailed`, which starts the conversion cooldown.
+    Conversion,
+}
+
+impl CooldownFailure {
+    const fn event_type(self) -> &'static str {
+        match self {
+            Self::Withdrawal => "UsdcRebalanceEvent::WithdrawalFailed",
+            Self::Conversion => "UsdcRebalanceEvent::ConversionFailed",
+        }
+    }
+
+    const fn failed_at_path(self) -> &'static str {
+        match self {
+            Self::Withdrawal => "$.WithdrawalFailed.failed_at",
+            Self::Conversion => "$.ConversionFailed.failed_at",
+        }
+    }
+}
+
+/// The `UsdcRebalance` aggregates that recorded `failure` less than `max_age`
+/// before `now`, so startup can restore the cooldown of a failure the process
+/// did not live through. A row whose id or `failed_at` cannot be read is
+/// skipped with a warning.
+pub(crate) async fn recent_failures(
     pool: &SqlitePool,
+    failure: CooldownFailure,
     now: DateTime<Utc>,
     max_age: std::time::Duration,
 ) -> Result<Vec<UsdcRebalanceId>, sqlx::Error> {
     let rows: Vec<(String, Option<String>)> = sqlx::query_as(
-        "SELECT aggregate_id, json_extract(payload, '$.WithdrawalFailed.failed_at') \
+        "SELECT aggregate_id, json_extract(payload, ?) \
          FROM events \
          WHERE aggregate_type = 'UsdcRebalance' \
-           AND event_type = 'UsdcRebalanceEvent::WithdrawalFailed' \
+           AND event_type = ? \
          ORDER BY aggregate_id",
     )
+    .bind(failure.failed_at_path())
+    .bind(failure.event_type())
     .fetch_all(pool)
     .await?;
 
@@ -2107,14 +2136,14 @@ pub(crate) async fn recent_withdrawal_failures(
         .into_iter()
         .filter_map(|(raw_id, raw_failed_at)| {
             let Ok(id) = raw_id.parse::<UsdcRebalanceId>() else {
-                warn!(target: "rebalance", %raw_id, "Unparseable UsdcRebalance aggregate_id on a WithdrawalFailed event");
+                warn!(target: "rebalance", %raw_id, ?failure, "Unparseable UsdcRebalance aggregate_id on a failure event");
                 return None;
             };
             let Some(failed_at) = raw_failed_at
                 .as_deref()
                 .and_then(|raw| DateTime::parse_from_rfc3339(raw).ok())
             else {
-                warn!(target: "rebalance", %id, ?raw_failed_at, "Unreadable failed_at on a WithdrawalFailed event");
+                warn!(target: "rebalance", %id, ?failure, ?raw_failed_at, "Unreadable failed_at on a failure event");
                 return None;
             };
             // A `failed_at` after `now` (clock skew) counts as recent.
