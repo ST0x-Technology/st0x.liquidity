@@ -25,6 +25,10 @@ use alloy::signers::local::PrivateKeySigner;
 use chrono::{DateTime, Utc};
 use rain_math_float::Float;
 use sqlx::SqlitePool;
+#[cfg(test)]
+use sqlx::migrate::{Migration, Migrator};
+#[cfg(test)]
+use std::borrow::Cow;
 use std::sync::atomic::{AtomicU64, Ordering};
 #[cfg(test)]
 use std::sync::{Arc, Condvar, LazyLock, Mutex};
@@ -785,6 +789,29 @@ pub(crate) async fn wait_for_terminal_job<Task: 'static>(apalis_pool: &apalis_sq
 #[cfg(test)]
 pub async fn setup_test_db() -> SqlitePool {
     setup_test_pools().await.0
+}
+
+/// In memory database migrated only up to `version`, reproducing the schema a
+/// later migration upgrades, so a test can seed legacy state and then run the
+/// remaining migrations over it.
+#[cfg(test)]
+pub(crate) async fn pool_migrated_up_to(version: i64) -> SqlitePool {
+    let pool = SqlitePool::connect(":memory:").await.unwrap();
+    let migrator = sqlx::migrate!();
+    let legacy_migrations: Vec<Migration> = migrator
+        .iter()
+        .filter(|migration| migration.version <= version)
+        .cloned()
+        .collect();
+    Migrator {
+        migrations: Cow::Owned(legacy_migrations),
+        ..migrator
+    }
+    .run(&pool)
+    .await
+    .unwrap();
+
+    pool
 }
 
 /// Fallible database fixture constructor for external test crates.

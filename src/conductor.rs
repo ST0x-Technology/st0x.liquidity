@@ -1104,7 +1104,7 @@ impl Conductor {
         let onchain_trade =
             setup_onchain_trade_store(&pool, dashboard_delivery.broadcaster.clone()).await?;
 
-        let pnl_ledger_reactor = setup_pnl_ledger(pnl_ledger).await?;
+        let pnl_ledger_reactor = setup_pnl_ledger(pnl_ledger).await;
 
         let (record_bot_gas_receipt_cost_queue, record_bot_gas_receipt_cost_ctx) =
             setup_bot_gas_receipt_cost(&pool, &apalis_pool, &ctx, pnl_ledger_reactor.clone())
@@ -1590,17 +1590,29 @@ impl Drop for Conductor {
 /// dispatch or a /pnl request; on a normal restart it is a no-op (the bot is
 /// the sole writer of its database, so no events accumulate while it is
 /// down).
-async fn setup_pnl_ledger(ledger: Arc<PnlLedger>) -> anyhow::Result<Arc<PnlLedgerReactor>> {
+///
+/// A failed catch up does not stop startup: the ledger is a read model and
+/// must never keep the bot from hedging. The failure is logged and counted
+/// in `pnl_ledger_catch_up_failures_total`, the reactor retries on every
+/// source event, and /pnl returns the ingestion error until it recovers.
+async fn setup_pnl_ledger(ledger: Arc<PnlLedger>) -> Arc<PnlLedgerReactor> {
     let started_at = Instant::now();
-    let LedgerHead(head) = ledger.catch_up().await?;
-    info!(
-        target: "startup",
-        head,
-        elapsed = ?started_at.elapsed(),
-        "PnL ledger caught up at startup"
-    );
+    match ledger.catch_up().await {
+        Ok(LedgerHead(head)) => info!(
+            target: "startup",
+            head,
+            elapsed = ?started_at.elapsed(),
+            "PnL ledger caught up at startup"
+        ),
+        Err(error) => error!(
+            target: "startup",
+            %error,
+            elapsed = ?started_at.elapsed(),
+            "PnL ledger failed to catch up at startup; starting without it"
+        ),
+    }
 
-    Ok(Arc::new(PnlLedgerReactor::new(ledger)))
+    Arc::new(PnlLedgerReactor::new(ledger))
 }
 
 /// Builds the bot-gas cost-recording wiring (ADR 0020): the event store, the
