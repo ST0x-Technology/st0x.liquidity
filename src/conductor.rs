@@ -1611,6 +1611,9 @@ async fn setup_pnl_ledger(
             "PnL ledger caught up at startup"
         ),
         Err(error) => {
+            // The top level message of `Database` and `Stream` hides the
+            // SQLite or payload error the operator needs; render the chain.
+            let error = format!("{:#}", anyhow::Error::from(error));
             error!(
                 target: "startup",
                 %error,
@@ -8527,7 +8530,8 @@ mod tests {
     }
 
     /// A ledger that cannot catch up must not keep the bot from starting:
-    /// startup continues with the reactor wired and pages the operator.
+    /// startup continues with the reactor wired and pages the operator with
+    /// the underlying cause, not only the ledger's top level message.
     #[tokio::test]
     async fn ledger_startup_failure_pages_and_does_not_stop_startup() {
         let pool = setup_test_db().await;
@@ -8548,6 +8552,10 @@ mod tests {
         assert_eq!(alerts.len(), 1, "{alerts:?}");
         assert!(
             alerts[0].contains("PnL ledger failed to catch up at startup"),
+            "{alerts:?}"
+        );
+        assert!(
+            alerts[0].contains("Undeserializable Position event payload at events rowid 1"),
             "{alerts:?}"
         );
     }

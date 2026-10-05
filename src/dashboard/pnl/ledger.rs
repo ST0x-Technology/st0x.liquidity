@@ -139,8 +139,12 @@ impl PnlLedger {
     async fn ingest_to_head(&self) -> Result<i64, PnlLedgerError> {
         self.reconcile_version().await?;
 
-        let head = head_rowid(&self.pool).await?;
         let mut checkpoint = self.checkpoint().await?;
+        // Compaction can delete the rows at and below the checkpoint, so
+        // MAX(rowid) can drop below it. No event can take those numbers
+        // (ADR 0025), so the ledger is complete up to the checkpoint and the
+        // head it reports must never go below a head it reported before.
+        let head = head_rowid(&self.pool).await?.max(checkpoint);
         record_checkpoint_lag(head, checkpoint);
         while checkpoint < head {
             checkpoint = self.ingest_batch(checkpoint, head).await?;
@@ -1062,6 +1066,23 @@ mod tests {
         );
     }
 
+    /// Compaction of the newest rows with no event written since lowers
+    /// MAX(rowid) below the checkpoint. The head the ledger reports, which
+    /// `/pnl` validates saved `asOfRowid` values against, must not go down.
+    #[tokio::test]
+    async fn reported_head_does_not_drop_when_the_newest_rows_are_compacted() {
+        let pool = setup_test_db().await;
+        let ledger = PnlLedger::new(pool.clone());
+        persist_event::<Position>(&pool, "AAPL", 1, &onchain_fill(1, 0)).await;
+        persist_compactable_inventory_event(&pool, 1).await;
+        let LedgerHead(reported) = ledger.catch_up().await.unwrap();
+        assert_eq!(compact_events::<InventorySnapshot>(&pool).await.unwrap(), 1);
+
+        let LedgerHead(after_compaction) = ledger.catch_up().await.unwrap();
+
+        assert_eq!(after_compaction, reported);
+    }
+
     async fn event_rows(pool: &SqlitePool) -> Vec<(i64, String, String, i64)> {
         sqlx::query_as(
             "SELECT rowid, aggregate_type, aggregate_id, sequence FROM events ORDER BY rowid",
@@ -1119,6 +1140,67 @@ mod tests {
             stored_basis(&pool, 7).await,
             Some(WRAPPED_RATIO.to_string())
         );
+    }
+
+    /// Columns sorted by name, indexes with their key columns, and whether
+    /// the table declares `AUTOINCREMENT`.
+    async fn table_shape(
+        pool: &SqlitePool,
+        table: &str,
+    ) -> (
+        Vec<(String, String, i64, Option<String>, i64)>,
+        Vec<(String, i64, String)>,
+        bool,
+    ) {
+        let columns = sqlx::query_as(
+            "SELECT name, type, \"notnull\", dflt_value, pk FROM pragma_table_xinfo(?1) \
+             ORDER BY name",
+        )
+        .bind(table)
+        .fetch_all(pool)
+        .await
+        .unwrap();
+        let indexes = sqlx::query_as(
+            "SELECT CASE WHEN list.origin = 'c' THEN list.name ELSE list.origin END, \
+                    list.\"unique\", \
+                    (SELECT group_concat(name, ',') FROM \
+                        (SELECT name FROM pragma_index_info(list.name) ORDER BY seqno)) \
+             FROM pragma_index_list(?1) AS list ORDER BY 1",
+        )
+        .bind(table)
+        .fetch_all(pool)
+        .await
+        .unwrap();
+        let sql: String =
+            sqlx::query_scalar("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?1")
+                .bind(table)
+                .fetch_one(pool)
+                .await
+                .unwrap();
+
+        (
+            columns,
+            indexes,
+            sql.to_uppercase().contains("AUTOINCREMENT"),
+        )
+    }
+
+    /// This crate keeps its own copy of the event store migrations, so a
+    /// schema change event-sorcery ships (such as its `declare_rowid`
+    /// migration, ported by ADR 0025) must be mirrored here. Column order is
+    /// ignored: columns added by `ALTER TABLE` land last in either copy.
+    #[tokio::test]
+    async fn event_store_schema_matches_event_sorcery() {
+        let ours = setup_test_db().await;
+        let upstream = sqlite_es::testing::create_test_pool().await.unwrap();
+
+        for table in ["events", "snapshots"] {
+            assert_eq!(
+                table_shape(&ours, table).await,
+                table_shape(&upstream, table).await,
+                "{table}"
+            );
+        }
     }
 
     /// Interleaved multi-entity history ingested with a batch size smaller

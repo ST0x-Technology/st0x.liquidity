@@ -4,6 +4,10 @@
 -- deletes the newest InventorySnapshot rows, the next events take their
 -- numbers at or below the watermark and the ledger never reads them.
 --
+-- The rebuild ports event-sorcery's `20260806105250_declare_rowid.sql`, which
+-- this repository never applied when it adopted `events_since` and
+-- `head_rowid`. It adds the sequence seed and the ledger reset below.
+--
 -- `id` aliases `rowid`, so every reader that selects `rowid` sees the same
 -- values. The composite key stays as a UNIQUE constraint, which keeps the
 -- duplicate sequence rejection that optimistic locking relies on and the

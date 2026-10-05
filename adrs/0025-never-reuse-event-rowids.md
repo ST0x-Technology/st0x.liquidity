@@ -40,17 +40,30 @@ up in `setup_pnl_ledger` returns that error, so every restart from 2026-10-03
 
 ### Event rowids come from `AUTOINCREMENT`
 
-A migration rebuilds `events` with `id INTEGER PRIMARY KEY AUTOINCREMENT`. `id`
-aliases `rowid`, the copy keeps every existing rowid, and
-`(aggregate_type, aggregate_id, sequence)` stays as a `UNIQUE` constraint, so
-duplicate sequence rejection (event-sorcery's optimistic locking matches any
-unique violation) and the aggregate load index are unchanged. Both secondary
-indexes are recreated.
+event-sorcery, the library that owns the `events` schema, already ships this
+rebuild as `migrations/20260806105250_declare_rowid.sql` in the pinned v0.3.1,
+and its spec asks consumers to apply its migrations. This repository keeps its
+own copy of the event store migrations and never ported that one when it adopted
+`events_since` and `head_rowid`. That missing port is the root cause.
+
+A migration ports it: it rebuilds `events` with
+`id INTEGER PRIMARY KEY AUTOINCREMENT`. `id` aliases `rowid`, the copy keeps
+every existing rowid, and `(aggregate_type, aggregate_id, sequence)` stays as a
+`UNIQUE` constraint, so duplicate sequence rejection (event-sorcery's optimistic
+locking matches any unique violation) and the aggregate load index are
+unchanged. Both secondary indexes are recreated. The seed and the ledger reset
+below are additions this repository needs because it ran the old schema.
 
 With `AUTOINCREMENT`, SQLite tracks the highest id ever used in
 `sqlite_sequence` and never hands out a lower one, whatever is deleted. The
 cursor in ADR 0016 and ADR 0018 then holds for every reader without each reader
-knowing which aggregates compact.
+knowing which aggregates compact. Compaction can still lower `MAX(rowid)` below
+the ledger checkpoint when it deletes the newest rows, so the ledger reports the
+larger of the two as its head, keeping saved `asOfRowid` values valid.
+
+A test compares the `events` and `snapshots` tables this repository's migrations
+create with those event-sorcery's migrations create, so the next upstream schema
+change that is not ported fails a test.
 
 ### Seed the sequence above the ledger checkpoint
 
