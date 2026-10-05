@@ -1,7 +1,8 @@
 //! Apalis job that orchestrates wrapped-equity recovery.
 //!
-//! Enqueued per symbol with a positive `BaseWalletWrappedEquity` balance,
-//! naming the chain whose wallet holds it. The job is a thin orchestrator:
+//! Enqueued per symbol and chain with a positive wrapped wallet balance
+//! (`BaseWalletWrappedEquity` or `ChainWalletWrappedEquity`), naming the
+//! chain whose wallet holds it. The job is a thin orchestrator:
 //! it reads `InventoryView`, picks a dispatch path, and sends the command
 //! sequence through the aggregate's store. All side effects (raindex
 //! deposit/confirm, mint/redemption resume, wrapped-token lookup) live in
@@ -14,8 +15,10 @@
 //!    (`ActiveTransfer`) or another chain's recovery holds it, the job
 //!    reschedules itself with a delay so an unchanged wallet balance is not
 //!    stranded waiting for another snapshot.
-//! 2. Read the inventory view's wallet balance + active mint/redemption
-//!    maps to pick a `DispatchDecision`.
+//! 2. Read the job chain's wallet balance and active mint/redemption from
+//!    the inventory view to pick a `DispatchDecision`. A transfer of the
+//!    symbol on another chain makes the job reschedule, never dispatch or
+//!    take the orphan path.
 //! 3. Send `Detect` followed by the path-specific command sequence:
 //!    `DispatchToMint`, `DispatchToRedemption`, or `SubmitOrphanDeposit +
 //!    ConfirmOrphanDeposit`. The aggregate's terminal state encodes the
@@ -160,8 +163,8 @@ pub(crate) enum WrappedEquityRecoveryJobError {
     Reschedule(#[from] QueuePushError),
 }
 
-/// Apalis job payload. The reactor pushes one of these per symbol with a
-/// positive `BaseWalletWrappedEquity` balance, generating a fresh
+/// Apalis job payload. The reactor pushes one of these per symbol and chain
+/// with a positive wrapped wallet balance, generating a fresh
 /// `recovery_id` at push time so apalis retries hit the same aggregate.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct WrappedEquityRecoveryJob {
@@ -231,7 +234,7 @@ impl Job<WrappedEquityRecoveryCtx> for WrappedEquityRecoveryJob {
             return Ok(());
         }
 
-        // Two-path claim: this job handles a positive `BaseWalletWrapped`
+        // Two-path claim: this job handles a positive wrapped wallet
         // balance, which can be either an orphan (absent guard) or the
         // landed-but-unconfirmed `WrapSubmitted` outcome -- the wrap tx
         // actually landed so the tokens are WRAPPED, but the confirmation read
@@ -329,7 +332,8 @@ impl Job<WrappedEquityRecoveryCtx> for WrappedEquityRecoveryJob {
             }
         }
 
-        let Some(snapshot) = read_recovery_snapshot(&ctx.inventory, &symbol).await else {
+        let Some(snapshot) = read_recovery_snapshot(&ctx.inventory, self.chain, &symbol).await
+        else {
             // No wrapped balance to drain this cycle. Do NOT release the guard:
             // an orphan claim drops to absent (the reactor re-triggers on the
             // next positive-balance poll), while a `HeldForRecovery` claim drops
@@ -406,40 +410,7 @@ impl Job<WrappedEquityRecoveryCtx> for WrappedEquityRecoveryJob {
             if detected_shares.is_some() && error.is_business_validation() {
                 return self.fail_invalid_detection(ctx, &error).await;
             }
-            if let WrappedEquityRecoveryJobError::ActiveTransferOnOtherChain { .. } = error {
-                // Another chain's transfer owns the symbol. Record nothing and
-                // wait: dispatching would resume that transfer from this
-                // chain's recovery, and the orphan path would treat its
-                // tokens as abandoned. The guard drops, restoring its claim
-                // origin.
-                error!(
-                    target: "operational_alert",
-                    alert = true,
-                    chain = %self.chain,
-                    %symbol,
-                    recovery_id = %self.recovery_id,
-                    %error,
-                    "Rescheduling wrapped equity recovery: the symbol's active transfer is \
-                     on another chain",
-                );
-                ctx.queue
-                    .clone()
-                    .push_with_delay(self.clone(), ctx.reschedule_interval)
-                    .await?;
-                return Ok(());
-            }
-            warn!(
-                target: "rebalance",
-                %symbol,
-                recovery_id = %self.recovery_id,
-                %error,
-                "Wrapped equity recovery: active aggregate quantity mismatch; \
-                 skipping dispatch",
-            );
-            // Validation failure is a retryable error: guard drops normally,
-            // restoring its claim origin (orphan removes the entry;
-            // HeldForRecovery restores HeldForRecovery for the next retry).
-            return Err(error);
+            return wait_or_retry_after_validation(ctx, self, error).await;
         }
 
         if detected_shares.is_none() {
@@ -594,6 +565,17 @@ impl WrappedEquityRecoveryJob {
                 }
                 .await
             }
+            // Rejected by `validate_active_aggregate_quantity` before
+            // `Detect`; never dispatched across chains.
+            DispatchDecision::BusyOnOtherChain {
+                transfer,
+                transfer_chain,
+            } => Err(WrappedEquityRecoveryJobError::ActiveTransferOnOtherChain {
+                symbol: symbol.clone(),
+                transfer,
+                transfer_chain,
+                recovery_chain: self.chain,
+            }),
             DispatchDecision::Conflict {
                 mint_id,
                 redemption_id,
@@ -622,6 +604,47 @@ impl WrappedEquityRecoveryJob {
 
         finish(ctx, self, guard, result).await
     }
+}
+
+/// Handles a dispatch that failed validation before `Detect`. The guard
+/// drops either way, restoring its claim origin (orphan removes the entry;
+/// `HeldForRecovery` restores `HeldForRecovery`).
+async fn wait_or_retry_after_validation(
+    ctx: &WrappedEquityRecoveryCtx,
+    job: &WrappedEquityRecoveryJob,
+    error: WrappedEquityRecoveryJobError,
+) -> Result<(), WrappedEquityRecoveryJobError> {
+    if let WrappedEquityRecoveryJobError::ActiveTransferOnOtherChain { .. } = error {
+        // Another chain's transfer owns the symbol. Record nothing and wait:
+        // dispatching would resume that transfer from this chain's recovery,
+        // and the orphan path would treat its tokens as abandoned.
+        error!(
+            target: "operational_alert",
+            alert = true,
+            chain = %job.chain,
+            symbol = %job.symbol,
+            recovery_id = %job.recovery_id,
+            %error,
+            "Rescheduling wrapped equity recovery: the symbol's active transfer is \
+             on another chain",
+        );
+        ctx.queue
+            .clone()
+            .push_with_delay(job.clone(), ctx.reschedule_interval)
+            .await?;
+        return Ok(());
+    }
+
+    warn!(
+        target: "rebalance",
+        symbol = %job.symbol,
+        recovery_id = %job.recovery_id,
+        %error,
+        "Wrapped equity recovery: active aggregate quantity mismatch; \
+         skipping dispatch",
+    );
+    // A quantity mismatch is retryable.
+    Err(error)
 }
 
 /// Releases or restores the per-symbol guard based on the dispatch outcome
@@ -782,18 +805,26 @@ enum DispatchDecision {
         mint_id: IssuerRequestId,
         redemption_id: RedemptionAggregateId,
     },
+    /// The symbol's active mint or redemption runs on another chain. The
+    /// symbol is busy: this chain's wallet balance is neither that
+    /// transfer's tokens nor an orphan while it runs.
+    BusyOnOtherChain {
+        transfer: String,
+        transfer_chain: Chain,
+    },
 }
 
 async fn read_recovery_snapshot(
     inventory: &BroadcastingInventory,
+    chain: Chain,
     symbol: &Symbol,
 ) -> Option<RecoverySnapshot> {
     let view = inventory.read().await;
-    let shares = view.inflight_equity_at(symbol, InFlightEquityLocation::BaseWalletWrapped)?;
+    let shares = view.inflight_equity_at(symbol, InFlightEquityLocation::WalletWrapped(chain))?;
     if shares == st0x_execution::FractionalShares::ZERO {
         return None;
     }
-    let dispatch = decide_dispatch(&view, symbol);
+    let dispatch = decide_dispatch(&view, chain, symbol);
     drop(view);
     Some(RecoverySnapshot { shares, dispatch })
 }
@@ -866,12 +897,55 @@ async fn validate_active_aggregate_quantity(
             }
             Ok(())
         }
+        DispatchDecision::BusyOnOtherChain {
+            transfer,
+            transfer_chain,
+        } => Err(WrappedEquityRecoveryJobError::ActiveTransferOnOtherChain {
+            symbol: symbol.clone(),
+            transfer: transfer.clone(),
+            transfer_chain: *transfer_chain,
+            recovery_chain: chain,
+        }),
         DispatchDecision::Orphan | DispatchDecision::Conflict { .. } => Ok(()),
     }
 }
 
-fn decide_dispatch(view: &InventoryView, symbol: &Symbol) -> DispatchDecision {
-    match (view.active_mint(symbol), view.active_redemption(symbol)) {
+/// Picks the dispatch path for a wallet balance on `chain`. Only a transfer
+/// on the same chain can own that balance; a transfer of the symbol on
+/// another chain makes the symbol busy rather than the balance an orphan.
+fn decide_dispatch(view: &InventoryView, chain: Chain, symbol: &Symbol) -> DispatchDecision {
+    if let (Some((mint_id, _)), Some((redemption_id, _))) = (
+        view.active_mint_with_chain(symbol),
+        view.active_redemption_with_chain(symbol),
+    ) {
+        return DispatchDecision::Conflict {
+            mint_id: mint_id.clone(),
+            redemption_id: redemption_id.clone(),
+        };
+    }
+
+    if let Some((mint_id, mint_chain)) = view.active_mint_with_chain(symbol)
+        && mint_chain != chain
+    {
+        return DispatchDecision::BusyOnOtherChain {
+            transfer: format!("mint {mint_id}"),
+            transfer_chain: mint_chain,
+        };
+    }
+
+    if let Some((redemption_id, redemption_chain)) = view.active_redemption_with_chain(symbol)
+        && redemption_chain != chain
+    {
+        return DispatchDecision::BusyOnOtherChain {
+            transfer: format!("redemption {redemption_id}"),
+            transfer_chain: redemption_chain,
+        };
+    }
+
+    match (
+        view.active_mint_on(symbol, chain),
+        view.active_redemption_on(symbol, chain),
+    ) {
         (Some(mint_id), Some(redemption_id)) => DispatchDecision::Conflict {
             mint_id: mint_id.clone(),
             redemption_id: redemption_id.clone(),
@@ -899,6 +973,22 @@ mod tests {
 
     use super::super::aggregate::WrappedEquityRecoveryServices;
     use super::*;
+
+    #[test]
+    fn conflicting_transfers_on_different_chains_are_not_normal_contention() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let mint_id = st0x_tokenization::issuer_request_id("cross-chain-mint");
+        let redemption_id =
+            crate::equity_redemption::redemption_aggregate_id("cross-chain-redemption");
+        let view = InventoryView::default()
+            .set_active_mint(symbol.clone(), Chain::Base, mint_id.clone())
+            .set_active_redemption(symbol.clone(), Chain::Ethereum, redemption_id.clone());
+        for chain in [Chain::Base, Chain::Ethereum] {
+            assert!(
+                matches!(decide_dispatch(&view, chain, &symbol), DispatchDecision::Conflict { mint_id: mint, redemption_id: redemption } if mint == mint_id && redemption == redemption_id)
+            );
+        }
+    }
     use crate::inventory::BroadcastingInventory;
     use crate::inventory::view::InventoryView;
     use crate::mint_authorization::ConfiguredMintAuthorizer;
@@ -964,7 +1054,7 @@ mod tests {
 
         let now = chrono::Utc::now();
         let view = InventoryView::default().set_inflight_equity_at_location(
-            InFlightEquityLocation::BaseWalletWrapped,
+            InFlightEquityLocation::WalletWrapped(Chain::Base),
             &BTreeMap::from([(
                 Symbol::new("AAPL").unwrap(),
                 FractionalShares::new(st0x_float_macro::float!(5)),
@@ -1021,6 +1111,7 @@ mod tests {
     /// itself, and the symbol stays held for that chain's recovery while it
     /// waits.
     #[tokio::test]
+    #[tracing_test::traced_test]
     async fn job_on_a_chain_without_services_reschedules_and_keeps_its_hold() {
         let symbol = Symbol::new("AAPL").unwrap();
         let held = GuardState::HeldForRecovery {
@@ -1031,6 +1122,19 @@ mod tests {
             HashMap::from([(symbol.clone(), held.clone())]),
         )
         .await;
+        let now = chrono::Utc::now();
+        {
+            let mut inventory = ctx.inventory.write().await;
+            *inventory = inventory.clone().set_inflight_equity_at_location(
+                InFlightEquityLocation::WalletWrapped(Chain::Ethereum),
+                &BTreeMap::from([(
+                    symbol.clone(),
+                    FractionalShares::new(st0x_float_macro::float!(5)),
+                )]),
+                now,
+                now,
+            );
+        }
         let job = WrappedEquityRecoveryJob {
             chain: Chain::Ethereum,
             symbol: symbol.clone(),
@@ -1039,6 +1143,9 @@ mod tests {
         };
 
         job.perform(&ctx).await.unwrap();
+        assert!(logs_contain(
+            "Wrapped equity recovery cannot run: its chain has no equity services"
+        ));
 
         assert_eq!(ctx.store.load(&job.recovery_id).await.unwrap(), None);
         let rescheduled = queued_recovery_jobs(&ctx).await;
@@ -1152,6 +1259,55 @@ mod tests {
             ctx.equity_in_progress.read().unwrap().get(&symbol),
             Some(&held)
         );
+    }
+
+    /// A balance in Robinhood's wallet is never handed to Base's active mint
+    /// nor taken as an orphan: the mint owns the symbol, so Robinhood's
+    /// recovery records nothing and waits. The mint is never even loaded,
+    /// because the view already names its chain.
+    #[tokio::test]
+    async fn another_chains_wallet_balance_waits_for_an_active_base_mint() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let mut chains = base_only_chain_services();
+        let robinhood = chains[&Chain::Base].clone();
+        chains.insert(Chain::Robinhood, robinhood);
+        let mut ctx = ctx_over(chains, HashMap::new()).await;
+        let now = chrono::Utc::now();
+        let view = ctx
+            .inventory
+            .read()
+            .await
+            .clone()
+            .set_inflight_equity_at_location(
+                InFlightEquityLocation::WalletWrapped(Chain::Robinhood),
+                &BTreeMap::from([(
+                    symbol.clone(),
+                    FractionalShares::new(st0x_float_macro::float!(5)),
+                )]),
+                now,
+                now,
+            )
+            .set_active_mint(
+                symbol.clone(),
+                Chain::Base,
+                st0x_tokenization::issuer_request_id("ISS-BASE"),
+            );
+        let (sender, _receiver) = broadcast::channel(16);
+        ctx.inventory = Arc::new(BroadcastingInventory::new(view, sender));
+        let job = WrappedEquityRecoveryJob {
+            chain: Chain::Robinhood,
+            symbol: symbol.clone(),
+            recovery_id: WrappedEquityRecoveryId(Uuid::new_v4()),
+            backpressure_streak: BackpressureStreak::default(),
+        };
+
+        job.perform(&ctx).await.unwrap();
+
+        assert_eq!(ctx.store.load(&job.recovery_id).await.unwrap(), None);
+        let rescheduled = queued_recovery_jobs(&ctx).await;
+        assert_eq!(rescheduled.len(), 1, "the job must reschedule itself");
+        assert_eq!(rescheduled[0].chain, Chain::Robinhood);
+        assert_eq!(ctx.equity_in_progress.read().unwrap().get(&symbol), None);
     }
 
     #[tokio::test]
@@ -1402,7 +1558,7 @@ mod tests {
         )]);
         let view = InventoryView::default()
             .set_inflight_equity_at_location(
-                InFlightEquityLocation::BaseWalletWrapped,
+                InFlightEquityLocation::WalletWrapped(Chain::Base),
                 &balances,
                 now,
                 now,
@@ -1565,7 +1721,7 @@ mod tests {
         );
         let now = chrono::Utc::now();
         let view = InventoryView::default().set_inflight_equity_at_location(
-            crate::inventory::view::InFlightEquityLocation::BaseWalletWrapped,
+            crate::inventory::view::InFlightEquityLocation::WalletWrapped(Chain::Base),
             &balances,
             now,
             now,
