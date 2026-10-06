@@ -41,6 +41,7 @@ use crate::bot_gas::BotGasReceiptCostEnqueuer;
 use crate::bot_gas::{
     RecordBotGasReceiptCost, RecordBotGasReceiptCostCtx, RecordBotGasReceiptCostJobQueue,
 };
+use crate::dashboard::equity_price::EquityPriceStore;
 use crate::dashboard::{
     DashboardTradeDeliveryCtx, DashboardTradeDeliveryJobQueue, DashboardTradeHandoffMonitor,
     DeliverDashboardTrade,
@@ -170,6 +171,9 @@ pub(crate) struct ConductorCtx<Prov, Exec> {
     /// capture job resolves each wrapped balance through the service of the
     /// chain that balance sits on.
     pub(crate) wrappers: BTreeMap<Chain, Arc<dyn Wrapper>>,
+    /// The pricing service's marks; the daily capture values each symbol at
+    /// the newer of its last fill and its last mark.
+    pub(crate) equity_prices: EquityPriceStore,
     pub(crate) projection_maintenance: Arc<super::projection_pause::ProjectionMaintenance>,
     pub(crate) shutdown_token: CancellationToken,
     pub(crate) startup_token: StartupToken,
@@ -596,6 +600,7 @@ where
         market_making: market_making_slots(&context.ctx),
         inventory: context.inventory.clone(),
         position_projection: context.frameworks.position_projection.clone(),
+        equity_prices: context.equity_prices.clone(),
         portfolio_snapshot: context.frameworks.portfolio_snapshot.clone(),
         wrappers: context.wrappers.clone(),
         wallet_transit_equity_symbols: chain_equity_symbols(&context.ctx.chains.primary().assets),

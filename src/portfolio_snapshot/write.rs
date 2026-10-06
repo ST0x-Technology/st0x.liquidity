@@ -3,7 +3,8 @@
 //! [`PortfolioSnapshotJob`] wakes once per Eastern Time day at the next ET
 //! midnight boundary, reads the live
 //! [`crate::inventory::InventoryView`], resolves each equity balance's USD
-//! mark from the `Position` aggregate, and issues a `Capture` command against
+//! mark from the newer of the `Position` aggregate's last fill and the pricing
+//! service's last mark, and issues a `Capture` command against
 //! the `PortfolioSnapshot` aggregate. Idempotency for a given ET day is the
 //! aggregate's job (see `crate::portfolio_snapshot`'s module doc); this job
 //! only decides *when* to try and what to skip when the view is not yet
@@ -70,11 +71,12 @@ use super::{
 };
 use crate::alerts::{Notifier, NotifierError};
 use crate::conductor::job::{Job, JobQueue, Label, QueuePushError};
+use crate::dashboard::equity_price::EquityPriceStore;
 use crate::inventory::{
     BroadcastingInventory, InventoryViewError, PollFreshness, PortfolioAsset, PortfolioBalanceRow,
     PortfolioLocation,
 };
-use crate::position::Position;
+use crate::position::{Position, PriceObservation};
 
 pub(crate) type PortfolioSnapshotJobQueue = JobQueue<PortfolioSnapshotJob>;
 
@@ -133,6 +135,10 @@ pub(crate) struct MarketMakingSlots {
 pub(crate) struct PortfolioSnapshotCtx {
     pub(crate) inventory: Arc<BroadcastingInventory>,
     pub(crate) position_projection: Arc<Projection<Position>>,
+    /// The pricing service's marks, the same store its monitor writes. While
+    /// pricing quotes a symbol its mark is usually newer than the last fill,
+    /// so it values the symbol (see [`resolve_marks`]).
+    pub(crate) equity_prices: EquityPriceStore,
     pub(crate) portfolio_snapshot: Arc<Store<PortfolioSnapshot>>,
     /// Resolves each configured equity's live vault ratio so wrapped onchain
     /// balances (MarketMaking, BaseWalletWrapped) can be valued in
@@ -398,6 +404,12 @@ impl PortfolioSnapshotJob {
                 .await;
         }
 
+        // Read before every await that can block, the inventory lock below
+        // included (the poller holds it while it loads positions): the store
+        // keeps only each symbol's newest mark, so a quote arriving in such a
+        // wait would replace the mark `resolve_marks` may use with one it
+        // must reject as later than `now`.
+        let pricing_marks = ctx.equity_prices.last_observed_marks().await;
         let configured_equities = ConfiguredEquities::of(ctx);
 
         let rows = {
@@ -425,8 +437,14 @@ impl PortfolioSnapshotJob {
         }
 
         let rows = convert_wrapped_equity_rows(rows, &ctx.wrappers, &configured_equities).await?;
-        let marked_rows =
-            resolve_marks(&ctx.position_projection, now, rows, &configured_equities).await?;
+        let marked_rows = resolve_marks(
+            &ctx.position_projection,
+            &pricing_marks,
+            now,
+            rows,
+            &configured_equities,
+        )
+        .await?;
 
         match ctx
             .portfolio_snapshot
@@ -1083,7 +1101,7 @@ fn drop_empty_unconfigured_equity_rows(
 /// underlying units and is left untouched.
 ///
 /// `evaluate_day` (`read.rs`) later multiplies each row's balance directly by
-/// `Position.last_price`'s price, an UNDERLYING share price -- so a wrapped
+/// the row's mark (see [`resolve_marks`]), an UNDERLYING share price -- so a wrapped
 /// balance persisted without this conversion would be valued as if 1 wrapped
 /// share == 1 underlying share, silently wrong once a vault's ratio departs
 /// from 1:1 (dividends, splits, NAV accrual).
@@ -1151,22 +1169,29 @@ async fn convert_wrapped_equity_rows(
     Ok(rows)
 }
 
-/// Resolves each row's USD mark (decision 7): USDC is par, equity is
-/// `Position.last_price`'s price as of capture time. A symbol with a balance
-/// but no observed price yet gets `usd_mark: None, mark_captured_at: None` --
+/// Resolves each row's USD mark (decision 7): USDC is par, equity is the newer
+/// of `Position.last_price` and the pricing service's last observed mark, both
+/// an underlying share price, as of capture time. While pricing quotes a
+/// symbol its mark is usually the newer one, so a symbol that has not filled
+/// for weeks no longer goes stale; the fill values it when pricing has sent no
+/// newer mark this session. A symbol with a
+/// balance but neither price gets `usd_mark: None, mark_captured_at: None` --
 /// never a fabricated zero.
 ///
-/// `mark_captured_at` for an equity row is `Position.last_price`'s
-/// `observed_at`, a dedicated price-observation timestamp set only by the
+/// `mark_captured_at` for an equity row is the chosen price's `observed_at`.
+/// For a fill that is a dedicated price-observation timestamp set only by the
 /// events that also set the price (`OnChainOrderFilled`, priced
-/// `ManualPositionAdjusted`) -- unlike `last_updated`, which advances on every event including
-/// price-less ones (offchain order placement/fill/cancel, threshold updates).
-/// `read.rs`'s staleness guard (`is_stale_mark`) therefore keys off how
-/// recently the price itself was actually observed, not how recently the
-/// position was last touched for any reason; see SPEC.md "Portfolio Capital
-/// and Return Tracking".
+/// `ManualPositionAdjusted`) -- unlike `last_updated`, which advances on every
+/// event including price-less ones (offchain order placement/fill/cancel,
+/// threshold updates). `read.rs`'s staleness guard (`is_stale_mark`) therefore
+/// keys off how recently a price was actually observed, not how recently the
+/// position was last touched for any reason. A pricing mark's `observed_at` is
+/// pricing's publish time, which stays fresh while pricing republishes an
+/// unchanged price, so the guard catches a pricing outage but not a frozen
+/// upstream price; see SPEC.md "Portfolio Capital and Return Tracking".
 async fn resolve_marks(
     position_projection: &Projection<Position>,
+    pricing_marks: &HashMap<Symbol, PriceObservation>,
     captured_at: DateTime<Utc>,
     rows: Vec<PortfolioBalanceRow>,
     configured_equities: &ConfiguredEquities<'_>,
@@ -1193,12 +1218,19 @@ async fn resolve_marks(
                 if let Some(mark) = equity_marks.get(symbol) {
                     *mark
                 } else {
-                    let mark = match position_projection.load(symbol).await? {
-                        Some(position) => position.last_price.map_or((None, None), |observation| {
-                            (Some(observation.price), Some(observation.observed_at))
-                        }),
-                        None => (None, None),
-                    };
+                    let fill = position_projection
+                        .load(symbol)
+                        .await?
+                        .and_then(|position| position.last_price);
+                    // A mark from after `captured_at` must not value an
+                    // earlier snapshot.
+                    let pricing = pricing_marks
+                        .get(symbol)
+                        .copied()
+                        .filter(|mark| mark.observed_at <= captured_at);
+                    let mark = newer_price(fill, pricing).map_or((None, None), |observation| {
+                        (Some(observation.price), Some(observation.observed_at))
+                    });
                     equity_marks.insert(symbol.clone(), mark);
                     mark
                 }
@@ -1213,6 +1245,18 @@ async fn resolve_marks(
     }
 
     Ok(marked_rows)
+}
+
+/// The later-observed of a fill and a pricing mark; the fill on a tie.
+fn newer_price(
+    fill: Option<PriceObservation>,
+    pricing: Option<PriceObservation>,
+) -> Option<PriceObservation> {
+    match (fill, pricing) {
+        (Some(fill), Some(pricing)) if pricing.observed_at > fill.observed_at => Some(pricing),
+        (Some(fill), _) => Some(fill),
+        (None, pricing) => pricing,
+    }
 }
 
 /// The delay and ET day for the very FIRST job [`bootstrap_portfolio_snapshot`]
@@ -1491,6 +1535,7 @@ mod tests {
             )]),
             inventory: broadcasting(inventory),
             position_projection,
+            equity_prices: EquityPriceStore::new([]),
             portfolio_snapshot,
             wrappers,
             wallet_transit_equity_symbols: primary_equity_symbols,
@@ -2472,6 +2517,217 @@ mod tests {
         );
     }
 
+    async fn fill_aapl_at(
+        position: &Store<Position>,
+        price_usdc: rain_math_float::Float,
+        at: DateTime<Utc>,
+    ) {
+        position
+            .send(
+                &aapl(),
+                PositionCommand::AcknowledgeOnChainFillAt {
+                    symbol: aapl(),
+                    threshold: ExecutionThreshold::whole_share(),
+                    trade_id: TradeId {
+                        chain: Chain::Base,
+                        tx_hash: TxHash::ZERO,
+                        log_index: 0,
+                    },
+                    amount: FractionalShares::new(float!(1)),
+                    direction: Direction::Buy,
+                    price_usdc,
+                    block_timestamp: at,
+                    block_number: None,
+                    seen_at: at,
+                },
+            )
+            .await
+            .unwrap();
+    }
+
+    async fn captured_aapl_mark(pool: &SqlitePool) -> (Option<String>, Option<DateTime<Utc>>) {
+        let (usd_mark, mark_captured_at): (Option<String>, Option<String>) = sqlx::query_as(
+            "SELECT usd_mark, mark_captured_at FROM portfolio_snapshot \
+             WHERE et_day = ? AND asset = 'AAPL' AND location = 'market_making:base'",
+        )
+        .bind(et_day(Utc::now()).to_string())
+        .fetch_one(pool)
+        .await
+        .unwrap();
+
+        let mark_captured_at = mark_captured_at.map(|captured_at| {
+            DateTime::parse_from_rfc3339(&captured_at)
+                .unwrap()
+                .with_timezone(&Utc)
+        });
+        (usd_mark, mark_captured_at)
+    }
+
+    async fn todays_capital(pool: &SqlitePool) -> DayCapital {
+        let today = et_day(Utc::now());
+        let mut days = load_portfolio_days(
+            pool,
+            EtDayRange {
+                from: Some(today),
+                to: Some(today),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(days.len(), 1);
+        days.remove(0).capital
+    }
+
+    #[test]
+    fn newer_price_prefers_the_fill_on_a_tie() {
+        let at = Utc::now();
+        let fill = PriceObservation {
+            price: float!(150),
+            observed_at: at,
+        };
+        let pricing = PriceObservation {
+            price: float!(210),
+            observed_at: at,
+        };
+
+        let chosen = newer_price(Some(fill), Some(pricing)).unwrap();
+
+        assert_eq!(chosen.price.format().unwrap(), "150");
+    }
+
+    /// The months-old fills behind the daily stale-mark alerts: a symbol that
+    /// has not filled since long before the capture is valued at the pricing
+    /// service's newer mark, so the day counts and nothing alerts.
+    #[tokio::test]
+    async fn pricing_mark_newer_than_an_old_fill_values_the_day() {
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let capture_at = safe_capture_now();
+        let (mut ctx, position) = build_fully_hydrated_ctx(pool.clone(), apalis_pool).await;
+        let notifier = Arc::new(CapturingNotifier::default());
+        ctx.notifier = notifier.clone();
+        fill_aapl_at(
+            &position,
+            float!(150),
+            capture_at - chrono::Duration::days(60),
+        )
+        .await;
+        let marked_at = capture_at - chrono::Duration::hours(1);
+        ctx.equity_prices = EquityPriceStore::with_last_mark(aapl(), float!(210), marked_at);
+
+        job_for_today().perform_at(&ctx, capture_at).await.unwrap();
+        PortfolioSnapshotJob::alert(et_day(Utc::now()))
+            .perform_at(&ctx, capture_at)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            captured_aapl_mark(&pool).await,
+            (Some("210".to_string()), Some(marked_at))
+        );
+        assert!(matches!(
+            todays_capital(&pool).await,
+            DayCapital::Included(_)
+        ));
+        assert!(notifier.messages().is_empty());
+    }
+
+    #[tokio::test]
+    async fn fill_newer_than_the_pricing_mark_values_the_row() {
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let capture_at = safe_capture_now();
+        let (mut ctx, position) = build_fully_hydrated_ctx(pool.clone(), apalis_pool).await;
+        let filled_at = capture_at - chrono::Duration::hours(1);
+        fill_aapl_at(&position, float!(150), filled_at).await;
+        ctx.equity_prices = EquityPriceStore::with_last_mark(
+            aapl(),
+            float!(210),
+            filled_at - chrono::Duration::hours(1),
+        );
+
+        job_for_today().perform_at(&ctx, capture_at).await.unwrap();
+
+        assert_eq!(
+            captured_aapl_mark(&pool).await,
+            (Some("150".to_string()), Some(filled_at))
+        );
+    }
+
+    /// An asset seeded at listing holds inventory before its first fill.
+    #[tokio::test]
+    async fn never_filled_symbol_is_valued_at_its_pricing_mark() {
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let capture_at = safe_capture_now();
+        let (mut ctx, _position) = build_fully_hydrated_ctx(pool.clone(), apalis_pool).await;
+        let marked_at = capture_at - chrono::Duration::hours(1);
+        ctx.equity_prices = EquityPriceStore::with_last_mark(aapl(), float!(210), marked_at);
+
+        job_for_today().perform_at(&ctx, capture_at).await.unwrap();
+
+        assert_eq!(
+            captured_aapl_mark(&pool).await,
+            (Some("210".to_string()), Some(marked_at))
+        );
+    }
+
+    /// The pricing mark is held across quote expiry, so a feed that stopped
+    /// more than `MARK_STALENESS_THRESHOLD_DAYS` ago must still alert.
+    #[tokio::test]
+    async fn pricing_mark_past_the_staleness_threshold_still_excludes_the_day() {
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let capture_at = safe_capture_now();
+        let (mut ctx, position) = build_fully_hydrated_ctx(pool.clone(), apalis_pool).await;
+        let notifier = Arc::new(CapturingNotifier::default());
+        ctx.notifier = notifier.clone();
+        fill_aapl_at(
+            &position,
+            float!(150),
+            capture_at - chrono::Duration::days(60),
+        )
+        .await;
+        let marked_at = capture_at - chrono::Duration::days(10);
+        ctx.equity_prices = EquityPriceStore::with_last_mark(aapl(), float!(210), marked_at);
+
+        job_for_today().perform_at(&ctx, capture_at).await.unwrap();
+        PortfolioSnapshotJob::alert(et_day(Utc::now()))
+            .perform_at(&ctx, capture_at)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            todays_capital(&pool).await,
+            DayCapital::Excluded(DayExclusionReason::StaleMark(
+                PortfolioAsset::Equity(aapl()),
+                marked_at
+            ))
+        );
+        let alerts = notifier.messages();
+        assert_eq!(alerts.len(), 1);
+        assert!(alerts[0].contains("mark stale"));
+    }
+
+    /// The monitor keeps writing during the capture, so a mark that arrives
+    /// after the capture instant must not value that snapshot.
+    #[tokio::test]
+    async fn pricing_mark_observed_after_the_capture_is_ignored() {
+        let (pool, apalis_pool) = setup_test_pools().await;
+        let capture_at = safe_capture_now();
+        let (mut ctx, position) = build_fully_hydrated_ctx(pool.clone(), apalis_pool).await;
+        let filled_at = capture_at - chrono::Duration::hours(1);
+        fill_aapl_at(&position, float!(150), filled_at).await;
+        ctx.equity_prices = EquityPriceStore::with_last_mark(
+            aapl(),
+            float!(210),
+            capture_at + chrono::Duration::seconds(1),
+        );
+
+        job_for_today().perform_at(&ctx, capture_at).await.unwrap();
+
+        assert_eq!(
+            captured_aapl_mark(&pool).await,
+            (Some("150".to_string()), Some(filled_at))
+        );
+    }
+
     #[tokio::test]
     async fn reschedules_at_next_et_midnight_plus_buffer_after_capture() {
         let (pool, apalis_pool) = setup_test_pools().await;
@@ -3187,7 +3443,7 @@ mod tests {
             FractionalShares::new(float!(3)),
             FractionalShares::new(float!(2)),
         );
-        let (ctx, position) = build_ctx(
+        let (mut ctx, position) = build_ctx(
             pool.clone(),
             apalis_pool,
             view,
@@ -3198,6 +3454,15 @@ mod tests {
         )
         .await;
         mark_all_required_fresh(&ctx);
+        // Its balance stays in wrapped units, so even a live pricing mark
+        // must not value it. Stamped before the capture so the
+        // `observed_at <= captured_at` filter cannot be what rejects it.
+        let capture_at = safe_capture_now();
+        ctx.equity_prices = EquityPriceStore::with_last_mark(
+            unconfigured.clone(),
+            float!(42),
+            capture_at - chrono::Duration::hours(1),
+        );
 
         // Give the configured symbol a fresh mark so every OTHER counted row
         // is complete. Without this the day is excluded on AAPL's missing
@@ -3225,10 +3490,7 @@ mod tests {
             .await
             .unwrap();
 
-        job_for_today()
-            .perform_at(&ctx, safe_capture_now())
-            .await
-            .unwrap();
+        job_for_today().perform_at(&ctx, capture_at).await.unwrap();
 
         let today = et_day(Utc::now());
         let days = load_portfolio_days(

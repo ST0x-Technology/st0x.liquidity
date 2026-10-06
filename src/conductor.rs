@@ -1187,7 +1187,7 @@ impl Conductor {
                 telemetry: telemetry.clone(),
                 notifier: notifier.clone(),
                 record_bot_gas_receipt_cost_queue: record_bot_gas_receipt_cost_queue.clone(),
-                equity_prices,
+                equity_prices: equity_prices.clone(),
             },
             &backfill_queues,
         ))
@@ -1310,6 +1310,7 @@ impl Conductor {
             wallet_polling,
             tokenizer,
             wrappers,
+            equity_prices,
             projection_maintenance,
             shutdown_token: shutdown_token.clone(),
             startup_token: startup_tokens.apalis_monitor,

@@ -183,9 +183,10 @@ pub struct Position {
     /// The most recently economically observed price, paired with when it was
     /// observed. Set only by the events that carry a price (`OnChainOrderFilled`,
     /// `ManualPositionAdjusted` with a price), unlike `last_updated`, which
-    /// advances on every event including price-less ones. Drives
-    /// `resolve_marks`' `mark_captured_at` so mark staleness keys off price
-    /// recency, not the aggregate's generic last-touched time. `#[serde(default)]`
+    /// advances on every event including price-less ones. `resolve_marks`
+    /// weighs its `observed_at` against the pricing service's last mark, so
+    /// mark staleness keys off price recency, not the aggregate's generic
+    /// last-touched time. `#[serde(default)]`
     /// so legacy (pre-this-field) snapshots deserialize to `None`; the
     /// `SCHEMA_VERSION` bump discards those snapshots before load.
     #[serde(default)]
