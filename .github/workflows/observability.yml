@@ -1,0 +1,36 @@
+name: observability
+
+# This repo's Grafana dashboards (observability/dashboards/liquidity/) and alert
+# rules (observability/alerting/liquidity.rules.yml): checked in a throwaway
+# Grafana on every PR, shipped to the T0 observability box's config bucket on
+# master. The flow lives in ST0x-Technology/.github; this is the caller.
+
+on:
+  pull_request:
+    paths:
+      - "observability/**"
+      - ".github/workflows/observability.yml"
+  push:
+    branches: [master]
+    paths:
+      - "observability/**"
+      - ".github/workflows/observability.yml"
+  workflow_dispatch:
+
+# Nothing by default; the one job below asks for exactly what it needs.
+permissions: {}
+
+jobs:
+  observability:
+    permissions:
+      contents: read  # checkout of this repo's observability/ files
+      id-token: write  # keyless GCP login as this repo's <app>-obs-deploy identity
+    # One group per ref: a pending master deploy is only ever replaced by a
+    # newer master deploy, never by a PR check. A newer push to a PR cancels
+    # its stale check.
+    concurrency:
+      group: observability-${{ github.ref }}
+      cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+    uses: ST0x-Technology/.github/.github/workflows/observability.yml@a1689d50bc42dbb1ffcae353b5d4512c70454c3e  # observability @ .github main
+    with:
+      app: liquidity
