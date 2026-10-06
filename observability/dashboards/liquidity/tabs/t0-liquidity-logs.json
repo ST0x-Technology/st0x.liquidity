@@ -1,0 +1,1089 @@
+{
+  "uid": "t0-liquidity-logs",
+  "title": "Liquidity bot: Logs",
+  "description": "Sub-page of the Liquidity bot board in the liquidity folder. The SPA's Logs tab: level/category/target/search-filterable structured log lines.",
+  "tags": [
+    "liquidity",
+    "bot",
+    "t0"
+  ],
+  "timezone": "utc",
+  "editable": true,
+  "graphTooltip": 1,
+  "schemaVersion": 39,
+  "refresh": "1m",
+  "time": {
+    "from": "now-24h",
+    "to": "now"
+  },
+  "templating": {
+    "list": [
+      {
+        "name": "env",
+        "type": "custom",
+        "label": "Environment",
+        "description": "GCP project id \u2014 both the Cloud Monitoring and Cloud Logging queries take it directly.",
+        "query": "production : t0-liquidity, staging : t0-liquidity-staging",
+        "includeAll": false,
+        "multi": false,
+        "hide": 0,
+        "current": {
+          "selected": true,
+          "text": "production",
+          "value": "t0-liquidity"
+        },
+        "options": [
+          {
+            "selected": true,
+            "text": "production",
+            "value": "t0-liquidity"
+          },
+          {
+            "selected": false,
+            "text": "staging",
+            "value": "t0-liquidity-staging"
+          }
+        ]
+      },
+      {
+        "name": "level",
+        "type": "custom",
+        "label": "Log level",
+        "query": "ERROR, WARN, INFO",
+        "includeAll": true,
+        "multi": true,
+        "hide": 0,
+        "current": {
+          "selected": true,
+          "text": [
+            "All"
+          ],
+          "value": [
+            "$__all"
+          ]
+        },
+        "options": [
+          {
+            "selected": true,
+            "text": "All",
+            "value": "$__all"
+          },
+          {
+            "selected": false,
+            "text": "ERROR",
+            "value": "ERROR"
+          },
+          {
+            "selected": false,
+            "text": "WARN",
+            "value": "WARN"
+          },
+          {
+            "selected": false,
+            "text": "INFO",
+            "value": "INFO"
+          }
+        ],
+        "allValue": "ERROR|WARN|INFO"
+      },
+      {
+        "name": "category",
+        "type": "custom",
+        "label": "Category",
+        "description": "The SPA's log Category filter \u2014 exact-match domain tags the bot's tracing spans set (bridge/broker/cqrs/.../wallet), distinct from crate/module paths.",
+        "query": "bridge, broker, cqrs, dashboard, hedge, inventory, orderbook, rebalance, startup, tokenization, wallet",
+        "includeAll": true,
+        "multi": true,
+        "hide": 0,
+        "current": {
+          "selected": true,
+          "text": [
+            "All"
+          ],
+          "value": [
+            "$__all"
+          ]
+        },
+        "options": [
+          {
+            "selected": true,
+            "text": "All",
+            "value": "$__all"
+          },
+          {
+            "selected": false,
+            "text": "bridge",
+            "value": "bridge"
+          },
+          {
+            "selected": false,
+            "text": "broker",
+            "value": "broker"
+          },
+          {
+            "selected": false,
+            "text": "cqrs",
+            "value": "cqrs"
+          },
+          {
+            "selected": false,
+            "text": "dashboard",
+            "value": "dashboard"
+          },
+          {
+            "selected": false,
+            "text": "hedge",
+            "value": "hedge"
+          },
+          {
+            "selected": false,
+            "text": "inventory",
+            "value": "inventory"
+          },
+          {
+            "selected": false,
+            "text": "orderbook",
+            "value": "orderbook"
+          },
+          {
+            "selected": false,
+            "text": "rebalance",
+            "value": "rebalance"
+          },
+          {
+            "selected": false,
+            "text": "startup",
+            "value": "startup"
+          },
+          {
+            "selected": false,
+            "text": "tokenization",
+            "value": "tokenization"
+          },
+          {
+            "selected": false,
+            "text": "wallet",
+            "value": "wallet"
+          }
+        ],
+        "allValue": ".*"
+      },
+      {
+        "name": "target",
+        "type": "textbox",
+        "label": "Log target regex",
+        "query": ".*",
+        "hide": 0,
+        "current": {
+          "selected": true,
+          "text": ".*",
+          "value": ".*"
+        },
+        "options": [
+          {
+            "selected": true,
+            "text": ".*",
+            "value": ".*"
+          }
+        ]
+      },
+      {
+        "name": "search",
+        "type": "textbox",
+        "label": "Message search",
+        "description": "The SPA's free-text search box \u2014 regex against jsonPayload.message.",
+        "query": ".*",
+        "hide": 0,
+        "current": {
+          "selected": true,
+          "text": ".*",
+          "value": ".*"
+        },
+        "options": [
+          {
+            "selected": true,
+            "text": ".*",
+            "value": ".*"
+          }
+        ]
+      }
+    ]
+  },
+  "links": [
+    {
+      "type": "link",
+      "title": "Dashboard",
+      "url": "/d/t0-liquidity/?theme=light&autofitpanels",
+      "icon": "dashboard",
+      "targetBlank": false,
+      "keepTime": true,
+      "includeVars": true,
+      "asDropdown": false,
+      "tags": [],
+      "tooltip": ""
+    },
+    {
+      "type": "link",
+      "title": "Orders",
+      "url": "/d/t0-liquidity-orders/?theme=light",
+      "icon": "dashboard",
+      "targetBlank": false,
+      "keepTime": true,
+      "includeVars": true,
+      "asDropdown": false,
+      "tags": [],
+      "tooltip": ""
+    },
+    {
+      "type": "link",
+      "title": "PnL",
+      "url": "/d/t0-liquidity-pnl/?theme=light",
+      "icon": "dashboard",
+      "targetBlank": false,
+      "keepTime": true,
+      "includeVars": true,
+      "asDropdown": false,
+      "tags": [],
+      "tooltip": ""
+    },
+    {
+      "type": "link",
+      "title": "Performance",
+      "url": "/d/t0-liquidity-performance/?theme=light",
+      "icon": "dashboard",
+      "targetBlank": false,
+      "keepTime": true,
+      "includeVars": true,
+      "asDropdown": false,
+      "tags": [],
+      "tooltip": ""
+    },
+    {
+      "type": "link",
+      "title": "\u25b8 Logs",
+      "url": "/d/t0-liquidity-logs/?theme=light",
+      "icon": "dashboard",
+      "targetBlank": false,
+      "keepTime": true,
+      "includeVars": true,
+      "asDropdown": false,
+      "tags": [],
+      "tooltip": ""
+    },
+    {
+      "type": "dashboards",
+      "title": "Related",
+      "tags": [
+        "t0"
+      ],
+      "asDropdown": true,
+      "icon": "external link",
+      "includeVars": false,
+      "keepTime": true,
+      "targetBlank": false,
+      "tooltip": "Other T0 dashboards"
+    }
+  ],
+  "panels": [
+    {
+      "id": 108,
+      "type": "stat",
+      "title": "",
+      "description": "The SPA header's connection light: is the bot process up and answering /health? '\u2014' means the exporter itself is not reporting.",
+      "datasource": {
+        "type": "stackdriver",
+        "uid": "cloudmon"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "stackdriver",
+            "uid": "cloudmon"
+          },
+          "queryType": "promQL",
+          "promQLQuery": {
+            "projectName": "$env",
+            "expr": "max(liq_up)",
+            "step": "60s"
+          },
+          "timeSeriesList": {
+            "projectName": "",
+            "filters": [],
+            "view": "FULL",
+            "groupBys": []
+          },
+          "instant": true
+        }
+      ],
+      "transparent": true,
+      "gridPos": {
+        "h": 1,
+        "w": 3,
+        "x": 0,
+        "y": 0
+      },
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            {
+              "type": "value",
+              "options": {
+                "1": {
+                  "text": "Connected",
+                  "color": "green",
+                  "index": 0
+                },
+                "0": {
+                  "text": "Disconnected",
+                  "color": "red",
+                  "index": 1
+                }
+              }
+            },
+            {
+              "type": "special",
+              "options": {
+                "match": "null+nan",
+                "result": {
+                  "text": "\u2014",
+                  "color": "text",
+                  "index": 99
+                }
+              }
+            }
+          ],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": null
+              }
+            ]
+          },
+          "unit": "short",
+          "displayName": "Bot"
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "textMode": "value_and_name",
+        "justifyMode": "center",
+        "text": {
+          "valueSize": 14,
+          "titleSize": 12
+        },
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        }
+      },
+      "timeFrom": "5m",
+      "hideTimeOverride": true
+    },
+    {
+      "id": 109,
+      "type": "stat",
+      "title": "",
+      "description": "Deployed commit, from /health, cut to 7 characters like the SPA header. The stackdriver plugin runs a range query even for an instant target, so over the dashboard's 24h the previous commit is a second series and its name drew over this one. PromQL also keeps a stopped series for its 5m lookback, so topk on the sample timestamp keeps only the commit with the newest sample, over a 1m window.",
+      "datasource": {
+        "type": "stackdriver",
+        "uid": "cloudmon"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "stackdriver",
+            "uid": "cloudmon"
+          },
+          "queryType": "promQL",
+          "promQLQuery": {
+            "projectName": "$env",
+            "expr": "max by (git_commit) (topk(1, label_replace(timestamp(liq_bot_info), \"git_commit\", \"$1\", \"git_commit\", \"(.{7}).*\")))",
+            "step": "60s"
+          },
+          "timeSeriesList": {
+            "projectName": "",
+            "filters": [],
+            "view": "FULL",
+            "groupBys": []
+          },
+          "instant": true,
+          "legendFormat": "{{git_commit}}"
+        }
+      ],
+      "transparent": true,
+      "gridPos": {
+        "h": 1,
+        "w": 3,
+        "x": 3,
+        "y": 0
+      },
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            {
+              "type": "special",
+              "options": {
+                "match": "null+nan",
+                "result": {
+                  "text": "\u2014",
+                  "color": "text",
+                  "index": 99
+                }
+              }
+            }
+          ],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": null
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "none",
+        "graphMode": "none",
+        "textMode": "name",
+        "justifyMode": "center",
+        "text": {
+          "valueSize": 14,
+          "titleSize": 12
+        },
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        }
+      },
+      "timeFrom": "1m",
+      "hideTimeOverride": true
+    },
+    {
+      "id": 110,
+      "type": "stat",
+      "title": "",
+      "description": "Bot process uptime, from /health uptimeSeconds.",
+      "datasource": {
+        "type": "stackdriver",
+        "uid": "cloudmon"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "stackdriver",
+            "uid": "cloudmon"
+          },
+          "queryType": "promQL",
+          "promQLQuery": {
+            "projectName": "$env",
+            "expr": "time() - max(liq_bot_start_timestamp_seconds)",
+            "step": "60s"
+          },
+          "timeSeriesList": {
+            "projectName": "",
+            "filters": [],
+            "view": "FULL",
+            "groupBys": []
+          },
+          "instant": true
+        }
+      ],
+      "transparent": true,
+      "gridPos": {
+        "h": 1,
+        "w": 3,
+        "x": 6,
+        "y": 0
+      },
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            {
+              "type": "special",
+              "options": {
+                "match": "null+nan",
+                "result": {
+                  "text": "\u2014",
+                  "color": "text",
+                  "index": 99
+                }
+              }
+            }
+          ],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": null
+              }
+            ]
+          },
+          "unit": "s",
+          "displayName": "Uptime",
+          "decimals": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "none",
+        "graphMode": "none",
+        "textMode": "value_and_name",
+        "justifyMode": "center",
+        "text": {
+          "valueSize": 14,
+          "titleSize": 12
+        },
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        }
+      },
+      "timeFrom": "5m",
+      "hideTimeOverride": true
+    },
+    {
+      "id": 111,
+      "type": "stat",
+      "title": "",
+      "description": "The SPA settings bar's Broker pill.",
+      "datasource": {
+        "type": "stackdriver",
+        "uid": "cloudmon"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "stackdriver",
+            "uid": "cloudmon"
+          },
+          "queryType": "promQL",
+          "promQLQuery": {
+            "projectName": "$env",
+            "expr": "sum by (broker) (liq_settings_info)",
+            "step": "60s"
+          },
+          "timeSeriesList": {
+            "projectName": "",
+            "filters": [],
+            "view": "FULL",
+            "groupBys": []
+          },
+          "instant": true,
+          "legendFormat": "{{broker}}"
+        }
+      ],
+      "transparent": true,
+      "gridPos": {
+        "h": 1,
+        "w": 3,
+        "x": 9,
+        "y": 0
+      },
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            {
+              "type": "special",
+              "options": {
+                "match": "null+nan",
+                "result": {
+                  "text": "\u2014",
+                  "color": "text",
+                  "index": 99
+                }
+              }
+            }
+          ],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": null
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "none",
+        "graphMode": "none",
+        "textMode": "name",
+        "justifyMode": "center",
+        "text": {
+          "valueSize": 14,
+          "titleSize": 12
+        },
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        }
+      },
+      "timeFrom": "5m",
+      "hideTimeOverride": true
+    },
+    {
+      "id": 112,
+      "type": "stat",
+      "title": "",
+      "description": "Equity rebalance target. The SPA pill also shows the band: target +/- liq_settings_equity_deviation.",
+      "datasource": {
+        "type": "stackdriver",
+        "uid": "cloudmon"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "stackdriver",
+            "uid": "cloudmon"
+          },
+          "queryType": "promQL",
+          "promQLQuery": {
+            "projectName": "$env",
+            "expr": "max(liq_settings_equity_target)",
+            "step": "60s"
+          },
+          "timeSeriesList": {
+            "projectName": "",
+            "filters": [],
+            "view": "FULL",
+            "groupBys": []
+          },
+          "instant": true
+        }
+      ],
+      "transparent": true,
+      "gridPos": {
+        "h": 1,
+        "w": 4,
+        "x": 12,
+        "y": 0
+      },
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            {
+              "type": "special",
+              "options": {
+                "match": "null+nan",
+                "result": {
+                  "text": "\u2014",
+                  "color": "text",
+                  "index": 99
+                }
+              }
+            }
+          ],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": null
+              }
+            ]
+          },
+          "unit": "percentunit",
+          "displayName": "Equity",
+          "decimals": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "none",
+        "graphMode": "none",
+        "textMode": "value_and_name",
+        "justifyMode": "center",
+        "text": {
+          "valueSize": 14,
+          "titleSize": 12
+        },
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        }
+      },
+      "timeFrom": "5m",
+      "hideTimeOverride": true
+    },
+    {
+      "id": 113,
+      "type": "stat",
+      "title": "",
+      "description": "USDC rebalance target. The SPA pill also shows the band: target +/- liq_settings_usdc_deviation.",
+      "datasource": {
+        "type": "stackdriver",
+        "uid": "cloudmon"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "stackdriver",
+            "uid": "cloudmon"
+          },
+          "queryType": "promQL",
+          "promQLQuery": {
+            "projectName": "$env",
+            "expr": "max(liq_settings_usdc_target)",
+            "step": "60s"
+          },
+          "timeSeriesList": {
+            "projectName": "",
+            "filters": [],
+            "view": "FULL",
+            "groupBys": []
+          },
+          "instant": true
+        }
+      ],
+      "transparent": true,
+      "gridPos": {
+        "h": 1,
+        "w": 4,
+        "x": 16,
+        "y": 0
+      },
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            {
+              "type": "special",
+              "options": {
+                "match": "null+nan",
+                "result": {
+                  "text": "\u2014",
+                  "color": "text",
+                  "index": 99
+                }
+              }
+            }
+          ],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": null
+              }
+            ]
+          },
+          "unit": "percentunit",
+          "displayName": "USDC",
+          "decimals": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "none",
+        "graphMode": "none",
+        "textMode": "value_and_name",
+        "justifyMode": "center",
+        "text": {
+          "valueSize": 14,
+          "titleSize": 12
+        },
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        }
+      },
+      "timeFrom": "5m",
+      "hideTimeOverride": true
+    },
+    {
+      "id": 114,
+      "type": "stat",
+      "title": "",
+      "description": "Hedge execution threshold (settings bar 'Trigger').",
+      "datasource": {
+        "type": "stackdriver",
+        "uid": "cloudmon"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "stackdriver",
+            "uid": "cloudmon"
+          },
+          "queryType": "promQL",
+          "promQLQuery": {
+            "projectName": "$env",
+            "expr": "max(liq_settings_execution_threshold_usd)",
+            "step": "60s"
+          },
+          "timeSeriesList": {
+            "projectName": "",
+            "filters": [],
+            "view": "FULL",
+            "groupBys": []
+          },
+          "instant": true
+        }
+      ],
+      "transparent": true,
+      "gridPos": {
+        "h": 1,
+        "w": 4,
+        "x": 20,
+        "y": 0
+      },
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            {
+              "type": "special",
+              "options": {
+                "match": "null+nan",
+                "result": {
+                  "text": "\u2014",
+                  "color": "text",
+                  "index": 99
+                }
+              }
+            }
+          ],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": null
+              }
+            ]
+          },
+          "unit": "currencyUSD",
+          "displayName": "Trigger",
+          "decimals": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "none",
+        "graphMode": "none",
+        "textMode": "value_and_name",
+        "justifyMode": "center",
+        "text": {
+          "valueSize": 14,
+          "titleSize": 12
+        },
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        }
+      },
+      "timeFrom": "5m",
+      "hideTimeOverride": true
+    },
+    {
+      "id": 115,
+      "type": "table",
+      "title": "Log History",
+      "description": "The bot's structured log lines, re-emitted by the exporter with real severity and target (the raw container stream is all-INFO). Filter with the level/category/target/search variables above. \u26a0\ufe0f Only the newest matching entries, about the panel's pixel width of them. Narrow the filters, or use the SPA for deep digs. DEBUG/TRACE are not shipped.",
+      "datasource": {
+        "type": "googlecloud-logging-datasource",
+        "uid": "cloudlog"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "googlecloud-logging-datasource",
+            "uid": "cloudlog"
+          },
+          "projectId": "$env",
+          "queryText": "logName=\"projects/$env/logs/liquidity-botlogs\" labels.level=~\"^(${level:pipe})$\" labels.target=~\"${target}\" labels.target=~\"^(${category:pipe})$\" jsonPayload.message=~\"${search}\"",
+          "queryType": "logs"
+        }
+      ],
+      "gridPos": {
+        "h": 19,
+        "w": 24,
+        "x": 0,
+        "y": 2
+      },
+      "transformations": [
+        {
+          "id": "extractFields",
+          "options": {
+            "source": "labels",
+            "format": "json",
+            "replace": false,
+            "keepTime": false
+          }
+        },
+        {
+          "id": "filterFieldsByName",
+          "options": {
+            "include": {
+              "pattern": "^(timestamp|jsonPayload\\.level|jsonPayload\\.target|body)$"
+            }
+          }
+        },
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {},
+            "indexByName": {
+              "timestamp": 0,
+              "jsonPayload.level": 1,
+              "jsonPayload.target": 2,
+              "body": 3
+            },
+            "renameByName": {
+              "timestamp": "Time",
+              "jsonPayload.level": "Level",
+              "jsonPayload.target": "Target",
+              "body": "Message"
+            }
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "align": "auto",
+            "filterable": true
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Time"
+            },
+            "properties": [
+              {
+                "id": "custom.width",
+                "value": 170
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Level"
+            },
+            "properties": [
+              {
+                "id": "custom.width",
+                "value": 70
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Target"
+            },
+            "properties": [
+              {
+                "id": "custom.width",
+                "value": 220
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Level"
+            },
+            "properties": [
+              {
+                "id": "mappings",
+                "value": [
+                  {
+                    "type": "value",
+                    "options": {
+                      "ERROR": {
+                        "text": "ERROR",
+                        "color": "red",
+                        "index": 0
+                      },
+                      "WARN": {
+                        "text": "WARN",
+                        "color": "yellow",
+                        "index": 1
+                      },
+                      "INFO": {
+                        "text": "INFO",
+                        "color": "blue",
+                        "index": 2
+                      }
+                    }
+                  }
+                ]
+              },
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "color-text"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Time"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "time:MMM D, HH:mm:ss.SSS"
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "showHeader": true,
+        "cellHeight": "sm",
+        "sortBy": [
+          {
+            "displayName": "Time",
+            "desc": true
+          }
+        ]
+      }
+    }
+  ]
+}
