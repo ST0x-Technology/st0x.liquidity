@@ -17,11 +17,14 @@ on:
       - ".github/workflows/observability.yml"
   workflow_dispatch:
 
+# Nothing by default; the one job below asks for exactly what it needs.
+permissions: {}
+
 jobs:
   observability:
     permissions:
-      contents: read
-      id-token: write
+      contents: read  # checkout of this repo's observability/ files
+      id-token: write  # keyless GCP login as this repo's <app>-obs-deploy identity
     concurrency:
       group: observability
       cancel-in-progress: false
