@@ -321,7 +321,9 @@ ethereum = "0.005"
 # Robinhood pays for the startup approvals and about four transactions per
 # equity mint or redemption (wrap or unwrap, vault deposit or withdraw, the
 # redemption transfer). At ~0.05 gwei each is under 0.00001 ETH, so 0.001
-# ETH is still hundreds of operations of headroom.
+# ETH is at least about 25 operations of headroom. It is also the equity
+# gas gate: below it, Robinhood rebalancing pauses until the wallet is
+# topped up.
 robinhood = "0.001"
 
 # USDC vault and rebalancing settings.
