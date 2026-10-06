@@ -3751,7 +3751,10 @@ mod tests {
 
     use super::*;
     use crate::chain::IngestionCutoffTag;
-    use crate::{ChainLifecycle, ChainRole, ExecutionThreshold, InventoryModeTag, RebalancingMode};
+    use crate::{
+        ChainLifecycle, ChainRole, ExecutionThreshold, InventoryAdapter, InventoryAdapterVenue,
+        InventoryModeTag, RebalancingMode,
+    };
 
     fn toml_file(content: &str) -> NamedTempFile {
         let mut file = NamedTempFile::new().unwrap();
@@ -10135,7 +10138,8 @@ mod tests {
 
     /// Loads a shipped config and checks the Robinhood settings prod and
     /// staging share: the same orderbook and inventory, hedged fills on
-    /// every listed equity, no Bebop, and the 0.001 ETH gas threshold.
+    /// every listed equity, Bebop's Robinhood hook as the one inventory
+    /// adapter, and the 0.001 ETH gas threshold.
     /// Returns Robinhood and the other declared chains.
     fn shipped_robinhood(
         name: &str,
@@ -10188,8 +10192,12 @@ mod tests {
         assert_eq!(trading.ingestion_cutoff_confirmations, Some(600), "{name}");
         assert_eq!(
             trading.inventory_adapters,
-            InventoryAdapters::default(),
-            "{name}: Bebop is off on Robinhood"
+            InventoryAdapters::try_new(vec![InventoryAdapter {
+                venue: InventoryAdapterVenue::Bebop,
+                operator: address!("0x242FdEc55623187E80A690ff15302e63dddd7130"),
+            }])
+            .unwrap(),
+            "{name}: Bebop's Robinhood hook is the only inventory adapter"
         );
 
         let equities: BTreeMap<Symbol, (Address, Address)> = trading
