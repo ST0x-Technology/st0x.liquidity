@@ -171,7 +171,9 @@ required_confirmations = 1
 [chains.robinhood]
 lifecycle = "active"
 # ~1 s at the ~100 ms block cadence: enough for a load-balanced RPC to have
-# seen the startup USDG approval before it is treated as settled.
+# seen a transaction before it is treated as settled. It gates the startup
+# USDG, wrap and deposit approvals and every wrap, deposit, withdrawal,
+# unwrap and redemption transfer on 4663.
 required_confirmations = 10
 
 [chains.robinhood.trading]
