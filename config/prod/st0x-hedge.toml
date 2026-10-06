@@ -154,13 +154,19 @@ required_confirmations = 1
 # cash does not, since USDG has no corridor yet. Staging watches the same
 # inventory and stays hedge-only, so only prod moves it. Gas is ETH.
 #
-# Rollback once Robinhood has moved equity: set the listing's rebalancing to
-# "paused" on this release. A tag rollback is safe only while no Robinhood
-# mint, redemption or recovery is unfinished: older configs run Robinhood
-# prefunded with no redemption_wallet, and startup refuses to build the
-# services that unfinished work needs, so the bot stops on every chain.
-# Reverting only this table to "prefunded" fails validate-config while the
-# token file enables Robinhood rebalancing.
+# Rollback once Robinhood has moved equity: publish a st0x.registry
+# generation with the listing's Robinhood rebalancing at "paused" and bump
+# [registry].generation here; this file cannot set it, since [registry]
+# refuses inline equities tables. "paused" still runs the Robinhood startup
+# preflights (OPERATOR_ROLE, approvals, issuer and wrapper), so it does not
+# fix a release that fails to boot. A tag rollback is safe only while no
+# Robinhood mint, redemption or recovery is unfinished: older configs run
+# Robinhood prefunded with no redemption_wallet, and startup refuses to
+# build the services that unfinished work needs, so the bot stops on every
+# chain. So if the switch-on release does not boot and nothing on Robinhood
+# has moved, roll back to the previous release. Reverting only this table
+# to "prefunded" fails validate-config while the token file enables
+# Robinhood rebalancing.
 
 [chains.robinhood]
 lifecycle = "active"
