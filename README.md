@@ -470,9 +470,15 @@ nix run .#deployAll   # first deployment
 - **Release** (`.github/workflows/release-tag.yml`): pushing a `vX.Y.Z` tag
   labels the images already built and attested for that commit and cuts the
   GitHub release. It does not build or deploy.
-- **Production** is promoted from `t0.devops`, not this repo: promote a digest
-  proven in staging into `terraform/production-liquidity/images.yaml` and merge.
-  The apply requires 2 of 4 approvers (Juan, Alastair, Kais, Josh).
+- **Observability** (`.github/workflows/observability.yml`): the liquidity bot's
+  Grafana boards and alert rules in `observability/`. Every pull request that
+  touches them provisions them into a throwaway Grafana; a merge to `master`
+  ships them to the production T0 Grafana. See
+  [observability/README.md](observability/README.md).
+- **Production** bot images are promoted from `t0.devops`, not this repo:
+  promote a digest proven in staging into
+  `terraform/production-liquidity/images.yaml` and merge. The apply requires 2
+  of 4 approvers (Juan, Alastair, Kais, Josh).
 
 Track staging and production deploys in the Grafana deployments dashboard:
 https://grafana.t0trade.com/d/t0-deployments/deployments
@@ -603,8 +609,10 @@ secret/
 ├── st0x-hedge.toml.age           # encrypted core service secrets
 └── st0x-hedge-pricing.toml.age   # encrypted pricing credential overlay
 dashboard/                 # SvelteKit operations dashboard
+observability/             # Grafana boards and alert rules, shipped on merge
 .github/workflows/
 ├── ci.yaml                # Build, test, clippy, dashboard
+├── observability.yml      # Check and ship observability/
 └── cd.yaml                # Deploy to NixOS host
 ```
 
