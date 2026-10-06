@@ -209,8 +209,8 @@ required_confirmations = 1
 # hedge-only secondary. Fills on its orderbook are ingested, validated against
 # USDG (its settlement stable, pinned in code) and hedged; inventory is topped
 # up by hand and the prefunded lifecycle refuses any asset that enables
-# rebalancing (no wrapper or CCTP domain is wired there anyway). Gas is ETH,
-# so "active" is reachable, but rebalancing assets stay refused by capability.
+# rebalancing. Gas is ETH, so "active" is reachable, and at "active" an
+# equity may rebalance against Alpaca. Cash cannot: there is no CCTP domain.
 [chains.robinhood]
 lifecycle = "prefunded"
 # ~1 s at Robinhood's ~100 ms block cadence: enough for a load-balanced RPC

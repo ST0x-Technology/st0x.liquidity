@@ -331,7 +331,7 @@ mod tests {
 
         assert_eq!(
             error.to_string(),
-            "Robinhood Chain does not support automated equity transfers or donations"
+            "the CLI refuses equity transfers and donations on Robinhood Chain: until the bot's first supervised round trip there, Robinhood equity moves only through the bot"
         );
         assert_eq!(operations.buys.load(Ordering::Relaxed), 0);
         assert_eq!(operations.tokenizations.load(Ordering::Relaxed), 0);

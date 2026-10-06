@@ -2697,33 +2697,6 @@ fn usdc_corridor_endpoints<Signer: Wallet + Clone>(
     })
 }
 
-/// The OPERATOR_ROLE preflight of a USDC corridor's chain, against that
-/// chain's own inventory with the corridor's signer. The primary chain is
-/// skipped: its equity leg's preflight already checked it.
-async fn preflight_usdc_corridor_inventory<Signer: Wallet + Clone>(
-    ctx: &Ctx,
-    endpoints: &UsdcCorridorEndpoints<Signer>,
-) -> anyhow::Result<()> {
-    let chain = endpoints.corridor.chain();
-    if chain == ctx.chains.primary().chain {
-        return Ok(());
-    }
-
-    let hedged = ctx.chains.hedged_chain(chain).with_context(|| {
-        format!("the USDC corridor chain {chain} has no [chains.{chain}.trading] table")
-    })?;
-    let wallet = &endpoints.chain_wallet;
-    let raindex = build_rebalancing_raindex_service(wallet, hedged, wallet.address());
-
-    preflight_inventory_access(&raindex, hedged).await
-}
-
-/// Startup preflight for the shared-inventory rebalancing path: the bot must
-/// hold `OPERATOR_ROLE` on the configured inventory or every rebalance
-/// deposit/withdraw reverts. Fails fast with a clear error rather than burning
-/// gas reverting on the first rebalance (the shared-inventory cutover grants
-/// the role before rebalancing runs).
-///
 /// Refuses an endpoint that is not the chain its registry entry names.
 ///
 /// Every address in the entry -- orderbook, inventory, vaults, tokens -- is
@@ -2731,6 +2704,7 @@ async fn preflight_usdc_corridor_inventory<Signer: Wallet + Clone>(
 /// would route funds by addresses that mean something else there, or nothing
 /// at all. The id comes from the [`Chain`] type rather than from config: a
 /// config-supplied id would be the very value being checked.
+///
 /// The primary chain's id is confirmed inside `setup_instrumentation`; the
 /// transport chains hold funds through their signers, so a signer pointed at
 /// the wrong network must fail startup the same way.
@@ -3017,31 +2991,87 @@ async fn confirm_chain_id<P: Provider>(provider: &P, chain: Chain) -> anyhow::Re
     Ok(())
 }
 
-/// Skipped in [`InventoryMode::Legacy`]: no distinct inventory contract is in
-/// play (integration tests and any not-yet-migrated setup), so there is no
-/// `OPERATOR_ROLE` to check and the orderbook allowance is the live one, not a
-/// stale artifact to revoke.
+/// Startup preflight for the shared-inventory rebalancing path: the bot must
+/// hold `OPERATOR_ROLE` on each rebalancing chain's inventory or every
+/// rebalance deposit/withdraw there reverts. Fails fast with a clear error
+/// rather than burning gas reverting on the first rebalance (the
+/// shared-inventory cutover grants the role before rebalancing runs).
+///
+/// Runs once on every equity-rebalancing or served USDC corridor chain: a
+/// secondary missing the role would mint and wrap, then revert on the
+/// deposit, leaving the wrapped shares in its wallet.
 async fn preflight_inventory_access<Signer: Wallet + Clone>(
-    raindex_service: &RaindexService<Signer>,
-    hedged: &HedgedChain,
+    ctx: &Ctx,
+    tokenizations: &BTreeMap<Chain, ChainTokenization<Signer>>,
+    served_usdc_corridors: &BTreeSet<UsdcCorridor>,
 ) -> anyhow::Result<()> {
-    let chain = hedged.chain;
-    let InventoryMode::Managed { inventory } = hedged.inventory else {
-        debug!(
-            target: "inventory",
-            %chain,
-            "legacy inventory mode; skipping OPERATOR_ROLE preflight (no distinct inventory in play)",
+    for (hedged, inventory) in operator_role_preflight_chains(ctx, served_usdc_corridors) {
+        let chain = hedged.chain;
+        let tokenization = tokenizations.get(&chain).with_context(|| {
+            format!("no signing wallet was built for the rebalancing chain {chain}")
+        })?;
+        let raindex_service = build_rebalancing_raindex_service(
+            &tokenization.wallet,
+            hedged,
+            tokenization.wallet.address(),
         );
-        return Ok(());
-    };
 
+        preflight_chain_inventory_access(chain, inventory, &raindex_service).await?;
+    }
+
+    Ok(())
+}
+
+/// The chains whose inventory the `OPERATOR_ROLE` preflight checks, with that
+/// inventory: every managed hedged chain that rebalances equity or serves
+/// a served USDC corridor, including while new cash transfers are paused.
+///
+/// A hedge-only secondary outside those corridors makes no operator calls.
+/// [`InventoryMode::Legacy`] is skipped too: no distinct inventory contract
+/// is in play (integration tests and any not-yet-migrated setup), so there is
+/// no `OPERATOR_ROLE` to check and the orderbook allowance is the live one,
+/// not a stale artifact to revoke.
+fn operator_role_preflight_chains<'ctx>(
+    ctx: &'ctx Ctx,
+    served_usdc_corridors: &BTreeSet<UsdcCorridor>,
+) -> Vec<(&'ctx HedgedChain, Address)> {
+    ctx.chains
+        .hedged_with_roles()
+        .filter(|(role, hedged)| {
+            role.rebalances_equity(&hedged.assets)
+                || served_usdc_corridors
+                    .iter()
+                    .any(|corridor| corridor.chain() == hedged.chain)
+        })
+        .filter_map(|(_, hedged)| match hedged.inventory {
+            InventoryMode::Managed { inventory } => Some((hedged, inventory)),
+            InventoryMode::Legacy => {
+                debug!(
+                    target: "inventory",
+                    chain = %hedged.chain,
+                    "legacy inventory mode; skipping OPERATOR_ROLE preflight (no distinct \
+                     inventory in play)",
+                );
+                None
+            }
+        })
+        .collect()
+}
+
+async fn preflight_chain_inventory_access<Signer: Wallet + Clone>(
+    chain: Chain,
+    inventory: Address,
+    raindex_service: &RaindexService<Signer>,
+) -> anyhow::Result<()> {
     raindex_service
         .verify_operator_role::<OpenChainErrorRegistry>()
         .await
-        .context(
-            "OPERATOR_ROLE preflight failed: the signing wallet cannot operate the \
-             configured RaindexInventory",
-        )?;
+        .with_context(|| {
+            format!(
+                "OPERATOR_ROLE preflight failed on {chain}: the signing wallet cannot operate \
+                 the configured RaindexInventory {inventory}"
+            )
+        })?;
     info!(
         target: "inventory",
         %chain,
@@ -3685,7 +3715,6 @@ async fn build_primary_rebalancing_services<Signer: Wallet + Clone>(
         chain = %primary.chain,
         "Initializing rebalancing infrastructure on the primary chain's tokenization services"
     );
-    let market_maker_wallet = primary.wallet.address();
 
     // The worker consuming this queue is always registered
     // (`build_record_bot_gas_receipt_cost_ctx` fails startup when its
@@ -3693,12 +3722,6 @@ async fn build_primary_rebalancing_services<Signer: Wallet + Clone>(
     // disagree: every enqueued row has a consumer.
     let bot_gas_enqueuer =
         BotGasReceiptCostEnqueuer::Enabled(deps.record_bot_gas_receipt_cost_queue.clone());
-
-    let raindex_service = build_rebalancing_raindex_service(
-        &primary.wallet,
-        deps.ctx.chains.primary(),
-        market_maker_wallet,
-    );
 
     // One issuance client serves the tokenization preflight's vault-mode
     // reads and both mint-authorization consumers (the saga's vault-mode
@@ -3709,7 +3732,6 @@ async fn build_primary_rebalancing_services<Signer: Wallet + Clone>(
         deps.ctx.issuance.api_key.header_value(),
     )?);
 
-    preflight_inventory_access(&raindex_service, deps.ctx.chains.primary()).await?;
     preflight_tokenization(&deps.ctx, tokenizations, issuance_client.as_ref()).await?;
 
     let tokenizer = primary_equity.tokenizer.clone();
@@ -3745,6 +3767,9 @@ fn spawn_rebalancing_infrastructure<Signer: Wallet + Clone>(
 
         let BrokerCtx::AlpacaBrokerApi(alpaca_auth) = &deps.ctx.broker;
 
+        preflight_inventory_access(&deps.ctx, &tokenizations, rebalancing_ctx.usdc.served())
+            .await?;
+
         let PrimaryRebalancingServices {
             bot_gas_enqueuer,
             tokenizer,
@@ -3773,9 +3798,6 @@ fn spawn_rebalancing_infrastructure<Signer: Wallet + Clone>(
                 usdc_corridor_endpoints(&deps.ctx, &tokenizations, &ethereum_wallet, *corridor)
             })
             .collect::<anyhow::Result<Vec<_>>>()?;
-        for endpoints in &usdc_endpoints {
-            preflight_usdc_corridor_inventory(&deps.ctx, endpoints).await?;
-        }
 
         let equity_transfer_services = EquityTransferServices {
             chains: chain_services,
@@ -7818,6 +7840,8 @@ mod tests {
     use alloy::primitives::{Address, B256, TxHash, U256, address, bytes, fixed_bytes};
     use alloy::providers::ProviderBuilder;
     use alloy::providers::mock::Asserter;
+    use alloy::rpc::json_rpc::{RequestPacket, Response, ResponsePacket, ResponsePayload};
+    use alloy::sol_types::SolCall;
     use apalis::prelude::Status;
     use rain_math_float::Float;
     use sqlx::{ConnectOptions, SqlitePool};
@@ -7855,7 +7879,9 @@ mod tests {
 
     use super::*;
     use crate::alerts::{CapturingNotifier, NotifierError};
-    use crate::bindings::IRaindexInventory::{OperatorDeposit, OperatorWithdraw};
+    use crate::bindings::IRaindexInventory::{
+        OPERATOR_ROLECall, OperatorDeposit, OperatorWithdraw, hasRoleCall,
+    };
     use crate::bindings::IRaindexV6::{
         ClearConfigV2, ClearV3, EvaluableV4, IOV2, OrderV4, TakeOrderConfigV4, TakeOrderV3,
     };
@@ -8593,40 +8619,284 @@ mod tests {
         )
     }
 
-    #[tokio::test]
-    async fn preflight_skips_role_check_in_legacy_mode() {
-        // Legacy mode has no distinct inventory, so the preflight must return Ok
-        // WITHOUT issuing any eth_call. The service's asserter is empty: if the
-        // preflight tried to read OPERATOR_ROLE / hasRole, the mock would error.
-        let service = mock_wallet_raindex_service(Asserter::new());
+    fn operator_role_preflight_chain_ids(ctx: &Ctx) -> Vec<Chain> {
+        operator_role_preflight_chains(ctx, &BTreeSet::from([UsdcCorridor::BASE_CCTP]))
+            .into_iter()
+            .map(|(hedged, _)| hedged.chain)
+            .collect()
+    }
+
+    fn managed(hedged: &mut HedgedChain, inventory: Address) {
+        hedged.inventory = InventoryMode::Managed { inventory };
+    }
+
+    #[test]
+    fn operator_role_preflight_skips_legacy_mode() {
         let mut ctx = create_test_ctx_with_order_owner(Address::ZERO);
         ctx.chains.primary_mut().inventory = InventoryMode::Legacy;
 
-        preflight_inventory_access(&service, ctx.chains.primary())
-            .await
-            .expect("legacy mode must skip the preflight and succeed");
+        assert!(
+            operator_role_preflight_chains(&ctx, &BTreeSet::from([UsdcCorridor::BASE_CCTP]))
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn operator_role_preflight_covers_a_rebalancing_secondary_but_not_a_hedge_only_one() {
+        let mut ctx = create_test_ctx_with_order_owner(Address::ZERO);
+        managed(ctx.chains.primary_mut(), Address::repeat_byte(0xAA));
+        let mut robinhood = hedged_chain_with_equities([(
+            "DNUT",
+            Address::repeat_byte(0x11),
+            Address::repeat_byte(0x22),
+        )]);
+        robinhood.chain = Chain::Robinhood;
+        managed(&mut robinhood, Address::repeat_byte(0xCC));
+        ctx.chains.insert_secondary(robinhood.clone());
+
+        assert_eq!(
+            operator_role_preflight_chain_ids(&ctx),
+            vec![Chain::Base],
+            "a hedge-only secondary makes no operator calls"
+        );
+
+        for equity in robinhood.assets.equities.symbols.values_mut() {
+            equity.rebalancing = RebalancingMode::Enabled;
+        }
+        ctx.chains.insert_secondary(robinhood);
+
+        let chains =
+            operator_role_preflight_chains(&ctx, &BTreeSet::from([UsdcCorridor::BASE_CCTP]));
+        assert_eq!(
+            chains
+                .iter()
+                .map(|(hedged, inventory)| (hedged.chain, *inventory))
+                .collect::<Vec<_>>(),
+            vec![
+                (Chain::Base, Address::repeat_byte(0xAA)),
+                (Chain::Robinhood, Address::repeat_byte(0xCC)),
+            ]
+        );
+    }
+
+    /// The wallet a chain's tokenization set signs with, backed by `asserter`.
+    fn mock_chain_tokenization(
+        chain: Chain,
+        asserter: Asserter,
+    ) -> ChainTokenization<RawPrivateKeyWallet<impl alloy::providers::Provider + Clone>> {
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+        chain_tokenization_with(chain, B256::repeat_byte(0x11), provider)
+    }
+
+    fn chain_tokenization_with<P: alloy::providers::Provider + Clone + 'static>(
+        chain: Chain,
+        private_key: B256,
+        provider: P,
+    ) -> ChainTokenization<RawPrivateKeyWallet<P>> {
+        let wallet = RawPrivateKeyWallet::new(&private_key, provider, chain.chain_id()).unwrap();
+
+        ChainTokenization {
+            chain,
+            role: ChainRole::Secondary,
+            wallet,
+            equity: EquityTokenization::HedgeOnly,
+        }
+    }
+
+    fn push_operator_role_granted(asserter: &Asserter) {
+        asserter.push_success(&alloy::primitives::Bytes::from(
+            <crate::bindings::IRaindexInventory::OPERATOR_ROLECall as alloy::sol_types::SolCall>::abi_encode_returns(&B256::repeat_byte(0x42)),
+        ));
+        asserter.push_success(&alloy::primitives::Bytes::from(
+            <crate::bindings::IRaindexInventory::hasRoleCall as alloy::sol_types::SolCall>::abi_encode_returns(&true),
+        ));
+    }
+
+    fn ctx_with_rebalancing_robinhood() -> Ctx {
+        let mut ctx = create_test_ctx_with_order_owner(Address::ZERO);
+        managed(ctx.chains.primary_mut(), Address::repeat_byte(0xAA));
+        let mut robinhood = hedged_chain_with_equities([(
+            "DNUT",
+            Address::repeat_byte(0x11),
+            Address::repeat_byte(0x22),
+        )]);
+        robinhood.chain = Chain::Robinhood;
+        managed(&mut robinhood, Address::repeat_byte(0xCC));
+        for equity in robinhood.assets.equities.symbols.values_mut() {
+            equity.rebalancing = RebalancingMode::Enabled;
+        }
+        ctx.chains.insert_secondary(robinhood);
+        ctx
+    }
+
+    /// The primary holds the role, so startup reaches the rebalancing
+    /// secondary and refuses on it.
+    #[tokio::test]
+    async fn preflight_refuses_a_rebalancing_secondary_without_the_role() {
+        let ctx = ctx_with_rebalancing_robinhood();
+        let base_asserter = Asserter::new();
+        push_operator_role_granted(&base_asserter);
+        let tokenizations = BTreeMap::from([
+            (
+                Chain::Base,
+                mock_chain_tokenization(Chain::Base, base_asserter.clone()),
+            ),
+            (
+                Chain::Robinhood,
+                mock_chain_tokenization(Chain::Robinhood, Asserter::new()),
+            ),
+        ]);
+
+        let error = preflight_inventory_access(
+            &ctx,
+            &tokenizations,
+            &BTreeSet::from([UsdcCorridor::BASE_CCTP]),
+        )
+        .await
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("OPERATOR_ROLE preflight failed on robinhood"),
+            "the failure must name the secondary, got: {error}"
+        );
+        assert!(
+            base_asserter.read_q().is_empty(),
+            "the primary's role check must consume its own responses"
+        );
+    }
+
+    /// Answers the `OPERATOR_ROLE` preflight's two `eth_call`s and records
+    /// each call's target and calldata.
+    #[derive(Clone, Default)]
+    struct RoleCheckTransport {
+        calls: Arc<std::sync::Mutex<Vec<(Address, alloy::primitives::Bytes)>>>,
+    }
+
+    impl tower::Service<RequestPacket> for RoleCheckTransport {
+        type Response = ResponsePacket;
+        type Error = alloy::transports::TransportError;
+        type Future = alloy::transports::TransportFut<'static>;
+
+        fn poll_ready(
+            &mut self,
+            _context: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Result<(), Self::Error>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, request: RequestPacket) -> Self::Future {
+            let RequestPacket::Single(request) = request else {
+                panic!("RoleCheckTransport serves single requests only");
+            };
+            assert_eq!(request.method(), "eth_call");
+            let params: Vec<serde_json::Value> =
+                serde_json::from_str(request.params().unwrap().get()).unwrap();
+            let call = &params[0];
+            let to: Address = serde_json::from_value(call["to"].clone()).unwrap();
+            let input: alloy::primitives::Bytes = serde_json::from_value(
+                call.get("input")
+                    .or_else(|| call.get("data"))
+                    .unwrap()
+                    .clone(),
+            )
+            .unwrap();
+            let returns = match input.get(..4) {
+                Some(selector) if selector == OPERATOR_ROLECall::SELECTOR => {
+                    OPERATOR_ROLECall::abi_encode_returns(&B256::repeat_byte(0x42))
+                }
+                Some(selector) if selector == hasRoleCall::SELECTOR => {
+                    hasRoleCall::abi_encode_returns(&true)
+                }
+                _ => panic!("unexpected eth_call input {input}"),
+            };
+            self.calls.lock().unwrap().push((to, input));
+            let payload = serde_json::to_string(&alloy::primitives::Bytes::from(returns)).unwrap();
+            let response = Response {
+                id: request.id().clone(),
+                payload: ResponsePayload::Success(
+                    serde_json::value::RawValue::from_string(payload).unwrap(),
+                ),
+            };
+
+            Box::pin(async move { Ok(ResponsePacket::Single(response)) })
+        }
+    }
+
+    /// Each chain's role check asks its own inventory whether its own wallet
+    /// holds `OPERATOR_ROLE`.
+    #[tokio::test]
+    async fn preflight_checks_each_rebalancing_chain_through_its_own_wallet() {
+        let ctx = ctx_with_rebalancing_robinhood();
+        let base_transport = RoleCheckTransport::default();
+        let robinhood_transport = RoleCheckTransport::default();
+        let provider = |transport: &RoleCheckTransport| {
+            ProviderBuilder::new()
+                .connect_client(alloy::rpc::client::RpcClient::new(transport.clone(), true))
+        };
+        let base = chain_tokenization_with(
+            Chain::Base,
+            B256::repeat_byte(0x11),
+            provider(&base_transport),
+        );
+        let robinhood = chain_tokenization_with(
+            Chain::Robinhood,
+            B256::repeat_byte(0x33),
+            provider(&robinhood_transport),
+        );
+        let expected = [
+            (
+                &base_transport,
+                Address::repeat_byte(0xAA),
+                base.wallet.address(),
+            ),
+            (
+                &robinhood_transport,
+                Address::repeat_byte(0xCC),
+                robinhood.wallet.address(),
+            ),
+        ];
+        assert_ne!(expected[0].2, expected[1].2);
+        let tokenizations = BTreeMap::from([(Chain::Base, base), (Chain::Robinhood, robinhood)]);
+
+        preflight_inventory_access(
+            &ctx,
+            &tokenizations,
+            &BTreeSet::from([UsdcCorridor::BASE_CCTP]),
+        )
+        .await
+        .unwrap();
+
+        for (transport, inventory, account) in expected {
+            let calls = transport.calls.lock().unwrap().clone();
+            assert_eq!(calls.len(), 2, "{calls:?}");
+            assert!(calls.iter().all(|(to, _)| *to == inventory), "{calls:?}");
+            let has_role = hasRoleCall::abi_decode(&calls[1].1).unwrap();
+            assert_eq!(has_role.role, B256::repeat_byte(0x42));
+            assert_eq!(has_role.account, account);
+        }
     }
 
     #[tokio::test]
-    async fn preflight_attempts_role_check_in_managed_mode() {
-        // Managed mode must actually query the role: with an empty asserter the
-        // first eth_call fails, so the preflight surfaces an error (wrapped in its
-        // context). This is the mirror of the legacy test -- proving the branch on
-        // InventoryMode, not the skip. The exact MissingOperatorRole outcome is
-        // covered by the RaindexService::verify_operator_role unit tests.
+    async fn chain_preflight_failure_names_the_chain() {
+        // With an empty asserter the first eth_call fails, so the role check
+        // surfaces an error. The exact MissingOperatorRole outcome is covered
+        // by the RaindexService::verify_operator_role unit tests.
         let service = mock_wallet_raindex_service(Asserter::new());
-        let mut ctx = create_test_ctx_with_order_owner(Address::ZERO);
-        ctx.chains.primary_mut().inventory = InventoryMode::Managed {
-            inventory: Address::repeat_byte(0xAA),
-        };
 
-        let error = preflight_inventory_access(&service, ctx.chains.primary())
-            .await
-            .expect_err("managed mode must attempt the role check and surface the failure");
+        let error = preflight_chain_inventory_access(
+            Chain::Robinhood,
+            Address::repeat_byte(0xAA),
+            &service,
+        )
+        .await
+        .expect_err("the role check must fail against an empty asserter");
 
+        let message = error.to_string();
         assert!(
-            error.to_string().contains("OPERATOR_ROLE preflight failed"),
-            "managed-mode failure must carry the preflight context, got: {error}"
+            message.contains("OPERATOR_ROLE preflight failed on robinhood"),
+            "the failure must name the chain, got: {message}"
         );
     }
 
@@ -22318,65 +22588,73 @@ mod tests {
         );
     }
 
-    fn mock_wallet_corridor_endpoints(
-        corridor: UsdcCorridor,
-    ) -> UsdcCorridorEndpoints<RawPrivateKeyWallet<impl alloy::providers::Provider + Clone>> {
-        let provider = ProviderBuilder::new().connect_mocked_client(Asserter::new());
-        let chain_wallet = RawPrivateKeyWallet::new(&B256::repeat_byte(0x11), provider, 1).unwrap();
-
-        UsdcCorridorEndpoints {
-            corridor,
-            chain_wallet,
-            contracts: RaindexContracts {
-                inventory: Address::repeat_byte(0xAA),
-                orderbook: Address::repeat_byte(0xBB),
-            },
-            vault_id: RaindexVaultId(B256::repeat_byte(0xba)),
-            gas_readiness: GasReadiness::always_ready_for_test(),
-        }
-    }
-
-    /// The primary chain's inventory access is checked with its equity leg,
-    /// so a corridor on the primary makes no call of its own. The wallet's
-    /// mock has no responses, so any call would fail.
     #[tokio::test]
-    async fn usdc_corridor_preflight_skips_the_primary_chain() {
+    async fn inventory_preflight_checks_a_primary_equity_and_cash_chain_once() {
         let mut ctx = create_test_ctx_with_order_owner(Address::ZERO);
-        ctx.chains.primary_mut().inventory = InventoryMode::Managed {
-            inventory: Address::repeat_byte(0xAA),
-        };
+        managed(ctx.chains.primary_mut(), Address::repeat_byte(0xAA));
+        let base_asserter = Asserter::new();
+        push_operator_role_granted(&base_asserter);
+        let tokenizations = BTreeMap::from([(
+            Chain::Base,
+            mock_chain_tokenization(Chain::Base, base_asserter.clone()),
+        )]);
 
-        preflight_usdc_corridor_inventory(
+        preflight_inventory_access(
             &ctx,
-            &mock_wallet_corridor_endpoints(UsdcCorridor::BASE_CCTP),
+            &tokenizations,
+            &BTreeSet::from([UsdcCorridor::BASE_CCTP]),
         )
         .await
         .unwrap();
+
+        assert!(base_asserter.read_q().is_empty());
     }
 
-    /// A corridor off the primary is checked against its own chain's
-    /// inventory: a legacy-mode corridor chain skips the role read even
-    /// though the primary is managed, and a managed one reads it.
     #[tokio::test]
-    async fn usdc_corridor_preflight_checks_a_non_primary_chains_own_inventory() {
+    async fn inventory_preflight_checks_a_cash_only_secondary_and_skips_legacy() {
         let mut ctx = ethereum_primary_with_base_cash_ctx(B256::repeat_byte(0xba));
-        let endpoints = mock_wallet_corridor_endpoints(UsdcCorridor::BASE_CCTP);
+        let base_asserter = Asserter::new();
+        let ethereum_asserter = Asserter::new();
+        push_operator_role_granted(&ethereum_asserter);
+        let tokenizations = BTreeMap::from([
+            (
+                Chain::Base,
+                mock_chain_tokenization(Chain::Base, base_asserter.clone()),
+            ),
+            (
+                Chain::Ethereum,
+                mock_chain_tokenization(Chain::Ethereum, ethereum_asserter.clone()),
+            ),
+        ]);
 
-        let error = preflight_usdc_corridor_inventory(&ctx, &endpoints)
-            .await
-            .unwrap_err();
+        let error = preflight_inventory_access(
+            &ctx,
+            &tokenizations,
+            &BTreeSet::from([UsdcCorridor::BASE_CCTP]),
+        )
+        .await
+        .unwrap_err();
         assert!(
-            error.to_string().contains("OPERATOR_ROLE"),
-            "a managed corridor chain must read the role, got: {error:#}"
+            error
+                .to_string()
+                .contains("OPERATOR_ROLE preflight failed on base")
         );
+        assert!(ethereum_asserter.read_q().is_empty());
 
         let mut base = ctx.chains.hedged_chain(Chain::Base).unwrap().clone();
         base.inventory = InventoryMode::Legacy;
         ctx.chains.insert_secondary(base);
+        push_operator_role_granted(&ethereum_asserter);
 
-        preflight_usdc_corridor_inventory(&ctx, &endpoints)
-            .await
-            .unwrap();
+        preflight_inventory_access(
+            &ctx,
+            &tokenizations,
+            &BTreeSet::from([UsdcCorridor::BASE_CCTP]),
+        )
+        .await
+        .unwrap();
+        assert!(base_asserter.read_q().is_empty());
+        assert!(ethereum_asserter.read_q().is_empty());
     }
 
     /// A corridor's USDC gas check reads its own chain's wallet and the

@@ -142,10 +142,11 @@ required_confirmations = 1
 
 # Robinhood Chain (an Arbitrum Orbit L2, chain id 4663): a prefunded
 # hedge-only secondary. Fills on its orderbook are ingested, validated
-# against USDG (pinned in code) and hedged; inventory is topped up by hand
-# and no asset may enable rebalancing (no wrapper or CCTP domain is wired
-# there). Gas is ETH. There is one Robinhood deployment, so staging watches
-# the same orderbook and inventory as prod.
+# against USDG (pinned in code) and hedged. Gas is ETH. There is one
+# Robinhood deployment, so staging watches the same orderbook and inventory
+# as prod, on a different broker account. Staging must therefore never
+# rebalance Robinhood equity, even though the chain can: the wrappers are
+# deployed there and Alpaca serves its network. Prod owns that inventory.
 
 [chains.robinhood]
 lifecycle = "prefunded"

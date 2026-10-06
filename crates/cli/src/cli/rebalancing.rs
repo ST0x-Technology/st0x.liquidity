@@ -331,7 +331,9 @@ fn chain_wallet(
 
 pub(super) fn require_equity_mutation_network(network: TokenizationNetwork) -> anyhow::Result<()> {
     if network == TokenizationNetwork::Robinhood {
-        anyhow::bail!("Robinhood Chain does not support automated equity transfers or donations");
+        anyhow::bail!(
+            "the CLI refuses equity transfers and donations on Robinhood Chain: until the bot's first supervised round trip there, Robinhood equity moves only through the bot"
+        );
     }
 
     Ok(())
@@ -3329,7 +3331,7 @@ mod tests {
 
         assert_eq!(
             error.to_string(),
-            "Robinhood Chain does not support automated equity transfers or donations"
+            "the CLI refuses equity transfers and donations on Robinhood Chain: until the bot's first supervised round trip there, Robinhood equity moves only through the bot"
         );
         assert!(stdout.is_empty());
     }

@@ -26,8 +26,8 @@ Robinhood Chain (4663) is declared the same way and ships as a prefunded
 hedge-only secondary: fills on its two launch equities (wtDNUT, wtFGI) are
 ingested, validated against USDG and hedged, with `rebalancing = "disabled"` on
 every asset and no inventory adapter mapped. The build can also value its gas
-(it pays gas in ETH), so `active` is reachable; rebalancing remains unavailable
-there.
+(it pays gas in ETH), so `active` is reachable. At `active` it can rebalance
+equity against Alpaca; it cannot rebalance cash, because it has no CCTP domain.
 
 ## Features
 

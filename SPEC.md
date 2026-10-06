@@ -274,17 +274,19 @@ unavailable. Its vault balances are polled like any hedged chain's; automated
 rebalancing remains on Base.
 
 Robinhood Chain (chain id 4663, an Arbitrum Orbit L2) is declared the same way.
-The build provides fill ingestion, hedging, signing and gas valuation on it, and
-the shipped configuration runs it as a prefunded hedge-only secondary: fills on
-its orderbook are ingested, validated against USDG and hedged, while every asset
-keeps `rebalancing = "disabled"` and no inventory adapter is mapped. Its
-settlement stable is USDG at `0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168` (6
-decimals), so it is the first chain whose stable CCTP cannot carry. It pays gas
-in ETH, so the Base Chainlink ETH/USD read values its gas and `active` is
-reachable without rebalancing assets; no wrapper or CCTP domain is wired, so it
-cannot be the primary chain. Base's `safe` cutoff is OP-Stack-only: a Robinhood
-trading table must use the `confirmations` cutoff with a depth covering
-parent-chain finality.
+The build provides fill ingestion, hedging, signing, gas valuation and equity
+rebalancing on it (the wrappers are deployed and Alpaca's issuer serves its
+`robinhood` network), and the shipped configuration runs it as a prefunded
+hedge-only secondary: fills on its orderbook are ingested, validated against
+USDG and hedged, while every asset keeps `rebalancing = "disabled"` and no
+inventory adapter is mapped. Its settlement stable is USDG at
+`0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168` (6 decimals), so it is the first
+chain whose stable CCTP cannot carry. It pays gas in ETH, so the Base Chainlink
+ETH/USD read values its gas and `active` is reachable. Rebalancing an equity
+there needs `active`. It has no CCTP domain, so it cannot rebalance cash or be
+the primary chain. Base's `safe` cutoff is OP-Stack-only: a Robinhood trading
+table must use the `confirmations` cutoff with a depth covering parent-chain
+finality.
 
 The tokenization services are built per hedged chain, never once for Base, on
 the chain's own signing wallet. The primary, and every secondary with at least
