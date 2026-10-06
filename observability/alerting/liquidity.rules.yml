@@ -10,9 +10,10 @@
 # critical` also pages PagerDuty in US extended hours.
 #
 # Removing a rule from this file does NOT remove it from Grafana: add its
-# uid to deleteRules below as well, or it keeps firing. Write each entry as
-# `- orgId: 1` with `uid: <uid>` on the next line: the check job counts every
-# `- uid:` line as a rule it expects Grafana to load.
+# uid to deleteRules below as well, or it keeps firing. deleteRules is for
+# retiring one of THIS file's rules for good. A rule that moves to another
+# file is never listed there: Grafana applies deleteRules by uid whatever
+# file provisions the rule, so it would be deleted after every restart.
 apiVersion: 1
 
 deleteRules: []
