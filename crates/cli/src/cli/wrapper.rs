@@ -834,7 +834,7 @@ mod tests {
 
         assert_eq!(
             error.to_string(),
-            "the CLI refuses equity transfers and donations on Robinhood Chain: a failed one there has no crash recovery yet"
+            "the CLI refuses equity transfers and donations on Robinhood Chain: until the bot's first supervised round trip there, Robinhood equity moves only through the bot"
         );
         assert!(stdout.is_empty());
     }
