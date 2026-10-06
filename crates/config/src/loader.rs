@@ -10153,12 +10153,13 @@ mod tests {
     /// Loads a shipped config and checks the Robinhood settings prod and
     /// staging share: the same orderbook and inventory, hedged fills on
     /// every listed equity, no Bebop, and the 0.001 ETH gas threshold.
+    /// Returns Robinhood and the other declared chains.
     fn shipped_robinhood(
         name: &str,
         config_str: &str,
         tokens: &[u8],
         expected_equities: &BTreeMap<Symbol, (Address, Address)>,
-    ) -> ChainConfig {
+    ) -> (ChainConfig, BTreeMap<Chain, ChainConfig>) {
         let inventory = address!("0x1eFd85E6C384fAD9B80C6D508E9098Eb91C4eD30");
         let (config, _) = config_from(
             config_str,
@@ -10223,7 +10224,7 @@ mod tests {
             .collect();
         assert_eq!(&equities, expected_equities, "{name}");
 
-        robinhood
+        (robinhood, chains)
     }
 
     /// Staging watches prod's Robinhood inventory on its own broker account,
@@ -10231,7 +10232,7 @@ mod tests {
     /// rebalanced and nothing is redeemed.
     #[test]
     fn shipped_staging_config_hedges_robinhood_prefunded_without_rebalancing() {
-        let robinhood = shipped_robinhood(
+        let (robinhood, _) = shipped_robinhood(
             "staging",
             include_str!("../../../config/staging/st0x-hedge.toml"),
             &registry::fixtures::read("tokens-staging.toml"),
@@ -10259,7 +10260,7 @@ mod tests {
     /// st0x.issuance signs with on every chain.
     #[test]
     fn shipped_prod_config_rebalances_only_dnut_on_robinhood() {
-        let robinhood = shipped_robinhood(
+        let (robinhood, mut chains) = shipped_robinhood(
             "prod",
             include_str!("../../../config/prod/st0x-hedge.toml"),
             &registry::fixtures::pinned_production_tokens(),
@@ -10271,6 +10272,11 @@ mod tests {
         assert_eq!(
             trading.redemption_wallet,
             Some(address!("0x3d0CD66EFA66c05d86c3d4316B03eAE87ab9E8aE"))
+        );
+        let base_trading = chains.remove(&Chain::Base).unwrap().trading.unwrap();
+        assert_eq!(
+            trading.redemption_wallet, base_trading.redemption_wallet,
+            "issuance signs every chain with one key, so both chains redeem to one address"
         );
 
         let dnut = Symbol::new("DNUT").unwrap();
