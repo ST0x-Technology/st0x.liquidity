@@ -30,9 +30,10 @@ run of the generator overwrites them.
 `alerting/liquidity.rules.yml` is the alert rules, in the `Alerts` folder. Each
 rule's `uid` is permanent and must be unique across every repo's file. Removing
 a rule from the file does not remove it from Grafana: add its `uid` to
-`deleteRules:` as well, or it keeps firing. Write each `deleteRules` entry as
-`- orgId: 1` with `uid: <uid>` on the next line: the check job counts every
-`- uid:` line as a rule it expects Grafana to load. Routing is by label:
+`deleteRules:` as well, or it keeps firing. `deleteRules` retires one of this
+file's rules for good; never list a rule that merely moved to another file,
+because Grafana applies `deleteRules` by uid whatever file provisions the rule
+and would delete it after every restart. Routing is by label:
 `service: liquidity` picks the Zulip channel, each rule gets its own topic named
 `<service> / <rule>`, and `severity: critical` also pages PagerDuty in US
 extended hours. Datasource uids are fixed by the box: `victoriametrics` (PromQL
