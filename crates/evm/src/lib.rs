@@ -795,10 +795,58 @@ impl PreparedTransaction {
             .ok()
     }
 
+    /// Whether `wallet` signed these bytes. Nonce bookkeeping is per address,
+    /// so bytes another key signed (a rotated wallet) must never enter
+    /// `wallet`'s; bytes no signer can be recovered from are not `wallet`'s
+    /// either.
+    pub fn signed_by(&self, wallet: Address) -> bool {
+        // Test doubles carry no signed envelope; they stand for the wallet's own.
+        #[cfg(any(test, feature = "test-support"))]
+        if self.raw.is_empty() {
+            return true;
+        }
+
+        self.signer() == Some(wallet)
+    }
+
     /// The address these bytes call, or `None` when they are not a signed
     /// envelope or create a contract.
     pub fn to(&self) -> Option<Address> {
         TxEnvelope::decode_2718_exact(self.raw.as_ref()).ok()?.to()
+    }
+
+    /// The max fee and max priority fee per gas these bytes were signed with,
+    /// in wei, or `None` when they are not a signed EIP-1559 envelope.
+    pub fn fees_per_gas(&self) -> Option<(u128, u128)> {
+        let envelope = TxEnvelope::decode_2718_exact(self.raw.as_ref()).ok()?;
+        Some((
+            envelope.max_fee_per_gas(),
+            envelope.max_priority_fee_per_gas()?,
+        ))
+    }
+
+    /// Whether these bytes are a fee replacement of `original`: another
+    /// signed transaction at the same nonce, with the same chain, recipient,
+    /// value and calldata, so at most one of the two can mine.
+    pub fn replaces(&self, original: &Self) -> bool {
+        if self.tx_hash == original.tx_hash || self.nonce != original.nonce {
+            return false;
+        }
+        // Test doubles carry no signed envelope; only the nonce identifies them.
+        #[cfg(any(test, feature = "test-support"))]
+        if self.raw.is_empty() && original.raw.is_empty() {
+            return true;
+        }
+
+        let decode = |prepared: &Self| TxEnvelope::decode_2718_exact(prepared.raw.as_ref()).ok();
+        let (Some(replacement), Some(original)) = (decode(self), decode(original)) else {
+            return false;
+        };
+        replacement.chain_id() == original.chain_id()
+            && replacement.to() == original.to()
+            && replacement.value() == original.value()
+            && replacement.input() == original.input()
+            && replacement.recover_signer().ok() == original.recover_signer().ok()
     }
 
     /// The calldata these bytes carry, or `None` when they are not a signed
@@ -929,6 +977,18 @@ pub trait Wallet: Evm {
         prepared: &PreparedTransaction,
         note: &str,
     ) -> Result<TxHash, EvmError>;
+    /// Re-signs `prepared` at its own nonce with higher fees when the
+    /// network's fee estimate has risen above the max fee it was signed with,
+    /// so a send the market priced out can still mine. `None` while the
+    /// market is at or below that fee. The replacement carries the same call,
+    /// so at most one of the two mines. It is only signed: persist it before
+    /// [`broadcast_prepared`](Self::broadcast_prepared), which records it at
+    /// the reserved nonce.
+    async fn prepare_fee_replacement(
+        &self,
+        prepared: &PreparedTransaction,
+    ) -> Result<Option<PreparedTransaction>, EvmError>;
+
     /// Releases the wallet nonce reservation held for a prepared transaction
     /// that will never be broadcast (a persist-failure rollback), and rewinds
     /// allocation so its unused nonce is refilled first. Ownership-checked and
@@ -938,8 +998,9 @@ pub trait Wallet: Evm {
     /// Releases the wallet nonce reservation held for a prepared transaction
     /// after another transaction from this wallet mined at its nonce. Unlike
     /// [`discard_prepared`](Self::discard_prepared) it leaves allocation
-    /// untouched, because the chain has already used the nonce.
-    /// Ownership-checked and idempotent.
+    /// untouched, because the chain has already used the nonce, and it drops
+    /// every hash recorded at that nonce, including fee replacements, since
+    /// none of them can mine any more. Ownership-checked and idempotent.
     async fn release_superseded(&self, tx_hash: TxHash);
 
     /// Restores allocator and ownership state for an exact transaction loaded
@@ -1203,6 +1264,13 @@ impl<Inner: Wallet + ?Sized> Wallet for Arc<Inner> {
 
     async fn discard_prepared(&self, tx_hash: TxHash) {
         (**self).discard_prepared(tx_hash).await;
+    }
+
+    async fn prepare_fee_replacement(
+        &self,
+        prepared: &PreparedTransaction,
+    ) -> Result<Option<PreparedTransaction>, EvmError> {
+        (**self).prepare_fee_replacement(prepared).await
     }
 
     async fn release_superseded(&self, tx_hash: TxHash) {

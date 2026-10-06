@@ -3,7 +3,7 @@
 
 use alloy::primitives::{Address, TxHash, U256};
 use alloy::providers::Provider;
-use alloy::sol_types::SolEvent;
+use alloy::sol_types::{SolCall, SolEvent};
 use async_trait::async_trait;
 use tracing::info;
 
@@ -11,13 +11,14 @@ use st0x_alpaca::core::Network as AlpacaChain;
 use st0x_alpaca::tokenization::AlpacaTokenizationService as SharedService;
 use st0x_evm::{
     Chain, EvmError, IERC20, IntoErrorRegistry, NODE_SYNC_MAX_ATTEMPTS, NODE_SYNC_POLL_INTERVAL,
-    OpenChainErrorRegistry, Wallet, wait_for_node_sync,
+    OpenChainErrorRegistry, PreparedTransaction, Wallet, wait_for_node_sync,
 };
 use st0x_execution::{AlpacaAccountId, AlpacaBrokerAuth, FractionalShares, PollingConfig, Symbol};
 use st0x_wrapper::UnwrappedToken;
 
 use super::{
-    IssuerRequestId, MintVerificationError, TokenizationRequestId, Tokenizer, TokenizerError,
+    IssuerRequestId, MintVerificationError, RedemptionSendReceipt, TokenizationRequestId,
+    Tokenizer, TokenizerError,
 };
 
 pub use st0x_alpaca::tokenization::{
@@ -213,6 +214,83 @@ impl<W: Wallet> Tokenizer for AlpacaTokenizationService<W> {
         Self::send_for_redemption::<OpenChainErrorRegistry>(self, token, amount).await
     }
 
+    fn signing_wallet(&self) -> Address {
+        self.wallet.address()
+    }
+
+    async fn prepare_redemption_send(
+        &self,
+        token: UnwrappedToken,
+        amount: U256,
+    ) -> Result<PreparedTransaction, TokenizerError> {
+        let to = self
+            .redemption_wallet
+            .ok_or(TokenizerError::MissingRedemptionWallet)?;
+        Ok(self
+            .wallet
+            .prepare_pending(
+                token.address(),
+                IERC20::transferCall { to, amount }.abi_encode().into(),
+                "ERC20 transfer for redemption",
+            )
+            .await?)
+    }
+
+    async fn broadcast_redemption_send(
+        &self,
+        prepared: &PreparedTransaction,
+    ) -> Result<TxHash, TokenizerError> {
+        self.wallet.restore_prepared(prepared).await;
+        Ok(self
+            .wallet
+            .broadcast_prepared(prepared, "ERC20 transfer for redemption")
+            .await?)
+    }
+
+    async fn prepare_redemption_send_replacement(
+        &self,
+        prepared: &PreparedTransaction,
+    ) -> Result<Option<PreparedTransaction>, TokenizerError> {
+        Ok(self.wallet.prepare_fee_replacement(prepared).await?)
+    }
+
+    async fn confirm_redemption_send(
+        &self,
+        tx_hash: TxHash,
+    ) -> Result<RedemptionSendReceipt, TokenizerError> {
+        if self.wallet.await_receipt(tx_hash).await?.status() {
+            return Ok(RedemptionSendReceipt::Succeeded);
+        }
+        // The receipt is final, so the outcome is a revert whatever the replay
+        // that decodes its cause returns; a failed replay becomes the cause.
+        let cause = match self.wallet.confirm::<OpenChainErrorRegistry>(tx_hash).await {
+            Ok(_) => "the replay of the reverted transfer succeeded".to_string(),
+            Err(error) => error.to_string(),
+        };
+        Ok(RedemptionSendReceipt::Reverted { cause })
+    }
+
+    async fn redemption_send_mined(&self, tx_hash: TxHash) -> Result<bool, TokenizerError> {
+        // A canonical receipt only: a lagging node can serve one from a
+        // reorged-out block, and the copy found here is the one confirmed.
+        Ok(st0x_evm::mined_tx(self.wallet.provider(), tx_hash)
+            .await
+            .map_err(EvmError::from)?
+            .is_some())
+    }
+
+    async fn restore_redemption_send(&self, prepared: &PreparedTransaction) {
+        self.wallet.restore_prepared(prepared).await;
+    }
+
+    async fn discard_redemption_send(&self, tx_hash: TxHash) {
+        self.wallet.discard_prepared(tx_hash).await;
+    }
+
+    async fn release_superseded_redemption_send(&self, tx_hash: TxHash) {
+        self.wallet.release_superseded(tx_hash).await;
+    }
+
     async fn poll_for_redemption(
         &self,
         tx_hash: &TxHash,
@@ -298,6 +376,255 @@ mod tests {
             Some(redemption_wallet),
         )
         .unwrap()
+    }
+
+    /// A redemption client over the anvil account `key`, sending to
+    /// [`TEST_REDEMPTION_WALLET`].
+    async fn redemption_client(
+        endpoint: &str,
+        key: &B256,
+    ) -> AlpacaTokenizationService<impl Wallet> {
+        let wallet = RawPrivateKeyWallet::new(
+            key,
+            ProviderBuilder::new().connect(endpoint).await.unwrap(),
+            1,
+        )
+        .unwrap();
+        AlpacaTokenizationService::new(
+            "https://unused.invalid".to_string(),
+            TEST_ACCOUNT_ID,
+            AlpacaBrokerAuth::Basic {
+                api_key: "test_api_key".to_string(),
+                api_secret: "test_api_secret".to_string(),
+            },
+            wallet,
+            Chain::Base,
+            Some(TEST_REDEMPTION_WALLET),
+        )
+        .unwrap()
+    }
+
+    /// Deploys a test token and mints `amount` of it to the anvil account `key`.
+    async fn deploy_funded_token(endpoint: &str, key: &B256, amount: U256) -> Address {
+        let wallet = RawPrivateKeyWallet::new(
+            key,
+            ProviderBuilder::new().connect(endpoint).await.unwrap(),
+            1,
+        )
+        .unwrap();
+        let token = TestERC20::deploy(wallet.signing_provider()).await.unwrap();
+        token
+            .mint(wallet.address(), amount)
+            .send()
+            .await
+            .unwrap()
+            .get_receipt()
+            .await
+            .unwrap();
+        *token.address()
+    }
+
+    async fn redemption_wallet_balance(endpoint: &str, token: Address) -> U256 {
+        TestERC20::new(
+            token,
+            ProviderBuilder::new().connect(endpoint).await.unwrap(),
+        )
+        .balanceOf(TEST_REDEMPTION_WALLET)
+        .call()
+        .await
+        .unwrap()
+    }
+
+    /// The durable send against a real node: after it mines, a fresh service
+    /// (a restart) restores and rebroadcasts the exact bytes, still confirms
+    /// the receipt, and signs the next send at the following nonce, so the
+    /// restored hold on the used nonce does not wedge the wallet.
+    #[tokio::test]
+    async fn a_restarted_service_rebroadcasts_a_mined_send_and_confirms_it() {
+        let (_anvil, endpoint, key) = setup_anvil();
+        let token = deploy_funded_token(&endpoint, &key, U256::from(1_000_000u64)).await;
+        let amount = U256::from(100_000u64);
+        let client = redemption_client(&endpoint, &key).await;
+        let prepared = client
+            .prepare_redemption_send(UnwrappedToken::unchecked(token), amount)
+            .await
+            .unwrap();
+        assert_eq!(
+            client.broadcast_redemption_send(&prepared).await.unwrap(),
+            prepared.tx_hash()
+        );
+        assert_eq!(
+            client
+                .confirm_redemption_send(prepared.tx_hash())
+                .await
+                .unwrap(),
+            RedemptionSendReceipt::Succeeded
+        );
+
+        let restarted = redemption_client(&endpoint, &key).await;
+        restarted.restore_redemption_send(&prepared).await;
+        assert_eq!(
+            restarted
+                .broadcast_redemption_send(&prepared)
+                .await
+                .unwrap(),
+            prepared.tx_hash(),
+            "rebroadcasting already mined bytes adopts their hash"
+        );
+        assert!(
+            restarted
+                .redemption_send_mined(prepared.tx_hash())
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            restarted
+                .confirm_redemption_send(prepared.tx_hash())
+                .await
+                .unwrap(),
+            RedemptionSendReceipt::Succeeded
+        );
+        assert_eq!(redemption_wallet_balance(&endpoint, token).await, amount);
+
+        let next = restarted
+            .prepare_redemption_send(UnwrappedToken::unchecked(token), amount)
+            .await
+            .unwrap();
+        assert_eq!(next.nonce(), prepared.nonce() + 1);
+    }
+
+    /// A send whose transfer reverts when it mines confirms with a failed
+    /// status, the proof that no tokens moved.
+    #[tokio::test]
+    async fn a_send_that_reverts_onchain_confirms_as_failed() {
+        let anvil = Anvil::new().spawn();
+        let endpoint = anvil.endpoint();
+        let key = B256::from_slice(&anvil.keys()[0].to_bytes());
+        let drainer = alloy::signers::local::PrivateKeySigner::from_bytes(&B256::from_slice(
+            &anvil.keys()[1].to_bytes(),
+        ))
+        .unwrap();
+        let funded = U256::from(1_000_000u64);
+        let token = deploy_funded_token(&endpoint, &key, funded).await;
+        let owner = RawPrivateKeyWallet::new(
+            &key,
+            ProviderBuilder::new().connect(&endpoint).await.unwrap(),
+            1,
+        )
+        .unwrap();
+        TestERC20::new(token, owner.signing_provider())
+            .approve(drainer.address(), funded)
+            .send()
+            .await
+            .unwrap()
+            .get_receipt()
+            .await
+            .unwrap();
+
+        let client = redemption_client(&endpoint, &key).await;
+        let prepared = client
+            .prepare_redemption_send(UnwrappedToken::unchecked(token), funded)
+            .await
+            .unwrap();
+        let drainer_address = drainer.address();
+        TestERC20::new(
+            token,
+            ProviderBuilder::new()
+                .wallet(drainer)
+                .connect(&endpoint)
+                .await
+                .unwrap(),
+        )
+        .transferFrom(owner.address(), drainer_address, funded)
+        .send()
+        .await
+        .unwrap()
+        .get_receipt()
+        .await
+        .unwrap();
+
+        client.broadcast_redemption_send(&prepared).await.unwrap();
+
+        let RedemptionSendReceipt::Reverted { cause } = client
+            .confirm_redemption_send(prepared.tx_hash())
+            .await
+            .unwrap()
+        else {
+            panic!("the drained send must revert");
+        };
+        assert!(cause.contains("ERC20InsufficientBalance"), "{cause}");
+        assert_eq!(
+            redemption_wallet_balance(&endpoint, token).await,
+            U256::ZERO
+        );
+    }
+
+    /// A send priced out by a fee spike: the node refuses it, the wallet signs
+    /// a replacement at the same nonce above the new market fee, and the
+    /// transfer confirms through the replacement's hash while the original
+    /// never mines. With fees unchanged no replacement is signed.
+    #[tokio::test]
+    async fn a_send_priced_out_by_a_fee_spike_confirms_through_its_replacement() {
+        let (_anvil, endpoint, key) = setup_anvil();
+        let token = deploy_funded_token(&endpoint, &key, U256::from(1_000_000u64)).await;
+        let amount = U256::from(100_000u64);
+        let client = redemption_client(&endpoint, &key).await;
+        let prepared = client
+            .prepare_redemption_send(UnwrappedToken::unchecked(token), amount)
+            .await
+            .unwrap();
+        assert_eq!(
+            client
+                .prepare_redemption_send_replacement(&prepared)
+                .await
+                .unwrap(),
+            None,
+            "a send priced at the market is not replaced"
+        );
+
+        let node = ProviderBuilder::new().connect(&endpoint).await.unwrap();
+        node.raw_request::<_, ()>(
+            "anvil_setNextBlockBaseFeePerGas".into(),
+            (U256::from(500_000_000_000_u64),),
+        )
+        .await
+        .unwrap();
+        node.raw_request::<_, String>("evm_mine".into(), ())
+            .await
+            .unwrap();
+        client
+            .broadcast_redemption_send(&prepared)
+            .await
+            .expect_err("the original is priced below the base fee");
+
+        let replacement = client
+            .prepare_redemption_send_replacement(&prepared)
+            .await
+            .unwrap()
+            .expect("the market fee rose above the send's");
+        assert!(replacement.replaces(&prepared));
+        assert_eq!(
+            client
+                .broadcast_redemption_send(&replacement)
+                .await
+                .unwrap(),
+            replacement.tx_hash()
+        );
+
+        assert_eq!(
+            client
+                .confirm_redemption_send(replacement.tx_hash())
+                .await
+                .unwrap(),
+            RedemptionSendReceipt::Succeeded
+        );
+        assert!(
+            !client
+                .redemption_send_mined(prepared.tx_hash())
+                .await
+                .unwrap()
+        );
+        assert_eq!(redemption_wallet_balance(&endpoint, token).await, amount);
     }
 
     #[tokio::test]

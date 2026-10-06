@@ -76,7 +76,8 @@ use crate::performance::reliability::{
 use crate::performance::{ReportRange, hedge_latency_report, load_hedge_performance};
 use crate::rebalancing::equity::{
     CrossVenueEquityTransfer, EquityTransferServices, MintError, RecheckError, RecheckOutcome,
-    ReplacementNotAdoptable, WithdrawalNotSuperseded, withdrawal_required_confirmations,
+    ReplacementNotAdoptable, SignedTxNotSuperseded, WithdrawalNotSuperseded,
+    withdrawal_required_confirmations,
 };
 use crate::rebalancing::usdc::{
     CctpMintRecoveryError, DepositSendNotSuperseded, DriverNotQuiesced, RecheckUsdcDeposit,
@@ -1141,6 +1142,8 @@ fn stuck_redemption_info(rows: &[(String, String, i64)]) -> Option<StuckTransfer
             | UnwrapPending { .. }
             | UnwrapSubmitted { .. }
             | SendPending { .. }
+            | SendPrepared { .. }
+            | SendReplaced { .. }
             | Detected { .. }
             | VaultWithdrawReplacementAdopted { .. } => {}
         }
@@ -3248,8 +3251,8 @@ fn cctp_mint_recovery_error_response(error: &CctpMintRecoveryError) -> (StatusCo
 struct ReconcileEquityRequest {
     /// Free-text operator audit reason (required; persisted on the event).
     reason: String,
-    /// For a redemption with a signed vault withdrawal, the tx that took
-    /// that withdrawal's nonce.
+    /// For a redemption with a signed vault withdrawal or send to the issuer, the tx
+    /// that took that signed tx's nonce.
     #[serde(default)]
     superseding_tx: Option<TxHash>,
 }
@@ -3260,8 +3263,8 @@ struct ReconcileEquityRequest {
 /// no inventory update, so it is safe against the live bot (a `Failed` terminal
 /// has no active driver).
 ///
-/// A redemption with a signed vault withdrawal reconciles only once the bot
-/// proves on the redemption's chain that the withdrawal can never land (`409`
+/// A redemption with a signed vault withdrawal or send to the issuer reconciles only
+/// once the bot proves on the redemption's chain that it can never land (`409`
 /// until it does, `503` before the bot is ready): see
 /// [`verify_withdrawal_superseded`](crate::rebalancing::equity::verify_withdrawal_superseded).
 /// A `supersedingTx` on a mint, or on a redemption with no signed withdrawal,
@@ -3371,7 +3374,8 @@ async fn reconcile_equity_transfer(
                     Json(ErrorResponse {
                         error: format!(
                             "Redemption {id} is not reconcilable; reconcile resolves a \
-                             Failed terminal or an unresolved vault-withdrawal submission."
+                             Failed terminal, an unresolved vault-withdrawal submission, or a \
+                             pending send to the issuer."
                         ),
                     }),
                 ));
@@ -3415,7 +3419,8 @@ async fn reconcile_equity_transfer(
 }
 
 /// The redemption command is pure, so the chain proof that a signed vault
-/// withdrawal can never land is read before it, through the bot's equity
+/// withdrawal (or signed send to the issuer, checked the same way) can never land is
+/// read before it, through the bot's equity
 /// transfer on the redemption's own chain. Returns the proven withdrawal's
 /// hash (`None` when there is none), which the command checks is still the
 /// redemption's, so a withdrawal signed during the check is never reconciled
@@ -3429,14 +3434,15 @@ async fn check_signed_withdrawal_superseded(
     redemption: &EquityRedemption,
     superseding_tx: Option<TxHash>,
 ) -> Result<Option<TxHash>, (StatusCode, Json<ErrorResponse>)> {
-    let prepared = redemption.prepared_withdrawal();
+    let prepared = redemption.reconcilable_signed_tx();
+    let (kind, signed) = redemption.reconcilable_signed_txs();
     if prepared.is_none() && superseding_tx.is_some() {
         return Err((
             StatusCode::BAD_REQUEST,
             Json(ErrorResponse {
                 error: format!(
-                    "Redemption {id} has no signed vault withdrawal; supersedingTx applies only \
-                     to one that has"
+                    "Redemption {id} has no signed vault withdrawal or send to the issuer; \
+                     supersedingTx applies only to one that has"
                 ),
             }),
         ));
@@ -3460,21 +3466,23 @@ async fn check_signed_withdrawal_superseded(
         (Some(prepared), _) => match withdrawal_required_confirmations(&state.ctx.chains, chain) {
             Ok(required_confirmations) => handle
                 .transfer
-                .verify_withdrawal_superseded(
+                .verify_signed_txs_superseded(
                     chain,
-                    prepared,
+                    kind,
+                    &signed,
                     superseding_tx,
                     required_confirmations,
                 )
                 .await
                 .map(|()| Some(prepared.tx_hash())),
-            Err(error) => Err(error),
+            Err(refusal) => Err(SignedTxNotSuperseded { kind, refusal }),
         },
         (None, Some(tx)) => handle
             .transfer
             .verify_hash_only_withdrawal_not_through(chain, tx)
             .await
-            .map(|()| None),
+            .map(|()| None)
+            .map_err(|refusal| SignedTxNotSuperseded { kind, refusal }),
         (None, None) => Ok(None),
     };
 
@@ -3491,9 +3499,9 @@ async fn check_signed_withdrawal_superseded(
 /// withdrawal is a `409` naming why; a failed chain read is a transient `502`.
 fn withdrawal_not_superseded_response(
     id: &RedemptionAggregateId,
-    error: &WithdrawalNotSuperseded,
+    error: &SignedTxNotSuperseded,
 ) -> (StatusCode, String) {
-    match error {
+    match &error.refusal {
         WithdrawalNotSuperseded::UnreadableWithdrawal { .. }
         | WithdrawalNotSuperseded::WithdrawalSignedByAnotherWallet { .. }
         | WithdrawalNotSuperseded::WithdrawalWentThrough { .. }
@@ -4734,7 +4742,7 @@ mod tests {
         PortfolioSnapshotId, PortfolioSnapshotProjection, et_day,
     };
     use crate::position::{NormalizedOnChainFillCommand, Position, PositionCommand, TradeId};
-    use crate::rebalancing::equity::ChainServicesMissing;
+    use crate::rebalancing::equity::{ChainServicesMissing, SignedRedemptionTx};
     use crate::rebalancing::usdc::{
         RecoveredCctpMint, UsdcDriverGate, u256_to_usdc, usdc_driver_pause,
     };
@@ -10713,6 +10721,54 @@ mod tests {
     /// Seeds an `EquityRedemption` into the non-terminal, non-reconcilable
     /// `VaultWithdrawSubmitted` state (withdrawal `prepared` broadcast, awaiting
     /// confirmation).
+    /// Seeds a redemption at `SendPending` holding the signed send to the issuer
+    /// `prepared`.
+    async fn seed_redemption_signed_send(
+        pool: &SqlitePool,
+        id: &RedemptionAggregateId,
+        prepared: PreparedTransaction,
+    ) {
+        use EquityRedemptionCommand::*;
+
+        let token = Address::ZERO;
+        let amount = U256::from(10_000_000_000_000_000_000_u128);
+        let (store, _projection) = StoreBuilder::<EquityRedemption>::new(pool.clone())
+            .build(EquityTransferServices::confirming_withdrawal(token, amount))
+            .await
+            .unwrap();
+        store
+            .send(
+                id,
+                Redeem {
+                    chain: Chain::Base,
+                    symbol: Symbol::new("AAPL").unwrap(),
+                    quantity: float!(10),
+                    token,
+                    vault_id: st0x_raindex::RaindexVaultId(alloy::primitives::B256::ZERO),
+                    amount,
+                    from_block: 0,
+                    prepared: crate::equity_redemption::prepared_withdrawal_for_test(),
+                },
+            )
+            .await
+            .unwrap();
+        for command in [
+            RecordWithdrawSubmission {
+                tx_hash: crate::equity_redemption::prepared_withdrawal_for_test().tx_hash(),
+            },
+            ConfirmWithdraw,
+            UnwrapTokens,
+            SubmitUnwrap,
+            ConfirmUnwrap,
+            PrepareSend {
+                prepared,
+                redemption_wallet: Address::repeat_byte(0x77),
+            },
+        ] {
+            store.send(id, command).await.unwrap();
+        }
+    }
+
     async fn seed_redemption_submitted(
         pool: &SqlitePool,
         id: &RedemptionAggregateId,
@@ -12442,6 +12498,51 @@ mod tests {
         );
     }
 
+    /// A signed send to the issuer can still mine until its nonce is proven taken, so
+    /// reconcile needs the bot's chain proof; before the bot is ready there is
+    /// none, and the send stays unresolved.
+    #[tokio::test]
+    async fn reconcile_equity_transfer_does_not_reconcile_a_signed_send_on_the_operators_word() {
+        let ctx = create_test_ctx_with_order_owner(Address::ZERO);
+        let state = empty_app_state(ctx).await;
+        let id = redemption_aggregate_id("api-redemption-signed-send-reconcile");
+        seed_redemption_signed_send(
+            &state.pool,
+            &id,
+            PreparedTransaction::for_test(TxHash::repeat_byte(0x5e), 7),
+        )
+        .await;
+
+        let resp = reconcile_equity_transfer(
+            State(state.clone()),
+            Path(("equity_redemption".to_string(), id.to_string())),
+            Json(ReconcileEquityRequest {
+                reason: "send outrun by fees; verified dead onchain".to_string(),
+                superseding_tx: Some(TxHash::repeat_byte(0xCA)),
+            }),
+        )
+        .await;
+
+        let Err((status, _)) = resp else {
+            panic!("a signed send must not reconcile without the chain proof");
+        };
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        let entity = load_entity::<EquityRedemption>(&state.pool, &id)
+            .await
+            .unwrap()
+            .expect("redemption aggregate must exist");
+        assert!(
+            matches!(
+                entity,
+                EquityRedemption::SendPending {
+                    prepared_send: Some(_),
+                    ..
+                }
+            ),
+            "the send must stay unresolved, got {entity:?}",
+        );
+    }
+
     #[tokio::test]
     async fn reconcile_equity_transfer_refuses_a_superseding_tx_without_a_signed_withdrawal() {
         let ctx = create_test_ctx_with_order_owner(Address::ZERO);
@@ -13182,7 +13283,10 @@ mod tests {
         let id = redemption_aggregate_id("api-withdrawal-response");
         let tx = TxHash::repeat_byte(0x66);
 
-        let refused = WithdrawalNotSuperseded::NoSupersedingTx { tx, nonce: 7 };
+        let refused = SignedTxNotSuperseded {
+            kind: SignedRedemptionTx::VaultWithdrawal,
+            refusal: WithdrawalNotSuperseded::NoSupersedingTx { tx, nonce: 7 },
+        };
         assert_eq!(
             withdrawal_not_superseded_response(&id, &refused),
             (
@@ -13192,9 +13296,12 @@ mod tests {
         );
         let (status, _) = withdrawal_not_superseded_response(
             &id,
-            &WithdrawalNotSuperseded::Read {
-                tx,
-                source: Box::new(st0x_raindex::RaindexError::ZeroAmount),
+            &SignedTxNotSuperseded {
+                kind: SignedRedemptionTx::VaultWithdrawal,
+                refusal: WithdrawalNotSuperseded::Read {
+                    tx,
+                    source: Box::new(st0x_raindex::RaindexError::ZeroAmount),
+                },
             },
         );
         assert_eq!(status, StatusCode::BAD_GATEWAY);

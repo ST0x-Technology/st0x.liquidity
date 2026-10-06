@@ -233,7 +233,8 @@ impl InFlightNonces {
     /// Ownership-checked release for an explicit discard of a durable prepared
     /// transaction. Finds the nonce whose recorded hash set still contains
     /// `tx_hash`, removes that hash regardless of its drop policy, and when it was
-    /// the nonce's last hash releases the reservation. An [`Unused`] nonce is
+    /// the nonce's last hash releases the reservation. A [`Superseded`] release
+    /// drops every hash at the nonce, since a mined transaction used it. An [`Unused`] nonce is
     /// also rewound onto so it is reused before any higher one; a [`Superseded`]
     /// nonce leaves allocation untouched, because the chain has already used it.
     ///
@@ -269,7 +270,9 @@ impl InFlightNonces {
                     return false;
                 };
                 tx_hashes.remove(&tx_hash);
-                if tx_hashes.is_empty() {
+                // A mined transaction used the nonce, so no other hash recorded
+                // at it (a fee replacement of the same send) can mine either.
+                if tx_hashes.is_empty() || discarded == DiscardedNonce::Superseded {
                     record.per_nonce.remove(&nonce);
                     Some(nonce)
                 } else {
@@ -532,6 +535,32 @@ mod tests {
             manager.release_occupied_nonce(ADDRESS, NONCE),
             "the stale repeat must leave the reused transaction's allocator hold \
              intact, not just its in-flight record"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_superseded_release_drops_every_replacement_at_the_nonce() {
+        // A send and its fee replacement share a nonce. Once a cancel mines at
+        // it, releasing either hash must free the nonce: neither can mine.
+        let manager = ResettableNonceManager::default();
+        let in_flight = InFlightNonces::new(manager.clone());
+        let original = TxHash::repeat_byte(0x94);
+        let replacement = TxHash::repeat_byte(0x95);
+        in_flight.record_durable(ADDRESS, NONCE, original);
+        in_flight.record_durable(ADDRESS, NONCE, replacement);
+
+        assert!(
+            in_flight
+                .release_durable_by_hash(ADDRESS, original, DiscardedNonce::Superseded)
+                .await
+        );
+
+        assert_eq!(in_flight.ownership(ADDRESS, NONCE), NonceOwnership::Unknown);
+        assert!(
+            !in_flight
+                .release_durable_by_hash(ADDRESS, replacement, DiscardedNonce::Superseded)
+                .await,
+            "the replacement's hash went with its nonce"
         );
     }
 

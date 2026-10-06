@@ -1081,8 +1081,77 @@ stox transfer reconcile --kind redemption --id <redemption-aggregate-id> \
   be signed by the chain's configured bot wallet, since nonces are per sender:
   one signed by a key rotated out since is refused; cancel it from that key and
   run the CLI reconcile configured with that key. `--superseding-tx` is refused
-  for a mint and for a redemption with no signed withdrawal (the API with
-  `400`).
+  for a mint and for a redemption with no signed withdrawal or send to the
+  issuer (the API with `400`).
+- A redemption on `SendPending` with a signed send to the issuer follows the
+  same rule: reconcile refuses until the chain proves the send can never land,
+  with the same checks as for a withdrawal. When the market fee rose above the
+  send's, the bot has also signed fee replacements of it: the same transfer at
+  the same nonce, so at most one copy mines. Reconcile checks every copy, and a
+  refusal names the send to the issuer. If any copy mined successfully, do not
+  reconcile: recovery records it as `TokensSent`. If a copy reverted with the
+  required confirmations, it used the shared nonce: reconcile with no
+  `--superseding-tx`. Otherwise cancel it with the same plain 0-value
+  self-transfer at the send's nonce, wait for its required confirmations, and
+  reconcile with `--superseding-tx <cancel>`. Cancel only after the
+  `transfer_timeout` page: from then on the bot stops fee-replacing the send, so
+  it cannot outbid the cancel. Price both of the cancel's fees at least 10%
+  above the newest copy's, which the page names, and above the current market
+  fee.
+- A redemption on `SendPending` with no signed send to the issuer is a legacy
+  row; see
+  [Legacy pending send to the issuer](#legacy-pending-send-to-the-issuer).
+
+### Legacy pending send to the issuer
+
+A binary from before durable sends to the issuer may have left a redemption on
+`SendPending` with no recorded transaction: it may have broadcast the ERC-20
+transfer of the unwrapped tokens to the issuer redemption wallet without storing
+its hash. The bot never signs such a send again. It pages ("legacy pending send
+to the issuer with no recorded transaction") at startup and when the transfer
+times out, keeps the redemption's guard and inflight, and pauses startup
+approvals on that chain. The only exit is `transfer reconcile`, after these
+steps.
+
+1. Read what the redemption unwrapped. The `TokensUnwrapped` payload names the
+   unwrapped token (`underlying_token`), the amount (`unwrapped_amount`, in the
+   token's smallest unit) and the unwrap tx (`unwrap_tx_hash`); the redemption's
+   chain is in its first event:
+
+   ```sql
+   SELECT event_type, payload
+   FROM events
+   WHERE aggregate_type = 'EquityRedemption' AND aggregate_id = '<id>'
+   ORDER BY sequence;
+   ```
+
+2. On a block explorer for that chain, list the bot wallet's transfers of the
+   unwrapped token after the unwrap tx. The old send, if it went out, is a
+   transfer of exactly `unwrapped_amount` to the chain's `redemption_wallet`
+   (`[chains.<name>.trading]`).
+3. Follow up on what you found, before you reconcile. Reconcile stops all
+   tracking of the redemption, so nothing does this afterwards:
+   - **It landed.** The tokens reached the issuer. Find the redemption request
+     for that tx in `stox alpaca-tokenization-requests` and check that Alpaca
+     completed it, so the shares are in the broker account. If Alpaca rejected
+     it or never detected the transfer, raise it with Alpaca first: the bot will
+     not surface that rejection.
+   - **It never went out.** The unwrapped tokens are still in the bot wallet.
+     Once the reconcile releases the redemption's guard, the bot's
+     unwrapped-equity recovery wraps them and deposits them for market making if
+     the listing has `wrapped_equity_recovery = "enabled"`. Otherwise move them
+     by hand: `stox wrap-equity`, then `stox vault-deposit` (add
+     `--network <chain>` off Base), or redeem them with `stox alpaca-redeem`.
+   - **Anything else** (another amount, another recipient, a reverted transfer):
+     stop and escalate. That is not a send this guide covers.
+4. Reconcile with what you found:
+   `stox transfer reconcile --kind redemption --id <id> --reason "<what you found>"`.
+   No `--superseding-tx`: there is no stored send to prove dead.
+
+Reconciling a legacy row writes `OperatorReconciled` after a `SendPending` with
+no stored send, which a binary before durable sends to the issuer cannot replay:
+from then on that binary fails the deploy gate (see "Rollback floor for durable
+sends to the issuer" in SPEC.md).
 
 ### Base->Alpaca deposit send pages
 

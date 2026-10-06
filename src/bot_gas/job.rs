@@ -678,6 +678,13 @@ mod tests {
             panic!("MockWallet::discard_prepared should not be called in job tests");
         }
 
+        async fn prepare_fee_replacement(
+            &self,
+            _prepared: &PreparedTransaction,
+        ) -> Result<Option<PreparedTransaction>, EvmError> {
+            panic!("MockWallet::prepare_fee_replacement should not be called here")
+        }
+
         async fn release_superseded(&self, _tx_hash: TxHash) {
             panic!("MockWallet::release_superseded should not be called in job tests");
         }

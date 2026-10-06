@@ -7,14 +7,14 @@ use reqwest::StatusCode;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, PoisonError};
 
-use st0x_evm::{EvmError, NODE_SYNC_MAX_ATTEMPTS};
+use st0x_evm::{EvmError, NODE_SYNC_MAX_ATTEMPTS, PreparedTransaction};
 use st0x_execution::{FractionalShares, Symbol};
 use st0x_wrapper::UnwrappedToken;
 
 use super::{
     AlpacaTokenizationError, ClientRequestId, IssuerRequestId, MintVerificationError,
-    TokenizationRequest, TokenizationRequestId, TokenizationRequestStatus, TokenizationRequestType,
-    Tokenizer, TokenizerError,
+    RedemptionSendReceipt, TokenizationRequest, TokenizationRequestId, TokenizationRequestStatus,
+    TokenizationRequestType, Tokenizer, TokenizerError,
 };
 use crate::alpaca::AlpacaApiErrorMessage;
 
@@ -113,6 +113,18 @@ pub struct MockTokenizer {
     wait_for_block_outcome: MockWaitForBlockOutcome,
     wait_for_block_calls: Mutex<Vec<u64>>,
     send_for_redemption_calls: Mutex<Vec<UnwrappedToken>>,
+    redemption_send_broadcasts: Mutex<Vec<TxHash>>,
+    redemption_send_confirm_failures: AtomicUsize,
+    redemption_send_broadcast_fails: bool,
+    redemption_send_receipt_missing: bool,
+    redemption_send_restores: Mutex<Vec<TxHash>>,
+    redemption_send_discards: Mutex<Vec<TxHash>>,
+    redemption_send_superseded_releases: Mutex<Vec<TxHash>>,
+    redemption_send_replacement: Option<TxHash>,
+    signing_wallet: Address,
+    redemption_send_replacements: Mutex<Vec<TxHash>>,
+    mined_redemption_sends: Option<Vec<TxHash>>,
+    redemption_send_confirms: Mutex<Vec<TxHash>>,
     list_pending_outcome: MockListPendingOutcome,
     mint_lookup_outcome: MockMintLookupOutcome,
     last_issuer_request_id: Mutex<Option<IssuerRequestId>>,
@@ -141,6 +153,18 @@ impl MockTokenizer {
             wait_for_block_outcome: MockWaitForBlockOutcome::Succeed,
             wait_for_block_calls: Mutex::new(Vec::new()),
             send_for_redemption_calls: Mutex::new(Vec::new()),
+            redemption_send_broadcasts: Mutex::new(Vec::new()),
+            redemption_send_confirm_failures: AtomicUsize::new(0),
+            redemption_send_broadcast_fails: false,
+            redemption_send_receipt_missing: false,
+            redemption_send_restores: Mutex::new(Vec::new()),
+            redemption_send_discards: Mutex::new(Vec::new()),
+            redemption_send_superseded_releases: Mutex::new(Vec::new()),
+            redemption_send_replacement: None,
+            signing_wallet: Address::ZERO,
+            redemption_send_replacements: Mutex::new(Vec::new()),
+            mined_redemption_sends: None,
+            redemption_send_confirms: Mutex::new(Vec::new()),
             list_pending_outcome: MockListPendingOutcome::Succeed,
             mint_lookup_outcome: MockMintLookupOutcome::Succeed,
             last_issuer_request_id: Mutex::new(None),
@@ -151,6 +175,112 @@ impl MockTokenizer {
             fees_override: None,
             pending_requests: Vec::new(),
         }
+    }
+
+    /// Fail the first receipt read after broadcasting, simulating an interrupted send.
+    #[must_use]
+    pub fn with_redemption_confirmation_failure_once(self) -> Self {
+        self.with_redemption_confirmation_failures(1)
+    }
+
+    /// Fail the next `count` receipt reads after broadcasting.
+    #[must_use]
+    pub fn with_redemption_confirmation_failures(self, count: usize) -> Self {
+        self.redemption_send_confirm_failures
+            .store(count, Ordering::Relaxed);
+        self
+    }
+
+    /// Reject every rebroadcast of a persisted send, as a node does when an
+    /// already mined transaction fails its fee-cap check.
+    #[must_use]
+    pub fn with_redemption_broadcast_failure(mut self) -> Self {
+        self.redemption_send_broadcast_fails = true;
+        self
+    }
+
+    /// Report no receipt for any persisted send.
+    #[must_use]
+    pub fn with_redemption_receipt_missing(mut self) -> Self {
+        self.redemption_send_receipt_missing = true;
+        self
+    }
+
+    /// The wallet the mock signs sends to the issuer from.
+    #[must_use]
+    pub fn with_signing_wallet(mut self, wallet: Address) -> Self {
+        self.signing_wallet = wallet;
+        self
+    }
+
+    /// Sign every redemption send with `tx_hash`.
+    #[must_use]
+    pub fn with_redemption_tx(mut self, tx_hash: TxHash) -> Self {
+        self.redemption_tx = tx_hash;
+        self
+    }
+
+    /// Sign `replacement` as the fee replacement of any send, as a wallet does
+    /// once the market outran the send's fee.
+    #[must_use]
+    pub fn with_redemption_send_replacement(mut self, replacement: TxHash) -> Self {
+        self.redemption_send_replacement = Some(replacement);
+        self
+    }
+
+    /// Report a receipt only for these sends; every other has none.
+    #[must_use]
+    pub fn with_mined_redemption_sends(mut self, mined: Vec<TxHash>) -> Self {
+        self.mined_redemption_sends = Some(mined);
+        self
+    }
+
+    /// Hashes of the sends a replacement was signed for.
+    pub fn redemption_send_replacements(&self) -> Vec<TxHash> {
+        self.redemption_send_replacements
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Hashes whose receipt the durable send path waited for.
+    pub fn redemption_send_confirms(&self) -> Vec<TxHash> {
+        self.redemption_send_confirms
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Exact transaction identities submitted by the durable send path.
+    pub fn redemption_send_broadcasts(&self) -> Vec<TxHash> {
+        self.redemption_send_broadcasts
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Hashes of persisted sends whose nonce was restored.
+    pub fn redemption_send_restores(&self) -> Vec<TxHash> {
+        self.redemption_send_restores
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Hashes of signed sends released as never persisted.
+    pub fn redemption_send_discards(&self) -> Vec<TxHash> {
+        self.redemption_send_discards
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    /// Hashes of signed sends released after another transaction used their nonce.
+    pub fn redemption_send_superseded_releases(&self) -> Vec<TxHash> {
+        self.redemption_send_superseded_releases
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
     }
 
     /// Returns the total number of tokenizer method calls made since construction.
@@ -465,6 +595,126 @@ impl Tokenizer for MockTokenizer {
             }
             MockSendOutcome::Succeed => Ok(self.redemption_tx),
         }
+    }
+
+    fn signing_wallet(&self) -> Address {
+        self.signing_wallet
+    }
+
+    async fn prepare_redemption_send(
+        &self,
+        token: UnwrappedToken,
+        _amount: U256,
+    ) -> Result<PreparedTransaction, TokenizerError> {
+        self.call_count.fetch_add(1, Ordering::Relaxed);
+        self.redemption_wallet
+            .ok_or(TokenizerError::MissingRedemptionWallet)?;
+        self.send_for_redemption_calls
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(token);
+        Ok(PreparedTransaction::for_test(self.redemption_tx, 0))
+    }
+
+    async fn broadcast_redemption_send(
+        &self,
+        prepared: &PreparedTransaction,
+    ) -> Result<TxHash, TokenizerError> {
+        self.call_count.fetch_add(1, Ordering::Relaxed);
+        self.redemption_send_broadcasts
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(prepared.tx_hash());
+        if self.redemption_send_broadcast_fails {
+            return Err(TokenizerError::Alpaca(AlpacaTokenizationError::ApiError {
+                status: StatusCode::BAD_REQUEST,
+                message: AlpacaApiErrorMessage::for_test(
+                    "max fee per gas less than block base fee".to_string(),
+                ),
+                retry_after: None,
+            }));
+        }
+        Ok(prepared.tx_hash())
+    }
+
+    async fn prepare_redemption_send_replacement(
+        &self,
+        prepared: &PreparedTransaction,
+    ) -> Result<Option<PreparedTransaction>, TokenizerError> {
+        self.call_count.fetch_add(1, Ordering::Relaxed);
+        self.redemption_send_replacements
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(prepared.tx_hash());
+        Ok(self
+            .redemption_send_replacement
+            .map(|replacement| PreparedTransaction::for_test(replacement, prepared.nonce())))
+    }
+
+    async fn confirm_redemption_send(
+        &self,
+        tx_hash: TxHash,
+    ) -> Result<RedemptionSendReceipt, TokenizerError> {
+        self.call_count.fetch_add(1, Ordering::Relaxed);
+        self.redemption_send_confirms
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(tx_hash);
+        if self
+            .redemption_send_confirm_failures
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |remaining| {
+                remaining.checked_sub(1)
+            })
+            .is_ok()
+        {
+            return Err(TokenizerError::Alpaca(AlpacaTokenizationError::ApiError {
+                status: StatusCode::SERVICE_UNAVAILABLE,
+                message: AlpacaApiErrorMessage::for_test(
+                    "Receipt unavailable after broadcast".to_string(),
+                ),
+                retry_after: None,
+            }));
+        }
+        Ok(match self.send_outcome {
+            MockSendOutcome::Succeed => RedemptionSendReceipt::Succeeded,
+            MockSendOutcome::ApiError => RedemptionSendReceipt::Reverted {
+                cause: "mock revert".to_string(),
+            },
+        })
+    }
+
+    async fn restore_redemption_send(&self, prepared: &PreparedTransaction) {
+        self.call_count.fetch_add(1, Ordering::Relaxed);
+        self.redemption_send_restores
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(prepared.tx_hash());
+    }
+
+    async fn discard_redemption_send(&self, tx_hash: TxHash) {
+        self.call_count.fetch_add(1, Ordering::Relaxed);
+        self.redemption_send_discards
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(tx_hash);
+    }
+
+    async fn redemption_send_mined(&self, tx_hash: TxHash) -> Result<bool, TokenizerError> {
+        self.call_count.fetch_add(1, Ordering::Relaxed);
+        Ok(self
+            .mined_redemption_sends
+            .as_ref()
+            .map_or(!self.redemption_send_receipt_missing, |mined| {
+                mined.contains(&tx_hash)
+            }))
+    }
+
+    async fn release_superseded_redemption_send(&self, tx_hash: TxHash) {
+        self.call_count.fetch_add(1, Ordering::Relaxed);
+        self.redemption_send_superseded_releases
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(tx_hash);
     }
 
     async fn poll_for_redemption(

@@ -715,6 +715,16 @@ async fn resume_redemption_or_fail(
                 dispatched_at: now,
             }])
         }
+        // A redemption still resolving onchain (a pending withdrawal or issuer
+        // send, or a legacy send an operator must verify) has its own jobs
+        // driving it, so the recovery has handed it over rather than failed.
+        Err(error) if error.is_still_in_progress() => {
+            info!(target: "rebalance", %redemption_id, %error, "Wrapped equity recovery: the redemption is still resolving and drives itself");
+            Ok(vec![WrappedEquityRecoveryEvent::DispatchedToRedemption {
+                redemption_id: redemption_id.clone(),
+                dispatched_at: now,
+            }])
+        }
         Err(error) => {
             warn!(target: "rebalance", %redemption_id, ?error, "Wrapped equity recovery: resume_redemption failed");
             Ok(vec![WrappedEquityRecoveryEvent::RecoveryFailed {
@@ -896,6 +906,13 @@ mod tests {
     async fn services_over(
         chains: BTreeMap<Chain, ChainEquityServices>,
     ) -> WrappedEquityRecoveryServices {
+        services_and_pool_over(chains).await.0
+    }
+
+    /// [`services_over`], also returning the pool the stores write to.
+    async fn services_and_pool_over(
+        chains: BTreeMap<Chain, ChainEquityServices>,
+    ) -> (WrappedEquityRecoveryServices, sqlx::SqlitePool) {
         let pool = sqlx::SqlitePool::connect(":memory:").await.unwrap();
         sqlx::migrate!().run(&pool).await.unwrap();
         let equity = EquityTransferServices {
@@ -903,17 +920,21 @@ mod tests {
             bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
         };
         let mint_store = Arc::new(st0x_event_sorcery::test_store(pool.clone(), equity.clone()));
-        let redemption_store = Arc::new(st0x_event_sorcery::test_store(pool, equity.clone()));
+        let redemption_store =
+            Arc::new(st0x_event_sorcery::test_store(pool.clone(), equity.clone()));
         let transfer = Arc::new(CrossVenueEquityTransfer::new(
             equity.clone(),
             mint_store,
             redemption_store,
         ));
-        WrappedEquityRecoveryServices {
-            equity,
-            transfer,
-            bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
-        }
+        (
+            WrappedEquityRecoveryServices {
+                equity,
+                transfer,
+                bot_gas_enqueuer: BotGasReceiptCostEnqueuer::Disabled,
+            },
+            pool,
+        )
     }
 
     async fn test_services() -> WrappedEquityRecoveryServices {
@@ -1412,6 +1433,79 @@ mod tests {
         assert!(
             reason.contains("resume_redemption failed"),
             "RecoveryFailed reason should mention resume_redemption; got {reason:?}",
+        );
+    }
+
+    /// A redemption still resolving onchain drives itself through its own
+    /// jobs, so dispatching to it hands the recovery over instead of recording
+    /// a failure on every detection cycle. A legacy pending send (no recorded
+    /// transaction) is one: only an operator closes it.
+    #[tokio::test]
+    async fn dispatch_to_a_redemption_still_resolving_hands_it_over() {
+        let (services, pool) = services_and_pool_over(BTreeMap::from([(
+            Chain::Base,
+            chain_services_with(Arc::new(MockRaindex::new())),
+        )]))
+        .await;
+        let redemption_id = redemption_aggregate_id("legacy-send-pending");
+        let history: [crate::equity_redemption::EquityRedemptionEvent; 3] = [
+            crate::equity_redemption::EquityRedemptionEvent::WithdrawnFromRaindex {
+                symbol: aapl(),
+                quantity: st0x_float_macro::float!(1),
+                token: Address::repeat_byte(0x11),
+                wrapped_amount: alloy::primitives::U256::from(1_000_000_000_000_000_000_u128),
+                actual_wrapped_amount: None,
+                raindex_withdraw_tx: TxHash::repeat_byte(0x12),
+                raindex_withdraw_block: None,
+                withdrawn_at: Utc::now(),
+            },
+            crate::equity_redemption::EquityRedemptionEvent::TokensUnwrapped {
+                quantity: Some(st0x_float_macro::float!(1)),
+                underlying_token: crate::equity_redemption::UnwrappedProvenance::Legacy(
+                    Address::repeat_byte(0x21),
+                ),
+                unwrap_tx_hash: TxHash::repeat_byte(0x13),
+                unwrapped_amount: alloy::primitives::U256::from(1_000_000_000_000_000_000_u128),
+                unwrap_block: None,
+                unwrapped_at: Utc::now(),
+            },
+            crate::equity_redemption::EquityRedemptionEvent::SendPending {
+                pending_at: Utc::now(),
+            },
+        ];
+        for (sequence, event) in (1_i64..).zip(history) {
+            sqlx::query(
+                "INSERT INTO events \
+                 (aggregate_type, aggregate_id, sequence, event_type, event_version, payload, \
+                  metadata) \
+                 VALUES ('EquityRedemption', ?1, ?2, ?3, '1', ?4, '{}')",
+            )
+            .bind(redemption_id.to_string())
+            .bind(sequence)
+            .bind(st0x_event_sorcery::DomainEvent::event_type(&event))
+            .bind(serde_json::to_string(&event).unwrap())
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        let events = detected_state()
+            .transition(
+                WrappedEquityRecoveryCommand::DispatchToRedemption {
+                    redemption_id: redemption_id.clone(),
+                },
+                &services,
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            matches!(
+                events.as_slice(),
+                [WrappedEquityRecoveryEvent::DispatchedToRedemption { redemption_id: dispatched, .. }]
+                    if *dispatched == redemption_id
+            ),
+            "Expected the recovery to hand over, got {events:?}"
         );
     }
 

@@ -1489,6 +1489,13 @@ mod tests {
             unreachable!("prepare_withdraw must not discard")
         }
 
+        async fn prepare_fee_replacement(
+            &self,
+            _prepared: &PreparedTransaction,
+        ) -> Result<Option<PreparedTransaction>, EvmError> {
+            unreachable!("prepare_withdraw must not sign a fee replacement")
+        }
+
         async fn release_superseded(&self, _tx_hash: TxHash) {
             unreachable!("prepare_withdraw must not release a superseded transaction")
         }

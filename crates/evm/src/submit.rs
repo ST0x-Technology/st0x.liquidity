@@ -127,9 +127,9 @@
 //! definitive receipt or drop decision; elapsed time alone never releases a
 //! nonce that may still mine.
 
-use alloy::consensus::Transaction;
+use alloy::consensus::{Transaction, TxEnvelope};
 use alloy::eips::eip1559::Eip1559Estimation;
-use alloy::eips::eip2718::Encodable2718;
+use alloy::eips::eip2718::{Decodable2718, Encodable2718};
 use alloy::network::Ethereum;
 use alloy::primitives::{Address, Bytes, TxHash, keccak256};
 use alloy::providers::Provider;
@@ -460,6 +460,97 @@ where
     // broadcast or restart ever recorded it.
     in_flight.record_durable(address, prepared.nonce(), prepared.tx_hash());
     Ok(prepared)
+}
+
+/// Fee bump, in percent, of a replacement over the transaction it replaces.
+/// Clears the node's required replacement margin (geth's `txpool.pricebump`
+/// default is 10%).
+const REPLACEMENT_FEE_BUMP_PCT: u64 = 15;
+
+/// Whether the market fee `estimate` has risen above either fee a transaction
+/// was signed with. A tip below the market's leaves it behind competing sends
+/// even when its max fee still covers the base fee.
+fn outbid_by_market(
+    estimate: &Eip1559Estimation,
+    signed_max_fee: u128,
+    signed_priority_fee: u128,
+) -> bool {
+    estimate.max_fee_per_gas > signed_max_fee
+        || estimate.max_priority_fee_per_gas > signed_priority_fee
+}
+
+/// Re-sign `prepared` at its own nonce with higher fees, when the network's
+/// current fee estimate has risen above the max fee or the priority fee
+/// `prepared` was signed with.
+///
+/// Returns `None` while the market is at or below both fees: a send priced at
+/// the market is not stuck on its fee, so a bump would only overpay. The
+/// replacement carries the same call, gas limit, value and chain, so at most
+/// one of the two can mine. Each fee is the larger of the current estimate and
+/// the replaced fee plus [`REPLACEMENT_FEE_BUMP_PCT`].
+///
+/// Nothing is recorded or broadcast: the caller persists the replacement
+/// before [`broadcast_prepared`] records its hash at the reserved nonce.
+pub(crate) async fn prepare_fee_replacement<F, P>(
+    submitter: &FillProvider<F, P, Ethereum>,
+    send_lock: &Mutex<()>,
+    address: Address,
+    prepared: &PreparedTransaction,
+) -> Result<Option<PreparedTransaction>, EvmError>
+where
+    F: TxFiller<Ethereum>,
+    P: Provider<Ethereum>,
+{
+    let _guard = send_lock.lock().await;
+    let replaced = TxEnvelope::decode_2718_exact(prepared.raw().as_ref())
+        .map_err(|_| EvmError::TransactionPreparation)?;
+    let replaced_max_fee = replaced.max_fee_per_gas();
+    let replaced_priority_fee = replaced
+        .max_priority_fee_per_gas()
+        .ok_or(EvmError::TransactionPreparation)?;
+    let estimate = submitter.estimate_eip1559_fees().await?;
+    if !outbid_by_market(&estimate, replaced_max_fee, replaced_priority_fee) {
+        return Ok(None);
+    }
+
+    let max_fee_per_gas = estimate
+        .max_fee_per_gas
+        .max(bump_fee(replaced_max_fee, REPLACEMENT_FEE_BUMP_PCT)?);
+    let max_priority_fee_per_gas = estimate
+        .max_priority_fee_per_gas
+        .max(bump_fee(replaced_priority_fee, REPLACEMENT_FEE_BUMP_PCT)?)
+        .min(max_fee_per_gas);
+    let mut tx = TransactionRequest::default()
+        .from(address)
+        .input(replaced.input().clone().into())
+        .value(replaced.value())
+        .nonce(replaced.nonce())
+        .gas_limit(replaced.gas_limit())
+        .max_fee_per_gas(max_fee_per_gas)
+        .max_priority_fee_per_gas(max_priority_fee_per_gas);
+    if let Some(to) = replaced.to() {
+        tx = tx.to(to);
+    }
+    if let Some(chain_id) = replaced.chain_id() {
+        tx.chain_id = Some(chain_id);
+    }
+
+    let envelope = submitter
+        .fill(tx)
+        .await?
+        .try_into_envelope()
+        .map_err(|_| EvmError::TransactionPreparation)?;
+    let replacement = PreparedTransaction::from_envelope(&envelope);
+    info!(
+        target: "wallet",
+        replaced = %prepared.tx_hash(),
+        replacement = %replacement.tx_hash(),
+        nonce = replacement.nonce(),
+        replaced_max_fee,
+        max_fee_per_gas,
+        "Signed a fee replacement for a prepared transaction"
+    );
+    Ok(Some(replacement))
 }
 
 async fn prepared_transaction_visible<P>(provider: &P, tx_hash: TxHash) -> bool
@@ -1398,6 +1489,38 @@ mod tests {
     const CONTRACT: Address = address!("00000000000000000000000000000000000000c1");
     const WALLET: Address = address!("00000000000000000000000000000000000000a9");
     const STUCK_NONCE: u64 = 7;
+
+    /// A send is replaced when the market outbids either of its fees: a high
+    /// max fee with a tip below the market's still leaves it unmined.
+    #[test]
+    fn a_send_is_outbid_when_the_market_tip_rises_above_its_own() {
+        const GWEI: u128 = 1_000_000_000;
+        let market = |max_fee_per_gas, max_priority_fee_per_gas| Eip1559Estimation {
+            max_fee_per_gas,
+            max_priority_fee_per_gas,
+        };
+
+        assert!(outbid_by_market(
+            &market(60 * GWEI, 5 * GWEI),
+            200 * GWEI,
+            GWEI
+        ));
+        assert!(outbid_by_market(
+            &market(250 * GWEI, GWEI),
+            200 * GWEI,
+            GWEI
+        ));
+        assert!(!outbid_by_market(
+            &market(200 * GWEI, GWEI),
+            200 * GWEI,
+            GWEI
+        ));
+        assert!(!outbid_by_market(
+            &market(60 * GWEI, GWEI / 2),
+            200 * GWEI,
+            GWEI
+        ));
+    }
 
     fn rpc_error(message: impl Into<Cow<'static, str>>) -> EvmError {
         EvmError::Transport(RpcError::ErrorResp(ErrorPayload {

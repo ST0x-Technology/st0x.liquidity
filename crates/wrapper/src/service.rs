@@ -564,6 +564,13 @@ mod tests {
             );
         }
 
+        async fn prepare_fee_replacement(
+            &self,
+            _prepared: &PreparedTransaction,
+        ) -> Result<Option<PreparedTransaction>, EvmError> {
+            panic!("StubWallet::prepare_fee_replacement should not be called here")
+        }
+
         async fn release_superseded(&self, _tx_hash: TxHash) {
             panic!(
                 "StubWallet::release_superseded called - use a real wallet in tests that need transactions"
@@ -855,6 +862,13 @@ mod tests {
         }
 
         async fn discard_prepared(&self, _tx_hash: TxHash) {}
+
+        async fn prepare_fee_replacement(
+            &self,
+            _prepared: &PreparedTransaction,
+        ) -> Result<Option<PreparedTransaction>, EvmError> {
+            panic!("MockedWallet::prepare_fee_replacement should not be called in wrapper tests")
+        }
 
         async fn release_superseded(&self, _tx_hash: TxHash) {}
 

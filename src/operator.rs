@@ -192,7 +192,8 @@ pub mod equity_redemption {
 
     #[cfg(feature = "test-support")]
     pub use crate::equity_redemption::{
-        DetectionFailure, EquityRedemptionError, redemption_aggregate_id,
+        DetectionFailure, EquityRedemptionError, prepared_withdrawal_for_test,
+        redemption_aggregate_id,
     };
 }
 
@@ -8513,8 +8514,9 @@ pub mod rebalancing {
     pub mod equity {
         pub use crate::rebalancing::equity::{
             ChainEquityServices, CrossVenueEquityTransfer, EquityTransferServices,
-            WithdrawalNotSuperseded, verify_hash_only_withdrawal_not_through,
-            verify_withdrawal_superseded, withdrawal_required_confirmations,
+            SignedRedemptionTx, SignedTxNotSuperseded, WithdrawalNotSuperseded,
+            verify_hash_only_withdrawal_not_through, verify_signed_redemption_txs_superseded,
+            withdrawal_required_confirmations,
         };
     }
 
