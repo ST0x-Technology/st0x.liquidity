@@ -25,9 +25,12 @@ jobs:
     permissions:
       contents: read  # checkout of this repo's observability/ files
       id-token: write  # keyless GCP login as this repo's <app>-obs-deploy identity
+    # One group per ref: a pending master deploy is only ever replaced by a
+    # newer master deploy, never by a PR check. A newer push to a PR cancels
+    # its stale check.
     concurrency:
-      group: observability
-      cancel-in-progress: false
+      group: observability-${{ github.ref }}
+      cancel-in-progress: ${{ github.event_name == 'pull_request' }}
     uses: ST0x-Technology/.github/.github/workflows/observability.yml@f5fbc1e5468aff3918d6f585dab7ecf029c92153  # observability @ .github main
     with:
       app: liquidity

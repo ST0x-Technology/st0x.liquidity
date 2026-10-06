@@ -387,9 +387,6 @@ groups:
   #     means "no new occurrence", not "fixed", and each description says so.
   # The 15-minute window (vs the bot's 5-minute re-log) leaves room for a
   # late tick or a log-pipeline hiccup without the state alert flapping.
-  # The staging rules exist to prove the pipeline end to end. Like every
-  # env=staging rule they are muted for Telegram (contact-points.yml) and
-  # only show in Grafana.
   - orgId: 1
     name: liquidity-bot
     folder: Alerts
@@ -473,7 +470,7 @@ groups:
           summary: >-
             Production liquidity bot: low gas on {{ index $labels "metric.label.chain" }}, wallet {{ index $labels "metric.label.wallet" }}
           description: >-
-            The bot's wallet {{ index $labels "metric.label.wallet" }} on {{ index $labels "metric.label.chain" }} is below its gas threshold (0.05 ETH, [alerts.low_balance_thresholds] in terraform/production-liquidity/st0x-hedge.toml). Send it ETH. The bot re-checks every 5 minutes and this alert clears on its own once the balance is back above the threshold; the exact balance is in the log line.
+            The bot's wallet {{ index $labels "metric.label.wallet" }} on {{ index $labels "metric.label.chain" }} is below its gas threshold for that chain ([alerts.low_balance_thresholds] in config/prod/st0x-hedge.toml). Send it ETH. The bot re-checks every 5 minutes and this alert clears on its own once the balance is back above the threshold; the exact balance is in the log line.
         labels: {service: liquidity, severity: critical}
       - uid: t0liqmrkstaleprd
         title: liquidity-portfolio-mark-stale-production
@@ -1023,7 +1020,7 @@ groups:
       # from its first line instead of arriving as "unclassified". All are
       # EVENTs (one line per occurrence) except the two 4-hour deadline pages,
       # withdrawal-no-tx-hash and deposit-send-unconfirmed, which the bot
-      # re-logs every 30 minutes while they last: keep_firing_for 30m bridges
+      # re-logs every 30 minutes while they last: keepFiringFor 30m bridges
       # that gap, so those two stay firing until the condition ends and
       # resolve about 45 minutes after the last line (window plus hold). The
       # every-corridor latch is logged once per transfer but holds until a
@@ -1250,12 +1247,12 @@ groups:
         noDataState: OK
         execErrState: OK
         for: 0m
-        keep_firing_for: 30m
+        keepFiringFor: 30m
         annotations:
           summary: >-
             Production liquidity bot: an Alpaca withdrawal is complete with no tx hash for over 4 hours
           description: >-
-            Alpaca reports a USDC withdrawal Complete but gives no tx hash, and 4 hours have passed. The USDC has probably reached the Ethereum wallet, but the bot credits a transfer only from its tx, so the transfer stays in Withdrawing with the rebalance guard held and USDC rebalancing does not run. The bot keeps re-polling Alpaca for the hash. Ask Alpaca for the tx. At the settlement deadline the transfer fails to BridgingFailed and pages as liquidity-usdc-withdrawal-tx-unrecorded-production; the USDC is then in the Ethereum wallet, credited to no transfer. Find the withdrawal tx with Alpaca, finish the funds leg by hand and verify it arrived (reconcile moves no funds), then `transfer reconcile --kind usdc --id <id> --reason funds-moved-manually` (docs/cli-ops.md, withdrawal poll inconclusive). The transfer id is in the log line: gcloud logging read '"complete with no tx hash"' --project t0-liquidity --freshness 6h. A STATE: the bot re-pages every 30 minutes while it lasts, so this rule stays firing about 45 minutes past the last line (the 15-minute window, then 30 minutes of keep_firing_for). RESOLVED means the hash arrived or the transfer failed at the deadline; the second still needs the funds leg and the reconcile.
+            Alpaca reports a USDC withdrawal Complete but gives no tx hash, and 4 hours have passed. The USDC has probably reached the Ethereum wallet, but the bot credits a transfer only from its tx, so the transfer stays in Withdrawing with the rebalance guard held and USDC rebalancing does not run. The bot keeps re-polling Alpaca for the hash. Ask Alpaca for the tx. At the settlement deadline the transfer fails to BridgingFailed and pages as liquidity-usdc-withdrawal-tx-unrecorded-production; the USDC is then in the Ethereum wallet, credited to no transfer. Find the withdrawal tx with Alpaca, finish the funds leg by hand and verify it arrived (reconcile moves no funds), then `transfer reconcile --kind usdc --id <id> --reason funds-moved-manually` (docs/cli-ops.md, withdrawal poll inconclusive). The transfer id is in the log line: gcloud logging read '"complete with no tx hash"' --project t0-liquidity --freshness 6h. A STATE: the bot re-pages every 30 minutes while it lasts, so this rule stays firing about 45 minutes past the last line (the 15-minute window, then 30 minutes of keepFiringFor). RESOLVED means the hash arrived or the transfer failed at the deadline; the second still needs the funds leg and the reconcile.
         labels: {service: liquidity, severity: critical}
       - uid: t0liqmintunresprd
         title: liquidity-cctp-mint-unresolvable-production
@@ -1992,12 +1989,12 @@ groups:
         noDataState: OK
         execErrState: OK
         for: 0m
-        keep_firing_for: 30m
+        keepFiringFor: 30m
         annotations:
           summary: >-
             Production liquidity bot: a signed Alpaca deposit send is unconfirmed for over 4 hours
           description: >-
-            A Base->Alpaca transfer's signed deposit send has not confirmed for 4 hours. The bot never re-signs or fee-bumps it, so later sends from the Ethereum wallet queue behind its nonce and the transfer holds the guard. Check the tx on chain. Do not move the minted USDC or reconcile until a different tx is mined at the send's nonce: cancel it with a higher-fee 0-value self-transfer at that nonce, wait for the cancel's required confirmations, move the minted USDC to Alpaca by hand (reconcile moves no funds), then `transfer reconcile --kind usdc --id <id> --reason funds-moved-manually --superseding-tx <cancel>` and restart the bot (docs/cli-ops.md, Base->Alpaca deposit send pages). The transfer id is in the log line: gcloud logging read '"later sends from the Ethereum wallet queue behind its nonce"' --project t0-liquidity --freshness 6h. A STATE: the bot re-pages every 30 minutes while the send is unconfirmed, so this rule stays firing about 45 minutes past the last line (the 15-minute window, then 30 minutes of keep_firing_for) and RESOLVED means the send confirmed or the transfer was reconciled.
+            A Base->Alpaca transfer's signed deposit send has not confirmed for 4 hours. The bot never re-signs or fee-bumps it, so later sends from the Ethereum wallet queue behind its nonce and the transfer holds the guard. Check the tx on chain. Do not move the minted USDC or reconcile until a different tx is mined at the send's nonce: cancel it with a higher-fee 0-value self-transfer at that nonce, wait for the cancel's required confirmations, move the minted USDC to Alpaca by hand (reconcile moves no funds), then `transfer reconcile --kind usdc --id <id> --reason funds-moved-manually --superseding-tx <cancel>` and restart the bot (docs/cli-ops.md, Base->Alpaca deposit send pages). The transfer id is in the log line: gcloud logging read '"later sends from the Ethereum wallet queue behind its nonce"' --project t0-liquidity --freshness 6h. A STATE: the bot re-pages every 30 minutes while the send is unconfirmed, so this rule stays firing about 45 minutes past the last line (the 15-minute window, then 30 minutes of keepFiringFor) and RESOLVED means the send confirmed or the transfer was reconciled.
         labels: {service: liquidity, severity: critical}
       - uid: t0liqdepunresprd
         title: liquidity-deposit-send-unresolved-production

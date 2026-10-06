@@ -21,6 +21,12 @@ the `t0` tag so the board shows in every board's "Related" dropdown, keep
 `timezone: utc`, and never change a `uid` (links and the alert annotations point
 at it).
 
+The Liquidity bot board and its four tab boards are generated: edit
+`gen-t0-liquidity.py` (or `t0-liquidity-native-rows.json`) and run
+`python3 observability/gen-t0-liquidity.py`, which rewrites all five JSON files.
+Do not edit those files by hand or replace them with a Grafana export; the next
+run of the generator overwrites them.
+
 `alerting/liquidity.rules.yml` is the alert rules, in the `Alerts` folder. Each
 rule's `uid` is permanent and must be unique across every repo's file. Removing
 a rule from the file does not remove it from Grafana: add its `uid` to
