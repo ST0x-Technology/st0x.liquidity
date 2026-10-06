@@ -4618,8 +4618,8 @@ enum BridgeStage { Burn, Attestation, Mint }
     `withdrawable cash - reserve`. The notional is truncated to whole cents,
     which is all Alpaca accepts in a USD amount, always downwards so the buy
     cannot ask for more cash than it was sized against
-  - A placement-time `403 Forbidden` carrying Alpaca code `40310000`
-    (insufficient USD balance) is a determinate rejection: no order was
+  - A placement-time `403 Forbidden` carrying Alpaca code `40310000` and an
+    "insufficient balance" message is a determinate rejection: no order was
     accepted, so the same conversion attempt re-reads withdrawable cash and
     retries rather than entering `ConversionFailed`. The resized notional is
     `min(previous notional - $0.01, fresh withdrawable cash - reserve)`, floored
@@ -4633,7 +4633,11 @@ enum BridgeStage { Burn, Attestation, Mint }
     terminal event is emitted. The correlation `client_order_id` is reused
     across all attempts. No other placement or polling error is resized or
     retried: an ambiguous response could represent an accepted live order and
-    must remain fail-closed against double spending
+    must remain fail-closed against double spending. Alpaca reuses `40310000`
+    for other rejections, such as "no available quote for symbol" when the
+    `USDC/USD` book is empty; a smaller notional cannot fix those, so the
+    conversion fails once with a `ConversionFailed` reason that includes
+    Alpaca's message
   - Collar: Alpaca prices a USDC/USD market order with a ~2% collar. On a `qty`
     buy the collar inflates the hold to `quantity x price x 1.02`, which rejects
     a buy sized at 100% of settled cash. On a `notional` buy the hold equals the

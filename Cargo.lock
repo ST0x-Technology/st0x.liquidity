@@ -7383,8 +7383,8 @@ dependencies = [
 
 [[package]]
 name = "st0x-alpaca"
-version = "0.2.0"
-source = "git+https://github.com/ST0x-Technology/st0x.alpaca?tag=v0.2.0#0e2b4125c5c684599ee27128b84191e63879d03e"
+version = "0.2.1"
+source = "git+https://github.com/ST0x-Technology/st0x.alpaca?tag=v0.2.1#ba660046fa5aad3155bc49ccb334d1f0d6d8d2b6"
 dependencies = [
  "alloy",
  "alloy-primitives",
