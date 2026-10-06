@@ -7840,6 +7840,8 @@ mod tests {
     use alloy::primitives::{Address, B256, TxHash, U256, address, bytes, fixed_bytes};
     use alloy::providers::ProviderBuilder;
     use alloy::providers::mock::Asserter;
+    use alloy::rpc::json_rpc::{RequestPacket, Response, ResponsePacket, ResponsePayload};
+    use alloy::sol_types::SolCall;
     use apalis::prelude::Status;
     use rain_math_float::Float;
     use sqlx::{ConnectOptions, SqlitePool};
@@ -7877,7 +7879,9 @@ mod tests {
 
     use super::*;
     use crate::alerts::{CapturingNotifier, NotifierError};
-    use crate::bindings::IRaindexInventory::{OperatorDeposit, OperatorWithdraw};
+    use crate::bindings::IRaindexInventory::{
+        OPERATOR_ROLECall, OperatorDeposit, OperatorWithdraw, hasRoleCall,
+    };
     use crate::bindings::IRaindexV6::{
         ClearConfigV2, ClearV3, EvaluableV4, IOV2, OrderV4, TakeOrderConfigV4, TakeOrderV3,
     };
@@ -8770,8 +8774,8 @@ mod tests {
         calls: Arc<std::sync::Mutex<Vec<(Address, alloy::primitives::Bytes)>>>,
     }
 
-    impl tower::Service<alloy::rpc::json_rpc::RequestPacket> for RoleCheckTransport {
-        type Response = alloy::rpc::json_rpc::ResponsePacket;
+    impl tower::Service<RequestPacket> for RoleCheckTransport {
+        type Response = ResponsePacket;
         type Error = alloy::transports::TransportError;
         type Future = alloy::transports::TransportFut<'static>;
 
@@ -8782,11 +8786,7 @@ mod tests {
             std::task::Poll::Ready(Ok(()))
         }
 
-        fn call(&mut self, request: alloy::rpc::json_rpc::RequestPacket) -> Self::Future {
-            use crate::bindings::IRaindexInventory::{OPERATOR_ROLECall, hasRoleCall};
-            use alloy::rpc::json_rpc::{RequestPacket, Response, ResponsePacket, ResponsePayload};
-            use alloy::sol_types::SolCall;
-
+        fn call(&mut self, request: RequestPacket) -> Self::Future {
             let RequestPacket::Single(request) = request else {
                 panic!("RoleCheckTransport serves single requests only");
             };
@@ -8828,9 +8828,6 @@ mod tests {
     /// holds `OPERATOR_ROLE`.
     #[tokio::test]
     async fn preflight_checks_each_rebalancing_chain_through_its_own_wallet() {
-        use crate::bindings::IRaindexInventory::hasRoleCall;
-        use alloy::sol_types::SolCall;
-
         let ctx = ctx_with_rebalancing_robinhood();
         let base_transport = RoleCheckTransport::default();
         let robinhood_transport = RoleCheckTransport::default();
