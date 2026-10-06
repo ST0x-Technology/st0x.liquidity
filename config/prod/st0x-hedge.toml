@@ -117,9 +117,11 @@ ingestion_cutoff = "safe"
 # Seconds between fill-watch poll cycles on this chain (required; was the
 # global order_fill_poll_interval with a hidden default of 5).
 order_fill_poll_interval_secs = 5
-# Exactly one hedged chain is the primary: the operator's default chain,
-# whose wallet equity polling and recovery read. Rebalancing is per chain
-# (Robinhood rebalances its own DNUT); fills are hedged on every hedged chain.
+# Exactly one hedged chain is the primary: it must be active, it always
+# carries the rebalancing services, and it is the default --network for
+# operator commands. Each rebalancing chain polls its own wallet and
+# recovers its own transfers (Robinhood rebalances its own DNUT); fills
+# are hedged on every hedged chain.
 primary = true
 # Alpaca's issuer wallet on this chain -- ERC-20 transfers for redemption go
 # here. Per chain: a redemption delivers tokens that exist on one chain, so
