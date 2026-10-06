@@ -150,6 +150,14 @@ required_confirmations = 1
 # (mint, wrap, deposit and back) for the listings the token file enables;
 # cash does not, since USDG has no corridor yet. Staging watches the same
 # inventory and stays hedge-only, so only prod moves it. Gas is ETH.
+#
+# Rollback once Robinhood has moved equity: set the listing's rebalancing to
+# "paused" on this release. A tag rollback is safe only while no Robinhood
+# mint, redemption or recovery is unfinished: older configs run Robinhood
+# prefunded with no redemption_wallet, and startup refuses to build the
+# services that unfinished work needs, so the bot stops on every chain.
+# Reverting only this table to "prefunded" fails validate-config while the
+# token file enables Robinhood rebalancing.
 
 [chains.robinhood]
 lifecycle = "active"
