@@ -550,6 +550,7 @@ fn conductor_startup_tokens(
             hyperevm_gas_monitor: barrier.token(),
             robinhood_gas_monitor: barrier.token(),
             trading_schedule_monitor: barrier.token(),
+            hedge_stall_monitor: barrier.token(),
         },
     }
 }
@@ -1096,6 +1097,7 @@ mod tests {
                 hyperevm_gas_monitor: barrier.token(),
                 robinhood_gas_monitor: barrier.token(),
                 trading_schedule_monitor: barrier.token(),
+                hedge_stall_monitor: barrier.token(),
             },
         }
     }
