@@ -9,6 +9,7 @@ const usdc = (overrides: Partial<UsdcInventory>): UsdcInventory => ({
   onchainInflight: '0',
   offchainAvailable: '50',
   offchainInflight: '0',
+  onchainByChain: [],
   offchainGross: null,
   withdrawableCash: null,
   alpacaUsdc: null,

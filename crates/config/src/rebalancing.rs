@@ -188,6 +188,11 @@ impl UsdcCorridors {
         self.by_chain.values().filter(move |_| enabled)
     }
 
+    /// Every corridor table, in chain order, whatever the USDC mode.
+    pub fn configured(&self) -> impl Iterator<Item = &UsdcCorridorCtx> {
+        self.by_chain.values()
+    }
+
     /// The corridors this build runs a cash transfer service for.
     pub const fn served(&self) -> &BTreeSet<UsdcCorridor> {
         &self.served

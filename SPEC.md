@@ -7901,12 +7901,15 @@ multiple broker-specific contexts.
    rather than losing them. Adapter-specific venue values use
    `trade_protocol=terminal_outcomes_v3`; legacy, v1, and v2 responses downgrade
    every adapter or unknown-onchain venue to Raindex so an older exhaustive
-   dashboard cannot enter a parse/reconnect loop. A newer dashboard requests v3
-   and retries v2, then v1, when an older backend rejects an unknown protocol.
-   Legacy-protocol filter requests likewise collapse selected adapter venues to
-   Raindex so an old backend does not reject the venue query. The dashboard
-   continues to accept v1 responses and reconstructs the complete fill as the
-   legacy filled plus excess quantity. A legacy zero fill remains unknown
+   dashboard cannot enter a parse/reconnect loop. The v3 trade also carries
+   `price`, the fill price in USD per share: the onchain fill price, or the
+   broker fill price of a filled counter-trade, and `null` for a failed or
+   cancelled counter-trade. Older protocols omit the field. A newer dashboard
+   requests v3 and retries v2, then v1, when an older backend rejects an unknown
+   protocol. Legacy-protocol filter requests likewise collapse selected adapter
+   venues to Raindex so an old backend does not reject the venue query. The
+   dashboard continues to accept v1 responses and reconstructs the complete fill
+   as the legacy filled plus excess quantity. A legacy zero fill remains unknown
    because v1 synthesized zero when no fill evidence existed. A successful
    lower-version WebSocket fallback probes v3 again after its next disconnect so
    a transient restart cannot pin the client to an older protocol. Failed

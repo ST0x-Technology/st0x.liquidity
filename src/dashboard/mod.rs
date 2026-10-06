@@ -15,10 +15,11 @@ use tracing::{info, trace, warn};
 
 use st0x_config::{ExecutionThreshold, OperationMode};
 use st0x_dto::{
-    CurrentState, LegacyCompatibleTrade, Statement, TerminalOutcomesV1Trade, Trade, TradeOutcome,
-    TransferWarning,
+    ChainName, CurrentState, LegacyCompatibleTrade, Statement, TerminalOutcomesV1Trade, Trade,
+    TradeOutcome, TransferWarning,
 };
 use st0x_event_sorcery::{load_all_ids, load_entity};
+use st0x_evm::Chain;
 use st0x_finance::Positive;
 
 use crate::AppState;
@@ -276,7 +277,7 @@ async fn send_initial_state(
         inventory: inventory_dto,
         positions,
         equity_prices: state.equity_prices.snapshot(chrono::Utc::now()).await,
-        settings: state.settings.clone(),
+        settings: st0x_dto::Settings::clone(&state.settings),
         active_transfers: transfers.active,
         recent_transfers: transfers.recent,
         warnings,
@@ -365,6 +366,17 @@ pub(crate) fn settings_from_ctx(ctx: &st0x_config::Ctx) -> st0x_dto::Settings {
         )
     };
 
+    let usdc_corridors = ctx
+        .rebalancing
+        .usdc
+        .configured()
+        .map(|usdc| st0x_dto::UsdcCorridorSettings {
+            chain: chain_name(usdc.corridor.chain()),
+            target: float_to_f64(usdc.threshold.target, 0.5),
+            deviation: float_to_f64(usdc.threshold.deviation, 0.3),
+        })
+        .collect();
+
     let execution_threshold = match &ctx.execution_threshold {
         ExecutionThreshold::Shares(shares) => {
             let formatted = shares
@@ -446,6 +458,7 @@ pub(crate) fn settings_from_ctx(ctx: &st0x_config::Ctx) -> st0x_dto::Settings {
         equity_deviation,
         usdc_target,
         usdc_deviation,
+        usdc_corridors,
         cash_reserved,
         execution_threshold,
         assets,
@@ -457,6 +470,17 @@ pub(crate) fn settings_from_ctx(ctx: &st0x_config::Ctx) -> st0x_dto::Settings {
         broker: broker.to_string(),
         order_polling_interval: ctx.order_polling_interval_secs,
         inventory_poll_interval: ctx.inventory_poll_interval_secs,
+    }
+}
+
+/// The dashboard's chain discriminator for a chain the bot operates on.
+/// Exhaustive so a chain added to `Chain` cannot reach the dashboard unnamed.
+pub(crate) fn chain_name(chain: Chain) -> ChainName {
+    match chain {
+        Chain::Base => ChainName::Base,
+        Chain::Ethereum => ChainName::Ethereum,
+        Chain::HyperEvm => ChainName::HyperEvm,
+        Chain::Robinhood => ChainName::Robinhood,
     }
 }
 
@@ -507,6 +531,7 @@ mod tests {
     use alloy::primitives::address;
     use futures_util::StreamExt;
     use futures_util::future::join_all;
+    use rain_math_float::Float;
     use serde_json::json;
     use std::sync::Arc;
     use tokio::net::TcpListener;
@@ -544,6 +569,7 @@ mod tests {
                 st0x_float_macro::float!(1),
             ))
             .unwrap(),
+            price: None,
             outcome: st0x_dto::TradeOutcome::Filled,
         })
     }
@@ -579,6 +605,7 @@ mod tests {
             direction: Direction::Sell,
             symbol: Symbol::new("AAPL").unwrap(),
             shares: Positive::new(FractionalShares::new(float!(1))).unwrap(),
+            price: None,
             outcome: TradeOutcome::Cancelled {
                 accepted_shares: Some(Positive::new(FractionalShares::new(float!(1))).unwrap()),
                 filled_shares: Some(
@@ -613,6 +640,7 @@ mod tests {
             direction: Direction::Buy,
             symbol: Symbol::new("AAPL").unwrap(),
             shares: Positive::new(FractionalShares::new(float!(1))).unwrap(),
+            price: None,
             outcome: TradeOutcome::Filled,
         };
 
@@ -649,6 +677,7 @@ mod tests {
             equity_deviation: 0.2,
             usdc_target: None,
             usdc_deviation: None,
+            usdc_corridors: Vec::new(),
             cash_reserved: None,
             execution_threshold: "$2".to_string(),
             assets: Vec::new(),
@@ -718,6 +747,84 @@ mod tests {
 
         assert_eq!(settings["usdcTarget"], json!(0.25));
         assert_eq!(settings["usdcDeviation"], json!(0.125));
+    }
+
+    /// The dashboard's chain discriminator serializes to the wire name
+    /// `st0x_evm::Chain` pins, for every chain the bot can watch. It lives
+    /// here because the dto crate cannot see `Chain`: the two spellings are
+    /// separately pinned literals, so nothing else catches them drifting.
+    #[test]
+    fn chain_name_wire_names_match_the_evm_chain_names() {
+        for chain in Chain::ALL {
+            assert_eq!(
+                serde_json::to_value(chain_name(chain)).unwrap(),
+                json!(chain.as_str()),
+                "{chain:?} must reach the dashboard under its pinned wire name"
+            );
+        }
+    }
+
+    fn corridor(chain: Chain, hop: HopKind, target: Float, deviation: Float) -> UsdcCorridorCtx {
+        UsdcCorridorCtx {
+            corridor: UsdcCorridor::HubRouted { chain, hop },
+            threshold: ImbalanceThreshold { target, deviation },
+        }
+    }
+
+    /// Each corridor table gets its own band, in chain order, while the
+    /// single dashboard band stays the primary chain's.
+    #[test]
+    fn settings_from_ctx_lists_every_usdc_corridor_band() {
+        let mut ctx = create_test_ctx_with_order_owner(address!(
+            "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        ));
+        assert_eq!(ctx.chains.primary().chain, Chain::Base);
+        ctx.rebalancing.usdc = UsdcCorridors::for_test(
+            OperationMode::Enabled,
+            [
+                corridor(Chain::HyperEvm, HopKind::Relay, float!(0.25), float!(0.125)),
+                corridor(Chain::Base, HopKind::Cctp, float!(0.5), float!(0.3)),
+            ],
+        );
+
+        let settings = serde_json::to_value(settings_from_ctx(&ctx)).unwrap();
+
+        assert_eq!(
+            settings["usdcCorridors"],
+            json!([
+                { "chain": "base", "target": 0.5, "deviation": 0.3 },
+                { "chain": "hyperevm", "target": 0.25, "deviation": 0.125 },
+            ])
+        );
+        assert_eq!(settings["usdcTarget"], json!(0.5));
+        assert_eq!(settings["usdcDeviation"], json!(0.3));
+    }
+
+    /// USDC mode disabled stops new transfers, not the corridor tables: their
+    /// bands are still listed, while the single dashboard band is absent.
+    #[test]
+    fn settings_from_ctx_lists_usdc_corridor_bands_while_usdc_mode_is_disabled() {
+        let mut ctx = create_test_ctx_with_order_owner(address!(
+            "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        ));
+        ctx.rebalancing.usdc = UsdcCorridors::for_test(
+            OperationMode::Disabled,
+            [corridor(
+                Chain::Base,
+                HopKind::Cctp,
+                float!(0.5),
+                float!(0.3),
+            )],
+        );
+
+        let settings = serde_json::to_value(settings_from_ctx(&ctx)).unwrap();
+
+        assert_eq!(
+            settings["usdcCorridors"],
+            json!([{ "chain": "base", "target": 0.5, "deviation": 0.3 }])
+        );
+        assert_eq!(settings["usdcTarget"], json!(null));
+        assert_eq!(settings["usdcDeviation"], json!(null));
     }
 
     #[test]
@@ -849,7 +956,7 @@ mod tests {
                 sender,
             )),
             equity_prices: equity_price::EquityPriceStore::new([&ChainAssets::default()]),
-            settings: empty_settings(),
+            settings: Arc::new(empty_settings()),
             recovery: Arc::new(tokio::sync::OnceCell::new()),
             process_tx: Arc::new(tokio::sync::OnceCell::new()),
             resume_lock: Arc::new(crate::api::ResumeLock(Arc::new(
@@ -1099,6 +1206,7 @@ mod tests {
             direction: Direction::Buy,
             symbol: Symbol::new("TSLA").unwrap(),
             shares: Positive::new(FractionalShares::new(float!(1))).unwrap(),
+            price: None,
             outcome: TradeOutcome::Filled,
         };
         server
@@ -1131,6 +1239,7 @@ mod tests {
             direction: Direction::Sell,
             symbol: Symbol::new("TSLA").unwrap(),
             shares: Positive::new(FractionalShares::new(float!(1))).unwrap(),
+            price: None,
             outcome: TradeOutcome::Failed {
                 error: "broker rejected order".to_string(),
                 accepted_shares: None,

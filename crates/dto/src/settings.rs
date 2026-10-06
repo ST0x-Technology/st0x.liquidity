@@ -5,6 +5,8 @@ use ts_rs::TS;
 
 use st0x_finance::{Symbol, Usd};
 
+use crate::ChainName;
+
 /// Operational settings shown on the dashboard overview.
 #[derive(Debug, Clone, Serialize, TS)]
 #[serde(rename_all = "camelCase")]
@@ -15,6 +17,10 @@ pub struct Settings {
     pub equity_deviation: f64,
     pub usdc_target: Option<f64>,
     pub usdc_deviation: Option<f64>,
+    /// Every `[rebalancing.usdc.corridors.<chain>]` table's band, in chain
+    /// order, whatever the USDC mode. `usdc_target` and `usdc_deviation`
+    /// above stay the single band the dashboard shows.
+    pub usdc_corridors: Vec<UsdcCorridorSettings>,
     #[ts(as = "Option<String>")]
     pub cash_reserved: Option<Usd>,
     pub execution_threshold: String,
@@ -34,6 +40,16 @@ pub struct Settings {
     pub order_polling_interval: u64,
     #[ts(type = "number")]
     pub inventory_poll_interval: u64,
+}
+
+/// One USDC corridor's trigger band: the chain vault's target share of (that
+/// vault's USDC + Alpaca cash) and the deviation inside which nothing moves.
+#[derive(Debug, Clone, PartialEq, Serialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct UsdcCorridorSettings {
+    pub chain: ChainName,
+    pub target: f64,
+    pub deviation: f64,
 }
 
 /// Wallet provider settings shown in the config dialog.
@@ -90,7 +106,8 @@ mod tests {
 
     use st0x_finance::Symbol;
 
-    use super::{AssetSettings, CounterTrading};
+    use super::{AssetSettings, CounterTrading, UsdcCorridorSettings};
+    use crate::ChainName;
 
     #[test]
     fn counter_trading_disabled_serializes_with_status_tag_only() {
@@ -138,5 +155,31 @@ mod tests {
         );
         assert_eq!(value["rebalancing"], json!(false));
         assert_eq!(value["operationalLimit"], json!(null));
+    }
+
+    #[test]
+    fn usdc_corridor_settings_serialize_chain_by_wire_name_and_band_as_numbers() {
+        let corridors = vec![
+            UsdcCorridorSettings {
+                chain: ChainName::Base,
+                target: 0.5,
+                deviation: 0.3,
+            },
+            UsdcCorridorSettings {
+                chain: ChainName::HyperEvm,
+                target: 0.25,
+                deviation: 0.125,
+            },
+        ];
+
+        let value = serde_json::to_value(&corridors).unwrap();
+
+        assert_eq!(
+            value,
+            json!([
+                { "chain": "base", "target": 0.5, "deviation": 0.3 },
+                { "chain": "hyperevm", "target": 0.25, "deviation": 0.125 },
+            ])
+        );
     }
 }

@@ -133,6 +133,7 @@ mod tests {
             direction: Direction::Buy,
             symbol: Symbol::new("AAPL").unwrap(),
             shares: Positive::new(FractionalShares::new(float!(10))).unwrap(),
+            price: None,
             outcome: crate::TradeOutcome::Filled,
         };
         let msg = Statement::TradeUpdate(trade);
@@ -155,6 +156,7 @@ mod tests {
                 equity_deviation: 0.2,
                 usdc_target: None,
                 usdc_deviation: None,
+                usdc_corridors: Vec::new(),
                 cash_reserved: None,
                 execution_threshold: "1 share".to_string(),
                 assets: Vec::new(),

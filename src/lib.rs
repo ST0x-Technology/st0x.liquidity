@@ -179,7 +179,7 @@ pub(crate) struct AppState {
     pub(crate) event_sender: broadcast::Sender<Statement>,
     pub(crate) inventory: Arc<inventory::BroadcastingInventory>,
     pub(crate) equity_prices: dashboard::equity_price::EquityPriceStore,
-    pub(crate) settings: st0x_dto::Settings,
+    pub(crate) settings: Arc<st0x_dto::Settings>,
     pub(crate) recovery: Arc<tokio::sync::OnceCell<api::RecoveryHandle>>,
     pub(crate) process_tx: Arc<tokio::sync::OnceCell<api::ProcessTxHandle>>,
     pub(crate) resume_lock: Arc<api::ResumeLock>,
@@ -308,7 +308,8 @@ async fn run_bot_session_inner(
     let metrics_handle = metrics::setup().context("failed to install Prometheus recorder")?;
 
     let inventory = Arc::new(inventory::BroadcastingInventory::new(
-        inventory::InventoryView::for_primary_chain(ctx.chains.primary().chain),
+        inventory::InventoryView::for_primary_chain(ctx.chains.primary().chain)
+            .with_hedged_chains(ctx.chains.hedged().map(|hedged| hedged.chain)),
         event_sender.clone(),
     ));
     let equity_prices = dashboard::equity_price::EquityPriceStore::new(
@@ -361,7 +362,7 @@ async fn run_bot_session_inner(
         event_sender: event_sender.clone(),
         inventory: inventory.clone(),
         equity_prices: equity_prices.clone(),
-        settings: dashboard::settings_from_ctx(&ctx),
+        settings: Arc::new(dashboard::settings_from_ctx(&ctx)),
         recovery: recovery_cell.clone(),
         process_tx: process_tx_cell.clone(),
         resume_lock,

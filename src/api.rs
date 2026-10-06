@@ -4762,7 +4762,7 @@ mod tests {
         let pool = crate::test_utils::setup_test_db().await;
 
         AppState {
-            settings: dashboard::settings_from_ctx(&ctx),
+            settings: Arc::new(dashboard::settings_from_ctx(&ctx)),
             ctx: ctx.clone(),
             pnl_ledger: Arc::new(crate::dashboard::pnl::PnlLedger::new(pool.clone())),
             pool,
@@ -4930,6 +4930,7 @@ mod tests {
             direction: Direction::Buy,
             symbol: Symbol::new("AAPL").unwrap(),
             shares: Positive::new(FractionalShares::new(float!(1))).unwrap(),
+            price: Some(st0x_finance::Usd::new(float!(199.5))),
             outcome: TradeOutcome::Filled,
         };
 
@@ -4950,6 +4951,16 @@ mod tests {
             assert_eq!(wire["entries"][0]["venue"], expected_venue);
             assert_eq!(wire["entries"][0]["filledAt"], "2026-01-01T00:00:00Z");
             assert_eq!(wire["entries"][0]["outcome"]["status"], "filled");
+            match trade_protocol {
+                TradeProtocol::TerminalOutcomesV3 => {
+                    assert_eq!(wire["entries"][0]["price"], "199.5");
+                }
+                TradeProtocol::LegacyFills
+                | TradeProtocol::TerminalOutcomesV1
+                | TradeProtocol::TerminalOutcomesV2 => {
+                    assert_eq!(wire["entries"][0].get("price"), None);
+                }
+            }
             assert_eq!(wire["total"], 1);
             assert_eq!(wire["hasMore"], false);
         }
@@ -5154,6 +5165,78 @@ mod tests {
         assert_eq!(cancelled["outcome"]["filledShares"], "0");
         assert_eq!(cancelled["outcome"]["remainingShares"], "1");
         assert_eq!(cancelled["outcome"]["excessShares"], "0");
+    }
+
+    async fn insert_offchain_view_row(pool: &sqlx::SqlitePool, view_id: &str, payload: &str) {
+        sqlx::query("INSERT INTO offchain_order_view (view_id, version, payload) VALUES (?, 1, ?)")
+            .bind(view_id)
+            .bind(payload)
+            .execute(pool)
+            .await
+            .unwrap();
+    }
+
+    async fn trades_wire(state: AppState, trade_protocol: &str) -> serde_json::Value {
+        let response = build_app(state)
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/trades?trade_protocol={trade_protocol}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        serde_json::from_str(&body_to_string(response).await).unwrap()
+    }
+
+    #[tokio::test]
+    async fn trades_endpoint_serves_the_fill_price_on_v3_only() {
+        let state = empty_app_state(create_test_ctx_with_order_owner(Address::ZERO)).await;
+        let pool = state.pool.clone();
+        let filled_view_id = "00000000-0000-0000-0000-000000000150";
+        let filled_payload = r#"{"Live":{"Filled":{"symbol":"AAPL","shares":"2","direction":"Sell","executor":"AlpacaBrokerApi","executor_order_id":"broker-fill","price":"199.5","placed_at":"2026-01-01T00:00:00Z","submitted_at":"2026-01-01T00:00:00Z","filled_at":"2026-01-01T00:00:03Z"}}}"#;
+        insert_offchain_view_row(&pool, filled_view_id, filled_payload).await;
+        // A priced partial fill is retained, but a failed or cancelled
+        // counter-trade has no fill price of its own.
+        let failed_view_id = "00000000-0000-0000-0000-000000000151";
+        let failed_payload = r#"{"Live":{"Failed":{"symbol":"SPCX","shares":"1","direction":"Buy","executor":"AlpacaBrokerApi","retained_fill":{"Priced":{"shares_filled":"0.25","avg_price":"25","partially_filled_at":"2026-01-01T00:00:00Z"}},"executor_order_id":"broker-order","error":"asset is not tradable","placed_at":"2026-01-01T00:00:00Z","failed_at":"2026-01-01T00:00:01Z"}}}"#;
+        insert_offchain_view_row(&pool, failed_view_id, failed_payload).await;
+        let cancelled_view_id = "00000000-0000-0000-0000-000000000152";
+        let cancelled_payload = r#"{"Live":{"Cancelled":{"symbol":"MSFT","shares":"1","requested_shares":"1.5","filled_shares":"0","direction":"Sell","executor":"AlpacaBrokerApi","executor_order_id":"broker-cancel","reason":"MarketOpenReplacement","placed_at":"2026-01-01T00:00:01Z","cancelled_at":"2026-01-01T00:00:02Z"}}}"#;
+        insert_offchain_view_row(&pool, cancelled_view_id, cancelled_payload).await;
+
+        let v3 = trades_wire(state.clone(), "terminal_outcomes_v3").await;
+        let v3_entry = |id: &str| {
+            v3["entries"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|trade| trade["id"] == id)
+                .unwrap_or_else(|| panic!("v3 clients should receive trade {id}"))
+        };
+        assert_eq!(v3_entry(filled_view_id)["price"], "199.5");
+        assert_eq!(
+            v3_entry(failed_view_id).get("price"),
+            Some(&serde_json::Value::Null)
+        );
+        assert_eq!(
+            v3_entry(cancelled_view_id).get("price"),
+            Some(&serde_json::Value::Null)
+        );
+
+        for older_protocol in [
+            "terminal_outcomes_v2",
+            "terminal_outcomes_v1",
+            "legacy_fills",
+        ] {
+            let wire = trades_wire(state.clone(), older_protocol).await;
+            let entries = wire["entries"].as_array().unwrap();
+            assert!(
+                !entries.is_empty() && entries.iter().all(|trade| trade.get("price").is_none()),
+                "{older_protocol} keeps the wire shape its clients were built against"
+            );
+        }
     }
 
     #[tokio::test]

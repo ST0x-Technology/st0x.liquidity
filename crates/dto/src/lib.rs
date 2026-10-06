@@ -57,6 +57,7 @@ pub fn export_bindings(out_dir: &Path) -> Result<(), ts_rs::ExportError> {
     AssetSettings::export_all_to(out_dir)?;
     CounterTrading::export_all_to(out_dir)?;
     WalletSettings::export_all_to(out_dir)?;
+    UsdcCorridorSettings::export_all_to(out_dir)?;
     Trade::export_all_to(out_dir)?;
     LegacyTrade::export_all_to(out_dir)?;
     TradeOutcome::export_all_to(out_dir)?;
@@ -64,6 +65,8 @@ pub fn export_bindings(out_dir: &Path) -> Result<(), ts_rs::ExportError> {
     EquityPrice::export_all_to(out_dir)?;
     EquityPriceStatus::export_all_to(out_dir)?;
     SymbolInventory::export_all_to(out_dir)?;
+    OnchainEquityBalance::export_all_to(out_dir)?;
+    OnchainUsdcBalance::export_all_to(out_dir)?;
     InFlightEquity::export_all_to(out_dir)?;
     Inventory::export_all_to(out_dir)?;
     InventorySnapshot::export_all_to(out_dir)?;
@@ -146,6 +149,11 @@ mod tests {
                 equity_deviation: 0.2,
                 usdc_target: None,
                 usdc_deviation: None,
+                usdc_corridors: vec![UsdcCorridorSettings {
+                    chain: ChainName::Base,
+                    target: 0.5,
+                    deviation: 0.3,
+                }],
                 cash_reserved: None,
                 execution_threshold: "$2".to_string(),
                 assets: Vec::new(),
@@ -172,6 +180,10 @@ mod tests {
         assert_eq!(json["settings"]["equityTarget"], json!(0.5));
         assert_eq!(json["settings"]["equityDeviation"], json!(0.2));
         assert_eq!(json["settings"]["usdcTarget"], json!(null));
+        assert_eq!(
+            json["settings"]["usdcCorridors"],
+            json!([{ "chain": "base", "target": 0.5, "deviation": 0.3 }])
+        );
         assert_eq!(json["settings"]["executionThreshold"], json!("$2"));
         assert!(json["inventory"].is_object());
     }

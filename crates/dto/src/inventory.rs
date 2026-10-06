@@ -9,6 +9,8 @@ use ts_rs::TS;
 
 use st0x_finance::{FractionalShares, HasZero, Symbol, Usdc};
 
+use crate::ChainName;
+
 /// Per-symbol equity balances split by venue and availability.
 #[derive(Debug, Clone, Serialize, TS)]
 #[serde(rename_all = "camelCase")]
@@ -23,8 +25,24 @@ pub struct SymbolInventory {
     pub offchain_available: FractionalShares,
     #[ts(type = "string")]
     pub offchain_inflight: FractionalShares,
+    /// Every chain's vault balance for this symbol, in chain order. The
+    /// `onchain*` fields above are the primary chain's entry alone: wrapped
+    /// shares on different chains cannot be added together. A chain whose
+    /// vault the bot has not read yet has no entry.
+    pub onchain_by_chain: Vec<OnchainEquityBalance>,
     /// Equity tokens observed in the Base wallet between venues.
     pub inflight_equity: InFlightEquity,
+}
+
+/// One chain's vault balance of a symbol's wrapped equity.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct OnchainEquityBalance {
+    pub chain: ChainName,
+    #[ts(type = "string")]
+    pub available: FractionalShares,
+    #[ts(type = "string")]
+    pub inflight: FractionalShares,
 }
 
 /// Equity tokens sitting in wallets between venues, observed by polling.
@@ -54,6 +72,10 @@ pub struct UsdcInventory {
     pub offchain_available: Usdc,
     #[ts(type = "string")]
     pub offchain_inflight: Usdc,
+    /// Every chain's cash vault balance, in chain order. The `onchain*`
+    /// fields above are the primary chain's entry alone. A chain whose vault
+    /// the bot has not read yet has no entry.
+    pub onchain_by_chain: Vec<OnchainUsdcBalance>,
     /// Gross offchain USD balance before cash reserve subtraction.
     #[ts(type = "string | null")]
     pub offchain_gross: Option<Usdc>,
@@ -68,6 +90,20 @@ pub struct UsdcInventory {
     pub alpaca_usdc: Option<Usdc>,
     /// USDC observed at intermediate wallet locations between venues.
     pub inflight_cash: InFlightCash,
+}
+
+/// One chain's cash vault balance, in that chain's settlement stable.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, TS)]
+#[serde(rename_all = "camelCase")]
+pub struct OnchainUsdcBalance {
+    pub chain: ChainName,
+    /// The chain's settlement stable (USDC, or USDG on Robinhood): the
+    /// `usdc.symbol` above names the primary chain's only.
+    pub symbol: String,
+    #[ts(type = "string")]
+    pub available: Usdc,
+    #[ts(type = "string")]
+    pub inflight: Usdc,
 }
 
 /// USDC sitting in wallets between venues, observed by polling.
@@ -116,6 +152,7 @@ impl Inventory {
                 onchain_inflight: Usdc::ZERO,
                 offchain_available: Usdc::ZERO,
                 offchain_inflight: Usdc::ZERO,
+                onchain_by_chain: Vec::new(),
                 offchain_gross: None,
                 withdrawable_cash: None,
                 alpaca_usdc: None,
@@ -149,6 +186,7 @@ mod tests {
                 onchain_inflight: FractionalShares::new(float!(5)),
                 offchain_available: FractionalShares::new(float!(45)),
                 offchain_inflight: FractionalShares::ZERO,
+                onchain_by_chain: Vec::new(),
                 inflight_equity: InFlightEquity {
                     base_wallet_unwrapped: FractionalShares::new(float!(3)),
                     base_wallet_wrapped: FractionalShares::new(float!(2)),
@@ -160,6 +198,7 @@ mod tests {
                 onchain_inflight: Usdc::ZERO,
                 offchain_available: Usdc::new(float!(5000)),
                 offchain_inflight: Usdc::new(float!(500)),
+                onchain_by_chain: Vec::new(),
                 offchain_gross: Some(Usdc::new(float!(6000))),
                 withdrawable_cash: Some(Usdc::new(float!(4500))),
                 alpaca_usdc: Some(Usdc::new(float!(125))),
@@ -192,5 +231,71 @@ mod tests {
         assert_eq!(usdc["alpacaUsdc"], json!("125"));
         assert_eq!(usdc["inflightCash"]["ethereumWallet"], json!("250"));
         assert_eq!(usdc["inflightCash"]["baseWallet"], json!("0"));
+    }
+
+    #[test]
+    fn onchain_balances_by_chain_serialize_with_wire_chain_names() {
+        let symbol_inventory = SymbolInventory {
+            symbol: Symbol::new("TSLA").unwrap(),
+            onchain_available: FractionalShares::new(float!(50)),
+            onchain_inflight: FractionalShares::new(float!(5)),
+            offchain_available: FractionalShares::ZERO,
+            offchain_inflight: FractionalShares::ZERO,
+            onchain_by_chain: vec![
+                OnchainEquityBalance {
+                    chain: ChainName::Base,
+                    available: FractionalShares::new(float!(50)),
+                    inflight: FractionalShares::new(float!(5)),
+                },
+                OnchainEquityBalance {
+                    chain: ChainName::HyperEvm,
+                    available: FractionalShares::new(float!(1.25)),
+                    inflight: FractionalShares::ZERO,
+                },
+            ],
+            inflight_equity: InFlightEquity {
+                base_wallet_unwrapped: FractionalShares::ZERO,
+                base_wallet_wrapped: FractionalShares::ZERO,
+            },
+        };
+        let usdc_by_chain = vec![
+            OnchainUsdcBalance {
+                chain: ChainName::Base,
+                symbol: "USDC".to_string(),
+                available: Usdc::new(float!(10000)),
+                inflight: Usdc::new(float!(250.5)),
+            },
+            OnchainUsdcBalance {
+                chain: ChainName::Robinhood,
+                symbol: "USDG".to_string(),
+                available: Usdc::new(float!(300)),
+                inflight: Usdc::ZERO,
+            },
+        ];
+
+        let symbol_json = serde_json::to_value(&symbol_inventory).unwrap();
+        let usdc_json = serde_json::to_value(&usdc_by_chain).unwrap();
+
+        assert_eq!(
+            symbol_json["onchainByChain"],
+            json!([
+                { "chain": "base", "available": "50", "inflight": "5" },
+                { "chain": "hyperevm", "available": "1.25", "inflight": "0" },
+            ])
+        );
+        assert_eq!(
+            usdc_json,
+            json!([
+                { "chain": "base", "symbol": "USDC", "available": "10000", "inflight": "250.5" },
+                { "chain": "robinhood", "symbol": "USDG", "available": "300", "inflight": "0" },
+            ])
+        );
+    }
+
+    #[test]
+    fn empty_inventory_lists_no_onchain_usdc_by_chain() {
+        let json = serde_json::to_value(Inventory::empty("USDC")).unwrap();
+
+        assert_eq!(json["usdc"]["onchainByChain"], json!([]));
     }
 }

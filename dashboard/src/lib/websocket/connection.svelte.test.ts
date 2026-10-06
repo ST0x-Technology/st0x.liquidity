@@ -83,6 +83,7 @@ const makeTrade = (overrides: Partial<Trade> = {}): Trade => ({
   direction: 'buy',
   symbol: 'AAPL',
   shares: '10',
+  price: null,
   outcome: { status: 'filled' },
   ...overrides
 })
@@ -109,6 +110,7 @@ const makeCurrentState = (overrides: Partial<CurrentState> = {}): CurrentState =
       onchainInflight: '0',
       offchainAvailable: '0',
       offchainInflight: '0',
+      onchainByChain: [],
       offchainGross: null,
       withdrawableCash: null,
       alpacaUsdc: null,
@@ -125,6 +127,7 @@ const makeCurrentState = (overrides: Partial<CurrentState> = {}): CurrentState =
     equityDeviation: 0.2,
     usdcTarget: null,
     usdcDeviation: null,
+    usdcCorridors: [],
     cashReserved: null,
     executionThreshold: '$2',
     assets: [],
@@ -435,6 +438,7 @@ describe('createWebSocket', () => {
                   onchainInflight: '0',
                   offchainAvailable: '2',
                   offchainInflight: '0',
+                  onchainByChain: [],
                   inflightEquity: {
                     baseWalletUnwrapped: '0',
                     baseWalletWrapped: '0'
@@ -563,6 +567,7 @@ describe('createWebSocket', () => {
           direction: 'sell',
           symbol: 'TSLA',
           shares: '2',
+          price: null,
           outcome: { status: 'filled' }
         }
       ])
@@ -597,6 +602,7 @@ describe('createWebSocket', () => {
           direction: 'buy',
           symbol: 'AAPL',
           shares: '1',
+          price: null,
           outcome: { status: 'filled' }
         }
       ])
@@ -737,6 +743,7 @@ describe('createWebSocket', () => {
             onchainInflight: '0',
             offchainAvailable: '5',
             offchainInflight: '0',
+            onchainByChain: [],
             inflightEquity: {
               baseWalletUnwrapped: '0',
               baseWalletWrapped: '0'
@@ -749,6 +756,7 @@ describe('createWebSocket', () => {
           onchainInflight: '0',
           offchainAvailable: '500',
           offchainInflight: '0',
+          onchainByChain: [],
           offchainGross: null,
           withdrawableCash: null,
           alpacaUsdc: null,
