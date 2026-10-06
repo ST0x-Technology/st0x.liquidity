@@ -10308,9 +10308,13 @@ mod tests {
                 .eq(float!(0.4))
                 .unwrap()
         );
+        // Also the hedge cap: the CheckPositions backstop takes the tightest
+        // limit across chains, so Base DNUT hedges are capped at 25 too.
         assert!(
             dnut.operational_limit
-                .expect("DNUT must cap each Robinhood operation")
+                .expect(
+                    "DNUT must cap each Robinhood rebalancing operation and each DNUT hedge order"
+                )
                 .inner()
                 .inner()
                 .eq(float!(25))
