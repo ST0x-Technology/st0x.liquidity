@@ -167,6 +167,16 @@ required_confirmations = 1
 # has moved, roll back to the previous release. Reverting only this table
 # to "prefunded" fails validate-config while the token file enables
 # Robinhood rebalancing.
+#
+# Neither state is neutral for DNUT. "paused" keeps Robinhood's vault in
+# the total but stops it redeeming, so sells into that vault drain the
+# broker's DNUT toward the hedge floor with no planner action: keep the
+# pause short and watch the broker's DNUT position. "disabled" drops the
+# vault from the total, so Base (target 0.4, no operational_limit) is far
+# over its band and redeems several hundred DNUT in one operation: a
+# generation that disables Robinhood DNUT restores Base DNUT to 0.5, or
+# the operator expects that redemption. A tag rollback after the mints
+# redeems on Base the same way, from the old pin's 0.5 target.
 
 [chains.robinhood]
 lifecycle = "active"
