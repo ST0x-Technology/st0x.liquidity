@@ -10101,14 +10101,9 @@ mod tests {
             .unwrap();
     }
 
-    /// The shipped prod and staging configs run Robinhood Chain as a
-    /// prefunded hedge-only secondary: fills on every listed equity are
-    /// ingested and hedged, nothing is rebalanced, and Bebop is not mapped.
-    /// Both list the two launch equities; prod also lists PLBY, GRND, and SNES.
-    #[test]
-    fn shipped_configs_hedge_robinhood_prefunded_without_rebalancing() {
-        let orderbook = address!("0x37FC0EFec37D19f8A221aa4F8F7600C9ba2AcD20");
-        let inventory = address!("0x1eFd85E6C384fAD9B80C6D508E9098Eb91C4eD30");
+    /// Robinhood's equities as the shipped configs list them, by symbol:
+    /// the two launch equities everywhere, plus PLBY, GRND, and SNES in prod.
+    fn robinhood_equities(with_prod_only: bool) -> BTreeMap<Symbol, (Address, Address)> {
         let launch_equities = [
             (
                 Symbol::new("DNUT").unwrap(),
@@ -10148,100 +10143,163 @@ mod tests {
                 ),
             ),
         ];
-        let prod_equities: BTreeMap<Symbol, (Address, Address)> = launch_equities
+
+        launch_equities
+            .into_iter()
+            .chain(prod_only_equities.into_iter().filter(|_| with_prod_only))
+            .collect()
+    }
+
+    /// Loads a shipped config and checks the Robinhood settings prod and
+    /// staging share: the same orderbook and inventory, hedged fills on
+    /// every listed equity, no Bebop, and the 0.001 ETH gas threshold.
+    fn shipped_robinhood(
+        name: &str,
+        config_str: &str,
+        tokens: &[u8],
+        expected_equities: &BTreeMap<Symbol, (Address, Address)>,
+    ) -> ChainConfig {
+        let inventory = address!("0x1eFd85E6C384fAD9B80C6D508E9098Eb91C4eD30");
+        let (config, _) = config_from(
+            config_str,
+            Path::new(name),
+            TokenFile::Bytes(tokens),
+            &mut Vec::new(),
+        )
+        .unwrap();
+
+        let alerts = AlertsCtx::new(config.alerts, &config.chains, &mut Vec::new())
+            .unwrap()
+            .unwrap_or_else(|| panic!("{name}: a hedged Robinhood requires [alerts]"));
+        assert_eq!(
+            alerts.low_balance_threshold_wei(Chain::Robinhood),
+            Some(U256::from(1_000_000_000_000_000_u64)),
+            "{name}: the Robinhood gas threshold is 0.001 ETH"
+        );
+
+        let mut chains = config.chains;
+        let robinhood = chains
+            .remove(&Chain::Robinhood)
+            .unwrap_or_else(|| panic!("{name} config must declare [chains.robinhood]"));
+
+        let trading = robinhood
+            .trading
+            .as_ref()
+            .unwrap_or_else(|| panic!("{name} config must hedge fills on Robinhood"));
+        assert!(!trading.primary, "{name}: Robinhood is a secondary");
+        assert_eq!(
+            trading.orderbook,
+            address!("0x37FC0EFec37D19f8A221aa4F8F7600C9ba2AcD20"),
+            "{name}"
+        );
+        assert_eq!(trading.inventory_mode, InventoryModeTag::Managed, "{name}");
+        assert_eq!(trading.inventory, Some(inventory), "{name}");
+        assert_eq!(trading.vault_owner, inventory, "{name}");
+        assert_eq!(trading.deployment_block, 59_557_818, "{name}");
+        assert_eq!(
+            trading.ingestion_cutoff,
+            IngestionCutoffTag::Confirmations,
+            "{name}: Robinhood has no OP-Stack safe tag"
+        );
+        assert_eq!(trading.ingestion_cutoff_confirmations, Some(600), "{name}");
+        assert_eq!(
+            trading.inventory_adapters,
+            InventoryAdapters::default(),
+            "{name}: Bebop is off on Robinhood"
+        );
+
+        let equities: BTreeMap<Symbol, (Address, Address)> = trading
+            .assets
+            .equities
+            .symbols
             .iter()
-            .chain(prod_only_equities.iter())
-            .cloned()
+            .map(|(symbol, equity)| {
+                assert_eq!(equity.trading, OperationMode::Enabled, "{name} {symbol}");
+                (
+                    symbol.clone(),
+                    (equity.tokenized_equity, equity.tokenized_equity_derivative),
+                )
+            })
             .collect();
-        let staging_equities: BTreeMap<Symbol, (Address, Address)> =
-            launch_equities.iter().cloned().collect();
+        assert_eq!(&equities, expected_equities, "{name}");
 
-        for (name, config_str, tokens, expected_equities) in [
-            (
-                "prod",
-                include_str!("../../../config/prod/st0x-hedge.toml"),
-                registry::fixtures::pinned_production_tokens(),
-                &prod_equities,
-            ),
-            (
-                "staging",
-                include_str!("../../../config/staging/st0x-hedge.toml"),
-                registry::fixtures::read("tokens-staging.toml"),
-                &staging_equities,
-            ),
-        ] {
-            let (config, _) = config_from(
-                config_str,
-                Path::new(name),
-                TokenFile::Bytes(&tokens),
-                &mut Vec::new(),
-            )
-            .unwrap();
-            let robinhood = config
-                .chains
-                .get(&Chain::Robinhood)
-                .unwrap_or_else(|| panic!("{name} config must declare [chains.robinhood]"));
-            assert_eq!(robinhood.lifecycle, ChainLifecycle::Prefunded, "{name}");
+        robinhood
+    }
 
-            let trading = robinhood
-                .trading
-                .as_ref()
-                .unwrap_or_else(|| panic!("{name} config must hedge fills on Robinhood"));
-            assert!(!trading.primary, "{name}: Robinhood is a secondary");
-            assert_eq!(trading.orderbook, orderbook, "{name}");
-            assert_eq!(trading.inventory_mode, InventoryModeTag::Managed, "{name}");
-            assert_eq!(trading.inventory, Some(inventory), "{name}");
-            assert_eq!(trading.vault_owner, inventory, "{name}");
-            assert_eq!(trading.deployment_block, 59_557_818, "{name}");
-            assert_eq!(
-                trading.ingestion_cutoff,
-                IngestionCutoffTag::Confirmations,
-                "{name}: Robinhood has no OP-Stack safe tag"
-            );
-            assert_eq!(trading.ingestion_cutoff_confirmations, Some(600), "{name}");
-            assert_eq!(
-                trading.inventory_adapters,
-                InventoryAdapters::default(),
-                "{name}: Bebop is off on Robinhood"
-            );
-            assert_eq!(
-                trading.redemption_wallet, None,
-                "{name}: a hedge-only chain redeems nothing"
-            );
+    /// Staging watches prod's Robinhood inventory on its own broker account,
+    /// so it runs Robinhood as a prefunded hedge-only secondary: nothing is
+    /// rebalanced and nothing is redeemed.
+    #[test]
+    fn shipped_staging_config_hedges_robinhood_prefunded_without_rebalancing() {
+        let robinhood = shipped_robinhood(
+            "staging",
+            include_str!("../../../config/staging/st0x-hedge.toml"),
+            &registry::fixtures::read("tokens-staging.toml"),
+            &robinhood_equities(false),
+        );
+        assert_eq!(robinhood.lifecycle, ChainLifecycle::Prefunded);
 
-            let equities: BTreeMap<Symbol, (Address, Address)> = trading
-                .assets
-                .equities
-                .symbols
-                .iter()
-                .map(|(symbol, equity)| {
-                    assert_eq!(equity.trading, OperationMode::Enabled, "{name} {symbol}");
-                    assert_eq!(
-                        equity.rebalancing,
-                        RebalancingMode::Disabled,
-                        "{name} {symbol}"
-                    );
-                    (
-                        symbol.clone(),
-                        (equity.tokenized_equity, equity.tokenized_equity_derivative),
-                    )
-                })
-                .collect();
-            assert_eq!(&equities, expected_equities, "{name}");
-            assert!(
-                !ChainRole::Secondary.rebalances_equity(&trading.assets),
-                "{name}: no Robinhood equity may opt into rebalancing"
-            );
-
-            let alerts = AlertsCtx::new(config.alerts, &config.chains, &mut Vec::new())
-                .unwrap()
-                .unwrap_or_else(|| panic!("{name}: a hedged Robinhood requires [alerts]"));
-            assert_eq!(
-                alerts.low_balance_threshold_wei(Chain::Robinhood),
-                Some(U256::from(1_000_000_000_000_000_u64)),
-                "{name}: the Robinhood gas threshold is 0.001 ETH"
-            );
+        let trading = robinhood.trading.unwrap();
+        assert_eq!(
+            trading.redemption_wallet, None,
+            "a hedge-only chain redeems nothing"
+        );
+        for (symbol, equity) in &trading.assets.equities.symbols {
+            assert_eq!(equity.rebalancing, RebalancingMode::Disabled, "{symbol}");
         }
+        assert!(
+            !ChainRole::Secondary.rebalances_equity(&trading.assets),
+            "no staging Robinhood equity may opt into rebalancing"
+        );
+    }
+
+    /// Prod runs Robinhood as an active secondary that rebalances DNUT, and
+    /// only DNUT, against Alpaca: with its own target share and a small
+    /// per-operation limit, and with redemptions sent to the issuer wallet
+    /// st0x.issuance signs with on every chain.
+    #[test]
+    fn shipped_prod_config_rebalances_only_dnut_on_robinhood() {
+        let robinhood = shipped_robinhood(
+            "prod",
+            include_str!("../../../config/prod/st0x-hedge.toml"),
+            &registry::fixtures::pinned_production_tokens(),
+            &robinhood_equities(true),
+        );
+        assert_eq!(robinhood.lifecycle, ChainLifecycle::Active);
+
+        let trading = robinhood.trading.unwrap();
+        assert_eq!(
+            trading.redemption_wallet,
+            Some(address!("0x3d0CD66EFA66c05d86c3d4316B03eAE87ab9E8aE"))
+        );
+
+        let dnut = Symbol::new("DNUT").unwrap();
+        for (symbol, equity) in &trading.assets.equities.symbols {
+            let expected = if *symbol == dnut {
+                RebalancingMode::Enabled
+            } else {
+                RebalancingMode::Disabled
+            };
+            assert_eq!(equity.rebalancing, expected, "{symbol}");
+        }
+
+        let dnut = &trading.assets.equities.symbols[&dnut];
+        assert_eq!(dnut.wrapped_equity_recovery, OperationMode::Enabled);
+        assert!(
+            dnut.target_share
+                .expect("DNUT must set its own Robinhood target_share")
+                .inner()
+                .eq(float!(0.4))
+                .unwrap()
+        );
+        assert!(
+            dnut.operational_limit
+                .expect("DNUT must cap each Robinhood operation")
+                .inner()
+                .inner()
+                .eq(float!(25))
+                .unwrap()
+        );
     }
 
     #[test]

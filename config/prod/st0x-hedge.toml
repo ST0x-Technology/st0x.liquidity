@@ -144,14 +144,15 @@ required_confirmations = 12
 lifecycle = "observe-only"
 required_confirmations = 1
 
-# Robinhood Chain (an Arbitrum Orbit L2, chain id 4663): a prefunded
-# hedge-only secondary. Fills on its orderbook are ingested, validated
-# against USDG (pinned in code) and hedged on Alpaca; inventory is topped up
-# by hand and no asset may enable rebalancing (no wrapper or CCTP domain is
-# wired there). Gas is ETH.
+# Robinhood Chain (an Arbitrum Orbit L2, chain id 4663): an active
+# secondary. Fills on its orderbook are ingested, validated against USDG
+# (pinned in code) and hedged on Alpaca. Equity rebalances against Alpaca
+# (mint, wrap, deposit and back) for the listings the token file enables;
+# cash does not, since USDG has no corridor yet. Staging watches the same
+# inventory and stays hedge-only, so only prod moves it. Gas is ETH.
 
 [chains.robinhood]
-lifecycle = "prefunded"
+lifecycle = "active"
 # ~1 s at the ~100 ms block cadence: enough for a load-balanced RPC to have
 # seen the startup USDG approval before it is treated as settled.
 required_confirmations = 10
@@ -176,7 +177,11 @@ ingestion_cutoff = "confirmations"
 ingestion_cutoff_confirmations = 600
 order_fill_poll_interval_secs = 5
 primary = false
-# No redemption_wallet: a hedge-only chain redeems nothing.
+# Alpaca's issuer wallet on this chain, where redemption transfers go.
+# st0x.issuance signs every chain with one key and its redemption poller
+# watches transfers to that key's address, so this equals Base's. That
+# address has sent transactions on 4663 (nonce 556 on 2026-10-06).
+redemption_wallet = "0x3d0CD66EFA66c05d86c3d4316B03eAE87ab9E8aE"
 
 [chains.robinhood.trading.assets.cash]
 # The USDG vault the orders quote against; polled, never rebalanced.
@@ -244,10 +249,12 @@ deviation = 0.05
 
 # Equity allocation across the hedged chains (st0x.liquidity RAI-2082). Base
 # keeps the 50% target and 5% band the retired [rebalancing.equity] table
-# carried; Robinhood is hedge-only and Ethereum runs no orderbook, so neither
-# gets a target and the broker holds the other 50%. alpaca_floor keeps a
-# tenth of every equity's total at the broker as the hedging reserve (inert
-# beside a 50% target: a mint stops there anyway). min_operation_usd sits two
+# carried. Robinhood gets no chain-wide target: each listing it rebalances
+# sets its own target_share in the token file, and validation refuses one
+# that does not. Ethereum runs no orderbook. alpaca_floor keeps a tenth of
+# every equity's total at the broker as the hedging reserve (it binds only
+# where a symbol's targets sum to 0.9, as DNUT's Base 0.5 and Robinhood 0.4
+# do). min_operation_usd sits two
 # orders of magnitude above a Base mint's gas while still letting the cheapest
 # listings rebalance; cooldown_secs matches the inventory staleness bound, so
 # a limit-truncated transfer re-fires once per poll window, not every tick.
@@ -302,8 +309,10 @@ realert_interval = 1
 [alerts.low_balance_thresholds]
 base = "0.05"
 ethereum = "0.005"
-# Robinhood only pays for the startup USDG approval (~50k gas at ~0.05 gwei,
-# under 0.00001 ETH), so 0.001 ETH is hundreds of approvals of headroom.
+# Robinhood pays for the startup approvals and about four transactions per
+# equity mint or redemption (wrap or unwrap, vault deposit or withdraw, the
+# redemption transfer). At ~0.05 gwei each is under 0.00001 ETH, so 0.001
+# ETH is still hundreds of operations of headroom.
 robinhood = "0.001"
 
 # USDC vault and rebalancing settings.
