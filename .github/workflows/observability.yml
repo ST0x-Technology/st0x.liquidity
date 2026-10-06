@@ -31,6 +31,6 @@ jobs:
     concurrency:
       group: observability-${{ github.ref }}
       cancel-in-progress: ${{ github.event_name == 'pull_request' }}
-    uses: ST0x-Technology/.github/.github/workflows/observability.yml@f5fbc1e5468aff3918d6f585dab7ecf029c92153  # observability @ .github main
+    uses: ST0x-Technology/.github/.github/workflows/observability.yml@a1689d50bc42dbb1ffcae353b5d4512c70454c3e  # observability @ .github main
     with:
       app: liquidity
