@@ -10289,6 +10289,16 @@ mod tests {
             assert_eq!(equity.rebalancing, expected, "{symbol}");
         }
 
+        // Both upper bands (0.45 + 0.45) leave the broker its 0.1 floor.
+        assert!(
+            base_trading.assets.equities.symbols[&dnut]
+                .target_share
+                .expect("DNUT must set its own Base target_share")
+                .inner()
+                .eq(float!(0.4))
+                .unwrap()
+        );
+
         let dnut = &trading.assets.equities.symbols[&dnut];
         assert_eq!(dnut.wrapped_equity_recovery, OperationMode::Enabled);
         assert!(
