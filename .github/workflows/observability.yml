@@ -1,0 +1,30 @@
+name: observability
+
+# This repo's Grafana dashboards (observability/dashboards/liquidity/) and alert
+# rules (observability/alerting/liquidity.rules.yml): checked in a throwaway
+# Grafana on every PR, shipped to the T0 observability box's config bucket on
+# master. The flow lives in ST0x-Technology/.github; this is the caller.
+
+on:
+  pull_request:
+    paths:
+      - "observability/**"
+      - ".github/workflows/observability.yml"
+  push:
+    branches: [master]
+    paths:
+      - "observability/**"
+      - ".github/workflows/observability.yml"
+  workflow_dispatch:
+
+jobs:
+  observability:
+    permissions:
+      contents: read
+      id-token: write
+    concurrency:
+      group: observability
+      cancel-in-progress: false
+    uses: ST0x-Technology/.github/.github/workflows/observability.yml@f5fbc1e5468aff3918d6f585dab7ecf029c92153  # observability @ .github main
+    with:
+      app: liquidity

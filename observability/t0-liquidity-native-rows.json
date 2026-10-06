@@ -1,0 +1,1421 @@
+[
+  {
+    "row": {
+      "id": 14,
+      "type": "row",
+      "title": "Hedge execution quality",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 25
+      },
+      "panels": []
+    },
+    "panels": [
+      {
+        "id": 15,
+        "type": "timeseries",
+        "title": "Hedge fill latency percentiles",
+        "description": "Wall-clock seconds from hedge order placement to confirmed fill. The app builds these as a metrics-rs summary (no explicit buckets), so the quantiles come straight off the {quantile=...} label rather than from histogram_quantile. This is the metrics-side view of the SPA's 'Latency percentiles over time' chart \u2014 that chart's per-stage waterfall (detection / decision / submission / execution) comes from the telemetry tables in SQLite and has no metric behind it.",
+        "datasource": {
+          "type": "stackdriver",
+          "uid": "cloudmon"
+        },
+        "targets": [
+          {
+            "refId": "A",
+            "datasource": {
+              "type": "stackdriver",
+              "uid": "cloudmon"
+            },
+            "queryType": "promQL",
+            "promQLQuery": {
+              "projectName": "$env",
+              "expr": "max(hedge_fill_latency_seconds{quantile=\"0.5\"})",
+              "step": "60s",
+              "legendFormat": "p50"
+            },
+            "timeSeriesList": {
+              "projectName": "",
+              "filters": [],
+              "view": "FULL",
+              "groupBys": []
+            }
+          },
+          {
+            "refId": "B",
+            "datasource": {
+              "type": "stackdriver",
+              "uid": "cloudmon"
+            },
+            "queryType": "promQL",
+            "promQLQuery": {
+              "projectName": "$env",
+              "expr": "max(hedge_fill_latency_seconds{quantile=\"0.9\"})",
+              "step": "60s",
+              "legendFormat": "p90"
+            },
+            "timeSeriesList": {
+              "projectName": "",
+              "filters": [],
+              "view": "FULL",
+              "groupBys": []
+            }
+          },
+          {
+            "refId": "C",
+            "datasource": {
+              "type": "stackdriver",
+              "uid": "cloudmon"
+            },
+            "queryType": "promQL",
+            "promQLQuery": {
+              "projectName": "$env",
+              "expr": "max(hedge_fill_latency_seconds{quantile=\"0.99\"})",
+              "step": "60s",
+              "legendFormat": "p99"
+            },
+            "timeSeriesList": {
+              "projectName": "",
+              "filters": [],
+              "view": "FULL",
+              "groupBys": []
+            }
+          }
+        ],
+        "gridPos": {
+          "h": 9,
+          "w": 12,
+          "x": 0,
+          "y": 26
+        },
+        "fieldConfig": {
+          "defaults": {
+            "unit": "s",
+            "decimals": 2,
+            "custom": {
+              "drawStyle": "line",
+              "lineInterpolation": "linear",
+              "lineWidth": 1,
+              "fillOpacity": 0,
+              "showPoints": "never",
+              "pointSize": 5,
+              "spanNulls": true,
+              "stacking": {
+                "mode": "none",
+                "group": "A"
+              },
+              "axisPlacement": "auto",
+              "axisSoftMin": 0
+            }
+          },
+          "overrides": []
+        },
+        "options": {
+          "legend": {
+            "displayMode": "list",
+            "placement": "bottom",
+            "showLegend": true,
+            "calcs": []
+          },
+          "tooltip": {
+            "mode": "multi",
+            "sort": "desc"
+          }
+        }
+      },
+      {
+        "id": 16,
+        "type": "timeseries",
+        "title": "Hedge fill latency by symbol (1h average)",
+        "description": "Average seconds between placing a hedge and it filling, per symbol, derived from the summary's _sum / _count. Spikes mean capital sits exposed longer on that name.",
+        "datasource": {
+          "type": "stackdriver",
+          "uid": "cloudmon"
+        },
+        "targets": [
+          {
+            "refId": "A",
+            "datasource": {
+              "type": "stackdriver",
+              "uid": "cloudmon"
+            },
+            "queryType": "promQL",
+            "promQLQuery": {
+              "projectName": "$env",
+              "expr": "sum by (symbol) (increase(hedge_fill_latency_seconds_sum[1h])) / sum by (symbol) (increase(hedge_fill_latency_seconds_count[1h]))",
+              "step": "60s",
+              "legendFormat": "{{symbol}}"
+            },
+            "timeSeriesList": {
+              "projectName": "",
+              "filters": [],
+              "view": "FULL",
+              "groupBys": []
+            }
+          }
+        ],
+        "gridPos": {
+          "h": 9,
+          "w": 12,
+          "x": 12,
+          "y": 26
+        },
+        "fieldConfig": {
+          "defaults": {
+            "unit": "s",
+            "decimals": 2,
+            "custom": {
+              "drawStyle": "line",
+              "lineInterpolation": "linear",
+              "lineWidth": 1,
+              "fillOpacity": 0,
+              "showPoints": "never",
+              "pointSize": 5,
+              "spanNulls": true,
+              "stacking": {
+                "mode": "none",
+                "group": "A"
+              },
+              "axisPlacement": "auto",
+              "axisSoftMin": 0
+            }
+          },
+          "overrides": []
+        },
+        "options": {
+          "legend": {
+            "displayMode": "table",
+            "placement": "bottom",
+            "showLegend": true,
+            "calcs": [
+              "mean",
+              "max"
+            ]
+          },
+          "tooltip": {
+            "mode": "multi",
+            "sort": "desc"
+          }
+        }
+      },
+      {
+        "id": 17,
+        "type": "timeseries",
+        "title": "Broker errors per hour, by kind",
+        "description": "Alpaca API failures, split by kind (e.g. place_order_failed) and symbol. Empty is the healthy state.",
+        "datasource": {
+          "type": "stackdriver",
+          "uid": "cloudmon"
+        },
+        "targets": [
+          {
+            "refId": "A",
+            "datasource": {
+              "type": "stackdriver",
+              "uid": "cloudmon"
+            },
+            "queryType": "promQL",
+            "promQLQuery": {
+              "projectName": "$env",
+              "expr": "sum by (kind, symbol) (increase(broker_errors_total[1h]))",
+              "step": "60s",
+              "legendFormat": "{{kind}} \u00b7 {{symbol}}"
+            },
+            "timeSeriesList": {
+              "projectName": "",
+              "filters": [],
+              "view": "FULL",
+              "groupBys": []
+            }
+          }
+        ],
+        "gridPos": {
+          "h": 8,
+          "w": 8,
+          "x": 0,
+          "y": 35
+        },
+        "fieldConfig": {
+          "defaults": {
+            "unit": "short",
+            "custom": {
+              "drawStyle": "bars",
+              "lineInterpolation": "linear",
+              "lineWidth": 1,
+              "fillOpacity": 10,
+              "showPoints": "never",
+              "pointSize": 5,
+              "spanNulls": true,
+              "stacking": {
+                "mode": "normal",
+                "group": "A"
+              },
+              "axisPlacement": "auto"
+            }
+          },
+          "overrides": []
+        },
+        "options": {
+          "legend": {
+            "displayMode": "list",
+            "placement": "bottom",
+            "showLegend": true,
+            "calcs": []
+          },
+          "tooltip": {
+            "mode": "multi",
+            "sort": "desc"
+          }
+        }
+      },
+      {
+        "id": 18,
+        "type": "timeseries",
+        "title": "Hedge scans skipped, by cause",
+        "description": "Extended-hours buys the position scan dropped before enqueueing a hedge job, because reference-price resolution or crossing failed. Each one is an on-chain fill that did not get hedged on that pass.",
+        "datasource": {
+          "type": "stackdriver",
+          "uid": "cloudmon"
+        },
+        "targets": [
+          {
+            "refId": "A",
+            "datasource": {
+              "type": "stackdriver",
+              "uid": "cloudmon"
+            },
+            "queryType": "promQL",
+            "promQLQuery": {
+              "projectName": "$env",
+              "expr": "sum by (cause, symbol) (increase(hedge_scan_skipped_total[1h]))",
+              "step": "60s",
+              "legendFormat": "{{cause}} \u00b7 {{symbol}}"
+            },
+            "timeSeriesList": {
+              "projectName": "",
+              "filters": [],
+              "view": "FULL",
+              "groupBys": []
+            }
+          }
+        ],
+        "gridPos": {
+          "h": 8,
+          "w": 8,
+          "x": 8,
+          "y": 35
+        },
+        "fieldConfig": {
+          "defaults": {
+            "unit": "short",
+            "custom": {
+              "drawStyle": "bars",
+              "lineInterpolation": "linear",
+              "lineWidth": 1,
+              "fillOpacity": 10,
+              "showPoints": "never",
+              "pointSize": 5,
+              "spanNulls": true,
+              "stacking": {
+                "mode": "normal",
+                "group": "A"
+              },
+              "axisPlacement": "auto"
+            }
+          },
+          "overrides": []
+        },
+        "options": {
+          "legend": {
+            "displayMode": "list",
+            "placement": "bottom",
+            "showLegend": true,
+            "calcs": []
+          },
+          "tooltip": {
+            "mode": "multi",
+            "sort": "desc"
+          }
+        }
+      },
+      {
+        "id": 19,
+        "type": "timeseries",
+        "title": "Hedges dead-lettered, by reason",
+        "description": "Hedge attempts the process gave up on: a permanent or retry-budget-exhausted pricing failure, or broker rate-limiting that outlived the reschedule budget. Anything here is an unhedged fill that needs a human.",
+        "datasource": {
+          "type": "stackdriver",
+          "uid": "cloudmon"
+        },
+        "targets": [
+          {
+            "refId": "A",
+            "datasource": {
+              "type": "stackdriver",
+              "uid": "cloudmon"
+            },
+            "queryType": "promQL",
+            "promQLQuery": {
+              "projectName": "$env",
+              "expr": "sum by (reason, symbol) (increase(hedge_dead_lettered_total[1h]))",
+              "step": "60s",
+              "legendFormat": "{{reason}} \u00b7 {{symbol}}"
+            },
+            "timeSeriesList": {
+              "projectName": "",
+              "filters": [],
+              "view": "FULL",
+              "groupBys": []
+            }
+          }
+        ],
+        "gridPos": {
+          "h": 8,
+          "w": 8,
+          "x": 16,
+          "y": 35
+        },
+        "fieldConfig": {
+          "defaults": {
+            "unit": "short",
+            "custom": {
+              "drawStyle": "bars",
+              "lineInterpolation": "linear",
+              "lineWidth": 1,
+              "fillOpacity": 10,
+              "showPoints": "never",
+              "pointSize": 5,
+              "spanNulls": true,
+              "stacking": {
+                "mode": "normal",
+                "group": "A"
+              },
+              "axisPlacement": "auto"
+            }
+          },
+          "overrides": []
+        },
+        "options": {
+          "legend": {
+            "displayMode": "list",
+            "placement": "bottom",
+            "showLegend": true,
+            "calcs": []
+          },
+          "tooltip": {
+            "mode": "multi",
+            "sort": "desc"
+          }
+        }
+      },
+      {
+        "id": 20,
+        "type": "timeseries",
+        "title": "Which reference priced each extended-hours limit",
+        "description": "hedge_price_source_total by source (primary_quote / mark / delayed_sip_quote) and path (ordinary_extended / close_flatten). Shows which fallback legs are load-bearing \u2014 a rise in delayed_sip_quote means we are pricing off stale data.",
+        "datasource": {
+          "type": "stackdriver",
+          "uid": "cloudmon"
+        },
+        "targets": [
+          {
+            "refId": "A",
+            "datasource": {
+              "type": "stackdriver",
+              "uid": "cloudmon"
+            },
+            "queryType": "promQL",
+            "promQLQuery": {
+              "projectName": "$env",
+              "expr": "sum by (source, path) (increase(hedge_price_source_total[1h]))",
+              "step": "60s",
+              "legendFormat": "{{source}} \u00b7 {{path}}"
+            },
+            "timeSeriesList": {
+              "projectName": "",
+              "filters": [],
+              "view": "FULL",
+              "groupBys": []
+            }
+          }
+        ],
+        "gridPos": {
+          "h": 8,
+          "w": 24,
+          "x": 0,
+          "y": 43
+        },
+        "fieldConfig": {
+          "defaults": {
+            "unit": "short",
+            "custom": {
+              "drawStyle": "bars",
+              "lineInterpolation": "linear",
+              "lineWidth": 1,
+              "fillOpacity": 15,
+              "showPoints": "never",
+              "pointSize": 5,
+              "spanNulls": true,
+              "stacking": {
+                "mode": "normal",
+                "group": "A"
+              },
+              "axisPlacement": "auto"
+            }
+          },
+          "overrides": []
+        },
+        "options": {
+          "legend": {
+            "displayMode": "table",
+            "placement": "right",
+            "showLegend": true,
+            "calcs": [
+              "sum"
+            ]
+          },
+          "tooltip": {
+            "mode": "multi",
+            "sort": "desc"
+          }
+        }
+      }
+    ]
+  },
+  {
+    "row": {
+      "id": 21,
+      "type": "row",
+      "title": "Close-flatten (end-of-session flattening)",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 51
+      },
+      "panels": []
+    },
+    "panels": [
+      {
+        "id": 22,
+        "type": "timeseries",
+        "title": "Attempts, by post-close gap reason",
+        "description": "Close-flatten hedge pricing attempts, by the post-close gap reason that triggered them.",
+        "datasource": {
+          "type": "stackdriver",
+          "uid": "cloudmon"
+        },
+        "targets": [
+          {
+            "refId": "A",
+            "datasource": {
+              "type": "stackdriver",
+              "uid": "cloudmon"
+            },
+            "queryType": "promQL",
+            "promQLQuery": {
+              "projectName": "$env",
+              "expr": "sum by (reason) (increase(close_flatten_attempts_total[1h]))",
+              "step": "60s",
+              "legendFormat": "{{reason}}"
+            },
+            "timeSeriesList": {
+              "projectName": "",
+              "filters": [],
+              "view": "FULL",
+              "groupBys": []
+            }
+          }
+        ],
+        "gridPos": {
+          "h": 8,
+          "w": 6,
+          "x": 0,
+          "y": 52
+        },
+        "fieldConfig": {
+          "defaults": {
+            "unit": "short",
+            "custom": {
+              "drawStyle": "bars",
+              "lineInterpolation": "linear",
+              "lineWidth": 1,
+              "fillOpacity": 10,
+              "showPoints": "never",
+              "pointSize": 5,
+              "spanNulls": true,
+              "stacking": {
+                "mode": "normal",
+                "group": "A"
+              },
+              "axisPlacement": "auto"
+            }
+          },
+          "overrides": []
+        },
+        "options": {
+          "legend": {
+            "displayMode": "list",
+            "placement": "bottom",
+            "showLegend": true,
+            "calcs": []
+          },
+          "tooltip": {
+            "mode": "multi",
+            "sort": "desc"
+          }
+        }
+      },
+      {
+        "id": 23,
+        "type": "timeseries",
+        "title": "Blocked before submission, by reason",
+        "description": "Close-flatten attempts stopped before they reached the broker. close_time_unknown carries no symbol label; the rest are per symbol.",
+        "datasource": {
+          "type": "stackdriver",
+          "uid": "cloudmon"
+        },
+        "targets": [
+          {
+            "refId": "A",
+            "datasource": {
+              "type": "stackdriver",
+              "uid": "cloudmon"
+            },
+            "queryType": "promQL",
+            "promQLQuery": {
+              "projectName": "$env",
+              "expr": "sum by (reason) (increase(close_flatten_blocked_total[1h]))",
+              "step": "60s",
+              "legendFormat": "{{reason}}"
+            },
+            "timeSeriesList": {
+              "projectName": "",
+              "filters": [],
+              "view": "FULL",
+              "groupBys": []
+            }
+          }
+        ],
+        "gridPos": {
+          "h": 8,
+          "w": 6,
+          "x": 6,
+          "y": 52
+        },
+        "fieldConfig": {
+          "defaults": {
+            "unit": "short",
+            "custom": {
+              "drawStyle": "bars",
+              "lineInterpolation": "linear",
+              "lineWidth": 1,
+              "fillOpacity": 10,
+              "showPoints": "never",
+              "pointSize": 5,
+              "spanNulls": true,
+              "stacking": {
+                "mode": "normal",
+                "group": "A"
+              },
+              "axisPlacement": "auto"
+            }
+          },
+          "overrides": []
+        },
+        "options": {
+          "legend": {
+            "displayMode": "list",
+            "placement": "bottom",
+            "showLegend": true,
+            "calcs": []
+          },
+          "tooltip": {
+            "mode": "multi",
+            "sort": "desc"
+          }
+        }
+      },
+      {
+        "id": 24,
+        "type": "timeseries",
+        "title": "Placements, by cross applied",
+        "description": "Limit orders priced and cleared for submission, bucketed to whole percent of cross. Counts attempts, not orders: a retried or re-driven placement of the same hedge counts again, and an attempt the broker later rejects still counts.",
+        "datasource": {
+          "type": "stackdriver",
+          "uid": "cloudmon"
+        },
+        "targets": [
+          {
+            "refId": "A",
+            "datasource": {
+              "type": "stackdriver",
+              "uid": "cloudmon"
+            },
+            "queryType": "promQL",
+            "promQLQuery": {
+              "projectName": "$env",
+              "expr": "sum by (cross_bucket, direction) (increase(close_flatten_placements_total[1h]))",
+              "step": "60s",
+              "legendFormat": "{{cross_bucket}} \u00b7 {{direction}}"
+            },
+            "timeSeriesList": {
+              "projectName": "",
+              "filters": [],
+              "view": "FULL",
+              "groupBys": []
+            }
+          }
+        ],
+        "gridPos": {
+          "h": 8,
+          "w": 6,
+          "x": 12,
+          "y": 52
+        },
+        "fieldConfig": {
+          "defaults": {
+            "unit": "short",
+            "custom": {
+              "drawStyle": "bars",
+              "lineInterpolation": "linear",
+              "lineWidth": 1,
+              "fillOpacity": 10,
+              "showPoints": "never",
+              "pointSize": 5,
+              "spanNulls": true,
+              "stacking": {
+                "mode": "normal",
+                "group": "A"
+              },
+              "axisPlacement": "auto"
+            }
+          },
+          "overrides": []
+        },
+        "options": {
+          "legend": {
+            "displayMode": "list",
+            "placement": "bottom",
+            "showLegend": true,
+            "calcs": []
+          },
+          "tooltip": {
+            "mode": "multi",
+            "sort": "desc"
+          }
+        }
+      },
+      {
+        "id": 25,
+        "type": "timeseries",
+        "title": "Outcomes",
+        "description": "Terminal broker-state dispatches for close-flatten placements (filled / cancelled / failed). A placement can be observed again until its follow-up job commits the terminal aggregate transition, so treat these as dispatches rather than a strict order count.",
+        "datasource": {
+          "type": "stackdriver",
+          "uid": "cloudmon"
+        },
+        "targets": [
+          {
+            "refId": "A",
+            "datasource": {
+              "type": "stackdriver",
+              "uid": "cloudmon"
+            },
+            "queryType": "promQL",
+            "promQLQuery": {
+              "projectName": "$env",
+              "expr": "sum by (outcome) (increase(close_flatten_outcomes_total[1h]))",
+              "step": "60s",
+              "legendFormat": "{{outcome}}"
+            },
+            "timeSeriesList": {
+              "projectName": "",
+              "filters": [],
+              "view": "FULL",
+              "groupBys": []
+            }
+          }
+        ],
+        "gridPos": {
+          "h": 8,
+          "w": 6,
+          "x": 18,
+          "y": 52
+        },
+        "fieldConfig": {
+          "defaults": {
+            "unit": "short",
+            "custom": {
+              "drawStyle": "bars",
+              "lineInterpolation": "linear",
+              "lineWidth": 1,
+              "fillOpacity": 10,
+              "showPoints": "never",
+              "pointSize": 5,
+              "spanNulls": true,
+              "stacking": {
+                "mode": "normal",
+                "group": "A"
+              },
+              "axisPlacement": "auto"
+            }
+          },
+          "overrides": []
+        },
+        "options": {
+          "legend": {
+            "displayMode": "list",
+            "placement": "bottom",
+            "showLegend": true,
+            "calcs": []
+          },
+          "tooltip": {
+            "mode": "multi",
+            "sort": "desc"
+          }
+        }
+      }
+    ]
+  },
+  {
+    "row": {
+      "id": 26,
+      "type": "row",
+      "title": "Data integrity & ingestion health",
+      "collapsed": false,
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 60
+      },
+      "panels": []
+    },
+    "panels": [
+      {
+        "id": 27,
+        "type": "stat",
+        "title": "Ambiguous settlements (24h)",
+        "description": "Inventory settlements quarantined because one transaction emitted multiple OperatorDeposits or multiple OperatorWithdraws and the legs could not be safely paired. Each one is a held-back settlement.",
+        "datasource": {
+          "type": "stackdriver",
+          "uid": "cloudmon"
+        },
+        "targets": [
+          {
+            "refId": "A",
+            "datasource": {
+              "type": "stackdriver",
+              "uid": "cloudmon"
+            },
+            "queryType": "promQL",
+            "promQLQuery": {
+              "projectName": "$env",
+              "expr": "sum(increase(inventory_ambiguous_settlement_total[24h])) or vector(0)",
+              "step": "60s"
+            },
+            "timeSeriesList": {
+              "projectName": "",
+              "filters": [],
+              "view": "FULL",
+              "groupBys": []
+            },
+            "instant": true
+          }
+        ],
+        "transparent": true,
+        "gridPos": {
+          "h": 5,
+          "w": 6,
+          "x": 0,
+          "y": 61
+        },
+        "fieldConfig": {
+          "defaults": {
+            "mappings": [
+              {
+                "type": "special",
+                "options": {
+                  "match": "null+nan",
+                  "result": {
+                    "text": "NO DATA",
+                    "color": "text",
+                    "index": 99
+                  }
+                }
+              }
+            ],
+            "thresholds": {
+              "mode": "absolute",
+              "steps": [
+                {
+                  "color": "green",
+                  "value": null
+                },
+                {
+                  "color": "orange",
+                  "value": 1
+                }
+              ]
+            },
+            "displayName": "QUARANTINED",
+            "unit": "short",
+            "decimals": 0
+          },
+          "overrides": []
+        },
+        "options": {
+          "colorMode": "value",
+          "graphMode": "none",
+          "textMode": "value_and_name",
+          "justifyMode": "center",
+          "text": {
+            "titleSize": 14,
+            "valueSize": 34
+          },
+          "reduceOptions": {
+            "calcs": [
+              "lastNotNull"
+            ],
+            "fields": "",
+            "values": false
+          }
+        }
+      },
+      {
+        "id": 28,
+        "type": "stat",
+        "title": "Unpaired settlement legs (24h)",
+        "description": "OperatorDeposit / OperatorWithdraw legs with no same-transaction counterpart in the batch.",
+        "datasource": {
+          "type": "stackdriver",
+          "uid": "cloudmon"
+        },
+        "targets": [
+          {
+            "refId": "A",
+            "datasource": {
+              "type": "stackdriver",
+              "uid": "cloudmon"
+            },
+            "queryType": "promQL",
+            "promQLQuery": {
+              "projectName": "$env",
+              "expr": "sum(increase(inventory_unpaired_settlement_total[24h])) or vector(0)",
+              "step": "60s"
+            },
+            "timeSeriesList": {
+              "projectName": "",
+              "filters": [],
+              "view": "FULL",
+              "groupBys": []
+            },
+            "instant": true
+          }
+        ],
+        "transparent": true,
+        "gridPos": {
+          "h": 5,
+          "w": 6,
+          "x": 6,
+          "y": 61
+        },
+        "fieldConfig": {
+          "defaults": {
+            "mappings": [
+              {
+                "type": "special",
+                "options": {
+                  "match": "null+nan",
+                  "result": {
+                    "text": "NO DATA",
+                    "color": "text",
+                    "index": 99
+                  }
+                }
+              }
+            ],
+            "thresholds": {
+              "mode": "absolute",
+              "steps": [
+                {
+                  "color": "green",
+                  "value": null
+                },
+                {
+                  "color": "orange",
+                  "value": 1
+                }
+              ]
+            },
+            "displayName": "UNPAIRED LEGS",
+            "unit": "short",
+            "decimals": 0
+          },
+          "overrides": []
+        },
+        "options": {
+          "colorMode": "value",
+          "graphMode": "none",
+          "textMode": "value_and_name",
+          "justifyMode": "center",
+          "text": {
+            "titleSize": 14,
+            "valueSize": 34
+          },
+          "reduceOptions": {
+            "calcs": [
+              "lastNotNull"
+            ],
+            "fields": "",
+            "values": false
+          }
+        }
+      },
+      {
+        "id": 29,
+        "type": "stat",
+        "title": "Unusable snapshot marks (24h)",
+        "description": "Nonzero equity balances captured with a missing or stale USD mark. These make the portfolio snapshot \u2014 and therefore the PnL replay in the SPA \u2014 incomplete for that interval.",
+        "datasource": {
+          "type": "stackdriver",
+          "uid": "cloudmon"
+        },
+        "targets": [
+          {
+            "refId": "A",
+            "datasource": {
+              "type": "stackdriver",
+              "uid": "cloudmon"
+            },
+            "queryType": "promQL",
+            "promQLQuery": {
+              "projectName": "$env",
+              "expr": "sum(increase(portfolio_snapshot_unusable_mark_total[24h])) or vector(0)",
+              "step": "60s"
+            },
+            "timeSeriesList": {
+              "projectName": "",
+              "filters": [],
+              "view": "FULL",
+              "groupBys": []
+            },
+            "instant": true
+          }
+        ],
+        "transparent": true,
+        "gridPos": {
+          "h": 5,
+          "w": 6,
+          "x": 12,
+          "y": 61
+        },
+        "fieldConfig": {
+          "defaults": {
+            "mappings": [
+              {
+                "type": "special",
+                "options": {
+                  "match": "null+nan",
+                  "result": {
+                    "text": "NO DATA",
+                    "color": "text",
+                    "index": 99
+                  }
+                }
+              }
+            ],
+            "thresholds": {
+              "mode": "absolute",
+              "steps": [
+                {
+                  "color": "green",
+                  "value": null
+                },
+                {
+                  "color": "orange",
+                  "value": 1
+                }
+              ]
+            },
+            "displayName": "BAD MARKS",
+            "unit": "short",
+            "decimals": 0
+          },
+          "overrides": []
+        },
+        "options": {
+          "colorMode": "value",
+          "graphMode": "none",
+          "textMode": "value_and_name",
+          "justifyMode": "center",
+          "text": {
+            "titleSize": 14,
+            "valueSize": 34
+          },
+          "reduceOptions": {
+            "calcs": [
+              "lastNotNull"
+            ],
+            "fields": "",
+            "values": false
+          }
+        }
+      },
+      {
+        "id": 30,
+        "type": "stat",
+        "title": "PnL ledger checkpoint lag",
+        "description": "How many events the PnL ledger's checkpoint trails the event store by. The PnL numbers themselves are computed by the backend from SQLite and are not exported \u2014 this gauge is the one PnL signal that reaches Grafana, and it answers 'is the PnL panel's input keeping up?'.",
+        "datasource": {
+          "type": "stackdriver",
+          "uid": "cloudmon"
+        },
+        "targets": [
+          {
+            "refId": "A",
+            "datasource": {
+              "type": "stackdriver",
+              "uid": "cloudmon"
+            },
+            "queryType": "promQL",
+            "promQLQuery": {
+              "projectName": "$env",
+              "expr": "max(pnl_ledger_checkpoint_lag_events) or vector(0)",
+              "step": "60s"
+            },
+            "timeSeriesList": {
+              "projectName": "",
+              "filters": [],
+              "view": "FULL",
+              "groupBys": []
+            },
+            "instant": true
+          }
+        ],
+        "transparent": true,
+        "gridPos": {
+          "h": 5,
+          "w": 6,
+          "x": 18,
+          "y": 61
+        },
+        "fieldConfig": {
+          "defaults": {
+            "mappings": [
+              {
+                "type": "special",
+                "options": {
+                  "match": "null+nan",
+                  "result": {
+                    "text": "NO DATA",
+                    "color": "text",
+                    "index": 99
+                  }
+                }
+              }
+            ],
+            "thresholds": {
+              "mode": "absolute",
+              "steps": [
+                {
+                  "color": "green",
+                  "value": null
+                },
+                {
+                  "color": "yellow",
+                  "value": 100
+                },
+                {
+                  "color": "orange",
+                  "value": 1000
+                }
+              ]
+            },
+            "displayName": "EVENTS BEHIND",
+            "unit": "short",
+            "decimals": 0
+          },
+          "overrides": []
+        },
+        "options": {
+          "colorMode": "value",
+          "graphMode": "none",
+          "textMode": "value_and_name",
+          "justifyMode": "center",
+          "text": {
+            "titleSize": 14,
+            "valueSize": 34
+          },
+          "reduceOptions": {
+            "calcs": [
+              "lastNotNull"
+            ],
+            "fields": "",
+            "values": false
+          }
+        }
+      },
+      {
+        "id": 31,
+        "type": "timeseries",
+        "title": "Scrape health",
+        "description": "The Ops Agent's own view of the bot's /metrics endpoint: 1 = scraped successfully, 0 = the endpoint did not answer. Every other panel on this dashboard goes blank while this is 0, so check it first before concluding the bot is idle.",
+        "datasource": {
+          "type": "stackdriver",
+          "uid": "cloudmon"
+        },
+        "targets": [
+          {
+            "refId": "A",
+            "datasource": {
+              "type": "stackdriver",
+              "uid": "cloudmon"
+            },
+            "queryType": "promQL",
+            "promQLQuery": {
+              "projectName": "$env",
+              "expr": "up{job=~\"t0-liquidity.*\"}",
+              "step": "60s",
+              "legendFormat": "{{job}} \u00b7 {{instance}}"
+            },
+            "timeSeriesList": {
+              "projectName": "",
+              "filters": [],
+              "view": "FULL",
+              "groupBys": []
+            }
+          }
+        ],
+        "gridPos": {
+          "h": 8,
+          "w": 8,
+          "x": 0,
+          "y": 66
+        },
+        "fieldConfig": {
+          "defaults": {
+            "unit": "short",
+            "decimals": 0,
+            "min": 0,
+            "max": 1,
+            "custom": {
+              "drawStyle": "line",
+              "lineInterpolation": "linear",
+              "lineWidth": 1,
+              "fillOpacity": 12,
+              "showPoints": "never",
+              "pointSize": 5,
+              "spanNulls": true,
+              "stacking": {
+                "mode": "none",
+                "group": "A"
+              },
+              "axisPlacement": "auto"
+            }
+          },
+          "overrides": []
+        },
+        "options": {
+          "legend": {
+            "displayMode": "list",
+            "placement": "bottom",
+            "showLegend": true,
+            "calcs": []
+          },
+          "tooltip": {
+            "mode": "multi",
+            "sort": "desc"
+          }
+        }
+      },
+      {
+        "id": 32,
+        "type": "timeseries",
+        "title": "Scrape duration and series count",
+        "description": "How long the scrape takes and how many series come back. A series count that collapses to near zero while up=1 means the bot restarted and its counters reset.",
+        "datasource": {
+          "type": "stackdriver",
+          "uid": "cloudmon"
+        },
+        "targets": [
+          {
+            "refId": "A",
+            "datasource": {
+              "type": "stackdriver",
+              "uid": "cloudmon"
+            },
+            "queryType": "promQL",
+            "promQLQuery": {
+              "projectName": "$env",
+              "expr": "scrape_duration_seconds{job=~\"t0-liquidity.*\"}",
+              "step": "60s",
+              "legendFormat": "scrape duration"
+            },
+            "timeSeriesList": {
+              "projectName": "",
+              "filters": [],
+              "view": "FULL",
+              "groupBys": []
+            }
+          },
+          {
+            "refId": "B",
+            "datasource": {
+              "type": "stackdriver",
+              "uid": "cloudmon"
+            },
+            "queryType": "promQL",
+            "promQLQuery": {
+              "projectName": "$env",
+              "expr": "scrape_samples_scraped{job=~\"t0-liquidity.*\"}",
+              "step": "60s",
+              "legendFormat": "samples scraped"
+            },
+            "timeSeriesList": {
+              "projectName": "",
+              "filters": [],
+              "view": "FULL",
+              "groupBys": []
+            }
+          }
+        ],
+        "gridPos": {
+          "h": 8,
+          "w": 8,
+          "x": 8,
+          "y": 66
+        },
+        "fieldConfig": {
+          "defaults": {
+            "unit": "short",
+            "custom": {
+              "drawStyle": "line",
+              "lineInterpolation": "linear",
+              "lineWidth": 1,
+              "fillOpacity": 0,
+              "showPoints": "never",
+              "pointSize": 5,
+              "spanNulls": true,
+              "stacking": {
+                "mode": "none",
+                "group": "A"
+              },
+              "axisPlacement": "auto",
+              "axisSoftMin": 0
+            }
+          },
+          "overrides": []
+        },
+        "options": {
+          "legend": {
+            "displayMode": "list",
+            "placement": "bottom",
+            "showLegend": true,
+            "calcs": []
+          },
+          "tooltip": {
+            "mode": "multi",
+            "sort": "desc"
+          }
+        }
+      },
+      {
+        "id": 33,
+        "type": "timeseries",
+        "title": "Bot-gas redrives and PnL catch-up failures",
+        "description": "bot_gas_redrive_total: receipt-cost enqueue failures redriven instead of failing the triggering job. pnl_ledger_catch_up_failures_total: the PnL ledger failing to catch up to the event store. Both are self-healing retries \u2014 a steady rate means something underneath is not healing.",
+        "datasource": {
+          "type": "stackdriver",
+          "uid": "cloudmon"
+        },
+        "targets": [
+          {
+            "refId": "A",
+            "datasource": {
+              "type": "stackdriver",
+              "uid": "cloudmon"
+            },
+            "queryType": "promQL",
+            "promQLQuery": {
+              "projectName": "$env",
+              "expr": "sum by (job) (increase(bot_gas_redrive_total[1h]))",
+              "step": "60s",
+              "legendFormat": "bot-gas redrive \u00b7 {{job}}"
+            },
+            "timeSeriesList": {
+              "projectName": "",
+              "filters": [],
+              "view": "FULL",
+              "groupBys": []
+            }
+          },
+          {
+            "refId": "B",
+            "datasource": {
+              "type": "stackdriver",
+              "uid": "cloudmon"
+            },
+            "queryType": "promQL",
+            "promQLQuery": {
+              "projectName": "$env",
+              "expr": "sum(increase(pnl_ledger_catch_up_failures_total[1h]))",
+              "step": "60s",
+              "legendFormat": "PnL catch-up failures"
+            },
+            "timeSeriesList": {
+              "projectName": "",
+              "filters": [],
+              "view": "FULL",
+              "groupBys": []
+            }
+          }
+        ],
+        "gridPos": {
+          "h": 8,
+          "w": 8,
+          "x": 16,
+          "y": 66
+        },
+        "fieldConfig": {
+          "defaults": {
+            "unit": "short",
+            "custom": {
+              "drawStyle": "bars",
+              "lineInterpolation": "linear",
+              "lineWidth": 1,
+              "fillOpacity": 10,
+              "showPoints": "never",
+              "pointSize": 5,
+              "spanNulls": true,
+              "stacking": {
+                "mode": "none",
+                "group": "A"
+              },
+              "axisPlacement": "auto",
+              "axisSoftMin": 0
+            }
+          },
+          "overrides": []
+        },
+        "options": {
+          "legend": {
+            "displayMode": "list",
+            "placement": "bottom",
+            "showLegend": true,
+            "calcs": []
+          },
+          "tooltip": {
+            "mode": "multi",
+            "sort": "desc"
+          }
+        }
+      }
+    ]
+  }
+]

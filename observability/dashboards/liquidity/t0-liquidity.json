@@ -1,0 +1,2867 @@
+{
+  "uid": "t0-liquidity",
+  "title": "Liquidity bot",
+  "description": "1:1 Grafana rendering of the liquidity bot's own dashboard, fed by the exporter sidecar on the VM. Five linked boards mimic the SPA's tabs \u2014 use the Dashboard/Orders/PnL/Performance/Logs links above (they carry theme=light so the suite matches the SPA's look). Refresh is 1m polling, not WebSocket-live. On a relative range (the default now-24h) the header and the inventory show the live state, the last 5 minutes, and trades and transfers show the last 30 days. An absolute range shows that range's data in every panel. Open it with &autofitpanels (the Dashboard tab link does) to fill the window height like the SPA. Full history and drilldowns: the IAP dashboard at https://liquidity.t0trade.com (production), or gcloud compute start-iap-tunnel <vm> 8080 --local-host-port=localhost:8080 --zone europe-west3-b --project $env (VM name = project id)",
+  "tags": [
+    "liquidity",
+    "bot",
+    "t0"
+  ],
+  "timezone": "utc",
+  "editable": true,
+  "graphTooltip": 1,
+  "schemaVersion": 39,
+  "refresh": "1m",
+  "time": {
+    "from": "now-24h",
+    "to": "now"
+  },
+  "templating": {
+    "list": [
+      {
+        "name": "env",
+        "type": "custom",
+        "label": "Environment",
+        "description": "GCP project id \u2014 both the Cloud Monitoring and Cloud Logging queries take it directly.",
+        "query": "production : t0-liquidity, staging : t0-liquidity-staging",
+        "includeAll": false,
+        "multi": false,
+        "hide": 0,
+        "current": {
+          "selected": true,
+          "text": "production",
+          "value": "t0-liquidity"
+        },
+        "options": [
+          {
+            "selected": true,
+            "text": "production",
+            "value": "t0-liquidity"
+          },
+          {
+            "selected": false,
+            "text": "staging",
+            "value": "t0-liquidity-staging"
+          }
+        ]
+      }
+    ]
+  },
+  "links": [
+    {
+      "type": "link",
+      "title": "\u25b8 Dashboard",
+      "url": "/d/t0-liquidity/?theme=light&autofitpanels",
+      "icon": "dashboard",
+      "targetBlank": false,
+      "keepTime": true,
+      "includeVars": true,
+      "asDropdown": false,
+      "tags": [],
+      "tooltip": ""
+    },
+    {
+      "type": "link",
+      "title": "Orders",
+      "url": "/d/t0-liquidity-orders/?theme=light",
+      "icon": "dashboard",
+      "targetBlank": false,
+      "keepTime": true,
+      "includeVars": true,
+      "asDropdown": false,
+      "tags": [],
+      "tooltip": ""
+    },
+    {
+      "type": "link",
+      "title": "PnL",
+      "url": "/d/t0-liquidity-pnl/?theme=light",
+      "icon": "dashboard",
+      "targetBlank": false,
+      "keepTime": true,
+      "includeVars": true,
+      "asDropdown": false,
+      "tags": [],
+      "tooltip": ""
+    },
+    {
+      "type": "link",
+      "title": "Performance",
+      "url": "/d/t0-liquidity-performance/?theme=light",
+      "icon": "dashboard",
+      "targetBlank": false,
+      "keepTime": true,
+      "includeVars": true,
+      "asDropdown": false,
+      "tags": [],
+      "tooltip": ""
+    },
+    {
+      "type": "link",
+      "title": "Logs",
+      "url": "/d/t0-liquidity-logs/?theme=light",
+      "icon": "dashboard",
+      "targetBlank": false,
+      "keepTime": true,
+      "includeVars": true,
+      "asDropdown": false,
+      "tags": [],
+      "tooltip": ""
+    },
+    {
+      "type": "dashboards",
+      "title": "Related",
+      "tags": [
+        "t0"
+      ],
+      "asDropdown": true,
+      "icon": "external link",
+      "includeVars": false,
+      "keepTime": true,
+      "targetBlank": false,
+      "tooltip": "Other T0 dashboards"
+    }
+  ],
+  "panels": [
+    {
+      "id": 1,
+      "type": "stat",
+      "title": "",
+      "description": "The SPA header's connection light: is the bot process up and answering /health? '\u2014' means the exporter itself is not reporting.",
+      "datasource": {
+        "type": "stackdriver",
+        "uid": "cloudmon"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "stackdriver",
+            "uid": "cloudmon"
+          },
+          "queryType": "promQL",
+          "promQLQuery": {
+            "projectName": "$env",
+            "expr": "max(liq_up)",
+            "step": "60s"
+          },
+          "timeSeriesList": {
+            "projectName": "",
+            "filters": [],
+            "view": "FULL",
+            "groupBys": []
+          },
+          "instant": true
+        }
+      ],
+      "transparent": true,
+      "gridPos": {
+        "h": 1,
+        "w": 3,
+        "x": 0,
+        "y": 0
+      },
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            {
+              "type": "value",
+              "options": {
+                "1": {
+                  "text": "Connected",
+                  "color": "green",
+                  "index": 0
+                },
+                "0": {
+                  "text": "Disconnected",
+                  "color": "red",
+                  "index": 1
+                }
+              }
+            },
+            {
+              "type": "special",
+              "options": {
+                "match": "null+nan",
+                "result": {
+                  "text": "\u2014",
+                  "color": "text",
+                  "index": 99
+                }
+              }
+            }
+          ],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": null
+              }
+            ]
+          },
+          "unit": "short",
+          "displayName": "Bot"
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "value",
+        "graphMode": "none",
+        "textMode": "value_and_name",
+        "justifyMode": "center",
+        "text": {
+          "valueSize": 14,
+          "titleSize": 12
+        },
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        }
+      },
+      "timeFrom": "5m",
+      "hideTimeOverride": true
+    },
+    {
+      "id": 2,
+      "type": "stat",
+      "title": "",
+      "description": "Deployed commit, from /health, cut to 7 characters like the SPA header. The stackdriver plugin runs a range query even for an instant target, so over the dashboard's 24h the previous commit is a second series and its name drew over this one. PromQL also keeps a stopped series for its 5m lookback, so topk on the sample timestamp keeps only the commit with the newest sample, over a 1m window.",
+      "datasource": {
+        "type": "stackdriver",
+        "uid": "cloudmon"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "stackdriver",
+            "uid": "cloudmon"
+          },
+          "queryType": "promQL",
+          "promQLQuery": {
+            "projectName": "$env",
+            "expr": "max by (git_commit) (topk(1, label_replace(timestamp(liq_bot_info), \"git_commit\", \"$1\", \"git_commit\", \"(.{7}).*\")))",
+            "step": "60s"
+          },
+          "timeSeriesList": {
+            "projectName": "",
+            "filters": [],
+            "view": "FULL",
+            "groupBys": []
+          },
+          "instant": true,
+          "legendFormat": "{{git_commit}}"
+        }
+      ],
+      "transparent": true,
+      "gridPos": {
+        "h": 1,
+        "w": 3,
+        "x": 3,
+        "y": 0
+      },
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            {
+              "type": "special",
+              "options": {
+                "match": "null+nan",
+                "result": {
+                  "text": "\u2014",
+                  "color": "text",
+                  "index": 99
+                }
+              }
+            }
+          ],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": null
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "none",
+        "graphMode": "none",
+        "textMode": "name",
+        "justifyMode": "center",
+        "text": {
+          "valueSize": 14,
+          "titleSize": 12
+        },
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        }
+      },
+      "timeFrom": "1m",
+      "hideTimeOverride": true
+    },
+    {
+      "id": 3,
+      "type": "stat",
+      "title": "",
+      "description": "Bot process uptime, from /health uptimeSeconds.",
+      "datasource": {
+        "type": "stackdriver",
+        "uid": "cloudmon"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "stackdriver",
+            "uid": "cloudmon"
+          },
+          "queryType": "promQL",
+          "promQLQuery": {
+            "projectName": "$env",
+            "expr": "time() - max(liq_bot_start_timestamp_seconds)",
+            "step": "60s"
+          },
+          "timeSeriesList": {
+            "projectName": "",
+            "filters": [],
+            "view": "FULL",
+            "groupBys": []
+          },
+          "instant": true
+        }
+      ],
+      "transparent": true,
+      "gridPos": {
+        "h": 1,
+        "w": 3,
+        "x": 6,
+        "y": 0
+      },
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            {
+              "type": "special",
+              "options": {
+                "match": "null+nan",
+                "result": {
+                  "text": "\u2014",
+                  "color": "text",
+                  "index": 99
+                }
+              }
+            }
+          ],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": null
+              }
+            ]
+          },
+          "unit": "s",
+          "displayName": "Uptime",
+          "decimals": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "none",
+        "graphMode": "none",
+        "textMode": "value_and_name",
+        "justifyMode": "center",
+        "text": {
+          "valueSize": 14,
+          "titleSize": 12
+        },
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        }
+      },
+      "timeFrom": "5m",
+      "hideTimeOverride": true
+    },
+    {
+      "id": 4,
+      "type": "stat",
+      "title": "",
+      "description": "The SPA settings bar's Broker pill.",
+      "datasource": {
+        "type": "stackdriver",
+        "uid": "cloudmon"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "stackdriver",
+            "uid": "cloudmon"
+          },
+          "queryType": "promQL",
+          "promQLQuery": {
+            "projectName": "$env",
+            "expr": "sum by (broker) (liq_settings_info)",
+            "step": "60s"
+          },
+          "timeSeriesList": {
+            "projectName": "",
+            "filters": [],
+            "view": "FULL",
+            "groupBys": []
+          },
+          "instant": true,
+          "legendFormat": "{{broker}}"
+        }
+      ],
+      "transparent": true,
+      "gridPos": {
+        "h": 1,
+        "w": 3,
+        "x": 9,
+        "y": 0
+      },
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            {
+              "type": "special",
+              "options": {
+                "match": "null+nan",
+                "result": {
+                  "text": "\u2014",
+                  "color": "text",
+                  "index": 99
+                }
+              }
+            }
+          ],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": null
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "none",
+        "graphMode": "none",
+        "textMode": "name",
+        "justifyMode": "center",
+        "text": {
+          "valueSize": 14,
+          "titleSize": 12
+        },
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        }
+      },
+      "timeFrom": "5m",
+      "hideTimeOverride": true
+    },
+    {
+      "id": 5,
+      "type": "stat",
+      "title": "",
+      "description": "Equity rebalance target. The SPA pill also shows the band: target +/- liq_settings_equity_deviation.",
+      "datasource": {
+        "type": "stackdriver",
+        "uid": "cloudmon"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "stackdriver",
+            "uid": "cloudmon"
+          },
+          "queryType": "promQL",
+          "promQLQuery": {
+            "projectName": "$env",
+            "expr": "max(liq_settings_equity_target)",
+            "step": "60s"
+          },
+          "timeSeriesList": {
+            "projectName": "",
+            "filters": [],
+            "view": "FULL",
+            "groupBys": []
+          },
+          "instant": true
+        }
+      ],
+      "transparent": true,
+      "gridPos": {
+        "h": 1,
+        "w": 4,
+        "x": 12,
+        "y": 0
+      },
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            {
+              "type": "special",
+              "options": {
+                "match": "null+nan",
+                "result": {
+                  "text": "\u2014",
+                  "color": "text",
+                  "index": 99
+                }
+              }
+            }
+          ],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": null
+              }
+            ]
+          },
+          "unit": "percentunit",
+          "displayName": "Equity",
+          "decimals": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "none",
+        "graphMode": "none",
+        "textMode": "value_and_name",
+        "justifyMode": "center",
+        "text": {
+          "valueSize": 14,
+          "titleSize": 12
+        },
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        }
+      },
+      "timeFrom": "5m",
+      "hideTimeOverride": true
+    },
+    {
+      "id": 6,
+      "type": "stat",
+      "title": "",
+      "description": "USDC rebalance target. The SPA pill also shows the band: target +/- liq_settings_usdc_deviation.",
+      "datasource": {
+        "type": "stackdriver",
+        "uid": "cloudmon"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "stackdriver",
+            "uid": "cloudmon"
+          },
+          "queryType": "promQL",
+          "promQLQuery": {
+            "projectName": "$env",
+            "expr": "max(liq_settings_usdc_target)",
+            "step": "60s"
+          },
+          "timeSeriesList": {
+            "projectName": "",
+            "filters": [],
+            "view": "FULL",
+            "groupBys": []
+          },
+          "instant": true
+        }
+      ],
+      "transparent": true,
+      "gridPos": {
+        "h": 1,
+        "w": 4,
+        "x": 16,
+        "y": 0
+      },
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            {
+              "type": "special",
+              "options": {
+                "match": "null+nan",
+                "result": {
+                  "text": "\u2014",
+                  "color": "text",
+                  "index": 99
+                }
+              }
+            }
+          ],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": null
+              }
+            ]
+          },
+          "unit": "percentunit",
+          "displayName": "USDC",
+          "decimals": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "none",
+        "graphMode": "none",
+        "textMode": "value_and_name",
+        "justifyMode": "center",
+        "text": {
+          "valueSize": 14,
+          "titleSize": 12
+        },
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        }
+      },
+      "timeFrom": "5m",
+      "hideTimeOverride": true
+    },
+    {
+      "id": 7,
+      "type": "stat",
+      "title": "",
+      "description": "Hedge execution threshold (settings bar 'Trigger').",
+      "datasource": {
+        "type": "stackdriver",
+        "uid": "cloudmon"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "stackdriver",
+            "uid": "cloudmon"
+          },
+          "queryType": "promQL",
+          "promQLQuery": {
+            "projectName": "$env",
+            "expr": "max(liq_settings_execution_threshold_usd)",
+            "step": "60s"
+          },
+          "timeSeriesList": {
+            "projectName": "",
+            "filters": [],
+            "view": "FULL",
+            "groupBys": []
+          },
+          "instant": true
+        }
+      ],
+      "transparent": true,
+      "gridPos": {
+        "h": 1,
+        "w": 4,
+        "x": 20,
+        "y": 0
+      },
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            {
+              "type": "special",
+              "options": {
+                "match": "null+nan",
+                "result": {
+                  "text": "\u2014",
+                  "color": "text",
+                  "index": 99
+                }
+              }
+            }
+          ],
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": null
+              }
+            ]
+          },
+          "unit": "currencyUSD",
+          "displayName": "Trigger",
+          "decimals": 0
+        },
+        "overrides": []
+      },
+      "options": {
+        "colorMode": "none",
+        "graphMode": "none",
+        "textMode": "value_and_name",
+        "justifyMode": "center",
+        "text": {
+          "valueSize": 14,
+          "titleSize": 12
+        },
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        }
+      },
+      "timeFrom": "5m",
+      "hideTimeOverride": true
+    },
+    {
+      "id": 8,
+      "type": "table",
+      "title": "Inventory",
+      "description": "The SPA's USDC row: Raindex + Alpaca Total + Inflight = Total; Ratio = Raindex/(Raindex+Alpaca Total); \u0394 = deviation from the target ratio in band widths, colored outside +/-1, where the SPA colors its bar.",
+      "datasource": {
+        "type": "stackdriver",
+        "uid": "cloudmon"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "stackdriver",
+            "uid": "cloudmon"
+          },
+          "queryType": "promQL",
+          "promQLQuery": {
+            "projectName": "$env",
+            "expr": "sum by (row, col) (label_replace(label_replace(liq_usdc_onchain_available, \"row\", \"USDC\", \"\", \"\"), \"col\", \"Raindex\", \"\", \"\")) or sum by (row, col) (label_replace(label_replace(liq_usdc_inflight_total, \"row\", \"USDC\", \"\", \"\"), \"col\", \"Inflight\", \"\", \"\")) or sum by (row, col) (label_replace(label_replace(liq_usdc_alpaca_total, \"row\", \"USDC\", \"\", \"\"), \"col\", \"Alpaca Total\", \"\", \"\")) or sum by (row, col) (label_replace(label_replace(liq_usdc_total, \"row\", \"USDC\", \"\", \"\"), \"col\", \"Total\", \"\", \"\")) or sum by (row, col) (label_replace(label_replace(liq_usdc_ratio, \"row\", \"USDC\", \"\", \"\"), \"col\", \"Ratio\", \"\", \"\")) or sum by (row, col) (label_replace(label_replace(liq_usdc_ratio_deviation and liq_usdc_total > 0, \"row\", \"USDC\", \"\", \"\"), \"col\", \"\u0394\", \"\", \"\"))",
+            "step": "60s"
+          },
+          "timeSeriesList": {
+            "projectName": "",
+            "filters": [],
+            "view": "FULL",
+            "groupBys": []
+          },
+          "instant": true
+        }
+      ],
+      "gridPos": {
+        "h": 4,
+        "w": 7,
+        "x": 0,
+        "y": 1
+      },
+      "transformations": [
+        {
+          "id": "labelsToFields",
+          "options": {}
+        },
+        {
+          "id": "merge",
+          "options": {}
+        },
+        {
+          "id": "groupBy",
+          "options": {
+            "fields": {
+              "row": {
+                "operation": "groupby",
+                "aggregations": []
+              },
+              "col": {
+                "operation": "groupby",
+                "aggregations": []
+              },
+              "Value": {
+                "operation": "aggregate",
+                "aggregations": [
+                  "lastNotNull"
+                ]
+              }
+            }
+          }
+        },
+        {
+          "id": "groupingToMatrix",
+          "options": {
+            "columnField": "col",
+            "rowField": "row",
+            "valueField": "Value (lastNotNull)",
+            "emptyValue": "null"
+          }
+        },
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {},
+            "renameByName": {
+              "row\\col": "Asset"
+            },
+            "indexByName": {
+              "row\\col": 0,
+              "Raindex": 1,
+              "Inflight": 2,
+              "Alpaca Total": 3,
+              "Total": 4,
+              "Ratio": 5,
+              "\u0394": 6
+            }
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 2,
+          "custom": {
+            "align": "auto",
+            "filterable": false,
+            "cellOptions": {
+              "type": "auto"
+            },
+            "minWidth": 40
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": null
+              }
+            ]
+          },
+          "mappings": []
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Asset"
+            },
+            "properties": [
+              {
+                "id": "custom.width",
+                "value": 50
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Inflight"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "locale"
+              },
+              {
+                "id": "decimals",
+                "value": 2
+              },
+              {
+                "id": "custom.width",
+                "value": 80
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Raindex"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "locale"
+              },
+              {
+                "id": "decimals",
+                "value": 2
+              },
+              {
+                "id": "custom.width",
+                "value": 90
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Alpaca Total"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "locale"
+              },
+              {
+                "id": "decimals",
+                "value": 2
+              },
+              {
+                "id": "custom.width",
+                "value": 90
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Total"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "locale"
+              },
+              {
+                "id": "decimals",
+                "value": 2
+              },
+              {
+                "id": "custom.width",
+                "value": 90
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Ratio"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "percentunit"
+              },
+              {
+                "id": "decimals",
+                "value": 1
+              },
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "gauge",
+                  "mode": "basic",
+                  "valueDisplayMode": "text"
+                }
+              },
+              {
+                "id": "min",
+                "value": 0
+              },
+              {
+                "id": "max",
+                "value": 1
+              },
+              {
+                "id": "thresholds",
+                "value": {
+                  "mode": "absolute",
+                  "steps": [
+                    {
+                      "color": "blue",
+                      "value": null
+                    }
+                  ]
+                }
+              },
+              {
+                "id": "custom.width",
+                "value": 75
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "\u0394"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "short"
+              },
+              {
+                "id": "decimals",
+                "value": 1
+              },
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "color-text"
+                }
+              },
+              {
+                "id": "custom.width",
+                "value": 45
+              },
+              {
+                "id": "thresholds",
+                "value": {
+                  "mode": "absolute",
+                  "steps": [
+                    {
+                      "color": "red",
+                      "value": null
+                    },
+                    {
+                      "color": "text",
+                      "value": -1
+                    },
+                    {
+                      "color": "green",
+                      "value": 1
+                    }
+                  ]
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "showHeader": true,
+        "cellHeight": "sm"
+      },
+      "timeFrom": "5m",
+      "hideTimeOverride": false
+    },
+    {
+      "id": 9,
+      "type": "table",
+      "title": "Alpaca",
+      "description": "Rebalanceable = max(0, withdrawable \u2212 reserve). Counter-tradeable deliberately equals Alpaca Total (reserve NOT subtracted, same as the SPA).",
+      "datasource": {
+        "type": "stackdriver",
+        "uid": "cloudmon"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "stackdriver",
+            "uid": "cloudmon"
+          },
+          "queryType": "promQL",
+          "promQLQuery": {
+            "projectName": "$env",
+            "expr": "sum by (row, col) (label_replace(label_replace(liq_usdc_alpaca_usdc, \"row\", \"USDC\", \"\", \"\"), \"col\", \"USDC\", \"\", \"\")) or sum by (row, col) (label_replace(label_replace(liq_usdc_rebalanceable, \"row\", \"USDC\", \"\", \"\"), \"col\", \"Rebalanceable\", \"\", \"\")) or sum by (row, col) (label_replace(label_replace(liq_usdc_alpaca_total, \"row\", \"USDC\", \"\", \"\"), \"col\", \"Counter-tradeable\", \"\", \"\"))",
+            "step": "60s"
+          },
+          "timeSeriesList": {
+            "projectName": "",
+            "filters": [],
+            "view": "FULL",
+            "groupBys": []
+          },
+          "instant": true
+        }
+      ],
+      "gridPos": {
+        "h": 4,
+        "w": 4,
+        "x": 7,
+        "y": 1
+      },
+      "transformations": [
+        {
+          "id": "labelsToFields",
+          "options": {}
+        },
+        {
+          "id": "merge",
+          "options": {}
+        },
+        {
+          "id": "groupBy",
+          "options": {
+            "fields": {
+              "row": {
+                "operation": "groupby",
+                "aggregations": []
+              },
+              "col": {
+                "operation": "groupby",
+                "aggregations": []
+              },
+              "Value": {
+                "operation": "aggregate",
+                "aggregations": [
+                  "lastNotNull"
+                ]
+              }
+            }
+          }
+        },
+        {
+          "id": "groupingToMatrix",
+          "options": {
+            "columnField": "col",
+            "rowField": "row",
+            "valueField": "Value (lastNotNull)",
+            "emptyValue": "null"
+          }
+        },
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {
+              "row\\col": true
+            },
+            "renameByName": {
+              "row\\col": "Asset"
+            },
+            "indexByName": {
+              "row\\col": 0,
+              "USDC": 1,
+              "Rebalanceable": 2,
+              "Counter-tradeable": 3
+            }
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 2,
+          "custom": {
+            "align": "auto",
+            "filterable": false,
+            "cellOptions": {
+              "type": "auto"
+            },
+            "minWidth": 40
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": null
+              }
+            ]
+          },
+          "mappings": []
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "USDC"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "locale"
+              },
+              {
+                "id": "decimals",
+                "value": 2
+              },
+              {
+                "id": "custom.width",
+                "value": 90
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Rebalanceable"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "locale"
+              },
+              {
+                "id": "decimals",
+                "value": 2
+              },
+              {
+                "id": "custom.width",
+                "value": 105
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Counter-tradeable"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "locale"
+              },
+              {
+                "id": "decimals",
+                "value": 2
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "showHeader": true,
+        "cellHeight": "sm"
+      },
+      "timeFrom": "5m",
+      "hideTimeOverride": false
+    },
+    {
+      "id": 10,
+      "type": "table",
+      "title": "Wallets",
+      "description": "USDC seen in the bot's Ethereum and Base wallets: sanity checks, not part of Total.",
+      "datasource": {
+        "type": "stackdriver",
+        "uid": "cloudmon"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "stackdriver",
+            "uid": "cloudmon"
+          },
+          "queryType": "promQL",
+          "promQLQuery": {
+            "projectName": "$env",
+            "expr": "sum by (row, col) (label_replace(label_replace(liq_usdc_inflight_ethereum_wallet, \"row\", \"USDC\", \"\", \"\"), \"col\", \"Eth\", \"\", \"\")) or sum by (row, col) (label_replace(label_replace(liq_usdc_inflight_base_wallet, \"row\", \"USDC\", \"\", \"\"), \"col\", \"Base\", \"\", \"\"))",
+            "step": "60s"
+          },
+          "timeSeriesList": {
+            "projectName": "",
+            "filters": [],
+            "view": "FULL",
+            "groupBys": []
+          },
+          "instant": true
+        }
+      ],
+      "gridPos": {
+        "h": 4,
+        "w": 3,
+        "x": 11,
+        "y": 1
+      },
+      "transformations": [
+        {
+          "id": "labelsToFields",
+          "options": {}
+        },
+        {
+          "id": "merge",
+          "options": {}
+        },
+        {
+          "id": "groupBy",
+          "options": {
+            "fields": {
+              "row": {
+                "operation": "groupby",
+                "aggregations": []
+              },
+              "col": {
+                "operation": "groupby",
+                "aggregations": []
+              },
+              "Value": {
+                "operation": "aggregate",
+                "aggregations": [
+                  "lastNotNull"
+                ]
+              }
+            }
+          }
+        },
+        {
+          "id": "groupingToMatrix",
+          "options": {
+            "columnField": "col",
+            "rowField": "row",
+            "valueField": "Value (lastNotNull)",
+            "emptyValue": "null"
+          }
+        },
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {
+              "row\\col": true
+            },
+            "renameByName": {
+              "row\\col": "Asset"
+            },
+            "indexByName": {
+              "row\\col": 0,
+              "Eth": 1,
+              "Base": 2
+            }
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 2,
+          "custom": {
+            "align": "auto",
+            "filterable": false,
+            "cellOptions": {
+              "type": "auto"
+            },
+            "minWidth": 40
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": null
+              }
+            ]
+          },
+          "mappings": []
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Eth"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "locale"
+              },
+              {
+                "id": "decimals",
+                "value": 2
+              },
+              {
+                "id": "custom.width",
+                "value": 80
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Base"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "locale"
+              },
+              {
+                "id": "decimals",
+                "value": 2
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "showHeader": true,
+        "cellHeight": "sm"
+      },
+      "timeFrom": "5m",
+      "hideTimeOverride": true
+    },
+    {
+      "id": 11,
+      "type": "table",
+      "title": "",
+      "description": "The SPA inventory equity table: CT / Rebal / Ext status lights from settings; Raindex / Inflight / Alpaca / Total share balances; Ratio = onchain/(onchain+offchain); \u0394 = deviation from the target ratio in band widths, colored outside +/-1; Exposure = net \u00d7 last price. Unwrapped/Wrapped are wallet-observed and not part of Total. Sorted CT-first (desc) so counter-tradeable assets float to the top, like the SPA.",
+      "datasource": {
+        "type": "stackdriver",
+        "uid": "cloudmon"
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "stackdriver",
+            "uid": "cloudmon"
+          },
+          "queryType": "promQL",
+          "promQLQuery": {
+            "projectName": "$env",
+            "expr": "sum by (symbol, col) (label_replace(liq_asset_counter_trading, \"col\", \"CT\", \"\", \"\")) or sum by (symbol, col) (label_replace(liq_asset_rebalancing, \"col\", \"Rebal\", \"\", \"\")) or sum by (symbol, col) (label_replace(liq_asset_extended_hours, \"col\", \"Ext\", \"\", \"\")) or sum by (symbol, col) (label_replace(liq_equity_onchain_available, \"col\", \"Raindex\", \"\", \"\")) or sum by (symbol, col) (label_replace(liq_equity_inflight_total, \"col\", \"Inflight\", \"\", \"\")) or sum by (symbol, col) (label_replace(liq_equity_offchain_available, \"col\", \"Alpaca\", \"\", \"\")) or sum by (symbol, col) (label_replace(liq_equity_total, \"col\", \"Total\", \"\", \"\")) or sum by (symbol, col) (label_replace(liq_equity_ratio, \"col\", \"Ratio\", \"\", \"\")) or sum by (symbol, col) (label_replace(liq_equity_ratio_deviation and liq_equity_total > 0, \"col\", \"\u0394\", \"\", \"\")) or sum by (symbol, col) (label_replace(liq_equity_exposure_usd or (liq_equity_total * NaN), \"col\", \"Exposure\", \"\", \"\")) or sum by (symbol, col) (label_replace(liq_equity_unwrapped, \"col\", \"Unwrapped\", \"\", \"\")) or sum by (symbol, col) (label_replace(liq_equity_wrapped, \"col\", \"Wrapped\", \"\", \"\"))",
+            "step": "60s"
+          },
+          "timeSeriesList": {
+            "projectName": "",
+            "filters": [],
+            "view": "FULL",
+            "groupBys": []
+          },
+          "instant": true
+        }
+      ],
+      "gridPos": {
+        "h": 24,
+        "w": 14,
+        "x": 0,
+        "y": 5
+      },
+      "transformations": [
+        {
+          "id": "labelsToFields",
+          "options": {}
+        },
+        {
+          "id": "merge",
+          "options": {}
+        },
+        {
+          "id": "groupBy",
+          "options": {
+            "fields": {
+              "symbol": {
+                "operation": "groupby",
+                "aggregations": []
+              },
+              "col": {
+                "operation": "groupby",
+                "aggregations": []
+              },
+              "Value": {
+                "operation": "aggregate",
+                "aggregations": [
+                  "lastNotNull"
+                ]
+              }
+            }
+          }
+        },
+        {
+          "id": "groupingToMatrix",
+          "options": {
+            "columnField": "col",
+            "rowField": "symbol",
+            "valueField": "Value (lastNotNull)",
+            "emptyValue": "null"
+          }
+        },
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {},
+            "renameByName": {
+              "symbol\\col": "Asset"
+            },
+            "indexByName": {
+              "symbol\\col": 0,
+              "CT": 1,
+              "Rebal": 2,
+              "Ext": 3,
+              "Raindex": 4,
+              "Inflight": 5,
+              "Alpaca": 6,
+              "Total": 7,
+              "Ratio": 8,
+              "\u0394": 9,
+              "Exposure": 10,
+              "Unwrapped": 11,
+              "Wrapped": 12
+            }
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 2,
+          "custom": {
+            "align": "auto",
+            "filterable": false,
+            "cellOptions": {
+              "type": "auto"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "text",
+                "value": null
+              }
+            ]
+          },
+          "mappings": []
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Asset"
+            },
+            "properties": [
+              {
+                "id": "custom.width",
+                "value": 60
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "CT"
+            },
+            "properties": [
+              {
+                "id": "mappings",
+                "value": [
+                  {
+                    "type": "value",
+                    "options": {
+                      "1": {
+                        "text": "\u25cf",
+                        "color": "green",
+                        "index": 0
+                      },
+                      "0": {
+                        "text": "\u25cf",
+                        "color": "red",
+                        "index": 1
+                      }
+                    }
+                  },
+                  {
+                    "type": "special",
+                    "options": {
+                      "match": "null+nan",
+                      "result": {
+                        "text": "\u25cb",
+                        "color": "text",
+                        "index": 2
+                      }
+                    }
+                  }
+                ]
+              },
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "color-text"
+                }
+              },
+              {
+                "id": "custom.align",
+                "value": "center"
+              },
+              {
+                "id": "custom.width",
+                "value": 40
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Rebal"
+            },
+            "properties": [
+              {
+                "id": "mappings",
+                "value": [
+                  {
+                    "type": "value",
+                    "options": {
+                      "1": {
+                        "text": "\u25cf",
+                        "color": "green",
+                        "index": 0
+                      },
+                      "0": {
+                        "text": "\u25cf",
+                        "color": "red",
+                        "index": 1
+                      }
+                    }
+                  },
+                  {
+                    "type": "special",
+                    "options": {
+                      "match": "null+nan",
+                      "result": {
+                        "text": "\u25cb",
+                        "color": "text",
+                        "index": 2
+                      }
+                    }
+                  }
+                ]
+              },
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "color-text"
+                }
+              },
+              {
+                "id": "custom.align",
+                "value": "center"
+              },
+              {
+                "id": "custom.width",
+                "value": 40
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Ext"
+            },
+            "properties": [
+              {
+                "id": "mappings",
+                "value": [
+                  {
+                    "type": "value",
+                    "options": {
+                      "1": {
+                        "text": "\u25cf",
+                        "color": "green",
+                        "index": 0
+                      },
+                      "0": {
+                        "text": "\u25cf",
+                        "color": "red",
+                        "index": 1
+                      }
+                    }
+                  },
+                  {
+                    "type": "special",
+                    "options": {
+                      "match": "null+nan",
+                      "result": {
+                        "text": "\u25cb",
+                        "color": "text",
+                        "index": 2
+                      }
+                    }
+                  }
+                ]
+              },
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "color-text"
+                }
+              },
+              {
+                "id": "custom.align",
+                "value": "center"
+              },
+              {
+                "id": "custom.width",
+                "value": 40
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Raindex"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "locale"
+              },
+              {
+                "id": "decimals",
+                "value": 2
+              },
+              {
+                "id": "custom.width",
+                "value": 70
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Inflight"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "locale"
+              },
+              {
+                "id": "decimals",
+                "value": 2
+              },
+              {
+                "id": "custom.width",
+                "value": 70
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Alpaca"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "locale"
+              },
+              {
+                "id": "decimals",
+                "value": 2
+              },
+              {
+                "id": "custom.width",
+                "value": 70
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Total"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "locale"
+              },
+              {
+                "id": "decimals",
+                "value": 2
+              },
+              {
+                "id": "custom.width",
+                "value": 70
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Wrapped"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "locale"
+              },
+              {
+                "id": "decimals",
+                "value": 2
+              },
+              {
+                "id": "custom.width",
+                "value": 70
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Unwrapped"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "locale"
+              },
+              {
+                "id": "decimals",
+                "value": 2
+              },
+              {
+                "id": "custom.width",
+                "value": 80
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Ratio"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "percentunit"
+              },
+              {
+                "id": "decimals",
+                "value": 1
+              },
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "gauge",
+                  "mode": "basic",
+                  "valueDisplayMode": "text"
+                }
+              },
+              {
+                "id": "min",
+                "value": 0
+              },
+              {
+                "id": "max",
+                "value": 1
+              },
+              {
+                "id": "thresholds",
+                "value": {
+                  "mode": "absolute",
+                  "steps": [
+                    {
+                      "color": "blue",
+                      "value": null
+                    }
+                  ]
+                }
+              },
+              {
+                "id": "custom.width",
+                "value": 140
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "\u0394"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "short"
+              },
+              {
+                "id": "decimals",
+                "value": 1
+              },
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "color-text"
+                }
+              },
+              {
+                "id": "custom.width",
+                "value": 45
+              },
+              {
+                "id": "thresholds",
+                "value": {
+                  "mode": "absolute",
+                  "steps": [
+                    {
+                      "color": "red",
+                      "value": null
+                    },
+                    {
+                      "color": "text",
+                      "value": -1
+                    },
+                    {
+                      "color": "green",
+                      "value": 1
+                    }
+                  ]
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Exposure"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "currencyUSD"
+              },
+              {
+                "id": "decimals",
+                "value": 2
+              },
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "color-text"
+                }
+              },
+              {
+                "id": "thresholds",
+                "value": {
+                  "mode": "absolute",
+                  "steps": [
+                    {
+                      "color": "red",
+                      "value": null
+                    },
+                    {
+                      "color": "text",
+                      "value": -0.01
+                    },
+                    {
+                      "color": "green",
+                      "value": 0.01
+                    }
+                  ]
+                }
+              },
+              {
+                "id": "custom.width",
+                "value": 80
+              },
+              {
+                "id": "mappings",
+                "value": [
+                  {
+                    "type": "special",
+                    "options": {
+                      "match": "null+nan",
+                      "result": {
+                        "text": "\u2014",
+                        "color": "text",
+                        "index": 0
+                      }
+                    }
+                  }
+                ]
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "showHeader": true,
+        "cellHeight": "sm",
+        "sortBy": [
+          {
+            "displayName": "CT",
+            "desc": true
+          }
+        ]
+      },
+      "timeFrom": "5m",
+      "hideTimeOverride": false
+    },
+    {
+      "id": 12,
+      "type": "table",
+      "title": "Trade History",
+      "description": "Direct Raindex fills, fills routed through supported adapters such as Bebop, and the corresponding Alpaca hedge trades placed to offset exposure. One row per trade at its latest status. Built from the newest 500 status entries, so a busy period can push older rows out of the 30-day window.",
+      "datasource": {
+        "type": "googlecloud-logging-datasource",
+        "uid": "cloudlog"
+      },
+      "timeFrom": "30d",
+      "maxDataPoints": 500,
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "googlecloud-logging-datasource",
+            "uid": "cloudlog"
+          },
+          "projectId": "$env",
+          "queryText": "logName=\"projects/$env/logs/liquidity-trades\"",
+          "queryType": "logs"
+        }
+      ],
+      "gridPos": {
+        "h": 14,
+        "w": 10,
+        "x": 14,
+        "y": 1
+      },
+      "transformations": [
+        {
+          "id": "extractFields",
+          "options": {
+            "source": "labels",
+            "format": "json",
+            "replace": false,
+            "keepTime": false
+          }
+        },
+        {
+          "id": "filterFieldsByName",
+          "options": {
+            "include": {
+              "names": [
+                "jsonPayload.symbol",
+                "jsonPayload.venue",
+                "jsonPayload.direction",
+                "jsonPayload.shares",
+                "jsonPayload.status",
+                "timestamp",
+                "jsonPayload.id"
+              ]
+            }
+          }
+        },
+        {
+          "id": "convertFieldType",
+          "options": {
+            "conversions": [
+              {
+                "targetField": "jsonPayload.shares",
+                "destinationType": "number"
+              }
+            ]
+          }
+        },
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {},
+            "indexByName": {},
+            "renameByName": {
+              "jsonPayload.symbol": "Asset",
+              "jsonPayload.venue": "Venue",
+              "jsonPayload.direction": "Side",
+              "jsonPayload.shares": "Size",
+              "jsonPayload.status": "Status",
+              "timestamp": "Time",
+              "jsonPayload.id": "Id"
+            }
+          }
+        },
+        {
+          "id": "groupBy",
+          "options": {
+            "fields": {
+              "Id": {
+                "operation": "groupby",
+                "aggregations": []
+              },
+              "Time": {
+                "operation": "aggregate",
+                "aggregations": [
+                  "first"
+                ]
+              },
+              "Asset": {
+                "operation": "aggregate",
+                "aggregations": [
+                  "first"
+                ]
+              },
+              "Venue": {
+                "operation": "aggregate",
+                "aggregations": [
+                  "first"
+                ]
+              },
+              "Side": {
+                "operation": "aggregate",
+                "aggregations": [
+                  "first"
+                ]
+              },
+              "Size": {
+                "operation": "aggregate",
+                "aggregations": [
+                  "first"
+                ]
+              },
+              "Status": {
+                "operation": "aggregate",
+                "aggregations": [
+                  "first"
+                ]
+              }
+            }
+          }
+        },
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {
+              "Id": true
+            },
+            "indexByName": {
+              "Time (first)": 0,
+              "Asset (first)": 1,
+              "Venue (first)": 2,
+              "Side (first)": 3,
+              "Size (first)": 4,
+              "Status (first)": 5
+            },
+            "renameByName": {
+              "Time (first)": "Time",
+              "Asset (first)": "Asset",
+              "Venue (first)": "Venue",
+              "Side (first)": "Side",
+              "Size (first)": "Size",
+              "Status (first)": "Status"
+            }
+          }
+        },
+        {
+          "id": "sortBy",
+          "options": {
+            "fields": {},
+            "sort": [
+              {
+                "field": "Time",
+                "desc": true
+              }
+            ]
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "align": "auto",
+            "filterable": true
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Size"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "locale"
+              },
+              {
+                "id": "decimals",
+                "value": 3
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Time"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "time:MMM D, HH:mm:ss [UTC]"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Time"
+            },
+            "properties": [
+              {
+                "id": "custom.width",
+                "value": 170
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Asset"
+            },
+            "properties": [
+              {
+                "id": "custom.width",
+                "value": 80
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Venue"
+            },
+            "properties": [
+              {
+                "id": "custom.width",
+                "value": 110
+              },
+              {
+                "id": "mappings",
+                "value": [
+                  {
+                    "type": "value",
+                    "options": {
+                      "raindex": {
+                        "text": "Raindex",
+                        "color": "blue",
+                        "index": 0
+                      },
+                      "bebop": {
+                        "text": "Bebop",
+                        "color": "purple",
+                        "index": 1
+                      },
+                      "uniswap_v4": {
+                        "text": "Uniswap v4",
+                        "color": "#e91e63",
+                        "index": 2
+                      },
+                      "unknown_onchain": {
+                        "text": "Unknown Onchain",
+                        "color": "text",
+                        "index": 3
+                      },
+                      "alpaca": {
+                        "text": "Alpaca",
+                        "color": "orange",
+                        "index": 4
+                      },
+                      "dry_run": {
+                        "text": "DryRun",
+                        "color": "text",
+                        "index": 5
+                      }
+                    }
+                  }
+                ]
+              },
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "color-text"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Side"
+            },
+            "properties": [
+              {
+                "id": "custom.width",
+                "value": 70
+              },
+              {
+                "id": "mappings",
+                "value": [
+                  {
+                    "type": "value",
+                    "options": {
+                      "buy": {
+                        "text": "buy",
+                        "color": "green",
+                        "index": 0
+                      },
+                      "sell": {
+                        "text": "sell",
+                        "color": "red",
+                        "index": 1
+                      }
+                    }
+                  }
+                ]
+              },
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "color-text"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Size"
+            },
+            "properties": [
+              {
+                "id": "custom.width",
+                "value": 110
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Status"
+            },
+            "properties": [
+              {
+                "id": "mappings",
+                "value": [
+                  {
+                    "type": "value",
+                    "options": {
+                      "filled": {
+                        "text": "Filled",
+                        "color": "green",
+                        "index": 0
+                      },
+                      "completed": {
+                        "text": "Completed",
+                        "color": "green",
+                        "index": 1
+                      },
+                      "failed": {
+                        "text": "Failed",
+                        "color": "red",
+                        "index": 2
+                      },
+                      "cancelled": {
+                        "text": "Cancelled",
+                        "color": "orange",
+                        "index": 3
+                      },
+                      "minting": {
+                        "text": "Minting",
+                        "color": "blue",
+                        "index": 4
+                      },
+                      "wrapping": {
+                        "text": "Wrapping",
+                        "color": "blue",
+                        "index": 5
+                      },
+                      "depositing": {
+                        "text": "Depositing",
+                        "color": "blue",
+                        "index": 6
+                      },
+                      "withdrawing": {
+                        "text": "Withdrawing",
+                        "color": "blue",
+                        "index": 7
+                      },
+                      "unwrapping": {
+                        "text": "Unwrapping",
+                        "color": "blue",
+                        "index": 8
+                      },
+                      "sending": {
+                        "text": "Sending",
+                        "color": "blue",
+                        "index": 9
+                      },
+                      "pending_confirmation": {
+                        "text": "Pending confirmation",
+                        "color": "blue",
+                        "index": 10
+                      },
+                      "converting": {
+                        "text": "Converting",
+                        "color": "blue",
+                        "index": 11
+                      },
+                      "bridging": {
+                        "text": "Bridging",
+                        "color": "blue",
+                        "index": 12
+                      },
+                      "reconciled": {
+                        "text": "Reconciled",
+                        "color": "yellow",
+                        "index": 13
+                      }
+                    }
+                  }
+                ]
+              },
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "color-text"
+                }
+              }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "showHeader": true,
+        "cellHeight": "sm"
+      }
+    },
+    {
+      "id": 13,
+      "type": "table",
+      "title": "Cross-venue Transfers",
+      "description": "Asset movements between venues to rebalance inventory: equity mints (Alpaca to onchain), redemptions (onchain to Alpaca), and USDC bridges (Base/Ethereum via CCTP). One row per transfer at its latest status. A USDC bridge can show the previous status for a while: the exporter stamps each status with the transfer's updatedAt, which is not always later than the one before (bridging starts from initiated_at). Built from the newest 500 status entries, so a busy period can push older rows out of the 30-day window.",
+      "datasource": {
+        "type": "googlecloud-logging-datasource",
+        "uid": "cloudlog"
+      },
+      "timeFrom": "30d",
+      "maxDataPoints": 500,
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": {
+            "type": "googlecloud-logging-datasource",
+            "uid": "cloudlog"
+          },
+          "projectId": "$env",
+          "queryText": "logName=\"projects/$env/logs/liquidity-transfers\"",
+          "queryType": "logs"
+        }
+      ],
+      "gridPos": {
+        "h": 14,
+        "w": 10,
+        "x": 14,
+        "y": 15
+      },
+      "transformations": [
+        {
+          "id": "extractFields",
+          "options": {
+            "source": "labels",
+            "format": "json",
+            "replace": false,
+            "keepTime": false
+          }
+        },
+        {
+          "id": "extractFields",
+          "options": {
+            "source": "body",
+            "format": "regexp",
+            "regExp": "/\"(?:direction|kind)\":\"(?<Type>alpaca_to_base|base_to_alpaca|equity_mint|equity_redemption)\"/",
+            "replace": false,
+            "keepTime": false
+          }
+        },
+        {
+          "id": "filterFieldsByName",
+          "options": {
+            "include": {
+              "names": [
+                "jsonPayload.started_at",
+                "jsonPayload.symbol",
+                "jsonPayload.amount",
+                "jsonPayload.status",
+                "timestamp",
+                "jsonPayload.id",
+                "Type"
+              ]
+            }
+          }
+        },
+        {
+          "id": "convertFieldType",
+          "options": {
+            "conversions": [
+              {
+                "targetField": "jsonPayload.amount",
+                "destinationType": "number"
+              },
+              {
+                "targetField": "jsonPayload.started_at",
+                "destinationType": "time"
+              }
+            ]
+          }
+        },
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {},
+            "indexByName": {},
+            "renameByName": {
+              "jsonPayload.started_at": "Started",
+              "jsonPayload.symbol": "Asset",
+              "jsonPayload.amount": "Amount",
+              "jsonPayload.status": "Status",
+              "timestamp": "Updated",
+              "jsonPayload.id": "Id"
+            }
+          }
+        },
+        {
+          "id": "groupBy",
+          "options": {
+            "fields": {
+              "Id": {
+                "operation": "groupby",
+                "aggregations": []
+              },
+              "Started": {
+                "operation": "aggregate",
+                "aggregations": [
+                  "first"
+                ]
+              },
+              "Type": {
+                "operation": "aggregate",
+                "aggregations": [
+                  "first"
+                ]
+              },
+              "Asset": {
+                "operation": "aggregate",
+                "aggregations": [
+                  "first"
+                ]
+              },
+              "Amount": {
+                "operation": "aggregate",
+                "aggregations": [
+                  "first"
+                ]
+              },
+              "Status": {
+                "operation": "aggregate",
+                "aggregations": [
+                  "first"
+                ]
+              },
+              "Updated": {
+                "operation": "aggregate",
+                "aggregations": [
+                  "first"
+                ]
+              }
+            }
+          }
+        },
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {
+              "Id": true
+            },
+            "indexByName": {
+              "Started (first)": 0,
+              "Type (first)": 1,
+              "Asset (first)": 2,
+              "Amount (first)": 3,
+              "Status (first)": 4,
+              "Updated (first)": 5
+            },
+            "renameByName": {
+              "Started (first)": "Started",
+              "Type (first)": "Type",
+              "Asset (first)": "Asset",
+              "Amount (first)": "Amount",
+              "Status (first)": "Status",
+              "Updated (first)": "Updated"
+            }
+          }
+        },
+        {
+          "id": "sortBy",
+          "options": {
+            "fields": {},
+            "sort": [
+              {
+                "field": "Updated",
+                "desc": true
+              }
+            ]
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "custom": {
+            "align": "auto",
+            "filterable": true
+          }
+        },
+        "overrides": [
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Amount"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "locale"
+              },
+              {
+                "id": "decimals",
+                "value": 3
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Updated"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "time:MMM D, HH:mm:ss [UTC]"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Started"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "time:MMM D, HH:mm:ss [UTC]"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Started"
+            },
+            "properties": [
+              {
+                "id": "custom.width",
+                "value": 135
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Type"
+            },
+            "properties": [
+              {
+                "id": "custom.width",
+                "value": 125
+              },
+              {
+                "id": "mappings",
+                "value": [
+                  {
+                    "type": "value",
+                    "options": {
+                      "equity_mint": {
+                        "text": "Mint",
+                        "color": "text",
+                        "index": 0
+                      },
+                      "equity_redemption": {
+                        "text": "Redeem",
+                        "color": "text",
+                        "index": 1
+                      },
+                      "alpaca_to_base": {
+                        "text": "Alpaca \u2192 Raindex",
+                        "color": "text",
+                        "index": 3
+                      },
+                      "base_to_alpaca": {
+                        "text": "Raindex \u2192 Alpaca",
+                        "color": "text",
+                        "index": 4
+                      }
+                    }
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Asset"
+            },
+            "properties": [
+              {
+                "id": "custom.width",
+                "value": 60
+              },
+              {
+                "id": "mappings",
+                "value": [
+                  {
+                    "type": "special",
+                    "options": {
+                      "match": "empty",
+                      "result": {
+                        "text": "USDC",
+                        "index": 0
+                      }
+                    }
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Amount"
+            },
+            "properties": [
+              {
+                "id": "custom.width",
+                "value": 85
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Status"
+            },
+            "properties": [
+              {
+                "id": "custom.width",
+                "value": 110
+              },
+              {
+                "id": "mappings",
+                "value": [
+                  {
+                    "type": "value",
+                    "options": {
+                      "filled": {
+                        "text": "\u25cf Filled",
+                        "color": "green",
+                        "index": 0
+                      },
+                      "completed": {
+                        "text": "\u25cf Completed",
+                        "color": "green",
+                        "index": 1
+                      },
+                      "failed": {
+                        "text": "\u25cf Failed",
+                        "color": "red",
+                        "index": 2
+                      },
+                      "cancelled": {
+                        "text": "\u25cf Cancelled",
+                        "color": "orange",
+                        "index": 3
+                      },
+                      "minting": {
+                        "text": "\u25cf Minting",
+                        "color": "blue",
+                        "index": 4
+                      },
+                      "wrapping": {
+                        "text": "\u25cf Wrapping",
+                        "color": "blue",
+                        "index": 5
+                      },
+                      "depositing": {
+                        "text": "\u25cf Depositing",
+                        "color": "blue",
+                        "index": 6
+                      },
+                      "withdrawing": {
+                        "text": "\u25cf Withdrawing",
+                        "color": "blue",
+                        "index": 7
+                      },
+                      "unwrapping": {
+                        "text": "\u25cf Unwrapping",
+                        "color": "blue",
+                        "index": 8
+                      },
+                      "sending": {
+                        "text": "\u25cf Sending",
+                        "color": "blue",
+                        "index": 9
+                      },
+                      "pending_confirmation": {
+                        "text": "\u25cf Pending confirmation",
+                        "color": "blue",
+                        "index": 10
+                      },
+                      "converting": {
+                        "text": "\u25cf Converting",
+                        "color": "blue",
+                        "index": 11
+                      },
+                      "bridging": {
+                        "text": "\u25cf Bridging",
+                        "color": "blue",
+                        "index": 12
+                      },
+                      "reconciled": {
+                        "text": "\u25cf Reconciled",
+                        "color": "yellow",
+                        "index": 13
+                      }
+                    }
+                  }
+                ]
+              },
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "color-text"
+                }
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Updated"
+            },
+            "properties": []
+          }
+        ]
+      },
+      "options": {
+        "showHeader": true,
+        "cellHeight": "sm"
+      }
+    }
+  ]
+}
