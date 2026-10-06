@@ -57,7 +57,7 @@ use self::allocation::{
 };
 use self::freeze::FreezeStatusReader;
 use self::usdc::UsdcRebalanceOperation;
-use self::usdc_guard::ClaimRefusal;
+use self::usdc_guard::{CashGuardClaim, ClaimRefusal};
 #[cfg(test)]
 use crate::alerts::LogNotifier;
 #[cfg(test)]
@@ -101,8 +101,8 @@ use crate::unwrapped_equity_recovery::{
     UnwrappedEquityRecoveryJob, UnwrappedEquityRecoveryJobQueue,
 };
 use crate::usdc_rebalance::{
-    InterruptedUsdcRebalances, RebalanceDirection, UsdcRebalance, UsdcRebalanceEvent,
-    UsdcRebalanceId, any_rebalance_holds_guard, interrupted_usdc_rebalance_ids,
+    CooldownFailure, InterruptedUsdcRebalances, RebalanceDirection, UsdcRebalance,
+    UsdcRebalanceEvent, UsdcRebalanceId, any_rebalance_holds_guard, interrupted_usdc_rebalance_ids,
 };
 use crate::vault_registry::{VaultRegistry, VaultRegistryId};
 use crate::wrapped_equity_recovery::aggregate::WrappedEquityRecoveryId;
@@ -892,6 +892,15 @@ enum EquitySettlementOutcome {
     DeferredToSnapshot,
 }
 
+impl From<EquitySettlementOutcome> for usdc::CashLedgerState {
+    fn from(outcome: EquitySettlementOutcome) -> Self {
+        match outcome {
+            EquitySettlementOutcome::Reconciled => Self::Reconciled,
+            EquitySettlementOutcome::DeferredToSnapshot => Self::AwaitingSnapshot,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ZombieJobKillOutcome {
     Killed,
@@ -943,6 +952,10 @@ pub(crate) struct RebalancingService {
     /// starting (see `usdc::USDC_WITHDRAW_REJECTION_COOLDOWN`). The `None`
     /// key holds every chain, for a failure whose corridor is unknown.
     usdc_withdraw_rejections: RwLock<HashMap<Option<Chain>, DateTime<Utc>>>,
+    /// When a USD->USDC conversion last failed before its Alpaca withdrawal.
+    /// Holds Alpaca->Base planning on every corridor for the configured
+    /// conversion cooldown (see `UsdcCorridors::conversion_failure_cooldown`).
+    usdc_conversion_failed_at: RwLock<Option<DateTime<Utc>>>,
     /// Shared with the Base->Alpaca job: at most one under-funded page per
     /// chain per cooldown, cleared when a transfer on the chain completes or
     /// an operator acts.
@@ -1290,6 +1303,7 @@ impl RebalancingService {
             equity_gas_readiness: RwLock::new(BTreeMap::new()),
             equity_cooldowns: RwLock::new(HashMap::new()),
             usdc_withdraw_rejections: RwLock::new(HashMap::new()),
+            usdc_conversion_failed_at: RwLock::new(None),
             underfunded_alerts: crate::rebalancing::usdc::UnderfundedAlertLatch::default(),
             last_prices: RwLock::new(None),
             equity_in_progress: Arc::new(std::sync::RwLock::new(HashMap::new())),
@@ -5853,6 +5867,29 @@ impl RebalancingService {
         }
     }
 
+    /// Whether the conversion cooldown holds `operation`: only an
+    /// Alpaca->Base transfer converts USD to USDC, so only it is held.
+    async fn conversion_cooldown_holds(
+        &self,
+        chain: Chain,
+        operation: UsdcRebalanceOperation,
+    ) -> bool {
+        let UsdcRebalanceOperation::AlpacaToBase { amount } = operation else {
+            return false;
+        };
+        if !self.usdc_conversion_cooling_down(Utc::now()).await {
+            return false;
+        }
+
+        debug!(
+            target: "rebalance",
+            %chain,
+            ?amount,
+            "Skipped USDC trigger: a USD->USDC conversion failed within the cooldown"
+        );
+        true
+    }
+
     /// Checks one corridor for a USDC imbalance and dispatches the transfer
     /// it needs under that corridor's guard.
     async fn check_and_trigger_usdc_corridor(
@@ -5903,6 +5940,10 @@ impl RebalancingService {
             return;
         }
 
+        if self.conversion_cooldown_holds(chain, sized).await {
+            return;
+        }
+
         // The id is minted before the claim so the guard records which
         // transfer holds it; a refused or undispatched claim leaves no row.
         let id = UsdcRebalanceId(Uuid::new_v4());
@@ -5919,6 +5960,27 @@ impl RebalancingService {
             }
         };
 
+        self.dispatch_claimed_usdc_operation(
+            usdc, usdc_limit, reserved, admission, sized, id, guard,
+        )
+        .await;
+    }
+
+    /// Sizes the USDC operation again under the corridor's claim and enqueues
+    /// its transfer, unless the imbalance or a gate changed since `sized` was
+    /// read before the claim.
+    async fn dispatch_claimed_usdc_operation(
+        &self,
+        usdc: &UsdcCorridorCtx,
+        usdc_limit: Option<Usdc>,
+        reserved: Option<Usd>,
+        admission: CashAdmission,
+        sized: UsdcRebalanceOperation,
+        id: UsdcRebalanceId,
+        guard: CashGuardClaim,
+    ) {
+        let chain = usdc.corridor.chain();
+
         // Size again under the claim: a holder released between the read
         // above and the claim may have settled funds that read did not see.
         // A dropped claim releases on return.
@@ -5932,6 +5994,13 @@ impl RebalancingService {
                 ?operation,
                 "Skipped USDC trigger: the imbalance changed direction under the claim"
             );
+            return;
+        }
+
+        // Again under the claim: a conversion that failed after the read
+        // above holds before its guard is released, so a claim taken on that
+        // guard sees the hold here.
+        if self.conversion_cooldown_holds(chain, operation).await {
             return;
         }
 
@@ -7809,8 +7878,9 @@ impl RebalancingService {
         pool: &SqlitePool,
         usdc_store: &Store<UsdcRebalance>,
     ) -> Result<(), RebalancingServiceError> {
-        let recent = crate::usdc_rebalance::recent_withdrawal_failures(
+        let recent = crate::usdc_rebalance::recent_failures(
             pool,
+            CooldownFailure::Withdrawal,
             Utc::now(),
             usdc::USDC_WITHDRAW_REJECTION_COOLDOWN,
         )
@@ -7827,7 +7897,11 @@ impl RebalancingService {
                     let chain = corridor.chain();
                     self.hold_after_withdraw_rejection(Some(chain), failed_at)
                         .await;
-                    self.enqueue_cooldown_expiry_check(failed_at).await;
+                    self.enqueue_cooldown_expiry_check(
+                        failed_at,
+                        usdc::USDC_WITHDRAW_REJECTION_COOLDOWN,
+                    )
+                    .await;
                     info!(target: "rebalance", %id, %chain, %failed_at, "Restored the withdraw cooldown of a recent rejected withdrawal");
                 }
                 Ok(_) => {}
@@ -7835,7 +7909,63 @@ impl RebalancingService {
                     warn!(target: "rebalance", %id, ?error, "Failed to load a recent failed withdrawal; holding Base->Alpaca planning on every chain for the cooldown");
                     let now = Utc::now();
                     self.hold_after_withdraw_rejection(None, now).await;
-                    self.enqueue_cooldown_expiry_check(now).await;
+                    self.enqueue_cooldown_expiry_check(now, usdc::USDC_WITHDRAW_REJECTION_COOLDOWN)
+                        .await;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Restores the cooldowns that recent failed transfers started before
+    /// this start: the withdraw cooldowns and the conversion cooldown.
+    async fn restore_failure_cooldowns(
+        &self,
+        pool: &SqlitePool,
+        usdc_store: &Store<UsdcRebalance>,
+    ) -> Result<(), RebalancingServiceError> {
+        self.restore_withdrawal_rejection_cooldowns(pool, usdc_store)
+            .await?;
+        self.restore_conversion_failure_cooldown(pool, usdc_store)
+            .await
+    }
+
+    /// Restores the conversion cooldown for an Alpaca->Base USD->USDC
+    /// conversion that failed before its withdrawal within the cooldown
+    /// before this start, so a restart does not lift the hold. An aggregate
+    /// that cannot be loaded holds Alpaca->Base planning from now.
+    async fn restore_conversion_failure_cooldown(
+        &self,
+        pool: &SqlitePool,
+        usdc_store: &Store<UsdcRebalance>,
+    ) -> Result<(), RebalancingServiceError> {
+        let cooldown = self.config.usdc.conversion_failure_cooldown();
+        let recent = crate::usdc_rebalance::recent_failures(
+            pool,
+            CooldownFailure::Conversion,
+            Utc::now(),
+            cooldown,
+        )
+        .await?;
+        for id in recent {
+            match usdc_store.load(&id).await {
+                Ok(Some(UsdcRebalance::ConversionFailed {
+                    direction: RebalanceDirection::AlpacaToBase,
+                    failed_at,
+                    ..
+                })) => {
+                    self.hold_after_conversion_failure(failed_at).await;
+                    self.enqueue_cooldown_expiry_check(failed_at, cooldown)
+                        .await;
+                    info!(target: "rebalance", %id, %failed_at, "Restored the conversion cooldown of a recent failed Alpaca->Base conversion");
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    warn!(target: "rebalance", %id, ?error, "Failed to load a recent failed conversion; holding Alpaca->Base planning for the cooldown");
+                    let now = Utc::now();
+                    self.hold_after_conversion_failure(now).await;
+                    self.enqueue_cooldown_expiry_check(now, cooldown).await;
                 }
             }
         }
@@ -7852,8 +7982,7 @@ impl RebalancingService {
             ids: candidate_ids,
             unparseable,
         } = interrupted_usdc_rebalance_ids(pool).await?;
-        self.restore_withdrawal_rejection_cooldowns(pool, usdc_store)
-            .await?;
+        self.restore_failure_cooldowns(pool, usdc_store).await?;
 
         let mut held = Vec::new();
         let mut held_tracking = Vec::new();
@@ -9294,7 +9423,7 @@ impl RebalancingService {
         // against the post-rebalance inventory.
         if is_terminal {
             self.equity_scheduler.cancel_pending().await;
-            self.usdc_scheduler.cancel_pending().await;
+            self.cancel_pending_usdc_checks(settlement.into()).await;
             match settlement {
                 EquitySettlementOutcome::Reconciled => {
                     self.usdc_scheduler.enqueue_check().await;
@@ -9496,7 +9625,7 @@ impl RebalancingService {
         // a fresh USDC check against the post-rebalance inventory.
         if is_terminal {
             self.equity_scheduler.cancel_pending().await;
-            self.usdc_scheduler.cancel_pending().await;
+            self.cancel_pending_usdc_checks(settlement.into()).await;
             match settlement {
                 EquitySettlementOutcome::Reconciled => {
                     self.usdc_scheduler.enqueue_check().await;
@@ -32502,6 +32631,10 @@ mod tests {
              AlpacaToBase pre-burn ConversionFailed does not hold the guard, \
              so the running bot must clear it without a restart"
         );
+        assert!(
+            trigger.usdc_conversion_cooling_down(Utc::now()).await,
+            "the cleared pre-withdrawal conversion failure starts the conversion cooldown"
+        );
     }
 
     /// Regression guard for the durable fallback: a BaseToAlpaca
@@ -32586,6 +32719,10 @@ mod tests {
             "the durable fallback must hold the transfer's own corridor for a genuinely \
              post-burn (BaseToAlpaca post-deposit) conversion failure"
         );
+        assert!(
+            !trigger.usdc_conversion_cooling_down(Utc::now()).await,
+            "a post-deposit conversion failure starts no conversion cooldown"
+        );
     }
 
     #[tokio::test]
@@ -32612,6 +32749,10 @@ mod tests {
         assert!(
             !trigger.usdc_tracking.read().await.contains_key(&id),
             "a conversion failure with no prior tracking should not fabricate a context"
+        );
+        assert!(
+            !trigger.usdc_conversion_cooling_down(Utc::now()).await,
+            "a failure kept as possibly post-burn starts no conversion cooldown"
         );
 
         let inventory = trigger.inventory.read().await;
@@ -39846,6 +39987,688 @@ mod tests {
             1,
             "planning resumes after the fresh read and the cooldown"
         );
+    }
+
+    /// Marks every pending Alpaca->Base transfer row done and returns the
+    /// transfer ids, so the next trigger cycle sees no in-flight row.
+    async fn take_pending_alpaca_to_base_ids(service: &RebalancingService) -> Vec<UsdcRebalanceId> {
+        let pool = service.transfer_usdc_to_market_making_queue.pool().clone();
+        let rows: Vec<(String, Vec<u8>)> = sqlx_apalis::query_as(
+            "SELECT id, job FROM Jobs WHERE status = 'Pending' AND job_type = ? ORDER BY run_at",
+        )
+        .bind(std::any::type_name::<TransferUsdcToMarketMaking>())
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+
+        let mut ids = Vec::with_capacity(rows.len());
+        for (row_id, payload) in rows {
+            let job: TransferUsdcToMarketMaking = serde_json::from_slice(&payload).unwrap();
+            sqlx_apalis::query("UPDATE Jobs SET status = 'Done' WHERE id = ?")
+                .bind(row_id)
+                .execute(&pool)
+                .await
+                .unwrap();
+            ids.push(job.id);
+        }
+
+        ids
+    }
+
+    async fn fail_alpaca_to_base_conversion(
+        harness: &ReactorHarness<Arc<RebalancingService>>,
+        id: &UsdcRebalanceId,
+    ) {
+        harness
+            .receive::<UsdcRebalance>(
+                id.clone(),
+                make_usdc_conversion_initiated(RebalanceDirection::AlpacaToBase, usdc(400)),
+            )
+            .await
+            .unwrap();
+        harness
+            .receive::<UsdcRebalance>(id.clone(), make_usdc_conversion_failed())
+            .await
+            .unwrap();
+    }
+
+    /// Starts a conversion cooldown as a live failure does: the hold, then the
+    /// delayed check for its end.
+    async fn start_conversion_cooldown(service: &RebalancingService, failed_at: DateTime<Utc>) {
+        service.hold_after_conversion_failure(failed_at).await;
+        service
+            .enqueue_cooldown_expiry_check(
+                failed_at,
+                service.config.usdc.conversion_failure_cooldown(),
+            )
+            .await;
+    }
+
+    /// Starts a Base withdraw cooldown as a live rejection does: the hold,
+    /// then the delayed check for its end.
+    async fn start_withdraw_cooldown(service: &RebalancingService, rejected_at: DateTime<Utc>) {
+        service
+            .hold_after_withdraw_rejection(Some(Chain::Base), rejected_at)
+            .await;
+        service
+            .enqueue_cooldown_expiry_check(rejected_at, usdc::USDC_WITHDRAW_REJECTION_COOLDOWN)
+            .await;
+    }
+
+    async fn count_usdc_checks_delayed_at_least(service: &RebalancingService, secs: i64) -> i64 {
+        sqlx_apalis::query_scalar(
+            "SELECT COUNT(*) FROM Jobs WHERE status = 'Pending' AND job_type = ? \
+             AND run_at >= strftime('%s', 'now') + ?",
+        )
+        .bind(std::any::type_name::<UsdcRebalancingCheck>())
+        .bind(secs)
+        .fetch_one(service.usdc_scheduler.queue().pool())
+        .await
+        .unwrap()
+    }
+
+    /// A conversion that keeps failing (an empty `USDC/USD` book) starts one
+    /// Alpaca->Base transfer per cooldown window instead of one per check,
+    /// and the first check after the window starts the transfer again.
+    #[tokio::test]
+    async fn failing_alpaca_to_base_conversion_dispatches_once_per_cooldown() {
+        // 100 onchain, 900 offchain = TooMuchOffchain -> Alpaca->Base.
+        let inventory = InventoryView::default()
+            .with_usdc(usdc(100), usdc(900))
+            .with_withdrawable_cash_cents(90_000);
+        let trigger = make_trigger_with_inventory(inventory).await;
+        let harness = ReactorHarness::new(Arc::clone(&trigger));
+        let cooldown =
+            ChronoDuration::from_std(trigger.config.usdc.conversion_failure_cooldown()).unwrap();
+
+        for window in 0..2 {
+            trigger.check_and_trigger_usdc().await;
+            let ids = take_pending_alpaca_to_base_ids(&trigger).await;
+            assert_eq!(
+                ids.len(),
+                1,
+                "window {window}: the first check starts one transfer"
+            );
+
+            fail_alpaca_to_base_conversion(&harness, &ids[0]).await;
+            assert!(!trigger.usdc_guards.is_held(Chain::Base));
+            assert!(trigger.usdc_conversion_cooling_down(Utc::now()).await);
+
+            for _ in 0..3 {
+                trigger.check_and_trigger_usdc().await;
+            }
+            assert_eq!(
+                take_pending_alpaca_to_base_ids(&trigger).await,
+                Vec::new(),
+                "window {window}: checks inside the cooldown start no transfer"
+            );
+
+            // The window ends: the failure is now one cooldown old.
+            *trigger.usdc_conversion_failed_at.write().await = Some(Utc::now() - cooldown);
+        }
+
+        trigger.check_and_trigger_usdc().await;
+        assert_eq!(
+            take_pending_alpaca_to_base_ids(&trigger).await.len(),
+            1,
+            "the first check after the cooldown starts the transfer"
+        );
+    }
+
+    /// The failed conversion moved nothing, so inventory is untouched. The
+    /// terminal event queues the usual fresh check, which the cooldown keeps
+    /// from planning Alpaca->Base again, and one at the cooldown's end.
+    #[tokio::test]
+    async fn alpaca_to_base_conversion_failure_queues_a_check_at_the_cooldown_end() {
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let inventory = InventoryView::default()
+            .with_usdc(usdc(100), usdc(900))
+            .with_withdrawable_cash_cents(90_000);
+        let trigger = make_trigger_with_inventory(inventory).await;
+        let harness = ReactorHarness::new(Arc::clone(&trigger));
+        trigger
+            .usdc_guards
+            .hold(Chain::Base, &id, RebalanceDirection::AlpacaToBase);
+
+        fail_alpaca_to_base_conversion(&harness, &id).await;
+
+        assert!(!trigger.usdc_guards.is_held(Chain::Base));
+        assert_eq!(trigger.inventory.read().await.active_usdc_rebalance(), None);
+        let available = {
+            let inventory = trigger.inventory.read().await;
+            (
+                inventory.usdc_available(Venue::MarketMaking),
+                inventory.usdc_available(Venue::Hedging),
+            )
+        };
+        assert_eq!(available, (Some(usdc(100)), Some(usdc(900))));
+        assert_eq!(
+            (
+                count_pending_usdc_check_jobs(&trigger).await,
+                count_usdc_checks_delayed_at_least(&trigger, 295).await,
+            ),
+            (2, 1),
+            "the fresh check, and one at the cooldown's end"
+        );
+
+        trigger.check_and_trigger_usdc().await;
+        assert_eq!(
+            take_pending_alpaca_to_base_ids(&trigger).await,
+            Vec::new(),
+            "the fresh check plans no Alpaca->Base transfer during the cooldown"
+        );
+    }
+
+    /// A conversion failure stamped earlier than the one holding planning
+    /// does not shorten the hold.
+    #[tokio::test]
+    async fn earlier_conversion_failure_does_not_shorten_the_cooldown() {
+        let trigger = make_trigger_with_inventory(InventoryView::default()).await;
+        let later = Utc::now();
+        let earlier = later - ChronoDuration::minutes(4);
+
+        trigger.hold_after_conversion_failure(later).await;
+        trigger.hold_after_conversion_failure(earlier).await;
+
+        let cooldown =
+            ChronoDuration::from_std(trigger.config.usdc.conversion_failure_cooldown()).unwrap();
+        assert!(
+            trigger
+                .usdc_conversion_cooling_down(later + cooldown - ChronoDuration::seconds(1))
+                .await
+        );
+        assert!(!trigger.usdc_conversion_cooling_down(later + cooldown).await);
+    }
+
+    /// The conversion runs only on the Alpaca->Base leg: its cooldown leaves
+    /// Base->Alpaca planning alone.
+    #[tokio::test]
+    async fn conversion_cooldown_does_not_hold_base_to_alpaca() {
+        // 900 onchain, 100 offchain = TooMuchOnchain -> Base->Alpaca.
+        let inventory = InventoryView::default().with_usdc(usdc(900), usdc(100));
+        let trigger = make_trigger_with_inventory(inventory).await;
+        trigger.hold_after_conversion_failure(Utc::now()).await;
+
+        trigger.check_and_trigger_usdc().await;
+
+        assert_eq!(
+            count_pending_transfer_usdc_to_hedging_jobs(&trigger).await,
+            1
+        );
+    }
+
+    /// Cancelling the pending checks after a terminal event (USDC, mint or
+    /// redemption) queues again the delayed check of every running cooldown:
+    /// otherwise a quiet market would wait for the next fill or balance
+    /// change to plan again.
+    #[tokio::test]
+    async fn cancelling_pending_usdc_checks_keeps_every_cooldown_expiry_check() {
+        let trigger = make_trigger_with_inventory(InventoryView::default()).await;
+        let now = Utc::now();
+        start_withdraw_cooldown(&trigger, now).await;
+        start_conversion_cooldown(&trigger, now).await;
+        trigger.usdc_scheduler.enqueue_check().await;
+
+        trigger
+            .cancel_pending_usdc_checks(usdc::CashLedgerState::Reconciled)
+            .await;
+
+        assert_eq!(
+            (
+                count_pending_usdc_check_jobs(&trigger).await,
+                count_usdc_checks_delayed_at_least(&trigger, 295).await,
+                count_usdc_checks_delayed_at_least(&trigger, 1790).await,
+            ),
+            (2, 2, 1),
+            "one check at each cooldown's end, and the stale immediate check dropped"
+        );
+    }
+
+    /// A terminal event that left the cash ledger stale must not re-queue a
+    /// cooldown check that runs before a post-settlement poll: it would size
+    /// a transfer from the pre-settlement balances.
+    #[tokio::test]
+    async fn cancelling_with_a_stale_ledger_delays_cooldown_checks_past_the_staleness_bound() {
+        let trigger = make_trigger_with_inventory(InventoryView::default()).await;
+        let cooldown =
+            ChronoDuration::from_std(trigger.config.usdc.conversion_failure_cooldown()).unwrap();
+        start_conversion_cooldown(
+            &trigger,
+            Utc::now() - cooldown + ChronoDuration::seconds(10),
+        )
+        .await;
+        let bound_secs = i64::try_from(trigger.config.inventory_staleness_bound.as_secs()).unwrap();
+
+        trigger
+            .cancel_pending_usdc_checks(usdc::CashLedgerState::AwaitingSnapshot)
+            .await;
+
+        assert_eq!(
+            (
+                count_pending_usdc_check_jobs(&trigger).await,
+                count_usdc_checks_delayed_at_least(&trigger, bound_secs).await,
+            ),
+            (1, 1),
+            "the nearly expired cooldown's check waits out the staleness bound"
+        );
+    }
+
+    /// A cooldown check that is due but still pending (a busy worker) is kept
+    /// by a deferred cancel, moved past the staleness bound.
+    #[tokio::test]
+    async fn deferred_cancel_keeps_an_overdue_cooldown_check() {
+        let trigger = make_trigger_with_inventory(InventoryView::default()).await;
+        trigger.usdc_scheduler.enqueue_check().await;
+        // Strictly past the bound, whatever the whole-second rounding of `run_at`.
+        let past_bound_secs =
+            i64::try_from(trigger.config.inventory_staleness_bound.as_secs()).unwrap() + 4;
+
+        trigger
+            .cancel_pending_usdc_checks(usdc::CashLedgerState::AwaitingSnapshot)
+            .await;
+
+        assert_eq!(
+            (
+                count_pending_usdc_check_jobs(&trigger).await,
+                count_usdc_checks_delayed_at_least(&trigger, past_bound_secs).await,
+            ),
+            (1, 1),
+            "the overdue check is kept, strictly after the staleness bound"
+        );
+    }
+
+    /// A conversion check that a deferred cancel pushed past the conversion
+    /// end survives later deferred cancels next to a longer withdraw cooldown.
+    #[tokio::test]
+    async fn deferred_cancels_keep_a_conversion_check_next_to_a_withdraw_cooldown() {
+        let trigger = make_trigger_with_inventory(InventoryView::default()).await;
+        let cooldown =
+            ChronoDuration::from_std(trigger.config.usdc.conversion_failure_cooldown()).unwrap();
+        start_withdraw_cooldown(&trigger, Utc::now()).await;
+        start_conversion_cooldown(
+            &trigger,
+            Utc::now() - cooldown + ChronoDuration::seconds(10),
+        )
+        .await;
+        let bound_secs = i64::try_from(trigger.config.inventory_staleness_bound.as_secs()).unwrap();
+
+        for cancel in 0..2 {
+            trigger
+                .cancel_pending_usdc_checks(usdc::CashLedgerState::AwaitingSnapshot)
+                .await;
+            assert_eq!(
+                (
+                    count_pending_usdc_check_jobs(&trigger).await,
+                    count_usdc_checks_delayed_at_least(&trigger, bound_secs).await,
+                    count_usdc_checks_delayed_at_least(&trigger, 1790).await,
+                ),
+                (2, 2, 1),
+                "cancel {cancel}: the conversion check after the bound, the withdraw check at its end"
+            );
+
+            *trigger.usdc_conversion_failed_at.write().await = None;
+        }
+    }
+
+    /// Each deferred cancel can push a cooldown's check past its end; every
+    /// later cancel, however many, must queue it again rather than drop it.
+    #[tokio::test]
+    async fn chained_deferred_cancels_keep_a_check_pushed_past_the_cooldown() {
+        let trigger = make_trigger_with_inventory(InventoryView::default()).await;
+        let cooldown =
+            ChronoDuration::from_std(trigger.config.usdc.conversion_failure_cooldown()).unwrap();
+        start_conversion_cooldown(
+            &trigger,
+            Utc::now() - cooldown + ChronoDuration::seconds(10),
+        )
+        .await;
+        let bound_secs = i64::try_from(trigger.config.inventory_staleness_bound.as_secs()).unwrap();
+
+        for cancel in 0..3 {
+            trigger
+                .cancel_pending_usdc_checks(usdc::CashLedgerState::AwaitingSnapshot)
+                .await;
+            assert_eq!(
+                (
+                    count_pending_usdc_check_jobs(&trigger).await,
+                    count_usdc_checks_delayed_at_least(&trigger, bound_secs).await,
+                ),
+                (1, 1),
+                "cancel {cancel}: the cooldown's check is queued again, after the staleness bound"
+            );
+
+            // Later cancels land after the hold expired, and a check that ran
+            // since has cleared it, so only the queued check is left to keep.
+            *trigger.usdc_conversion_failed_at.write().await = None;
+        }
+    }
+
+    /// A terminal mint that reconciles the ledger keeps a running cooldown's
+    /// check at the cooldown's end, next to the fresh check.
+    #[tokio::test]
+    async fn reconciled_terminal_mint_keeps_the_cooldown_check_at_its_end() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let trigger = make_trigger_with_inventory_and_registry(
+            InventoryView::default().with_equity(symbol.clone(), shares(0), shares(90)),
+            &symbol,
+        )
+        .await;
+        let id = issuer_request_id("mint-terminal-during-cooldown");
+        trigger.mint_tracking.write().await.insert(
+            id.clone(),
+            MintTracking {
+                chain: Chain::Base,
+                symbol,
+                quantity: shares(10),
+                tokenization_request_id: None,
+                stage: MintTrackingStage::Requested,
+                last_progress_at: Utc::now(),
+            },
+        );
+        let cooldown =
+            ChronoDuration::from_std(trigger.config.usdc.conversion_failure_cooldown()).unwrap();
+        start_conversion_cooldown(
+            &trigger,
+            Utc::now() - cooldown + ChronoDuration::seconds(10),
+        )
+        .await;
+        let bound_secs = i64::try_from(trigger.config.inventory_staleness_bound.as_secs()).unwrap();
+
+        trigger
+            .on_mint(id, make_mint_acceptance_failed())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            (
+                count_pending_usdc_check_jobs(&trigger).await,
+                count_usdc_checks_delayed_at_least(&trigger, 10).await,
+                count_usdc_checks_delayed_at_least(&trigger, bound_secs).await,
+            ),
+            (2, 1, 0),
+            "the fresh check, and one at the cooldown's end, before the staleness bound"
+        );
+    }
+
+    /// A terminal redemption that leaves the ledger to the next snapshot
+    /// queues a running cooldown's check again, after the staleness bound.
+    #[tokio::test]
+    async fn deferred_terminal_redemption_delays_the_cooldown_check_past_the_staleness_bound() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let trigger = make_trigger_with_inventory_and_registry(
+            InventoryView::default().with_equity(symbol.clone(), shares(90), shares(0)),
+            &symbol,
+        )
+        .await;
+        let id = redemption_aggregate_id("redemption-deferred-during-cooldown");
+        trigger.equity_in_progress.write().unwrap().insert(
+            symbol.clone(),
+            equity::GuardState::ActiveTransfer {
+                generation: equity::GuardGeneration::default(),
+            },
+        );
+        trigger.redemption_tracking.write().await.insert(
+            id.clone(),
+            RedemptionTracking {
+                chain: Chain::Base,
+                symbol,
+                quantity: shares(10),
+                tokenization_request_id: None,
+                redemption_tx: Some(TxHash::random()),
+                stage: RedemptionTrackingStage::TokensSent,
+                last_progress_at: Utc::now(),
+            },
+        );
+        let cooldown =
+            ChronoDuration::from_std(trigger.config.usdc.conversion_failure_cooldown()).unwrap();
+        start_conversion_cooldown(
+            &trigger,
+            Utc::now() - cooldown + ChronoDuration::seconds(10),
+        )
+        .await;
+        let bound_secs = i64::try_from(trigger.config.inventory_staleness_bound.as_secs()).unwrap();
+
+        trigger
+            .on_redemption(id, make_redemption_completed())
+            .await
+            .unwrap();
+
+        assert_eq!(
+            (
+                count_pending_usdc_check_jobs(&trigger).await,
+                count_usdc_checks_delayed_at_least(&trigger, bound_secs).await,
+            ),
+            (1, 1),
+            "no fresh check, and the cooldown's check waits out the staleness bound"
+        );
+    }
+
+    /// A conversion that fails after the check sized its transfer, but before
+    /// the check claimed the guard, installs the hold before releasing the
+    /// guard: the re-check under the claim must then refuse the dispatch.
+    #[tokio::test]
+    async fn conversion_failure_between_sizing_and_claim_holds_the_dispatch() {
+        // 100 onchain, 900 offchain = TooMuchOffchain -> Alpaca->Base.
+        let inventory = InventoryView::default()
+            .with_usdc(usdc(100), usdc(900))
+            .with_withdrawable_cash_cents(90_000);
+        let trigger = make_trigger_with_inventory(inventory).await;
+        let corridor = *trigger.config.usdc.active().next().unwrap();
+        let (usdc_limit, reserved) = trigger.usdc_rebalancing_params(&corridor).unwrap();
+        let admission = trigger.divergence_gate.cash_admission().unwrap();
+
+        let sized = trigger
+            .size_usdc_operation(&corridor, usdc_limit, reserved)
+            .await
+            .unwrap();
+        assert!(matches!(sized, UsdcRebalanceOperation::AlpacaToBase { .. }));
+        assert!(!trigger.conversion_cooldown_holds(Chain::Base, sized).await);
+
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let guard = trigger
+            .usdc_guards
+            .try_claim(Chain::Base, &id, sized.direction())
+            .unwrap();
+        trigger.hold_after_conversion_failure(Utc::now()).await;
+
+        trigger
+            .dispatch_claimed_usdc_operation(
+                &corridor, usdc_limit, reserved, admission, sized, id, guard,
+            )
+            .await;
+
+        assert_eq!(
+            count_pending_transfer_usdc_to_market_making_jobs(&trigger).await,
+            0
+        );
+        assert!(!trigger.usdc_guards.is_held(Chain::Base));
+    }
+
+    /// An untracked terminal success (a transfer resumed after a restart)
+    /// settles as `DeferredToSnapshot`: the running cooldown's check is
+    /// queued again, but not before a post-settlement poll.
+    #[tokio::test]
+    async fn untracked_terminal_success_delays_the_cooldown_check_past_the_staleness_bound() {
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let trigger = make_trigger_with_inventory(InventoryView::default()).await;
+        let harness = ReactorHarness::new(Arc::clone(&trigger));
+        let cooldown =
+            ChronoDuration::from_std(trigger.config.usdc.conversion_failure_cooldown()).unwrap();
+        start_conversion_cooldown(
+            &trigger,
+            Utc::now() - cooldown + ChronoDuration::seconds(10),
+        )
+        .await;
+        let bound_secs = i64::try_from(trigger.config.inventory_staleness_bound.as_secs()).unwrap();
+
+        harness
+            .receive::<UsdcRebalance>(
+                id,
+                make_usdc_deposit_confirmed(RebalanceDirection::AlpacaToBase),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            (
+                count_pending_usdc_check_jobs(&trigger).await,
+                count_usdc_checks_delayed_at_least(&trigger, bound_secs).await,
+            ),
+            (1, 1),
+            "no fresh check, and the cooldown's check waits out the staleness bound"
+        );
+    }
+
+    /// A conversion failure while a withdraw cooldown runs keeps the withdraw
+    /// cooldown's delayed check next to its own.
+    #[tokio::test]
+    async fn conversion_failure_keeps_a_running_withdraw_cooldown_check() {
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let trigger = make_trigger_with_inventory(InventoryView::default()).await;
+        let harness = ReactorHarness::new(Arc::clone(&trigger));
+        start_withdraw_cooldown(&trigger, Utc::now()).await;
+
+        fail_alpaca_to_base_conversion(&harness, &id).await;
+
+        assert_eq!(
+            (
+                count_pending_usdc_check_jobs(&trigger).await,
+                count_usdc_checks_delayed_at_least(&trigger, 295).await,
+                count_usdc_checks_delayed_at_least(&trigger, 1790).await,
+            ),
+            (3, 2, 1),
+            "the fresh check, and one at each cooldown's end"
+        );
+    }
+
+    #[tokio::test]
+    async fn recover_usdc_guard_restores_a_recent_conversion_failure() {
+        let pool = crate::test_utils::setup_test_db().await;
+        let store = test_store::<UsdcRebalance>(pool.clone(), ());
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        store
+            .send(
+                &id,
+                UsdcRebalanceCommand::InitiateConversion {
+                    corridor: UsdcCorridor::BASE_CCTP,
+                    direction: RebalanceDirection::AlpacaToBase,
+                    amount: usdc(400),
+                    order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .send(
+                &id,
+                UsdcRebalanceCommand::FailConversion {
+                    reason: "no asks on USDC/USD".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let service = make_trigger_with_inventory(InventoryView::default()).await;
+        service.recover_usdc_guard(&pool, &store).await.unwrap();
+
+        assert!(service.usdc_conversion_cooling_down(Utc::now()).await);
+        assert!(!service.usdc_guards.is_held(Chain::Base));
+        assert_eq!(count_usdc_checks_delayed_at_least(&service, 290).await, 1);
+    }
+
+    /// `ConversionFailed` carries no direction, so only the loaded state
+    /// keeps a BaseToAlpaca post-deposit failure from holding Alpaca->Base.
+    #[tokio::test]
+    async fn recover_usdc_guard_skips_a_base_to_alpaca_conversion_failure() {
+        let pool = crate::test_utils::setup_test_db().await;
+        let burn_tx =
+            fixed_bytes!("0x0000000000000000000000000000000000000000000000000000000000000021");
+        let mint_tx =
+            fixed_bytes!("0x1111111111111111111111111111111111111111111111111111111111111122");
+        let store = test_store::<UsdcRebalance>(pool.clone(), ());
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        for command in [
+            UsdcRebalanceCommand::Initiate {
+                corridor: UsdcCorridor::BASE_CCTP,
+                direction: RebalanceDirection::BaseToAlpaca,
+                amount: usdc(400),
+                withdrawal: TransferRef::OnchainTx(burn_tx),
+            },
+            UsdcRebalanceCommand::ConfirmWithdrawal {
+                withdrawal_tx: None,
+            },
+            UsdcRebalanceCommand::InitiateBridging { burn_tx },
+            UsdcRebalanceCommand::ReceiveAttestation {
+                attestation: vec![0x01],
+                cctp_nonce: alloy::primitives::B256::left_padding_from(&42u64.to_be_bytes()),
+                message: valid_cctp_message(),
+                mint_scan_from_block: 100,
+            },
+            UsdcRebalanceCommand::ConfirmBridging {
+                mint_tx,
+                amount_received: usdc(399),
+                fee_collected: usdc(1),
+            },
+            UsdcRebalanceCommand::InitiateDeposit {
+                deposit: TransferRef::OnchainTx(mint_tx),
+            },
+            UsdcRebalanceCommand::ConfirmDeposit {
+                vault_deposit_block: None,
+            },
+            UsdcRebalanceCommand::InitiatePostDepositConversion {
+                order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
+                amount: usdc(399),
+            },
+            UsdcRebalanceCommand::FailConversion {
+                reason: "conversion rejected".to_string(),
+            },
+        ] {
+            store.send(&id, command).await.unwrap();
+        }
+
+        let service = make_trigger_with_inventory(InventoryView::default()).await;
+        service.recover_usdc_guard(&pool, &store).await.unwrap();
+
+        assert!(!service.usdc_conversion_cooling_down(Utc::now()).await);
+        assert_eq!(count_usdc_checks_delayed_at_least(&service, 290).await, 0);
+    }
+
+    #[tokio::test]
+    async fn recover_usdc_guard_skips_a_conversion_failure_older_than_the_cooldown() {
+        let pool = crate::test_utils::setup_test_db().await;
+        let store = test_store::<UsdcRebalance>(pool.clone(), ());
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        store
+            .send(
+                &id,
+                UsdcRebalanceCommand::InitiateConversion {
+                    corridor: UsdcCorridor::BASE_CCTP,
+                    direction: RebalanceDirection::AlpacaToBase,
+                    amount: usdc(400),
+                    order_id: ClientOrderId::from_uuid(Uuid::new_v4()),
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .send(
+                &id,
+                UsdcRebalanceCommand::FailConversion {
+                    reason: "no asks on USDC/USD".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+        let cooldown = Duration::from_millis(1);
+        tokio::time::sleep(Duration::from_millis(10)).await;
+
+        let mut config = test_config();
+        config.usdc = config.usdc.with_conversion_failure_cooldown(cooldown);
+        let service = make_trigger_with_inventory_config(InventoryView::default(), config).await;
+        service.recover_usdc_guard(&pool, &store).await.unwrap();
+
+        assert!(!service.usdc_conversion_cooling_down(Utc::now()).await);
+        assert_eq!(count_pending_usdc_check_jobs(&service).await, 0);
     }
 
     /// The forced read after a rejection is floored at the view's applied USDC

@@ -4793,6 +4793,23 @@ enum BridgeStage { Burn, Attestation, Mint }
     `USDC/USD` book is empty; a smaller notional cannot fix those, so the
     conversion fails once with a `ConversionFailed` reason that includes
     Alpaca's message
+  - Conversion cooldown: any AlpacaToBase `ConversionFailed` that clears the
+    guard (the conversion runs before the withdrawal, so nothing has left
+    Alpaca) holds Alpaca-to-Base planning on every corridor for
+    `[rebalancing.usdc]` `conversion_failure_cooldown_secs` (default 300,
+    non-zero, at most 86400), counted from the event's `failed_at`. All
+    corridors share Alpaca's one `USDC/USD` book, so an immediate retry would
+    meet the same cause: without the hold a persistent failure (for example a
+    book with no asks) starts a new transfer on every check. The trigger logs
+    one `rebalance` WARN with the failure reason when the hold starts, and runs
+    a delayed USDC check when it ends. A terminal event (USDC, mint or
+    redemption) drops the pending USDC checks that are due and keeps the delayed
+    ones, such as each cooldown's check; when that event leaves the cash ledger
+    to the next snapshot poll, it drops none and instead moves every pending
+    check to no sooner than `inventory_staleness_bound`, so no check sizes a
+    transfer from pre-settlement onchain balances. Startup restores the hold
+    from recent AlpacaToBase `ConversionFailed` events, so a restart does not
+    lift it. Base-to-Alpaca planning is not held
   - Collar: Alpaca prices a USDC/USD market order with a ~2% collar. On a `qty`
     buy the collar inflates the hold to `quantity x price x 1.02`, which rejects
     a buy sized at 100% of settled cash. On a `notional` buy the hold equals the
@@ -4848,7 +4865,13 @@ enum BridgeStage { Burn, Attestation, Mint }
     under the withdrawal threshold, which strands the USDC in the crypto wallet
     for an operator to reconcile. It also floors
     `assets.cash.operational_limit`, since that limit caps every transfer
-  - ConversionFailed is a terminal state (requires manual intervention)
+  - ConversionFailed is a terminal state. For BaseToAlpaca (post-deposit) it
+    requires manual intervention; for AlpacaToBase (pre-withdrawal) it ends the
+    transfer, and planning retries after the conversion cooldown. Two
+    AlpacaToBase failures still leave USDC for the operator to reconcile in the
+    Alpaca crypto wallet: a conversion that settles below the minimum withdrawal
+    threshold, and a resume from `Converting` with no persisted broker order ID
+    (the order may have filled)
   - ConversionComplete is terminal for BaseToAlpaca direction
 - Alpaca withdrawals/deposits are asynchronous: initiate with API call (get
   transfer_id), poll status until COMPLETE
@@ -6217,7 +6240,9 @@ transfer dispatch. It does not calculate cross-venue inventory imbalances.
 - `UsdcRebalanceEvent::WithdrawalFailed`, BaseToAlpaca pre-burn
   `BridgingFailed`, and AlpacaToBase `ConversionFailed` (the pre-withdrawal
   USD->USDC leg) - Reconciles inflight back to source available, because the
-  failure happened before any funds left the source venue
+  failure happened before any funds left the source venue. The AlpacaToBase
+  `ConversionFailed` also starts the conversion cooldown, so the fresh check
+  after it plans no Alpaca-to-Base transfer until the cooldown ends
 - Post-burn `UsdcRebalanceEvent::BridgingFailed`, any AlpacaToBase
   `BridgingFailed` (post-withdrawal, so the funds are off Alpaca even without
   burn evidence), `DepositFailed`, and BaseToAlpaca `ConversionFailed` (the

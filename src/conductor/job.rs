@@ -500,6 +500,60 @@ impl<Task: Serialize + DeserializeOwned + Send + Sync + Unpin + 'static> JobQueu
         }
     }
 
+    /// Mark this queue's pending rows that are already due as `Done`, and keep
+    /// the ones scheduled for later. Used after a terminal domain event makes
+    /// the due work stale while delayed work stays valid.
+    pub(crate) async fn cancel_due_pending(&self) {
+        let job_type = self.queue_key();
+        if let Err(error) = sqlx_apalis::query(
+            "UPDATE Jobs SET status = 'Done' \
+             WHERE status = 'Pending' AND job_type = ? \
+             AND run_at <= strftime('%s', 'now')",
+        )
+        .bind(job_type)
+        .execute(self.pool())
+        .await
+        {
+            warn!(
+                target: "rebalance",
+                %error,
+                job_type,
+                "Failed to cancel due pending rows for job type",
+            );
+        }
+    }
+
+    /// Move this queue's pending rows so none runs sooner than `not_before`
+    /// from now. A row already scheduled later keeps its time.
+    pub(crate) async fn defer_pending(&self, not_before: Duration) {
+        let job_type = self.queue_key();
+        let Ok(not_before_secs) = i64::try_from(not_before.as_secs()) else {
+            warn!(
+                target: "rebalance",
+                ?not_before,
+                job_type,
+                "Deferral too long to schedule; leaving pending rows unchanged",
+            );
+            return;
+        };
+        if let Err(error) = sqlx_apalis::query(
+            "UPDATE Jobs SET run_at = MAX(run_at, strftime('%s', 'now') + ?) \
+             WHERE status = 'Pending' AND job_type = ?",
+        )
+        .bind(not_before_secs)
+        .bind(job_type)
+        .execute(self.pool())
+        .await
+        {
+            warn!(
+                target: "rebalance",
+                %error,
+                job_type,
+                "Failed to defer pending rows for job type",
+            );
+        }
+    }
+
     /// Resets this queue's in-flight rows (`Running`/`Queued`) back to
     /// `Pending` so the apalis monitor re-drives them, and returns the number
     /// of rows reset.

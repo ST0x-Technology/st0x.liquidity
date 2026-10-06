@@ -342,6 +342,11 @@ freeze_check = "enabled"
 # "disabled" keeps the corridor tables below (still validated) in place.
 [rebalancing.usdc]
 mode = "enabled"
+# How long a USD->USDC conversion that fails before the Alpaca withdrawal
+# holds Alpaca->Base transfers on every corridor, so a conversion that keeps
+# failing (for example an empty USDC/USD book) is retried once per period
+# instead of on every check. Optional; non-zero, at most 86400 (one day). 300 = 5 minutes.
+conversion_failure_cooldown_secs = 300
 
 # One table per cash corridor, keyed by the chain whose vault it serves;
 # every corridor routes through the bot's Ethereum wallet, where Alpaca
