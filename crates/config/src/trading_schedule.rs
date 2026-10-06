@@ -184,7 +184,7 @@ mod tests {
         for (runtime, tokens, fragment) in [
             (
                 include_str!("../../../config/prod/st0x-hedge.toml"),
-                crate::registry::fixtures::pinned_production_tokens(),
+                crate::registry::fixtures::production_tokens(),
                 include_str!("../../../docs/trading-schedule/prod.toml"),
             ),
             (

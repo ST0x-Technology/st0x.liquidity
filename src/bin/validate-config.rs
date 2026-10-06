@@ -127,8 +127,7 @@ mod tests {
     #[test]
     fn validates_every_boot_candidate() {
         let config = Path::new("config/prod/st0x-hedge.toml");
-        let valid =
-            std::fs::read("tests/fixtures/tokens-production-1790341753647581.toml").unwrap();
+        let valid = std::fs::read("tests/fixtures/tokens-production.toml").unwrap();
         validate_candidates(config, None, &[Some(valid.clone())]).unwrap();
         assert!(
             validate_candidates(

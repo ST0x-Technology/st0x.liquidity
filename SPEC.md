@@ -2004,8 +2004,8 @@ reach no external service.
 `--registry-state` judges the copies a restart would boot: the running record,
 or a pending record together with the fallback that would keep its added
 listings. It reads the state without writing it. It reads the bucket only when
-the config pins a `generation` (the pin is what boots) or the state directory
-holds no record yet (the latest copy is what a first boot records).
+the state directory holds no record yet (the latest copy is what a first boot
+records).
 
 The two modes differ only in how much of the input they have:
 
@@ -2072,8 +2072,10 @@ vault ids, `trading` / `rebalancing` / `wrapped_equity_recovery`) and
 come from the token file that `st0x.registry` publishes to
 `gs://t0-artifacts-tokens/<env>/tokens.toml`, one file per environment shared
 with pricing, the oracle, bebop and the price publisher. The config names it
-under `[registry]` (`url`, and in production `generation`) and must carry no
-per-symbol table of its own; one that does is refused.
+under `[registry]` by `url` alone and must carry no per-symbol table of its own;
+one that does is refused. The bot follows the latest copy in every environment.
+There is no pin: a config that sets `[registry].generation` is refused with a
+message to remove it.
 
 At boot the file is read as the VM's service account (`storage.objects.get` on
 its own env prefix only, no proxy, no redirects), three attempts within a 20
@@ -2125,12 +2127,11 @@ Server boot leaves it in place, so an old service that restarts during the gates
 cannot accept a publication behind them. Holds expire after fifteen minutes. A
 local `--registry-file` overrides state for offline checks.
 
-Rollout retains the production generation pin while the persisted state and
-reload code are seeded from the reviewed pin; the pinned watcher remains
-report-only. Removing the pin is a separate release after the t0.devops compose
-gates pass the state path and create/clean up holds. The final configuration
-follows latest and refuses the generation key. Until that release, production
-still needs a pin bump to apply new token rows.
+Production rolls depend on the t0.devops roll change: the GCE roll script
+creates the hold and passes `--registry-state /mnt/data/registry` to the gates.
+The first production boot without a pin boots the running record that the
+earlier pinned release seeded from the reviewed pin. The loop then judges the
+latest copy as an ordinary change.
 
 Metrics expose applied generation, invalid latest content, reload outcomes and
 last outcome timestamps, carried-forward rows, completion-only services,
