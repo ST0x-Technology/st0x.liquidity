@@ -285,7 +285,11 @@ deviation = 0.05
 # redeems when the broker is under it, so a symbol rebalanced on two chains
 # needs targets whose upper bands leave the floor: DNUT's Base and Robinhood
 # rows in the token file both set target_share = 0.4, and 0.45 + 0.45 keeps
-# the broker at or above 0.1 with no planner action. min_operation_usd sits two
+# the broker at or above 0.1 only while Robinhood redeems as fast as it goes
+# over its band: 25 DNUT per operation (its operational_limit), one at a
+# time and at least cooldown_secs apart, about 300 an hour. Sustained sells
+# into the Robinhood vault hedge faster than that and take the broker below
+# 0.1, down to the hedge floor. min_operation_usd sits two
 # orders of magnitude above a Base mint's gas while still letting the cheapest
 # listings rebalance; cooldown_secs matches the inventory staleness bound, so
 # a limit-truncated transfer re-fires once per poll window, not every tick.
