@@ -212,9 +212,8 @@
   "links": [
     {
       "type": "link",
-      "title": "Dashboard",
+      "title": "\ud83d\udcca\u00a0Dashboard",
       "url": "/d/t0-liquidity/?theme=light&autofitpanels",
-      "icon": "dashboard",
       "targetBlank": false,
       "keepTime": true,
       "includeVars": true,
@@ -224,9 +223,8 @@
     },
     {
       "type": "link",
-      "title": "Orders",
+      "title": "\ud83d\udccb\u00a0Orders",
       "url": "/d/t0-liquidity-orders/?theme=light",
-      "icon": "dashboard",
       "targetBlank": false,
       "keepTime": true,
       "includeVars": true,
@@ -236,9 +234,8 @@
     },
     {
       "type": "link",
-      "title": "PnL",
+      "title": "\ud83d\udcb5\u00a0PnL",
       "url": "/d/t0-liquidity-pnl/?theme=light",
-      "icon": "dashboard",
       "targetBlank": false,
       "keepTime": true,
       "includeVars": true,
@@ -248,9 +245,8 @@
     },
     {
       "type": "link",
-      "title": "Performance",
+      "title": "\u26a1\u00a0Performance",
       "url": "/d/t0-liquidity-performance/?theme=light",
-      "icon": "dashboard",
       "targetBlank": false,
       "keepTime": true,
       "includeVars": true,
@@ -260,9 +256,8 @@
     },
     {
       "type": "link",
-      "title": "\u25b8 Logs",
+      "title": "\u25b8 \ud83d\udcdc\u00a0Logs",
       "url": "/d/t0-liquidity-logs/?theme=light",
-      "icon": "dashboard",
       "targetBlank": false,
       "keepTime": true,
       "includeVars": true,
@@ -286,10 +281,10 @@
   ],
   "panels": [
     {
-      "id": 108,
-      "type": "stat",
+      "id": 84,
+      "type": "marcusolsson-dynamictext-panel",
       "title": "",
-      "description": "The SPA header's connection light: is the bot process up and answering /health? '\u2014' means the exporter itself is not reporting.",
+      "description": "The SPA header: settings pills, Config, the CLI recovery guide, the deployed commit, uptime, and whether the exporter reaches the bot's /health.",
       "datasource": {
         "type": "stackdriver",
         "uid": "cloudmon"
@@ -304,7 +299,7 @@
           "queryType": "promQL",
           "promQLQuery": {
             "projectName": "$env",
-            "expr": "max(liq_up)",
+            "expr": "label_replace(max(liq_up), \"k\", \"up\", \"\", \"\") or label_replace(time() - max(liq_bot_start_timestamp_seconds), \"k\", \"uptime\", \"\", \"\") or label_replace(max by (git_commit) (timestamp(liq_bot_info)), \"k\", \"commit\", \"\", \"\") or label_replace(max by (broker, log_level, wallet_kind, wallet_address, orderbook, turnkey_organization, server_port) (liq_settings_info), \"k\", \"info\", \"\", \"\") or label_replace(max(liq_settings_equity_target), \"k\", \"equity_target\", \"\", \"\") or label_replace(max(liq_settings_equity_deviation), \"k\", \"equity_deviation\", \"\", \"\") or label_replace(max(liq_settings_usdc_target), \"k\", \"usdc_target\", \"\", \"\") or label_replace(max(liq_settings_usdc_deviation), \"k\", \"usdc_deviation\", \"\", \"\") or label_replace(max(liq_settings_execution_threshold_usd), \"k\", \"trigger\", \"\", \"\") or label_replace(max(liq_settings_cash_reserved), \"k\", \"cash_reserved\", \"\", \"\") or label_replace(max(liq_settings_order_polling_seconds), \"k\", \"order_polling\", \"\", \"\") or label_replace(max(liq_settings_inventory_poll_seconds), \"k\", \"inventory_polling\", \"\", \"\") or label_replace(max(liq_settings_deployment_block), \"k\", \"deployment_block\", \"\", \"\")",
             "step": "60s"
           },
           "timeSeriesList": {
@@ -319,602 +314,38 @@
       "transparent": true,
       "gridPos": {
         "h": 1,
-        "w": 3,
+        "w": 24,
         "x": 0,
         "y": 0
       },
-      "fieldConfig": {
-        "defaults": {
-          "mappings": [
-            {
-              "type": "value",
-              "options": {
-                "1": {
-                  "text": "Connected",
-                  "color": "green",
-                  "index": 0
-                },
-                "0": {
-                  "text": "Disconnected",
-                  "color": "red",
-                  "index": 1
-                }
-              }
-            },
-            {
-              "type": "special",
-              "options": {
-                "match": "null+nan",
-                "result": {
-                  "text": "\u2014",
-                  "color": "text",
-                  "index": 99
-                }
-              }
-            }
-          ],
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "text",
-                "value": null
-              }
-            ]
-          },
-          "unit": "short",
-          "displayName": "Bot"
+      "transformations": [
+        {
+          "id": "labelsToFields",
+          "options": {}
         },
-        "overrides": []
-      },
-      "options": {
-        "colorMode": "value",
-        "graphMode": "none",
-        "textMode": "value_and_name",
-        "justifyMode": "center",
-        "text": {
-          "valueSize": 14,
-          "titleSize": 12
-        },
-        "reduceOptions": {
-          "calcs": [
-            "lastNotNull"
-          ],
-          "fields": "",
-          "values": false
+        {
+          "id": "merge",
+          "options": {}
         }
+      ],
+      "options": {
+        "renderMode": "allRows",
+        "editor": {
+          "format": "auto",
+          "language": "html"
+        },
+        "content": "<div></div>",
+        "defaultContent": "No bot data.",
+        "helpers": "",
+        "afterRender": "const RECOVERY_GUIDE = {\"source\": \"ST0x-Technology/st0x.liquidity dashboard/src/lib/transfer.ts RECOVERY_GUIDE, same commit as this file; regenerate from there, do not edit by hand\", \"modeLabels\": {\"requires-bot\": \"REST \\u2014 requires the running bot\", \"live-rpc-only\": \"live RPC \\u2014 ensure the bot is not driving this same on-chain action\", \"direct-db-live-rpc\": \"direct DB + live RPC \\u2014 stop the bot / ensure it is not driving this id\", \"direct-db\": \"direct DB \\u2014 stop the bot / ensure it is not driving this id\"}, \"groups\": [{\"object\": \"transfer\", \"commands\": [{\"command\": \"st0x-liquidity-client --env production debug recheck <mint|redemption|usdc> <id>\", \"description\": \"Re-poll the provider and complete the transfer if it has settled.\", \"whenToUse\": \"A transfer is stuck or failed but the provider may have settled it.\", \"appliesTo\": \"Equity mint / redemption (any non-completed state), failed USDC deposit\", \"mode\": \"requires-bot\"}, {\"command\": \"st0x-liquidity-client --env production debug resume\", \"description\": \"Re-drive ALL interrupted mints and redemptions (no id; best-effort per transfer, failures reported as counts).\", \"whenToUse\": \"Equity transfers were interrupted mid-flight and need re-driving via the bot.\", \"appliesTo\": \"All in-flight equity transfers\", \"mode\": \"requires-bot\"}, {\"command\": \"st0x-liquidity-client --env production debug resume-usdc <alpaca-to-base|base-to-alpaca> <id>\", \"description\": \"Re-drive a single USDC bridge on the bot's transfer worker.\", \"whenToUse\": \"A USDC bridge stopped mid-flight, before or after the burn.\", \"appliesTo\": \"USDC bridge (in-flight)\", \"mode\": \"requires-bot\"}, {\"command\": \"st0x-liquidity-client --env production debug fail-equity-transfer <mint|redemption> <id> --reason \\\"<reason>\\\"\", \"description\": \"Force a stuck transfer into the terminal Failed state.\", \"whenToUse\": \"A mint/redemption is permanently stuck and unrecoverable.\", \"appliesTo\": \"Equity mint / redemption (non-terminal)\", \"mode\": \"requires-bot\"}, {\"command\": \"st0x-liquidity-client --env production debug fail-usdc-transfer <id> --reason \\\"<reason>\\\"\", \"description\": \"Force a USDC bridge stuck before its burn into Failed. The bot accepts it for an Alpaca to Base bridge whose withdrawal completed, or a Base to Alpaca bridge whose vault withdrawal was not sent. If the Alpaca withdrawal completed, the guard stays held until reconcile-usdc settles the funds. After a Base to Alpaca vault withdrawal, the bot refuses it: stop the bot, run the offline stox fail-usdc-transfer, and move the wallet USDC back by hand.\", \"whenToUse\": \"A USDC bridge is stuck before its CCTP burn and must be terminalized. Check the transfer and verify on-chain that no burn landed first.\", \"appliesTo\": \"USDC bridge (pre-burn stuck)\", \"mode\": \"requires-bot\"}, {\"command\": \"st0x-liquidity-client --env production debug reconcile-equity <mint|redemption> <id> --reason \\\"<reason>\\\"\", \"description\": \"Mark a terminally-failed equity transfer Reconciled after handling residue manually.\", \"whenToUse\": \"An equity transfer is in a terminal failure and its residue was settled out-of-band (bookkeeping).\", \"appliesTo\": \"Failed equity mint / redemption\", \"mode\": \"requires-bot\"}, {\"command\": \"st0x-liquidity-client --env production debug reconcile-usdc <id> --reason <funds-moved-manually|deposit-credited-offline>\", \"description\": \"Mark a failed USDC bridge Reconciled after its funds were settled manually.\", \"whenToUse\": \"A USDC bridge failed after its funds left the source venue, and they were settled out-of-band.\", \"appliesTo\": \"Post-burn USDC failure (DepositFailed, post-burn BridgingFailed, or BaseToAlpaca ConversionFailed)\", \"mode\": \"requires-bot\"}]}, {\"object\": \"position\", \"commands\": [{\"command\": \"st0x-liquidity-client --env production debug position release-hedge <symbol> --order-id <order-id> --reason \\\"<reason>\\\"\", \"description\": \"Clear a position's pending offchain order pointer so hedging can retry.\", \"whenToUse\": \"A position is wedged on a hedge order that never resolved.\", \"appliesTo\": \"Position with a stuck pending offchain order\", \"mode\": \"requires-bot\"}, {\"command\": \"st0x-liquidity-client --env production debug position set <symbol> --target-net <N> [--price-usdc <USDC_PER_SHARE>] --reason \\\"<reason>\\\"\", \"description\": \"Override a position\\u2019s net exposure after a manual correction. The target is signed: negative is short, 0 is flat.\", \"whenToUse\": \"The recorded net exposure has drifted from reality and must be set explicitly.\", \"appliesTo\": \"Any position\", \"mode\": \"requires-bot\"}]}, {\"object\": \"view\", \"commands\": [{\"command\": \"st0x-liquidity-client --env production debug view rebuild <position|offchain-order|vault-registry> (--id <id> | --all)\", \"description\": \"Replay all events to reconstruct a corrupted materialized view.\", \"whenToUse\": \"A view became corrupted (e.g. lost updates from optimistic-lock conflicts).\", \"appliesTo\": \"Position / offchain-order / vault-registry views\", \"mode\": \"requires-bot\"}]}, {\"object\": \"cctp\", \"commands\": [{\"command\": \"st0x-liquidity-client --env production debug cctp complete-mint --burn-tx <hash> --source-chain <ethereum|base>\", \"description\": \"Complete the destination-chain mint of a stuck CCTP transfer. A burn Circle has not attested yet fails at once as retryable; rerun it later.\", \"whenToUse\": \"A CCTP burn succeeded but attestation polling was interrupted before the mint.\", \"appliesTo\": \"CCTP cross-chain USDC transfer\", \"mode\": \"requires-bot\"}]}, {\"object\": \"trade\", \"commands\": [{\"command\": \"st0x-liquidity-client --env production debug process-tx <hash> [--chain <base|ethereum|hyperevm|robinhood>]\", \"description\": \"Re-account a missed onchain fill: record the trade and place the hedge.\", \"whenToUse\": \"The bot missed an onchain fill and the position/hedge was never updated.\", \"appliesTo\": \"Onchain (Raindex) fills\", \"mode\": \"requires-bot\"}]}]};\n\n// Business Text \"afterRender\" code for the Liquidity bot header: the SPA's\n// HeaderBar and SettingsBar (header-bar.svelte, settings-bar.svelte,\n// recovery-guide.svelte in ST0x-Technology/st0x.liquidity) in one row, with\n// the same Config and CLI recovery guide dialogs.\n//\n// Input: context.data, rows with a `k` column naming the value (up, uptime,\n// commit, info, equity_target, ...) plus the string labels some of them\n// carry (git_commit on commit; broker, wallet_kind, ... on info).\n//\n// RECOVERY_GUIDE is not defined here: the generator prepends it from\n// recovery-guide.json (see header_card()), because the template output is\n// sanitized and cannot carry data into this code.\n\nconst rows = Array.isArray(context.data) ? context.data : [];\nconst value = {};\nconst labels = {};\n// The stackdriver datasource runs a range query even for an instant target,\n// so each `k` can arrive at several times; keep the newest.\nconst seen = {};\nfor (const row of rows) {\n  const time = Number(row.Time) || 0;\n  if (row.k !== 'commit') {\n    if (row.k in seen && seen[row.k] > time) continue;\n    seen[row.k] = time;\n  }\n  if (row.k === 'commit') {\n    // A range query keeps the previous commit's series for a few minutes\n    // after a deploy. The commit row's value is its sample timestamp, so the\n    // newest one is the running commit.\n    if (!labels.commit || row.Value > labels.commit.at) labels.commit = { sha: row.git_commit, at: row.Value };\n  } else if (row.k === 'info') {\n    labels.info = row;\n  } else {\n    value[row.k] = row.Value === null || row.Value === undefined || Number.isNaN(Number(row.Value)) ? null : Number(row.Value);\n  }\n}\nconst info = labels.info || {};\n\nconst theme = context.grafana.theme;\nconst root = context.element;\n// The guide's commands target the environment the board shows: the client\n// takes the selector's text, production or staging.\nconst ENV = context.grafana.replaceVariables('${env:text}') === 'staging' ? 'staging' : 'production';\n// The plugin pads each rendered row by 8px, which makes this one-row panel\n// scroll; the row has no room for it.\nroot.style.padding = '0';\nroot.style.height = '100%';\nroot.style.overflow = 'hidden';\nroot.style.setProperty('--hdr-muted', theme.colors.text.secondary);\n// Light theme swaps the mode colours for darker shades (header.css).\nroot.classList.toggle('hdr-light', !theme.isDark);\nroot.style.setProperty('--hdr-border', theme.colors.border.weak);\nroot.style.setProperty('--hdr-pill', theme.colors.background.secondary);\nroot.style.setProperty('--hdr-card', theme.colors.background.primary);\nroot.style.setProperty('--hdr-text', theme.colors.text.primary);\n\nconst escapeHtml = (text) =>\n  String(text ?? '').replace(/[&<>\"']/g, (char) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '\"': '&quot;', \"'\": '&#39;' })[char]);\n\n// The SPA's fmtPct and band strings: \"50%\" and \"45%\u201355%\".\nconst pct = (fraction) => `${(fraction * 100).toFixed(0)}%`;\nconst band = (target, deviation) =>\n  target === null || target === undefined\n    ? ''\n    : deviation === null || deviation === undefined\n      ? ''\n      : ` <span class=\"hdr-muted\">(${pct(target - deviation)}\u2013${pct(target + deviation)})</span>`;\n\n// The SPA's formatUptime.\nconst uptime = (seconds) => {\n  if (seconds === null || seconds === undefined) return '';\n  const days = Math.floor(seconds / 86400);\n  const hours = Math.floor((seconds % 86400) / 3600);\n  const minutes = Math.floor((seconds % 3600) / 60);\n  if (days > 0) return `up ${days}d ${hours}h`;\n  if (hours > 0) return `up ${hours}h ${minutes}m`;\n  return `up ${minutes}m`;\n};\n\nconst clock = () => new Date().toISOString().replace('T', ' ').slice(0, 19) + ' UTC';\n\nconst pill = (inner) => `<span class=\"hdr-pill\">${inner}</span>`;\nconst connected = value.up === 1;\n\nconst pills = [\n  info.broker ? pill(`<span class=\"hdr-mono\">${escapeHtml(info.broker)}</span>`) : '',\n  value.equity_target !== null && value.equity_target !== undefined\n    ? pill(`Equity <b class=\"hdr-mono\">${pct(value.equity_target)}</b>${band(value.equity_target, value.equity_deviation)}`)\n    : '',\n  value.usdc_target !== null && value.usdc_target !== undefined\n    ? pill(`USDC <b class=\"hdr-mono\">${pct(value.usdc_target)}</b>${band(value.usdc_target, value.usdc_deviation)}`)\n    : '',\n  value.trigger !== null && value.trigger !== undefined ? pill(`Trigger <b class=\"hdr-mono\">$${value.trigger}</b>`) : '',\n  value.cash_reserved !== null && value.cash_reserved !== undefined\n    ? pill(`Reserve <b class=\"hdr-mono\">$${value.cash_reserved}</b>`)\n    : '',\n  '<button class=\"hdr-pill hdr-button\" data-open=\"config\">Config</button>',\n].join('');\n\nconst configRow = (name, text) =>\n  `<div class=\"hdr-row\"><span class=\"hdr-muted\">${name}</span><span class=\"hdr-mono hdr-trunc\" title=\"${escapeHtml(text)}\">${escapeHtml(text)}</span></div>`;\nconst seconds = (number) => (number === null || number === undefined ? '' : `${number}s`);\n\nconst configDialog = `\n<dialog class=\"hdr-dialog hdr-narrow\" data-dialog=\"config\">\n  <div class=\"hdr-dialog-head\"><span>Configuration</span><button class=\"hdr-close\" data-close>&times;</button></div>\n  <div class=\"hdr-dialog-body hdr-mono\">\n    ${\n      info.wallet_kind\n        ? configRow('Wallet', info.wallet_kind) +\n          configRow('Address', info.wallet_address) +\n          (info.wallet_kind === 'turnkey' && info.turnkey_organization ? configRow('Turnkey org', info.turnkey_organization) : '') +\n          '<div class=\"hdr-rule\"></div>'\n        : ''\n    }\n    ${configRow('Exported log level', info.log_level)}\n    ${configRow('Server port', info.server_port)}\n    ${configRow('Deployment block', value.deployment_block ?? '')}\n    ${configRow('Order polling', seconds(value.order_polling))}\n    ${configRow('Inventory polling', seconds(value.inventory_polling))}\n    ${configRow('Cash reserve', value.cash_reserved !== null && value.cash_reserved !== undefined ? `$${value.cash_reserved}` : 'none')}\n    ${configRow('Orderbook', info.orderbook)}\n  </div>\n</dialog>`;\n\nconst guide = RECOVERY_GUIDE;\nconst modeClass = (mode) =>\n  mode === 'requires-bot' ? 'hdr-amber' : mode === 'live-rpc-only' ? 'hdr-sky' : 'hdr-red';\nconst guideDialog = `\n<dialog class=\"hdr-dialog hdr-wide\" data-dialog=\"guide\">\n  <div class=\"hdr-dialog-head\"><span>CLI recovery guide</span><button class=\"hdr-close\" data-close>&times;</button></div>\n  <div class=\"hdr-dialog-body\">\n    <p class=\"hdr-muted hdr-intro\">Every recovery command, grouped by object. They use <span class=\"hdr-mono\">st0x-liquidity-client</span>, which signs in with your Google account and calls the running bot's API, so no SSH is needed and the bot must be running.</p>\n    ${guide.groups\n      .map(\n        (group) => `\n      <section class=\"hdr-group\">\n        <h3 class=\"hdr-mono\">${escapeHtml(group.object)}</h3>\n        ${group.commands\n          .map(\n            (entry) => `\n          <div class=\"hdr-command\">\n            <pre class=\"hdr-mono\">${escapeHtml(entry.command.replace('--env production', `--env ${ENV}`))}</pre>\n            <div class=\"hdr-grid\">\n              <span class=\"hdr-muted\">What</span><span>${escapeHtml(entry.description)}</span>\n              <span class=\"hdr-muted\">When</span><span>${escapeHtml(entry.whenToUse)}</span>\n              <span class=\"hdr-muted\">Applies to</span><span>${escapeHtml(entry.appliesTo)}</span>\n              <span class=\"hdr-muted\">Mode</span><span class=\"${modeClass(entry.mode)}\">${escapeHtml(guide.modeLabels[entry.mode] || entry.mode)}</span>\n            </div>\n          </div>`\n          )\n          .join('')}\n      </section>`\n      )\n      .join('')}\n  </div>\n</dialog>`;\n\n// The board refreshes every minute and each render replaces the markup, which\n// would close a dialog the operator is reading. Remember it to reopen it at\n// the same scroll position.\nconst openDialog = root.querySelector('dialog[open]');\nconst reopen = openDialog && {\n  name: openDialog.dataset.dialog,\n  scroll: openDialog.querySelector('.hdr-dialog-body')?.scrollTop || 0,\n};\n\nroot.innerHTML = `\n<div class=\"hdr\">\n  <div class=\"hdr-left\">${pills}</div>\n  <div class=\"hdr-right\">\n    <button class=\"hdr-guide\" data-open=\"guide\">CLI recovery guide</button>\n    <span class=\"hdr-mono hdr-muted\" data-clock>${clock()}</span>\n    ${labels.commit && labels.commit.sha ? `<span class=\"hdr-mono hdr-muted\" title=\"Deployed commit\">${escapeHtml(labels.commit.sha.slice(0, 7))}</span>` : ''}\n    <span class=\"hdr-muted\" title=\"Bot uptime\">${uptime(value.uptime)}</span>\n    <span class=\"hdr-badge ${connected ? 'hdr-ok' : 'hdr-bad'}\">${connected ? 'Connected' : 'Disconnected'}</span>\n  </div>\n</div>\n${configDialog}\n${guideDialog}`;\n\nroot.querySelectorAll('[data-open]').forEach((button) => {\n  button.addEventListener('click', () => root.querySelector(`[data-dialog=\"${button.dataset.open}\"]`).showModal());\n});\nroot.querySelectorAll('dialog').forEach((dialog) => {\n  dialog.querySelector('[data-close]').addEventListener('click', () => dialog.close());\n  // A click on the backdrop closes it, like the SPA.\n  dialog.addEventListener('click', (event) => {\n    if (event.target === dialog) dialog.close();\n  });\n});\nif (reopen) {\n  const dialog = root.querySelector(`[data-dialog=\"${reopen.name}\"]`);\n  if (dialog) {\n    dialog.showModal();\n    const body = dialog.querySelector('.hdr-dialog-body');\n    if (body) body.scrollTop = reopen.scroll;\n  }\n}\n\n// The SPA's ticking UTC clock. One interval per element, replaced on every\n// render so a refresh never stacks them. Grafana can also mount a new\n// element (tab switch, view mode), so an interval whose element left the\n// page stops itself.\nclearInterval(root.__hdrClock);\nroot.__hdrClock = setInterval(() => {\n  if (!root.isConnected) {\n    clearInterval(root.__hdrClock);\n    return;\n  }\n  const node = root.querySelector('[data-clock]');\n  if (node) node.textContent = clock();\n}, 1000);\n",
+        "styles": "/* Business Text \"styles\" for the Liquidity bot header row and its two\n   dialogs. Theme colours come in as --hdr-* variables set by header.js. */\n\n.hdr {\n  display: flex;\n  align-items: center;\n  justify-content: space-between;\n  gap: 8px;\n  height: 100%;\n  font-size: 13px;\n  white-space: nowrap;\n}\n\n.hdr-left,\n.hdr-right {\n  display: flex;\n  align-items: center;\n  gap: 8px;\n  min-width: 0;\n}\n\n.hdr-pill {\n  display: inline-flex;\n  align-items: center;\n  gap: 4px;\n  padding: 2px 10px;\n  border-radius: 9999px;\n  background: var(--hdr-pill);\n  color: var(--hdr-text);\n  font-size: 13px;\n  line-height: 18px;\n  border: 0;\n}\n\n.hdr-button {\n  color: var(--hdr-muted);\n  cursor: pointer;\n}\n\n.hdr-button:hover,\n.hdr-guide:hover,\n.hdr-close:hover {\n  color: var(--hdr-text);\n}\n\n.hdr-guide {\n  padding: 2px 8px;\n  border: 1px solid var(--hdr-border);\n  border-radius: 4px;\n  background: transparent;\n  color: var(--hdr-text);\n  font-size: 13px;\n  line-height: 18px;\n  cursor: pointer;\n}\n\n.hdr-badge {\n  padding: 2px 8px;\n  border-radius: 9999px;\n  font-size: 13px;\n  line-height: 18px;\n  font-weight: 600;\n}\n\n.hdr-ok { background: #f5f5f5; color: #171717; }\n.hdr-bad { background: #ef4444; color: #fff; }\n\n.hdr-mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }\n.hdr-muted { color: var(--hdr-muted); }\n\n.hdr-dialog {\n  padding: 0;\n  border: 1px solid var(--hdr-border);\n  border-radius: 8px;\n  background: var(--hdr-card);\n  color: var(--hdr-text);\n  white-space: normal;\n}\n\n.hdr-dialog::backdrop { background: rgba(0, 0, 0, 0.5); }\n.hdr-narrow { width: min(28rem, 92vw); }\n.hdr-wide { width: min(42rem, 92vw); }\n\n.hdr-dialog-head {\n  display: flex;\n  align-items: center;\n  justify-content: space-between;\n  padding: 12px 20px;\n  border-bottom: 1px solid var(--hdr-border);\n  font-size: 14px;\n  font-weight: 600;\n}\n\n.hdr-close {\n  border: 0;\n  background: transparent;\n  color: var(--hdr-muted);\n  font-size: 18px;\n  line-height: 1;\n  cursor: pointer;\n}\n\n.hdr-dialog-body {\n  max-height: 70vh;\n  overflow-y: auto;\n  padding: 16px 20px;\n  font-size: 13px;\n}\n\n.hdr-row {\n  display: flex;\n  justify-content: space-between;\n  gap: 16px;\n  padding: 4px 0;\n}\n\n.hdr-trunc {\n  overflow: hidden;\n  text-overflow: ellipsis;\n  white-space: nowrap;\n}\n\n.hdr-rule { border-top: 1px solid var(--hdr-border); margin: 8px 0; }\n.hdr-intro { margin: 0 0 16px; }\n.hdr-group { margin-bottom: 20px; }\n.hdr-group h3 { margin: 0 0 8px; font-size: 13px; text-transform: capitalize; }\n\n.hdr-command {\n  margin-bottom: 12px;\n  padding: 8px 12px;\n  border: 1px solid var(--hdr-border);\n  border-radius: 6px;\n  background: var(--hdr-pill);\n}\n\n.hdr-command pre {\n  margin: 0;\n  padding: 8px;\n  border-radius: 4px;\n  background: var(--hdr-card);\n  font-size: 12px;\n  white-space: pre-wrap;\n  word-break: break-all;\n}\n\n.hdr-grid {\n  display: grid;\n  grid-template-columns: auto 1fr;\n  gap: 4px 12px;\n  margin-top: 6px;\n  font-size: 12px;\n}\n\n.hdr-amber { color: #f59e0b; }\n.hdr-sky { color: #0ea5e9; }\n.hdr-red { color: #ef4444; }\n\n/* Tailwind 700 on the light theme, like detail.css, for a 4.5:1 contrast\n   against the white dialog. */\n.hdr-light .hdr-amber { color: #b45309; }\n.hdr-light .hdr-sky { color: #0369a1; }\n.hdr-light .hdr-red { color: #b91c1c; }\n",
+        "wrap": false
       },
       "timeFrom": "5m",
       "hideTimeOverride": true
     },
     {
-      "id": 109,
-      "type": "stat",
-      "title": "",
-      "description": "Deployed commit, from /health, cut to 7 characters like the SPA header. The stackdriver plugin runs a range query even for an instant target, so over the dashboard's 24h the previous commit is a second series and its name drew over this one. PromQL also keeps a stopped series for its 5m lookback, so topk on the sample timestamp keeps only the commit with the newest sample, over a 1m window.",
-      "datasource": {
-        "type": "stackdriver",
-        "uid": "cloudmon"
-      },
-      "targets": [
-        {
-          "refId": "A",
-          "datasource": {
-            "type": "stackdriver",
-            "uid": "cloudmon"
-          },
-          "queryType": "promQL",
-          "promQLQuery": {
-            "projectName": "$env",
-            "expr": "max by (git_commit) (topk(1, label_replace(timestamp(liq_bot_info), \"git_commit\", \"$1\", \"git_commit\", \"(.{7}).*\")))",
-            "step": "60s"
-          },
-          "timeSeriesList": {
-            "projectName": "",
-            "filters": [],
-            "view": "FULL",
-            "groupBys": []
-          },
-          "instant": true,
-          "legendFormat": "{{git_commit}}"
-        }
-      ],
-      "transparent": true,
-      "gridPos": {
-        "h": 1,
-        "w": 3,
-        "x": 3,
-        "y": 0
-      },
-      "fieldConfig": {
-        "defaults": {
-          "mappings": [
-            {
-              "type": "special",
-              "options": {
-                "match": "null+nan",
-                "result": {
-                  "text": "\u2014",
-                  "color": "text",
-                  "index": 99
-                }
-              }
-            }
-          ],
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "text",
-                "value": null
-              }
-            ]
-          },
-          "unit": "short"
-        },
-        "overrides": []
-      },
-      "options": {
-        "colorMode": "none",
-        "graphMode": "none",
-        "textMode": "name",
-        "justifyMode": "center",
-        "text": {
-          "valueSize": 14,
-          "titleSize": 12
-        },
-        "reduceOptions": {
-          "calcs": [
-            "lastNotNull"
-          ],
-          "fields": "",
-          "values": false
-        }
-      },
-      "timeFrom": "1m",
-      "hideTimeOverride": true
-    },
-    {
-      "id": 110,
-      "type": "stat",
-      "title": "",
-      "description": "Bot process uptime, from /health uptimeSeconds.",
-      "datasource": {
-        "type": "stackdriver",
-        "uid": "cloudmon"
-      },
-      "targets": [
-        {
-          "refId": "A",
-          "datasource": {
-            "type": "stackdriver",
-            "uid": "cloudmon"
-          },
-          "queryType": "promQL",
-          "promQLQuery": {
-            "projectName": "$env",
-            "expr": "time() - max(liq_bot_start_timestamp_seconds)",
-            "step": "60s"
-          },
-          "timeSeriesList": {
-            "projectName": "",
-            "filters": [],
-            "view": "FULL",
-            "groupBys": []
-          },
-          "instant": true
-        }
-      ],
-      "transparent": true,
-      "gridPos": {
-        "h": 1,
-        "w": 3,
-        "x": 6,
-        "y": 0
-      },
-      "fieldConfig": {
-        "defaults": {
-          "mappings": [
-            {
-              "type": "special",
-              "options": {
-                "match": "null+nan",
-                "result": {
-                  "text": "\u2014",
-                  "color": "text",
-                  "index": 99
-                }
-              }
-            }
-          ],
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "text",
-                "value": null
-              }
-            ]
-          },
-          "unit": "s",
-          "displayName": "Uptime",
-          "decimals": 0
-        },
-        "overrides": []
-      },
-      "options": {
-        "colorMode": "none",
-        "graphMode": "none",
-        "textMode": "value_and_name",
-        "justifyMode": "center",
-        "text": {
-          "valueSize": 14,
-          "titleSize": 12
-        },
-        "reduceOptions": {
-          "calcs": [
-            "lastNotNull"
-          ],
-          "fields": "",
-          "values": false
-        }
-      },
-      "timeFrom": "5m",
-      "hideTimeOverride": true
-    },
-    {
-      "id": 111,
-      "type": "stat",
-      "title": "",
-      "description": "The SPA settings bar's Broker pill.",
-      "datasource": {
-        "type": "stackdriver",
-        "uid": "cloudmon"
-      },
-      "targets": [
-        {
-          "refId": "A",
-          "datasource": {
-            "type": "stackdriver",
-            "uid": "cloudmon"
-          },
-          "queryType": "promQL",
-          "promQLQuery": {
-            "projectName": "$env",
-            "expr": "sum by (broker) (liq_settings_info)",
-            "step": "60s"
-          },
-          "timeSeriesList": {
-            "projectName": "",
-            "filters": [],
-            "view": "FULL",
-            "groupBys": []
-          },
-          "instant": true,
-          "legendFormat": "{{broker}}"
-        }
-      ],
-      "transparent": true,
-      "gridPos": {
-        "h": 1,
-        "w": 3,
-        "x": 9,
-        "y": 0
-      },
-      "fieldConfig": {
-        "defaults": {
-          "mappings": [
-            {
-              "type": "special",
-              "options": {
-                "match": "null+nan",
-                "result": {
-                  "text": "\u2014",
-                  "color": "text",
-                  "index": 99
-                }
-              }
-            }
-          ],
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "text",
-                "value": null
-              }
-            ]
-          },
-          "unit": "short"
-        },
-        "overrides": []
-      },
-      "options": {
-        "colorMode": "none",
-        "graphMode": "none",
-        "textMode": "name",
-        "justifyMode": "center",
-        "text": {
-          "valueSize": 14,
-          "titleSize": 12
-        },
-        "reduceOptions": {
-          "calcs": [
-            "lastNotNull"
-          ],
-          "fields": "",
-          "values": false
-        }
-      },
-      "timeFrom": "5m",
-      "hideTimeOverride": true
-    },
-    {
-      "id": 112,
-      "type": "stat",
-      "title": "",
-      "description": "Equity rebalance target. The SPA pill also shows the band: target +/- liq_settings_equity_deviation.",
-      "datasource": {
-        "type": "stackdriver",
-        "uid": "cloudmon"
-      },
-      "targets": [
-        {
-          "refId": "A",
-          "datasource": {
-            "type": "stackdriver",
-            "uid": "cloudmon"
-          },
-          "queryType": "promQL",
-          "promQLQuery": {
-            "projectName": "$env",
-            "expr": "max(liq_settings_equity_target)",
-            "step": "60s"
-          },
-          "timeSeriesList": {
-            "projectName": "",
-            "filters": [],
-            "view": "FULL",
-            "groupBys": []
-          },
-          "instant": true
-        }
-      ],
-      "transparent": true,
-      "gridPos": {
-        "h": 1,
-        "w": 4,
-        "x": 12,
-        "y": 0
-      },
-      "fieldConfig": {
-        "defaults": {
-          "mappings": [
-            {
-              "type": "special",
-              "options": {
-                "match": "null+nan",
-                "result": {
-                  "text": "\u2014",
-                  "color": "text",
-                  "index": 99
-                }
-              }
-            }
-          ],
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "text",
-                "value": null
-              }
-            ]
-          },
-          "unit": "percentunit",
-          "displayName": "Equity",
-          "decimals": 0
-        },
-        "overrides": []
-      },
-      "options": {
-        "colorMode": "none",
-        "graphMode": "none",
-        "textMode": "value_and_name",
-        "justifyMode": "center",
-        "text": {
-          "valueSize": 14,
-          "titleSize": 12
-        },
-        "reduceOptions": {
-          "calcs": [
-            "lastNotNull"
-          ],
-          "fields": "",
-          "values": false
-        }
-      },
-      "timeFrom": "5m",
-      "hideTimeOverride": true
-    },
-    {
-      "id": 113,
-      "type": "stat",
-      "title": "",
-      "description": "USDC rebalance target. The SPA pill also shows the band: target +/- liq_settings_usdc_deviation.",
-      "datasource": {
-        "type": "stackdriver",
-        "uid": "cloudmon"
-      },
-      "targets": [
-        {
-          "refId": "A",
-          "datasource": {
-            "type": "stackdriver",
-            "uid": "cloudmon"
-          },
-          "queryType": "promQL",
-          "promQLQuery": {
-            "projectName": "$env",
-            "expr": "max(liq_settings_usdc_target)",
-            "step": "60s"
-          },
-          "timeSeriesList": {
-            "projectName": "",
-            "filters": [],
-            "view": "FULL",
-            "groupBys": []
-          },
-          "instant": true
-        }
-      ],
-      "transparent": true,
-      "gridPos": {
-        "h": 1,
-        "w": 4,
-        "x": 16,
-        "y": 0
-      },
-      "fieldConfig": {
-        "defaults": {
-          "mappings": [
-            {
-              "type": "special",
-              "options": {
-                "match": "null+nan",
-                "result": {
-                  "text": "\u2014",
-                  "color": "text",
-                  "index": 99
-                }
-              }
-            }
-          ],
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "text",
-                "value": null
-              }
-            ]
-          },
-          "unit": "percentunit",
-          "displayName": "USDC",
-          "decimals": 0
-        },
-        "overrides": []
-      },
-      "options": {
-        "colorMode": "none",
-        "graphMode": "none",
-        "textMode": "value_and_name",
-        "justifyMode": "center",
-        "text": {
-          "valueSize": 14,
-          "titleSize": 12
-        },
-        "reduceOptions": {
-          "calcs": [
-            "lastNotNull"
-          ],
-          "fields": "",
-          "values": false
-        }
-      },
-      "timeFrom": "5m",
-      "hideTimeOverride": true
-    },
-    {
-      "id": 114,
-      "type": "stat",
-      "title": "",
-      "description": "Hedge execution threshold (settings bar 'Trigger').",
-      "datasource": {
-        "type": "stackdriver",
-        "uid": "cloudmon"
-      },
-      "targets": [
-        {
-          "refId": "A",
-          "datasource": {
-            "type": "stackdriver",
-            "uid": "cloudmon"
-          },
-          "queryType": "promQL",
-          "promQLQuery": {
-            "projectName": "$env",
-            "expr": "max(liq_settings_execution_threshold_usd)",
-            "step": "60s"
-          },
-          "timeSeriesList": {
-            "projectName": "",
-            "filters": [],
-            "view": "FULL",
-            "groupBys": []
-          },
-          "instant": true
-        }
-      ],
-      "transparent": true,
-      "gridPos": {
-        "h": 1,
-        "w": 4,
-        "x": 20,
-        "y": 0
-      },
-      "fieldConfig": {
-        "defaults": {
-          "mappings": [
-            {
-              "type": "special",
-              "options": {
-                "match": "null+nan",
-                "result": {
-                  "text": "\u2014",
-                  "color": "text",
-                  "index": 99
-                }
-              }
-            }
-          ],
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "text",
-                "value": null
-              }
-            ]
-          },
-          "unit": "currencyUSD",
-          "displayName": "Trigger",
-          "decimals": 0
-        },
-        "overrides": []
-      },
-      "options": {
-        "colorMode": "none",
-        "graphMode": "none",
-        "textMode": "value_and_name",
-        "justifyMode": "center",
-        "text": {
-          "valueSize": 14,
-          "titleSize": 12
-        },
-        "reduceOptions": {
-          "calcs": [
-            "lastNotNull"
-          ],
-          "fields": "",
-          "values": false
-        }
-      },
-      "timeFrom": "5m",
-      "hideTimeOverride": true
-    },
-    {
-      "id": 115,
+      "id": 85,
       "type": "table",
       "title": "Log History",
       "description": "The bot's structured log lines, re-emitted by the exporter with real severity and target (the raw container stream is all-INFO). Filter with the level/category/target/search variables above. \u26a0\ufe0f Only the newest matching entries, about the panel's pixel width of them. Narrow the filters, or use the SPA for deep digs. DEBUG/TRACE are not shipped.",

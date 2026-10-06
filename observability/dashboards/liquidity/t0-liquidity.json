@@ -44,15 +44,25 @@
             "value": "t0-liquidity-staging"
           }
         ]
+      },
+      {
+        "type": "textbox",
+        "name": "detail",
+        "hide": 2,
+        "query": "",
+        "current": {
+          "text": "",
+          "value": ""
+        },
+        "options": []
       }
     ]
   },
   "links": [
     {
       "type": "link",
-      "title": "\u25b8 Dashboard",
+      "title": "\u25b8 \ud83d\udcca\u00a0Dashboard",
       "url": "/d/t0-liquidity/?theme=light&autofitpanels",
-      "icon": "dashboard",
       "targetBlank": false,
       "keepTime": true,
       "includeVars": true,
@@ -62,9 +72,8 @@
     },
     {
       "type": "link",
-      "title": "Orders",
+      "title": "\ud83d\udccb\u00a0Orders",
       "url": "/d/t0-liquidity-orders/?theme=light",
-      "icon": "dashboard",
       "targetBlank": false,
       "keepTime": true,
       "includeVars": true,
@@ -74,9 +83,8 @@
     },
     {
       "type": "link",
-      "title": "PnL",
+      "title": "\ud83d\udcb5\u00a0PnL",
       "url": "/d/t0-liquidity-pnl/?theme=light",
-      "icon": "dashboard",
       "targetBlank": false,
       "keepTime": true,
       "includeVars": true,
@@ -86,9 +94,8 @@
     },
     {
       "type": "link",
-      "title": "Performance",
+      "title": "\u26a1\u00a0Performance",
       "url": "/d/t0-liquidity-performance/?theme=light",
-      "icon": "dashboard",
       "targetBlank": false,
       "keepTime": true,
       "includeVars": true,
@@ -98,9 +105,8 @@
     },
     {
       "type": "link",
-      "title": "Logs",
+      "title": "\ud83d\udcdc\u00a0Logs",
       "url": "/d/t0-liquidity-logs/?theme=light",
-      "icon": "dashboard",
       "targetBlank": false,
       "keepTime": true,
       "includeVars": true,
@@ -125,9 +131,9 @@
   "panels": [
     {
       "id": 1,
-      "type": "stat",
+      "type": "marcusolsson-dynamictext-panel",
       "title": "",
-      "description": "The SPA header's connection light: is the bot process up and answering /health? '\u2014' means the exporter itself is not reporting.",
+      "description": "The SPA header: settings pills, Config, the CLI recovery guide, the deployed commit, uptime, and whether the exporter reaches the bot's /health.",
       "datasource": {
         "type": "stackdriver",
         "uid": "cloudmon"
@@ -142,7 +148,7 @@
           "queryType": "promQL",
           "promQLQuery": {
             "projectName": "$env",
-            "expr": "max(liq_up)",
+            "expr": "label_replace(max(liq_up), \"k\", \"up\", \"\", \"\") or label_replace(time() - max(liq_bot_start_timestamp_seconds), \"k\", \"uptime\", \"\", \"\") or label_replace(max by (git_commit) (timestamp(liq_bot_info)), \"k\", \"commit\", \"\", \"\") or label_replace(max by (broker, log_level, wallet_kind, wallet_address, orderbook, turnkey_organization, server_port) (liq_settings_info), \"k\", \"info\", \"\", \"\") or label_replace(max(liq_settings_equity_target), \"k\", \"equity_target\", \"\", \"\") or label_replace(max(liq_settings_equity_deviation), \"k\", \"equity_deviation\", \"\", \"\") or label_replace(max(liq_settings_usdc_target), \"k\", \"usdc_target\", \"\", \"\") or label_replace(max(liq_settings_usdc_deviation), \"k\", \"usdc_deviation\", \"\", \"\") or label_replace(max(liq_settings_execution_threshold_usd), \"k\", \"trigger\", \"\", \"\") or label_replace(max(liq_settings_cash_reserved), \"k\", \"cash_reserved\", \"\", \"\") or label_replace(max(liq_settings_order_polling_seconds), \"k\", \"order_polling\", \"\", \"\") or label_replace(max(liq_settings_inventory_poll_seconds), \"k\", \"inventory_polling\", \"\", \"\") or label_replace(max(liq_settings_deployment_block), \"k\", \"deployment_block\", \"\", \"\")",
             "step": "60s"
           },
           "timeSeriesList": {
@@ -157,605 +163,42 @@
       "transparent": true,
       "gridPos": {
         "h": 1,
-        "w": 3,
+        "w": 23,
         "x": 0,
         "y": 0
       },
-      "fieldConfig": {
-        "defaults": {
-          "mappings": [
-            {
-              "type": "value",
-              "options": {
-                "1": {
-                  "text": "Connected",
-                  "color": "green",
-                  "index": 0
-                },
-                "0": {
-                  "text": "Disconnected",
-                  "color": "red",
-                  "index": 1
-                }
-              }
-            },
-            {
-              "type": "special",
-              "options": {
-                "match": "null+nan",
-                "result": {
-                  "text": "\u2014",
-                  "color": "text",
-                  "index": 99
-                }
-              }
-            }
-          ],
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "text",
-                "value": null
-              }
-            ]
-          },
-          "unit": "short",
-          "displayName": "Bot"
+      "transformations": [
+        {
+          "id": "labelsToFields",
+          "options": {}
         },
-        "overrides": []
-      },
-      "options": {
-        "colorMode": "value",
-        "graphMode": "none",
-        "textMode": "value_and_name",
-        "justifyMode": "center",
-        "text": {
-          "valueSize": 14,
-          "titleSize": 12
-        },
-        "reduceOptions": {
-          "calcs": [
-            "lastNotNull"
-          ],
-          "fields": "",
-          "values": false
+        {
+          "id": "merge",
+          "options": {}
         }
+      ],
+      "options": {
+        "renderMode": "allRows",
+        "editor": {
+          "format": "auto",
+          "language": "html"
+        },
+        "content": "<div></div>",
+        "defaultContent": "No bot data.",
+        "helpers": "",
+        "afterRender": "const RECOVERY_GUIDE = {\"source\": \"ST0x-Technology/st0x.liquidity dashboard/src/lib/transfer.ts RECOVERY_GUIDE, same commit as this file; regenerate from there, do not edit by hand\", \"modeLabels\": {\"requires-bot\": \"REST \\u2014 requires the running bot\", \"live-rpc-only\": \"live RPC \\u2014 ensure the bot is not driving this same on-chain action\", \"direct-db-live-rpc\": \"direct DB + live RPC \\u2014 stop the bot / ensure it is not driving this id\", \"direct-db\": \"direct DB \\u2014 stop the bot / ensure it is not driving this id\"}, \"groups\": [{\"object\": \"transfer\", \"commands\": [{\"command\": \"st0x-liquidity-client --env production debug recheck <mint|redemption|usdc> <id>\", \"description\": \"Re-poll the provider and complete the transfer if it has settled.\", \"whenToUse\": \"A transfer is stuck or failed but the provider may have settled it.\", \"appliesTo\": \"Equity mint / redemption (any non-completed state), failed USDC deposit\", \"mode\": \"requires-bot\"}, {\"command\": \"st0x-liquidity-client --env production debug resume\", \"description\": \"Re-drive ALL interrupted mints and redemptions (no id; best-effort per transfer, failures reported as counts).\", \"whenToUse\": \"Equity transfers were interrupted mid-flight and need re-driving via the bot.\", \"appliesTo\": \"All in-flight equity transfers\", \"mode\": \"requires-bot\"}, {\"command\": \"st0x-liquidity-client --env production debug resume-usdc <alpaca-to-base|base-to-alpaca> <id>\", \"description\": \"Re-drive a single USDC bridge on the bot's transfer worker.\", \"whenToUse\": \"A USDC bridge stopped mid-flight, before or after the burn.\", \"appliesTo\": \"USDC bridge (in-flight)\", \"mode\": \"requires-bot\"}, {\"command\": \"st0x-liquidity-client --env production debug fail-equity-transfer <mint|redemption> <id> --reason \\\"<reason>\\\"\", \"description\": \"Force a stuck transfer into the terminal Failed state.\", \"whenToUse\": \"A mint/redemption is permanently stuck and unrecoverable.\", \"appliesTo\": \"Equity mint / redemption (non-terminal)\", \"mode\": \"requires-bot\"}, {\"command\": \"st0x-liquidity-client --env production debug fail-usdc-transfer <id> --reason \\\"<reason>\\\"\", \"description\": \"Force a USDC bridge stuck before its burn into Failed. The bot accepts it for an Alpaca to Base bridge whose withdrawal completed, or a Base to Alpaca bridge whose vault withdrawal was not sent. If the Alpaca withdrawal completed, the guard stays held until reconcile-usdc settles the funds. After a Base to Alpaca vault withdrawal, the bot refuses it: stop the bot, run the offline stox fail-usdc-transfer, and move the wallet USDC back by hand.\", \"whenToUse\": \"A USDC bridge is stuck before its CCTP burn and must be terminalized. Check the transfer and verify on-chain that no burn landed first.\", \"appliesTo\": \"USDC bridge (pre-burn stuck)\", \"mode\": \"requires-bot\"}, {\"command\": \"st0x-liquidity-client --env production debug reconcile-equity <mint|redemption> <id> --reason \\\"<reason>\\\"\", \"description\": \"Mark a terminally-failed equity transfer Reconciled after handling residue manually.\", \"whenToUse\": \"An equity transfer is in a terminal failure and its residue was settled out-of-band (bookkeeping).\", \"appliesTo\": \"Failed equity mint / redemption\", \"mode\": \"requires-bot\"}, {\"command\": \"st0x-liquidity-client --env production debug reconcile-usdc <id> --reason <funds-moved-manually|deposit-credited-offline>\", \"description\": \"Mark a failed USDC bridge Reconciled after its funds were settled manually.\", \"whenToUse\": \"A USDC bridge failed after its funds left the source venue, and they were settled out-of-band.\", \"appliesTo\": \"Post-burn USDC failure (DepositFailed, post-burn BridgingFailed, or BaseToAlpaca ConversionFailed)\", \"mode\": \"requires-bot\"}]}, {\"object\": \"position\", \"commands\": [{\"command\": \"st0x-liquidity-client --env production debug position release-hedge <symbol> --order-id <order-id> --reason \\\"<reason>\\\"\", \"description\": \"Clear a position's pending offchain order pointer so hedging can retry.\", \"whenToUse\": \"A position is wedged on a hedge order that never resolved.\", \"appliesTo\": \"Position with a stuck pending offchain order\", \"mode\": \"requires-bot\"}, {\"command\": \"st0x-liquidity-client --env production debug position set <symbol> --target-net <N> [--price-usdc <USDC_PER_SHARE>] --reason \\\"<reason>\\\"\", \"description\": \"Override a position\\u2019s net exposure after a manual correction. The target is signed: negative is short, 0 is flat.\", \"whenToUse\": \"The recorded net exposure has drifted from reality and must be set explicitly.\", \"appliesTo\": \"Any position\", \"mode\": \"requires-bot\"}]}, {\"object\": \"view\", \"commands\": [{\"command\": \"st0x-liquidity-client --env production debug view rebuild <position|offchain-order|vault-registry> (--id <id> | --all)\", \"description\": \"Replay all events to reconstruct a corrupted materialized view.\", \"whenToUse\": \"A view became corrupted (e.g. lost updates from optimistic-lock conflicts).\", \"appliesTo\": \"Position / offchain-order / vault-registry views\", \"mode\": \"requires-bot\"}]}, {\"object\": \"cctp\", \"commands\": [{\"command\": \"st0x-liquidity-client --env production debug cctp complete-mint --burn-tx <hash> --source-chain <ethereum|base>\", \"description\": \"Complete the destination-chain mint of a stuck CCTP transfer. A burn Circle has not attested yet fails at once as retryable; rerun it later.\", \"whenToUse\": \"A CCTP burn succeeded but attestation polling was interrupted before the mint.\", \"appliesTo\": \"CCTP cross-chain USDC transfer\", \"mode\": \"requires-bot\"}]}, {\"object\": \"trade\", \"commands\": [{\"command\": \"st0x-liquidity-client --env production debug process-tx <hash> [--chain <base|ethereum|hyperevm|robinhood>]\", \"description\": \"Re-account a missed onchain fill: record the trade and place the hedge.\", \"whenToUse\": \"The bot missed an onchain fill and the position/hedge was never updated.\", \"appliesTo\": \"Onchain (Raindex) fills\", \"mode\": \"requires-bot\"}]}]};\n\n// Business Text \"afterRender\" code for the Liquidity bot header: the SPA's\n// HeaderBar and SettingsBar (header-bar.svelte, settings-bar.svelte,\n// recovery-guide.svelte in ST0x-Technology/st0x.liquidity) in one row, with\n// the same Config and CLI recovery guide dialogs.\n//\n// Input: context.data, rows with a `k` column naming the value (up, uptime,\n// commit, info, equity_target, ...) plus the string labels some of them\n// carry (git_commit on commit; broker, wallet_kind, ... on info).\n//\n// RECOVERY_GUIDE is not defined here: the generator prepends it from\n// recovery-guide.json (see header_card()), because the template output is\n// sanitized and cannot carry data into this code.\n\nconst rows = Array.isArray(context.data) ? context.data : [];\nconst value = {};\nconst labels = {};\n// The stackdriver datasource runs a range query even for an instant target,\n// so each `k` can arrive at several times; keep the newest.\nconst seen = {};\nfor (const row of rows) {\n  const time = Number(row.Time) || 0;\n  if (row.k !== 'commit') {\n    if (row.k in seen && seen[row.k] > time) continue;\n    seen[row.k] = time;\n  }\n  if (row.k === 'commit') {\n    // A range query keeps the previous commit's series for a few minutes\n    // after a deploy. The commit row's value is its sample timestamp, so the\n    // newest one is the running commit.\n    if (!labels.commit || row.Value > labels.commit.at) labels.commit = { sha: row.git_commit, at: row.Value };\n  } else if (row.k === 'info') {\n    labels.info = row;\n  } else {\n    value[row.k] = row.Value === null || row.Value === undefined || Number.isNaN(Number(row.Value)) ? null : Number(row.Value);\n  }\n}\nconst info = labels.info || {};\n\nconst theme = context.grafana.theme;\nconst root = context.element;\n// The guide's commands target the environment the board shows: the client\n// takes the selector's text, production or staging.\nconst ENV = context.grafana.replaceVariables('${env:text}') === 'staging' ? 'staging' : 'production';\n// The plugin pads each rendered row by 8px, which makes this one-row panel\n// scroll; the row has no room for it.\nroot.style.padding = '0';\nroot.style.height = '100%';\nroot.style.overflow = 'hidden';\nroot.style.setProperty('--hdr-muted', theme.colors.text.secondary);\n// Light theme swaps the mode colours for darker shades (header.css).\nroot.classList.toggle('hdr-light', !theme.isDark);\nroot.style.setProperty('--hdr-border', theme.colors.border.weak);\nroot.style.setProperty('--hdr-pill', theme.colors.background.secondary);\nroot.style.setProperty('--hdr-card', theme.colors.background.primary);\nroot.style.setProperty('--hdr-text', theme.colors.text.primary);\n\nconst escapeHtml = (text) =>\n  String(text ?? '').replace(/[&<>\"']/g, (char) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '\"': '&quot;', \"'\": '&#39;' })[char]);\n\n// The SPA's fmtPct and band strings: \"50%\" and \"45%\u201355%\".\nconst pct = (fraction) => `${(fraction * 100).toFixed(0)}%`;\nconst band = (target, deviation) =>\n  target === null || target === undefined\n    ? ''\n    : deviation === null || deviation === undefined\n      ? ''\n      : ` <span class=\"hdr-muted\">(${pct(target - deviation)}\u2013${pct(target + deviation)})</span>`;\n\n// The SPA's formatUptime.\nconst uptime = (seconds) => {\n  if (seconds === null || seconds === undefined) return '';\n  const days = Math.floor(seconds / 86400);\n  const hours = Math.floor((seconds % 86400) / 3600);\n  const minutes = Math.floor((seconds % 3600) / 60);\n  if (days > 0) return `up ${days}d ${hours}h`;\n  if (hours > 0) return `up ${hours}h ${minutes}m`;\n  return `up ${minutes}m`;\n};\n\nconst clock = () => new Date().toISOString().replace('T', ' ').slice(0, 19) + ' UTC';\n\nconst pill = (inner) => `<span class=\"hdr-pill\">${inner}</span>`;\nconst connected = value.up === 1;\n\nconst pills = [\n  info.broker ? pill(`<span class=\"hdr-mono\">${escapeHtml(info.broker)}</span>`) : '',\n  value.equity_target !== null && value.equity_target !== undefined\n    ? pill(`Equity <b class=\"hdr-mono\">${pct(value.equity_target)}</b>${band(value.equity_target, value.equity_deviation)}`)\n    : '',\n  value.usdc_target !== null && value.usdc_target !== undefined\n    ? pill(`USDC <b class=\"hdr-mono\">${pct(value.usdc_target)}</b>${band(value.usdc_target, value.usdc_deviation)}`)\n    : '',\n  value.trigger !== null && value.trigger !== undefined ? pill(`Trigger <b class=\"hdr-mono\">$${value.trigger}</b>`) : '',\n  value.cash_reserved !== null && value.cash_reserved !== undefined\n    ? pill(`Reserve <b class=\"hdr-mono\">$${value.cash_reserved}</b>`)\n    : '',\n  '<button class=\"hdr-pill hdr-button\" data-open=\"config\">Config</button>',\n].join('');\n\nconst configRow = (name, text) =>\n  `<div class=\"hdr-row\"><span class=\"hdr-muted\">${name}</span><span class=\"hdr-mono hdr-trunc\" title=\"${escapeHtml(text)}\">${escapeHtml(text)}</span></div>`;\nconst seconds = (number) => (number === null || number === undefined ? '' : `${number}s`);\n\nconst configDialog = `\n<dialog class=\"hdr-dialog hdr-narrow\" data-dialog=\"config\">\n  <div class=\"hdr-dialog-head\"><span>Configuration</span><button class=\"hdr-close\" data-close>&times;</button></div>\n  <div class=\"hdr-dialog-body hdr-mono\">\n    ${\n      info.wallet_kind\n        ? configRow('Wallet', info.wallet_kind) +\n          configRow('Address', info.wallet_address) +\n          (info.wallet_kind === 'turnkey' && info.turnkey_organization ? configRow('Turnkey org', info.turnkey_organization) : '') +\n          '<div class=\"hdr-rule\"></div>'\n        : ''\n    }\n    ${configRow('Exported log level', info.log_level)}\n    ${configRow('Server port', info.server_port)}\n    ${configRow('Deployment block', value.deployment_block ?? '')}\n    ${configRow('Order polling', seconds(value.order_polling))}\n    ${configRow('Inventory polling', seconds(value.inventory_polling))}\n    ${configRow('Cash reserve', value.cash_reserved !== null && value.cash_reserved !== undefined ? `$${value.cash_reserved}` : 'none')}\n    ${configRow('Orderbook', info.orderbook)}\n  </div>\n</dialog>`;\n\nconst guide = RECOVERY_GUIDE;\nconst modeClass = (mode) =>\n  mode === 'requires-bot' ? 'hdr-amber' : mode === 'live-rpc-only' ? 'hdr-sky' : 'hdr-red';\nconst guideDialog = `\n<dialog class=\"hdr-dialog hdr-wide\" data-dialog=\"guide\">\n  <div class=\"hdr-dialog-head\"><span>CLI recovery guide</span><button class=\"hdr-close\" data-close>&times;</button></div>\n  <div class=\"hdr-dialog-body\">\n    <p class=\"hdr-muted hdr-intro\">Every recovery command, grouped by object. They use <span class=\"hdr-mono\">st0x-liquidity-client</span>, which signs in with your Google account and calls the running bot's API, so no SSH is needed and the bot must be running.</p>\n    ${guide.groups\n      .map(\n        (group) => `\n      <section class=\"hdr-group\">\n        <h3 class=\"hdr-mono\">${escapeHtml(group.object)}</h3>\n        ${group.commands\n          .map(\n            (entry) => `\n          <div class=\"hdr-command\">\n            <pre class=\"hdr-mono\">${escapeHtml(entry.command.replace('--env production', `--env ${ENV}`))}</pre>\n            <div class=\"hdr-grid\">\n              <span class=\"hdr-muted\">What</span><span>${escapeHtml(entry.description)}</span>\n              <span class=\"hdr-muted\">When</span><span>${escapeHtml(entry.whenToUse)}</span>\n              <span class=\"hdr-muted\">Applies to</span><span>${escapeHtml(entry.appliesTo)}</span>\n              <span class=\"hdr-muted\">Mode</span><span class=\"${modeClass(entry.mode)}\">${escapeHtml(guide.modeLabels[entry.mode] || entry.mode)}</span>\n            </div>\n          </div>`\n          )\n          .join('')}\n      </section>`\n      )\n      .join('')}\n  </div>\n</dialog>`;\n\n// The board refreshes every minute and each render replaces the markup, which\n// would close a dialog the operator is reading. Remember it to reopen it at\n// the same scroll position.\nconst openDialog = root.querySelector('dialog[open]');\nconst reopen = openDialog && {\n  name: openDialog.dataset.dialog,\n  scroll: openDialog.querySelector('.hdr-dialog-body')?.scrollTop || 0,\n};\n\nroot.innerHTML = `\n<div class=\"hdr\">\n  <div class=\"hdr-left\">${pills}</div>\n  <div class=\"hdr-right\">\n    <button class=\"hdr-guide\" data-open=\"guide\">CLI recovery guide</button>\n    <span class=\"hdr-mono hdr-muted\" data-clock>${clock()}</span>\n    ${labels.commit && labels.commit.sha ? `<span class=\"hdr-mono hdr-muted\" title=\"Deployed commit\">${escapeHtml(labels.commit.sha.slice(0, 7))}</span>` : ''}\n    <span class=\"hdr-muted\" title=\"Bot uptime\">${uptime(value.uptime)}</span>\n    <span class=\"hdr-badge ${connected ? 'hdr-ok' : 'hdr-bad'}\">${connected ? 'Connected' : 'Disconnected'}</span>\n  </div>\n</div>\n${configDialog}\n${guideDialog}`;\n\nroot.querySelectorAll('[data-open]').forEach((button) => {\n  button.addEventListener('click', () => root.querySelector(`[data-dialog=\"${button.dataset.open}\"]`).showModal());\n});\nroot.querySelectorAll('dialog').forEach((dialog) => {\n  dialog.querySelector('[data-close]').addEventListener('click', () => dialog.close());\n  // A click on the backdrop closes it, like the SPA.\n  dialog.addEventListener('click', (event) => {\n    if (event.target === dialog) dialog.close();\n  });\n});\nif (reopen) {\n  const dialog = root.querySelector(`[data-dialog=\"${reopen.name}\"]`);\n  if (dialog) {\n    dialog.showModal();\n    const body = dialog.querySelector('.hdr-dialog-body');\n    if (body) body.scrollTop = reopen.scroll;\n  }\n}\n\n// The SPA's ticking UTC clock. One interval per element, replaced on every\n// render so a refresh never stacks them. Grafana can also mount a new\n// element (tab switch, view mode), so an interval whose element left the\n// page stops itself.\nclearInterval(root.__hdrClock);\nroot.__hdrClock = setInterval(() => {\n  if (!root.isConnected) {\n    clearInterval(root.__hdrClock);\n    return;\n  }\n  const node = root.querySelector('[data-clock]');\n  if (node) node.textContent = clock();\n}, 1000);\n",
+        "styles": "/* Business Text \"styles\" for the Liquidity bot header row and its two\n   dialogs. Theme colours come in as --hdr-* variables set by header.js. */\n\n.hdr {\n  display: flex;\n  align-items: center;\n  justify-content: space-between;\n  gap: 8px;\n  height: 100%;\n  font-size: 13px;\n  white-space: nowrap;\n}\n\n.hdr-left,\n.hdr-right {\n  display: flex;\n  align-items: center;\n  gap: 8px;\n  min-width: 0;\n}\n\n.hdr-pill {\n  display: inline-flex;\n  align-items: center;\n  gap: 4px;\n  padding: 2px 10px;\n  border-radius: 9999px;\n  background: var(--hdr-pill);\n  color: var(--hdr-text);\n  font-size: 13px;\n  line-height: 18px;\n  border: 0;\n}\n\n.hdr-button {\n  color: var(--hdr-muted);\n  cursor: pointer;\n}\n\n.hdr-button:hover,\n.hdr-guide:hover,\n.hdr-close:hover {\n  color: var(--hdr-text);\n}\n\n.hdr-guide {\n  padding: 2px 8px;\n  border: 1px solid var(--hdr-border);\n  border-radius: 4px;\n  background: transparent;\n  color: var(--hdr-text);\n  font-size: 13px;\n  line-height: 18px;\n  cursor: pointer;\n}\n\n.hdr-badge {\n  padding: 2px 8px;\n  border-radius: 9999px;\n  font-size: 13px;\n  line-height: 18px;\n  font-weight: 600;\n}\n\n.hdr-ok { background: #f5f5f5; color: #171717; }\n.hdr-bad { background: #ef4444; color: #fff; }\n\n.hdr-mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }\n.hdr-muted { color: var(--hdr-muted); }\n\n.hdr-dialog {\n  padding: 0;\n  border: 1px solid var(--hdr-border);\n  border-radius: 8px;\n  background: var(--hdr-card);\n  color: var(--hdr-text);\n  white-space: normal;\n}\n\n.hdr-dialog::backdrop { background: rgba(0, 0, 0, 0.5); }\n.hdr-narrow { width: min(28rem, 92vw); }\n.hdr-wide { width: min(42rem, 92vw); }\n\n.hdr-dialog-head {\n  display: flex;\n  align-items: center;\n  justify-content: space-between;\n  padding: 12px 20px;\n  border-bottom: 1px solid var(--hdr-border);\n  font-size: 14px;\n  font-weight: 600;\n}\n\n.hdr-close {\n  border: 0;\n  background: transparent;\n  color: var(--hdr-muted);\n  font-size: 18px;\n  line-height: 1;\n  cursor: pointer;\n}\n\n.hdr-dialog-body {\n  max-height: 70vh;\n  overflow-y: auto;\n  padding: 16px 20px;\n  font-size: 13px;\n}\n\n.hdr-row {\n  display: flex;\n  justify-content: space-between;\n  gap: 16px;\n  padding: 4px 0;\n}\n\n.hdr-trunc {\n  overflow: hidden;\n  text-overflow: ellipsis;\n  white-space: nowrap;\n}\n\n.hdr-rule { border-top: 1px solid var(--hdr-border); margin: 8px 0; }\n.hdr-intro { margin: 0 0 16px; }\n.hdr-group { margin-bottom: 20px; }\n.hdr-group h3 { margin: 0 0 8px; font-size: 13px; text-transform: capitalize; }\n\n.hdr-command {\n  margin-bottom: 12px;\n  padding: 8px 12px;\n  border: 1px solid var(--hdr-border);\n  border-radius: 6px;\n  background: var(--hdr-pill);\n}\n\n.hdr-command pre {\n  margin: 0;\n  padding: 8px;\n  border-radius: 4px;\n  background: var(--hdr-card);\n  font-size: 12px;\n  white-space: pre-wrap;\n  word-break: break-all;\n}\n\n.hdr-grid {\n  display: grid;\n  grid-template-columns: auto 1fr;\n  gap: 4px 12px;\n  margin-top: 6px;\n  font-size: 12px;\n}\n\n.hdr-amber { color: #f59e0b; }\n.hdr-sky { color: #0ea5e9; }\n.hdr-red { color: #ef4444; }\n\n/* Tailwind 700 on the light theme, like detail.css, for a 4.5:1 contrast\n   against the white dialog. */\n.hdr-light .hdr-amber { color: #b45309; }\n.hdr-light .hdr-sky { color: #0369a1; }\n.hdr-light .hdr-red { color: #b91c1c; }\n",
+        "wrap": false
       },
       "timeFrom": "5m",
       "hideTimeOverride": true
     },
     {
       "id": 2,
-      "type": "stat",
-      "title": "",
-      "description": "Deployed commit, from /health, cut to 7 characters like the SPA header. The stackdriver plugin runs a range query even for an instant target, so over the dashboard's 24h the previous commit is a second series and its name drew over this one. PromQL also keeps a stopped series for its 5m lookback, so topk on the sample timestamp keeps only the commit with the newest sample, over a 1m window.",
-      "datasource": {
-        "type": "stackdriver",
-        "uid": "cloudmon"
-      },
-      "targets": [
-        {
-          "refId": "A",
-          "datasource": {
-            "type": "stackdriver",
-            "uid": "cloudmon"
-          },
-          "queryType": "promQL",
-          "promQLQuery": {
-            "projectName": "$env",
-            "expr": "max by (git_commit) (topk(1, label_replace(timestamp(liq_bot_info), \"git_commit\", \"$1\", \"git_commit\", \"(.{7}).*\")))",
-            "step": "60s"
-          },
-          "timeSeriesList": {
-            "projectName": "",
-            "filters": [],
-            "view": "FULL",
-            "groupBys": []
-          },
-          "instant": true,
-          "legendFormat": "{{git_commit}}"
-        }
-      ],
-      "transparent": true,
-      "gridPos": {
-        "h": 1,
-        "w": 3,
-        "x": 3,
-        "y": 0
-      },
-      "fieldConfig": {
-        "defaults": {
-          "mappings": [
-            {
-              "type": "special",
-              "options": {
-                "match": "null+nan",
-                "result": {
-                  "text": "\u2014",
-                  "color": "text",
-                  "index": 99
-                }
-              }
-            }
-          ],
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "text",
-                "value": null
-              }
-            ]
-          },
-          "unit": "short"
-        },
-        "overrides": []
-      },
-      "options": {
-        "colorMode": "none",
-        "graphMode": "none",
-        "textMode": "name",
-        "justifyMode": "center",
-        "text": {
-          "valueSize": 14,
-          "titleSize": 12
-        },
-        "reduceOptions": {
-          "calcs": [
-            "lastNotNull"
-          ],
-          "fields": "",
-          "values": false
-        }
-      },
-      "timeFrom": "1m",
-      "hideTimeOverride": true
-    },
-    {
-      "id": 3,
-      "type": "stat",
-      "title": "",
-      "description": "Bot process uptime, from /health uptimeSeconds.",
-      "datasource": {
-        "type": "stackdriver",
-        "uid": "cloudmon"
-      },
-      "targets": [
-        {
-          "refId": "A",
-          "datasource": {
-            "type": "stackdriver",
-            "uid": "cloudmon"
-          },
-          "queryType": "promQL",
-          "promQLQuery": {
-            "projectName": "$env",
-            "expr": "time() - max(liq_bot_start_timestamp_seconds)",
-            "step": "60s"
-          },
-          "timeSeriesList": {
-            "projectName": "",
-            "filters": [],
-            "view": "FULL",
-            "groupBys": []
-          },
-          "instant": true
-        }
-      ],
-      "transparent": true,
-      "gridPos": {
-        "h": 1,
-        "w": 3,
-        "x": 6,
-        "y": 0
-      },
-      "fieldConfig": {
-        "defaults": {
-          "mappings": [
-            {
-              "type": "special",
-              "options": {
-                "match": "null+nan",
-                "result": {
-                  "text": "\u2014",
-                  "color": "text",
-                  "index": 99
-                }
-              }
-            }
-          ],
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "text",
-                "value": null
-              }
-            ]
-          },
-          "unit": "s",
-          "displayName": "Uptime",
-          "decimals": 0
-        },
-        "overrides": []
-      },
-      "options": {
-        "colorMode": "none",
-        "graphMode": "none",
-        "textMode": "value_and_name",
-        "justifyMode": "center",
-        "text": {
-          "valueSize": 14,
-          "titleSize": 12
-        },
-        "reduceOptions": {
-          "calcs": [
-            "lastNotNull"
-          ],
-          "fields": "",
-          "values": false
-        }
-      },
-      "timeFrom": "5m",
-      "hideTimeOverride": true
-    },
-    {
-      "id": 4,
-      "type": "stat",
-      "title": "",
-      "description": "The SPA settings bar's Broker pill.",
-      "datasource": {
-        "type": "stackdriver",
-        "uid": "cloudmon"
-      },
-      "targets": [
-        {
-          "refId": "A",
-          "datasource": {
-            "type": "stackdriver",
-            "uid": "cloudmon"
-          },
-          "queryType": "promQL",
-          "promQLQuery": {
-            "projectName": "$env",
-            "expr": "sum by (broker) (liq_settings_info)",
-            "step": "60s"
-          },
-          "timeSeriesList": {
-            "projectName": "",
-            "filters": [],
-            "view": "FULL",
-            "groupBys": []
-          },
-          "instant": true,
-          "legendFormat": "{{broker}}"
-        }
-      ],
-      "transparent": true,
-      "gridPos": {
-        "h": 1,
-        "w": 3,
-        "x": 9,
-        "y": 0
-      },
-      "fieldConfig": {
-        "defaults": {
-          "mappings": [
-            {
-              "type": "special",
-              "options": {
-                "match": "null+nan",
-                "result": {
-                  "text": "\u2014",
-                  "color": "text",
-                  "index": 99
-                }
-              }
-            }
-          ],
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "text",
-                "value": null
-              }
-            ]
-          },
-          "unit": "short"
-        },
-        "overrides": []
-      },
-      "options": {
-        "colorMode": "none",
-        "graphMode": "none",
-        "textMode": "name",
-        "justifyMode": "center",
-        "text": {
-          "valueSize": 14,
-          "titleSize": 12
-        },
-        "reduceOptions": {
-          "calcs": [
-            "lastNotNull"
-          ],
-          "fields": "",
-          "values": false
-        }
-      },
-      "timeFrom": "5m",
-      "hideTimeOverride": true
-    },
-    {
-      "id": 5,
-      "type": "stat",
-      "title": "",
-      "description": "Equity rebalance target. The SPA pill also shows the band: target +/- liq_settings_equity_deviation.",
-      "datasource": {
-        "type": "stackdriver",
-        "uid": "cloudmon"
-      },
-      "targets": [
-        {
-          "refId": "A",
-          "datasource": {
-            "type": "stackdriver",
-            "uid": "cloudmon"
-          },
-          "queryType": "promQL",
-          "promQLQuery": {
-            "projectName": "$env",
-            "expr": "max(liq_settings_equity_target)",
-            "step": "60s"
-          },
-          "timeSeriesList": {
-            "projectName": "",
-            "filters": [],
-            "view": "FULL",
-            "groupBys": []
-          },
-          "instant": true
-        }
-      ],
-      "transparent": true,
-      "gridPos": {
-        "h": 1,
-        "w": 4,
-        "x": 12,
-        "y": 0
-      },
-      "fieldConfig": {
-        "defaults": {
-          "mappings": [
-            {
-              "type": "special",
-              "options": {
-                "match": "null+nan",
-                "result": {
-                  "text": "\u2014",
-                  "color": "text",
-                  "index": 99
-                }
-              }
-            }
-          ],
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "text",
-                "value": null
-              }
-            ]
-          },
-          "unit": "percentunit",
-          "displayName": "Equity",
-          "decimals": 0
-        },
-        "overrides": []
-      },
-      "options": {
-        "colorMode": "none",
-        "graphMode": "none",
-        "textMode": "value_and_name",
-        "justifyMode": "center",
-        "text": {
-          "valueSize": 14,
-          "titleSize": 12
-        },
-        "reduceOptions": {
-          "calcs": [
-            "lastNotNull"
-          ],
-          "fields": "",
-          "values": false
-        }
-      },
-      "timeFrom": "5m",
-      "hideTimeOverride": true
-    },
-    {
-      "id": 6,
-      "type": "stat",
-      "title": "",
-      "description": "USDC rebalance target. The SPA pill also shows the band: target +/- liq_settings_usdc_deviation.",
-      "datasource": {
-        "type": "stackdriver",
-        "uid": "cloudmon"
-      },
-      "targets": [
-        {
-          "refId": "A",
-          "datasource": {
-            "type": "stackdriver",
-            "uid": "cloudmon"
-          },
-          "queryType": "promQL",
-          "promQLQuery": {
-            "projectName": "$env",
-            "expr": "max(liq_settings_usdc_target)",
-            "step": "60s"
-          },
-          "timeSeriesList": {
-            "projectName": "",
-            "filters": [],
-            "view": "FULL",
-            "groupBys": []
-          },
-          "instant": true
-        }
-      ],
-      "transparent": true,
-      "gridPos": {
-        "h": 1,
-        "w": 4,
-        "x": 16,
-        "y": 0
-      },
-      "fieldConfig": {
-        "defaults": {
-          "mappings": [
-            {
-              "type": "special",
-              "options": {
-                "match": "null+nan",
-                "result": {
-                  "text": "\u2014",
-                  "color": "text",
-                  "index": 99
-                }
-              }
-            }
-          ],
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "text",
-                "value": null
-              }
-            ]
-          },
-          "unit": "percentunit",
-          "displayName": "USDC",
-          "decimals": 0
-        },
-        "overrides": []
-      },
-      "options": {
-        "colorMode": "none",
-        "graphMode": "none",
-        "textMode": "value_and_name",
-        "justifyMode": "center",
-        "text": {
-          "valueSize": 14,
-          "titleSize": 12
-        },
-        "reduceOptions": {
-          "calcs": [
-            "lastNotNull"
-          ],
-          "fields": "",
-          "values": false
-        }
-      },
-      "timeFrom": "5m",
-      "hideTimeOverride": true
-    },
-    {
-      "id": 7,
-      "type": "stat",
-      "title": "",
-      "description": "Hedge execution threshold (settings bar 'Trigger').",
-      "datasource": {
-        "type": "stackdriver",
-        "uid": "cloudmon"
-      },
-      "targets": [
-        {
-          "refId": "A",
-          "datasource": {
-            "type": "stackdriver",
-            "uid": "cloudmon"
-          },
-          "queryType": "promQL",
-          "promQLQuery": {
-            "projectName": "$env",
-            "expr": "max(liq_settings_execution_threshold_usd)",
-            "step": "60s"
-          },
-          "timeSeriesList": {
-            "projectName": "",
-            "filters": [],
-            "view": "FULL",
-            "groupBys": []
-          },
-          "instant": true
-        }
-      ],
-      "transparent": true,
-      "gridPos": {
-        "h": 1,
-        "w": 4,
-        "x": 20,
-        "y": 0
-      },
-      "fieldConfig": {
-        "defaults": {
-          "mappings": [
-            {
-              "type": "special",
-              "options": {
-                "match": "null+nan",
-                "result": {
-                  "text": "\u2014",
-                  "color": "text",
-                  "index": 99
-                }
-              }
-            }
-          ],
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "text",
-                "value": null
-              }
-            ]
-          },
-          "unit": "currencyUSD",
-          "displayName": "Trigger",
-          "decimals": 0
-        },
-        "overrides": []
-      },
-      "options": {
-        "colorMode": "none",
-        "graphMode": "none",
-        "textMode": "value_and_name",
-        "justifyMode": "center",
-        "text": {
-          "valueSize": 14,
-          "titleSize": 12
-        },
-        "reduceOptions": {
-          "calcs": [
-            "lastNotNull"
-          ],
-          "fields": "",
-          "values": false
-        }
-      },
-      "timeFrom": "5m",
-      "hideTimeOverride": true
-    },
-    {
-      "id": 8,
       "type": "table",
-      "title": "Inventory",
-      "description": "The SPA's USDC row: Raindex + Alpaca Total + Inflight = Total; Ratio = Raindex/(Raindex+Alpaca Total); \u0394 = deviation from the target ratio in band widths, colored outside +/-1, where the SPA colors its bar.",
+      "pluginVersion": "13.1.0",
+      "title": "USD \u00b7 Alpaca",
+      "description": "Alpaca's cash: no rebalance target, so it shows its share of all USD and USDC. Rebalanceable = max(0, withdrawable - reserve).",
       "datasource": {
         "type": "stackdriver",
         "uid": "cloudmon"
@@ -770,7 +213,7 @@
           "queryType": "promQL",
           "promQLQuery": {
             "projectName": "$env",
-            "expr": "sum by (row, col) (label_replace(label_replace(liq_usdc_onchain_available, \"row\", \"USDC\", \"\", \"\"), \"col\", \"Raindex\", \"\", \"\")) or sum by (row, col) (label_replace(label_replace(liq_usdc_inflight_total, \"row\", \"USDC\", \"\", \"\"), \"col\", \"Inflight\", \"\", \"\")) or sum by (row, col) (label_replace(label_replace(liq_usdc_alpaca_total, \"row\", \"USDC\", \"\", \"\"), \"col\", \"Alpaca Total\", \"\", \"\")) or sum by (row, col) (label_replace(label_replace(liq_usdc_total, \"row\", \"USDC\", \"\", \"\"), \"col\", \"Total\", \"\", \"\")) or sum by (row, col) (label_replace(label_replace(liq_usdc_ratio, \"row\", \"USDC\", \"\", \"\"), \"col\", \"Ratio\", \"\", \"\")) or sum by (row, col) (label_replace(label_replace(liq_usdc_ratio_deviation and liq_usdc_total > 0, \"row\", \"USDC\", \"\", \"\"), \"col\", \"\u0394\", \"\", \"\"))",
+            "expr": "sum by (venue, col) (label_replace(label_replace(liq_usdc_alpaca_total, \"venue\", \"Alpaca\", \"\", \"\"), \"col\", \"cash\", \"\", \"\")) or sum by (venue, col) (label_replace(label_replace(liq_usdc_alpaca_usdc, \"venue\", \"Alpaca\", \"\", \"\"), \"col\", \"usdc\", \"\", \"\")) or sum by (venue, col) (label_replace(label_replace((liq_settings_cash_reserved or (liq_usdc_offchain_gross - liq_usdc_offchain_available) or (liq_usdc_alpaca_total - liq_usdc_offchain_available)), \"venue\", \"Alpaca\", \"\", \"\"), \"col\", \"reserve\", \"\", \"\")) or sum by (venue, col) (label_replace(label_replace(liq_usdc_rebalanceable, \"venue\", \"Alpaca\", \"\", \"\"), \"col\", \"rebalanceable\", \"\", \"\")) or sum by (venue, col) (label_replace(label_replace(liq_usdc_offchain_inflight, \"venue\", \"Alpaca\", \"\", \"\"), \"col\", \"inflight\", \"\", \"\")) or sum by (venue, col) (label_replace(label_replace(round(100 * (liq_usdc_alpaca_total / liq_usdc_total), 0.1), \"venue\", \"Alpaca\", \"\", \"\"), \"col\", \"share\", \"\", \"\")) or sum by (venue, col) (label_replace(label_replace(liq_usdc_total, \"venue\", \"Alpaca\", \"\", \"\"), \"col\", \"total\", \"\", \"\"))",
             "step": "60s"
           },
           "timeSeriesList": {
@@ -783,8 +226,8 @@
         }
       ],
       "gridPos": {
-        "h": 4,
-        "w": 7,
+        "h": 8,
+        "w": 13,
         "x": 0,
         "y": 1
       },
@@ -801,7 +244,7 @@
           "id": "groupBy",
           "options": {
             "fields": {
-              "row": {
+              "venue": {
                 "operation": "groupby",
                 "aggregations": []
               },
@@ -822,7 +265,7 @@
           "id": "groupingToMatrix",
           "options": {
             "columnField": "col",
-            "rowField": "row",
+            "rowField": "venue",
             "valueField": "Value (lastNotNull)",
             "emptyValue": "null"
           }
@@ -831,38 +274,56 @@
           "id": "organize",
           "options": {
             "excludeByName": {},
-            "renameByName": {
-              "row\\col": "Asset"
-            },
             "indexByName": {
-              "row\\col": 0,
-              "Raindex": 1,
-              "Inflight": 2,
-              "Alpaca Total": 3,
-              "Total": 4,
-              "Ratio": 5,
-              "\u0394": 6
+              "venue\\col": 0,
+              "cash": 1,
+              "usdc": 2,
+              "reserve": 3,
+              "rebalanceable": 4,
+              "inflight": 5,
+              "share": 6,
+              "total": 7
+            },
+            "renameByName": {
+              "venue\\col": "Venue",
+              "cash": "Cash",
+              "usdc": "USDC",
+              "reserve": "Reserve",
+              "rebalanceable": "Rebalanceable",
+              "inflight": "In flight",
+              "share": "Share of total",
+              "total": "USD total"
             }
+          }
+        },
+        {
+          "id": "convertFieldType",
+          "options": {
+            "conversions": [
+              {
+                "targetField": "share",
+                "destinationType": "string"
+              }
+            ]
           }
         }
       ],
       "fieldConfig": {
         "defaults": {
-          "unit": "short",
+          "unit": "locale",
           "decimals": 2,
           "custom": {
-            "align": "auto",
-            "filterable": false,
+            "align": "right",
+            "filterable": true,
             "cellOptions": {
               "type": "auto"
-            },
-            "minWidth": 40
+            }
           },
           "thresholds": {
             "mode": "absolute",
             "steps": [
               {
-                "color": "text",
+                "color": "red",
                 "value": null
               }
             ]
@@ -873,28 +334,12 @@
           {
             "matcher": {
               "id": "byName",
-              "options": "Asset"
+              "options": "Venue"
             },
             "properties": [
               {
-                "id": "custom.width",
-                "value": 50
-              }
-            ]
-          },
-          {
-            "matcher": {
-              "id": "byName",
-              "options": "Inflight"
-            },
-            "properties": [
-              {
-                "id": "unit",
-                "value": "locale"
-              },
-              {
-                "id": "decimals",
-                "value": 2
+                "id": "custom.align",
+                "value": "left"
               },
               {
                 "id": "custom.width",
@@ -905,284 +350,15 @@
           {
             "matcher": {
               "id": "byName",
-              "options": "Raindex"
+              "options": "Cash"
             },
             "properties": [
               {
-                "id": "unit",
-                "value": "locale"
-              },
-              {
-                "id": "decimals",
-                "value": 2
-              },
-              {
                 "id": "custom.width",
-                "value": 90
+                "value": 110
               }
             ]
           },
-          {
-            "matcher": {
-              "id": "byName",
-              "options": "Alpaca Total"
-            },
-            "properties": [
-              {
-                "id": "unit",
-                "value": "locale"
-              },
-              {
-                "id": "decimals",
-                "value": 2
-              },
-              {
-                "id": "custom.width",
-                "value": 90
-              }
-            ]
-          },
-          {
-            "matcher": {
-              "id": "byName",
-              "options": "Total"
-            },
-            "properties": [
-              {
-                "id": "unit",
-                "value": "locale"
-              },
-              {
-                "id": "decimals",
-                "value": 2
-              },
-              {
-                "id": "custom.width",
-                "value": 90
-              }
-            ]
-          },
-          {
-            "matcher": {
-              "id": "byName",
-              "options": "Ratio"
-            },
-            "properties": [
-              {
-                "id": "unit",
-                "value": "percentunit"
-              },
-              {
-                "id": "decimals",
-                "value": 1
-              },
-              {
-                "id": "custom.cellOptions",
-                "value": {
-                  "type": "gauge",
-                  "mode": "basic",
-                  "valueDisplayMode": "text"
-                }
-              },
-              {
-                "id": "min",
-                "value": 0
-              },
-              {
-                "id": "max",
-                "value": 1
-              },
-              {
-                "id": "thresholds",
-                "value": {
-                  "mode": "absolute",
-                  "steps": [
-                    {
-                      "color": "blue",
-                      "value": null
-                    }
-                  ]
-                }
-              },
-              {
-                "id": "custom.width",
-                "value": 75
-              }
-            ]
-          },
-          {
-            "matcher": {
-              "id": "byName",
-              "options": "\u0394"
-            },
-            "properties": [
-              {
-                "id": "unit",
-                "value": "short"
-              },
-              {
-                "id": "decimals",
-                "value": 1
-              },
-              {
-                "id": "custom.cellOptions",
-                "value": {
-                  "type": "color-text"
-                }
-              },
-              {
-                "id": "custom.width",
-                "value": 45
-              },
-              {
-                "id": "thresholds",
-                "value": {
-                  "mode": "absolute",
-                  "steps": [
-                    {
-                      "color": "red",
-                      "value": null
-                    },
-                    {
-                      "color": "text",
-                      "value": -1
-                    },
-                    {
-                      "color": "green",
-                      "value": 1
-                    }
-                  ]
-                }
-              }
-            ]
-          }
-        ]
-      },
-      "options": {
-        "showHeader": true,
-        "cellHeight": "sm"
-      },
-      "timeFrom": "5m",
-      "hideTimeOverride": false
-    },
-    {
-      "id": 9,
-      "type": "table",
-      "title": "Alpaca",
-      "description": "Rebalanceable = max(0, withdrawable \u2212 reserve). Counter-tradeable deliberately equals Alpaca Total (reserve NOT subtracted, same as the SPA).",
-      "datasource": {
-        "type": "stackdriver",
-        "uid": "cloudmon"
-      },
-      "targets": [
-        {
-          "refId": "A",
-          "datasource": {
-            "type": "stackdriver",
-            "uid": "cloudmon"
-          },
-          "queryType": "promQL",
-          "promQLQuery": {
-            "projectName": "$env",
-            "expr": "sum by (row, col) (label_replace(label_replace(liq_usdc_alpaca_usdc, \"row\", \"USDC\", \"\", \"\"), \"col\", \"USDC\", \"\", \"\")) or sum by (row, col) (label_replace(label_replace(liq_usdc_rebalanceable, \"row\", \"USDC\", \"\", \"\"), \"col\", \"Rebalanceable\", \"\", \"\")) or sum by (row, col) (label_replace(label_replace(liq_usdc_alpaca_total, \"row\", \"USDC\", \"\", \"\"), \"col\", \"Counter-tradeable\", \"\", \"\"))",
-            "step": "60s"
-          },
-          "timeSeriesList": {
-            "projectName": "",
-            "filters": [],
-            "view": "FULL",
-            "groupBys": []
-          },
-          "instant": true
-        }
-      ],
-      "gridPos": {
-        "h": 4,
-        "w": 4,
-        "x": 7,
-        "y": 1
-      },
-      "transformations": [
-        {
-          "id": "labelsToFields",
-          "options": {}
-        },
-        {
-          "id": "merge",
-          "options": {}
-        },
-        {
-          "id": "groupBy",
-          "options": {
-            "fields": {
-              "row": {
-                "operation": "groupby",
-                "aggregations": []
-              },
-              "col": {
-                "operation": "groupby",
-                "aggregations": []
-              },
-              "Value": {
-                "operation": "aggregate",
-                "aggregations": [
-                  "lastNotNull"
-                ]
-              }
-            }
-          }
-        },
-        {
-          "id": "groupingToMatrix",
-          "options": {
-            "columnField": "col",
-            "rowField": "row",
-            "valueField": "Value (lastNotNull)",
-            "emptyValue": "null"
-          }
-        },
-        {
-          "id": "organize",
-          "options": {
-            "excludeByName": {
-              "row\\col": true
-            },
-            "renameByName": {
-              "row\\col": "Asset"
-            },
-            "indexByName": {
-              "row\\col": 0,
-              "USDC": 1,
-              "Rebalanceable": 2,
-              "Counter-tradeable": 3
-            }
-          }
-        }
-      ],
-      "fieldConfig": {
-        "defaults": {
-          "unit": "short",
-          "decimals": 2,
-          "custom": {
-            "align": "auto",
-            "filterable": false,
-            "cellOptions": {
-              "type": "auto"
-            },
-            "minWidth": 40
-          },
-          "thresholds": {
-            "mode": "absolute",
-            "steps": [
-              {
-                "color": "text",
-                "value": null
-              }
-            ]
-          },
-          "mappings": []
-        },
-        "overrides": [
           {
             "matcher": {
               "id": "byName",
@@ -1190,16 +366,20 @@
             },
             "properties": [
               {
-                "id": "unit",
-                "value": "locale"
-              },
-              {
-                "id": "decimals",
-                "value": 2
-              },
+                "id": "custom.width",
+                "value": 140
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Reserve"
+            },
+            "properties": [
               {
                 "id": "custom.width",
-                "value": 90
+                "value": 95
               }
             ]
           },
@@ -1210,32 +390,87 @@
             },
             "properties": [
               {
-                "id": "unit",
-                "value": "locale"
-              },
-              {
-                "id": "decimals",
-                "value": 2
-              },
-              {
                 "id": "custom.width",
-                "value": 105
+                "value": 140
               }
             ]
           },
           {
             "matcher": {
               "id": "byName",
-              "options": "Counter-tradeable"
+              "options": "In flight"
             },
             "properties": [
               {
-                "id": "unit",
-                "value": "locale"
+                "id": "custom.width",
+                "value": 95
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Share of total"
+            },
+            "properties": [
+              {
+                "id": "mappings",
+                "value": [
+                  {
+                    "type": "regex",
+                    "options": {
+                      "pattern": "^(null|NaN)?$",
+                      "result": {
+                        "text": " ",
+                        "index": 0
+                      }
+                    }
+                  },
+                  {
+                    "type": "regex",
+                    "options": {
+                      "pattern": "^(.*)$",
+                      "result": {
+                        "text": "<div style=\"height:20px;border-radius:4px;font-weight:600;text-align:center;background:linear-gradient(90deg, rgba(148,163,184,0.45) $1%, rgba(128,128,128,0.15) $1%)\">$1%</div>",
+                        "index": 1
+                      }
+                    }
+                  }
+                ]
               },
               {
-                "id": "decimals",
-                "value": 2
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "markdown"
+                }
+              },
+              {
+                "id": "custom.align",
+                "value": "center"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "USD total"
+            },
+            "properties": [
+              {
+                "id": "custom.width",
+                "value": 120
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Share of total"
+            },
+            "properties": [
+              {
+                "id": "custom.minWidth",
+                "value": 60
               }
             ]
           }
@@ -1243,16 +478,17 @@
       },
       "options": {
         "showHeader": true,
-        "cellHeight": "sm"
+        "cellHeight": "md"
       },
       "timeFrom": "5m",
       "hideTimeOverride": false
     },
     {
-      "id": 10,
+      "id": 3,
       "type": "table",
-      "title": "Wallets",
-      "description": "USDC seen in the bot's Ethereum and Base wallets: sanity checks, not part of Total.",
+      "pluginVersion": "13.1.0",
+      "title": "USD \u00b7 Onchain",
+      "description": "Each chain's vault and the ratio the bot rebalances on, vault / (vault + Alpaca cash), against the chain's band. It is not a share of all USD: other chains are not in it. Ethereum is the hub wallet Alpaca deposits to and withdraws from, with no band.",
       "datasource": {
         "type": "stackdriver",
         "uid": "cloudmon"
@@ -1267,7 +503,7 @@
           "queryType": "promQL",
           "promQLQuery": {
             "projectName": "$env",
-            "expr": "sum by (row, col) (label_replace(label_replace(liq_usdc_inflight_ethereum_wallet, \"row\", \"USDC\", \"\", \"\"), \"col\", \"Eth\", \"\", \"\")) or sum by (row, col) (label_replace(label_replace(liq_usdc_inflight_base_wallet, \"row\", \"USDC\", \"\", \"\"), \"col\", \"Base\", \"\", \"\"))",
+            "expr": "sum by (venue, col) (label_replace(max by (venue) (label_replace(liq_usdc_chain_available, \"venue\", \"$1\", \"chain\", \"(.*)\")) or max by (venue) (label_replace(liq_usdc_onchain_available, \"venue\", \"base\", \"\", \"\")), \"col\", \"vault\", \"\", \"\")) or sum by (venue, col) (label_replace(max by (venue) (label_replace(liq_usdc_chain_inflight, \"venue\", \"$1\", \"chain\", \"(.*)\")) or max by (venue) (label_replace(liq_usdc_onchain_inflight, \"venue\", \"base\", \"\", \"\")), \"col\", \"inflight\", \"\", \"\")) or sum by (venue, col) (label_replace(max by (venue) (label_replace(liq_usdc_inflight_base_wallet, \"venue\", \"base\", \"\", \"\")) or max by (venue) (label_replace(liq_usdc_inflight_ethereum_wallet, \"venue\", \"ethereum\", \"\", \"\")), \"col\", \"wallet\", \"\", \"\")) or sum by (venue, col) (label_replace((round(100 * (max by (venue) (label_replace(liq_usdc_chain_ratio, \"venue\", \"$1\", \"chain\", \"(.*)\")) or max by (venue) (label_replace(liq_usdc_ratio, \"venue\", \"base\", \"\", \"\"))), 0.1) + 0.0001) * (2 * (abs((max by (venue) (label_replace(liq_usdc_chain_ratio, \"venue\", \"$1\", \"chain\", \"(.*)\")) or max by (venue) (label_replace(liq_usdc_ratio, \"venue\", \"base\", \"\", \"\"))) - (max by (venue) (label_replace(liq_usdc_corridor_target, \"venue\", \"$1\", \"chain\", \"(.*)\")) or max by (venue) (label_replace(liq_settings_usdc_target, \"venue\", \"base\", \"\", \"\")))) <= bool (max by (venue) (label_replace(liq_usdc_corridor_deviation, \"venue\", \"$1\", \"chain\", \"(.*)\")) or max by (venue) (label_replace(liq_settings_usdc_deviation, \"venue\", \"base\", \"\", \"\")))) - 1), \"col\", \"ratio\", \"\", \"\")) or sum by (venue, col) (label_replace(max by (venue) (label_replace(liq_usdc_corridor_target, \"venue\", \"$1\", \"chain\", \"(.*)\")) or max by (venue) (label_replace(liq_settings_usdc_target, \"venue\", \"base\", \"\", \"\")), \"col\", \"target\", \"\", \"\")) or sum by (venue, col) (label_replace(max by (venue) (label_replace(liq_usdc_corridor_deviation, \"venue\", \"$1\", \"chain\", \"(.*)\")) or max by (venue) (label_replace(liq_settings_usdc_deviation, \"venue\", \"base\", \"\", \"\")), \"col\", \"deviation\", \"\", \"\"))",
             "step": "60s"
           },
           "timeSeriesList": {
@@ -1280,10 +516,10 @@
         }
       ],
       "gridPos": {
-        "h": 4,
-        "w": 3,
-        "x": 11,
-        "y": 1
+        "h": 9,
+        "w": 13,
+        "x": 0,
+        "y": 9
       },
       "transformations": [
         {
@@ -1298,7 +534,7 @@
           "id": "groupBy",
           "options": {
             "fields": {
-              "row": {
+              "venue": {
                 "operation": "groupby",
                 "aggregations": []
               },
@@ -1319,7 +555,7 @@
           "id": "groupingToMatrix",
           "options": {
             "columnField": "col",
-            "rowField": "row",
+            "rowField": "venue",
             "valueField": "Value (lastNotNull)",
             "emptyValue": "null"
           }
@@ -1327,37 +563,55 @@
         {
           "id": "organize",
           "options": {
-            "excludeByName": {
-              "row\\col": true
+            "excludeByName": {},
+            "indexByName": {
+              "venue\\col": 0,
+              "vault": 1,
+              "inflight": 2,
+              "wallet": 3,
+              "ratio": 4,
+              "target": 5,
+              "deviation": 6
             },
             "renameByName": {
-              "row\\col": "Asset"
-            },
-            "indexByName": {
-              "row\\col": 0,
-              "Eth": 1,
-              "Base": 2
+              "venue\\col": "Chain",
+              "vault": "Vault",
+              "inflight": "In flight",
+              "wallet": "Wallet",
+              "ratio": "Ratio",
+              "target": "Target",
+              "deviation": "\u00b1"
             }
+          }
+        },
+        {
+          "id": "convertFieldType",
+          "options": {
+            "conversions": [
+              {
+                "targetField": "ratio",
+                "destinationType": "string"
+              }
+            ]
           }
         }
       ],
       "fieldConfig": {
         "defaults": {
-          "unit": "short",
+          "unit": "locale",
           "decimals": 2,
           "custom": {
-            "align": "auto",
-            "filterable": false,
+            "align": "right",
+            "filterable": true,
             "cellOptions": {
               "type": "auto"
-            },
-            "minWidth": 40
+            }
           },
           "thresholds": {
             "mode": "absolute",
             "steps": [
               {
-                "color": "text",
+                "color": "red",
                 "value": null
               }
             ]
@@ -1368,36 +622,183 @@
           {
             "matcher": {
               "id": "byName",
-              "options": "Eth"
+              "options": "Chain"
             },
             "properties": [
               {
-                "id": "unit",
-                "value": "locale"
-              },
-              {
-                "id": "decimals",
-                "value": 2
+                "id": "custom.align",
+                "value": "left"
               },
               {
                 "id": "custom.width",
-                "value": 80
+                "value": 125
+              },
+              {
+                "id": "mappings",
+                "value": [
+                  {
+                    "type": "value",
+                    "options": {
+                      "base": {
+                        "text": "Base",
+                        "index": 0
+                      },
+                      "robinhood": {
+                        "text": "Robinhood",
+                        "index": 1
+                      },
+                      "hyperevm": {
+                        "text": "HyperEVM",
+                        "index": 2
+                      },
+                      "ethereum": {
+                        "text": "Ethereum (hub)",
+                        "index": 3
+                      }
+                    }
+                  }
+                ]
               }
             ]
           },
           {
             "matcher": {
               "id": "byName",
-              "options": "Base"
+              "options": "Vault"
+            },
+            "properties": [
+              {
+                "id": "custom.width",
+                "value": 110
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "In flight"
+            },
+            "properties": [
+              {
+                "id": "custom.width",
+                "value": 95
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Wallet"
+            },
+            "properties": [
+              {
+                "id": "custom.width",
+                "value": 85
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Ratio"
+            },
+            "properties": [
+              {
+                "id": "mappings",
+                "value": [
+                  {
+                    "type": "regex",
+                    "options": {
+                      "pattern": "^(null|NaN)?$",
+                      "result": {
+                        "text": " ",
+                        "index": 0
+                      }
+                    }
+                  },
+                  {
+                    "type": "regex",
+                    "options": {
+                      "pattern": "^-(\\d+(?:\\.[1-9])?).*$",
+                      "result": {
+                        "text": "<div style=\"height:20px;border-radius:4px;font-weight:600;text-align:center;background:linear-gradient(90deg, rgba(239,68,68,0.6) $1%, rgba(128,128,128,0.15) $1%)\">$1%</div>",
+                        "index": 1
+                      }
+                    }
+                  },
+                  {
+                    "type": "regex",
+                    "options": {
+                      "pattern": "^(\\d+(?:\\.[1-9])?).*$",
+                      "result": {
+                        "text": "<div style=\"height:20px;border-radius:4px;font-weight:600;text-align:center;background:linear-gradient(90deg, rgba(34,197,94,0.6) $1%, rgba(128,128,128,0.15) $1%)\">$1%</div>",
+                        "index": 2
+                      }
+                    }
+                  }
+                ]
+              },
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "markdown"
+                }
+              },
+              {
+                "id": "custom.align",
+                "value": "center"
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Target"
             },
             "properties": [
               {
                 "id": "unit",
-                "value": "locale"
+                "value": "percentunit"
               },
               {
                 "id": "decimals",
-                "value": 2
+                "value": 0
+              },
+              {
+                "id": "custom.width",
+                "value": 85
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "\u00b1"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "percentunit"
+              },
+              {
+                "id": "decimals",
+                "value": 0
+              },
+              {
+                "id": "custom.width",
+                "value": 60
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Ratio"
+            },
+            "properties": [
+              {
+                "id": "custom.minWidth",
+                "value": 60
               }
             ]
           }
@@ -1405,16 +806,17 @@
       },
       "options": {
         "showHeader": true,
-        "cellHeight": "sm"
+        "cellHeight": "md"
       },
       "timeFrom": "5m",
-      "hideTimeOverride": true
+      "hideTimeOverride": false
     },
     {
-      "id": 11,
+      "id": 4,
       "type": "table",
-      "title": "",
-      "description": "The SPA inventory equity table: CT / Rebal / Ext status lights from settings; Raindex / Inflight / Alpaca / Total share balances; Ratio = onchain/(onchain+offchain); \u0394 = deviation from the target ratio in band widths, colored outside +/-1; Exposure = net \u00d7 last price. Unwrapped/Wrapped are wallet-observed and not part of Total. Sorted CT-first (desc) so counter-tradeable assets float to the top, like the SPA.",
+      "pluginVersion": "13.1.0",
+      "title": "Equities",
+      "description": "Flags: counter trading, rebalancing and extended hours, green when on, grey when off, hollow when not set. Share balances per venue. Ratio = onchain / total, green inside the rebalance band and red outside it. Exposure = net x live price, empty without a price.",
       "datasource": {
         "type": "stackdriver",
         "uid": "cloudmon"
@@ -1429,7 +831,7 @@
           "queryType": "promQL",
           "promQLQuery": {
             "projectName": "$env",
-            "expr": "sum by (symbol, col) (label_replace(liq_asset_counter_trading, \"col\", \"CT\", \"\", \"\")) or sum by (symbol, col) (label_replace(liq_asset_rebalancing, \"col\", \"Rebal\", \"\", \"\")) or sum by (symbol, col) (label_replace(liq_asset_extended_hours, \"col\", \"Ext\", \"\", \"\")) or sum by (symbol, col) (label_replace(liq_equity_onchain_available, \"col\", \"Raindex\", \"\", \"\")) or sum by (symbol, col) (label_replace(liq_equity_inflight_total, \"col\", \"Inflight\", \"\", \"\")) or sum by (symbol, col) (label_replace(liq_equity_offchain_available, \"col\", \"Alpaca\", \"\", \"\")) or sum by (symbol, col) (label_replace(liq_equity_total, \"col\", \"Total\", \"\", \"\")) or sum by (symbol, col) (label_replace(liq_equity_ratio, \"col\", \"Ratio\", \"\", \"\")) or sum by (symbol, col) (label_replace(liq_equity_ratio_deviation and liq_equity_total > 0, \"col\", \"\u0394\", \"\", \"\")) or sum by (symbol, col) (label_replace(liq_equity_exposure_usd or (liq_equity_total * NaN), \"col\", \"Exposure\", \"\", \"\")) or sum by (symbol, col) (label_replace(liq_equity_unwrapped, \"col\", \"Unwrapped\", \"\", \"\")) or sum by (symbol, col) (label_replace(liq_equity_wrapped, \"col\", \"Wrapped\", \"\", \"\"))",
+            "expr": "sum by (symbol, col) (label_replace((max by (symbol) (liq_asset_counter_trading) + 1 or (max by (symbol) (liq_equity_total) * 0 + 3)) * 100 + (max by (symbol) (liq_asset_rebalancing) + 1 or (max by (symbol) (liq_equity_total) * 0 + 3)) * 10 + (max by (symbol) (liq_asset_extended_hours) + 1 or (max by (symbol) (liq_equity_total) * 0 + 3)), \"col\", \"flags\", \"\", \"\")) or max by (symbol, col) (label_replace(liq_equity_chain_available, \"col\", \"onchain_$1\", \"chain\", \"(.*)\")) or max by (symbol, col) (label_replace(liq_equity_onchain_available, \"col\", \"onchain_base\", \"\", \"\")) or sum by (symbol, col) (label_replace(liq_equity_inflight_total, \"col\", \"inflight\", \"\", \"\")) or sum by (symbol, col) (label_replace(liq_equity_offchain_available, \"col\", \"alpaca\", \"\", \"\")) or sum by (symbol, col) (label_replace(liq_equity_total, \"col\", \"total\", \"\", \"\")) or sum by (symbol, col) (label_replace((liq_equity_total * on (symbol) group_left max by (symbol) (liq_position_last_price_usd)) or (liq_equity_total * NaN), \"col\", \"total_usd\", \"\", \"\")) or sum by (symbol, col) (label_replace((round(100 * (liq_equity_ratio), 0.1) + 0.0001) * (2 * (abs((liq_equity_ratio) - scalar(max(liq_settings_equity_target))) <= bool scalar(max(liq_settings_equity_deviation))) - 1), \"col\", \"ratio\", \"\", \"\")) or sum by (symbol, col) (label_replace(liq_equity_exposure_usd or (liq_equity_total * NaN), \"col\", \"exposure\", \"\", \"\")) or sum by (symbol, col) (label_replace(liq_equity_unwrapped, \"col\", \"unwrapped\", \"\", \"\")) or sum by (symbol, col) (label_replace(liq_equity_wrapped, \"col\", \"wrapped\", \"\", \"\"))",
             "step": "60s"
           },
           "timeSeriesList": {
@@ -1442,10 +844,10 @@
         }
       ],
       "gridPos": {
-        "h": 24,
-        "w": 14,
+        "h": 35,
+        "w": 13,
         "x": 0,
-        "y": 5
+        "y": 18
       },
       "transformations": [
         {
@@ -1490,34 +892,61 @@
           "id": "organize",
           "options": {
             "excludeByName": {},
-            "renameByName": {
-              "symbol\\col": "Asset"
-            },
             "indexByName": {
               "symbol\\col": 0,
-              "CT": 1,
-              "Rebal": 2,
-              "Ext": 3,
-              "Raindex": 4,
-              "Inflight": 5,
-              "Alpaca": 6,
-              "Total": 7,
-              "Ratio": 8,
-              "\u0394": 9,
-              "Exposure": 10,
-              "Unwrapped": 11,
-              "Wrapped": 12
+              "flags": 1,
+              "onchain_base": 2,
+              "onchain_robinhood": 3,
+              "onchain_hyperevm": 4,
+              "inflight": 5,
+              "alpaca": 6,
+              "total": 7,
+              "total_usd": 8,
+              "ratio": 9,
+              "exposure": 10,
+              "unwrapped": 11,
+              "wrapped": 12
+            },
+            "renameByName": {
+              "symbol\\col": "Asset",
+              "flags": "Flags",
+              "onchain_base": "Base",
+              "onchain_robinhood": "Robinhood",
+              "onchain_hyperevm": "HyperEVM",
+              "inflight": "Inflight",
+              "alpaca": "Alpaca",
+              "total": "Total",
+              "total_usd": "Total USD",
+              "ratio": "Ratio",
+              "exposure": "Exposure",
+              "unwrapped": "Unwrapped",
+              "wrapped": "Wrapped"
             }
+          }
+        },
+        {
+          "id": "convertFieldType",
+          "options": {
+            "conversions": [
+              {
+                "targetField": "ratio",
+                "destinationType": "string"
+              },
+              {
+                "targetField": "flags",
+                "destinationType": "string"
+              }
+            ]
           }
         }
       ],
       "fieldConfig": {
         "defaults": {
-          "unit": "short",
+          "unit": "locale",
           "decimals": 2,
           "custom": {
-            "align": "auto",
-            "filterable": false,
+            "align": "left",
+            "filterable": true,
             "cellOptions": {
               "type": "auto"
             }
@@ -1526,7 +955,7 @@
             "mode": "absolute",
             "steps": [
               {
-                "color": "text",
+                "color": "red",
                 "value": null
               }
             ]
@@ -1541,43 +970,291 @@
             },
             "properties": [
               {
+                "id": "custom.align",
+                "value": "left"
+              },
+              {
                 "id": "custom.width",
-                "value": 60
+                "value": 96
               }
             ]
           },
           {
             "matcher": {
               "id": "byName",
-              "options": "CT"
+              "options": "Flags"
             },
             "properties": [
               {
                 "id": "mappings",
                 "value": [
                   {
-                    "type": "value",
+                    "type": "regex",
                     "options": {
-                      "1": {
-                        "text": "\u25cf",
-                        "color": "green",
+                      "pattern": "^111$",
+                      "result": {
+                        "text": "<span style=\"color:#6b7280\">\u25cf</span>&nbsp;<span style=\"color:#6b7280\">\u25cf</span>&nbsp;<span style=\"color:#6b7280\">\u25cf</span>",
                         "index": 0
-                      },
-                      "0": {
-                        "text": "\u25cf",
-                        "color": "red",
+                      }
+                    }
+                  },
+                  {
+                    "type": "regex",
+                    "options": {
+                      "pattern": "^112$",
+                      "result": {
+                        "text": "<span style=\"color:#6b7280\">\u25cf</span>&nbsp;<span style=\"color:#6b7280\">\u25cf</span>&nbsp;<span style=\"color:#22c55e\">\u25cf</span>",
                         "index": 1
                       }
                     }
                   },
                   {
-                    "type": "special",
+                    "type": "regex",
                     "options": {
-                      "match": "null+nan",
+                      "pattern": "^113$",
                       "result": {
-                        "text": "\u25cb",
-                        "color": "text",
+                        "text": "<span style=\"color:#6b7280\">\u25cf</span>&nbsp;<span style=\"color:#6b7280\">\u25cf</span>&nbsp;<span style=\"color:#6b7280\">\u25cb</span>",
                         "index": 2
+                      }
+                    }
+                  },
+                  {
+                    "type": "regex",
+                    "options": {
+                      "pattern": "^121$",
+                      "result": {
+                        "text": "<span style=\"color:#6b7280\">\u25cf</span>&nbsp;<span style=\"color:#22c55e\">\u25cf</span>&nbsp;<span style=\"color:#6b7280\">\u25cf</span>",
+                        "index": 3
+                      }
+                    }
+                  },
+                  {
+                    "type": "regex",
+                    "options": {
+                      "pattern": "^122$",
+                      "result": {
+                        "text": "<span style=\"color:#6b7280\">\u25cf</span>&nbsp;<span style=\"color:#22c55e\">\u25cf</span>&nbsp;<span style=\"color:#22c55e\">\u25cf</span>",
+                        "index": 4
+                      }
+                    }
+                  },
+                  {
+                    "type": "regex",
+                    "options": {
+                      "pattern": "^123$",
+                      "result": {
+                        "text": "<span style=\"color:#6b7280\">\u25cf</span>&nbsp;<span style=\"color:#22c55e\">\u25cf</span>&nbsp;<span style=\"color:#6b7280\">\u25cb</span>",
+                        "index": 5
+                      }
+                    }
+                  },
+                  {
+                    "type": "regex",
+                    "options": {
+                      "pattern": "^131$",
+                      "result": {
+                        "text": "<span style=\"color:#6b7280\">\u25cf</span>&nbsp;<span style=\"color:#6b7280\">\u25cb</span>&nbsp;<span style=\"color:#6b7280\">\u25cf</span>",
+                        "index": 6
+                      }
+                    }
+                  },
+                  {
+                    "type": "regex",
+                    "options": {
+                      "pattern": "^132$",
+                      "result": {
+                        "text": "<span style=\"color:#6b7280\">\u25cf</span>&nbsp;<span style=\"color:#6b7280\">\u25cb</span>&nbsp;<span style=\"color:#22c55e\">\u25cf</span>",
+                        "index": 7
+                      }
+                    }
+                  },
+                  {
+                    "type": "regex",
+                    "options": {
+                      "pattern": "^133$",
+                      "result": {
+                        "text": "<span style=\"color:#6b7280\">\u25cf</span>&nbsp;<span style=\"color:#6b7280\">\u25cb</span>&nbsp;<span style=\"color:#6b7280\">\u25cb</span>",
+                        "index": 8
+                      }
+                    }
+                  },
+                  {
+                    "type": "regex",
+                    "options": {
+                      "pattern": "^211$",
+                      "result": {
+                        "text": "<span style=\"color:#22c55e\">\u25cf</span>&nbsp;<span style=\"color:#6b7280\">\u25cf</span>&nbsp;<span style=\"color:#6b7280\">\u25cf</span>",
+                        "index": 9
+                      }
+                    }
+                  },
+                  {
+                    "type": "regex",
+                    "options": {
+                      "pattern": "^212$",
+                      "result": {
+                        "text": "<span style=\"color:#22c55e\">\u25cf</span>&nbsp;<span style=\"color:#6b7280\">\u25cf</span>&nbsp;<span style=\"color:#22c55e\">\u25cf</span>",
+                        "index": 10
+                      }
+                    }
+                  },
+                  {
+                    "type": "regex",
+                    "options": {
+                      "pattern": "^213$",
+                      "result": {
+                        "text": "<span style=\"color:#22c55e\">\u25cf</span>&nbsp;<span style=\"color:#6b7280\">\u25cf</span>&nbsp;<span style=\"color:#6b7280\">\u25cb</span>",
+                        "index": 11
+                      }
+                    }
+                  },
+                  {
+                    "type": "regex",
+                    "options": {
+                      "pattern": "^221$",
+                      "result": {
+                        "text": "<span style=\"color:#22c55e\">\u25cf</span>&nbsp;<span style=\"color:#22c55e\">\u25cf</span>&nbsp;<span style=\"color:#6b7280\">\u25cf</span>",
+                        "index": 12
+                      }
+                    }
+                  },
+                  {
+                    "type": "regex",
+                    "options": {
+                      "pattern": "^222$",
+                      "result": {
+                        "text": "<span style=\"color:#22c55e\">\u25cf</span>&nbsp;<span style=\"color:#22c55e\">\u25cf</span>&nbsp;<span style=\"color:#22c55e\">\u25cf</span>",
+                        "index": 13
+                      }
+                    }
+                  },
+                  {
+                    "type": "regex",
+                    "options": {
+                      "pattern": "^223$",
+                      "result": {
+                        "text": "<span style=\"color:#22c55e\">\u25cf</span>&nbsp;<span style=\"color:#22c55e\">\u25cf</span>&nbsp;<span style=\"color:#6b7280\">\u25cb</span>",
+                        "index": 14
+                      }
+                    }
+                  },
+                  {
+                    "type": "regex",
+                    "options": {
+                      "pattern": "^231$",
+                      "result": {
+                        "text": "<span style=\"color:#22c55e\">\u25cf</span>&nbsp;<span style=\"color:#6b7280\">\u25cb</span>&nbsp;<span style=\"color:#6b7280\">\u25cf</span>",
+                        "index": 15
+                      }
+                    }
+                  },
+                  {
+                    "type": "regex",
+                    "options": {
+                      "pattern": "^232$",
+                      "result": {
+                        "text": "<span style=\"color:#22c55e\">\u25cf</span>&nbsp;<span style=\"color:#6b7280\">\u25cb</span>&nbsp;<span style=\"color:#22c55e\">\u25cf</span>",
+                        "index": 16
+                      }
+                    }
+                  },
+                  {
+                    "type": "regex",
+                    "options": {
+                      "pattern": "^233$",
+                      "result": {
+                        "text": "<span style=\"color:#22c55e\">\u25cf</span>&nbsp;<span style=\"color:#6b7280\">\u25cb</span>&nbsp;<span style=\"color:#6b7280\">\u25cb</span>",
+                        "index": 17
+                      }
+                    }
+                  },
+                  {
+                    "type": "regex",
+                    "options": {
+                      "pattern": "^311$",
+                      "result": {
+                        "text": "<span style=\"color:#6b7280\">\u25cb</span>&nbsp;<span style=\"color:#6b7280\">\u25cf</span>&nbsp;<span style=\"color:#6b7280\">\u25cf</span>",
+                        "index": 18
+                      }
+                    }
+                  },
+                  {
+                    "type": "regex",
+                    "options": {
+                      "pattern": "^312$",
+                      "result": {
+                        "text": "<span style=\"color:#6b7280\">\u25cb</span>&nbsp;<span style=\"color:#6b7280\">\u25cf</span>&nbsp;<span style=\"color:#22c55e\">\u25cf</span>",
+                        "index": 19
+                      }
+                    }
+                  },
+                  {
+                    "type": "regex",
+                    "options": {
+                      "pattern": "^313$",
+                      "result": {
+                        "text": "<span style=\"color:#6b7280\">\u25cb</span>&nbsp;<span style=\"color:#6b7280\">\u25cf</span>&nbsp;<span style=\"color:#6b7280\">\u25cb</span>",
+                        "index": 20
+                      }
+                    }
+                  },
+                  {
+                    "type": "regex",
+                    "options": {
+                      "pattern": "^321$",
+                      "result": {
+                        "text": "<span style=\"color:#6b7280\">\u25cb</span>&nbsp;<span style=\"color:#22c55e\">\u25cf</span>&nbsp;<span style=\"color:#6b7280\">\u25cf</span>",
+                        "index": 21
+                      }
+                    }
+                  },
+                  {
+                    "type": "regex",
+                    "options": {
+                      "pattern": "^322$",
+                      "result": {
+                        "text": "<span style=\"color:#6b7280\">\u25cb</span>&nbsp;<span style=\"color:#22c55e\">\u25cf</span>&nbsp;<span style=\"color:#22c55e\">\u25cf</span>",
+                        "index": 22
+                      }
+                    }
+                  },
+                  {
+                    "type": "regex",
+                    "options": {
+                      "pattern": "^323$",
+                      "result": {
+                        "text": "<span style=\"color:#6b7280\">\u25cb</span>&nbsp;<span style=\"color:#22c55e\">\u25cf</span>&nbsp;<span style=\"color:#6b7280\">\u25cb</span>",
+                        "index": 23
+                      }
+                    }
+                  },
+                  {
+                    "type": "regex",
+                    "options": {
+                      "pattern": "^331$",
+                      "result": {
+                        "text": "<span style=\"color:#6b7280\">\u25cb</span>&nbsp;<span style=\"color:#6b7280\">\u25cb</span>&nbsp;<span style=\"color:#6b7280\">\u25cf</span>",
+                        "index": 24
+                      }
+                    }
+                  },
+                  {
+                    "type": "regex",
+                    "options": {
+                      "pattern": "^332$",
+                      "result": {
+                        "text": "<span style=\"color:#6b7280\">\u25cb</span>&nbsp;<span style=\"color:#6b7280\">\u25cb</span>&nbsp;<span style=\"color:#22c55e\">\u25cf</span>",
+                        "index": 25
+                      }
+                    }
+                  },
+                  {
+                    "type": "regex",
+                    "options": {
+                      "pattern": "^333$",
+                      "result": {
+                        "text": "<span style=\"color:#6b7280\">\u25cb</span>&nbsp;<span style=\"color:#6b7280\">\u25cb</span>&nbsp;<span style=\"color:#6b7280\">\u25cb</span>",
+                        "index": 26
                       }
                     }
                   }
@@ -1586,7 +1263,7 @@
               {
                 "id": "custom.cellOptions",
                 "value": {
-                  "type": "color-text"
+                  "type": "markdown"
                 }
               },
               {
@@ -1594,134 +1271,48 @@
                 "value": "center"
               },
               {
+                "id": "custom.filterable",
+                "value": false
+              },
+              {
                 "id": "custom.width",
-                "value": 40
+                "value": 64
               }
             ]
           },
           {
             "matcher": {
               "id": "byName",
-              "options": "Rebal"
+              "options": "Base"
             },
             "properties": [
               {
-                "id": "mappings",
-                "value": [
-                  {
-                    "type": "value",
-                    "options": {
-                      "1": {
-                        "text": "\u25cf",
-                        "color": "green",
-                        "index": 0
-                      },
-                      "0": {
-                        "text": "\u25cf",
-                        "color": "red",
-                        "index": 1
-                      }
-                    }
-                  },
-                  {
-                    "type": "special",
-                    "options": {
-                      "match": "null+nan",
-                      "result": {
-                        "text": "\u25cb",
-                        "color": "text",
-                        "index": 2
-                      }
-                    }
-                  }
-                ]
-              },
-              {
-                "id": "custom.cellOptions",
-                "value": {
-                  "type": "color-text"
-                }
-              },
-              {
-                "id": "custom.align",
-                "value": "center"
-              },
-              {
                 "id": "custom.width",
-                "value": 40
+                "value": 92
               }
             ]
           },
           {
             "matcher": {
               "id": "byName",
-              "options": "Ext"
+              "options": "Robinhood"
             },
             "properties": [
               {
-                "id": "mappings",
-                "value": [
-                  {
-                    "type": "value",
-                    "options": {
-                      "1": {
-                        "text": "\u25cf",
-                        "color": "green",
-                        "index": 0
-                      },
-                      "0": {
-                        "text": "\u25cf",
-                        "color": "red",
-                        "index": 1
-                      }
-                    }
-                  },
-                  {
-                    "type": "special",
-                    "options": {
-                      "match": "null+nan",
-                      "result": {
-                        "text": "\u25cb",
-                        "color": "text",
-                        "index": 2
-                      }
-                    }
-                  }
-                ]
-              },
-              {
-                "id": "custom.cellOptions",
-                "value": {
-                  "type": "color-text"
-                }
-              },
-              {
-                "id": "custom.align",
-                "value": "center"
-              },
-              {
                 "id": "custom.width",
-                "value": 40
+                "value": 92
               }
             ]
           },
           {
             "matcher": {
               "id": "byName",
-              "options": "Raindex"
+              "options": "HyperEVM"
             },
             "properties": [
               {
-                "id": "unit",
-                "value": "locale"
-              },
-              {
-                "id": "decimals",
-                "value": 2
-              },
-              {
                 "id": "custom.width",
-                "value": 70
+                "value": 92
               }
             ]
           },
@@ -1732,16 +1323,8 @@
             },
             "properties": [
               {
-                "id": "unit",
-                "value": "locale"
-              },
-              {
-                "id": "decimals",
-                "value": 2
-              },
-              {
                 "id": "custom.width",
-                "value": 70
+                "value": 86
               }
             ]
           },
@@ -1752,16 +1335,8 @@
             },
             "properties": [
               {
-                "id": "unit",
-                "value": "locale"
-              },
-              {
-                "id": "decimals",
-                "value": 2
-              },
-              {
                 "id": "custom.width",
-                "value": 70
+                "value": 86
               }
             ]
           },
@@ -1772,56 +1347,44 @@
             },
             "properties": [
               {
-                "id": "unit",
-                "value": "locale"
-              },
-              {
-                "id": "decimals",
-                "value": 2
-              },
-              {
                 "id": "custom.width",
-                "value": 70
+                "value": 74
               }
             ]
           },
           {
             "matcher": {
               "id": "byName",
-              "options": "Wrapped"
+              "options": "Total USD"
             },
             "properties": [
               {
                 "id": "unit",
-                "value": "locale"
+                "value": "currencyUSD"
               },
               {
                 "id": "decimals",
-                "value": 2
+                "value": 0
+              },
+              {
+                "id": "mappings",
+                "value": [
+                  {
+                    "type": "special",
+                    "options": {
+                      "match": "null+nan",
+                      "result": {
+                        "text": "\u2014",
+                        "color": "#6b7280",
+                        "index": 0
+                      }
+                    }
+                  }
+                ]
               },
               {
                 "id": "custom.width",
-                "value": 70
-              }
-            ]
-          },
-          {
-            "matcher": {
-              "id": "byName",
-              "options": "Unwrapped"
-            },
-            "properties": [
-              {
-                "id": "unit",
-                "value": "locale"
-              },
-              {
-                "id": "decimals",
-                "value": 2
-              },
-              {
-                "id": "custom.width",
-                "value": 80
+                "value": 100
               }
             ]
           },
@@ -1832,90 +1395,49 @@
             },
             "properties": [
               {
-                "id": "unit",
-                "value": "percentunit"
-              },
-              {
-                "id": "decimals",
-                "value": 1
+                "id": "mappings",
+                "value": [
+                  {
+                    "type": "regex",
+                    "options": {
+                      "pattern": "^(null|NaN)?$",
+                      "result": {
+                        "text": " ",
+                        "index": 0
+                      }
+                    }
+                  },
+                  {
+                    "type": "regex",
+                    "options": {
+                      "pattern": "^-(\\d+(?:\\.[1-9])?).*$",
+                      "result": {
+                        "text": "<div style=\"height:20px;border-radius:4px;font-weight:600;text-align:center;background:linear-gradient(90deg, rgba(239,68,68,0.6) $1%, rgba(128,128,128,0.15) $1%)\">$1%</div>",
+                        "index": 1
+                      }
+                    }
+                  },
+                  {
+                    "type": "regex",
+                    "options": {
+                      "pattern": "^(\\d+(?:\\.[1-9])?).*$",
+                      "result": {
+                        "text": "<div style=\"height:20px;border-radius:4px;font-weight:600;text-align:center;background:linear-gradient(90deg, rgba(34,197,94,0.6) $1%, rgba(128,128,128,0.15) $1%)\">$1%</div>",
+                        "index": 2
+                      }
+                    }
+                  }
+                ]
               },
               {
                 "id": "custom.cellOptions",
                 "value": {
-                  "type": "gauge",
-                  "mode": "basic",
-                  "valueDisplayMode": "text"
+                  "type": "markdown"
                 }
               },
               {
-                "id": "min",
-                "value": 0
-              },
-              {
-                "id": "max",
-                "value": 1
-              },
-              {
-                "id": "thresholds",
-                "value": {
-                  "mode": "absolute",
-                  "steps": [
-                    {
-                      "color": "blue",
-                      "value": null
-                    }
-                  ]
-                }
-              },
-              {
-                "id": "custom.width",
-                "value": 140
-              }
-            ]
-          },
-          {
-            "matcher": {
-              "id": "byName",
-              "options": "\u0394"
-            },
-            "properties": [
-              {
-                "id": "unit",
-                "value": "short"
-              },
-              {
-                "id": "decimals",
-                "value": 1
-              },
-              {
-                "id": "custom.cellOptions",
-                "value": {
-                  "type": "color-text"
-                }
-              },
-              {
-                "id": "custom.width",
-                "value": 45
-              },
-              {
-                "id": "thresholds",
-                "value": {
-                  "mode": "absolute",
-                  "steps": [
-                    {
-                      "color": "red",
-                      "value": null
-                    },
-                    {
-                      "color": "text",
-                      "value": -1
-                    },
-                    {
-                      "color": "green",
-                      "value": 1
-                    }
-                  ]
-                }
+                "id": "custom.align",
+                "value": "center"
               }
             ]
           },
@@ -1930,14 +1452,20 @@
                 "value": "currencyUSD"
               },
               {
-                "id": "decimals",
-                "value": 2
-              },
-              {
-                "id": "custom.cellOptions",
-                "value": {
-                  "type": "color-text"
-                }
+                "id": "mappings",
+                "value": [
+                  {
+                    "type": "special",
+                    "options": {
+                      "match": "null+nan",
+                      "result": {
+                        "text": "\u2014",
+                        "color": "#6b7280",
+                        "index": 0
+                      }
+                    }
+                  }
+                ]
               },
               {
                 "id": "thresholds",
@@ -1950,34 +1478,68 @@
                     },
                     {
                       "color": "text",
-                      "value": -0.01
+                      "value": -0.005
                     },
                     {
                       "color": "green",
-                      "value": 0.01
+                      "value": 0.005
                     }
                   ]
                 }
               },
               {
-                "id": "custom.width",
-                "value": 80
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "color-text"
+                }
               },
               {
-                "id": "mappings",
-                "value": [
-                  {
-                    "type": "special",
-                    "options": {
-                      "match": "null+nan",
-                      "result": {
-                        "text": "\u2014",
-                        "color": "text",
-                        "index": 0
-                      }
-                    }
-                  }
-                ]
+                "id": "custom.width",
+                "value": 95
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Unwrapped"
+            },
+            "properties": [
+              {
+                "id": "custom.align",
+                "value": "right"
+              },
+              {
+                "id": "custom.width",
+                "value": 118
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Wrapped"
+            },
+            "properties": [
+              {
+                "id": "custom.align",
+                "value": "right"
+              },
+              {
+                "id": "custom.width",
+                "value": 102
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Ratio"
+            },
+            "properties": [
+              {
+                "id": "custom.minWidth",
+                "value": 60
               }
             ]
           }
@@ -1985,11 +1547,11 @@
       },
       "options": {
         "showHeader": true,
-        "cellHeight": "sm",
+        "cellHeight": "md",
         "sortBy": [
           {
-            "displayName": "CT",
-            "desc": true
+            "displayName": "Asset",
+            "desc": false
           }
         ]
       },
@@ -1997,10 +1559,11 @@
       "hideTimeOverride": false
     },
     {
-      "id": 12,
+      "id": 5,
       "type": "table",
-      "title": "Trade History",
-      "description": "Direct Raindex fills, fills routed through supported adapters such as Bebop, and the corresponding Alpaca hedge trades placed to offset exposure. One row per trade at its latest status. Built from the newest 500 status entries, so a busy period can push older rows out of the 30-day window.",
+      "title": "Trades",
+      "description": "Direct Raindex fills, fills routed through supported adapters such as Bebop, and the corresponding Alpaca hedge trades placed to offset exposure. One row per trade at its latest status; its \u24d8 opens the details. Built from the newest 500 status entries, so a busy period can push older rows out of the 30-day window.",
+      "pluginVersion": "13.1.0",
       "datasource": {
         "type": "googlecloud-logging-datasource",
         "uid": "cloudlog"
@@ -2020,9 +1583,9 @@
         }
       ],
       "gridPos": {
-        "h": 14,
-        "w": 10,
-        "x": 14,
+        "h": 25,
+        "w": 11,
+        "x": 13,
         "y": 1
       },
       "transformations": [
@@ -2044,6 +1607,7 @@
                 "jsonPayload.venue",
                 "jsonPayload.direction",
                 "jsonPayload.shares",
+                "jsonPayload.usd",
                 "jsonPayload.status",
                 "timestamp",
                 "jsonPayload.id"
@@ -2057,6 +1621,10 @@
             "conversions": [
               {
                 "targetField": "jsonPayload.shares",
+                "destinationType": "number"
+              },
+              {
+                "targetField": "jsonPayload.usd",
                 "destinationType": "number"
               }
             ]
@@ -2072,8 +1640,9 @@
               "jsonPayload.venue": "Venue",
               "jsonPayload.direction": "Side",
               "jsonPayload.shares": "Size",
+              "jsonPayload.usd": "USD",
               "jsonPayload.status": "Status",
-              "timestamp": "Time",
+              "timestamp": "Last updated",
               "jsonPayload.id": "Id"
             }
           }
@@ -2086,7 +1655,7 @@
                 "operation": "groupby",
                 "aggregations": []
               },
-              "Time": {
+              "Last updated": {
                 "operation": "aggregate",
                 "aggregations": [
                   "first"
@@ -2116,6 +1685,12 @@
                   "first"
                 ]
               },
+              "USD": {
+                "operation": "aggregate",
+                "aggregations": [
+                  "first"
+                ]
+              },
               "Status": {
                 "operation": "aggregate",
                 "aggregations": [
@@ -2128,23 +1703,24 @@
         {
           "id": "organize",
           "options": {
-            "excludeByName": {
-              "Id": true
-            },
+            "excludeByName": {},
             "indexByName": {
-              "Time (first)": 0,
-              "Asset (first)": 1,
-              "Venue (first)": 2,
-              "Side (first)": 3,
-              "Size (first)": 4,
-              "Status (first)": 5
+              "Id": 0,
+              "Last updated (first)": 1,
+              "Asset (first)": 2,
+              "Venue (first)": 3,
+              "Side (first)": 4,
+              "Size (first)": 5,
+              "USD (first)": 6,
+              "Status (first)": 7
             },
             "renameByName": {
-              "Time (first)": "Time",
+              "Last updated (first)": "Last updated",
               "Asset (first)": "Asset",
               "Venue (first)": "Venue",
               "Side (first)": "Side",
               "Size (first)": "Size",
+              "USD (first)": "USD",
               "Status (first)": "Status"
             }
           }
@@ -2155,7 +1731,7 @@
             "fields": {},
             "sort": [
               {
-                "field": "Time",
+                "field": "Last updated",
                 "desc": true
               }
             ]
@@ -2189,7 +1765,23 @@
           {
             "matcher": {
               "id": "byName",
-              "options": "Time"
+              "options": "USD"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "locale"
+              },
+              {
+                "id": "decimals",
+                "value": 2
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Last updated"
             },
             "properties": [
               {
@@ -2201,12 +1793,53 @@
           {
             "matcher": {
               "id": "byName",
-              "options": "Time"
+              "options": "Id"
+            },
+            "properties": [
+              {
+                "id": "displayName",
+                "value": " "
+              },
+              {
+                "id": "custom.width",
+                "value": 50
+              },
+              {
+                "id": "custom.align",
+                "value": "center"
+              },
+              {
+                "id": "custom.filterable",
+                "value": false
+              },
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "data-links"
+                }
+              },
+              {
+                "id": "links",
+                "value": [
+                  {
+                    "title": "\u24d8",
+                    "url": "/d/${__dashboard.uid}/${__url.params:exclude:var-detail}&var-detail=${__data.fields[\"jsonPayload.id\"]}",
+                    "targetBlank": false,
+                    "oneClick": true
+                  }
+                ]
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Last updated"
             },
             "properties": [
               {
                 "id": "custom.width",
-                "value": 170
+                "value": 185
               }
             ]
           },
@@ -2218,7 +1851,7 @@
             "properties": [
               {
                 "id": "custom.width",
-                "value": 80
+                "value": 85
               }
             ]
           },
@@ -2230,7 +1863,7 @@
             "properties": [
               {
                 "id": "custom.width",
-                "value": 110
+                "value": 115
               },
               {
                 "id": "mappings",
@@ -2288,7 +1921,7 @@
             "properties": [
               {
                 "id": "custom.width",
-                "value": 70
+                "value": 75
               },
               {
                 "id": "mappings",
@@ -2326,7 +1959,27 @@
             "properties": [
               {
                 "id": "custom.width",
+                "value": 100
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "USD"
+            },
+            "properties": [
+              {
+                "id": "custom.width",
                 "value": 110
+              },
+              {
+                "id": "unit",
+                "value": "currencyUSD"
+              },
+              {
+                "id": "decimals",
+                "value": 2
               }
             ]
           },
@@ -2428,14 +2081,15 @@
       },
       "options": {
         "showHeader": true,
-        "cellHeight": "sm"
+        "cellHeight": "md"
       }
     },
     {
-      "id": 13,
+      "id": 6,
       "type": "table",
-      "title": "Cross-venue Transfers",
-      "description": "Asset movements between venues to rebalance inventory: equity mints (Alpaca to onchain), redemptions (onchain to Alpaca), and USDC bridges (Base/Ethereum via CCTP). One row per transfer at its latest status. A USDC bridge can show the previous status for a while: the exporter stamps each status with the transfer's updatedAt, which is not always later than the one before (bridging starts from initiated_at). Built from the newest 500 status entries, so a busy period can push older rows out of the 30-day window.",
+      "title": "Rebalances",
+      "description": "Asset movements between venues to rebalance inventory: equity mints (Alpaca to onchain), redemptions (onchain to Alpaca), and USDC bridges (Base/Ethereum via CCTP). One row per transfer at its latest status; its \u24d8 opens the details. A USDC bridge can show the previous status for a while: the exporter stamps each status with the transfer's updatedAt, which is not always later than the one before (bridging starts from initiated_at). Built from the newest 500 status entries, so a busy period can push older rows out of the 30-day window.",
+      "pluginVersion": "13.1.0",
       "datasource": {
         "type": "googlecloud-logging-datasource",
         "uid": "cloudlog"
@@ -2444,7 +2098,7 @@
       "maxDataPoints": 500,
       "targets": [
         {
-          "refId": "A",
+          "refId": "B",
           "datasource": {
             "type": "googlecloud-logging-datasource",
             "uid": "cloudlog"
@@ -2455,10 +2109,10 @@
         }
       ],
       "gridPos": {
-        "h": 14,
-        "w": 10,
-        "x": 14,
-        "y": 15
+        "h": 26,
+        "w": 11,
+        "x": 13,
+        "y": 26
       },
       "transformations": [
         {
@@ -2485,9 +2139,9 @@
           "options": {
             "include": {
               "names": [
-                "jsonPayload.started_at",
                 "jsonPayload.symbol",
                 "jsonPayload.amount",
+                "jsonPayload.usd",
                 "jsonPayload.status",
                 "timestamp",
                 "jsonPayload.id",
@@ -2505,8 +2159,8 @@
                 "destinationType": "number"
               },
               {
-                "targetField": "jsonPayload.started_at",
-                "destinationType": "time"
+                "targetField": "jsonPayload.usd",
+                "destinationType": "number"
               }
             ]
           }
@@ -2517,11 +2171,11 @@
             "excludeByName": {},
             "indexByName": {},
             "renameByName": {
-              "jsonPayload.started_at": "Started",
               "jsonPayload.symbol": "Asset",
               "jsonPayload.amount": "Amount",
+              "jsonPayload.usd": "USD",
               "jsonPayload.status": "Status",
-              "timestamp": "Updated",
+              "timestamp": "Last updated",
               "jsonPayload.id": "Id"
             }
           }
@@ -2534,7 +2188,7 @@
                 "operation": "groupby",
                 "aggregations": []
               },
-              "Started": {
+              "Last updated": {
                 "operation": "aggregate",
                 "aggregations": [
                   "first"
@@ -2558,13 +2212,13 @@
                   "first"
                 ]
               },
-              "Status": {
+              "USD": {
                 "operation": "aggregate",
                 "aggregations": [
                   "first"
                 ]
               },
-              "Updated": {
+              "Status": {
                 "operation": "aggregate",
                 "aggregations": [
                   "first"
@@ -2576,24 +2230,23 @@
         {
           "id": "organize",
           "options": {
-            "excludeByName": {
-              "Id": true
-            },
+            "excludeByName": {},
             "indexByName": {
-              "Started (first)": 0,
-              "Type (first)": 1,
-              "Asset (first)": 2,
-              "Amount (first)": 3,
-              "Status (first)": 4,
-              "Updated (first)": 5
+              "Id": 0,
+              "Last updated (first)": 1,
+              "Type (first)": 2,
+              "Asset (first)": 3,
+              "Amount (first)": 4,
+              "USD (first)": 5,
+              "Status (first)": 6
             },
             "renameByName": {
-              "Started (first)": "Started",
+              "Last updated (first)": "Last updated",
               "Type (first)": "Type",
               "Asset (first)": "Asset",
               "Amount (first)": "Amount",
-              "Status (first)": "Status",
-              "Updated (first)": "Updated"
+              "USD (first)": "USD",
+              "Status (first)": "Status"
             }
           }
         },
@@ -2603,7 +2256,7 @@
             "fields": {},
             "sort": [
               {
-                "field": "Updated",
+                "field": "Last updated",
                 "desc": true
               }
             ]
@@ -2637,7 +2290,23 @@
           {
             "matcher": {
               "id": "byName",
-              "options": "Updated"
+              "options": "USD"
+            },
+            "properties": [
+              {
+                "id": "unit",
+                "value": "locale"
+              },
+              {
+                "id": "decimals",
+                "value": 2
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "Last updated"
             },
             "properties": [
               {
@@ -2649,24 +2318,53 @@
           {
             "matcher": {
               "id": "byName",
-              "options": "Started"
+              "options": "Id"
             },
             "properties": [
               {
-                "id": "unit",
-                "value": "time:MMM D, HH:mm:ss [UTC]"
+                "id": "displayName",
+                "value": " "
+              },
+              {
+                "id": "custom.width",
+                "value": 50
+              },
+              {
+                "id": "custom.align",
+                "value": "center"
+              },
+              {
+                "id": "custom.filterable",
+                "value": false
+              },
+              {
+                "id": "custom.cellOptions",
+                "value": {
+                  "type": "data-links"
+                }
+              },
+              {
+                "id": "links",
+                "value": [
+                  {
+                    "title": "\u24d8",
+                    "url": "/d/${__dashboard.uid}/${__url.params:exclude:var-detail}&var-detail=${__data.fields[\"jsonPayload.id\"]}",
+                    "targetBlank": false,
+                    "oneClick": true
+                  }
+                ]
               }
             ]
           },
           {
             "matcher": {
               "id": "byName",
-              "options": "Started"
+              "options": "Last updated"
             },
             "properties": [
               {
                 "id": "custom.width",
-                "value": 135
+                "value": 185
               }
             ]
           },
@@ -2678,7 +2376,7 @@
             "properties": [
               {
                 "id": "custom.width",
-                "value": 125
+                "value": 165
               },
               {
                 "id": "mappings",
@@ -2720,7 +2418,7 @@
             "properties": [
               {
                 "id": "custom.width",
-                "value": 60
+                "value": 80
               },
               {
                 "id": "mappings",
@@ -2747,7 +2445,27 @@
             "properties": [
               {
                 "id": "custom.width",
-                "value": 85
+                "value": 115
+              }
+            ]
+          },
+          {
+            "matcher": {
+              "id": "byName",
+              "options": "USD"
+            },
+            "properties": [
+              {
+                "id": "custom.width",
+                "value": 110
+              },
+              {
+                "id": "unit",
+                "value": "currencyUSD"
+              },
+              {
+                "id": "decimals",
+                "value": 2
               }
             ]
           },
@@ -2757,10 +2475,6 @@
               "options": "Status"
             },
             "properties": [
-              {
-                "id": "custom.width",
-                "value": 110
-              },
               {
                 "id": "mappings",
                 "value": [
@@ -2848,19 +2562,75 @@
                 }
               }
             ]
-          },
-          {
-            "matcher": {
-              "id": "byName",
-              "options": "Updated"
-            },
-            "properties": []
           }
         ]
       },
       "options": {
         "showHeader": true,
-        "cellHeight": "sm"
+        "cellHeight": "md"
+      }
+    },
+    {
+      "id": 7,
+      "type": "marcusolsson-dynamictext-panel",
+      "title": "",
+      "description": "The detail dialog of a Trades or Rebalances row: open it from the row's \u24d8.",
+      "datasource": {
+        "type": "datasource",
+        "uid": "-- Mixed --"
+      },
+      "timeFrom": "30d",
+      "hideTimeOverride": true,
+      "maxDataPoints": 500,
+      "targets": [
+        {
+          "refId": "A",
+          "panelId": 5,
+          "withTransforms": false,
+          "datasource": {
+            "type": "datasource",
+            "uid": "-- Dashboard --"
+          }
+        },
+        {
+          "refId": "B",
+          "panelId": 6,
+          "withTransforms": false,
+          "datasource": {
+            "type": "datasource",
+            "uid": "-- Dashboard --"
+          }
+        },
+        {
+          "refId": "C",
+          "datasource": {
+            "type": "googlecloud-logging-datasource",
+            "uid": "cloudlog"
+          },
+          "projectId": "$env",
+          "queryText": "logName=\"projects/$env/logs/liquidity-events\"",
+          "queryType": "logs"
+        }
+      ],
+      "transparent": true,
+      "gridPos": {
+        "h": 1,
+        "w": 1,
+        "x": 23,
+        "y": 0
+      },
+      "options": {
+        "renderMode": "data",
+        "editor": {
+          "format": "auto",
+          "language": "html"
+        },
+        "content": "<div></div>",
+        "defaultContent": "<div></div>",
+        "helpers": "",
+        "afterRender": "const MODE_LABELS = {\"requires-bot\": \"REST \\u2014 requires the running bot\", \"live-rpc-only\": \"live RPC \\u2014 ensure the bot is not driving this same on-chain action\", \"direct-db-live-rpc\": \"direct DB + live RPC \\u2014 stop the bot / ensure it is not driving this id\", \"direct-db\": \"direct DB \\u2014 stop the bot / ensure it is not driving this id\"};\n\n// The board's per-row recovery commands: the client form of the SPA's\n// tradeRecoveryCommands and transferRecoveryCommands\n// (dashboard/src/lib/transfer.ts). The generator prepends this file to\n// detail.js; dashboard/src/lib/transfer-board.test.ts runs it against the SPA's\n// builders so the two cannot drift, importing it as a module through the\n// export line, which the generator drops. `client` is the client invocation\n// with its --env.\n\nconst tradeCommands = (client, symbol) => [\n  {\n    command: `${client} debug position release-hedge ${symbol} --order-id <order-id> --reason \"<reason>\"`,\n    description: \"Clear a position's stuck pending offchain order so normal hedging can retry. Needs the order id.\",\n    mode: 'requires-bot',\n  },\n  {\n    command: `${client} debug position set ${symbol} --target-net <N> [--price-usdc <USDC_PER_SHARE>] --reason \"<reason>\"`,\n    description:\n      'Override the net exposure after a manual correction. The target is signed: negative is short, 0 is flat. The price is required for a nonzero target unless the position already has a last price.',\n    mode: 'requires-bot',\n  },\n  {\n    command: `${client} debug view rebuild position --id ${symbol}`,\n    description: 'Replay all events to reconstruct a corrupted position view.',\n    mode: 'requires-bot',\n  },\n];\n\nconst transferCommands = (client, transfer) => {\n  const status = String(transfer.status || '').toLowerCase();\n  const failed = status === 'failed';\n  const terminal = failed || status === 'completed' || status === 'reconciled';\n  if (status === 'completed' || status === 'reconciled') return [];\n  const id = transfer.id;\n\n  if (transfer.kind === 'usdc_bridge') {\n    // Reconcile needs the bridge's postBurn flag, which the exporter does not\n    // log; the SPA offers nothing without it either.\n    if (failed) return [];\n    const direction =\n      { alpaca_to_base: 'alpaca-to-base', base_to_alpaca: 'base-to-alpaca' }[transfer.direction] ||\n      '<alpaca-to-base|base-to-alpaca>';\n    const resume = {\n      command: `${client} debug resume-usdc ${direction} ${id}`,\n      description: \"Re-drive this USDC bridge on the bot's transfer worker from the stage it stopped at.\",\n      mode: 'requires-bot',\n    };\n    if (status !== 'withdrawing') return [resume];\n    return [\n      resume,\n      {\n        command: `${client} debug fail-usdc-transfer ${id} --reason \"<reason>\"`,\n        description:\n          'Check the transfer first: the bot accepts this only before the burn, for an Alpaca to Base bridge whose withdrawal completed or a Base to Alpaca bridge whose vault withdrawal was not sent. Verify on-chain that no CCTP burn landed. After a Base to Alpaca vault withdrawal, stop the bot, run the offline stox fail-usdc-transfer and move the wallet USDC back by hand. If the Alpaca withdrawal completed, the guard stays held until you reconcile.',\n        mode: 'requires-bot',\n      },\n    ];\n  }\n\n  const kind = { equity_mint: 'mint', equity_redemption: 'redemption' }[transfer.kind];\n  if (!kind) return [];\n  const commands = [\n    {\n      command: `${client} debug recheck ${kind} ${id}`,\n      description: 'Ask the running bot to re-poll the provider and complete the transfer if it settled.',\n      mode: 'requires-bot',\n    },\n  ];\n  if (!terminal) {\n    commands.push({\n      command: `${client} debug resume`,\n      description:\n        'Re-drive ALL interrupted mints and redemptions via the bot (no id; best-effort per transfer, each succeeds or fails independently and failures are reported as counts).',\n      mode: 'requires-bot',\n    });\n    commands.push({\n      command: `${client} debug fail-equity-transfer ${kind} ${id} --reason \"<reason>\"`,\n      description: 'Force this stuck transfer into the terminal Failed state. Use when it is permanently stuck.',\n      mode: 'requires-bot',\n    });\n  }\n  if (failed) {\n    commands.push({\n      command: `${client} debug reconcile-equity ${kind} ${id} --reason \"<reason>\"`,\n      description: 'Mark a Failed transfer as Reconciled once its residue was handled out-of-band (bookkeeping).',\n      mode: 'requires-bot',\n    });\n  }\n  return commands;\n};\n\n\n// Business Text \"afterRender\" code for the Liquidity bot's detail panel: the\n// SPA's trade and transfer detail dialogs (trade-history-panel.svelte,\n// transfer-panel.svelte in ST0x-Technology/st0x.liquidity) for the row whose\n// \u24d8 was clicked in the Trades or Rebalances table.\n//\n// The click sets the hidden `detail` variable to the row's id. The panel\n// then queries every log entry of that id: query A (liquidity-trades) and\n// query B (liquidity-transfers), one entry per status change. Closing the\n// dialog clears the variable, which empties the queries again.\n//\n// The panel is one empty column of the header row; only the dialog shows.\n//\n// MODE_LABELS, tradeCommands and transferCommands are not defined here: the\n// generator prepends them from recovery-guide.json and recovery-commands.js\n// (see detail_panel()).\n\nconst theme = context.grafana.theme;\nconst root = context.element;\nroot.style.setProperty('--det-muted', theme.colors.text.secondary);\nroot.style.setProperty('--det-border', theme.colors.border.weak);\nroot.style.setProperty('--det-stripe', theme.colors.background.secondary);\nroot.style.setProperty('--det-card', theme.colors.background.primary);\nroot.style.setProperty('--det-text', theme.colors.text.primary);\n// Light theme swaps the status colours for darker shades (detail.css).\nroot.classList.toggle('det-light', !theme.isDark);\n\n// Alternate rows in the board's Trades and Rebalances\n// tables, like the SPA's. Grafana's table has no striping option, but its\n// grid marks every row rdg-row-even or rdg-row-odd. This panel lives only on\n// the Dashboard tab, so the rule goes into the page while the panel is\n// mounted and comes out when the board is left. Grafana can mount the panel\n// on a new element (tab switch, view mode), so each render takes the rule\n// over for its own element and restarts the watcher, and a watcher removes\n// the rule only while its element still owns it.\nlet stripes = document.getElementById('liquidity-table-stripes');\nif (!stripes) {\n  stripes = document.createElement('style');\n  stripes.id = 'liquidity-table-stripes';\n  document.head.appendChild(stripes);\n}\nstripes.textContent = `.rdg-row-even { background: ${theme.isDark ? 'rgba(255, 255, 255, 0.03)' : 'rgba(0, 0, 0, 0.03)'}; }`;\nroot.__stripesOwner = root.__stripesOwner || Math.random().toString(36).slice(2);\nstripes.dataset.owner = root.__stripesOwner;\nclearInterval(root.__stripesWatch);\nroot.__stripesWatch = setInterval(() => {\n  if (root.isConnected) return;\n  clearInterval(root.__stripesWatch);\n  if (stripes.dataset.owner === root.__stripesOwner) stripes.remove();\n}, 2000);\n\nconst escapeHtml = (text) =>\n  String(text ?? '').replace(/[&<>\"']/g, (char) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '\"': '&quot;', \"'\": '&#39;' })[char]);\n\n// The id the tables asked for. Entries of any other id are a previous\n// query's data, still shown while the new one loads.\nconst wanted = context.grafana.replaceVariables('${detail}');\n\n// One entry per log line: its time and the exporter's payload. The plugin\n// ships the payload as the JSON body and again as flattened\n// `jsonPayload.<key>` labels; the labels are the fallback.\nconst entriesOf = (refId) => {\n  const frame = (context.panelData?.series || []).find((series) => series.refId === refId);\n  if (!frame) return [];\n  const column = (name) => frame.fields.find((field) => field.name === name);\n  const times = column('timestamp');\n  const bodies = column('body');\n  const labels = column('labels');\n  const count = times ? times.values.length : 0;\n  const entries = [];\n  for (let index = 0; index < count; index++) {\n    let payload = {};\n    try {\n      payload = JSON.parse(bodies.values[index]);\n    } catch (error) {\n      let flat = labels ? labels.values[index] : {};\n      if (typeof flat === 'string') {\n        try {\n          flat = JSON.parse(flat);\n        } catch (inner) {\n          flat = {};\n        }\n      }\n      for (const [key, value] of Object.entries(flat || {})) {\n        if (key.startsWith('jsonPayload.')) payload[key.slice('jsonPayload.'.length)] = value;\n      }\n    }\n    if (payload.id && String(payload.id) === wanted) entries.push({ time: Number(times.values[index]), ...payload });\n  }\n  return entries;\n};\n\n// The row at its latest status, with its status history oldest first.\n// Cloud Logging returns entries newest first, and two status entries can share\n// a timestamp (USDC Withdrawing and BridgingSubmitting both use initiated_at),\n// so the latest is the first entry in datasource order with the highest time,\n// not the last one after a stable sort.\nconst latest = (entries) => {\n  if (entries.length === 0) return null;\n  const newest = Math.max(...entries.map((entry) => entry.time));\n  const last = entries.find((entry) => entry.time === newest);\n  const history = [...entries].reverse().sort((left, right) => left.time - right.time);\n  return { ...last, first: history[0].time, history };\n};\n\n// The SPA's formatUtc: \"Oct 6, 12:24:39 UTC\".\nconst MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];\nconst utc = (value) => {\n  const date = new Date(value);\n  if (Number.isNaN(date.getTime())) return '\u2014';\n  const pad = (number) => String(number).padStart(2, '0');\n  return `${MONTHS[date.getUTCMonth()]} ${date.getUTCDate()}, ${pad(date.getUTCHours())}:${pad(date.getUTCMinutes())}:${pad(date.getUTCSeconds())} UTC`;\n};\n\n// The SPA's formatDecimal(value, 3): fixed decimals, comma groups, and the\n// raw value when it does not parse.\nconst decimal = (value) => {\n  const number = Number(value);\n  if (value === '' || value === null || value === undefined || Number.isNaN(number)) return escapeHtml(value || '\u2014');\n  return number.toLocaleString('en-US', { minimumFractionDigits: 3, maximumFractionDigits: 3 });\n};\n\nconst VENUES = {\n  raindex: ['Raindex', 'det-blue', true],\n  bebop: ['Bebop', 'det-purple', true],\n  uniswap_v4: ['Uniswap v4', 'det-pink', true],\n  unknown_onchain: ['Unknown Onchain', '', true],\n  alpaca: ['Alpaca', 'det-orange', false],\n  dry_run: ['DryRun', '', false],\n};\nconst venue = (key) => VENUES[key] || [key || '\u2014', '', false];\n\nconst TYPES = {\n  equity_mint: 'Mint',\n  equity_redemption: 'Redeem',\n  alpaca_to_base: 'Alpaca \u2192 Raindex',\n  base_to_alpaca: 'Raindex \u2192 Alpaca',\n};\nconst typeOf = (transfer) => (transfer.kind === 'usdc_bridge' ? transfer.direction : transfer.kind);\nconst typeLabel = (transfer) => TYPES[typeOf(transfer)] || transfer.kind || '\u2014';\nconst assetOf = (transfer) => (transfer.kind === 'usdc_bridge' || !transfer.symbol ? 'USDC' : transfer.symbol);\n\n// The SPA's statusStyle colours.\nconst statusClass = (status) => {\n  const lower = String(status || '').toLowerCase();\n  if (lower.includes('completed') || lower.includes('filled') || lower.includes('deposited') || lower.includes('confirmed')) return 'det-green';\n  if (lower.includes('reconciled')) return 'det-amber';\n  if (lower.includes('failed')) return 'det-red';\n  if (lower.includes('cancelled')) return 'det-orange';\n  return 'det-blue';\n};\nconst statusLabel = (status) => {\n  const text = String(status || '\u2014').replace(/_/g, ' ');\n  return text.charAt(0).toUpperCase() + text.slice(1);\n};\n\n// --------------------------------------------------------------------------\n// Recovery commands (recovery-commands.js, prepended): the operations client,\n// which signs in with Google and calls the running bot's ops API, so no SSH\n// is needed and every command needs the bot.\n// --------------------------------------------------------------------------\n\n// The environment the board shows: the client takes the selector's text.\nconst ENV = context.grafana.replaceVariables('${env:text}') === 'staging' ? 'staging' : 'production';\nconst CLIENT = `st0x-liquidity-client --env ${ENV}`;\n\nconst modeClass = (mode) => (mode === 'requires-bot' ? 'det-amber' : mode === 'live-rpc-only' ? 'det-sky' : 'det-red');\nconst commandBlock = (commands, note) =>\n  commands.length === 0 && !note\n    ? ''\n    : `<div class=\"det-cli\"><div class=\"det-cli-title\">CLI commands</div>${note ? `<p class=\"det-muted\">${escapeHtml(note)}</p>` : ''}${commands\n        .map(\n          (entry) => `\n        <div class=\"det-command\">\n          <pre>${escapeHtml(entry.command)}</pre>\n          <div>${escapeHtml(entry.description)}</div>\n          <span class=\"det-mode ${modeClass(entry.mode)}\">${escapeHtml(MODE_LABELS[entry.mode] || entry.mode)}</span>\n        </div>`\n        )\n        .join('')}</div>`;\n\n// --------------------------------------------------------------------------\n// The dialog\n// --------------------------------------------------------------------------\n\n// Block explorers by the bot's chain wire name. A chain without one, or an\n// unknown chain, shows the hash unlinked: a link to the wrong explorer would\n// read as \"this tx does not exist\".\nconst EXPLORERS = {\n  base: 'https://basescan.org',\n  ethereum: 'https://etherscan.io',\n  hyperevm: 'https://hyperevmscan.io',\n};\nconst shortHash = (hash) => `${escapeHtml(hash.slice(0, 10))}\u2026${escapeHtml(hash.slice(-8))}`;\nconst txLink = (hash, chain) =>\n  EXPLORERS[chain]\n    ? `<a href=\"${EXPLORERS[chain]}/tx/${escapeHtml(hash)}\" target=\"_blank\" rel=\"noopener noreferrer\">${shortHash(hash)} \u2197</a>`\n    : `<span class=\"det-mono\" title=\"${escapeHtml(hash)}\">${shortHash(hash)}</span>`;\n\n// The bot's event timeline, when the exporter ships it (log liquidity-events,\n// query C): each step with its time and fields, like the SPA's dialog.\n// Without it, the exporter's status log: one step per status change.\nconst events = entriesOf('C').sort((left, right) => (left.sequence ?? 0) - (right.sequence ?? 0));\nconst humanize = (step) => String(step || '').replace(/([a-z0-9])([A-Z])/g, '$1 $2');\nconst isTxHash = (value) => typeof value === 'string' && /^0x[0-9a-fA-F]{64}$/.test(value);\nconst eventValue = (key, value, chain) => {\n  if (key === 'error') return `<span class=\"det-red\">${escapeHtml(value)}</span>`;\n  if (isTxHash(value)) return txLink(value, chain);\n  if (value !== null && typeof value === 'object') return `<span class=\"det-muted\">${escapeHtml(JSON.stringify(value))}</span>`;\n  return escapeHtml(value);\n};\n// A payload's own `chain` names where its hashes live; else the row's chain\n// (a trade's), else none, which leaves the hashes unlinked.\nconst eventFields = (payload, rowChain) => {\n  const fields = payload && typeof payload === 'object' ? payload : {};\n  const chain = typeof fields.chain === 'string' ? fields.chain : rowChain;\n  return Object.entries(fields)\n    .filter(([key]) => !/(_at|At|timestamp)$/.test(key))\n    .map(([key, value]) => `<div class=\"det-field det-mono\"><span class=\"det-muted\">${escapeHtml(key.replace(/_/g, ' '))}</span><span class=\"det-break\">${eventValue(key, value, chain)}</span></div>`)\n    .join('');\n};\n\n// The board loads the newest 500 events of all rows, so an older row can have\n// only its later events here. Then the timeline starts after the row's first\n// status entry, and says so.\nconst timelineIncomplete = (history) =>\n  history.length > 0 && Math.min(...events.map((event) => event.time)) > history[0].time + 120000;\n\nconst timeline = (history, chain) =>\n  events.length > 0\n    ? `\n  <div class=\"det-section-title\">Event timeline</div>\n  ${timelineIncomplete(history) ? '<p class=\"det-muted\">Older events of this row are outside the newest 500 the board loads; the full timeline is in the SPA at liquidity.t0trade.com.</p>' : ''}\n  <div class=\"det-timeline\">${events\n    .map(\n      (event) => `\n    <div class=\"det-step\">\n      <span class=\"det-dot ${statusClass(event.step)}\"></span>\n      <div class=\"${statusClass(event.step)}\">${escapeHtml(humanize(event.step))}</div>\n      <div class=\"det-muted det-mono\">${utc(event.time)}</div>\n      ${eventFields(event.payload, chain)}\n    </div>`\n    )\n    .join('')}</div>`\n    : `\n  <div class=\"det-section-title\">Status history</div>\n  <div class=\"det-timeline\">${history\n    .map(\n      (entry) => `\n    <div class=\"det-step\">\n      <span class=\"det-dot ${statusClass(entry.status)}\"></span>\n      <div class=\"${statusClass(entry.status)}\">${escapeHtml(statusLabel(entry.status))}</div>\n      <div class=\"det-muted det-mono\">${utc(entry.time)}</div>\n      ${entry.error ? `<div class=\"det-red det-mono det-break\">${escapeHtml(entry.error)}</div>` : ''}\n    </div>`\n    )\n    .join('')}</div>\n  <p class=\"det-muted\">From the exporter's status log. The full event timeline is in the SPA at liquidity.t0trade.com.</p>`;\n\nconst field = (name, value) => `<div class=\"det-field\"><span class=\"det-muted\">${name}</span><span class=\"det-break\">${value}</span></div>`;\n\nconst tradeDialog = (trade) => {\n  const [venueName, venueClass, onchain] = venue(trade.venue);\n  const id = String(trade.id);\n  // An onchain trade id is `chain:tx_hash:log_index` (OnChainTradeId), or\n  // `tx_hash:log_index` from before the chain was part of it (Base).\n  const parts = id.split(':');\n  const [chain, hash, log] = parts.length === 3 ? parts : ['base', ...parts];\n  const idCell =\n    onchain && parts.length >= 2 && isTxHash(hash)\n      ? `${txLink(hash, chain)} <span class=\"det-muted\">(${escapeHtml(chain)}, log ${escapeHtml(log)})</span>`\n      : `<span class=\"det-muted\">${escapeHtml(id)}</span>`;\n  return `\n  <div class=\"det-dialog-head\">\n    <span class=\"det-title-line\">\n      <span class=\"${trade.direction === 'buy' ? 'det-green' : 'det-red'}\">${escapeHtml(trade.direction)}</span>\n      <span class=\"det-mono\">${escapeHtml(trade.symbol)}</span>\n      <span class=\"det-mono det-muted\">${decimal(trade.shares)} ${onchain ? 'wrapped shares' : 'shares'}</span>\n      <span class=\"${venueClass}\">${escapeHtml(venueName)}</span>\n    </span>\n    <button class=\"det-close\" data-close aria-label=\"Close\">&times;</button>\n  </div>\n  <div class=\"det-dialog-body\">\n    <div class=\"det-fields det-mono\">\n      ${field('ID', idCell)}\n      ${field('Occurred At', utc(trade.first))}\n      ${field('Status', `<span class=\"${statusClass(trade.status)}\">${escapeHtml(statusLabel(trade.status))}</span>${trade.error ? `<div class=\"det-red\">${escapeHtml(trade.error)}</div>` : ''}`)}\n    </div>\n    ${timeline(trade.history, onchain ? chain : null)}\n    ${commandBlock(tradeCommands(CLIENT, trade.symbol))}\n  </div>`;\n};\n\nconst transferDialog = (transfer) => {\n  const usdcFailed = transfer.kind === 'usdc_bridge' && String(transfer.status).toLowerCase() === 'failed';\n  return `\n  <div class=\"det-dialog-head\">\n    <span class=\"det-title-line\">\n      <span>${escapeHtml(typeLabel(transfer))}</span>\n      <span class=\"det-mono det-muted\">${escapeHtml(assetOf(transfer))}</span>\n      <span class=\"det-mono det-muted\">${decimal(transfer.amount)}</span>\n    </span>\n    <button class=\"det-close\" data-close aria-label=\"Close\">&times;</button>\n  </div>\n  <div class=\"det-dialog-body\">\n    <div class=\"det-fields det-mono\">\n      ${field('ID', `<span class=\"det-muted\">${escapeHtml(transfer.id)}</span>`)}\n      ${field('Started', utc(transfer.started_at || transfer.first))}\n      ${field('Updated', utc(transfer.time))}\n      ${field('Status', `<span class=\"${statusClass(transfer.status)}\">${escapeHtml(statusLabel(transfer.status))}</span>`)}\n    </div>\n    ${timeline(transfer.history, null)}\n    ${commandBlock(\n      transferCommands(CLIENT, transfer),\n      usdcFailed\n        ? 'Reconcile applies only when the funds left their source venue, which the logs do not show. Check the transfer in the SPA before you reconcile it.'\n        : ''\n    )}\n  </div>`;\n};\n\n// --------------------------------------------------------------------------\n// Open, refresh or close the one dialog\n// --------------------------------------------------------------------------\n\n// Kept on the element across renders: the plugin re-runs this code on every\n// refresh and query, into the same element.\nconst state = root.__det || (root.__det = { dismissed: null });\n\n// The variable can lag the close by a render (a refresh that was already\n// running), so an id the operator just closed is not reopened until the\n// variable has moved off it.\nif (state.dismissed !== null && state.dismissed !== wanted) state.dismissed = null;\n\nconst trade = latest(entriesOf('A'));\nconst transfer = trade ? null : latest(entriesOf('B'));\n// The dialog opens on the click, before the query returns, and says so when\n// the id has no entries in the panel's window.\nconst message = (text) => `\n  <div class=\"det-dialog-head\"><span class=\"det-title-line det-mono\">${escapeHtml(wanted)}</span><button class=\"det-close\" data-close>&times;</button></div>\n  <div class=\"det-dialog-body\"><p class=\"det-muted\">${text}</p></div>`;\nconst loading = context.panelData?.state === 'Loading';\nconst html = trade\n  ? tradeDialog(trade)\n  : transfer\n    ? transferDialog(transfer)\n    : wanted === ''\n      ? null\n      : loading\n        ? message('Loading\u2026')\n        : message('This id is not in the newest 500 status entries any more. Search the Logs tab for it.');\n\n// Reuse the dialog when it is still in the element, so a refresh with the\n// dialog open swaps its content without closing and reopening it.\nlet dialog = root.querySelector('dialog.det-dialog');\nif (!dialog) {\n  dialog = document.createElement('dialog');\n  dialog.className = 'det-dialog';\n  root.appendChild(dialog);\n}\n\n// Property handlers, not listeners: each render replaces them instead of\n// stacking another copy.\ndialog.onclose = () => {\n  state.dismissed = dialog.detId || null;\n  dialog.detId = '';\n  // An empty value, not null: removing the URL parameter leaves a textbox\n  // variable at its old value, so the same row could not be reopened.\n  if (context.grafana.replaceVariables('${detail}') !== '') {\n    context.grafana.locationService.partial({ 'var-detail': '' }, true);\n  }\n};\n// A click on the backdrop closes it, like the SPA.\ndialog.onclick = (event) => {\n  if (event.target === dialog) dialog.close();\n};\n\nif (html === null || state.dismissed === wanted) {\n  if (dialog.open) dialog.close();\n} else {\n  if (dialog.detHtml !== html) {\n    // A refresh that brings a new status keeps the operator's scroll.\n    const body = dialog.querySelector('.det-dialog-body');\n    const scroll = dialog.detId === wanted && body ? body.scrollTop : 0;\n    dialog.innerHTML = html;\n    dialog.detHtml = html;\n    const next = dialog.querySelector('.det-dialog-body');\n    if (next) next.scrollTop = scroll;\n  }\n  dialog.detId = wanted;\n  dialog.querySelector('[data-close]').onclick = () => dialog.close();\n  if (!dialog.open) dialog.showModal();\n}\n",
+        "styles": "/* Business Text \"styles\" for the Liquidity bot's trade and transfer detail\n   dialog. Theme colours come in as --det-* variables set by detail.js;\n   status, venue and side colours are the SPA's (Tailwind 500). */\n\n.det-mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }\n.det-muted { color: var(--det-muted); }\n.det-break { word-break: break-all; }\n\n.det-green { color: #22c55e; }\n.det-red { color: #ef4444; }\n.det-amber { color: #f59e0b; }\n.det-orange { color: #f97316; }\n.det-blue { color: #3b82f6; }\n.det-sky { color: #0ea5e9; }\n.det-purple { color: #a855f7; }\n.det-pink { color: #ec4899; }\n\n/* Tailwind 700 on the light theme, so status text keeps a 4.5:1 contrast\n   against the white dialog. */\n.det-light .det-green { color: #15803d; }\n.det-light .det-red { color: #b91c1c; }\n.det-light .det-amber { color: #b45309; }\n.det-light .det-orange { color: #c2410c; }\n.det-light .det-blue { color: #1d4ed8; }\n.det-light .det-sky { color: #0369a1; }\n.det-light .det-purple { color: #7e22ce; }\n.det-light .det-pink { color: #be185d; }\n\n.det-dialog {\n  width: min(36rem, 92vw);\n  padding: 0;\n  border: 1px solid var(--det-border);\n  border-radius: 8px;\n  background: var(--det-card);\n  color: var(--det-text);\n  font-size: 14px;\n  white-space: normal;\n}\n\n.det-dialog::backdrop { background: rgba(0, 0, 0, 0.5); }\n\n.det-dialog-head {\n  display: flex;\n  align-items: center;\n  justify-content: space-between;\n  padding: 12px 20px;\n  border-bottom: 1px solid var(--det-border);\n}\n\n.det-title-line {\n  display: flex;\n  flex-wrap: wrap;\n  align-items: center;\n  gap: 8px;\n  font-size: 16px;\n  font-weight: 600;\n}\n\n.det-title-line .det-mono { font-size: 14px; font-weight: 400; }\n\n.det-close {\n  border: 0;\n  background: transparent;\n  color: var(--det-muted);\n  font-size: 20px;\n  line-height: 1;\n  cursor: pointer;\n}\n\n.det-close:hover { color: var(--det-text); }\n\n.det-dialog-body {\n  max-height: 70vh;\n  overflow-y: auto;\n  padding: 16px 20px;\n  font-size: 14px;\n}\n\n.det-dialog-body a { color: #3b82f6; }\n.det-light .det-dialog-body a { color: #1d4ed8; }\n\n.det-fields { margin-bottom: 16px; }\n\n.det-field {\n  display: flex;\n  gap: 8px;\n  padding: 2px 0;\n}\n\n.det-field > .det-muted { flex-shrink: 0; }\n\n.det-section-title,\n.det-cli-title {\n  margin-bottom: 8px;\n  font-weight: 600;\n}\n\n.det-timeline {\n  margin-bottom: 8px;\n  padding-left: 16px;\n  border-left: 2px solid var(--det-border);\n}\n\n.det-step {\n  position: relative;\n  padding-bottom: 12px;\n}\n\n.det-dot {\n  position: absolute;\n  top: 6px;\n  left: -21px;\n  width: 8px;\n  height: 8px;\n  border-radius: 9999px;\n  background: currentColor;\n}\n\n.det-cli {\n  margin-top: 16px;\n  padding-top: 12px;\n  border-top: 1px solid var(--det-border);\n}\n\n.det-command {\n  margin-bottom: 8px;\n  padding: 8px 12px;\n  border: 1px solid var(--det-border);\n  border-radius: 6px;\n  background: var(--det-stripe);\n}\n\n.det-command pre {\n  margin: 0 0 6px;\n  padding: 6px 8px;\n  border-radius: 4px;\n  background: var(--det-card);\n  font-size: 12px;\n  white-space: pre-wrap;\n  word-break: break-all;\n}\n\n.det-mode {\n  display: inline-block;\n  margin-top: 4px;\n  font-size: 12px;\n}\n",
+        "wrap": false
       }
     }
   ]

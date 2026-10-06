@@ -1,15 +1,18 @@
 <script lang="ts">
-  import { getSimulateSourceId } from '$lib/env'
-  import { RECOVERY_GUIDE, recoveryModeColor, recoveryModeLabel } from '$lib/transfer'
+  import { getLiquidityClientEnv, getSimulateSourceId } from '$lib/env'
+  import { RECOVERY_GUIDE, forClientEnv, recoveryModeColor, recoveryModeLabel } from '$lib/transfer'
 
   let dialogEl: HTMLDialogElement | undefined = $state()
 
   const open = () => dialogEl?.showModal()
 
   // A simulation build runs the mock CLI against a /tmp harness config, so the
-  // guide's hardcoded `stox` commands are not runnable as written. Steer the
-  // operator to the per-object modal commands, which carry the right prefix.
+  // guide's operations client commands are not runnable there. Steer the
+  // operator to the per-object modal commands, which use the mock CLI.
   const isSimulation = getSimulateSourceId() !== null
+
+  // The guide is spelled for production; a staging deployment targets staging.
+  const clientEnv = getLiquidityClientEnv()
 </script>
 
 <button
@@ -43,16 +46,16 @@
         class="mb-4 rounded-md border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-xs text-amber-500"
       >
         <span class="font-semibold">Simulation build.</span> The
-        <span class="font-mono">stox</span> commands below are not runnable here -- this build drives
-        the mock CLI against a temporary harness config. Use the per-object recovery commands in each
-        transfer/trade modal instead; they carry the correct prefix.
+        <span class="font-mono">st0x-liquidity-client</span> commands below are not runnable here -- this
+        build drives the mock CLI against a temporary harness config. Use the per-object recovery commands
+        in each transfer/trade modal instead; they use the mock CLI.
       </div>
     {/if}
 
     <p class="mb-4 text-xs text-muted-foreground">
-      Every recovery command, grouped by object. The <span class="font-mono">stox</span> prefix is the
-      production wrapper (run on the server via Tailscale ssh). Each command notes whether it mutates
-      the local CQRS state directly or dispatches through the running bot.
+      Every recovery command, grouped by object. They use
+      <span class="font-mono">st0x-liquidity-client</span>, which signs in with your Google account and
+      calls the running bot's API, so no SSH is needed and the bot must be running.
     </p>
 
     <div class="space-y-5">
@@ -66,7 +69,7 @@
             {#each group.commands as entry (entry.command)}
               <div class="rounded-md border bg-muted/20 px-3 py-2">
                 <pre
-                  class="overflow-x-auto whitespace-pre-wrap break-all rounded bg-background/80 p-2 font-mono text-[11px] text-foreground">{entry.command}</pre>
+                  class="overflow-x-auto whitespace-pre-wrap break-all rounded bg-background/80 p-2 font-mono text-[11px] text-foreground">{forClientEnv(entry.command, clientEnv)}</pre>
 
                 <div class="mt-1.5 grid grid-cols-[auto_1fr] gap-x-3 gap-y-1 text-[11px]">
                   <span class="text-muted-foreground">What</span>

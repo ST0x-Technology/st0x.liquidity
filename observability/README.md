@@ -27,6 +27,40 @@ The Liquidity bot board and its four tab boards are generated: edit
 Do not edit those files by hand or replace them with a Grafana export; the next
 run of the generator overwrites them.
 
+The header row and the Dashboard tab's `detail` panel are Business Text panels
+(`marcusolsson-dynamictext-panel`): their JavaScript and CSS live in
+`liquidity-panels/`, and the generator inlines them into the board JSON. The
+plugin is installed on the box by `T0Trade/t0.devops` (`GF_INSTALL_PLUGINS`);
+the PR check's throwaway Grafana does not have it, so it loads these panels as
+"Panel plugin not found" and still passes. Everything else on the Dashboard tab
+is a Grafana table, for its column filters: USD at Alpaca, USD on each chain,
+Equities, Trades, and Rebalances. A row's ⓘ sets the hidden `detail` variable to
+the row's id; the `detail` panel, in the header row's last column, then opens
+that row's dialog. It reads the two tables' results through the Dashboard
+datasource (so Rebalances queries as refId B) and only queries the events log
+itself. Closing the dialog clears the variable.
+
+The recovery commands in the header's guide (`recovery-guide.json`) and in the
+dialog (`recovery-commands.js`) are copies of the SPA's
+(`dashboard/src/lib/transfer.ts`), in the operations client form for the
+environment the board shows. `dashboard/src/lib/transfer-board.test.ts` fails
+when a copy drifts, so change the SPA and the copies together.
+
+Per-chain rows (USD · Onchain) and columns (Equities) come from the exporter's
+`chain`-labelled metrics; without them the tables show the single Base row and
+column from the unlabelled metrics. The dialog shows the bot's event timeline
+from the `liquidity-events` log, else the status history.
+
+Keep the Dashboard tab's panel heights (`TRADES_H`, `TRANSFERS_H` and the
+`native_inventory` heights in the generator) unless you check a new set on a
+preview board: reload it at a few window heights and confirm both columns end
+level and every table shows its rows. The tab link opens the board with
+`autofitpanels`, which scales and rounds every height, keeps the result, and
+fits it again on the next render. Whenever one column rounds a row taller than
+the window, the next pass shrinks everything again and the other column loses a
+row per pass. Most height sets do that on some window size; the current ones do
+not, for windows of 18 to 45 rows.
+
 `alerting/liquidity.rules.yml` is the alert rules, in the `Alerts` folder. Each
 rule's `uid` is permanent and must be unique across every repo's file. Removing
 a rule from the file does not remove it from Grafana: add its `uid` to

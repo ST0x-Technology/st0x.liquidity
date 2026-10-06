@@ -15,6 +15,7 @@ import {
   recoveryModeLabel,
   recoveryModeColor,
   transferWarningText,
+  forClientEnv,
   RECOVERY_GUIDE
 } from './transfer'
 
@@ -274,8 +275,11 @@ describe('stuckReasonLabel', () => {
   })
 })
 
-const PROD = { simulateSourceId: null, backendPort: null }
-const SIM = { simulateSourceId: 'sim-1', backendPort: '8123' }
+const PROD = { simulateSourceId: null, backendPort: null, clientEnv: 'production' } as const
+const STAGING = { simulateSourceId: null, backendPort: null, clientEnv: 'staging' } as const
+const UNKNOWN_HOST = { simulateSourceId: null, backendPort: null, clientEnv: null } as const
+const SIM = { simulateSourceId: 'sim-1', backendPort: '8123', clientEnv: 'production' } as const
+const CLIENT = 'st0x-liquidity-client --env production'
 const SIM_PREFIX =
   'nix develop --command cargo run -p st0x-cli --features mock -- --config /tmp/st0x-simulate-failures-8123.config.toml --secrets /tmp/st0x-simulate-failures-8123.secrets.toml'
 
@@ -294,10 +298,10 @@ describe('transferRecoveryCommands', () => {
       status: 'wrapping'
     })
     expect(commands.map((entry) => entry.label)).toEqual(['Recheck', 'Resume (all equity)', 'Fail'])
-    expect(commandFor(commands, 'Recheck')).toBe('stox transfer recheck --kind mint --id ISS001')
-    expect(commandFor(commands, 'Resume (all equity)')).toBe('stox transfer resume --kind equity')
+    expect(commandFor(commands, 'Recheck')).toBe(`${CLIENT} debug recheck mint ISS001`)
+    expect(commandFor(commands, 'Resume (all equity)')).toBe(`${CLIENT} debug resume`)
     expect(commandFor(commands, 'Fail')).toBe(
-      'stox transfer fail --kind mint --id ISS001 -r "<reason>"'
+      `${CLIENT} debug fail-equity-transfer mint ISS001 --reason "<reason>"`
     )
   })
 
@@ -310,7 +314,7 @@ describe('transferRecoveryCommands', () => {
     })
     expect(commands.map((entry) => entry.label)).toEqual(['Recheck', 'Reconcile'])
     expect(commandFor(commands, 'Reconcile')).toBe(
-      'stox transfer reconcile --kind mint --id ISS001 -r "<reason>"'
+      `${CLIENT} debug reconcile-equity mint ISS001 --reason "<reason>"`
     )
   })
 
@@ -321,24 +325,80 @@ describe('transferRecoveryCommands', () => {
       id: 'RED001',
       status: 'sending'
     })
-    expect(commandFor(commands, 'Recheck')).toBe(
-      'stox transfer recheck --kind redemption --id RED001'
-    )
+    expect(commandFor(commands, 'Recheck')).toBe(`${CLIENT} debug recheck redemption RED001`)
     expect(commandFor(commands, 'Fail')).toBe(
-      'stox transfer fail --kind redemption --id RED001 -r "<reason>"'
+      `${CLIENT} debug fail-equity-transfer redemption RED001 --reason "<reason>"`
     )
   })
 
-  it('marks recheck as requires-bot and fail/reconcile as direct-db', () => {
-    const commands = transferRecoveryCommands({
-      deployment: PROD,
+  it('targets the deployment environment with the client', () => {
+    const transfer = transferRecoveryCommands({
+      deployment: STAGING,
+      kind: 'equity_mint',
+      id: 'ISS001',
+      status: 'wrapping'
+    })
+    const trade = tradeRecoveryCommands({ deployment: STAGING, symbol: 'MSTR' })
+    expect(commandFor(transfer, 'Recheck')).toBe(
+      'st0x-liquidity-client --env staging debug recheck mint ISS001'
+    )
+    expect(commandFor(trade, 'Rebuild view')).toBe(
+      'st0x-liquidity-client --env staging debug view rebuild position --id MSTR'
+    )
+  })
+
+  it('shows an environment placeholder when the host is unknown', () => {
+    const trade = tradeRecoveryCommands({ deployment: UNKNOWN_HOST, symbol: 'MSTR' })
+    expect(commandFor(trade, 'Rebuild view')).toBe(
+      'st0x-liquidity-client --env <production|staging> debug view rebuild position --id MSTR'
+    )
+  })
+
+  it('marks every production command requires-bot, since the client calls the bot', () => {
+    const commands = [
+      ...transferRecoveryCommands({
+        deployment: PROD,
+        kind: 'equity_mint',
+        id: 'ISS001',
+        status: 'wrapping'
+      }),
+      ...transferRecoveryCommands({
+        deployment: PROD,
+        kind: 'equity_mint',
+        id: 'ISS001',
+        status: 'failed'
+      }),
+      ...tradeRecoveryCommands({ deployment: PROD, symbol: 'MSTR' })
+    ]
+    expect(commands.every((entry) => entry.mode === 'requires-bot')).toBe(true)
+  })
+
+  it('marks the mock cli fail and usdc resume as requires-bot and reconcile as direct-db', () => {
+    // The stox CLI's equity `transfer fail` and `transfer resume --kind usdc`
+    // POST to the running bot, so stopping the bot first would break them.
+    const modeFor = (commands: { label: string; mode: string }[], label: string) =>
+      commands.find((entry) => entry.label === label)?.mode
+    const inFlight = transferRecoveryCommands({
+      deployment: SIM,
+      kind: 'equity_mint',
+      id: 'ISS001',
+      status: 'wrapping'
+    })
+    const failed = transferRecoveryCommands({
+      deployment: SIM,
       kind: 'equity_mint',
       id: 'ISS001',
       status: 'failed'
     })
-    const modeFor = (label: string) => commands.find((entry) => entry.label === label)?.mode
-    expect(modeFor('Recheck')).toBe('requires-bot')
-    expect(modeFor('Reconcile')).toBe('direct-db')
+    const bridging = transferRecoveryCommands({
+      deployment: SIM,
+      kind: 'usdc_bridge',
+      id: 'BRIDGE001',
+      status: 'bridging'
+    })
+    expect(modeFor(inFlight, 'Fail')).toBe('requires-bot')
+    expect(modeFor(failed, 'Reconcile')).toBe('direct-db')
+    expect(modeFor(bridging, 'Resume')).toBe('requires-bot')
   })
 
   it('shows only resume for a post-burn in-flight usdc bridge, placeholder direction when unknown', () => {
@@ -350,9 +410,9 @@ describe('transferRecoveryCommands', () => {
     })
     expect(commands.map((entry) => entry.label)).toEqual(['Resume'])
     expect(commandFor(commands, 'Resume')).toBe(
-      'stox transfer resume --kind usdc --id BRIDGE001 --direction <to-raindex|to-alpaca>'
+      `${CLIENT} debug resume-usdc <alpaca-to-base|base-to-alpaca> BRIDGE001`
     )
-    expect(commands.find((entry) => entry.label === 'Resume')?.mode).toBe('direct-db-live-rpc')
+    expect(commands.find((entry) => entry.label === 'Resume')?.mode).toBe('requires-bot')
   })
 
   it('offers resume for the depositing (post-burn) usdc bridge status', () => {
@@ -365,38 +425,54 @@ describe('transferRecoveryCommands', () => {
     expect(commands.map((entry) => entry.label)).toEqual(['Resume'])
   })
 
-  it('offers fail-usdc-transfer (not resume) for a pre-burn in-flight usdc bridge', () => {
-    // converting/withdrawing precede the CCTP burn: nothing has left the source
-    // venue, so the safe in-flight action is to terminalize, not resume.
-    for (const status of ['converting', 'withdrawing']) {
-      const commands = transferRecoveryCommands({
-        deployment: PROD,
-        kind: 'usdc_bridge',
-        id: 'BRIDGE001',
-        status,
-        direction: 'alpaca_to_base'
-      })
-      expect(commands.map((entry) => entry.label)).toEqual(['Fail (pre-burn)'])
-      expect(commandFor(commands, 'Fail (pre-burn)')).toBe(
-        'stox fail-usdc-transfer --id BRIDGE001 -r "<reason>"'
-      )
-      expect(commands.find((entry) => entry.label === 'Fail (pre-burn)')?.mode).toBe('direct-db')
-    }
+  it('offers only resume for a converting usdc bridge', () => {
+    // converting comes after the deposit, where the bot always refuses
+    // fail-usdc-transfer, so resume is the only command that can work.
+    const commands = transferRecoveryCommands({
+      deployment: PROD,
+      kind: 'usdc_bridge',
+      id: 'BRIDGE001',
+      status: 'converting',
+      direction: 'base_to_alpaca'
+    })
+    expect(commands.map((entry) => entry.label)).toEqual(['Resume'])
+    expect(commandFor(commands, 'Resume')).toBe(
+      `${CLIENT} debug resume-usdc base-to-alpaca BRIDGE001`
+    )
   })
 
-  it('translates the DTO direction to the CLI flag vocabulary on the usdc resume command', () => {
-    // The DTO names the venue flow (alpaca_to_base) while the CLI names the
-    // Raindex-relative leg (to-raindex); the command must carry the CLI value.
-    const toRaindex = transferRecoveryCommands({
+  it('offers resume and fail-usdc-transfer for a withdrawing usdc bridge', () => {
+    // withdrawing does not say whether the bridge is still before its burn,
+    // so fail comes with a check-first description, the offline path for a
+    // sent Base to Alpaca vault withdrawal, and no promise that no reconcile
+    // is needed.
+    const commands = transferRecoveryCommands({
+      deployment: PROD,
+      kind: 'usdc_bridge',
+      id: 'BRIDGE001',
+      status: 'withdrawing',
+      direction: 'alpaca_to_base'
+    })
+    expect(commands.map((entry) => entry.label)).toEqual(['Resume', 'Fail (pre-burn)'])
+    expect(commandFor(commands, 'Fail (pre-burn)')).toBe(
+      `${CLIENT} debug fail-usdc-transfer BRIDGE001 --reason "<reason>"`
+    )
+    const fail = commands.find((entry) => entry.label === 'Fail (pre-burn)')
+    expect(fail?.mode).toBe('requires-bot')
+    expect(fail?.description.startsWith('Check the transfer first')).toBe(true)
+    expect(fail?.description.includes('offline stox fail-usdc-transfer')).toBe(true)
+    expect(fail?.description.includes('no reconcile is needed')).toBe(false)
+  })
+
+  it('fills the bridge direction on the usdc resume command for the client', () => {
+    const toBase = transferRecoveryCommands({
       deployment: PROD,
       kind: 'usdc_bridge',
       id: 'BRIDGE001',
       status: 'bridging',
       direction: 'alpaca_to_base'
     })
-    expect(commandFor(toRaindex, 'Resume')).toBe(
-      'stox transfer resume --kind usdc --id BRIDGE001 --direction to-raindex'
-    )
+    expect(commandFor(toBase, 'Resume')).toBe(`${CLIENT} debug resume-usdc alpaca-to-base BRIDGE001`)
 
     const toAlpaca = transferRecoveryCommands({
       deployment: PROD,
@@ -406,7 +482,33 @@ describe('transferRecoveryCommands', () => {
       direction: 'base_to_alpaca'
     })
     expect(commandFor(toAlpaca, 'Resume')).toBe(
-      'stox transfer resume --kind usdc --id BRIDGE002 --direction to-alpaca'
+      `${CLIENT} debug resume-usdc base-to-alpaca BRIDGE002`
+    )
+  })
+
+  it('translates the DTO direction to the mock CLI flag vocabulary on the usdc resume command', () => {
+    // The DTO names the venue flow (alpaca_to_base) while the mock CLI names the
+    // Raindex-relative leg (to-raindex); the command must carry the CLI value.
+    const toRaindex = transferRecoveryCommands({
+      deployment: SIM,
+      kind: 'usdc_bridge',
+      id: 'BRIDGE001',
+      status: 'bridging',
+      direction: 'alpaca_to_base'
+    })
+    expect(commandFor(toRaindex, 'Resume')).toBe(
+      `${SIM_PREFIX} transfer resume --kind usdc --id BRIDGE001 --direction to-raindex`
+    )
+
+    const toAlpaca = transferRecoveryCommands({
+      deployment: SIM,
+      kind: 'usdc_bridge',
+      id: 'BRIDGE002',
+      status: 'bridging',
+      direction: 'base_to_alpaca'
+    })
+    expect(commandFor(toAlpaca, 'Resume')).toBe(
+      `${SIM_PREFIX} transfer resume --kind usdc --id BRIDGE002 --direction to-alpaca`
     )
   })
 
@@ -425,9 +527,9 @@ describe('transferRecoveryCommands', () => {
       })
       expect(commands.map((entry) => entry.label)).toEqual(['Reconcile'])
       expect(commandFor(commands, 'Reconcile')).toBe(
-        'stox transfer reconcile --kind usdc --id BRIDGE001 -r "<reason>"'
+        `${CLIENT} debug reconcile-usdc BRIDGE001 --reason <funds-moved-manually|deposit-credited-offline>`
       )
-      expect(commands.find((entry) => entry.label === 'Reconcile')?.mode).toBe('direct-db')
+      expect(commands.find((entry) => entry.label === 'Reconcile')?.mode).toBe('requires-bot')
     }
   })
 
@@ -469,7 +571,7 @@ describe('transferRecoveryCommands', () => {
     })
     expect(commands.map((entry) => entry.label)).toEqual(['Recheck', 'Reconcile'])
     expect(commandFor(commands, 'Reconcile')).toBe(
-      'stox transfer reconcile --kind mint --id ISS001 -r "<reason>"'
+      `${CLIENT} debug reconcile-equity mint ISS001 --reason "<reason>"`
     )
   })
 
@@ -536,7 +638,7 @@ describe('transferRecoveryCommands', () => {
   it('returns no commands in a simulation build with an unknown backend port', () => {
     expect(
       transferRecoveryCommands({
-        deployment: { simulateSourceId: 'sim-1', backendPort: null },
+        deployment: { simulateSourceId: 'sim-1', backendPort: null, clientEnv: 'production' },
         kind: 'equity_mint',
         id: 'ISS001',
         status: 'wrapping'
@@ -562,9 +664,12 @@ describe('tradeRecoveryCommands', () => {
     ])
     expect(commands.every((entry) => !entry.command.includes('process-tx'))).toBe(true)
     expect(commandFor(commands, 'Release hedge')).toBe(
-      'stox position release-hedge -s MSTR -o <order-id> -r "<reason>"'
+      `${CLIENT} debug position release-hedge MSTR --order-id <order-id> --reason "<reason>"`
     )
-    expect(commandFor(commands, 'Rebuild view')).toBe('stox view rebuild -a position --id MSTR')
+    expect(commandFor(commands, 'Set position')).toBe(
+      `${CLIENT} debug position set MSTR --target-net <N> [--price-usdc <USDC_PER_SHARE>] --reason "<reason>"`
+    )
+    expect(commandFor(commands, 'Rebuild view')).toBe(`${CLIENT} debug view rebuild position --id MSTR`)
   })
 
   it('uses the mock cli prefix in a simulation build', () => {
@@ -579,10 +684,21 @@ describe('tradeRecoveryCommands', () => {
 
   it('returns no commands for a trade in a simulation build with an unknown backend port', () => {
     const commands = tradeRecoveryCommands({
-      deployment: { simulateSourceId: 'sim-1', backendPort: null },
+      deployment: { simulateSourceId: 'sim-1', backendPort: null, clientEnv: 'production' },
       symbol: 'MSTR'
     })
     expect(commands).toEqual([])
+  })
+})
+
+describe('forClientEnv', () => {
+  it('retargets a guide command at staging and leaves production as is', () => {
+    const command = `${CLIENT} debug resume`
+    expect(forClientEnv(command, 'staging')).toBe('st0x-liquidity-client --env staging debug resume')
+    expect(forClientEnv(command, 'production')).toBe(command)
+    expect(forClientEnv(command, null)).toBe(
+      'st0x-liquidity-client --env <production|staging> debug resume'
+    )
   })
 })
 
@@ -597,39 +713,20 @@ describe('RECOVERY_GUIDE', () => {
     ])
 
     const allCommands = RECOVERY_GUIDE.flatMap((group) => group.commands)
-    expect(allCommands.some((entry) => entry.command.startsWith('stox transfer recheck'))).toBe(
-      true
-    )
-    expect(allCommands.some((entry) => entry.command.startsWith('stox cctp complete-mint'))).toBe(
-      true
-    )
-    expect(allCommands.some((entry) => entry.command.startsWith('stox fail-usdc-transfer'))).toBe(
-      true
-    )
+    const has = (prefix: string) =>
+      allCommands.some((entry) => entry.command.startsWith(`${CLIENT} ${prefix}`))
+    expect(has('debug recheck')).toBe(true)
+    expect(has('debug cctp complete-mint')).toBe(true)
+    expect(has('debug fail-usdc-transfer')).toBe(true)
+    expect(has('debug reconcile-usdc')).toBe(true)
+    expect(has('debug reconcile-equity')).toBe(true)
     expect(allCommands.every((entry) => !entry.command.includes('recheck-transfer'))).toBe(true)
   })
 
-  it('labels each guide command with the SPEC execution mode', () => {
-    const modeOf = (prefix: string): string | undefined =>
-      RECOVERY_GUIDE.flatMap((group) => group.commands).find((entry) =>
-        entry.command.startsWith(prefix)
-      )?.mode
-
-    // requires-bot: only recheck and equity resume dispatch through the bot.
-    expect(modeOf('stox transfer recheck')).toBe('requires-bot')
-    expect(modeOf('stox transfer resume --kind equity')).toBe('requires-bot')
-    // live-rpc-only: cctp touches no DB state.
-    expect(modeOf('stox cctp complete-mint')).toBe('live-rpc-only')
-    // direct-db-live-rpc: usdc resume and process-tx drive on-chain from the CLI.
-    expect(modeOf('stox transfer resume --kind usdc')).toBe('direct-db-live-rpc')
-    expect(modeOf('stox process-tx')).toBe('direct-db-live-rpc')
-    // direct-db: pure local CQRS mutations.
-    expect(modeOf('stox transfer fail')).toBe('direct-db')
-    expect(modeOf('stox fail-usdc-transfer')).toBe('direct-db')
-    expect(modeOf('stox transfer reconcile')).toBe('direct-db')
-    expect(modeOf('stox position release-hedge')).toBe('direct-db')
-    expect(modeOf('stox position set')).toBe('direct-db')
-    expect(modeOf('stox view rebuild')).toBe('direct-db')
+  it('uses the operations client for every guide command, so each requires the bot', () => {
+    const allCommands = RECOVERY_GUIDE.flatMap((group) => group.commands)
+    expect(allCommands.every((entry) => entry.command.startsWith(`${CLIENT} `))).toBe(true)
+    expect(allCommands.every((entry) => entry.mode === 'requires-bot')).toBe(true)
   })
 })
 

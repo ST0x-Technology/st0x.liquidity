@@ -227,7 +227,9 @@ const equityTransferKind = (kind: TransferCategory): 'mint' | 'redemption' | nul
 }
 
 /// Execution mode for a recovery command, mirroring SPEC's four execution-mode
-/// contracts in the Operator Recovery Surface section:
+/// contracts in the Operator Recovery Surface section. Every production command
+/// goes through the operations client, so it is `requires-bot`; the other modes
+/// are the mock CLI's, which simulation builds run directly:
 ///   - `direct-db`: mutates local CQRS state directly; the bot must not be
 ///     concurrently driving the same id.
 ///   - `direct-db-live-rpc`: same direct-DB caveat, and also drives an on-chain
@@ -250,30 +252,68 @@ export type RecoveryCommand = {
   mode: RecoveryMode
 }
 
-/// Deployment context that determines the CLI invocation prefix.
+/// Deployment context that determines which CLI the recovery commands use.
 ///
 /// Simulation builds set `simulateSourceId` (`PUBLIC_SIMULATE_SOURCE_ID`, set
 /// solely by the `simulate-failures` flake apps) and run the mock CLI against
 /// the harness's `/tmp` config, so they also need `backendPort`. Live
-/// deployments invoke the `stox` wrapper, which auto-loads prod config/secrets,
-/// so the production command needs no config paths or port.
+/// deployments use the operations client, which needs no config paths or port,
+/// only the environment the deployment is (`clientEnv`).
 export type DeploymentContext = {
   simulateSourceId: string | null
   backendPort: string | null
+  clientEnv: 'production' | 'staging' | null
 }
 
-/// Builds the CLI invocation prefix for the current deployment, or null when a
-/// simulation build is missing the backend port it needs to locate its config.
-///
-/// Production -> the bare `stox` wrapper. Simulation -> the mock `cli` binary
-/// pointed at the harness's `/tmp/st0x-simulate-failures-<port>` config/secrets.
-const commandPrefix = (deployment: DeploymentContext): string | null => {
-  if (deployment.simulateSourceId === null) return 'stox'
+/// The production recovery CLI: the T0 operations client
+/// (`crates/liquidity-client`). It signs in with the operator's Google account
+/// and calls the running bot's IAP-fronted ops API, so it needs no SSH and no
+/// on-box config, and every command needs the bot running.
+export const LIQUIDITY_CLIENT = 'st0x-liquidity-client --env production'
+
+/// A client command retargeted at `clientEnv`. The static guide is spelled for
+/// production; a staging deployment shows it with `--env staging`, and an
+/// unknown one with a placeholder the operator must fill in.
+export const forClientEnv = (
+  command: string,
+  clientEnv: 'production' | 'staging' | null
+): string => command.replace('--env production', `--env ${clientEnv ?? '<production|staging>'}`)
+
+/// The CLI a deployment's recovery commands run with. `client` is the
+/// operations client; `mock` is the `st0x-cli` mock binary pointed at the
+/// harness's `/tmp/st0x-simulate-failures-<port>` config/secrets, since the
+/// harness has no IAP frontend for the client to reach. The two take
+/// different syntax, so each command is spelled for both.
+type RecoveryCli = { kind: 'client'; prefix: string } | { kind: 'mock'; prefix: string }
+
+/// The deployment's recovery CLI, or null when a simulation build is missing
+/// the backend port it needs to locate its config.
+const recoveryCli = (deployment: DeploymentContext): RecoveryCli | null => {
+  if (deployment.simulateSourceId === null)
+    return { kind: 'client', prefix: forClientEnv(LIQUIDITY_CLIENT, deployment.clientEnv) }
 
   if (deployment.backendPort === null) return null
 
   const basePath = `/tmp/st0x-simulate-failures-${deployment.backendPort}`
-  return `nix develop --command cargo run -p st0x-cli --features mock -- --config ${basePath}.config.toml --secrets ${basePath}.secrets.toml`
+  return {
+    kind: 'mock',
+    prefix: `nix develop --command cargo run -p st0x-cli --features mock -- --config ${basePath}.config.toml --secrets ${basePath}.secrets.toml`
+  }
+}
+
+/// One recovery action spelled for both CLIs: the client's arguments, and the
+/// mock CLI's arguments with the mode they run in.
+const spell = (
+  cli: RecoveryCli,
+  client: string,
+  mock: { args: string; mode: RecoveryMode }
+): { command: string; mode: RecoveryMode } => {
+  switch (cli.kind) {
+    case 'client':
+      return { command: `${cli.prefix} ${client}`, mode: 'requires-bot' }
+    case 'mock':
+      return { command: `${cli.prefix} ${mock.args}`, mode: mock.mode }
+  }
 }
 
 /// Whether a transfer status string (snake_case DTO status) is the terminal
@@ -313,15 +353,15 @@ export const transferRecoveryCommands = (params: {
   direction?: UsdcBridgeDirection | null
   postBurn?: boolean | null
 }): RecoveryCommand[] => {
-  const prefix = commandPrefix(params.deployment)
-  if (prefix === null) return []
+  const cli = recoveryCli(params.deployment)
+  if (cli === null) return []
 
   if (params.status.toLowerCase() === 'completed' || params.status.toLowerCase() === 'reconciled')
     return []
 
   if (params.kind === 'usdc_bridge') {
     return usdcBridgeRecoveryCommands(
-      prefix,
+      cli,
       params.id,
       params.status,
       params.direction ?? null,
@@ -332,61 +372,66 @@ export const transferRecoveryCommands = (params: {
   const equityKind = equityTransferKind(params.kind)
   if (equityKind === null) return []
 
-  return equityRecoveryCommands(prefix, equityKind, params.id, params.status)
+  return equityRecoveryCommands(cli, equityKind, params.id, params.status)
 }
 
 /// Recovery commands for an equity mint or redemption. `recheck` is always
 /// applicable while non-completed (the provider may settle it at any point);
 /// `resume` and `fail` apply only while in-flight; `reconcile` only once failed.
 const equityRecoveryCommands = (
-  prefix: string,
+  cli: RecoveryCli,
   kind: 'mint' | 'redemption',
   id: string,
   status: string
 ): RecoveryCommand[] => {
   const commands: RecoveryCommand[] = [
     {
-      command: `${prefix} transfer recheck --kind ${kind} --id ${id}`,
+      ...spell(cli, `debug recheck ${kind} ${id}`, {
+        args: `transfer recheck --kind ${kind} --id ${id}`,
+        mode: 'requires-bot'
+      }),
       label: 'Recheck',
       description:
-        'Ask the running bot to re-poll the provider and complete the transfer if it settled.',
-      mode: 'requires-bot'
+        'Ask the running bot to re-poll the provider and complete the transfer if it settled.'
     }
   ]
 
   if (!isTerminalStatus(status)) {
     commands.push({
-      command: `${prefix} transfer resume --kind equity`,
+      ...spell(cli, 'debug resume', { args: 'transfer resume --kind equity', mode: 'requires-bot' }),
       label: 'Resume (all equity)',
       description:
         'Re-drive ALL interrupted mints and redemptions via the bot (no id; best-effort per ' +
-        'transfer, each succeeds or fails independently and failures are reported as counts).',
-      mode: 'requires-bot'
+        'transfer, each succeeds or fails independently and failures are reported as counts).'
     })
 
     commands.push({
-      command: `${prefix} transfer fail --kind ${kind} --id ${id} -r "<reason>"`,
+      ...spell(cli, `debug fail-equity-transfer ${kind} ${id} --reason "<reason>"`, {
+        args: `transfer fail --kind ${kind} --id ${id} -r "<reason>"`,
+        mode: 'requires-bot'
+      }),
       label: 'Fail',
       description:
-        'Force this stuck transfer into the terminal Failed state. Use when it is permanently stuck.',
-      mode: 'direct-db'
+        'Force this stuck transfer into the terminal Failed state. Use when it is permanently stuck.'
     })
   }
 
   if (isFailedStatus(status)) {
     commands.push({
-      command: `${prefix} transfer reconcile --kind ${kind} --id ${id} -r "<reason>"`,
+      ...spell(cli, `debug reconcile-equity ${kind} ${id} --reason "<reason>"`, {
+        args: `transfer reconcile --kind ${kind} --id ${id} -r "<reason>"`,
+        mode: 'direct-db'
+      }),
       label: 'Reconcile',
       description:
-        'Mark a Failed transfer as Reconciled once its residue was handled out-of-band (bookkeeping).',
-      mode: 'direct-db'
+        'Mark a Failed transfer as Reconciled once its residue was handled out-of-band (bookkeeping).'
     })
   }
 
   return commands
 }
 
-/// Maps a `UsdcBridgeDirection` DTO value to the CLI's `--direction` flag
+/// Maps a `UsdcBridgeDirection` DTO value to the mock CLI's `--direction` flag
 /// vocabulary. The two namespaces deliberately differ: the DTO names the
 /// venue-to-venue flow (`alpaca_to_base` / `base_to_alpaca`) while the CLI names
 /// the Raindex-relative leg (`to-raindex` / `to-alpaca`), so this is a real
@@ -398,6 +443,19 @@ const usdcDirectionToCliFlag = (direction: UsdcBridgeDirection | null): string |
       return 'to-raindex'
     case 'base_to_alpaca':
       return 'to-alpaca'
+    case null:
+      return null
+  }
+}
+
+/// Maps a `UsdcBridgeDirection` DTO value to the operations client's direction
+/// argument, which names the venue-to-venue flow like the DTO.
+const usdcDirectionToClientArg = (direction: UsdcBridgeDirection | null): string | null => {
+  switch (direction) {
+    case 'alpaca_to_base':
+      return 'alpaca-to-base'
+    case 'base_to_alpaca':
+      return 'base-to-alpaca'
     case null:
       return null
   }
@@ -416,12 +474,15 @@ const usdcDirectionToCliFlag = (direction: UsdcBridgeDirection | null): string |
 ///     compatibility); when it is not `true` we surface nothing rather than
 ///     a false affordance the CLI would reject.
 ///   - completed (terminal): none.
-///   - in-flight pre-burn (`converting`/`withdrawing`): `fail-usdc-transfer` --
-///     nothing has burned, so the safe action is to terminalize, not resume.
-///   - in-flight post-burn (`bridging`/`depositing`): `resume` -- the burn went
-///     through, so the bridge is re-drivable against a live RPC provider.
+///   - any in-flight status: `resume`, which hands the bridge back to the
+///     bot's transfer worker whatever stage it stopped at.
+///   - in-flight `withdrawing` also: `fail-usdc-transfer`. The bot accepts it
+///     only before the burn (an Alpaca to Base withdrawal that completed, or
+///     a Base to Alpaca vault withdrawal not yet sent), and `withdrawing` does
+///     not say which, so the description sends the operator to check first.
+///     `converting` comes after the deposit, where the bot always refuses it.
 const usdcBridgeRecoveryCommands = (
-  prefix: string,
+  cli: RecoveryCli,
   id: string,
   status: string,
   direction: UsdcBridgeDirection | null,
@@ -432,47 +493,52 @@ const usdcBridgeRecoveryCommands = (
 
     return [
       {
-        command: `${prefix} transfer reconcile --kind usdc --id ${id} -r "<reason>"`,
+        ...spell(
+          cli,
+          `debug reconcile-usdc ${id} --reason <funds-moved-manually|deposit-credited-offline>`,
+          { args: `transfer reconcile --kind usdc --id ${id} -r "<reason>"`, mode: 'direct-db' }
+        ),
         label: 'Reconcile',
         description:
           'Mark this failed USDC bridge as Reconciled once its off-venue funds were ' +
-          'settled out-of-band (bookkeeping). Verify where the funds sit first.',
-        mode: 'direct-db'
+          'settled out-of-band (bookkeeping). Verify where the funds sit first.'
       }
     ]
   }
 
   if (isTerminalStatus(status)) return []
 
-  const lower = status.toLowerCase()
-
-  if (lower === 'converting' || lower === 'withdrawing') {
-    return [
-      {
-        command: `${prefix} fail-usdc-transfer --id ${id} -r "<reason>"`,
-        label: 'Fail (pre-burn)',
-        description:
-          'Force a pre-burn stuck USDC bridge into the terminal Failed state. Nothing left the ' +
-          'source venue, so no reconcile is needed afterwards. Verify on-chain that no CCTP burn ' +
-          'was broadcast before running.',
-        mode: 'direct-db'
-      }
-    ]
+  // Both CLIs require the direction and reject a mismatch against the
+  // persisted value, so fill the bridge's known direction (in each CLI's
+  // vocabulary) when we have it rather than leaving a placeholder.
+  const clientDirection = usdcDirectionToClientArg(direction) ?? '<alpaca-to-base|base-to-alpaca>'
+  const mockDirection = usdcDirectionToCliFlag(direction) ?? '<to-raindex|to-alpaca>'
+  const resume: RecoveryCommand = {
+    ...spell(cli, `debug resume-usdc ${clientDirection} ${id}`, {
+      args: `transfer resume --kind usdc --id ${id} --direction ${mockDirection}`,
+      mode: 'requires-bot'
+    }),
+    label: 'Resume',
+    description: "Re-drive this USDC bridge on the bot's transfer worker from the stage it stopped at."
   }
 
-  // Post-burn in-flight (`bridging`/`depositing`): the CLI requires --direction
-  // and rejects a mismatch against the persisted value, so fill the bridge's
-  // known direction (translated into the CLI's flag vocabulary) when we have it
-  // rather than leaving a placeholder.
-  const directionArg = usdcDirectionToCliFlag(direction) ?? '<to-raindex|to-alpaca>'
+  if (status.toLowerCase() !== 'withdrawing') return [resume]
+
   return [
+    resume,
     {
-      command: `${prefix} transfer resume --kind usdc --id ${id} --direction ${directionArg}`,
-      label: 'Resume',
+      ...spell(cli, `debug fail-usdc-transfer ${id} --reason "<reason>"`, {
+        args: `fail-usdc-transfer --id ${id} -r "<reason>"`,
+        mode: 'direct-db'
+      }),
+      label: 'Fail (pre-burn)',
       description:
-        'Re-drive this USDC bridge whose CLI invocation was interrupted after the burn. Drives ' +
-        'the on-chain flow against a live RPC provider.',
-      mode: 'direct-db-live-rpc'
+        'Check the transfer first: the bot accepts this only before the burn, for an Alpaca ' +
+        'to Base bridge whose withdrawal completed or a Base to Alpaca bridge whose vault ' +
+        'withdrawal was not sent. Verify on-chain that no CCTP burn landed. After a Base to ' +
+        'Alpaca vault withdrawal, stop the bot, run the offline stox fail-usdc-transfer and ' +
+        'move the wallet USDC back by hand. If the Alpaca withdrawal completed, the guard ' +
+        'stays held until you reconcile.'
     }
   ]
 }
@@ -493,35 +559,50 @@ export const tradeRecoveryCommands = (params: {
   deployment: DeploymentContext
   symbol: string
 }): RecoveryCommand[] => {
-  const prefix = commandPrefix(params.deployment)
-  if (prefix === null) return []
+  const cli = recoveryCli(params.deployment)
+  if (cli === null) return []
 
   const { symbol } = params
 
   const commands: RecoveryCommand[] = []
 
   commands.push({
-    command: `${prefix} position release-hedge -s ${symbol} -o <order-id> -r "<reason>"`,
+    ...spell(
+      cli,
+      `debug position release-hedge ${symbol} --order-id <order-id> --reason "<reason>"`,
+      {
+        args: `position release-hedge -s ${symbol} -o <order-id> -r "<reason>"`,
+        mode: 'direct-db'
+      }
+    ),
     label: 'Release hedge',
     description:
-      "Clear a position's stuck pending offchain order so normal hedging can retry. Needs the order id.",
-    mode: 'direct-db'
+      "Clear a position's stuck pending offchain order so normal hedging can retry. Needs the order id."
   })
 
   commands.push({
-    command: `${prefix} position set -s ${symbol} (--zero | --long <N> | --short <N>) [--price <USDC_PER_SHARE>] -r "<reason>"`,
+    ...spell(
+      cli,
+      `debug position set ${symbol} --target-net <N> [--price-usdc <USDC_PER_SHARE>] --reason "<reason>"`,
+      {
+        args: `position set -s ${symbol} (--zero | --long <N> | --short <N>) [--price <USDC_PER_SHARE>] -r "<reason>"`,
+        mode: 'direct-db'
+      }
+    ),
     label: 'Set position',
     description:
-      'Override the net exposure after a manual correction. Pick exactly one target. ' +
-      '--price is required for a nonzero target unless the position already has a last price.',
-    mode: 'direct-db'
+      'Override the net exposure after a manual correction. The target is signed: negative ' +
+      'is short, 0 is flat. The price is required for a nonzero target unless the position ' +
+      'already has a last price.'
   })
 
   commands.push({
-    command: `${prefix} view rebuild -a position --id ${symbol}`,
+    ...spell(cli, `debug view rebuild position --id ${symbol}`, {
+      args: `view rebuild -a position --id ${symbol}`,
+      mode: 'direct-db'
+    }),
     label: 'Rebuild view',
-    description: 'Stop the bot, then replay all events to reconstruct a corrupted position view.',
-    mode: 'direct-db'
+    description: 'Replay all events to reconstruct a corrupted position view.'
   })
 
   return commands
@@ -547,21 +628,21 @@ export type GuideGroup = {
 /// The static CLI recovery guide: every recovery command grouped by object,
 /// mirroring the verb glossary in `docs/domain.md`. Commands are shown with
 /// `<...>` placeholders since the guide is a general reference, not bound to a
-/// specific object. The `stox ` prefix shown is the production wrapper; in a
-/// simulation build the modals render the mock-cli prefix instead.
+/// specific object. They are the production operations client's; a simulation
+/// build runs the mock CLI, whose per-object commands the modals render.
 export const RECOVERY_GUIDE: GuideGroup[] = [
   {
     object: 'transfer',
     commands: [
       {
-        command: 'stox transfer recheck --kind <mint|redemption> --id <id>',
+        command: `${LIQUIDITY_CLIENT} debug recheck <mint|redemption|usdc> <id>`,
         description: 'Re-poll the provider and complete the transfer if it has settled.',
-        whenToUse: 'A mint/redemption is stuck or failed but the provider may have settled it.',
-        appliesTo: 'Equity mint / redemption (any non-completed state)',
+        whenToUse: 'A transfer is stuck or failed but the provider may have settled it.',
+        appliesTo: 'Equity mint / redemption (any non-completed state), failed USDC deposit',
         mode: 'requires-bot'
       },
       {
-        command: 'stox transfer resume --kind equity',
+        command: `${LIQUIDITY_CLIENT} debug resume`,
         description:
           'Re-drive ALL interrupted mints and redemptions (no id; best-effort per transfer, ' +
           'failures reported as counts).',
@@ -570,41 +651,54 @@ export const RECOVERY_GUIDE: GuideGroup[] = [
         mode: 'requires-bot'
       },
       {
-        command: 'stox transfer resume --kind usdc --id <id> --direction <to-raindex|to-alpaca>',
-        description:
-          'Re-drive a single USDC bridge interrupted after its burn (against a live RPC provider).',
-        whenToUse: 'A USDC bridge CLI invocation was interrupted after the burn went through.',
+        command: `${LIQUIDITY_CLIENT} debug resume-usdc <alpaca-to-base|base-to-alpaca> <id>`,
+        description: "Re-drive a single USDC bridge on the bot's transfer worker.",
+        whenToUse: 'A USDC bridge stopped mid-flight, before or after the burn.',
         appliesTo: 'USDC bridge (in-flight)',
-        mode: 'direct-db-live-rpc'
+        mode: 'requires-bot'
       },
       {
-        command: 'stox transfer fail --kind <mint|redemption> --id <id> -r "<reason>"',
+        command: `${LIQUIDITY_CLIENT} debug fail-equity-transfer <mint|redemption> <id> --reason "<reason>"`,
         description: 'Force a stuck transfer into the terminal Failed state.',
         whenToUse: 'A mint/redemption is permanently stuck and unrecoverable.',
         appliesTo: 'Equity mint / redemption (non-terminal)',
-        mode: 'direct-db'
+        mode: 'requires-bot'
       },
       {
-        command: 'stox fail-usdc-transfer --id <id> -r "<reason>"',
+        command: `${LIQUIDITY_CLIENT} debug fail-usdc-transfer <id> --reason "<reason>"`,
         description:
-          'Force a pre-burn stuck USDC bridge into the terminal Failed state (no reconcile ' +
-          'needed; nothing left the source venue).',
+          'Force a USDC bridge stuck before its burn into Failed. The bot accepts it for an ' +
+          'Alpaca to Base bridge whose withdrawal completed, or a Base to Alpaca bridge whose ' +
+          'vault withdrawal was not sent. If the Alpaca withdrawal completed, the guard stays ' +
+          'held until reconcile-usdc settles the funds. After a Base to Alpaca vault ' +
+          'withdrawal, the bot refuses it: stop the bot, run the offline stox ' +
+          'fail-usdc-transfer, and move the wallet USDC back by hand.',
         whenToUse:
-          'A USDC bridge is stuck before its CCTP burn and must be terminalized. Verify on-chain ' +
-          'that no burn was broadcast first.',
+          'A USDC bridge is stuck before its CCTP burn and must be terminalized. Check the ' +
+          'transfer and verify on-chain that no burn landed first.',
         appliesTo: 'USDC bridge (pre-burn stuck)',
-        mode: 'direct-db'
+        mode: 'requires-bot'
       },
       {
-        command: 'stox transfer reconcile --kind <usdc|mint|redemption> --id <id> -r "<reason>"',
+        command: `${LIQUIDITY_CLIENT} debug reconcile-equity <mint|redemption> <id> --reason "<reason>"`,
         description:
-          'Mark a terminally-failed transfer Reconciled after handling residue manually.',
+          'Mark a terminally-failed equity transfer Reconciled after handling residue manually.',
         whenToUse:
-          'A transfer is in a terminal failure and its residue was settled out-of-band (bookkeeping).',
+          'An equity transfer is in a terminal failure and its residue was settled out-of-band ' +
+          '(bookkeeping).',
+        appliesTo: 'Failed equity mint / redemption',
+        mode: 'requires-bot'
+      },
+      {
+        command: `${LIQUIDITY_CLIENT} debug reconcile-usdc <id> --reason <funds-moved-manually|deposit-credited-offline>`,
+        description: 'Mark a failed USDC bridge Reconciled after its funds were settled manually.',
+        whenToUse:
+          'A USDC bridge failed after its funds left the source venue, and they were settled ' +
+          'out-of-band.',
         appliesTo:
-          'Failed equity transfer / post-burn USDC failure (DepositFailed, post-burn ' +
-          'BridgingFailed, or BaseToAlpaca ConversionFailed)',
-        mode: 'direct-db'
+          'Post-burn USDC failure (DepositFailed, post-burn BridgingFailed, or BaseToAlpaca ' +
+          'ConversionFailed)',
+        mode: 'requires-bot'
       }
     ]
   },
@@ -612,20 +706,20 @@ export const RECOVERY_GUIDE: GuideGroup[] = [
     object: 'position',
     commands: [
       {
-        command: 'stox position release-hedge -s <symbol> -o <order-id> -r "<reason>"',
+        command: `${LIQUIDITY_CLIENT} debug position release-hedge <symbol> --order-id <order-id> --reason "<reason>"`,
         description: "Clear a position's pending offchain order pointer so hedging can retry.",
         whenToUse: 'A position is wedged on a hedge order that never resolved.',
         appliesTo: 'Position with a stuck pending offchain order',
-        mode: 'direct-db'
+        mode: 'requires-bot'
       },
       {
-        command:
-          'stox position set -s <symbol> (--zero | --long <N> | --short <N>) ' +
-          '[--price <USDC_PER_SHARE>] -r "<reason>"',
-        description: 'Override a position’s net exposure after a manual correction.',
+        command: `${LIQUIDITY_CLIENT} debug position set <symbol> --target-net <N> [--price-usdc <USDC_PER_SHARE>] --reason "<reason>"`,
+        description:
+          'Override a position’s net exposure after a manual correction. The target is ' +
+          'signed: negative is short, 0 is flat.',
         whenToUse: 'The recorded net exposure has drifted from reality and must be set explicitly.',
         appliesTo: 'Any position',
-        mode: 'direct-db'
+        mode: 'requires-bot'
       }
     ]
   },
@@ -633,13 +727,11 @@ export const RECOVERY_GUIDE: GuideGroup[] = [
     object: 'view',
     commands: [
       {
-        command:
-          'stox view rebuild -a <position|offchain-order|vault-registry> (--id <id> | --all)',
-        description:
-          'Stop the bot, then replay all events to reconstruct a corrupted materialized view.',
+        command: `${LIQUIDITY_CLIENT} debug view rebuild <position|offchain-order|vault-registry> (--id <id> | --all)`,
+        description: 'Replay all events to reconstruct a corrupted materialized view.',
         whenToUse: 'A view became corrupted (e.g. lost updates from optimistic-lock conflicts).',
         appliesTo: 'Position / offchain-order / vault-registry views',
-        mode: 'direct-db'
+        mode: 'requires-bot'
       }
     ]
   },
@@ -647,13 +739,13 @@ export const RECOVERY_GUIDE: GuideGroup[] = [
     object: 'cctp',
     commands: [
       {
-        command: 'stox cctp complete-mint --burn-tx <hash> --source-chain <ethereum|base>',
+        command: `${LIQUIDITY_CLIENT} debug cctp complete-mint --burn-tx <hash> --source-chain <ethereum|base>`,
         description:
-          'Complete the destination-chain mint of a stuck CCTP transfer (live RPC only; touches ' +
-          'no database state).',
+          'Complete the destination-chain mint of a stuck CCTP transfer. A burn Circle has not ' +
+          'attested yet fails at once as retryable; rerun it later.',
         whenToUse: 'A CCTP burn succeeded but attestation polling was interrupted before the mint.',
         appliesTo: 'CCTP cross-chain USDC transfer',
-        mode: 'live-rpc-only'
+        mode: 'requires-bot'
       }
     ]
   },
@@ -661,13 +753,11 @@ export const RECOVERY_GUIDE: GuideGroup[] = [
     object: 'trade',
     commands: [
       {
-        command: 'stox process-tx --tx-hash <hash>',
-        description:
-          'Re-account a missed onchain fill: record the trade and place the hedge. Runs in the ' +
-          'CLI process (own RPC + broker) -- does not need the bot.',
+        command: `${LIQUIDITY_CLIENT} debug process-tx <hash> [--chain <base|ethereum|hyperevm|robinhood>]`,
+        description: 'Re-account a missed onchain fill: record the trade and place the hedge.',
         whenToUse: 'The bot missed an onchain fill and the position/hedge was never updated.',
         appliesTo: 'Onchain (Raindex) fills',
-        mode: 'direct-db-live-rpc'
+        mode: 'requires-bot'
       }
     ]
   }

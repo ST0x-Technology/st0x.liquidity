@@ -192,6 +192,9 @@ def or_chain(cols, row_label="symbol"):
     (instance, job, cluster...) so the table transformations see clean frames.
     """
     return " or ".join(
+        # name None: the expression already carries its own col label (a
+        # column per chain, see native_inventory).
+        expr if name is None else
         f'sum by ({row_label}, col) '
         f'(label_replace({expr}, "col", "{name}", "", ""))'
         for expr, name in cols
@@ -474,15 +477,6 @@ SIDE_MAPPINGS = [
         "sell": {"text": "sell", "color": "red", "index": 1},
     }},
 ]
-LIGHT_MAPPINGS = [
-    {"type": "value", "options": {
-        "1": {"text": "●", "color": "green", "index": 0},
-        "0": {"text": "●", "color": "red", "index": 1},
-    }},
-    {"type": "special", "options": {"match": "null+nan",
-                                    "result": {"text": "○", "color": "text",
-                                               "index": 2}}},
-]
 
 USD = [{"id": "unit", "value": "currencyUSD"}, {"id": "decimals", "value": 2}]
 USD_SIGNED = USD + [
@@ -490,22 +484,6 @@ USD_SIGNED = USD + [
     {"id": "thresholds", "value": {"mode": "absolute", "steps": [
         {"color": "red", "value": None}, {"color": "text", "value": -0.01},
         {"color": "green", "value": 0.01}]}},
-]
-PCT = [
-    {"id": "unit", "value": "percentunit"}, {"id": "decimals", "value": 1},
-    # Inline bar plus percent, like the SPA's Ratio progress bar. The bar
-    # shares the cell with the percent text, so the column needs the width.
-    {"id": "custom.cellOptions", "value": {"type": "gauge", "mode": "basic",
-                                            "valueDisplayMode": "text"}},
-    {"id": "min", "value": 0}, {"id": "max", "value": 1},
-    {"id": "thresholds", "value": {"mode": "absolute", "steps": [
-        {"color": "blue", "value": None}]}},
-]
-LIGHT = [
-    {"id": "mappings", "value": LIGHT_MAPPINGS},
-    {"id": "custom.cellOptions", "value": {"type": "color-text"}},
-    {"id": "custom.align", "value": "center"},
-    {"id": "custom.width", "value": 40},
 ]
 
 # ==========================================================================
@@ -561,10 +539,6 @@ STATUS_DOT_MAPPINGS = [
     }},
 ]
 
-# The SPA renders plain locale numbers (37,934.83) — no $ prefix, no SI
-# abbreviation — in the inventory tables. "locale" is Grafana's
-# toLocaleString unit; it never abbreviates.
-NUM = [{"id": "unit", "value": "locale"}, {"id": "decimals", "value": 2}]
 # The stackdriver plugin runs a range query even for an `instant` target, so
 # a latest-value panel on the 24h dashboard pulled every 60s point of the day
 # (27,092 points for the equity table) just to show the newest one. A 5m
@@ -577,26 +551,8 @@ LATEST_ONLY = {"timeFrom": "5m", "hideTimeOverride": False}
 LATEST_ONLY_HIDDEN = {"timeFrom": "5m", "hideTimeOverride": True}
 
 
-# The SPA packs the inventory columns tight (64px bars, short numbers), so the
-# whole table fits beside the trade list. Grafana's auto widths are about
-# twice that and push Ratio and Exposure off the right edge.
-def width(px):
-    return [{"id": "custom.width", "value": px}]
-
-
 # The SPA's timestamp style: "Jul 31, 13:31:50 UTC" (D7).
 TIME_FMT = [{"id": "unit", "value": "time:MMM D, HH:mm:ss [UTC]"}]
-# D5: narrow ratio-deviation column after "Ratio", in band widths
-# ((ratio - target) / deviation): outside +/-1 is colored, inside the band
-# renders in plain text.
-DELTA = [
-    {"id": "unit", "value": "short"}, {"id": "decimals", "value": 1},
-    {"id": "custom.cellOptions", "value": {"type": "color-text"}},
-    {"id": "custom.width", "value": 45},
-    {"id": "thresholds", "value": {"mode": "absolute", "steps": [
-        {"color": "red", "value": None}, {"color": "text", "value": -1},
-        {"color": "green", "value": 1}]}},
-]
 
 # ==========================================================================
 # The tab suite: five dashboards, one per SPA tab, cross-linked with a
@@ -604,27 +560,32 @@ DELTA = [
 # theme=light so the suite renders in the SPA's light look regardless of
 # the viewer's Grafana theme preference.
 # ==========================================================================
+# Each tab carries its own symbol in its label. Grafana's link buttons take
+# only seven built-in icons (external link, dashboard, question, info, bolt,
+# doc, cloud), too few to tell five tabs apart.
 TABS = [
-    ("Dashboard", "t0-liquidity"),
-    ("Orders", "t0-liquidity-orders"),
-    ("PnL", "t0-liquidity-pnl"),
-    ("Performance", "t0-liquidity-performance"),
-    ("Logs", "t0-liquidity-logs"),
+    ("Dashboard", "t0-liquidity", "📊"),
+    ("Orders", "t0-liquidity-orders", "📋"),
+    ("PnL", "t0-liquidity-pnl", "💵"),
+    ("Performance", "t0-liquidity-performance", "⚡"),
+    ("Logs", "t0-liquidity-logs", "📜"),
 ]
 
 
 def tab_links(active):
     links = []
-    for name, uid in TABS:
+    for name, uid, symbol in TABS:
         links.append({
             "type": "link",
-            "title": f"▸ {name}" if name == active else name,
+            # A no-break space: Grafana trims a plain one after the symbol.
+            "title": (f"▸ {symbol}\u00a0{name}" if name == active
+                      else f"{symbol}\u00a0{name}"),
             # autofitpanels stretches the board to the window height, like
             # the SPA's full-height layout. Only the Dashboard tab: the
             # other tabs hold too many panels to squeeze into one screen.
             "url": f"/d/{uid}/?theme=light"
                    + ("&autofitpanels" if uid == "t0-liquidity" else ""),
-            "icon": "dashboard", "targetBlank": False,
+            "targetBlank": False,
             "keepTime": True, "includeVars": True,
             "asDropdown": False, "tags": [], "tooltip": "",
         })
@@ -637,67 +598,74 @@ def tab_links(active):
     return links
 
 
-def pills(y):
-    """The SPA's header + settings bar as one thin pill row, repeated on
-    every tab like the SPA repeats its header. One grid row tall: a pill
-    with an empty title gets a hover-only header, so the value fills the
-    30px row instead of sitting under a title line.
+def pills(y, w=24):
+    """The SPA's HeaderBar and SettingsBar as one Business Text row,
+    repeated on every tab like the SPA repeats its header: the settings
+    pills (broker, Equity and USDC targets with their bands, Trigger,
+    Reserve) and a Config button on the left; the CLI recovery guide
+    button, a UTC clock, the commit, uptime, and the connection badge on
+    the right. Config and the recovery guide open the SPA's dialogs.
 
-    The SPA has no Mode or CT-assets pill, so this row has neither. A stat cannot
-    join two series into one string, so the Equity and USDC pills show
-    the target only; the band is in their descriptions."""
-    def pill(title, desc, expr, display=None, unit="short", decimals=None,
-             mappings=None, legend=None, text_mode="value_and_name", x=0,
-             w=3):
-        return {**stat(title, desc, expr, display=display, unit=unit,
-                       decimals=decimals, mappings=mappings, legend=legend,
-                       text_mode=text_mode,
-                       color_mode="none" if not mappings else "value",
-                       w=w, h=1, x=x, y=y, value_size=14),
-                **LATEST_ONLY_HIDDEN}
+    Every series carries a `k` label naming it; liquidity-panels/header.js
+    reads the rows by `k`. The commit series is its sample timestamp, so
+    the script can keep the newest commit when a deploy leaves the previous
+    one in the lookback window. The recovery guide is static data exported
+    from the SPA (liquidity-panels/recovery-guide.json) and prepended to
+    the script.
 
-    return [
-        pill("", "The SPA header's connection light: is the bot process up "
-             "and answering /health? '—' means the exporter itself is not "
-             "reporting.",
-             "max(liq_up)", display="Bot",
-             mappings=[{"type": "value", "options": {
-                 "1": {"text": "Connected", "color": "green", "index": 0},
-                 "0": {"text": "Disconnected", "color": "red", "index": 1}}}],
-             x=0, w=3),
-        {**pill("", "Deployed commit, from /health, cut to 7 "
-                "characters like the SPA header. The stackdriver plugin "
-                "runs a range query even for an instant target, so over "
-                "the dashboard's 24h the previous commit is a second series "
-                "and its name drew over this one. PromQL also keeps a "
-                "stopped series for its 5m lookback, so topk on the sample "
-                "timestamp keeps only the commit with the newest sample, "
-                "over a 1m window.",
-                # max by drops every other label: this datasource ignores
-                # legendFormat, so the series name must be the commit alone.
-                'max by (git_commit) (topk(1, label_replace('
-                'timestamp(liq_bot_info), "git_commit", "$1", "git_commit", '
-                '"(.{7}).*")))',
-                legend="{{git_commit}}", text_mode="name", x=3, w=3),
-         "timeFrom": "1m"},
-        pill("", "Bot process uptime, from /health uptimeSeconds.",
-             "time() - max(liq_bot_start_timestamp_seconds)",
-             display="Uptime", unit="s", decimals=0, x=6, w=3),
-        pill("", "The SPA settings bar's Broker pill.",
-             "sum by (broker) (liq_settings_info)",
-             legend="{{broker}}", text_mode="name", x=9, w=3),
-        pill("", "Equity rebalance target. The SPA pill also shows the "
-             "band: target +/- liq_settings_equity_deviation.",
-             "max(liq_settings_equity_target)", display="Equity",
-             unit="percentunit", decimals=0, x=12, w=4),
-        pill("", "USDC rebalance target. The SPA pill also shows the "
-             "band: target +/- liq_settings_usdc_deviation.",
-             "max(liq_settings_usdc_target)", display="USDC",
-             unit="percentunit", decimals=0, x=16, w=4),
-        pill("", "Hedge execution threshold (settings bar 'Trigger').",
-             "max(liq_settings_execution_threshold_usd)", display="Trigger",
-             unit="currencyUSD", decimals=0, x=20, w=4),
-    ]
+    w: the Dashboard tab narrows it to 23 to fit the detail panel beside
+    it (see detail_panel()).
+    """
+    def named(expr, name):
+        return f'label_replace({expr}, "k", "{name}", "", "")'
+
+    expr = " or ".join([
+        named("max(liq_up)", "up"),
+        named("time() - max(liq_bot_start_timestamp_seconds)", "uptime"),
+        named("max by (git_commit) (timestamp(liq_bot_info))", "commit"),
+        named("max by (broker, log_level, wallet_kind, wallet_address, orderbook, "
+              "turnkey_organization, server_port) (liq_settings_info)", "info"),
+        named("max(liq_settings_equity_target)", "equity_target"),
+        named("max(liq_settings_equity_deviation)", "equity_deviation"),
+        named("max(liq_settings_usdc_target)", "usdc_target"),
+        named("max(liq_settings_usdc_deviation)", "usdc_deviation"),
+        named("max(liq_settings_execution_threshold_usd)", "trigger"),
+        named("max(liq_settings_cash_reserved)", "cash_reserved"),
+        named("max(liq_settings_order_polling_seconds)", "order_polling"),
+        named("max(liq_settings_inventory_poll_seconds)", "inventory_polling"),
+        named("max(liq_settings_deployment_block)", "deployment_block"),
+    ])
+    with open(os.path.join(HERE, "liquidity-panels", "recovery-guide.json")) as f:
+        guide = json.load(f)
+    with open(os.path.join(HERE, "liquidity-panels", "header.js")) as f:
+        after_render = f"const RECOVERY_GUIDE = {json.dumps(guide)};\n\n" + f.read()
+    with open(os.path.join(HERE, "liquidity-panels", "header.css")) as f:
+        styles = f.read()
+    return [{
+        "id": nid(), "type": "marcusolsson-dynamictext-panel", "title": "",
+        "description": "The SPA header: settings pills, Config, the CLI "
+                       "recovery guide, the deployed commit, uptime, and "
+                       "whether the exporter reaches the bot's /health.",
+        "datasource": CM,
+        "targets": [promql(expr, instant=True)],
+        "transparent": True,
+        "gridPos": {"h": 1, "w": w, "x": 0, "y": y},
+        "transformations": [
+            {"id": "labelsToFields", "options": {}},
+            {"id": "merge", "options": {}},
+        ],
+        "options": {
+            "renderMode": "allRows",
+            "editor": {"format": "auto", "language": "html"},
+            "content": "<div></div>",
+            "defaultContent": "No bot data.",
+            "helpers": "",
+            "afterRender": after_render,
+            "styles": styles,
+            "wrap": False,
+        },
+        **LATEST_ONLY_HIDDEN,
+    }]
 
 
 # The SPA's PnL range buttons (1W / 1M / YTD / 1Y / All). PnL is a windowed
@@ -766,135 +734,446 @@ def make_dashboard(uid, title, description, panels, links, variables):
 dashboards = []
 
 # ==========================================================================
-# Tab 1: Dashboard — the SPA's Inventory card (cash row + equity table)
-# on the left, Trade History / Cross-venue Transfers stacked right.
+# Tab 1: Dashboard: the SPA's Inventory card as Grafana tables (USD at
+# Alpaca, USD on each chain, equities) on the left, Trades / Rebalances
+# stacked right.
 # ==========================================================================
 panels = []
-panels += pills(0)
+panels += pills(0, w=23)
 
-def usdc(metric):
-    return f'label_replace({metric}, "row", "USDC", "", "")'
+def native_table(title, desc, expr, row_label, columns, w, h, x, y,
+                 first_col, sort_by=None, widths=None, bars=(),
+                 align="right", stretch=None, first_col_mappings=None):
+    """A Grafana table from one or-chain query pivoted on (row_label, col),
+    like matrix_table. columns: [(col, display name, [field override
+    properties])]; bars: columns drawn as HTML bars (see bar_cell)."""
+    matrix_key = f"{row_label}\\col"
+    names = {col: name for col, name, _ in columns}
+    # Fixed widths, except one `stretch` column that takes the rest of the
+    # card, so the table ends at the card's edge.
+    widths = {col: px for col, px in (widths or {}).items() if col != stretch}
+    # A stretching column otherwise never goes under Grafana's 150px
+    # default, which overflows a card whose fixed columns leave less.
+    stretch_props = ([{"matcher": {"id": "byName", "options": names[stretch]},
+                       "properties": [{"id": "custom.minWidth", "value": 60}]}]
+                     if stretch else [])
+    overrides = [{"matcher": {"id": "byName", "options": names[col]},
+                  "properties": [*(props or []),
+                                 *([{"id": "custom.width", "value": widths[col]}]
+                                   if col in widths else [])]}
+                 for col, _, props in columns if props or col in widths]
+    return {
+        "id": nid(), "type": "table", "pluginVersion": "13.1.0",
+        "title": title, "description": desc,
+        "datasource": CM,
+        "targets": [promql(expr, instant=True)],
+        "gridPos": {"h": h, "w": w, "x": x, "y": y},
+        "transformations": [
+            {"id": "labelsToFields", "options": {}},
+            {"id": "merge", "options": {}},
+            {"id": "groupBy", "options": {"fields": {
+                row_label: {"operation": "groupby", "aggregations": []},
+                "col": {"operation": "groupby", "aggregations": []},
+                "Value": {"operation": "aggregate",
+                          "aggregations": ["lastNotNull"]},
+            }}},
+            {"id": "groupingToMatrix",
+             "options": {"columnField": "col", "rowField": row_label,
+                         "valueField": "Value (lastNotNull)",
+                         "emptyValue": "null"}},
+            {"id": "organize", "options": {
+                "excludeByName": {},
+                "indexByName": {name: index for index, name in enumerate(
+                    [matrix_key] + [col for col, _, _ in columns])},
+                "renameByName": {matrix_key: first_col, **names}}},
+            # Regex value mappings only read strings (see bar_cell).
+            *([{"id": "convertFieldType", "options": {"conversions": [
+                {"targetField": col, "destinationType": "string"}
+                for col in bars]}}] if bars else []),
+        ],
+        "fieldConfig": {
+            "defaults": {"unit": "locale", "decimals": 2,
+                         "custom": {"align": align, "filterable": True,
+                                    "cellOptions": {"type": "auto"}},
+                         "thresholds": {"mode": "absolute", "steps": [
+                             {"color": "red", "value": None}]},
+                         "mappings": []},
+            "overrides": [
+                {"matcher": {"id": "byName", "options": first_col},
+                 "properties": [{"id": "custom.align", "value": "left"},
+                                {"id": "custom.width",
+                                 "value": widths.get(row_label, 90)},
+                                *([{"id": "mappings",
+                                    "value": first_col_mappings}]
+                                  if first_col_mappings else [])]},
+                *overrides,
+                *stretch_props,
+            ],
+        },
+        "options": {"showHeader": True, "cellHeight": "md",
+                    **({"sortBy": [sort_by]} if sort_by else {})},
+        **LATEST_ONLY,
+    }
 
 
-def usdc_group(title, desc, cols, w, x, overrides, show_asset=False,
-               latest=LATEST_ONLY):
-    """One slice of the SPA's USDC row. The SPA groups its right-hand
-    columns under "Alpaca" and "Wallets" header cells; a Grafana table has
-    no grouped headers, so each group is its own panel and the panel title
-    is the group header."""
-    panel = matrix_table(
-        title, desc, or_chain([(usdc(metric), name) for metric, name in cols],
-                              row_label="row"),
-        "row", w=w, h=4, x=x, y=1, first_col="Asset",
-        column_order=[name for _, name in cols], unit_overrides=overrides,
-        decimals=2)
-    if not show_asset:
-        panel["transformations"][-1]["options"]["excludeByName"]["row\\col"] = True
-    # Grafana gives a column without a width a 150px minimum, which made
-    # these narrow panels scroll; 40px lets an auto column take what is left.
-    panel["fieldConfig"]["defaults"]["custom"]["minWidth"] = 40
-    return {**panel, **latest}
+
+# Added to a banded percent before its sign, so an out-of-band 0% is -0.0001
+# and not -0, which Grafana writes as "0" (in band). The bar cell's regex
+# keeps one decimal, so the offset never shows.
+BAND_SIGN_OFFSET = 0.0001
 
 
-panels.append(usdc_group(
-    "Inventory",
-    "The SPA's USDC row: Raindex + Alpaca Total + Inflight = Total; Ratio "
-    "= Raindex/(Raindex+Alpaca Total); Δ = deviation from the target ratio "
-    "in band widths, colored outside +/-1, where the SPA colors its bar.",
-    [("liq_usdc_onchain_available", "Raindex"),
-     ("liq_usdc_inflight_total", "Inflight"),
-     ("liq_usdc_alpaca_total", "Alpaca Total"),
-     ("liq_usdc_total", "Total"),
-     ("liq_usdc_ratio", "Ratio"),
-     ("liq_usdc_ratio_deviation and liq_usdc_total > 0", "Δ")],
-    w=7, x=0, show_asset=True,
-    # 90px fits a six-figure balance ("104,302.08"); Ratio gives up the
-    # width, since its bar is redrawn in part 2 anyway.
-    overrides={"Asset": width(50), "Inflight": NUM + width(80),
-               **{c: NUM + width(90) for c in
-                  ["Raindex", "Alpaca Total", "Total"]},
-               "Ratio": PCT + width(75), "Δ": DELTA}))
-panels.append(usdc_group(
-    "Alpaca",
-    "Rebalanceable = max(0, withdrawable − reserve). Counter-tradeable "
-    "deliberately equals Alpaca Total (reserve NOT subtracted, same as the "
-    "SPA).",
-    [("liq_usdc_alpaca_usdc", "USDC"),
-     ("liq_usdc_rebalanceable", "Rebalanceable"),
-     ("liq_usdc_alpaca_total", "Counter-tradeable")],
-    w=4, x=7, overrides={"USDC": NUM + width(90),
-                         "Rebalanceable": NUM + width(105),
-                         # No width: it takes the rest of the panel.
-                         "Counter-tradeable": NUM}))
-panels.append(usdc_group(
-    "Wallets",
-    "USDC seen in the bot's Ethereum and Base wallets: sanity checks, not "
-    "part of Total.",
-    [("liq_usdc_inflight_ethereum_wallet", "Eth"),
-     ("liq_usdc_inflight_base_wallet", "Base")],
-    w=3, x=11, overrides={"Eth": NUM + width(80), "Base": NUM},
-    # Three units are too narrow for the title and the badge: Grafana drops
-    # the title, so this panel hides the badge like the header pills.
-    latest=LATEST_ONLY_HIDDEN))
+def banded_pct(expr, inside):
+    """pct_bar's sign encoding: the percent rounded to 0.1, negative when
+    `inside` (a 0/1 PromQL bool) says it is outside the band."""
+    return (f"(round(100 * ({expr}), 0.1) + {BAND_SIGN_OFFSET}) "
+            f"* (2 * {inside} - 1)")
 
-equity_expr = or_chain([
-    ("liq_asset_counter_trading", "CT"),
-    ("liq_asset_rebalancing", "Rebal"),
-    ("liq_asset_extended_hours", "Ext"),
-    ("liq_equity_onchain_available", "Raindex"),
-    ("liq_equity_inflight_total", "Inflight"),
-    ("liq_equity_offchain_available", "Alpaca"),
-    ("liq_equity_total", "Total"),
-    ("liq_equity_ratio", "Ratio"),
-    ("liq_equity_ratio_deviation and liq_equity_total > 0", "Δ"),
-    # The exporter emits Exposure only for a priced symbol. NaN for the rest
-    # keeps the column in the matrix when no symbol has a price, and NaN hits
-    # the "—" mapping like the SPA's dash.
-    ("liq_equity_exposure_usd or (liq_equity_total * NaN)", "Exposure"),
-    ("liq_equity_unwrapped", "Unwrapped"),
-    ("liq_equity_wrapped", "Wrapped"),
-])
-panels.append({**matrix_table(
-    "",
-    "The SPA inventory equity table: CT / Rebal / Ext status lights from "
-    "settings; Raindex / Inflight / Alpaca / Total share balances; Ratio = "
-    "onchain/(onchain+offchain); Δ = deviation from the target ratio in "
-    "band widths, colored outside +/-1; Exposure = net × last price. "
-    "Unwrapped/Wrapped are wallet-observed and not part of Total. Sorted "
-    "CT-first (desc) so counter-tradeable assets float to the top, like "
-    "the SPA.",
-    equity_expr, "symbol", w=14, h=24, x=0, y=5,
-    first_col="Asset",
-    column_order=["CT", "Rebal", "Ext", "Raindex", "Inflight", "Alpaca",
-                  "Total", "Ratio", "Δ", "Exposure", "Unwrapped", "Wrapped"],
-    unit_overrides={
-        "Asset": width(60),
-        "CT": LIGHT, "Rebal": LIGHT, "Ext": LIGHT,
-        **{c: NUM + width(70) for c in ["Raindex", "Inflight", "Alpaca",
-                                        "Total", "Wrapped"]},
-        "Unwrapped": NUM + width(80),
-        # Wider than the USDC row's: the gauge draws its bar in what the
-        # percent text leaves, and the SPA's bar is 64px.
-        "Ratio": PCT + width(140), "Δ": DELTA,
-        # The SPA prints "—" when the pricing service has no live price.
-        "Exposure": USD_SIGNED + width(80) + [{"id": "mappings", "value": [
-            {"type": "special", "options": {"match": "null+nan", "result": {
-                "text": "—", "color": "text", "index": 0}}}]}],
-    },
-    sort_by={"displayName": "CT", "desc": True},
-    decimals=2,
-), **LATEST_ONLY})
+
+def pct_bar(expr, band=None):
+    """A percent for an HTML bar cell (see BAR_CELL): the value as a percent
+    rounded to 0.1, negative when it is outside the rebalance band. A table
+    cell can only style its own value, so the band verdict travels in the
+    sign. band: (target metric, deviation metric), or None for a neutral
+    share."""
+    if not band:
+        return f"round(100 * ({expr}), 0.1)"
+    target, deviation = band
+    inside = (f"(abs(({expr}) - scalar(max({target}))) "
+              f"<= bool scalar(max({deviation})))")
+    return banded_pct(expr, inside)
+
+
+def bar_html(fill, text):
+    # One div: Grafana's sanitizer drops position, top, left and
+    # line-height, so the fill is a hard-stop gradient behind the text.
+    return ('<div style="height:20px;border-radius:4px;font-weight:600;'
+            f'text-align:center;background:linear-gradient(90deg, {fill} '
+            f'{text}%, rgba(128,128,128,0.15) {text}%)">{text}%</div>')
+
+
+# A percent drawn as the custom card's bar: the fill as wide as the percent
+# and the percent written inside it. Grafana's gauge cell puts the number
+# beside its bar, so this is a Markdown + HTML cell: the value turns into a
+# string and a regex mapping writes the HTML, its capture group the percent.
+# Negative means outside the band (see pct_bar): red, else green.
+def bar_cell(neutral=False):
+    # No value (a chain without a vault) shows nothing.
+    mappings = [{"type": "regex", "options": {"pattern": "^(null|NaN)?$",
+                 "result": {"text": " ", "index": 0}}}]
+    # The percent keeps at most one decimal, which drops pct_bar's offset
+    # and any float noise from the rounding.
+    mappings += ([] if neutral else [
+        {"type": "regex", "options": {"pattern": r"^-(\d+(?:\.[1-9])?).*$", "result": {
+            "text": bar_html("rgba(239,68,68,0.6)", "$1"), "index": 1}}}])
+    mappings.append({"type": "regex", "options": {
+        "pattern": r"^(\d+(?:\.[1-9])?).*$" if not neutral else "^(.*)$", "result": {
+        "text": bar_html("rgba(148,163,184,0.45)" if neutral
+                         else "rgba(34,197,94,0.6)", "$1"),
+        "index": len(mappings)}}})
+    return [{"id": "mappings", "value": mappings},
+            {"id": "custom.cellOptions", "value": {"type": "markdown"}},
+            {"id": "custom.align", "value": "center"}]
+
+# CT, Rebal and Ext as one column of three dots. Grafana renders no column
+# under 50px, so three one-dot columns took 150px. The query packs the flags
+# into one number, CT x 100 + Rebal x 10 + Ext, with each digit 1 off, 2 on
+# or 3 not set (never 0, so the number never loses a leading digit), and one
+# regex mapping per combination draws the dots as HTML.
+def flag_digit(metric):
+    return (f"(max by (symbol) ({metric}) + 1 "
+            "or (max by (symbol) (liq_equity_total) * 0 + 3))")
+
+
+FLAGS_EXPR = (f"{flag_digit('liq_asset_counter_trading')} * 100 + "
+              f"{flag_digit('liq_asset_rebalancing')} * 10 + "
+              f"{flag_digit('liq_asset_extended_hours')}")
+FLAG_DOT = {"2": '<span style="color:#22c55e">●</span>',
+            "1": '<span style="color:#6b7280">●</span>',
+            "3": '<span style="color:#6b7280">○</span>'}
+FLAGS_CELL = [
+    {"id": "mappings", "value": [
+        {"type": "regex", "options": {"pattern": f"^{a}{b}{c}$", "result": {
+            "text": "&nbsp;".join(FLAG_DOT[d] for d in (a, b, c)),
+            "index": index}}}
+        for index, (a, b, c) in enumerate(
+            (a, b, c) for a in "123" for b in "123" for c in "123")]},
+    {"id": "custom.cellOptions", "value": {"type": "markdown"}},
+    {"id": "custom.align", "value": "center"},
+    {"id": "custom.filterable", "value": False},
+]
+
+# Unpriced symbols arrive as NaN (see native_inventory) and read as a dash.
+NO_PRICE = {"id": "mappings", "value": [{"type": "special", "options": {
+    "match": "null+nan", "result": {"text": "—", "color": "#6b7280",
+                                    "index": 0}}}]}
+
+# Display names for the chains the bot knows (config keys). A chain not
+# listed here still gets its row and column, under its raw key.
+CHAIN_NAMES = {"base": "Base", "robinhood": "Robinhood", "hyperevm": "HyperEVM",
+               "ethereum": "Ethereum"}
+
+
+def native_inventory(w, x, y, heights):
+    """The Inventory card as three Grafana tables: USD at Alpaca, USD on each
+    chain, and the equities."""
+    alpaca_h, chains_h, equity_h = heights
+    usd = lambda metric, row: (f'label_replace({metric}, "venue", "{row}", '
+                               '"", "")')
+    alpaca = or_chain([
+        (usd("liq_usdc_alpaca_total", "Alpaca"), "cash"),
+        (usd("liq_usdc_alpaca_usdc", "Alpaca"), "usdc"),
+        # The reserve setting, else gross minus available cash, else Alpaca
+        # total minus available (0 when the bot ships no gross figure), as
+        # the custom card computed it.
+        (usd("(liq_settings_cash_reserved or (liq_usdc_offchain_gross "
+             "- liq_usdc_offchain_available) or (liq_usdc_alpaca_total "
+             "- liq_usdc_offchain_available))", "Alpaca"), "reserve"),
+        (usd("liq_usdc_rebalanceable", "Alpaca"), "rebalanceable"),
+        (usd("liq_usdc_offchain_inflight", "Alpaca"), "inflight"),
+        (usd(pct_bar("liq_usdc_alpaca_total / liq_usdc_total"), "Alpaca"),
+         "share"),
+        (usd("liq_usdc_total", "Alpaca"), "total"),
+    ], row_label="venue")
+    # One row per chain from the bot's per-chain fields (exporter metrics
+    # labelled chain), else today's single Base row from the unlabelled ones.
+    # Each side is reduced to just the venue label so `or` can tell they are
+    # the same row. A chain without a corridor has no target and no ratio.
+    def per_chain(labelled, base):
+        return (f'max by (venue) (label_replace({labelled}, "venue", "$1", '
+                f'"chain", "(.*)")) or max by (venue) (label_replace({base}, '
+                '"venue", "base", "", ""))')
+    ratio = per_chain("liq_usdc_chain_ratio", "liq_usdc_ratio")
+    target = per_chain("liq_usdc_corridor_target", "liq_settings_usdc_target")
+    deviation = per_chain("liq_usdc_corridor_deviation",
+                          "liq_settings_usdc_deviation")
+    inside = (f"(abs(({ratio}) - ({target})) <= bool ({deviation}))")
+    chains = or_chain([
+        (per_chain("liq_usdc_chain_available", "liq_usdc_onchain_available"),
+         "vault"),
+        (per_chain("liq_usdc_chain_inflight", "liq_usdc_onchain_inflight"),
+         "inflight"),
+        ('max by (venue) (label_replace(liq_usdc_inflight_base_wallet, '
+         '"venue", "base", "", "")) or max by (venue) (label_replace('
+         'liq_usdc_inflight_ethereum_wallet, "venue", "ethereum", "", ""))',
+         "wallet"),
+        # pct_bar's sign encoding, with each chain's own band.
+        (banded_pct(ratio, inside), "ratio"),
+        (target, "target"),
+        (deviation, "deviation"),
+    ], row_label="venue")
+    equity = or_chain([
+        (FLAGS_EXPR, "flags"),
+        # A column per chain (col onchain_<chain>) from the per-chain metric,
+        # else today's onchain total as the Base column.
+        ('max by (symbol, col) (label_replace(liq_equity_chain_available, '
+         '"col", "onchain_$1", "chain", "(.*)")) or max by (symbol, col) '
+         '(label_replace(liq_equity_onchain_available, "col", "onchain_base", '
+         '"", ""))', None),
+        ("liq_equity_inflight_total", "inflight"),
+        ("liq_equity_offchain_available", "alpaca"),
+        ("liq_equity_total", "total"),
+        # Priced symbols only: the pricing feed's price, which the exporter
+        # ships from T0Trade/t0.devops#770 on. The NaN fallback keeps the
+        # column on the board for unpriced symbols (a dash, see NO_PRICE),
+        # where Grafana would drop a column that has no values at all.
+        ("(liq_equity_total * on (symbol) group_left "
+         "max by (symbol) (liq_position_last_price_usd)) "
+         "or (liq_equity_total * NaN)", "total_usd"),
+        (pct_bar("liq_equity_ratio", ("liq_settings_equity_target",
+                                      "liq_settings_equity_deviation")),
+         "ratio"),
+        ("liq_equity_exposure_usd or (liq_equity_total * NaN)", "exposure"),
+        ("liq_equity_unwrapped", "unwrapped"),
+        ("liq_equity_wrapped", "wrapped"),
+    ])
+    pct = [{"id": "unit", "value": "percentunit"}, {"id": "decimals", "value": 0}]
+    return [
+        native_table(
+            "USD · Alpaca",
+            "Alpaca's cash: no rebalance target, so it shows its share of "
+            "all USD and USDC. Rebalanceable = max(0, withdrawable - "
+            "reserve).", alpaca, "venue",
+            [("cash", "Cash", None), ("usdc", "USDC", None),
+             ("reserve", "Reserve", None),
+             ("rebalanceable", "Rebalanceable", None),
+             ("inflight", "In flight", None),
+             ("share", "Share of total", bar_cell(neutral=True)),
+             ("total", "USD total", None)],
+            w, alpaca_h, x, y, first_col="Venue", bars=("share",),
+            stretch="share",
+            widths={"venue": 80, "cash": 110, "usdc": 140, "reserve": 95,
+                    "rebalanceable": 140, "inflight": 95, "share": 180,
+                    "total": 120}),
+        native_table(
+            "USD · Onchain",
+            "Each chain's vault and the ratio the bot rebalances on, vault "
+            "/ (vault + Alpaca cash), against the chain's band. It is not a "
+            "share of all USD: other chains are not in it. Ethereum is the "
+            "hub wallet Alpaca deposits to and withdraws from, with no band.", chains, "venue",
+            [("vault", "Vault", None), ("inflight", "In flight", None),
+             ("wallet", "Wallet", None),
+             ("ratio", "Ratio", bar_cell()),
+             ("target", "Target", pct), ("deviation", "±", pct)],
+            w, chains_h, x, y + alpaca_h, first_col="Chain",
+            first_col_mappings=[{"type": "value", "options": {
+                key: {"text": name if key != "ethereum" else "Ethereum (hub)",
+                      "index": index}
+                for index, (key, name) in enumerate(CHAIN_NAMES.items())}}],
+            bars=("ratio",), stretch="ratio",
+            widths={"venue": 125, "vault": 110, "inflight": 95, "wallet": 85,
+                    "target": 85, "deviation": 60},
+            ),
+        native_table(
+            "Equities",
+            "Flags: counter trading, rebalancing and extended hours, green "
+            "when on, grey when off, hollow when not set. "
+            "Share balances per venue. Ratio = onchain / total, green inside "
+            "the rebalance band and red outside it. Exposure = net x live "
+            "price, empty without a price.", equity, "symbol",
+            [("flags", "Flags", FLAGS_CELL),
+             *[(f"onchain_{key}", name, None)
+               for key, name in CHAIN_NAMES.items() if key != "ethereum"],
+             ("inflight", "Inflight", None),
+             ("alpaca", "Alpaca", None), ("total", "Total", None),
+             ("total_usd", "Total USD", [
+                 {"id": "unit", "value": "currencyUSD"},
+                 {"id": "decimals", "value": 0}, NO_PRICE]),
+             ("ratio", "Ratio", bar_cell()),
+             ("exposure", "Exposure", [
+                 {"id": "unit", "value": "currencyUSD"}, NO_PRICE,
+                 {"id": "thresholds", "value": {"mode": "absolute", "steps": [
+                     {"color": "red", "value": None},
+                     {"color": "text", "value": -0.005},
+                     {"color": "green", "value": 0.005}]}},
+                 {"id": "custom.cellOptions", "value": {"type": "color-text"}}]),
+             # Left-aligned like the SPA's table, except the wrap columns.
+             ("unwrapped", "Unwrapped", [{"id": "custom.align", "value": "right"}]),
+             ("wrapped", "Wrapped", [{"id": "custom.align", "value": "right"}])],
+            w, equity_h, x, y + alpaca_h + chains_h, first_col="Asset",
+            # Each width fits its header's text plus the filter icon
+            # (measured). A column under Grafana's 50px minimum renders at the
+            # minimum and would leave the stretching Ratio column too wide by
+            # the difference. With Total USD and Exposure both
+            # showing, the fixed columns no longer leave Ratio its 50px.
+            widths={"symbol": 96, "flags": 64,
+                    # One per chain; only chains with balances show up.
+                    **{f"onchain_{key}": 92 for key in CHAIN_NAMES},
+                    "inflight": 86, "alpaca": 86, "total": 74,
+                    "total_usd": 100, "ratio": 158, "exposure": 95,
+                    "unwrapped": 118, "wrapped": 102},
+            bars=("ratio", "flags"), align="left", stretch="ratio",
+            sort_by={"displayName": "Asset", "desc": False}),
+    ]
+
+
+# The inventory tables (8 + 9 + 35 rows) beside Trades stacked on
+# Rebalances (25 + 26), sized so that autofitpanels keeps the columns level.
+# Autofit scales every height by the same factor and rounds, then keeps the
+# result and fits again on the next render. Whenever one column rounds a row
+# taller than the window, the next pass shrinks everything again and the
+# other column loses a row per pass. These heights end level, or one row
+# short, for windows of 18 to 45 rows, in a throwaway simulation of
+# Grafana's fitPanelsInHeight and the grid's compaction (not kept in the
+# repo), and level on the preview board at 1934x1307.
+# Only a reload refits from these heights, so a window resized after load
+# can still drift.
+TRADES_H, TRANSFERS_H = 25, 26
+# USD · Alpaca gets 8 so its one row shows under the column headers: at 6 the
+# fit left it a header and a scrollbar on windows under ~1600px tall.
+panels += native_inventory(w=13, x=0, y=1, heights=(8, 9, 35))
+
+# A row's detail dialog is the hidden `detail` variable: a table row's link
+# sets it to the row's id, the detail panel queries both logs for that id
+# and opens the dialog, and closing the dialog clears the variable again.
+#
+# The id is read by the field NAME. The groupBy key keeps the raw field name
+# (jsonPayload.id); organize's rename only set its display name, and the Id
+# column's override replaces that with a blank header. ${__url.params:...}
+# already starts with "?", so the URL appends straight to it.
+DETAIL_URL = ('/d/${__dashboard.uid}/${__url.params:exclude:var-detail}'
+              '&var-detail=${__data.fields["jsonPayload.id"]}')
+
+
+DETAIL_VAR = {"type": "textbox", "name": "detail", "hide": 2, "query": "",
+              "current": {"text": "", "value": ""}, "options": []}
+
+
+def detail_panel(x, y, trades_id, transfers_id):
+    """The SPA's trade and transfer detail dialogs, opened from a row of the
+    Trades or Rebalances table (see DETAIL_URL).
+
+    The panel itself draws nothing; it takes the header row's last column so
+    the tab's panel heights stay as they are. It reads the Trades and
+    Rebalances tables' own results (the newest 500 entries of each log)
+    through the Dashboard datasource, so the board scans each log once per
+    refresh, and not per click: a query filtered on one id still scans the
+    whole window (about 13s for 30 days), so a click only picks the id out
+    of data the browser already has and the dialog opens at once. The
+    Dashboard datasource keeps each table's refId: Trades A, Rebalances B. The queries do not use
+    `$detail`, so a click does not re-run them; the script reads `${detail}`,
+    which makes Grafana redraw the panel when the variable changes.
+    liquidity-panels/detail.js builds the dialog. renderMode "data" hands
+    the script both frames, where "allRows" would draw a frame picker.
+    MODE_LABELS (how each recovery command runs) is prepended from
+    recovery-guide.json, like the header's guide, and the per-row command
+    builders from recovery-commands.js.
+    """
+    with open(os.path.join(HERE, "liquidity-panels", "recovery-guide.json")) as f:
+        mode_labels = json.load(f)["modeLabels"]
+    with open(os.path.join(HERE, "liquidity-panels", "recovery-commands.js")) as f:
+        # Its export line is for the SPA test; afterRender is not a module.
+        commands = "".join(line for line in f if not line.startswith("export "))
+    with open(os.path.join(HERE, "liquidity-panels", "detail.js")) as f:
+        after_render = (f"const MODE_LABELS = {json.dumps(mode_labels)};\n\n"
+                        + commands + "\n" + f.read())
+    with open(os.path.join(HERE, "liquidity-panels", "detail.css")) as f:
+        styles = f.read()
+    return {
+        "id": nid(), "type": "marcusolsson-dynamictext-panel", "title": "",
+        "description": "The detail dialog of a Trades or Rebalances row: "
+                       "open it from the row's ⓘ.",
+        "datasource": {"type": "datasource", "uid": "-- Mixed --"},
+        "timeFrom": "30d", "hideTimeOverride": True,
+        "maxDataPoints": 500,
+        "targets": [
+            *({"refId": ref, "panelId": panel_id, "withTransforms": False,
+               "datasource": {"type": "datasource", "uid": "-- Dashboard --"}}
+              for ref, panel_id in (("A", trades_id), ("B", transfers_id))),
+            # The bot's event timelines, shipped by the exporter from
+            # T0Trade/t0.devops (multichain + events change) on; until then
+            # this log is empty and the dialog shows the status history.
+            cloudlog('logName="projects/$env/logs/liquidity-events"', ref="C"),
+        ],
+        "transparent": True,
+        "gridPos": {"h": 1, "w": 1, "x": x, "y": y},
+        "options": {
+            "renderMode": "data",
+            "editor": {"format": "auto", "language": "html"},
+            "content": "<div></div>",
+            "defaultContent": "<div></div>",
+            "helpers": "",
+            "afterRender": after_render,
+            "styles": styles,
+            "wrap": False,
+        },
+    }
+
 
 def latest_status_table(title, desc, log, fields, shown, w, h, x, y,
                         body_regex=None, number_columns=None, time_columns=(),
-                        overrides=(), sort_by=None):
+                        overrides=(), sort_by=None, ref="A"):
     """A Cloud Logging table with one row per entity at its latest status,
-    like the SPA's Trade History and Cross-venue Transfers cards.
+    like the SPA's Trade History and Cross-venue Transfers cards (here
+    Trades and Rebalances).
 
     The exporter writes one log entry per status change (insertId
     `<id>:<status>`), so the raw feed holds several rows per trade or
     transfer. The plugin returns entries newest first, so groupBy on
     jsonPayload.id with `first` keeps each entity's latest status.
+
+    The id stays as the first column, an ⓘ that opens the row's detail
+    dialog; the Status cell opens it too (see DETAIL_URL).
 
     fields: {payload leaf: column name}; the entry's own timestamp is
       always kept, as fields["timestamp"].
@@ -920,6 +1199,9 @@ def latest_status_table(title, desc, log, fields, shown, w, h, x, y,
            for name in time_columns])
     return {
         "id": nid(), "type": "table", "title": title, "description": desc,
+        # Without a version Grafana runs the table panel's old-version
+        # migration on load, which can drop field overrides.
+        "pluginVersion": "13.1.0",
         "datasource": CL,
         "timeFrom": "30d",
         # The plugin takes the row limit from maxDataPoints, which Grafana
@@ -927,7 +1209,7 @@ def latest_status_table(title, desc, log, fields, shown, w, h, x, y,
         # 500 newest entries load in about 1.5s and still leave well over
         # the SPA's 100 rows after grouping by id.
         "maxDataPoints": 500,
-        "targets": [cloudlog(log)],
+        "targets": [cloudlog(log, ref=ref)],
         "gridPos": {"h": h, "w": w, "x": x, "y": y},
         "transformations": [
             # `labels` is a JSON object per row; extractFields lifts each
@@ -955,9 +1237,10 @@ def latest_status_table(title, desc, log, fields, shown, w, h, x, y,
                    for name in shown},
             }}},
             {"id": "organize",
-             "options": {"excludeByName": {"Id": True},
-                         "indexByName": {f"{name} (first)": index
-                                         for index, name in enumerate(shown)},
+             "options": {"excludeByName": {},
+                         "indexByName": {"Id": 0, **{
+                             f"{name} (first)": index + 1
+                             for index, name in enumerate(shown)}},
                          "renameByName": {f"{name} (first)": name
                                           for name in shown}}},
             {"id": "sortBy", "options": {"fields": {}, "sort": [
@@ -973,14 +1256,38 @@ def latest_status_table(title, desc, log, fields, shown, w, h, x, y,
                 *[{"matcher": {"id": "byName", "options": name},
                    "properties": TIME_FMT}
                   for name in [fields["timestamp"], *time_columns]],
+                # The ⓘ is the link's title: a data-links cell draws the
+                # title in place of the value. A value mapping would do the
+                # same, but it would also turn ${__data.fields[...]} into
+                # the ⓘ, since data links read a field's display text.
+                {"matcher": {"id": "byName", "options": "Id"},
+                 "properties": [
+                     {"id": "displayName", "value": " "},
+                     # Grafana's minimum column width; see native_inventory.
+                     {"id": "custom.width", "value": 50},
+                     {"id": "custom.align", "value": "center"},
+                     {"id": "custom.filterable", "value": False},
+                     {"id": "custom.cellOptions", "value": {"type": "data-links"}},
+                     {"id": "links", "value": [{
+                         "title": "ⓘ", "url": DETAIL_URL,
+                         "targetBlank": False, "oneClick": True}]}]},
                 *overrides,
             ],
         },
-        "options": {"showHeader": True, "cellHeight": "sm"},
+        # Medium rows: small ones read crowded, large ones waste the card.
+        "options": {"showHeader": True, "cellHeight": "md"},
     }
 
 
+def usd_column(px):
+    """The USD size column: the exporter's `usd` field in dollars, blank
+    when the row has no price (a failed trade, an unpriced symbol)."""
+    return {"matcher": {"id": "byName", "options": "USD"},
+            "properties": [{"id": "custom.width", "value": px}, *USD]}
+
+
 def column(name, px, mappings=None, color_text=False):
+    # px None: the column stretches over the rest of the card.
     properties = [{"id": "custom.width", "value": px}] if px else []
     if mappings:
         properties.append({"id": "mappings", "value": mappings})
@@ -992,63 +1299,74 @@ def column(name, px, mappings=None, color_text=False):
 
 
 panels.append(latest_status_table(
-    "Trade History",
+    "Trades",
     "Direct Raindex fills, fills routed through supported adapters such as "
     "Bebop, and the corresponding Alpaca hedge trades placed to offset "
-    "exposure. One row per trade at its latest status. Built from the "
-    "newest 500 status entries, so a busy period can push older rows out "
-    "of the 30-day window.",
+    "exposure. One row per trade at its latest status; its ⓘ "
+    "opens the details. Built from the newest 500 status entries, so a "
+    "busy period can push older rows out of the 30-day window.",
     'logName="projects/$env/logs/liquidity-trades"',
-    fields={"timestamp": "Time", "symbol": "Asset", "venue": "Venue",
-            "direction": "Side", "shares": "Size", "status": "Status"},
-    shown=["Time", "Asset", "Venue", "Side", "Size", "Status"],
-    w=10, h=14, x=14, y=1,
-    number_columns={"Size": 3},
+    # One timestamp, first: when the row last changed status.
+    # USD: shares x the fill's price, which the exporter logs from the bot.
+    fields={"timestamp": "Last updated", "symbol": "Asset", "venue": "Venue",
+            "direction": "Side", "shares": "Size", "usd": "USD",
+            "status": "Status"},
+    shown=["Last updated", "Asset", "Venue", "Side", "Size", "USD", "Status"],
+    w=11, h=TRADES_H, x=13, y=1,
+    number_columns={"Size": 3, "USD": 2},
     overrides=[
-        # No width on the last column: it takes what is left, so the
-        # table fills the card like the SPA's.
-        column("Time", 170), column("Asset", 80),
-        column("Venue", 110, VENUE_MAPPINGS, color_text=True),
-        column("Side", 70, SIDE_MAPPINGS, color_text=True),
-        column("Size", 110),
+        column("Last updated", 185), column("Asset", 85),
+        column("Venue", 115, VENUE_MAPPINGS, color_text=True),
+        column("Side", 75, SIDE_MAPPINGS, color_text=True),
+        column("Size", 100), usd_column(110),
         column("Status", None, STATUS_CAP_MAPPINGS, color_text=True),
     ],
 ))
 
 panels.append(latest_status_table(
-    "Cross-venue Transfers",
+    "Rebalances",
     "Asset movements between venues to rebalance inventory: equity mints "
     "(Alpaca to onchain), redemptions (onchain to Alpaca), and USDC bridges "
-    "(Base/Ethereum via CCTP). One row per transfer at its latest status. "
+    "(Base/Ethereum via CCTP). One row per transfer at its latest status; "
+    "its ⓘ opens the details. "
     "A USDC bridge can show the previous status for a while: the exporter "
     "stamps each status with the transfer's updatedAt, which is not always "
     "later than the one before (bridging starts from initiated_at). "
     "Built from the newest 500 status entries, so a busy period can push "
     "older rows out of the 30-day window.",
     'logName="projects/$env/logs/liquidity-transfers"',
-    fields={"timestamp": "Updated", "started_at": "Started", "symbol": "Asset",
-            "amount": "Amount", "status": "Status"},
-    shown=["Started", "Type", "Asset", "Amount", "Status", "Updated"],
+    # One timestamp, first: when the row last changed status. The start
+    # time is in the row's detail dialog.
+    # USD: a bridge's amount, or an equity transfer's shares at the price
+    # when the exporter logged the status.
+    fields={"timestamp": "Last updated", "symbol": "Asset",
+            "amount": "Amount", "usd": "USD", "status": "Status"},
+    shown=["Last updated", "Type", "Asset", "Amount", "USD", "Status"],
     # Type reads the direction for a USDC bridge and the kind for an equity
     # transfer, like the SPA's transferTypeLabel. A bridge's kind is
     # usdc_bridge and an equity transfer's direction is "", so each row can
     # match only one alternative, whatever the body's key order.
     body_regex='"(?:direction|kind)":"(?<Type>alpaca_to_base|base_to_alpaca'
                '|equity_mint|equity_redemption)"',
-    w=10, h=14, x=14, y=15,
-    number_columns={"Amount": 3},
-    time_columns=["Started"],
+    w=11, h=TRANSFERS_H, x=13, y=1 + TRADES_H,
+    number_columns={"Amount": 3, "USD": 2},
     overrides=[
-        column("Started", 135), column("Type", 125, TYPE_MAPPINGS),
+        column("Last updated", 185), column("Type", 165, TYPE_MAPPINGS),
         # A USDC bridge carries no symbol; the SPA's Asset column reads
         # "USDC" for it.
-        column("Asset", 60, [{"type": "special", "options": {
+        column("Asset", 80, [{"type": "special", "options": {
             "match": "empty", "result": {"text": "USDC", "index": 0}}}]),
-        column("Amount", 85),
-        column("Status", 110, STATUS_DOT_MAPPINGS, color_text=True),
-        column("Updated", None),
+        column("Amount", 115), usd_column(110),
+        column("Status", None, STATUS_DOT_MAPPINGS, color_text=True),
     ],
+    # B, not A: the detail panel reads both tables through the Dashboard
+    # datasource, which keeps each table's refId.
+    ref="B",
 ))
+panels.append(detail_panel(
+    x=23, y=0,
+    trades_id=next(p["id"] for p in panels if p.get("title") == "Trades"),
+    transfers_id=next(p["id"] for p in panels if p.get("title") == "Rebalances")))
 
 
 dashboards.append(make_dashboard(
@@ -1067,7 +1385,7 @@ dashboards.append(make_dashboard(
     "compute start-iap-tunnel <vm> 8080 "
     "--local-host-port=localhost:8080 --zone europe-west3-b "
     "--project $env (VM name = project id)",
-    panels, tab_links("Dashboard"), [ENV_VAR]))
+    panels, tab_links("Dashboard"), [ENV_VAR, DETAIL_VAR]))
 
 # ==========================================================================
 # Tab 2: Orders — the SPA's Raindex Orders table (+ ops extras).
