@@ -298,14 +298,17 @@ impl Projection {
     }
 
     /// This projection plus every listing (chain, symbol) of `previous`
-    /// that it lacks, each kept with its trading, rebalancing and
-    /// wrapped-equity recovery switched off. A symbol's hedge policy that
-    /// this projection lacks is kept too, with extended-hours counter
-    /// trading off, since a symbol that trades nowhere may not enable it.
+    /// that it lacks, each kept with its trading and rebalancing switched
+    /// off and its wrapped-equity recovery as it was. A symbol's hedge
+    /// policy that this projection lacks is kept too, with extended-hours
+    /// counter trading off, since a symbol that trades nowhere may not
+    /// enable it.
     ///
     /// No new work starts for a carried listing, yet every durable record
     /// that names it (positions, vaults, transfers in flight) still
-    /// resolves. A config release that retires the symbol drops it.
+    /// resolves, and tokens that unfinished work leaves in its wallet can
+    /// still be recovered. A config release that retires the symbol drops
+    /// it.
     #[must_use]
     pub fn carry_forward(mut self, previous: &Self) -> Carried {
         let mut listings = BTreeSet::new();
@@ -316,7 +319,7 @@ impl Projection {
                     continue;
                 }
                 let mut row = row.clone();
-                for key in ["trading", "rebalancing", "wrapped_equity_recovery"] {
+                for key in ["trading", "rebalancing"] {
                     row.insert(key.into(), Value::String(DISABLED.into()));
                 }
                 kept.insert(symbol.clone(), row);
@@ -1537,12 +1540,12 @@ mod tests {
         }
     }
 
-    /// A listing the fresh copy drops keeps its last row with every switch
-    /// off, per chain: a symbol leaving one chain keeps trading on the
-    /// other, and only a symbol that trades nowhere has its policy carried,
-    /// with extended hours off.
+    /// A listing the fresh copy drops keeps its last row with trading and
+    /// rebalancing off and recovery as it was, per chain: a symbol leaving
+    /// one chain keeps trading on the other, and only a symbol that trades
+    /// nowhere has its policy carried, with extended hours off.
     #[test]
-    fn a_dropped_listing_is_carried_switched_off() {
+    fn a_dropped_listing_is_carried_with_new_work_off_and_recovery_kept() {
         let running = project(&parse(&fixtures::pinned_production_tokens()).unwrap()).unwrap();
         assert_eq!(
             running.policies["AAPL"]["extended_hours_counter_trading"],
@@ -1557,9 +1560,17 @@ mod tests {
 
         assert_eq!(carried.listings, BTreeSet::from(["base/AAPL".to_string()]));
         let row = &carried.projection.chain_rows["base"]["AAPL"];
-        for key in ["trading", "rebalancing", "wrapped_equity_recovery"] {
+        for key in ["trading", "rebalancing"] {
             assert_eq!(row[key], Value::String("disabled".into()), "{key}");
         }
+        assert_eq!(
+            running.chain_rows["base"]["AAPL"]["wrapped_equity_recovery"],
+            Value::String("enabled".into())
+        );
+        assert_eq!(
+            row["wrapped_equity_recovery"],
+            Value::String("enabled".into())
+        );
         assert_eq!(
             row["tokenized_equity"],
             running.chain_rows["base"]["AAPL"]["tokenized_equity"]

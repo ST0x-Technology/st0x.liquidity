@@ -41,7 +41,7 @@ use sqlx::SqlitePool;
 use std::str::FromStr;
 use std::sync::Arc;
 use thiserror::Error;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 use uuid::Uuid;
 
 use st0x_event_sorcery::{DomainEvent, EventSourced, Nil};
@@ -56,6 +56,7 @@ use crate::bot_gas::{
 use crate::equity_redemption::RedemptionAggregateId;
 use crate::rebalancing::equity::{
     ChainEquityServices, ChainServicesMissing, CrossVenueEquityTransfer, EquityTransferServices,
+    MintError, MintResumeFailure, RedemptionError, RedemptionResumeFailure, ResumeFailureKind,
 };
 use crate::tokenized_equity_mint::TOKENIZED_EQUITY_DECIMALS;
 
@@ -97,21 +98,39 @@ pub(crate) struct WrappedEquityRecoveryServices {
 /// handlers. Most service failures (raindex/wrapper/transfer) do NOT flow
 /// through this enum -- they are recorded as `RecoveryFailed` events instead,
 /// so failures remain first-class entries in the audit trail. The
-/// exceptions are `ChainServicesMissing` (see its doc) and
+/// exceptions include `MintResumePending`, which keeps unfinished mints open,
+/// `ChainServicesMissing` (see its doc), and
 /// `BotGasEnqueueFailed`: a bot-gas cost-recording bookkeeping
 /// failure inside `confirm_orphan_deposit_or_fail` is deliberately propagated
 /// as `Err` rather than folded into `RecoveryFailed`, so the job's shared
 /// `redrive_on_bot_gas_failure` mechanism can redrive it instead of
 /// permanently failing the recovery over a best-effort accounting write.
 ///
-/// NOTE: `resume_mint_or_fail`/`resume_redemption_or_fail` (the
-/// `DispatchToMint`/`DispatchToRedemption` handlers) deliberately do NOT
+/// NOTE: `resume_redemption_or_fail` (the
+/// `DispatchToRedemption` handlers) deliberately do NOT
 /// propagate a bot-gas enqueue failure this way -- see the "Known gaps"
 /// entry in SPEC.md's bot-gas section. The job now resumes from `Detected`,
 /// so a redrive would no longer strand the record, but propagating the
 /// failure from these handlers is not wired yet.
 #[derive(Debug, Clone, Serialize, Deserialize, Error, PartialEq, Eq)]
 pub(crate) enum WrappedEquityRecoveryError {
+    /// `resume_mint` failed in a way a later attempt can clear. A permanent
+    /// failure is recorded as `RecoveryFailed` instead, so the hold ends.
+    #[error("mint {mint_id} resume remains pending")]
+    MintResumePending {
+        mint_id: IssuerRequestId,
+        #[source]
+        failure: MintResumeFailure,
+    },
+    /// `resume_redemption` failed in a way a later attempt can clear. A
+    /// permanent failure is recorded as `RecoveryFailed` instead, so the hold
+    /// ends.
+    #[error("redemption {redemption_id} resume remains pending")]
+    RedemptionResumePending {
+        redemption_id: RedemptionAggregateId,
+        #[source]
+        failure: RedemptionResumeFailure,
+    },
     #[error("recovery already initialized")]
     AlreadyInitialized,
     #[error("recovery not yet initialized; only Detect is valid")]
@@ -684,18 +703,42 @@ async fn resume_mint_or_fail(
     mint_id: &IssuerRequestId,
     now: DateTime<Utc>,
 ) -> Result<Vec<WrappedEquityRecoveryEvent>, WrappedEquityRecoveryError> {
-    match transfer.resume_mint(mint_id).await {
+    let result = transfer.resume_mint(mint_id).await;
+    mint_resume_outcome(mint_id, result, now)
+}
+
+/// `DispatchedToMint` once the mint resumed, `RecoveryFailed` on a
+/// permanent failure so the hold ends, and `MintResumePending` on a
+/// retryable one so the job keeps the hold and tries again.
+fn mint_resume_outcome(
+    mint_id: &IssuerRequestId,
+    result: Result<(), MintError>,
+    now: DateTime<Utc>,
+) -> Result<Vec<WrappedEquityRecoveryEvent>, WrappedEquityRecoveryError> {
+    let error = match result {
         Ok(()) => {
             info!(target: "rebalance", %mint_id, "Wrapped equity recovery: resume_mint succeeded");
-            Ok(vec![WrappedEquityRecoveryEvent::DispatchedToMint {
+            return Ok(vec![WrappedEquityRecoveryEvent::DispatchedToMint {
                 mint_id: mint_id.clone(),
                 dispatched_at: now,
-            }])
+            }]);
         }
-        Err(error) => {
-            warn!(target: "rebalance", %mint_id, ?error, "Wrapped equity recovery: resume_mint failed");
+        Err(error) => error,
+    };
+
+    let failure = MintResumeFailure::from_mint_error(&error);
+    match failure.kind {
+        ResumeFailureKind::Retryable => {
+            warn!(target: "rebalance", %mint_id, ?error, "Wrapped equity recovery: resume_mint failed; retrying");
+            Err(WrappedEquityRecoveryError::MintResumePending {
+                mint_id: mint_id.clone(),
+                failure,
+            })
+        }
+        ResumeFailureKind::Permanent => {
+            error!(target: "rebalance", %mint_id, ?error, "Wrapped equity recovery: resume_mint failed permanently; failing recovery");
             Ok(vec![WrappedEquityRecoveryEvent::RecoveryFailed {
-                reason: format!("resume_mint failed: {error}"),
+                reason: format!("resume_mint of {mint_id} failed permanently: {failure}"),
                 failed_at: now,
             }])
         }
@@ -707,7 +750,23 @@ async fn resume_redemption_or_fail(
     redemption_id: &RedemptionAggregateId,
     now: DateTime<Utc>,
 ) -> Result<Vec<WrappedEquityRecoveryEvent>, WrappedEquityRecoveryError> {
-    match transfer.resume_redemption(redemption_id).await {
+    redemption_resume_outcome(
+        redemption_id,
+        transfer.resume_redemption(redemption_id).await,
+        now,
+    )
+}
+
+/// `DispatchedToRedemption` once the redemption resumed or still resolves on
+/// its own, `RecoveryFailed` on a permanent failure so the hold ends, and
+/// `RedemptionResumePending` on a retryable one so the job keeps the hold and
+/// tries again.
+fn redemption_resume_outcome(
+    redemption_id: &RedemptionAggregateId,
+    result: Result<(), RedemptionError>,
+    now: DateTime<Utc>,
+) -> Result<Vec<WrappedEquityRecoveryEvent>, WrappedEquityRecoveryError> {
+    match result {
         Ok(()) => {
             info!(target: "rebalance", %redemption_id, "Wrapped equity recovery: resume_redemption succeeded");
             Ok(vec![WrappedEquityRecoveryEvent::DispatchedToRedemption {
@@ -726,11 +785,25 @@ async fn resume_redemption_or_fail(
             }])
         }
         Err(error) => {
-            warn!(target: "rebalance", %redemption_id, ?error, "Wrapped equity recovery: resume_redemption failed");
-            Ok(vec![WrappedEquityRecoveryEvent::RecoveryFailed {
-                reason: format!("resume_redemption failed: {error}"),
-                failed_at: now,
-            }])
+            let failure = RedemptionResumeFailure::from_redemption_error(&error);
+            match failure.kind {
+                ResumeFailureKind::Retryable => {
+                    warn!(target: "rebalance", %redemption_id, ?error, "Wrapped equity recovery: resume_redemption failed; retrying");
+                    Err(WrappedEquityRecoveryError::RedemptionResumePending {
+                        redemption_id: redemption_id.clone(),
+                        failure,
+                    })
+                }
+                ResumeFailureKind::Permanent => {
+                    error!(target: "rebalance", %redemption_id, ?error, "Wrapped equity recovery: resume_redemption failed permanently; failing recovery");
+                    Ok(vec![WrappedEquityRecoveryEvent::RecoveryFailed {
+                        reason: format!(
+                            "resume_redemption of {redemption_id} failed permanently: {failure}"
+                        ),
+                        failed_at: now,
+                    }])
+                }
+            }
         }
     }
 }
@@ -1379,16 +1452,11 @@ mod tests {
         );
     }
 
-    /// `resume_mint` fails because no mint aggregate exists in the store ->
-    /// the handler records the failure as `RecoveryFailed`. Proves service
-    /// failures flow through events, not aggregate errors.
     #[tokio::test]
-    async fn dispatch_to_mint_records_failure_when_resume_mint_fails() {
+    async fn dispatch_to_mint_fails_the_recovery_when_the_mint_is_missing() {
         let services = test_services().await;
-        let detected = detected_state();
         let mint_id = issuer_request_id("ISS-NONEXISTENT");
-
-        let events = detected
+        let events = detected_state()
             .transition(
                 WrappedEquityRecoveryCommand::DispatchToMint {
                     mint_id: mint_id.clone(),
@@ -1396,16 +1464,89 @@ mod tests {
                 &services,
             )
             .await
-            .expect(
-                "DispatchToMint should return Ok with a RecoveryFailed event on service failure",
-            );
-
+            .unwrap();
         let [WrappedEquityRecoveryEvent::RecoveryFailed { reason, .. }] = events.as_slice() else {
-            panic!("Expected single RecoveryFailed event, got {events:?}");
+            panic!("expected single RecoveryFailed event, got {events:?}");
         };
+        assert!(reason.contains(&mint_id.to_string()), "{reason}");
+    }
+
+    #[test]
+    fn a_retryable_redemption_resume_failure_keeps_the_recovery_pending() {
+        let redemption_id = redemption_aggregate_id("retryable");
+        let error = redemption_resume_outcome(
+            &redemption_id,
+            Err(RedemptionError::Alpaca(
+                st0x_tokenization::AlpacaTokenizationError::PollTimeout {
+                    elapsed: std::time::Duration::from_secs(60),
+                },
+            )),
+            Utc::now(),
+        )
+        .unwrap_err();
+        let WrappedEquityRecoveryError::RedemptionResumePending {
+            redemption_id: pending,
+            failure,
+        } = error
+        else {
+            panic!("expected RedemptionResumePending, got {error:?}");
+        };
+        assert_eq!(pending, redemption_id);
+        assert_eq!(failure.kind, ResumeFailureKind::Retryable);
+    }
+
+    #[test]
+    fn a_permanent_redemption_resume_failure_fails_the_recovery() {
+        let redemption_id = redemption_aggregate_id("rejected");
+        let events =
+            redemption_resume_outcome(&redemption_id, Err(RedemptionError::Rejected), Utc::now())
+                .unwrap();
+        let [WrappedEquityRecoveryEvent::RecoveryFailed { reason, .. }] = events.as_slice() else {
+            panic!("expected single RecoveryFailed event, got {events:?}");
+        };
+        assert!(reason.contains(&redemption_id.to_string()), "{reason}");
+    }
+
+    #[test]
+    fn a_retryable_mint_resume_failure_keeps_the_recovery_pending() {
+        let mint_id = issuer_request_id("ISS-1");
+        let error = mint_resume_outcome(
+            &mint_id,
+            Err(MintError::Raindex(
+                st0x_raindex::RaindexError::ScanInconclusive { from_block: 7 },
+            )),
+            Utc::now(),
+        )
+        .unwrap_err();
+        let WrappedEquityRecoveryError::MintResumePending {
+            mint_id: pending,
+            failure,
+        } = error
+        else {
+            panic!("expected MintResumePending, got {error:?}");
+        };
+        assert_eq!(pending, mint_id);
+        assert_eq!(failure.kind, ResumeFailureKind::Retryable);
+    }
+
+    #[test]
+    fn a_permanent_mint_resume_failure_fails_the_recovery() {
+        let mint_id = issuer_request_id("ISS-1");
+        let events = mint_resume_outcome(
+            &mint_id,
+            Err(MintError::UnknownTokenizedEquity {
+                chain: Chain::Base,
+                symbol: Symbol::new("AAPL").unwrap(),
+            }),
+            Utc::now(),
+        )
+        .unwrap();
         assert!(
-            reason.contains("resume_mint failed"),
-            "RecoveryFailed reason should mention resume_mint; got {reason:?}",
+            matches!(
+                events.as_slice(),
+                [WrappedEquityRecoveryEvent::RecoveryFailed { .. }]
+            ),
+            "{events:?}"
         );
     }
 
@@ -1431,7 +1572,9 @@ mod tests {
             panic!("Expected single RecoveryFailed event, got {events:?}");
         };
         assert!(
-            reason.contains("resume_redemption failed"),
+            reason.contains(&format!(
+                "resume_redemption of {redemption_id} failed permanently"
+            )),
             "RecoveryFailed reason should mention resume_redemption; got {reason:?}",
         );
     }

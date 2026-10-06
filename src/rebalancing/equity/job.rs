@@ -111,12 +111,12 @@ impl ResumeEquityToMarketMaking for CrossVenueEquityTransfer {
 /// Dependencies the job needs to drive the mint.
 pub(crate) struct TransferEquityToMarketMakingCtx {
     pub(crate) transfer: Arc<dyn ResumeEquityToMarketMaking>,
-    /// Shared in-progress map. When a `PostReceipt` error surfaces on a
-    /// primary-chain mint whose aggregate is in a pre-wrap post-receipt state
-    /// (`TokensReceived` or `WrapSubmitted`) AND `wrapped_equity_recovery` is
-    /// enabled for the symbol, the job transitions this entry from
-    /// `ActiveTransfer` to `HeldForRecovery` and returns `Ok(())` so apalis
-    /// does not retry.
+    /// Shared in-progress map. When a `PostReceipt` error surfaces on a mint
+    /// whose aggregate is in a pre-wrap post-receipt state (`TokensReceived`
+    /// or `WrapSubmitted`) AND the mint's own chain enables
+    /// `wrapped_equity_recovery` for the symbol, the job transitions this
+    /// entry from `ActiveTransfer` to `HeldForRecovery` on that chain and
+    /// returns `Ok(())` so apalis does not retry.
     /// `UnwrappedEquityRecovery` claims the `HeldForRecovery` slot and
     /// re-wraps + deposits the tokens.
     ///
@@ -143,9 +143,6 @@ pub(crate) struct TransferEquityToMarketMakingCtx {
     /// ensures the two paths cannot disagree: if recovery is disabled,
     /// `Err(PostReceipt)` is returned instead and apalis retries.
     pub(crate) transfer_services: EquityTransferServices,
-    /// The chain the recovery jobs run on. A mint on any other chain is never
-    /// handed off: nothing would claim or release its `HeldForRecovery` slot.
-    pub(crate) primary_chain: Chain,
     /// Used to delayed-redrive on a bot-gas receipt cost enqueue failure
     /// (ADR 0017 SS4: "failure in cost recording never blocks trading")
     /// instead of consuming the apalis retry budget or handing the symbol
@@ -498,11 +495,13 @@ impl Job<TransferEquityToMarketMakingCtx> for TransferEquityToMarketMaking {
                 // resume_mint via the transfer job is the correct path.
                 // WrappedEquityRecovery remains orphan-only (absent guard).
                 //
-                // The handoff is only done when recovery is enabled. When
-                // disabled, propagate Err so apalis retries. The recovery
-                // jobs run on the primary chain only, so a mint on any other
-                // chain is never held: nothing would ever release it, and
-                // propagating Err retries the transfer instead.
+                // The handoff is only done when the mint's own chain has
+                // wrapped equity recovery enabled. When it does not, propagate
+                // Err so apalis retries instead of holding a slot nobody
+                // recovers. Config load refuses a rebalancing listing without
+                // recovery, so this is defense in depth for a chain that is
+                // unwired or whose listing changed across a restart while the
+                // mint was in flight.
                 let state = ctx
                     .mint_store
                     .load(&self.issuer_request_id)
@@ -547,9 +546,7 @@ impl Job<TransferEquityToMarketMakingCtx> for TransferEquityToMarketMaking {
                                 })
                         });
 
-                let on_primary_chain = self.chain == ctx.primary_chain;
-
-                if is_post_receipt_recoverable && on_primary_chain && recovery_enabled {
+                if is_post_receipt_recoverable && recovery_enabled {
                     match mark_held_for_recovery(
                         &ctx.equity_in_progress,
                         &self.symbol,
@@ -617,10 +614,9 @@ impl Job<TransferEquityToMarketMakingCtx> for TransferEquityToMarketMaking {
                     }
                 } else {
                     // Aggregate is absent, pre-receipt, already terminal,
-                    // TokensWrapped/VaultDepositSubmitted, DB load failed,
-                    // recovery is disabled, or the mint is on a secondary
-                    // chain. Propagate Err so apalis retries or records a
-                    // failed job.
+                    // TokensWrapped/VaultDepositSubmitted, DB load failed, or
+                    // the mint's own chain has recovery disabled or unwired.
+                    // Propagate Err so apalis retries or records a failed job.
                     Err(TransferEquityToMarketMakingJobError::Transfer(
                         MintTransferError::PostReceipt(mint_error),
                     ))
@@ -698,10 +694,10 @@ impl Job<TransferEquityToMarketMakingCtx> for TransferEquityToMarketMaking {
 enum MarkHeldResult {
     /// Successfully transitioned `ActiveTransfer` -> `HeldForRecovery`.
     Transitioned,
-    /// Slot was already `HeldForRecovery` for the same chain (idempotent
-    /// double-call after retry).
+    /// Slot was already `HeldForRecovery` or `Recovering` for the same chain
+    /// (idempotent double-call after retry, or recovery already owns it).
     AlreadyHeld,
-    /// Slot is `HeldForRecovery` for another chain: that chain's recovery owns
+    /// Slot is held or being recovered for another chain: that chain's recovery owns
     /// the symbol, and this transfer's tokens have no hold of their own. The
     /// caller should propagate `Err` so apalis retries.
     HeldForOtherChain { held_chain: Chain },
@@ -750,14 +746,20 @@ fn mark_held_for_recovery(
                 MarkHeldResult::Transitioned
             }
             Some(GuardState::ActiveTransfer { .. }) => MarkHeldResult::GenerationMismatch,
-            Some(GuardState::HeldForRecovery { chain: held_chain }) if *held_chain == chain => {
-                MarkHeldResult::AlreadyHeld
-            }
-            Some(GuardState::HeldForRecovery { chain: held_chain }) => {
-                MarkHeldResult::HeldForOtherChain {
-                    held_chain: *held_chain,
-                }
-            }
+            Some(
+                GuardState::HeldForRecovery { chain: held_chain }
+                | GuardState::Recovering {
+                    chain: held_chain, ..
+                },
+            ) if *held_chain == chain => MarkHeldResult::AlreadyHeld,
+            Some(
+                GuardState::HeldForRecovery { chain: held_chain }
+                | GuardState::Recovering {
+                    chain: held_chain, ..
+                },
+            ) => MarkHeldResult::HeldForOtherChain {
+                held_chain: *held_chain,
+            },
             None => MarkHeldResult::EntryAbsent,
         };
         drop(guard);
@@ -1663,7 +1665,6 @@ mod tests {
             mint_store,
             position_authority: None,
             transfer_services,
-            primary_chain: Chain::Base,
             job_queue: TransferEquityToMarketMakingJobQueue::new(&apalis_pool),
         }
     }
@@ -2996,12 +2997,8 @@ mod tests {
         );
     }
 
-    /// The recovery jobs run on the primary chain only, so a mint on a
-    /// secondary chain is never handed off even with recovery enabled on
-    /// that chain: `PostReceipt` propagates as `Err` for apalis to retry
-    /// `resume_mint` and the guard stays `ActiveTransfer`.
     #[tokio::test]
-    async fn perform_post_receipt_on_a_secondary_chain_mint_is_not_held_for_recovery() {
+    async fn perform_post_receipt_on_a_secondary_chain_mint_is_held_for_its_chain() {
         let symbol = Symbol::new("AAPL").unwrap();
         let issuer_id = issuer_request_id("post-receipt-secondary-chain");
         let ctx = test_ctx_on_chains(
@@ -3049,19 +3046,12 @@ mod tests {
             position_reservation_retry_attempts: 0,
         };
 
-        let error = Job::perform(&job, &ctx).await.unwrap_err();
-
-        assert!(
-            matches!(
-                error,
-                TransferEquityToMarketMakingJobError::Transfer(MintTransferError::PostReceipt(_))
-            ),
-            "a secondary-chain PostReceipt must propagate for retry, got {error:?}"
-        );
-        let guard = ctx.equity_in_progress.read().unwrap().get(&symbol).cloned();
-        assert!(
-            matches!(guard, Some(GuardState::ActiveTransfer { .. })),
-            "a HyperEVM mint must not be held for a primary-chain recovery: {guard:?}"
+        Job::perform(&job, &ctx).await.unwrap();
+        assert_eq!(
+            ctx.equity_in_progress.read().unwrap().get(&symbol),
+            Some(&GuardState::HeldForRecovery {
+                chain: Chain::HyperEvm
+            }),
         );
     }
 
@@ -3657,6 +3647,28 @@ mod tests {
                 held_chain: Chain::Robinhood
             }
         ));
+    }
+
+    #[test]
+    fn mark_held_for_recovery_leaves_a_running_recovery_in_place() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let recovering = GuardState::Recovering {
+            chain: Chain::Robinhood,
+            generation: GuardGeneration::default(),
+        };
+        let map = RwLock::new(HashMap::from([(symbol.clone(), recovering.clone())]));
+
+        assert!(matches!(
+            mark_held_for_recovery(&map, &symbol, GuardGeneration::default(), Chain::Robinhood),
+            MarkHeldResult::AlreadyHeld
+        ));
+        assert!(matches!(
+            mark_held_for_recovery(&map, &symbol, GuardGeneration::default(), Chain::Base),
+            MarkHeldResult::HeldForOtherChain {
+                held_chain: Chain::Robinhood
+            }
+        ));
+        assert_eq!(map.read().unwrap().get(&symbol), Some(&recovering));
     }
 
     #[test]

@@ -112,6 +112,7 @@ pub(super) async fn setup_trading_job_queues(
         mint_store: mint_store.clone(),
         redemption_store: redemption_store.clone(),
         equity_in_progress: rebalancing_service.equity_in_progress.clone(),
+        pending_mint_resumes: rebalancing_service.pending_mint_resumes.clone(),
         queue: wrapped_equity_recovery_queue.clone(),
         reschedule_interval: inventory_poll_interval,
     });
@@ -122,6 +123,7 @@ pub(super) async fn setup_trading_job_queues(
         mint_store,
         redemption_store,
         equity_in_progress: rebalancing_service.equity_in_progress.clone(),
+        pending_mint_resumes: rebalancing_service.pending_mint_resumes.clone(),
         queue: unwrapped_equity_recovery_queue.clone(),
         reschedule_interval: inventory_poll_interval,
     });

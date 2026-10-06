@@ -15,8 +15,8 @@ Every command that itself submits an onchain operation takes `--network`
 (`base`, `ethereum`, `hyperevm`, `robinhood`; default `base`) and runs on that
 chain's signing wallet. The `transfer` recovery verbs (`recheck`, `resume`,
 `reconcile`, `fail`) take no `--network`: they act on the bot's local records or
-hand the work to the running bot, whose recovery runs on the primary chain's
-services. Two contracts apply to the network-aware commands:
+hand the work to the running bot, which resumes each mint or redemption on the
+chain its record names. Two contracts apply to the network-aware commands:
 
 - Orderbook-backed commands (`vault-deposit`, `vault-withdraw`,
   `vault-withdraw-usdc`, `reset-allowance`, `transfer-equity`, `donate-equity`,
@@ -509,6 +509,44 @@ validator (`t0/check.jq`) must accept it. On rollback, restore the token value
 before you downgrade the binary. The dashboard shows paused and disabled
 listings with the same red rebalancing indicator, so check the mode in the
 registry, not on the dashboard, before step 3.
+
+### Recovery Holds a Symbol
+
+The page "Recovery has held <SYM> on <chain> since ..." means a wallet recovery
+on that chain owns the symbol, so no new rebalancing of <SYM> starts on any
+chain. Pausing or disabling the listing does not end the hold. The page repeats
+every `recovery_hold_alert_after` while the hold stands.
+
+1. Read the page. When the recovery keeps retrying a mint, it names the recovery
+   id, the mint (issuer request) id and the last error. Otherwise, find the mint
+   in the bot's logs: search for "Mint recovery remains pending" with the symbol
+   and chain; each line has `recovery_id`, `mint_id` and `failure`.
+2. Read the mint's events and the chain:
+
+   ```bash
+   st0x-liquidity-client --env <env> read transfer-events mint <issuer-request-id>
+   ```
+
+   Check the bot wallet on that chain for the symbol's tStock and wrapped token,
+   and the equity vault balance, with a block explorer.
+3. If the last error is transient (RPC, gas, node behind), fix that cause; the
+   next retry finishes the mint and ends the hold.
+4. If the mint cannot finish, run
+
+   ```bash
+   stox transfer fail --kind mint --id <issuer-request-id> --reason "mint cannot finish; handing wallet tokens to orphan recovery"
+   ```
+
+   (see "Force-Failing Stuck Mint or Redemption Transfers"). The recovery's next
+   attempt finds the mint terminal and ends the hold. Tokens still in the wallet
+   are then picked up by the next wallet poll as an orphan recovery, which wraps
+   and deposits them. If that fails too, move them with `wrap-equity` and
+   `vault-deposit`, both with `--network <chain>`. Once the tokens are in the
+   vault, close the failed mint with:
+
+   ```bash
+   stox transfer reconcile --kind mint --id <issuer-request-id> --reason "wallet tokens wrapped and deposited to the vault by hand"
+   ```
 
 ### Orchestrator Rollout per Chain
 

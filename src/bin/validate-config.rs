@@ -124,11 +124,28 @@ fn report_failure(error: &CtxError) {
 mod tests {
     use super::*;
 
+    /// `tokens` with RKLB's Base listing set to
+    /// `wrapped_equity_recovery = "enabled"`, as st0x.registry#94 does. The
+    /// production copies predate it, and this build refuses a listing that
+    /// rebalances without recovery.
+    fn with_rklb_base_recovery(tokens: &[u8]) -> Vec<u8> {
+        let mut file: toml::Table = toml::from_str(std::str::from_utf8(tokens).unwrap()).unwrap();
+        file["chains"]["base"]["assets"]["equities"]["RKLB"]
+            .as_table_mut()
+            .unwrap()
+            .insert(
+                "wrapped_equity_recovery".into(),
+                toml::Value::String("enabled".into()),
+            );
+        file.to_string().into_bytes()
+    }
+
     #[test]
     fn validates_every_boot_candidate() {
         let config = Path::new("config/prod/st0x-hedge.toml");
-        let valid =
-            std::fs::read("tests/fixtures/tokens-production-1790341753647581.toml").unwrap();
+        let valid = with_rklb_base_recovery(
+            &std::fs::read("tests/fixtures/tokens-production-1790341753647581.toml").unwrap(),
+        );
         validate_candidates(config, None, &[Some(valid.clone())]).unwrap();
         assert!(
             validate_candidates(

@@ -456,6 +456,7 @@ mod tests {
             allocation: ctx.allocation.clone(),
             usdc: ctx.usdc,
             transfer_timeout: ctx.transfer_timeout,
+            recovery_hold_alert_after: ctx.recovery_hold_alert_after,
             chains: BTreeMap::new(),
         };
 
@@ -487,6 +488,7 @@ mod tests {
             allocation: ctx.allocation.clone(),
             usdc: ctx.usdc,
             transfer_timeout: ctx.transfer_timeout,
+            recovery_hold_alert_after: ctx.recovery_hold_alert_after,
             chains: BTreeMap::new(),
         };
 

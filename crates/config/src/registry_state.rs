@@ -460,12 +460,13 @@ pub enum BootOutcome {
         attempt: u32,
     },
     /// A pending copy used its attempts; this boots the last good tables
-    /// with the listings only it added switched off.
+    /// with the listings only it added carried in, trading and rebalancing
+    /// off.
     Fallback {
         record: RecordId,
         generation: u64,
         failed: RecordId,
-        /// `chain/SYMBOL` kept switched off from the failed copy.
+        /// `chain/SYMBOL` carried in from the failed copy.
         carried: BTreeSet<String>,
     },
     /// The fallback an earlier boot built, until the pending copy is
@@ -683,7 +684,8 @@ fn choose(
 
 /// Writes the fallback for a failed pending record: the last good (or
 /// running) tables with the listings only the failed copy added carried in
-/// switched off, so durable references to them still resolve. `damaged`
+/// with trading and rebalancing off, so durable references to them still
+/// resolve and their recovery stays as it was. `damaged`
 /// names an earlier fallback that no longer reads back, which cannot serve
 /// as the base.
 fn write_fallback(
@@ -707,7 +709,7 @@ fn write_fallback(
 struct FallbackTables {
     base: Record,
     effective: Vec<u8>,
-    /// `chain/SYMBOL` carried in switched off from the failed copy.
+    /// `chain/SYMBOL` carried in from the failed copy.
     carried: BTreeSet<String>,
 }
 
@@ -1220,8 +1222,8 @@ mod tests {
 
     /// A pending copy gets two boots; out of attempts, boot persists and
     /// runs a fallback: the last good tables plus the listings only the
-    /// pending copy had, switched off. The pending copy stays, marked, for
-    /// a later retry.
+    /// pending copy had, trading and rebalancing off. The pending copy
+    /// stays, marked, for a later retry.
     #[tokio::test]
     async fn a_pending_copy_that_fails_twice_falls_back() {
         let (_dir, state) = open();
@@ -1275,9 +1277,14 @@ mod tests {
         let tables = projection(&state.record(fallback).unwrap().effective);
         for chain in ["base", "robinhood"] {
             let row = &tables.chain_rows[chain]["FGI"];
-            for key in ["trading", "rebalancing", "wrapped_equity_recovery"] {
+            for key in ["trading", "rebalancing"] {
                 assert_eq!(row[key], Value::String("disabled".into()), "{chain} {key}");
             }
+            assert_eq!(
+                row["wrapped_equity_recovery"],
+                projection(&staging()).chain_rows[chain]["FGI"]["wrapped_equity_recovery"],
+                "{chain}"
+            );
         }
         assert_eq!(
             tables.policies["FGI"]["extended_hours_counter_trading"],
