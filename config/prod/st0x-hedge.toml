@@ -268,10 +268,12 @@ deviation = 0.05
 # keeps the 50% target and 5% band the retired [rebalancing.equity] table
 # carried. Robinhood gets no chain-wide target: each listing it rebalances
 # sets its own target_share in the token file, and validation refuses one
-# that does not. Ethereum runs no orderbook. alpaca_floor keeps a tenth of
-# every equity's total at the broker as the hedging reserve (it binds only
-# where a symbol's targets sum to 0.9, as DNUT's Base 0.5 and Robinhood 0.4
-# do). min_operation_usd sits two
+# that does not. Ethereum runs no orderbook. alpaca_floor only caps mints:
+# no mint takes the broker below a tenth of the equity's total. Nothing
+# redeems when the broker is under it. With DNUT's Base 0.5 and Robinhood
+# 0.4 the upper bands sum to 1.0, so both chains stay in band while the
+# broker's DNUT share is anywhere from 0 to 20%, and user sells can drain
+# the broker's DNUT with no planner action. min_operation_usd sits two
 # orders of magnitude above a Base mint's gas while still letting the cheapest
 # listings rebalance; cooldown_secs matches the inventory staleness bound, so
 # a limit-truncated transfer re-fires once per poll window, not every tick.
