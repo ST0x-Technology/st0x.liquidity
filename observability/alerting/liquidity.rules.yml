@@ -142,6 +142,8 @@ groups:
           description: |-
             Vault 0xfab of owner 0x1eFd85E6C384fAD9B80C6D508E9098Eb91C4eD30 on Raindex 0x37FC0EFec37D19f8A221aa4F8F7600C9ba2AcD20 (Robinhood Chain) holds {{ printf "%.6f" $values.A.Value }} {{ $labels.symbol }}; its approved threshold is {{ printf "%.6f" $values.T.Value }} and target is {{ printf "%.6f" $values.R.Value }}.
 
+            Never refill a listing the bot rebalances on Robinhood (DNUT): the bot mints and redeems that vault toward its own target, and a manual deposit overshoots it. Disarm such listings in the probe instead.
+
             STOP before funding: identify the depletion cause, verify the asset and total capital headroom, and obtain the runbook's two-person approval. Re-read the vault and calculate the exact amount independently (the displayed planning gap is about {{ printf "%.6f" $values.G.Value }}).
 
             Command shape, only after the runbook's two-person approval:
