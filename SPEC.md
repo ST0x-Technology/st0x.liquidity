@@ -276,10 +276,13 @@ rebalancing remains on Base.
 Robinhood Chain (chain id 4663, an Arbitrum Orbit L2) is declared the same way.
 The build provides fill ingestion, hedging, signing, gas valuation and equity
 rebalancing on it (the wrappers are deployed and Alpaca's issuer serves its
-`robinhood` network), and the shipped configuration runs it as a prefunded
-hedge-only secondary: fills on its orderbook are ingested, validated against
-USDG and hedged, while every asset keeps `rebalancing = "disabled"` and no
-inventory adapter is mapped. Its settlement stable is USDG at
+`robinhood` network). Fills on its orderbook are ingested, validated against
+USDG and hedged, and no inventory adapter is mapped. The production
+configuration runs it as an `active` secondary with the issuer's
+`redemption_wallet`, and rebalances against Alpaca the listings the pinned token
+file enables there (DNUT); every other listing keeps `rebalancing = "disabled"`.
+Staging watches the same inventory and runs it as a prefunded hedge-only
+secondary with every asset disabled. Its settlement stable is USDG at
 `0x5fc5360D0400a0Fd4f2af552ADD042D716F1d168` (6 decimals), so it is the first
 chain whose stable CCTP cannot carry. It pays gas in ETH, so the Base Chainlink
 ETH/USD read values its gas and `active` is reachable. Rebalancing an equity
