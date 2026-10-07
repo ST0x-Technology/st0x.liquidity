@@ -122,13 +122,18 @@ fn report_failure(error: &CtxError) {
 
 #[cfg(test)]
 mod tests {
+    use st0x_config::registry::source_of;
+
     use super::*;
 
     #[test]
     fn validates_every_boot_candidate() {
         let config = Path::new("config/prod/st0x-hedge.toml");
+        let deployed: toml::Table =
+            toml::from_str(&std::fs::read_to_string(config).unwrap()).unwrap();
+        let pinned = source_of(&deployed).unwrap().unwrap().generation.unwrap();
         let valid =
-            std::fs::read("tests/fixtures/tokens-production-1791378253362331.toml").unwrap();
+            std::fs::read(format!("tests/fixtures/tokens-production-{pinned}.toml")).unwrap();
         validate_candidates(config, None, &[Some(valid.clone())]).unwrap();
         assert!(
             validate_candidates(
