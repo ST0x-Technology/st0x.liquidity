@@ -44556,4 +44556,108 @@ mod tests {
         );
         assert!(market_making_job_rows(&trigger).await.is_empty());
     }
+
+    /// A chain-to-Alpaca Relay transfer timed out at `WithdrawalComplete`:
+    /// the withdrawn stable sits in the chain wallet outside the vault, so
+    /// the sweep holds the guard instead of clearing it as a pre-burn timeout.
+    #[tokio::test]
+    async fn sweep_holds_a_timed_out_relay_withdrawal_complete() {
+        let now = Utc::now();
+        let pool = crate::test_utils::setup_test_db().await;
+        let store = Arc::new(test_store::<UsdcRebalance>(pool.clone(), ()));
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let amount = usdc(400);
+        for command in [
+            UsdcRebalanceCommand::Initiate {
+                direction: RebalanceDirection::BaseToAlpaca,
+                corridor: ROBINHOOD_RELAY,
+                amount,
+                withdrawal: TransferRef::OnchainTx(TxHash::repeat_byte(0x77)),
+            },
+            UsdcRebalanceCommand::ConfirmWithdrawal {
+                withdrawal_tx: None,
+            },
+        ] {
+            store.send(&id, command).await.unwrap();
+        }
+
+        let config = RebalancingServiceConfig {
+            usdc: UsdcCorridors::for_test(
+                OperationMode::Enabled,
+                [active_corridor(Chain::Robinhood, HopKind::Relay)],
+            ),
+            ..with_cash_on(
+                test_config_with_timeout(Duration::from_secs(1)),
+                &[Chain::Robinhood],
+            )
+        };
+        let inventory = with_onchain_usdc(
+            InventoryView::default().with_usdc(usdc(500), usdc(900)),
+            Chain::Robinhood,
+            usdc(900),
+        )
+        .set_active_usdc_rebalance(
+            id.clone(),
+            ActiveUsdcRebalance::Known {
+                chain: Chain::Robinhood,
+                direction: RebalanceDirection::BaseToAlpaca,
+            },
+        );
+        let trigger = make_trigger_with_inventory_config(inventory, config).await;
+        trigger
+            .set_stores(
+                Arc::new(test_store::<TokenizedEquityMint>(
+                    pool.clone(),
+                    crate::rebalancing::equity::EquityTransferServices::panicking(),
+                )),
+                Arc::new(test_store::<EquityRedemption>(
+                    pool.clone(),
+                    crate::rebalancing::equity::EquityTransferServices::panicking(),
+                )),
+                store,
+            )
+            .await;
+        trigger
+            .usdc_guards
+            .hold(Chain::Robinhood, &id, RebalanceDirection::BaseToAlpaca);
+        trigger.usdc_tracking.write().await.insert(
+            id.clone(),
+            usdc::UsdcRebalanceTracking {
+                corridor: ROBINHOOD_RELAY,
+                direction: RebalanceDirection::BaseToAlpaca,
+                initiated_amount: amount,
+                bridged_amount_received: None,
+                stage: usdc::UsdcRebalanceStage::WithdrawalConfirmed,
+                last_progress_at: now - ChronoDuration::minutes(31),
+            },
+        );
+
+        trigger
+            .expire_stuck_usdc_rebalances(Utc::now())
+            .await
+            .unwrap();
+
+        assert!(
+            trigger.usdc_guards.is_held(Chain::Robinhood),
+            "the guard must stay held while the withdrawn stable is outside the vault",
+        );
+        assert!(
+            !trigger
+                .timed_out_usdc_rebalances
+                .read()
+                .await
+                .contains_key(&id),
+            "the sweep must not tombstone a held transfer",
+        );
+        assert_eq!(
+            trigger
+                .inventory
+                .read()
+                .await
+                .active_usdc_rebalance()
+                .cloned(),
+            Some(id.clone()),
+            "the transfer must stay the active rebalance",
+        );
+    }
 }
