@@ -1011,6 +1011,27 @@ mod tests {
         contracts: RelayEndContracts,
         store: Arc<Store<UsdcRebalance>>,
     ) -> CrossVenueCashTransfer<TestWallet, RelayHop<TestWallet>> {
+        relay_transfer_with_bounds(
+            server,
+            relay_api,
+            ethereum_wallet,
+            chain_wallet,
+            contracts,
+            store,
+            relay_bounds(),
+        )
+        .await
+    }
+
+    async fn relay_transfer_with_bounds(
+        server: &MockServer,
+        relay_api: &MockServer,
+        ethereum_wallet: TestWallet,
+        chain_wallet: TestWallet,
+        contracts: RelayEndContracts,
+        store: Arc<Store<UsdcRebalance>>,
+        bounds: RelayHopCtx,
+    ) -> CrossVenueCashTransfer<TestWallet, RelayHop<TestWallet>> {
         let hub_wallet = ethereum_wallet.address();
         let bridge = RelayBridge::try_from_ctx(RelayCtx {
             chain: Chain::Robinhood,
@@ -1037,7 +1058,7 @@ mod tests {
         CrossVenueCashTransfer::new(
             broker,
             Arc::new(alpaca_wallet),
-            Arc::new(RelayHop::new(bridge, client, relay_bounds(), hub_wallet)),
+            Arc::new(RelayHop::new(bridge, client, bounds, hub_wallet)),
             raindex,
             store,
             MarketMakingUsdcEndpoints::new(
@@ -1622,5 +1643,58 @@ mod tests {
             panic!("expected SwapDeposited, got {state:?}");
         };
         assert_eq!(deposit_tx, deposit.tx_hash());
+    }
+
+    /// A quote past its deadline, or older than the corridor's
+    /// `quote_max_age`, is never signed: the transfer stays at `SwapQuoted`
+    /// with its guard held and nothing is broadcast.
+    #[tokio::test]
+    async fn expired_swap_quote_is_not_signed() {
+        let past_deadline = (-chrono::Duration::minutes(1), Duration::from_secs(60));
+        let too_old = (chrono::Duration::hours(1), Duration::from_millis(50));
+
+        for (deadline_in, quote_max_age) in [past_deadline, too_old] {
+            let anvil = spawn_anvil(Anvil::new());
+            let (wallet, contracts) = funded_relay_end(&anvil).await;
+            let store = Arc::new(test_store(setup_test_db().await, ()));
+            let id = UsdcRebalanceId(Uuid::new_v4());
+            let witness = Arc::new(BroadcastWitness::new(
+                wallet.clone(),
+                store.clone(),
+                id.clone(),
+            ));
+            let chain_wallet: TestWallet = witness.clone();
+            let server = MockServer::start();
+            let relay_api = MockServer::start();
+            let transfer = relay_transfer_with_bounds(
+                &server,
+                &relay_api,
+                wallet.clone(),
+                chain_wallet,
+                contracts,
+                store.clone(),
+                RelayHopCtx {
+                    quote_max_age,
+                    ..relay_bounds()
+                },
+            )
+            .await;
+            let mut quote = exact_quote(&wallet, contracts, B256::repeat_byte(0x0d)).await;
+            quote.deadline = Utc::now() + deadline_in;
+            record_quoted(&store, &id, quote).await;
+            tokio::time::sleep(Duration::from_millis(100)).await;
+
+            let _refused = tokio::time::timeout(
+                Duration::from_secs(30),
+                transfer.resume_base_to_alpaca(&id, Usdc::new(float!(100)), ROBINHOOD_RELAY),
+            )
+            .await
+            .expect("the attempt ends");
+
+            let state = store.load(&id).await.unwrap().unwrap();
+            assert_eq!(state.state_name(), "SwapQuoted", "{state:?}");
+            assert!(state.holds_rebalance_guard());
+            assert_eq!(witness.broadcasts(), Vec::<TxHash>::new());
+        }
     }
 }
