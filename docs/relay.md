@@ -209,7 +209,11 @@ broadcasting them, at consecutive nonces, and returns both
 `PreparedTransaction`s (`PreparedSwap::Deposit`) for the caller to persist. It
 refuses a step for another chain than the wallet's, a step that calls another
 contract than the origin's stable (approve) or depository (deposit), and a
-deposit that credits another depositor than the signing wallet.
+deposit that credits another depositor than the signing wallet. `RelayQuote`'s
+fields are public, so it checks the calldata again before signing
+(`RelayBridgeError::Quote`): the approve allows the depository exactly
+`amount_in`, and the deposit is `amount_in` of the origin stable for the quote's
+order id.
 
 - The approve is estimated and padded as usual. With no approve step in the
   quote, the bridge reads the allowance and signs its own exact
