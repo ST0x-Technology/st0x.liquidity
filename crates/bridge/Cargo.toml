@@ -26,6 +26,7 @@ relay = [
   "dep:serde_json",
   "dep:st0x-evm",
   "dep:thiserror",
+  "dep:tokio",
   "dep:tracing",
 ]
 mock = ["cctp", "dep:anyhow", "dep:httpmock", "dep:rand"]

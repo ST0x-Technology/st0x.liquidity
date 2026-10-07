@@ -1,10 +1,12 @@
 //! [`RelayBridge`]: the deposit we send through Relay's depository and the
 //! proof of the fill or refund Relay's solver sends back.
 
+use std::time::Duration;
+
 use alloy::consensus::Transaction as _;
 use alloy::primitives::{Address, Bytes, TxHash, U256};
 use alloy::providers::Provider;
-use alloy::rpc::types::{Filter, Transaction, TransactionReceipt};
+use alloy::rpc::types::{Filter, Log, Transaction, TransactionReceipt};
 use alloy::sol_types::{SolCall, SolEvent};
 use alloy::transports::{RpcError, TransportErrorKind};
 use async_trait::async_trait;
@@ -35,6 +37,13 @@ const RELAY_DEPOSIT_GAS_LIMIT: u64 = 57_114;
 /// Blocks per `eth_getLogs` call of a deposit scan.
 const DEPOSIT_LOG_CHUNK: u64 = 10_000;
 
+/// Reads of each chunk of a deposit scan: one lagging load-balanced node can
+/// answer a range empty, as `CctpEndpoint::find_recent_burn` also guards.
+const SCAN_ATTEMPTS: u32 = 5;
+
+/// Pause between reads of a chunk, so another node may answer.
+const SCAN_RETRY_BACKOFF: Duration = Duration::from_millis(150);
+
 /// Who builds a [`RelayBridge`]: the corridor chain and a wallet on each end,
 /// with the confirmations each end requires of a deposit, a payment and a
 /// deposit scan.
@@ -59,7 +68,15 @@ pub struct RelayEndContracts {
 pub struct RelayBridge<EthWallet, ChainWallet> {
     hub: RelayEnd<EthWallet>,
     chain: RelayEnd<ChainWallet>,
-    log_chunk: u64,
+    scan_pace: ScanPace,
+}
+
+/// How a deposit scan reads the logs.
+#[derive(Debug, Clone, Copy)]
+struct ScanPace {
+    /// Blocks per `eth_getLogs` call.
+    chunk: u64,
+    backoff: Duration,
 }
 
 /// One chain's stable, depository and our wallet there.
@@ -149,7 +166,10 @@ impl<EthWallet: Wallet, ChainWallet: Wallet> RelayBridge<EthWallet, ChainWallet>
                 ctx.ethereum_confirmations,
             )?,
             chain: RelayEnd::pinned(ctx.chain, ctx.chain_wallet, ctx.chain_confirmations)?,
-            log_chunk: DEPOSIT_LOG_CHUNK,
+            scan_pace: ScanPace {
+                chunk: DEPOSIT_LOG_CHUNK,
+                backoff: SCAN_RETRY_BACKOFF,
+            },
         })
     }
 
@@ -172,7 +192,15 @@ impl<EthWallet: Wallet, ChainWallet: Wallet> RelayBridge<EthWallet, ChainWallet>
     #[cfg(test)]
     #[must_use]
     fn with_log_chunk(mut self, blocks: u64) -> Self {
-        self.log_chunk = blocks;
+        self.scan_pace.chunk = blocks;
+        self
+    }
+
+    /// Rereads a scan's chunks without pausing, so tests stay fast.
+    #[cfg(test)]
+    #[must_use]
+    fn without_scan_backoff(mut self) -> Self {
+        self.scan_pace.backoff = Duration::ZERO;
         self
     }
 
@@ -327,12 +355,12 @@ impl<EthWallet: Wallet, ChainWallet: Wallet> SwapBridge for RelayBridge<EthWalle
         match direction {
             HopDirection::ToHub => {
                 self.chain
-                    .find_deposits(order_ids, from_block, self.log_chunk)
+                    .find_deposits(order_ids, from_block, self.scan_pace)
                     .await
             }
             HopDirection::FromHub => {
                 self.hub
-                    .find_deposits(order_ids, from_block, self.log_chunk)
+                    .find_deposits(order_ids, from_block, self.scan_pace)
                     .await
             }
         }
@@ -740,7 +768,7 @@ impl<W: Wallet> RelayEnd<W> {
         &self,
         order_ids: &[RelayOrderId],
         from_block: u64,
-        chunk: u64,
+        pace: ScanPace,
     ) -> Result<DepositScan<RelayOrderId>, RelayBridgeError> {
         let head = self.wallet.provider().get_block_number().await?;
 
@@ -755,56 +783,10 @@ impl<W: Wallet> RelayEnd<W> {
 
         while start <= scanned_to {
             let end = start
-                .saturating_add(chunk.saturating_sub(1))
+                .saturating_add(pace.chunk.saturating_sub(1))
                 .min(scanned_to);
 
-            let filter = Filter::new()
-                .address(self.depository)
-                .event_signature(RelayErc20Deposit::SIGNATURE_HASH)
-                .from_block(start)
-                .to_block(end);
-
-            let logs = self.wallet.provider().get_logs(&filter).await?;
-
-            for log in &logs {
-                let Some(event) = deposit_event(log, self.depository) else {
-                    continue;
-                };
-                let order_id = RelayOrderId(event.id);
-
-                if !self.is_ours(&event) || !order_ids.contains(&order_id) {
-                    continue;
-                }
-
-                let (Some(tx), Some(block)) = (log.transaction_hash, log.block_number) else {
-                    return Err(RelayBridgeError::DepositLogIncomplete { order_id });
-                };
-
-                let receipt = self
-                    .wallet
-                    .provider()
-                    .get_transaction_receipt(tx)
-                    .await?
-                    .ok_or(RelayBridgeError::DepositReceiptMissing { tx })?;
-
-                if !self.sent_by_us(&receipt) {
-                    warn!(
-                        target: "bridge",
-                        %tx,
-                        %order_id,
-                        from = %receipt.from,
-                        "Relay deposit names our wallet but another account sent it"
-                    );
-                    continue;
-                }
-
-                deposits.push(SwapDeposit {
-                    tx,
-                    order_id,
-                    amount: event.amount,
-                    block,
-                });
-            }
+            deposits.extend(self.read_chunk(order_ids, start, end, pace).await?);
 
             start = end.saturating_add(1);
         }
@@ -823,6 +805,96 @@ impl<W: Wallet> RelayEnd<W> {
             deposits,
             scanned_to,
         })
+    }
+
+    /// Our deposits for `order_ids` in blocks `start..=end`. A load-balanced
+    /// node may lag and answer a range empty, so the chunk is read
+    /// `SCAN_ATTEMPTS` times and a deposit any read returns is kept.
+    async fn read_chunk(
+        &self,
+        order_ids: &[RelayOrderId],
+        start: u64,
+        end: u64,
+        pace: ScanPace,
+    ) -> Result<Vec<SwapDeposit<RelayOrderId>>, RelayBridgeError> {
+        let filter = Filter::new()
+            .address(self.depository)
+            .event_signature(RelayErc20Deposit::SIGNATURE_HASH)
+            .from_block(start)
+            .to_block(end);
+
+        let mut candidates = Vec::new();
+
+        for attempt in 1..=SCAN_ATTEMPTS {
+            let logs = self.wallet.provider().get_logs(&filter).await?;
+
+            for log in &logs {
+                if let Some(deposit) = self.candidate(log, order_ids)?
+                    && !candidates.contains(&deposit)
+                {
+                    candidates.push(deposit);
+                }
+            }
+
+            if attempt < SCAN_ATTEMPTS {
+                tokio::time::sleep(pace.backoff).await;
+            }
+        }
+
+        let mut deposits = Vec::with_capacity(candidates.len());
+
+        for deposit in candidates {
+            let receipt = self
+                .wallet
+                .provider()
+                .get_transaction_receipt(deposit.tx)
+                .await?
+                .ok_or(RelayBridgeError::DepositReceiptMissing { tx: deposit.tx })?;
+
+            if !self.sent_by_us(&receipt) {
+                warn!(
+                    target: "bridge",
+                    tx = %deposit.tx,
+                    order_id = %deposit.order_id,
+                    from = %receipt.from,
+                    "Relay deposit names our wallet but another account sent it"
+                );
+                continue;
+            }
+
+            deposits.push(deposit);
+        }
+
+        deposits.sort_by_key(|deposit| deposit.block);
+        Ok(deposits)
+    }
+
+    /// The deposit `log` records, when it names our wallet and stable and one
+    /// of `order_ids`; who sent it is checked after.
+    fn candidate(
+        &self,
+        log: &Log,
+        order_ids: &[RelayOrderId],
+    ) -> Result<Option<SwapDeposit<RelayOrderId>>, RelayBridgeError> {
+        let Some(event) = deposit_event(log, self.depository) else {
+            return Ok(None);
+        };
+        let order_id = RelayOrderId(event.id);
+
+        if !self.is_ours(&event) || !order_ids.contains(&order_id) {
+            return Ok(None);
+        }
+
+        let (Some(tx), Some(block)) = (log.transaction_hash, log.block_number) else {
+            return Err(RelayBridgeError::DepositLogIncomplete { order_id });
+        };
+
+        Ok(Some(SwapDeposit {
+            tx,
+            order_id,
+            amount: event.amount,
+            block,
+        }))
     }
 
     /// Requires `found` to have this chain's confirmations, then checks it
@@ -938,13 +1010,12 @@ impl ProofError {
 mod tests {
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicU32, Ordering};
-    use std::time::{Duration, SystemTime};
+    use std::time::SystemTime;
 
     use alloy::consensus::TxEnvelope;
     use alloy::eips::Decodable2718;
     use alloy::primitives::{B256, Signature};
     use alloy::providers::{DynProvider, ProviderBuilder, RootProvider};
-    use alloy::rpc::types::Log;
     use alloy::transports::TransportResult;
 
     use st0x_evm::Evm;
@@ -984,7 +1055,8 @@ mod tests {
                 chain_confirmations: CONFIRMATIONS,
             })
             .unwrap()
-            .with_local_contracts(contracts(&hub), contracts(&chain));
+            .with_local_contracts(contracts(&hub), contracts(&chain))
+            .without_scan_backoff();
 
             Self { hub, chain, bridge }
         }
@@ -2508,7 +2580,8 @@ mod tests {
             chain_confirmations: CONFIRMATIONS,
         })
         .unwrap()
-        .with_local_contracts(contracts(&harness.hub), contracts(&harness.chain));
+        .with_local_contracts(contracts(&harness.hub), contracts(&harness.chain))
+        .without_scan_backoff();
 
         let scan = bridge
             .find_recent_deposits(HopDirection::ToHub, &[deposit.order_id], from_block)
