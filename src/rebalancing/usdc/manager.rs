@@ -2227,7 +2227,10 @@ impl<Signer: Wallet, B: UsdcBridgeHelper> CrossVenueCashTransfer<Signer, B> {
                     info!(target: "rebalance", %id, tx = %prepared.tx_hash(), nonce = prepared.nonce(), "Reserved the nonce of a signed Alpaca deposit send");
                     outcome.restored += 1;
 
-                    if !self.rebroadcast_restored_deposit_send(&id, prepared).await {
+                    if !self
+                        .rebroadcast_restored_send(&id, prepared, "Alpaca deposit send")
+                        .await
+                    {
                         outcome.unmined += 1;
                     }
                 }
@@ -2276,7 +2279,10 @@ impl<Signer: Wallet, B: UsdcBridgeHelper> CrossVenueCashTransfer<Signer, B> {
                         info!(target: "rebalance", %id, tx = %prepared.tx_hash(), nonce = prepared.nonce(), "Reserved the nonce of a signed Relay envelope on the Ethereum wallet");
                         outcome.restored += 1;
 
-                        if !self.rebroadcast_restored_deposit_send(&id, prepared).await {
+                        if !self
+                            .rebroadcast_restored_send(&id, prepared, "Relay envelope")
+                            .await
+                        {
                             outcome.unmined += 1;
                         }
                     }
@@ -2321,29 +2327,31 @@ impl<Signer: Wallet, B: UsdcBridgeHelper> CrossVenueCashTransfer<Signer, B> {
         .await
     }
 
-    /// Rebroadcasts a deposit send restored at startup and reports whether it
-    /// is mined. A failed rebroadcast pages; a send with no receipt, or whose
-    /// receipt cannot be read, counts as not mined.
-    async fn rebroadcast_restored_deposit_send(
+    /// Rebroadcasts a send restored at startup on the Ethereum wallet (`what`
+    /// names it in the logs) and reports whether it is mined. A failed
+    /// rebroadcast pages; a send with no receipt, or whose receipt cannot be
+    /// read, counts as not mined.
+    async fn rebroadcast_restored_send(
         &self,
         id: &UsdcRebalanceId,
         prepared: &PreparedTransaction,
+        what: &'static str,
     ) -> bool {
         let tx = prepared.tx_hash();
         let nonce = prepared.nonce();
         if let Err(error) = self.hop.broadcast_usdc_on_ethereum(prepared).await {
-            error!(target: "operational_alert", alert = true, %id, %tx, nonce, ?error, "Could not rebroadcast a signed Alpaca deposit send at startup; its nonce stays reserved, so startup skips Ethereum token approvals and allowance revokes, and the transfer's resume broadcasts it again");
+            error!(target: "operational_alert", alert = true, %id, %tx, nonce, ?error, "Could not rebroadcast a signed {what} at startup; its nonce stays reserved, so startup skips Ethereum token approvals and allowance revokes, and the transfer's resume broadcasts it again");
             return false;
         }
 
         match self.hop.ethereum_tx_confirmations(tx).await {
             Ok(Some(_)) => true,
             Ok(None) => {
-                warn!(target: "rebalance", %id, %tx, nonce, "Restored Alpaca deposit send is not mined yet at startup");
+                warn!(target: "rebalance", %id, %tx, nonce, "Restored {what} is not mined yet at startup");
                 false
             }
             Err(error) => {
-                warn!(target: "rebalance", %id, %tx, nonce, ?error, "Could not read the receipt of a restored Alpaca deposit send at startup; treating it as not mined");
+                warn!(target: "rebalance", %id, %tx, nonce, ?error, "Could not read the receipt of a restored {what} at startup; treating it as not mined");
                 false
             }
         }
@@ -20330,7 +20338,7 @@ mod tests {
     /// a shortfall instead of reading that USDC as its own.
     #[tracing_test::traced_test]
     #[tokio::test]
-    async fn relay_credit_held_on_ethereum_blocks_base_deposit_send() {
+    async fn relay_credit_held_on_ethereum_pages_shortfall_on_base_deposit_send() {
         let market_maker_wallet = address!("0x2222222222222222222222222222222222222222");
         let chain = deploy_ethereum_usdc_chain_with_balance(
             U256::from(100_000_000u64),

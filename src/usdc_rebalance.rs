@@ -4903,7 +4903,23 @@ impl UsdcRebalance {
             Self::SwapDepositPrepared { .. } | Self::SwapDeposited { .. } => {
                 Err(UsdcRebalanceError::SwapDepositAlreadyPrepared)
             }
-            _ => Err(UsdcRebalanceError::InvalidCommand {
+            Self::Converting { .. }
+            | Self::ConversionComplete { .. }
+            | Self::ConversionFailed { .. }
+            | Self::WithdrawalSubmitting { .. }
+            | Self::Withdrawing { .. }
+            | Self::WithdrawalComplete { .. }
+            | Self::WithdrawalFailed { .. }
+            | Self::BridgingSubmitting { .. }
+            | Self::Bridging { .. }
+            | Self::AwaitingAttestation { .. }
+            | Self::Attested { .. }
+            | Self::Bridged { .. }
+            | Self::BridgingFailed { .. }
+            | Self::DepositInitiated { .. }
+            | Self::DepositConfirmed { .. }
+            | Self::DepositFailed { .. }
+            | Self::Reconciled { .. } => Err(UsdcRebalanceError::InvalidCommand {
                 command: "PrepareSwapApprove".to_string(),
                 state: self.state_name().to_string(),
             }),
@@ -4925,7 +4941,23 @@ impl UsdcRebalance {
             Self::SwapDepositPrepared { .. } | Self::SwapDeposited { .. } => {
                 Err(UsdcRebalanceError::SwapDepositAlreadyPrepared)
             }
-            _ => Err(UsdcRebalanceError::InvalidCommand {
+            Self::Converting { .. }
+            | Self::ConversionComplete { .. }
+            | Self::ConversionFailed { .. }
+            | Self::WithdrawalSubmitting { .. }
+            | Self::Withdrawing { .. }
+            | Self::WithdrawalComplete { .. }
+            | Self::WithdrawalFailed { .. }
+            | Self::BridgingSubmitting { .. }
+            | Self::Bridging { .. }
+            | Self::AwaitingAttestation { .. }
+            | Self::Attested { .. }
+            | Self::Bridged { .. }
+            | Self::BridgingFailed { .. }
+            | Self::DepositInitiated { .. }
+            | Self::DepositConfirmed { .. }
+            | Self::DepositFailed { .. }
+            | Self::Reconciled { .. } => Err(UsdcRebalanceError::InvalidCommand {
                 command: "PrepareSwapDeposit".to_string(),
                 state: self.state_name().to_string(),
             }),
