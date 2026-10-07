@@ -234,8 +234,10 @@ signs a fresh pair. `broadcast_deposit` sends the approve and then the deposit,
 refusing a pair that is not consecutive with `PairNonces`; a repeat sends the
 same bytes. `confirm_deposit` waits for the receipt, requires the origin chain's
 confirmations from `RelayCtx` (`RelayBridgeError::Unconfirmed` until it has
-them, as the wallet's own wait may count fewer) and a `RelayErc20Deposit` from
-our wallet, in the origin stable, for the order id.
+them, as the wallet's own wait may count fewer), a receipt from the canonical
+block at its height (`NotCanonical` for one a lagging node serves from a
+reorged-out block; retry) and a `RelayErc20Deposit` from our wallet, in the
+origin stable, for the order id.
 
 `find_recent_deposits` scans the depository's logs from a captured
 `origin_block` in 10,000-block chunks, decodes each, and returns our deposits
@@ -253,7 +255,8 @@ assumed.
 (`IntentStatusReport::txs`) and require exactly one. The tx is looked up on both
 chains; a tx on neither is `RelayBridgeError::TxNotFound` (retry later, the node
 may lag). The bridge waits for the receipt and requires that chain's
-confirmations from `RelayCtx` (`Unconfirmed` until it has them), then:
+confirmations from `RelayCtx` (`Unconfirmed` until it has them) in the canonical
+block (`NotCanonical` otherwise), then:
 
 - receipt success;
 - the tx calls that side's stable, with exactly `transferFrom` + one trailing
