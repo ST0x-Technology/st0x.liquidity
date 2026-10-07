@@ -55,9 +55,10 @@ not the CCTP implementation directly. Implementation details must remain hidden.
    `RelayBridgeError` and `UnverifiedReason` (behind `relay` feature)
 8. **Stable endpoint** - `StableEndpoint` (one chain's stable seen from our
    wallet: tx reads, credits, the signed transfer of a deposit send),
-   `StableEndpointError` and `UsdcTransferStatus`, reached through
-   `CctpBridge`'s Ethereum methods or `RelayBridge::ethereum_stable` (behind
-   either feature)
+   `StableEndpointError` and `UsdcTransferStatus` (behind either feature).
+   `StableEndpoint` is reached only through `RelayBridge::ethereum_stable`;
+   `CctpBridge` uses it internally. `UsdcTransferStatus` is also re-exported
+   from `cctp`
 9. **Test stand-ins** - the CCTP deployers, `deploy_relay_end`,
    `RelayEndContracts` and `RelayBridge::with_local_contracts` (behind `mock`)
 
