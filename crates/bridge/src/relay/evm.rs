@@ -19,6 +19,7 @@ use super::proof::{
 };
 use super::quote::{StepTerms, StepTransaction, check_steps};
 use super::{AcceptedRelayQuote, QuoteField, QuoteMismatch, RelayOrderId};
+use crate::stable_endpoint::StableEndpoint;
 use crate::{
     DepositScan, HopDirection, PreparedSwap, PreparedSwapDeposit, SwapBridge, SwapDeposit,
     SwapPayment, SwapSide,
@@ -173,6 +174,12 @@ impl<EthWallet: Wallet, ChainWallet: Wallet> RelayBridge<EthWallet, ChainWallet>
                 backoff: SCAN_RETRY_BACKOFF,
             },
         })
+    }
+
+    /// The Ethereum hub's USDC as seen from our wallet there, for the hub
+    /// legs every hop shares.
+    pub const fn ethereum_stable(&self) -> StableEndpoint<'_, EthWallet> {
+        StableEndpoint::new(self.hub.stable, &self.hub.wallet)
     }
 
     /// Points each end at locally deployed contracts.
