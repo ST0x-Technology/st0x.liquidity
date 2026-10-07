@@ -53,7 +53,13 @@ not the CCTP implementation directly. Implementation details must remain hidden.
    (`HopDirection`, `PreparedSwap`, `PreparedSwapDeposit`, `SwapDeposit`,
    `DepositScan`, `SwapSide`, `SwapPayment`), `RelayBridge`, `RelayCtx`,
    `RelayBridgeError` and `UnverifiedReason` (behind `relay` feature)
-8. **Test stand-ins** - the CCTP deployers, `deploy_relay_end`,
+8. **Stable endpoint** - `StableEndpoint` (one chain's stable seen from our
+   wallet: tx reads, credits, the signed transfer of a deposit send),
+   `StableEndpointError` and `UsdcTransferStatus` (behind either feature).
+   `StableEndpoint` is reached only through `RelayBridge::ethereum_stable`;
+   `CctpBridge` uses it internally. `UsdcTransferStatus` is also re-exported
+   from `cctp`
+9. **Test stand-ins** - the CCTP deployers, `deploy_relay_end`,
    `RelayEndContracts` and `RelayBridge::with_local_contracts` (behind `mock`)
 
 **What must remain private:**

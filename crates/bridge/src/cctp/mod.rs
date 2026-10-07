@@ -88,6 +88,8 @@ use st0x_float_serde::{deserialize_float_from_number_or_string, format_float_wit
 
 use crate::BridgeDirection;
 use crate::corridor::UsdcCorridor;
+use crate::stable_endpoint::StableEndpointError;
+pub use crate::stable_endpoint::UsdcTransferStatus;
 use evm::CctpEndpoint;
 
 // Committed ABI: CCTP contracts use solc 0.7.6 which solc.nix doesn't have for aarch64-darwin
@@ -446,17 +448,6 @@ pub enum MintScanFloorCheck {
     Unverified { from_block_timestamp: u64 },
 }
 
-/// What became of a broadcast Ethereum USDC transfer once its receipt was read.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum UsdcTransferStatus {
-    /// Mined successfully and confirmed to the wallet's required depth.
-    Confirmed,
-    /// Mined and reverted: it moved no USDC.
-    Reverted,
-    /// Absent from the mempool past the drop grace window, never mined.
-    Dropped,
-}
-
 /// Errors that can occur during CCTP bridge operations.
 #[derive(Debug, thiserror::Error)]
 pub enum CctpError {
@@ -596,6 +587,27 @@ pub enum CctpError {
     HexDecode(#[from] alloy::hex::FromHexError),
     #[error("Fee value parse error: {0}")]
     FeeValueParse(#[from] std::num::ParseIntError),
+}
+
+impl From<StableEndpointError> for CctpError {
+    fn from(error: StableEndpointError) -> Self {
+        match error {
+            StableEndpointError::Evm(source) => Self::Evm(source),
+            StableEndpointError::RpcTransport(source) => Self::RpcTransport(source),
+            StableEndpointError::SolType(source) => Self::SolType(source),
+            StableEndpointError::ScanInconclusive { from_block } => {
+                Self::ScanInconclusive { from_block }
+            }
+            StableEndpointError::TxReceiptMissingBlock { tx_hash } => {
+                Self::TxReceiptMissingBlock { tx_hash }
+            }
+            StableEndpointError::TxNotMined { tx_hash } => Self::TxNotMined { tx_hash },
+            StableEndpointError::CreditOverflow { tx_hash } => Self::UsdcCreditOverflow { tx_hash },
+            StableEndpointError::TransferLogDecode { tx_hash, source } => {
+                Self::UsdcTransferLogDecode { tx_hash, source }
+            }
+        }
+    }
 }
 
 impl CctpError {
@@ -1260,9 +1272,7 @@ impl<EthWallet: Wallet, BaseWallet: Wallet> CctpBridge<EthWallet, BaseWallet> {
     /// if the freshly minted USDC is no longer in the wallet, the vault deposit
     /// already landed, so re-submitting it would double-deposit (or revert).
     pub async fn base_usdc_balance(&self, holder: Address) -> Result<U256, CctpError> {
-        self.base
-            .usdc_balance::<OpenChainErrorRegistry>(holder)
-            .await
+        Ok(self.base.stable().balance(holder).await?)
     }
 
     /// Returns `holder`'s USDC balance on Ethereum, the source chain for
@@ -1272,9 +1282,7 @@ impl<EthWallet: Wallet, BaseWallet: Wallet> CctpBridge<EthWallet, BaseWallet> {
     /// before each burn or deposit send. Delegates to the Ethereum endpoint,
     /// not Base.
     pub async fn ethereum_usdc_balance(&self, holder: Address) -> Result<U256, CctpError> {
-        self.ethereum
-            .usdc_balance::<OpenChainErrorRegistry>(holder)
-            .await
+        Ok(self.ethereum.stable().balance(holder).await?)
     }
 
     /// Returns the number of confirmations `tx_hash` has on Ethereum, or `None`
@@ -1291,13 +1299,13 @@ impl<EthWallet: Wallet, BaseWallet: Wallet> CctpBridge<EthWallet, BaseWallet> {
         &self,
         tx_hash: TxHash,
     ) -> Result<Option<u64>, CctpError> {
-        self.ethereum.tx_confirmations(tx_hash).await
+        Ok(self.ethereum.stable().tx_confirmations(tx_hash).await?)
     }
 
     /// Returns `tx_hash` as mined on Ethereum, or `None` while the node shows
     /// no canonical receipt for it.
     pub async fn ethereum_mined_tx(&self, tx_hash: TxHash) -> Result<Option<MinedTx>, CctpError> {
-        self.ethereum.mined_tx(tx_hash).await
+        Ok(self.ethereum.stable().mined_tx(tx_hash).await?)
     }
 
     /// Ensures the standing allowance, queries the fast transfer fee, and signs
@@ -1397,8 +1405,8 @@ impl<EthWallet: Wallet, BaseWallet: Wallet> CctpBridge<EthWallet, BaseWallet> {
         tx_hash: TxHash,
     ) -> Result<Option<MinedTx>, CctpError> {
         match direction {
-            BridgeDirection::EthereumToBase => self.ethereum.mined_tx(tx_hash).await,
-            BridgeDirection::BaseToEthereum => self.base.mined_tx(tx_hash).await,
+            BridgeDirection::EthereumToBase => Ok(self.ethereum.stable().mined_tx(tx_hash).await?),
+            BridgeDirection::BaseToEthereum => Ok(self.base.stable().mined_tx(tx_hash).await?),
         }
     }
 
@@ -1448,7 +1456,7 @@ impl<EthWallet: Wallet, BaseWallet: Wallet> CctpBridge<EthWallet, BaseWallet> {
     /// known mint tx: the deposit send to Alpaca lands at or after the mint, so
     /// the mint's block is the scan lower bound.
     pub async fn ethereum_tx_block(&self, tx_hash: TxHash) -> Result<u64, CctpError> {
-        self.ethereum.tx_block(tx_hash).await
+        Ok(self.ethereum.stable().tx_block(tx_hash).await?)
     }
 
     /// Returns the USDC that `tx_hash` paid `recipient` on Ethereum: the sum of
@@ -1459,7 +1467,11 @@ impl<EthWallet: Wallet, BaseWallet: Wallet> CctpBridge<EthWallet, BaseWallet> {
         tx_hash: TxHash,
         recipient: Address,
     ) -> Result<U256, CctpError> {
-        self.ethereum.usdc_credited_in_tx(tx_hash, recipient).await
+        Ok(self
+            .ethereum
+            .stable()
+            .credited_in_tx(tx_hash, recipient)
+            .await?)
     }
 
     /// Returns the USDC that `tx_hash` moved from `sender` to `recipient` on
@@ -1471,9 +1483,11 @@ impl<EthWallet: Wallet, BaseWallet: Wallet> CctpBridge<EthWallet, BaseWallet> {
         sender: Address,
         recipient: Address,
     ) -> Result<U256, CctpError> {
-        self.ethereum
-            .usdc_sent_in_tx(tx_hash, sender, recipient)
-            .await
+        Ok(self
+            .ethereum
+            .stable()
+            .sent_in_tx(tx_hash, sender, recipient)
+            .await?)
     }
 
     /// Signs a transfer of `amount` (USDC smallest unit, 6 decimals) of
@@ -1488,7 +1502,7 @@ impl<EthWallet: Wallet, BaseWallet: Wallet> CctpBridge<EthWallet, BaseWallet> {
         to: Address,
         amount: U256,
     ) -> Result<PreparedTransaction, CctpError> {
-        Ok(self.ethereum.prepare_usdc(to, amount).await?)
+        Ok(self.ethereum.stable().prepare_transfer(to, amount).await?)
     }
 
     /// Broadcasts a transfer signed by
@@ -1498,19 +1512,19 @@ impl<EthWallet: Wallet, BaseWallet: Wallet> CctpBridge<EthWallet, BaseWallet> {
         &self,
         prepared: &PreparedTransaction,
     ) -> Result<TxHash, CctpError> {
-        Ok(self.ethereum.broadcast_usdc(prepared).await?)
+        Ok(self.ethereum.stable().broadcast_transfer(prepared).await?)
     }
 
     /// Releases the nonce of a signed transfer that was not persisted and so
     /// will never be broadcast.
     pub async fn discard_usdc_on_ethereum(&self, prepared: &PreparedTransaction) {
-        self.ethereum.discard_usdc(prepared).await;
+        self.ethereum.stable().discard_transfer(prepared).await;
     }
 
     /// Reserves the nonce of a persisted signed transfer after a restart,
     /// before any other send from the wallet can take it.
     pub async fn restore_usdc_on_ethereum(&self, prepared: &PreparedTransaction) {
-        self.ethereum.restore_usdc(prepared).await;
+        self.ethereum.stable().restore_transfer(prepared).await;
     }
 
     /// Awaits the receipt of a transfer broadcast by
@@ -1521,9 +1535,7 @@ impl<EthWallet: Wallet, BaseWallet: Wallet> CctpBridge<EthWallet, BaseWallet> {
         &self,
         tx_hash: TxHash,
     ) -> Result<UsdcTransferStatus, CctpError> {
-        self.ethereum
-            .confirm_usdc::<OpenChainErrorRegistry>(tx_hash)
-            .await
+        Ok(self.ethereum.stable().confirm_transfer(tx_hash).await?)
     }
 
     /// Scans Ethereum for USDC `Transfer(from, to, value == amount)` events at
@@ -1543,9 +1555,11 @@ impl<EthWallet: Wallet, BaseWallet: Wallet> CctpBridge<EthWallet, BaseWallet> {
         amount: U256,
         from_block: u64,
     ) -> Result<Vec<TxHash>, CctpError> {
-        self.ethereum
-            .find_recent_usdc_transfers(from, to, amount, from_block)
-            .await
+        Ok(self
+            .ethereum
+            .stable()
+            .find_recent_transfers(from, to, amount, from_block)
+            .await?)
     }
 }
 
@@ -6615,7 +6629,8 @@ mod tests {
         assert_eq!(
             bridge
                 .ethereum
-                .usdc_credited_in_tx(send_tx, recipient)
+                .stable()
+                .credited_in_tx(send_tx, recipient)
                 .await
                 .unwrap(),
             amount,
@@ -6693,7 +6708,8 @@ mod tests {
         assert_eq!(
             bridge
                 .ethereum
-                .usdc_credited_in_tx(first, recipient)
+                .stable()
+                .credited_in_tx(first, recipient)
                 .await
                 .unwrap(),
             amount,
@@ -7733,5 +7749,25 @@ mod tests {
             panic!("a consumed nonce outside the window must fail: {old_floor_error:?}");
         };
         assert_eq!(from_block, old_floor - 50);
+    }
+
+    #[test]
+    fn stable_endpoint_credit_errors_map_to_the_usdc_cctp_variants() {
+        let tx_hash = TxHash::repeat_byte(0x42);
+
+        let overflow = CctpError::from(StableEndpointError::CreditOverflow { tx_hash });
+        assert!(
+            matches!(overflow, CctpError::UsdcCreditOverflow { tx_hash: mapped } if mapped == tx_hash),
+            "got: {overflow:?}"
+        );
+
+        let decode = CctpError::from(StableEndpointError::TransferLogDecode {
+            tx_hash,
+            source: alloy::sol_types::Error::custom("malformed Transfer log"),
+        });
+        assert!(
+            matches!(decode, CctpError::UsdcTransferLogDecode { tx_hash: mapped, .. } if mapped == tx_hash),
+            "got: {decode:?}"
+        );
     }
 }

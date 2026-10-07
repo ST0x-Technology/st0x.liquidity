@@ -13,15 +13,18 @@ use tracing::{debug, info, trace, warn};
 #[cfg(test)]
 use st0x_evm::Evm;
 use st0x_evm::{
-    Chain, EvmError, IntoErrorRegistry, MinedTx, NODE_SYNC_MAX_ATTEMPTS, NODE_SYNC_POLL_INTERVAL,
+    Chain, EvmError, IntoErrorRegistry, NODE_SYNC_MAX_ATTEMPTS, NODE_SYNC_POLL_INTERVAL,
     PreparedTransaction, Wallet, wait_for_node_sync,
 };
 
 use super::{
     CctpError, CctpReceivedMessage, FAST_TRANSFER_THRESHOLD, MessageTransmitterV2, MintReceipt,
-    MintScanFloorCheck, TokenMessengerV2, UsdcTransferStatus, parse_received_message,
+    MintScanFloorCheck, TokenMessengerV2, parse_received_message,
 };
 use crate::BridgeDirection;
+use crate::stable_endpoint::{
+    SCAN_ATTEMPTS, SCAN_FINALITY_MARGIN, SCAN_RETRY_BACKOFF, StableEndpoint,
+};
 
 const CCTP_RECOVERY_LOG_BLOCK_CHUNK: u64 = 20_000;
 
@@ -62,18 +65,6 @@ sol!(
     #[derive(serde::Serialize, serde::Deserialize)]
     IERC20, env!("ST0X_IERC20_ABI")
 );
-
-/// Number of `eth_getLogs` scans that must agree a burn is absent before a
-/// resume re-issues an irreversible burn. Defends against a single load-balanced
-/// RPC node lagging and returning a false-empty result.
-const SCAN_ATTEMPTS: u32 = 5;
-
-/// Backoff between scan retries; different load-balanced nodes may answer each.
-const SCAN_RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_millis(150);
-
-/// Blocks the chain head must be past `from_block` before an empty scan is
-/// trusted as a true absence (the burn lands at/after `from_block`).
-const SCAN_FINALITY_MARGIN: u64 = 2;
 
 /// How far back [`CctpEndpoint::reconstruct_existing_mint`] scans from the
 /// head. It runs only after [`CctpEndpoint::recover_already_minted`] saw
@@ -816,56 +807,6 @@ impl<W: Wallet> CctpEndpoint<W> {
         Ok(self.wallet.provider().get_block_number().await?)
     }
 
-    /// Returns the block in which `tx_hash` was mined on this endpoint's chain.
-    ///
-    /// Used to derive the lower bound for [`find_recent_usdc_transfers`] from the
-    /// known mint tx: the deposit send to Alpaca lands at or after the mint's
-    /// block, so the mint block bounds the transfer scan exactly the way the
-    /// captured head bounds [`find_recent_burn`]. Confirmation-aware: it polls via
-    /// `await_receipt` rather than a single-shot lookup, so a load-balanced node
-    /// that has not yet seen the mint does not yield a spurious "block missing".
-    pub(super) async fn tx_block(&self, tx_hash: TxHash) -> Result<u64, CctpError> {
-        let receipt = self.wallet.await_receipt(tx_hash).await?;
-
-        receipt
-            .block_number
-            .ok_or(CctpError::TxReceiptMissingBlock { tx_hash })
-    }
-
-    /// Returns the number of confirmations `tx_hash` has on this endpoint's
-    /// chain, or `None` if the transaction is not yet mined.
-    ///
-    /// Confirmations = (current head block) - (block the tx landed in) + 1.
-    /// A tx in the current head has 1 confirmation (the inclusion block counts),
-    /// matching the `required_confirmations` contract used across the codebase
-    /// (alloy's `with_required_confirmations`, the e2e settlement helper). Used to
-    /// gate operations on on-chain settlement without blocking -- the caller
-    /// decides whether to retry if confirmations are insufficient.
-    pub(super) async fn tx_confirmations(&self, tx_hash: TxHash) -> Result<Option<u64>, CctpError> {
-        let Some(receipt) = self
-            .wallet
-            .provider()
-            .get_transaction_receipt(tx_hash)
-            .await?
-        else {
-            return Ok(None);
-        };
-
-        let Some(tx_block) = receipt.block_number else {
-            return Ok(None);
-        };
-
-        let head = self.wallet.provider().get_block_number().await?;
-
-        Ok(Some(head.saturating_sub(tx_block).saturating_add(1)))
-    }
-
-    /// Returns `tx_hash` as mined on this endpoint's chain; see
-    /// [`st0x_evm::mined_tx`].
-    pub(super) async fn mined_tx(&self, tx_hash: TxHash) -> Result<Option<MinedTx>, CctpError> {
-        Ok(st0x_evm::mined_tx(self.wallet.provider(), tx_hash).await?)
-    }
-
     /// Whether `tx_hash`'s receipt carries the CCTP `MessageSent` event that
     /// [`confirm_burn`](Self::confirm_burn) requires of a burn, read without
     /// waiting. `None` while the node shows no receipt: a lagging node proves
@@ -895,174 +836,6 @@ impl<W: Wallet> CctpEndpoint<W> {
             .get_transaction_by_hash(tx_hash)
             .await?
             .is_some())
-    }
-
-    /// Sums the USDC `Transfer` logs in `tx_hash`'s receipt that pay `recipient`:
-    /// what that transaction credited to `recipient`, exact in base units.
-    pub(super) async fn usdc_credited_in_tx(
-        &self,
-        tx_hash: TxHash,
-        recipient: Address,
-    ) -> Result<U256, CctpError> {
-        let receipt = self.wallet.await_receipt(tx_hash).await?;
-
-        usdc_credit_in_receipt(&receipt, self.usdc_address, None, recipient)
-    }
-
-    /// Like [`usdc_credited_in_tx`](Self::usdc_credited_in_tx), counting only
-    /// the `Transfer` logs from `sender`. The hash comes from an operator, so
-    /// one with no receipt yet is refused at once (`TxNotMined`) instead of
-    /// waiting out the receipt wait's drop grace or timeout.
-    pub(super) async fn usdc_sent_in_tx(
-        &self,
-        tx_hash: TxHash,
-        sender: Address,
-        recipient: Address,
-    ) -> Result<U256, CctpError> {
-        if self
-            .wallet
-            .provider()
-            .get_transaction_receipt(tx_hash)
-            .await?
-            .is_none()
-        {
-            return Err(CctpError::TxNotMined { tx_hash });
-        }
-
-        let receipt = self.wallet.await_receipt(tx_hash).await?;
-
-        usdc_credit_in_receipt(&receipt, self.usdc_address, Some(sender), recipient)
-    }
-
-    /// Signs a transfer of `amount` of this endpoint's USDC from the wallet to
-    /// `to` without broadcasting it, reserving its nonce.
-    ///
-    /// This is the fund-moving leg of a BaseToAlpaca deposit: the CCTP mint
-    /// credits the bot wallet, and this transfer forwards the minted USDC to
-    /// Alpaca's deposit address. The caller persists the signed transfer
-    /// before [`broadcast_usdc`](Self::broadcast_usdc) sends it, so every
-    /// retry sends the same bytes and no second transfer can exist.
-    pub(super) async fn prepare_usdc(
-        &self,
-        to: Address,
-        amount: U256,
-    ) -> Result<PreparedTransaction, EvmError> {
-        self.wallet
-            .prepare_pending(
-                self.usdc_address,
-                Bytes::from(IERC20::transferCall { to, amount }.abi_encode()),
-                "USDC deposit to Alpaca",
-            )
-            .await
-    }
-
-    /// Broadcasts a transfer signed by [`prepare_usdc`](Self::prepare_usdc).
-    /// Idempotent: a repeat sends the same bytes, and "already known" is
-    /// success.
-    pub(super) async fn broadcast_usdc(
-        &self,
-        prepared: &PreparedTransaction,
-    ) -> Result<TxHash, EvmError> {
-        self.wallet
-            .broadcast_prepared(prepared, "USDC deposit to Alpaca")
-            .await
-    }
-
-    pub(super) async fn discard_usdc(&self, prepared: &PreparedTransaction) {
-        self.wallet.discard_prepared(prepared.tx_hash()).await;
-    }
-
-    pub(super) async fn restore_usdc(&self, prepared: &PreparedTransaction) {
-        self.wallet.restore_prepared(prepared).await;
-    }
-
-    /// Awaits the receipt of a transfer broadcast by
-    /// [`broadcast_usdc`](Self::broadcast_usdc) to the wallet's confirmation depth.
-    /// A revert (decoded via `Registry`) and a drop are reported as statuses;
-    /// any other error leaves the outcome unknown.
-    pub(super) async fn confirm_usdc<Registry: IntoErrorRegistry>(
-        &self,
-        tx_hash: TxHash,
-    ) -> Result<UsdcTransferStatus, CctpError> {
-        match self.wallet.confirm::<Registry>(tx_hash).await {
-            Ok(_) => Ok(UsdcTransferStatus::Confirmed),
-            Err(error) if error.is_revert() => Ok(UsdcTransferStatus::Reverted),
-            Err(error) if error.is_transaction_dropped() => Ok(UsdcTransferStatus::Dropped),
-            Err(error) => Err(error.into()),
-        }
-    }
-
-    /// Scans for USDC `Transfer(from, to, value == amount)` events at or after
-    /// `from_block`, returning every matching transaction hash, newest first.
-    ///
-    /// Detects a legacy unrecorded deposit send: a BaseToAlpaca transfer that
-    /// reached `Bridged` without a persisted signed send may already have sent
-    /// the minted USDC, so resume refuses to send again when a match is not
-    /// another transfer's send. The send lands at or after the mint, so the
-    /// match is bounded to `from_block` (the mint's block) onward. Matching on
-    /// `(from, to, value)` cannot tell this transfer's send from another
-    /// transfer's same-amount send, so a match is never adopted.
-    ///
-    /// Returns an empty list ONLY when the queried node is confirmations-deep past
-    /// `from_block` and repeated scans agree the transfer is absent; a node that
-    /// may be lagging (the dRPC load-balancing hazard) yields a retryable
-    /// [`CctpError::ScanInconclusive`], so the caller never re-sends off a single
-    /// stale empty `eth_getLogs`.
-    pub(super) async fn find_recent_usdc_transfers(
-        &self,
-        from: Address,
-        to: Address,
-        amount: U256,
-        from_block: u64,
-    ) -> Result<Vec<TxHash>, CctpError> {
-        let from_topic = FixedBytes::<32>::left_padding_from(from.as_slice());
-        let to_topic = FixedBytes::<32>::left_padding_from(to.as_slice());
-        let filter = Filter::new()
-            .from_block(from_block)
-            .address(self.usdc_address)
-            .event_signature(IERC20::Transfer::SIGNATURE_HASH)
-            .topic1(from_topic)
-            .topic2(to_topic);
-
-        for attempt in 1..=SCAN_ATTEMPTS {
-            let logs = self.wallet.provider().get_logs(&filter).await?;
-
-            let mut matches = Vec::new();
-            for log in logs.iter().rev() {
-                let decoded = log.log_decode::<IERC20::Transfer>()?;
-                let event = decoded.data();
-
-                if event.value == amount
-                    && log.block_number.is_some_and(|block| block >= from_block)
-                    && let Some(tx_hash) = log.transaction_hash
-                {
-                    matches.push(tx_hash);
-                }
-            }
-
-            if !matches.is_empty() {
-                debug!(target: "bridge", ?matches, from_block, "Found existing USDC deposit transfers during resume");
-                return Ok(matches);
-            }
-
-            // A single empty eth_getLogs from a load-balanced node is not
-            // authoritative (dRPC lag). Only conclude a true absence once the head
-            // is confirmations-deep past from_block AND repeated scans agree; else
-            // retry, and if still inconclusive return a retryable error so the
-            // caller never re-sends off a stale empty result.
-            let head = self.wallet.provider().get_block_number().await?;
-            let caught_up = head >= from_block.saturating_add(SCAN_FINALITY_MARGIN);
-
-            if caught_up && attempt == SCAN_ATTEMPTS {
-                return Ok(Vec::new());
-            }
-
-            if attempt < SCAN_ATTEMPTS {
-                tokio::time::sleep(SCAN_RETRY_BACKOFF).await;
-            }
-        }
-
-        Err(CctpError::ScanInconclusive { from_block })
     }
 
     /// Claims USDC on this chain by submitting the attestation.
@@ -1690,17 +1463,6 @@ impl<W: Wallet> CctpEndpoint<W> {
         }
     }
 
-    /// Returns `holder`'s balance of this chain's USDC token.
-    pub(super) async fn usdc_balance<Registry: IntoErrorRegistry>(
-        &self,
-        holder: Address,
-    ) -> Result<U256, CctpError> {
-        Ok(self
-            .wallet
-            .call::<Registry, _>(self.usdc_address, IERC20::balanceOfCall { account: holder })
-            .await?)
-    }
-
     #[cfg(test)]
     pub(super) fn usdc(&self) -> IERC20::IERC20Instance<&<W as Evm>::Provider> {
         IERC20::new(self.usdc_address, self.wallet.provider())
@@ -1729,6 +1491,11 @@ impl<W: Wallet> CctpEndpoint<W> {
 
     pub(super) fn owner(&self) -> Address {
         self.wallet.address()
+    }
+
+    /// This chain's USDC as seen from the wallet.
+    pub(super) const fn stable(&self) -> StableEndpoint<'_, W> {
+        StableEndpoint::new(self.usdc_address, &self.wallet)
     }
 
     #[cfg(test)]
@@ -1799,41 +1566,6 @@ fn validate_message_shape(
     }
 
     Ok(received_message)
-}
-
-/// Sums the `usdc` `Transfer` logs in `receipt` that pay `recipient`, from
-/// `sender` only when one is given. A log carrying the `Transfer` topic that
-/// does not decode fails the read: skipping it would undercredit the
-/// transfer silently.
-fn usdc_credit_in_receipt(
-    receipt: &TransactionReceipt,
-    usdc: Address,
-    sender: Option<Address>,
-    recipient: Address,
-) -> Result<U256, CctpError> {
-    let tx_hash = receipt.transaction_hash;
-
-    receipt
-        .inner
-        .logs()
-        .iter()
-        .filter(|log| {
-            log.address() == usdc && log.topics().first() == Some(&IERC20::Transfer::SIGNATURE_HASH)
-        })
-        .map(|log| {
-            IERC20::Transfer::decode_log(log.as_ref())
-                .map_err(|source| CctpError::UsdcTransferLogDecode { tx_hash, source })
-        })
-        .try_fold(U256::ZERO, |credited, transfer| {
-            let transfer = transfer?;
-            if transfer.to != recipient || sender.is_some_and(|sender| transfer.from != sender) {
-                return Ok(credited);
-            }
-
-            credited
-                .checked_add(transfer.value)
-                .ok_or(CctpError::UsdcCreditOverflow { tx_hash })
-        })
 }
 
 fn parse_mint_receipt(receipt: &TransactionReceipt) -> Option<MintReceipt> {
@@ -2005,106 +1737,6 @@ mod tests {
             to: Some(Address::ZERO),
             contract_address: None,
         }
-    }
-
-    const USDC: Address = Address::repeat_byte(0x11);
-    const WALLET: Address = Address::repeat_byte(0x22);
-
-    fn transfer_log(token: Address, to: Address, value: U256) -> Log {
-        let event = IERC20::Transfer {
-            from: Address::repeat_byte(0x33),
-            to,
-            value,
-        };
-
-        Log {
-            inner: PrimitiveLog {
-                address: token,
-                data: event.encode_log_data(),
-            },
-            block_hash: None,
-            block_number: None,
-            block_timestamp: None,
-            transaction_hash: Some(TxHash::ZERO),
-            transaction_index: None,
-            log_index: None,
-            removed: false,
-        }
-    }
-
-    #[test]
-    fn usdc_credit_sums_every_usdc_transfer_to_the_wallet() {
-        let receipt = receipt_with_logs(vec![
-            transfer_log(USDC, WALLET, U256::from(600_000u64)),
-            transfer_log(USDC, WALLET, U256::from(400_000u64)),
-        ]);
-
-        assert_eq!(
-            usdc_credit_in_receipt(&receipt, USDC, None, WALLET).unwrap(),
-            U256::from(1_000_000u64)
-        );
-    }
-
-    #[test]
-    fn usdc_credit_ignores_other_tokens_and_other_recipients() {
-        let other_token = Address::repeat_byte(0x44);
-        let elsewhere = Address::repeat_byte(0x55);
-        let receipt = receipt_with_logs(vec![
-            transfer_log(other_token, WALLET, U256::from(7_000_000u64)),
-            transfer_log(USDC, elsewhere, U256::from(9_000_000u64)),
-            transfer_log(USDC, WALLET, U256::from(1_000_000u64)),
-            mint_log(3, 5_000_000),
-        ]);
-
-        assert_eq!(
-            usdc_credit_in_receipt(&receipt, USDC, None, WALLET).unwrap(),
-            U256::from(1_000_000u64)
-        );
-    }
-
-    #[test]
-    fn usdc_credit_overflow_is_an_error() {
-        let receipt = receipt_with_logs(vec![
-            transfer_log(USDC, WALLET, U256::MAX),
-            transfer_log(USDC, WALLET, U256::from(1u64)),
-        ]);
-
-        let error = usdc_credit_in_receipt(&receipt, USDC, None, WALLET).unwrap_err();
-
-        assert!(
-            matches!(error, CctpError::UsdcCreditOverflow { tx_hash } if tx_hash == TxHash::ZERO),
-            "got: {error:?}"
-        );
-    }
-
-    #[test]
-    fn usdc_credit_fails_on_an_undecodable_usdc_transfer_log() {
-        // The Transfer topic without its indexed from/to topics.
-        let malformed = Log {
-            inner: PrimitiveLog::new_unchecked(
-                USDC,
-                vec![IERC20::Transfer::SIGNATURE_HASH],
-                Bytes::new(),
-            ),
-            block_hash: None,
-            block_number: None,
-            block_timestamp: None,
-            transaction_hash: Some(TxHash::ZERO),
-            transaction_index: None,
-            log_index: None,
-            removed: false,
-        };
-        let receipt = receipt_with_logs(vec![
-            transfer_log(USDC, WALLET, U256::from(1_000_000u64)),
-            malformed,
-        ]);
-
-        let error = usdc_credit_in_receipt(&receipt, USDC, None, WALLET).unwrap_err();
-
-        assert!(
-            matches!(error, CctpError::UsdcTransferLogDecode { tx_hash, .. } if tx_hash == TxHash::ZERO),
-            "got: {error:?}"
-        );
     }
 
     #[test]
