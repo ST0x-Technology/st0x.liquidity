@@ -351,6 +351,15 @@ pub trait SwapBridge: Send + Sync + 'static {
         quote: &Self::Quote,
     ) -> Result<PreparedSwap, Self::Error>;
 
+    /// Releases the nonces of a prepared swap that was not persisted and so
+    /// will never be broadcast, the deposit's before the approve's.
+    async fn discard_prepared(&self, direction: HopDirection, prepared: &PreparedSwap);
+
+    /// Reserves the nonces of a persisted prepared swap after a restart. The
+    /// caller restores every persisted swap before any other send from the
+    /// origin wallet, which would otherwise take a nonce in the pair.
+    async fn restore_prepared(&self, direction: HopDirection, prepared: &PreparedSwap);
+
     /// Broadcasts a prepared pair in nonce order and returns the deposit's
     /// hash. Idempotent: a repeat sends the same bytes.
     async fn broadcast_deposit(

@@ -206,7 +206,10 @@ chain, and serves both directions (`HopDirection::ToHub`, `FromHub`).
 
 `prepare_deposit` signs the approve and the deposit on the origin chain without
 broadcasting them, at consecutive nonces, and returns both
-`PreparedTransaction`s (`PreparedSwap::Deposit`) for the caller to persist. It
+`PreparedTransaction`s (`PreparedSwap::Deposit`) for the caller to persist. When
+the persist fails, `discard_prepared` releases both nonces, the deposit's first;
+after a restart, `restore_prepared` reserves a persisted swap's nonces, and the
+caller restores every persisted swap before any other send from that wallet. It
 refuses a step for another chain than the wallet's, a step that calls another
 contract than the origin's stable (approve) or depository (deposit), and a
 deposit that credits another depositor than the signing wallet. `RelayQuote`'s
