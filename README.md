@@ -22,12 +22,13 @@ HyperEVM chain requires an explicit HYPE threshold in
 configuration. Active mode, gas valuation and automated rebalancing on HyperEVM
 remain unavailable.
 
-Robinhood Chain (4663) is declared the same way and ships as a prefunded
-hedge-only secondary: fills on its two launch equities (wtDNUT, wtFGI) are
-ingested, validated against USDG and hedged, with `rebalancing = "disabled"` on
-every asset and no inventory adapter mapped. The build can also value its gas
-(it pays gas in ETH), so `active` is reachable. At `active` it can rebalance
-equity against Alpaca; it cannot rebalance cash, because it has no CCTP domain.
+Robinhood Chain (4663) is declared the same way: fills on its two launch
+equities (wtDNUT, wtFGI) are ingested, validated against USDG and hedged, with
+no inventory adapter mapped. The build values its gas (it pays gas in ETH), so
+`active` is reachable. Production runs it `active` and rebalances against Alpaca
+the listings the pinned token file enables there (DNUT); staging runs it as a
+prefunded hedge-only secondary with `rebalancing = "disabled"` on every asset.
+It cannot rebalance cash, because it has no CCTP domain.
 
 ## Features
 
