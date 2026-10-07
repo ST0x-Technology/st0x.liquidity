@@ -22,6 +22,7 @@ use st0x_bridge::cctp::{
     AttestationResponse, CctpBridge, CctpError, MintScanFloorCheck, UsdcTransferStatus,
 };
 use st0x_bridge::corridor::UsdcCorridor;
+use st0x_bridge::relay::RelayBridge;
 use st0x_bridge::{Attestation, Bridge, BridgeDirection, BurnReceipt, BurnTxStatus, MintReceipt};
 use st0x_config::{
     ALPACA_MINIMUM_WITHDRAWAL, ALPACA_TO_BASE_MINIMUM_TRANSFER, ChainRegistry, RebalancingCtx,
@@ -175,8 +176,9 @@ impl MarketMakingUsdcEndpoints {
 /// transfers, and scan utilities). Defined here so the struct can be generic
 /// over `B` while still calling these operations through the trait in the
 /// shared impl block. [`CctpBridge`] implements this by delegating to its
-/// inherent methods. Tests implement it with `unimplemented!()` stubs for
-/// code paths that do not exercise these operations.
+/// inherent methods and [`RelayBridge`] through its Ethereum end. Tests
+/// implement it with `unimplemented!()` stubs for code paths that do not
+/// exercise these operations.
 #[async_trait::async_trait]
 pub trait UsdcBridgeHelper: Send + Sync + 'static {
     /// Returns the number of confirmations for `tx_hash` on Ethereum, or
@@ -322,6 +324,95 @@ impl<EthWallet: Wallet, BaseWallet: Wallet> UsdcBridgeHelper for CctpBridge<EthW
     ) -> Result<Vec<TxHash>, CctpError> {
         self.find_recent_usdc_transfers(from, to, amount, from_block)
             .await
+    }
+}
+
+/// Relay serves the hub legs through its Ethereum end; its stable errors
+/// keep the [`CctpError`] shapes the shared legs classify.
+#[async_trait::async_trait]
+impl<EthWallet: Wallet, ChainWallet: Wallet> UsdcBridgeHelper
+    for RelayBridge<EthWallet, ChainWallet>
+{
+    async fn ethereum_tx_confirmations(&self, tx_hash: TxHash) -> Result<Option<u64>, CctpError> {
+        Ok(self.ethereum_stable().tx_confirmations(tx_hash).await?)
+    }
+
+    async fn ethereum_tx_block(&self, tx_hash: TxHash) -> Result<u64, CctpError> {
+        Ok(self.ethereum_stable().tx_block(tx_hash).await?)
+    }
+
+    async fn ethereum_mined_tx(&self, tx_hash: TxHash) -> Result<Option<MinedTx>, CctpError> {
+        Ok(self.ethereum_stable().mined_tx(tx_hash).await?)
+    }
+
+    async fn ethereum_usdc_balance(&self, holder: Address) -> Result<U256, CctpError> {
+        Ok(self.ethereum_stable().balance(holder).await?)
+    }
+
+    async fn ethereum_usdc_credit(
+        &self,
+        tx_hash: TxHash,
+        recipient: Address,
+    ) -> Result<U256, CctpError> {
+        Ok(self
+            .ethereum_stable()
+            .credited_in_tx(tx_hash, recipient)
+            .await?)
+    }
+
+    async fn ethereum_usdc_sent(
+        &self,
+        tx_hash: TxHash,
+        sender: Address,
+        recipient: Address,
+    ) -> Result<U256, CctpError> {
+        Ok(self
+            .ethereum_stable()
+            .sent_in_tx(tx_hash, sender, recipient)
+            .await?)
+    }
+
+    async fn prepare_usdc_on_ethereum(
+        &self,
+        to: Address,
+        amount: U256,
+    ) -> Result<PreparedTransaction, CctpError> {
+        Ok(self.ethereum_stable().prepare_transfer(to, amount).await?)
+    }
+
+    async fn broadcast_usdc_on_ethereum(
+        &self,
+        prepared: &PreparedTransaction,
+    ) -> Result<TxHash, CctpError> {
+        Ok(self.ethereum_stable().broadcast_transfer(prepared).await?)
+    }
+
+    async fn discard_usdc_on_ethereum(&self, prepared: &PreparedTransaction) {
+        self.ethereum_stable().discard_transfer(prepared).await;
+    }
+
+    async fn restore_usdc_on_ethereum(&self, prepared: &PreparedTransaction) {
+        self.ethereum_stable().restore_transfer(prepared).await;
+    }
+
+    async fn confirm_usdc_on_ethereum(
+        &self,
+        tx_hash: TxHash,
+    ) -> Result<UsdcTransferStatus, CctpError> {
+        Ok(self.ethereum_stable().confirm_transfer(tx_hash).await?)
+    }
+
+    async fn find_recent_usdc_transfers(
+        &self,
+        from: Address,
+        to: Address,
+        amount: U256,
+        from_block: u64,
+    ) -> Result<Vec<TxHash>, CctpError> {
+        Ok(self
+            .ethereum_stable()
+            .find_recent_transfers(from, to, amount, from_block)
+            .await?)
     }
 }
 

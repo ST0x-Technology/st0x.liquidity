@@ -1072,6 +1072,7 @@ mod tests {
     use super::super::test_chain::RelayChain;
     use super::super::{BasisPoints, QuoteAmounts, QuoteFees, RelayRequestId};
     use super::*;
+    use crate::stable_endpoint::UsdcTransferStatus;
 
     type TestWallet = RawPrivateKeyWallet<DynProvider>;
 
@@ -1564,6 +1565,28 @@ mod tests {
             matches!(error, RelayBridgeError::NoDepository { chain: Chain::Base }),
             "{error:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn ethereum_stable_reads_and_sends_the_hub_stable() {
+        let harness = Harness::new().await;
+        let wallet = harness.hub.wallet();
+        let recipient = Address::repeat_byte(0xA1);
+        harness.hub.mint(wallet, AMOUNT).await;
+        harness.chain.mint(wallet, AMOUNT * U256::from(2)).await;
+        let stable = harness.bridge.ethereum_stable();
+
+        assert_eq!(stable.balance(wallet).await.unwrap(), AMOUNT);
+
+        let prepared = stable.prepare_transfer(recipient, AMOUNT).await.unwrap();
+        let tx = stable.broadcast_transfer(&prepared).await.unwrap();
+
+        assert_eq!(
+            stable.confirm_transfer(tx).await.unwrap(),
+            UsdcTransferStatus::Confirmed
+        );
+        assert_eq!(harness.hub.balance(recipient).await, AMOUNT);
+        assert_eq!(stable.credited_in_tx(tx, recipient).await.unwrap(), AMOUNT);
     }
 
     #[tokio::test]
