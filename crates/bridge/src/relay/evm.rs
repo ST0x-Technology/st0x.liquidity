@@ -4,7 +4,7 @@
 use alloy::consensus::Transaction as _;
 use alloy::primitives::{Address, Bytes, TxHash, U256};
 use alloy::providers::Provider;
-use alloy::rpc::types::{Filter, Transaction};
+use alloy::rpc::types::{Filter, Transaction, TransactionReceipt};
 use alloy::sol_types::{SolCall, SolEvent};
 use alloy::transports::{RpcError, TransportErrorKind};
 use async_trait::async_trait;
@@ -36,7 +36,8 @@ const RELAY_DEPOSIT_GAS_LIMIT: u64 = 57_114;
 const DEPOSIT_LOG_CHUNK: u64 = 10_000;
 
 /// Who builds a [`RelayBridge`]: the corridor chain and a wallet on each end,
-/// with the confirmations each end's wallet waits for.
+/// with the confirmations each end requires of a deposit, a payment and a
+/// deposit scan.
 pub struct RelayCtx<EthWallet, ChainWallet> {
     /// The corridor chain Relay connects to the Ethereum hub.
     pub chain: Chain,
@@ -67,8 +68,8 @@ struct RelayEnd<W> {
     stable: Address,
     depository: Address,
     wallet: W,
-    /// A deposit scan covers only blocks with this many confirmations,
-    /// counting the inclusion block as the wallet does.
+    /// A deposit, a payment and a deposit scan count only blocks with this
+    /// many confirmations, counting the inclusion block as the wallet does.
     confirmations: u64,
 }
 
@@ -640,7 +641,7 @@ impl<W: Wallet> RelayEnd<W> {
         order_id: RelayOrderId,
         tx: TxHash,
     ) -> Result<SwapDeposit<RelayOrderId>, RelayBridgeError> {
-        let receipt = self.wallet.await_receipt(tx).await?;
+        let receipt = self.confirmed_receipt(tx).await?;
 
         if !receipt.status() {
             return Err(RelayBridgeError::DepositReverted { tx });
@@ -664,6 +665,28 @@ impl<W: Wallet> RelayEnd<W> {
             amount: deposit.amount,
             block,
         })
+    }
+
+    /// `tx`'s receipt once it has this end's confirmations. The wallet's wait
+    /// counts its own required confirmations, which may be fewer.
+    async fn confirmed_receipt(&self, tx: TxHash) -> Result<TransactionReceipt, RelayBridgeError> {
+        let receipt = self.wallet.await_receipt(tx).await?;
+        let head = self.wallet.provider().get_block_number().await?;
+
+        let confirmations = receipt
+            .block_number
+            .and_then(|block| head.checked_sub(block))
+            .map_or(0, |depth| depth.saturating_add(1));
+
+        if confirmations < self.confirmations {
+            return Err(RelayBridgeError::Unconfirmed {
+                tx,
+                confirmations,
+                required: self.confirmations,
+            });
+        }
+
+        Ok(receipt)
     }
 
     fn is_ours(&self, event: &RelayErc20Deposit) -> bool {
@@ -746,7 +769,7 @@ impl<W: Wallet> RelayEnd<W> {
         })
     }
 
-    /// Waits for `found` to reach this chain's confirmations, then checks it
+    /// Requires `found` to have this chain's confirmations, then checks it
     /// paid our wallet this end's stable for `order_id`.
     async fn prove(
         &self,
@@ -754,7 +777,7 @@ impl<W: Wallet> RelayEnd<W> {
         found: &Transaction,
         order_id: RelayOrderId,
     ) -> Result<U256, ProofError> {
-        let receipt = self.wallet.await_receipt(tx).await?;
+        let receipt = self.confirmed_receipt(tx).await?;
 
         let terms = PaymentTerms {
             stable: self.stable,
@@ -813,7 +836,11 @@ fn check_pair_nonces(
 /// finish.
 enum ProofError {
     Unverified(UnverifiedReason),
-    NotFound { tx: TxHash },
+    NotFound {
+        tx: TxHash,
+    },
+    /// A failure that is not about the proof itself, passed through as is.
+    Bridge(RelayBridgeError),
     Evm(EvmError),
     Rpc(RpcError<TransportErrorKind>),
 }
@@ -821,6 +848,12 @@ enum ProofError {
 impl From<EvmError> for ProofError {
     fn from(error: EvmError) -> Self {
         Self::Evm(error)
+    }
+}
+
+impl From<RelayBridgeError> for ProofError {
+    fn from(error: RelayBridgeError) -> Self {
+        Self::Bridge(error)
     }
 }
 
@@ -838,6 +871,7 @@ impl ProofError {
         match self {
             Self::Unverified(reason) => unverified(reason),
             Self::NotFound { tx } => RelayBridgeError::TxNotFound { tx },
+            Self::Bridge(error) => error,
             Self::Evm(error) => RelayBridgeError::Evm(error),
             Self::Rpc(error) => RelayBridgeError::Rpc(error),
         }
@@ -853,7 +887,6 @@ mod tests {
     use alloy::eips::Decodable2718;
     use alloy::primitives::{B256, Signature};
     use alloy::providers::{DynProvider, ProviderBuilder};
-    use alloy::rpc::types::TransactionReceipt;
 
     use st0x_evm::Evm;
     use st0x_evm::local::RawPrivateKeyWallet;
@@ -897,8 +930,8 @@ mod tests {
             Self { hub, chain, bridge }
         }
 
-        /// Signs, broadcasts and confirms a Robinhood -> hub deposit.
-        async fn deposit_to_hub(&self, order_id: B256) -> SwapDeposit<RelayOrderId> {
+        /// Signs and broadcasts a Robinhood -> hub deposit, mined in one block.
+        async fn send_deposit_to_hub(&self, order_id: B256) -> TxHash {
             self.chain.mint(self.chain.wallet(), AMOUNT).await;
             let quote = quote(&self.chain, order_id, true);
 
@@ -908,14 +941,21 @@ mod tests {
                 .await
                 .map(deposit_pair)
                 .unwrap();
-            let tx = self
-                .bridge
-                .broadcast_deposit(HopDirection::ToHub, &prepared)
-                .await
-                .unwrap();
 
             self.bridge
-                .confirm_deposit(HopDirection::ToHub, quote.order_id, tx)
+                .broadcast_deposit(HopDirection::ToHub, &prepared)
+                .await
+                .unwrap()
+        }
+
+        /// [`Self::send_deposit_to_hub`], then mines to its confirmations and
+        /// confirms it.
+        async fn deposit_to_hub(&self, order_id: B256) -> SwapDeposit<RelayOrderId> {
+            let tx = self.send_deposit_to_hub(order_id).await;
+            self.chain.mine(CONFIRMATIONS - 1).await;
+
+            self.bridge
+                .confirm_deposit(HopDirection::ToHub, RelayOrderId(order_id), tx)
                 .await
                 .unwrap()
         }
@@ -1391,6 +1431,7 @@ mod tests {
             .broadcast_deposit(HopDirection::ToHub, &prepared)
             .await
             .unwrap();
+        harness.chain.mine(CONFIRMATIONS - 1).await;
 
         let deposit = harness
             .bridge
@@ -1496,6 +1537,7 @@ mod tests {
             )
             .await
             .unwrap();
+        harness.chain.mine(CONFIRMATIONS - 1).await;
         let reverted = harness
             .bridge
             .confirm_deposit(HopDirection::ToHub, quote.order_id, deposit)
@@ -1743,6 +1785,8 @@ mod tests {
             .pay(harness.hub.wallet(), MINIMUM_OUT, order_id)
             .await;
 
+        harness.hub.mine(CONFIRMATIONS - 1).await;
+
         let payment = harness
             .bridge
             .verify_fill(
@@ -1779,6 +1823,8 @@ mod tests {
             .pay(harness.chain.wallet(), MINIMUM_OUT, order_id)
             .await;
 
+        harness.chain.mine(CONFIRMATIONS - 1).await;
+
         let payment = harness
             .bridge
             .verify_fill(
@@ -1803,6 +1849,8 @@ mod tests {
             .hub
             .pay(harness.hub.wallet(), MINIMUM_OUT, order_id)
             .await;
+
+        harness.hub.mine(CONFIRMATIONS - 1).await;
 
         let error = harness
             .bridge
@@ -1831,6 +1879,8 @@ mod tests {
             .chain
             .pay(harness.chain.wallet(), AMOUNT, order_id)
             .await;
+
+        harness.chain.mine(CONFIRMATIONS - 1).await;
 
         let error = harness
             .bridge
@@ -1862,10 +1912,13 @@ mod tests {
             .hub
             .pay(harness.hub.wallet(), MINIMUM_OUT, order_id)
             .await;
+
+        harness.hub.mine(CONFIRMATIONS - 1).await;
         let second = harness
             .hub
             .pay(harness.hub.wallet(), MINIMUM_OUT, order_id)
             .await;
+        harness.hub.mine(CONFIRMATIONS - 1).await;
 
         let error = harness
             .bridge
@@ -1895,6 +1948,8 @@ mod tests {
             .hub
             .pay(harness.hub.wallet(), MINIMUM_OUT, order_id)
             .await;
+
+        harness.hub.mine(CONFIRMATIONS - 1).await;
 
         let error = harness
             .bridge
@@ -1927,6 +1982,8 @@ mod tests {
         harness.hub.mint(harness.hub.solver(), short).await;
 
         let tx = harness.hub.pay(harness.hub.wallet(), short, order_id).await;
+
+        harness.hub.mine(CONFIRMATIONS - 1).await;
 
         let error = harness
             .bridge
@@ -1983,6 +2040,8 @@ mod tests {
             .pay(harness.hub.wallet(), U256::ZERO, order_id)
             .await;
 
+        harness.hub.mine(CONFIRMATIONS - 1).await;
+
         let fill = harness
             .bridge
             .verify_fill(
@@ -2021,6 +2080,8 @@ mod tests {
             .hub
             .pay_from(ours, ours, MINIMUM_OUT, order_id)
             .await;
+
+        harness.hub.mine(CONFIRMATIONS - 1).await;
 
         let fill = harness
             .bridge
@@ -2061,6 +2122,8 @@ mod tests {
             .pay(harness.hub.wallet(), refunded, order_id)
             .await;
 
+        harness.hub.mine(CONFIRMATIONS - 1).await;
+
         let payment = harness
             .bridge
             .verify_refund(HopDirection::ToHub, RelayOrderId(order_id), AMOUNT, &[tx])
@@ -2088,6 +2151,8 @@ mod tests {
             .chain
             .pay(harness.chain.wallet(), refunded, order_id)
             .await;
+
+        harness.chain.mine(CONFIRMATIONS - 1).await;
 
         let payment = harness
             .bridge
@@ -2120,6 +2185,8 @@ mod tests {
             .chain
             .pay(harness.chain.wallet(), AMOUNT, order_id)
             .await;
+
+        harness.chain.mine(CONFIRMATIONS - 1).await;
 
         let error = harness
             .bridge
@@ -2233,18 +2300,24 @@ mod tests {
             .origin_block(HopDirection::ToHub)
             .await
             .unwrap();
-        let deposit = harness.deposit_to_hub(B256::random()).await;
+        let order_id = B256::random();
+        let tx = harness.send_deposit_to_hub(order_id).await;
         harness.chain.mine(CONFIRMATIONS - 2).await;
 
         let early = harness
             .bridge
-            .find_recent_deposits(HopDirection::ToHub, &[deposit.order_id], from_block)
+            .find_recent_deposits(HopDirection::ToHub, &[RelayOrderId(order_id)], from_block)
             .await
             .unwrap();
         harness.chain.mine(1).await;
         let confirmed = harness
             .bridge
-            .find_recent_deposits(HopDirection::ToHub, &[deposit.order_id], from_block)
+            .find_recent_deposits(HopDirection::ToHub, &[RelayOrderId(order_id)], from_block)
+            .await
+            .unwrap();
+        let deposit = harness
+            .bridge
+            .confirm_deposit(HopDirection::ToHub, RelayOrderId(order_id), tx)
             .await
             .unwrap();
 
