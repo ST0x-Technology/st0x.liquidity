@@ -103,7 +103,7 @@ const seconds = (number) => (number === null || number === undefined ? '' : `${n
 
 const configDialog = `
 <dialog class="hdr-dialog hdr-narrow" data-dialog="config">
-  <div class="hdr-dialog-head"><span>Configuration</span><button class="hdr-close" data-close>&times;</button></div>
+  <div class="hdr-dialog-head"><span>Configuration</span><button class="hdr-close" data-close aria-label="Close">&times;</button></div>
   <div class="hdr-dialog-body hdr-mono">
     ${
       info.wallet_kind
@@ -125,12 +125,12 @@ const configDialog = `
 
 const guide = RECOVERY_GUIDE;
 const modeClass = (mode) =>
-  mode === 'requires-bot' ? 'hdr-amber' : mode === 'live-rpc-only' ? 'hdr-sky' : 'hdr-red';
+  mode === 'requires-bot' ? 'hdr-amber' : 'hdr-red';
 const guideDialog = `
 <dialog class="hdr-dialog hdr-wide" data-dialog="guide">
-  <div class="hdr-dialog-head"><span>CLI recovery guide</span><button class="hdr-close" data-close>&times;</button></div>
+  <div class="hdr-dialog-head"><span>CLI recovery guide</span><button class="hdr-close" data-close aria-label="Close">&times;</button></div>
   <div class="hdr-dialog-body">
-    <p class="hdr-muted hdr-intro">Every recovery command, grouped by object. They use <span class="hdr-mono">st0x-liquidity-client</span>, which signs in with your Google account and calls the running bot's API, so no SSH is needed and the bot must be running.</p>
+    <p class="hdr-muted hdr-intro">Every recovery command, grouped by object. They use <span class="hdr-mono">st0x-liquidity-client</span>, which signs in with your Google account and calls the running bot's API, so no SSH is needed and the bot must be running. The one exception is failing a Base to Alpaca USDC bridge after its vault withdrawal confirmed: that needs the offline <span class="hdr-mono">stox fail-usdc-transfer</span> with the bot stopped.</p>
     ${guide.groups
       .map(
         (group) => `

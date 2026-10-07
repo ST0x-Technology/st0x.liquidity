@@ -30,6 +30,17 @@ const board = (await import(
   new URL('recovery-commands.js', panels).href
 )) as BoardBuilders
 
+type StatusEntry = { time: number; kind: string; status: string; direction?: string }
+type StatusHistory = {
+  latest: (
+    entries: StatusEntry[]
+  ) => (StatusEntry & { first: number; history: StatusEntry[] }) | null
+}
+
+const statusHistory = (await import(
+  new URL('status-history.js', panels).href
+)) as StatusHistory
+
 const CLIENT = 'st0x-liquidity-client --env production'
 const PROD = { simulateSourceId: null, backendPort: null, clientEnv: 'production' } as const
 
@@ -43,7 +54,7 @@ describe('board recovery-guide.json', () => {
       groups: unknown
     }
     expect(guide.groups).toEqual(RECOVERY_GUIDE)
-    for (const mode of ['requires-bot', 'live-rpc-only', 'direct-db-live-rpc', 'direct-db'] as const) {
+    for (const mode of ['requires-bot', 'direct-db'] as const) {
       expect(guide.modeLabels[mode]).toBe(recoveryModeLabel(mode))
     }
   })
@@ -87,5 +98,58 @@ describe('board recovery-commands.js', () => {
         )
       }
     }
+  })
+})
+
+describe('board status-history.js', () => {
+  const bridge = (status: string, time: number, direction = 'alpaca_to_base'): StatusEntry => ({
+    time,
+    kind: 'usdc_bridge',
+    status,
+    direction
+  })
+  // Cloud Logging returns the entries newest first.
+  const order = (entries: StatusEntry[]) => {
+    const row = statusHistory.latest(entries)
+    return { status: row?.status, first: row?.first, history: row?.history.map((entry) => entry.status) }
+  }
+
+  it('orders in-flight bridge statuses by lifecycle when their times go backwards', () => {
+    // WithdrawalComplete carries confirmed_at, the BridgingSubmitting after it
+    // the older initiated_at.
+    expect(order([bridge('withdrawing', 200), bridge('bridging', 100)])).toEqual({
+      status: 'bridging',
+      first: 100,
+      history: ['withdrawing', 'bridging']
+    })
+    expect(
+      order([bridge('bridging', 100, 'base_to_alpaca'), bridge('converting', 50, 'base_to_alpaca')])
+    ).toEqual({ status: 'converting', first: 50, history: ['bridging', 'converting'] })
+  })
+
+  it('orders in-flight bridge statuses that share a time by lifecycle, in either order', () => {
+    for (const entries of [
+      [bridge('bridging', 100), bridge('withdrawing', 100)],
+      [bridge('withdrawing', 100), bridge('bridging', 100)]
+    ]) {
+      expect(order(entries).history).toEqual(['withdrawing', 'bridging'])
+    }
+  })
+
+  it('orders a failed entry by time, so a recovered bridge shows its newer status', () => {
+    expect(
+      order([bridge('bridging', 300), bridge('failed', 200), bridge('bridging', 100)])
+    ).toEqual({ status: 'bridging', first: 100, history: ['bridging', 'failed', 'bridging'] })
+    expect(order([bridge('failed', 200), bridge('depositing', 100)]).status).toBe('failed')
+  })
+
+  it('orders other rows by time, ties newest last as Cloud Logging returned them', () => {
+    const mint = (status: string, time: number): StatusEntry => ({ time, kind: 'mint', status })
+    expect(order([mint('wrapping', 100), mint('minting', 100), mint('pending', 50)]).history).toEqual([
+      'pending',
+      'minting',
+      'wrapping'
+    ])
+    expect(statusHistory.latest([])).toBeNull()
   })
 })

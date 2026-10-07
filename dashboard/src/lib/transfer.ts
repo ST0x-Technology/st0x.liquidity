@@ -226,21 +226,15 @@ const equityTransferKind = (kind: TransferCategory): 'mint' | 'redemption' | nul
   }
 }
 
-/// Execution mode for a recovery command, mirroring SPEC's four execution-mode
-/// contracts in the Operator Recovery Surface section. Every production command
-/// goes through the operations client, so it is `requires-bot`; the other modes
-/// are the mock CLI's, which simulation builds run directly:
+/// Execution mode for a recovery command, from SPEC's execution-mode contracts
+/// in the Operator Recovery Surface section. Every production command goes
+/// through the operations client, so it is `requires-bot`; simulation builds
+/// run the mock CLI, whose per-object commands are one of the two:
 ///   - `direct-db`: mutates local CQRS state directly; the bot must not be
 ///     concurrently driving the same id.
-///   - `direct-db-live-rpc`: same direct-DB caveat, and also drives an on-chain
-///     flow against a live RPC provider (e.g. `transfer resume --kind usdc`,
-///     `process-tx`).
-///   - `live-rpc-only`: touches no database state, runs against a live RPC
-///     provider only; the caveat is the bot concurrently driving the same
-///     on-chain action (e.g. `cctp complete-mint`).
 ///   - `requires-bot`: dispatches through the bot's REST API and only works
-///     while the bot is running (`recheck`, `transfer resume --kind equity`).
-export type RecoveryMode = 'direct-db' | 'direct-db-live-rpc' | 'live-rpc-only' | 'requires-bot'
+///     while the bot is running.
+export type RecoveryMode = 'direct-db' | 'requires-bot'
 
 /// A single copy-pasteable recovery command applicable to one object in its
 /// current state. `label` names the action, `description` says when to use it,
@@ -461,6 +455,49 @@ const usdcDirectionToClientArg = (direction: UsdcBridgeDirection | null): string
   }
 }
 
+const USDC_FAIL_ALPACA_TO_BASE =
+  'Alpaca to Base: the bot accepts this only before the burn, from a completed withdrawal ' +
+  'or a burn submission with no recorded burn. The burn runs on Ethereum: verify on Ethereum ' +
+  'that no CCTP burn left the bot wallet after this transfer started (its Started time) and ' +
+  'that the wallet has no pending transaction (pending nonce equals latest nonce); if you ' +
+  'are not certain, run resume-usdc instead. The funds left Alpaca, so the guard stays held ' +
+  'until you settle them with reconcile-usdc.'
+
+const USDC_FAIL_BASE_TO_ALPACA =
+  'Base to Alpaca: the bot accepts this only while the vault withdrawal is unrecorded, and ' +
+  "it does not check the chain. Wait until the transfer's attempt timeout has passed, then " +
+  "confirm on Base that the bot wallet made no OperatorWithdraw after the transfer's " +
+  'from_block and has no pending transaction (pending nonce equals latest nonce); if one ' +
+  'landed or you are not certain, run resume-usdc instead. While a recorded withdrawal is ' +
+  'still confirming, run resume-usdc. Once it has confirmed the bot refuses: stop the bot, ' +
+  'then confirm the transfer has no recorded burn, and on Base that no CCTP burn left the ' +
+  'bot wallet after this transfer started and the wallet has no pending transaction. If any ' +
+  'of that is not certain, ' +
+  'start the bot and run resume-usdc; else run the offline stox fail-usdc-transfer and move ' +
+  'the wallet USDC back by hand.'
+
+/// A Base to Alpaca bridge stuck at `bridging` (its vault withdrawal confirmed):
+/// the running bot refuses `fail-usdc-transfer` there, so the resume command
+/// points to the offline path instead.
+const USDC_BRIDGING_BASE_TO_ALPACA =
+  ' If the burn keeps failing, the running bot refuses fail-usdc-transfer here: see ' +
+  'fail-usdc-transfer in the CLI recovery guide for the offline path.'
+
+/// The check to run before `fail-usdc-transfer` on an in-flight bridge, or null
+/// where the running bot always refuses it. An unknown direction gives both.
+const usdcFailCheck = (status: string, direction: UsdcBridgeDirection | null): string | null => {
+  switch (direction) {
+    case 'alpaca_to_base':
+      return status === 'withdrawing' || status === 'bridging' ? USDC_FAIL_ALPACA_TO_BASE : null
+    case 'base_to_alpaca':
+      return status === 'withdrawing' ? USDC_FAIL_BASE_TO_ALPACA : null
+    case null:
+      return status === 'withdrawing' || status === 'bridging'
+        ? `${USDC_FAIL_ALPACA_TO_BASE} ${USDC_FAIL_BASE_TO_ALPACA}`
+        : null
+  }
+}
+
 /// Recovery commands for a USDC bridge, gated by status:
 ///   - failed (terminal): `reconcile`, but ONLY for a reconcile-eligible
 ///     failure. The CLI accepts `transfer reconcile --kind usdc` when the
@@ -476,11 +513,12 @@ const usdcDirectionToClientArg = (direction: UsdcBridgeDirection | null): string
 ///   - completed (terminal): none.
 ///   - any in-flight status: `resume`, which hands the bridge back to the
 ///     bot's transfer worker whatever stage it stopped at.
-///   - in-flight `withdrawing` also: `fail-usdc-transfer`. The bot accepts it
-///     only before the burn (an Alpaca to Base withdrawal that completed, or
-///     a Base to Alpaca vault withdrawal not yet sent), and `withdrawing` does
-///     not say which, so the description sends the operator to check first.
-///     `converting` comes after the deposit, where the bot always refuses it.
+///   - also `fail-usdc-transfer` where the running bot can accept it (see
+///     `usdcFailCheck`): Alpaca to Base at `withdrawing` (WithdrawalComplete)
+///     or `bridging` (BridgingSubmitting with no recorded burn), and Base to
+///     Alpaca at `withdrawing` (an unrecorded WithdrawalSubmitting). The
+///     status alone does not prove the pre-burn state, so the description
+///     gives the check that applies to the bridge's direction.
 const usdcBridgeRecoveryCommands = (
   cli: RecoveryCli,
   id: string,
@@ -519,10 +557,15 @@ const usdcBridgeRecoveryCommands = (
       mode: 'requires-bot'
     }),
     label: 'Resume',
-    description: "Re-drive this USDC bridge on the bot's transfer worker from the stage it stopped at."
+    description:
+      "Re-drive this USDC bridge on the bot's transfer worker from the stage it stopped at." +
+      (direction === 'base_to_alpaca' && status.toLowerCase() === 'bridging'
+        ? USDC_BRIDGING_BASE_TO_ALPACA
+        : '')
   }
 
-  if (status.toLowerCase() !== 'withdrawing') return [resume]
+  const check = usdcFailCheck(status.toLowerCase(), direction)
+  if (check === null) return [resume]
 
   return [
     resume,
@@ -532,13 +575,7 @@ const usdcBridgeRecoveryCommands = (
         mode: 'direct-db'
       }),
       label: 'Fail (pre-burn)',
-      description:
-        'Check the transfer first: the bot accepts this only before the burn, for an Alpaca ' +
-        'to Base bridge whose withdrawal completed or a Base to Alpaca bridge whose vault ' +
-        'withdrawal was not sent. Verify on-chain that no CCTP burn landed. After a Base to ' +
-        'Alpaca vault withdrawal, stop the bot, run the offline stox fail-usdc-transfer and ' +
-        'move the wallet USDC back by hand. If the Alpaca withdrawal completed, the guard ' +
-        'stays held until you reconcile.'
+      description: `Check the transfer first. ${check}`
     }
   ]
 }
@@ -666,16 +703,10 @@ export const RECOVERY_GUIDE: GuideGroup[] = [
       },
       {
         command: `${LIQUIDITY_CLIENT} debug fail-usdc-transfer <id> --reason "<reason>"`,
-        description:
-          'Force a USDC bridge stuck before its burn into Failed. The bot accepts it for an ' +
-          'Alpaca to Base bridge whose withdrawal completed, or a Base to Alpaca bridge whose ' +
-          'vault withdrawal was not sent. If the Alpaca withdrawal completed, the guard stays ' +
-          'held until reconcile-usdc settles the funds. After a Base to Alpaca vault ' +
-          'withdrawal, the bot refuses it: stop the bot, run the offline stox ' +
-          'fail-usdc-transfer, and move the wallet USDC back by hand.',
+        description: `Force a USDC bridge stuck before its burn into Failed. ${USDC_FAIL_ALPACA_TO_BASE} ${USDC_FAIL_BASE_TO_ALPACA}`,
         whenToUse:
-          'A USDC bridge is stuck before its CCTP burn and must be terminalized. Check the ' +
-          'transfer and verify on-chain that no burn landed first.',
+          'A USDC bridge is stuck before its CCTP burn and must be terminalized. Run the check ' +
+          'for its direction in the description first; if it is not certain, run resume-usdc.',
         appliesTo: 'USDC bridge (pre-burn stuck)',
         mode: 'requires-bot'
       },
@@ -696,7 +727,8 @@ export const RECOVERY_GUIDE: GuideGroup[] = [
           'A USDC bridge failed after its funds left the source venue, and they were settled ' +
           'out-of-band.',
         appliesTo:
-          'Post-burn USDC failure (DepositFailed, post-burn BridgingFailed, or BaseToAlpaca ' +
+          'USDC failure with funds off the source venue (DepositFailed, any AlpacaToBase ' +
+          'BridgingFailed, a post-burn BaseToAlpaca BridgingFailed, or BaseToAlpaca ' +
           'ConversionFailed)',
         mode: 'requires-bot'
       }
@@ -768,20 +800,14 @@ export const recoveryModeLabel = (mode: RecoveryMode): string => {
   switch (mode) {
     case 'requires-bot':
       return 'REST — requires the running bot'
-    case 'live-rpc-only':
-      return 'live RPC — ensure the bot is not driving this same on-chain action'
-    case 'direct-db-live-rpc':
-      return 'direct DB + live RPC — stop the bot / ensure it is not driving this id'
     case 'direct-db':
       return 'direct DB — stop the bot / ensure it is not driving this id'
   }
 }
 
-/// Colour classes for an execution-mode badge. `live-rpc-only` writes no DB
-/// state and is safe while the bot runs, so it gets its own sky tone rather than
-/// the bot-stop red shared by the two direct-db modes; `requires-bot` is amber.
-/// `text` is the bare foreground class (static guide cell); `badge` adds the
-/// border + tint for the per-object modal pill.
+/// Colour classes for an execution-mode badge: `requires-bot` is amber,
+/// `direct-db` the bot-stop red. `text` is the bare foreground class (static
+/// guide cell); `badge` adds the border + tint for the per-object modal pill.
 export const recoveryModeColor = (mode: RecoveryMode): { text: string; badge: string } => {
   switch (mode) {
     case 'requires-bot':
@@ -790,13 +816,6 @@ export const recoveryModeColor = (mode: RecoveryMode): { text: string; badge: st
         badge: 'text-amber-500 border-amber-500/40 bg-amber-500/10'
       }
 
-    case 'live-rpc-only':
-      return {
-        text: 'text-sky-500',
-        badge: 'text-sky-500 border-sky-500/40 bg-sky-500/10'
-      }
-
-    case 'direct-db-live-rpc':
     case 'direct-db':
       return {
         text: 'text-destructive',

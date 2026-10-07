@@ -25,10 +25,10 @@ pub struct SymbolInventory {
     pub offchain_available: FractionalShares,
     #[ts(type = "string")]
     pub offchain_inflight: FractionalShares,
-    /// Every chain's vault balance for this symbol, in chain order. The
-    /// `onchain*` fields above are the primary chain's entry alone: wrapped
-    /// shares on different chains cannot be added together. A chain whose
-    /// vault the bot has not read yet has no entry.
+    /// Each chain the config hedges, in chain order, once the bot has read
+    /// that chain's vault for this symbol. The `onchain*` fields above are the
+    /// primary chain's entry alone: wrapped shares on different chains cannot
+    /// be added together.
     pub onchain_by_chain: Vec<OnchainEquityBalance>,
     /// Equity tokens observed in the Base wallet between venues.
     pub inflight_equity: InFlightEquity,
@@ -72,9 +72,9 @@ pub struct UsdcInventory {
     pub offchain_available: Usdc,
     #[ts(type = "string")]
     pub offchain_inflight: Usdc,
-    /// Every chain's cash vault balance, in chain order. The `onchain*`
-    /// fields above are the primary chain's entry alone. A chain whose vault
-    /// the bot has not read yet has no entry.
+    /// Each chain the config hedges, in chain order, once the bot has read
+    /// that chain's cash vault. The `onchain*` fields above are the primary
+    /// chain's entry alone.
     pub onchain_by_chain: Vec<OnchainUsdcBalance>,
     /// Gross offchain USD balance before cash reserve subtraction.
     #[ts(type = "string | null")]

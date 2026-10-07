@@ -3,16 +3,17 @@
 // transfer-panel.svelte in ST0x-Technology/st0x.liquidity) for the row whose
 // ⓘ was clicked in the Trades or Rebalances table.
 //
-// The click sets the hidden `detail` variable to the row's id. The panel
-// then queries every log entry of that id: query A (liquidity-trades) and
-// query B (liquidity-transfers), one entry per status change. Closing the
-// dialog clears the variable, which empties the queries again.
+// The click sets the hidden `detail` variable to the row's id. A and B are
+// the Trades and Rebalances tables' own results (the newest 500 status
+// entries of each log, through the Dashboard datasource), and the script
+// picks the id's entries out of them; only C queries Cloud Logging (the
+// events log). Closing the dialog clears the variable.
 //
 // The panel is one empty column of the header row; only the dialog shows.
 //
-// MODE_LABELS, tradeCommands and transferCommands are not defined here: the
-// generator prepends them from recovery-guide.json and recovery-commands.js
-// (see detail_panel()).
+// MODE_LABELS, tradeCommands, transferCommands and latest are not defined
+// here: the generator prepends them from recovery-guide.json,
+// recovery-commands.js and status-history.js (see detail_panel()).
 
 const theme = context.grafana.theme;
 const root = context.element;
@@ -89,19 +90,6 @@ const entriesOf = (refId) => {
   return entries;
 };
 
-// The row at its latest status, with its status history oldest first.
-// Cloud Logging returns entries newest first, and two status entries can share
-// a timestamp (USDC Withdrawing and BridgingSubmitting both use initiated_at),
-// so the latest is the first entry in datasource order with the highest time,
-// not the last one after a stable sort.
-const latest = (entries) => {
-  if (entries.length === 0) return null;
-  const newest = Math.max(...entries.map((entry) => entry.time));
-  const last = entries.find((entry) => entry.time === newest);
-  const history = [...entries].reverse().sort((left, right) => left.time - right.time);
-  return { ...last, first: history[0].time, history };
-};
-
 // The SPA's formatUtc: "Oct 6, 12:24:39 UTC".
 const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
 const utc = (value) => {
@@ -163,7 +151,7 @@ const statusLabel = (status) => {
 const ENV = context.grafana.replaceVariables('${env:text}') === 'staging' ? 'staging' : 'production';
 const CLIENT = `st0x-liquidity-client --env ${ENV}`;
 
-const modeClass = (mode) => (mode === 'requires-bot' ? 'det-amber' : mode === 'live-rpc-only' ? 'det-sky' : 'det-red');
+const modeClass = (mode) => (mode === 'requires-bot' ? 'det-amber' : 'det-red');
 const commandBlock = (commands, note) =>
   commands.length === 0 && !note
     ? ''
@@ -223,7 +211,8 @@ const eventFields = (payload, rowChain) => {
 // only its later events here. Then the timeline starts after the row's first
 // status entry, and says so.
 const timelineIncomplete = (history) =>
-  history.length > 0 && Math.min(...events.map((event) => event.time)) > history[0].time + 120000;
+  history.length > 0 &&
+  Math.min(...events.map((event) => event.time)) > Math.min(...history.map((entry) => entry.time)) + 120000;
 
 const timeline = (history, chain) =>
   events.length > 0
@@ -256,7 +245,8 @@ const timeline = (history, chain) =>
     .join('')}</div>
   <p class="det-muted">From the exporter's status log. The full event timeline is in the SPA at liquidity.t0trade.com.</p>`;
 
-const field = (name, value) => `<div class="det-field"><span class="det-muted">${name}</span><span class="det-break">${value}</span></div>`;
+// valueHtml is trusted HTML: a caller escapes any data it puts in it.
+const field = (name, valueHtml) => `<div class="det-field"><span class="det-muted">${escapeHtml(name)}</span><span class="det-break">${valueHtml}</span></div>`;
 
 const tradeDialog = (trade) => {
   const [venueName, venueClass, onchain] = venue(trade.venue);
@@ -336,8 +326,8 @@ const transfer = trade ? null : latest(entriesOf('B'));
 // The dialog opens on the click, before the query returns, and says so when
 // the id has no entries in the panel's window.
 const message = (text) => `
-  <div class="det-dialog-head"><span class="det-title-line det-mono">${escapeHtml(wanted)}</span><button class="det-close" data-close>&times;</button></div>
-  <div class="det-dialog-body"><p class="det-muted">${text}</p></div>`;
+  <div class="det-dialog-head"><span class="det-title-line det-mono">${escapeHtml(wanted)}</span><button class="det-close" data-close aria-label="Close">&times;</button></div>
+  <div class="det-dialog-body"><p class="det-muted">${escapeHtml(text)}</p></div>`;
 const loading = context.panelData?.state === 'Loading';
 const html = trade
   ? tradeDialog(trade)

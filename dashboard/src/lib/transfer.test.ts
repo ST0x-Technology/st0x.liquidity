@@ -401,14 +401,14 @@ describe('transferRecoveryCommands', () => {
     expect(modeFor(bridging, 'Resume')).toBe('requires-bot')
   })
 
-  it('shows only resume for a post-burn in-flight usdc bridge, placeholder direction when unknown', () => {
+  it('fills a placeholder direction on resume when the bridge direction is unknown', () => {
     const commands = transferRecoveryCommands({
       deployment: PROD,
       kind: 'usdc_bridge',
       id: 'BRIDGE001',
       status: 'bridging'
     })
-    expect(commands.map((entry) => entry.label)).toEqual(['Resume'])
+    expect(commands.map((entry) => entry.label)).toEqual(['Resume', 'Fail (pre-burn)'])
     expect(commandFor(commands, 'Resume')).toBe(
       `${CLIENT} debug resume-usdc <alpaca-to-base|base-to-alpaca> BRIDGE001`
     )
@@ -441,27 +441,85 @@ describe('transferRecoveryCommands', () => {
     )
   })
 
-  it('offers resume and fail-usdc-transfer for a withdrawing usdc bridge', () => {
-    // withdrawing does not say whether the bridge is still before its burn,
-    // so fail comes with a check-first description, the offline path for a
-    // sent Base to Alpaca vault withdrawal, and no promise that no reconcile
-    // is needed.
-    const commands = transferRecoveryCommands({
-      deployment: PROD,
-      kind: 'usdc_bridge',
-      id: 'BRIDGE001',
-      status: 'withdrawing',
-      direction: 'alpaca_to_base'
-    })
-    expect(commands.map((entry) => entry.label)).toEqual(['Resume', 'Fail (pre-burn)'])
-    expect(commandFor(commands, 'Fail (pre-burn)')).toBe(
+  const bridgeLabels = (status: string, direction: 'alpaca_to_base' | 'base_to_alpaca' | null) =>
+    transferRecoveryCommands({ deployment: PROD, kind: 'usdc_bridge', id: 'BRIDGE001', status, direction })
+
+  it('offers fail-usdc-transfer only where the running bot can accept it', () => {
+    // Alpaca to Base: WithdrawalComplete (withdrawing) and a BridgingSubmitting
+    // with no recorded burn (bridging). Base to Alpaca: an unrecorded
+    // WithdrawalSubmitting (withdrawing) only.
+    const labels = (status: string, direction: 'alpaca_to_base' | 'base_to_alpaca' | null) =>
+      bridgeLabels(status, direction).map((entry) => entry.label)
+    expect(labels('withdrawing', 'alpaca_to_base')).toEqual(['Resume', 'Fail (pre-burn)'])
+    expect(labels('bridging', 'alpaca_to_base')).toEqual(['Resume', 'Fail (pre-burn)'])
+    expect(labels('converting', 'alpaca_to_base')).toEqual(['Resume'])
+    expect(labels('withdrawing', 'base_to_alpaca')).toEqual(['Resume', 'Fail (pre-burn)'])
+    expect(labels('bridging', 'base_to_alpaca')).toEqual(['Resume'])
+    expect(labels('depositing', 'base_to_alpaca')).toEqual(['Resume'])
+    expect(labels('bridging', null)).toEqual(['Resume', 'Fail (pre-burn)'])
+  })
+
+  it('gives the pre-fail check that applies to the bridge direction', () => {
+    const failText = (status: string, direction: 'alpaca_to_base' | 'base_to_alpaca' | null) =>
+      bridgeLabels(status, direction).find((entry) => entry.label === 'Fail (pre-burn)')
+        ?.description ?? ''
+    expect(commandFor(bridgeLabels('withdrawing', 'alpaca_to_base'), 'Fail (pre-burn)')).toBe(
       `${CLIENT} debug fail-usdc-transfer BRIDGE001 --reason "<reason>"`
     )
-    const fail = commands.find((entry) => entry.label === 'Fail (pre-burn)')
-    expect(fail?.mode).toBe('requires-bot')
-    expect(fail?.description.startsWith('Check the transfer first')).toBe(true)
-    expect(fail?.description.includes('offline stox fail-usdc-transfer')).toBe(true)
-    expect(fail?.description.includes('no reconcile is needed')).toBe(false)
+    const toBase = failText('withdrawing', 'alpaca_to_base')
+    expect(toBase.startsWith('Check the transfer first.')).toBe(true)
+    // The Alpaca to Base burn runs on Ethereum, and a nonce is per chain.
+    // The wallet burned on every earlier transfer too, so the check is anchored.
+    expect(
+      toBase.includes('verify on Ethereum that no CCTP burn left the bot wallet after this transfer started')
+    ).toBe(true)
+    expect(toBase.includes('pending nonce equals latest nonce')).toBe(true)
+    expect(toBase.includes('OperatorWithdraw')).toBe(false)
+
+    // A Base to Alpaca burn comes after the vault withdrawal, so the check is
+    // on the withdrawal, and a landed one is adopted with resume-usdc.
+    const toAlpaca = failText('withdrawing', 'base_to_alpaca')
+    expect(toAlpaca.includes('OperatorWithdraw')).toBe(true)
+    expect(toAlpaca.includes('run resume-usdc instead')).toBe(true)
+    expect(toAlpaca.includes('offline stox fail-usdc-transfer')).toBe(true)
+    // A log scan misses an unmined transaction, so the check also waits out
+    // the attempt and asks for no pending one.
+    expect(toAlpaca.includes('attempt timeout has passed')).toBe(true)
+    expect(toAlpaca.includes('pending nonce equals latest nonce')).toBe(true)
+    // Between reading the board and stopping the bot, the bot can broadcast a
+    // burn it does not record, and the offline command does not check the chain.
+    expect(toAlpaca.includes('no CCTP burn left the bot wallet')).toBe(true)
+    // A burn sent just before the stop can still be pending after it.
+    expect(toAlpaca.includes('stop the bot, then confirm')).toBe(true)
+    expect(toAlpaca.includes('the wallet has no pending transaction')).toBe(true)
+    expect(toAlpaca.includes('on Base that no CCTP burn left the bot wallet after this transfer started')).toBe(
+      true
+    )
+    expect(toAlpaca.includes('on Ethereum')).toBe(false)
+
+    const unknown = failText('withdrawing', null)
+    expect(unknown.includes('verify on Ethereum')).toBe(true)
+    expect(unknown.includes('OperatorWithdraw')).toBe(true)
+    expect(unknown.includes('no reconcile is needed')).toBe(false)
+  })
+
+  it('points a Base to Alpaca bridge stuck at bridging to the offline fail path', () => {
+    const resumeText = (status: string, direction: 'alpaca_to_base' | 'base_to_alpaca' | null) =>
+      bridgeLabels(status, direction).find((entry) => entry.label === 'Resume')?.description ?? ''
+    // The running bot refuses fail-usdc-transfer once the vault withdrawal
+    // confirmed, so the dialog offers no Fail there and the resume says where to go.
+    expect(bridgeLabels('bridging', 'base_to_alpaca').map((entry) => entry.label)).toEqual(['Resume'])
+    expect(resumeText('bridging', 'base_to_alpaca').includes('CLI recovery guide for the offline path')).toBe(
+      true
+    )
+    for (const [status, direction] of [
+      ['withdrawing', 'base_to_alpaca'],
+      ['depositing', 'base_to_alpaca'],
+      ['bridging', 'alpaca_to_base'],
+      ['bridging', null]
+    ] as const) {
+      expect(resumeText(status, direction).includes('offline path')).toBe(false)
+    }
   })
 
   it('fills the bridge direction on the usdc resume command for the client', () => {
@@ -731,14 +789,8 @@ describe('RECOVERY_GUIDE', () => {
 })
 
 describe('recoveryModeLabel', () => {
-  it('renders a distinct badge for each of the four execution modes', () => {
+  it('renders a distinct badge for each execution mode', () => {
     expect(recoveryModeLabel('requires-bot')).toBe('REST — requires the running bot')
-    expect(recoveryModeLabel('live-rpc-only')).toBe(
-      'live RPC — ensure the bot is not driving this same on-chain action'
-    )
-    expect(recoveryModeLabel('direct-db-live-rpc')).toBe(
-      'direct DB + live RPC — stop the bot / ensure it is not driving this id'
-    )
     expect(recoveryModeLabel('direct-db')).toBe(
       'direct DB — stop the bot / ensure it is not driving this id'
     )
@@ -746,16 +798,8 @@ describe('recoveryModeLabel', () => {
 })
 
 describe('recoveryModeColor', () => {
-  it('gives live-rpc-only its own sky tone, distinct from the bot-stop red', () => {
-    // live-rpc-only writes no DB state and is safe while the bot runs, so it must
-    // not share the red of the direct-db modes that require stopping the bot.
-    const liveRpc = recoveryModeColor('live-rpc-only')
-    expect(liveRpc.text).toBe('text-sky-500')
-    expect(liveRpc.badge).toContain('text-sky-500')
-
+  it('gives requires-bot amber and direct-db the bot-stop red', () => {
     expect(recoveryModeColor('requires-bot').text).toBe('text-amber-500')
-
     expect(recoveryModeColor('direct-db').text).toBe('text-destructive')
-    expect(recoveryModeColor('direct-db-live-rpc').text).toBe('text-destructive')
   })
 })

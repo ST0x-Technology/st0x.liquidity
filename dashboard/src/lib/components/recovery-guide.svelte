@@ -55,7 +55,9 @@
     <p class="mb-4 text-xs text-muted-foreground">
       Every recovery command, grouped by object. They use
       <span class="font-mono">st0x-liquidity-client</span>, which signs in with your Google account and
-      calls the running bot's API, so no SSH is needed and the bot must be running.
+      calls the running bot's API, so no SSH is needed and the bot must be running. The one exception
+      is failing a Base to Alpaca USDC bridge after its vault withdrawal confirmed: that needs the offline
+      <span class="font-mono">stox fail-usdc-transfer</span> with the bot stopped.
     </p>
 
     <div class="space-y-5">

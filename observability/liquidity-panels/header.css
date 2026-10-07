@@ -152,11 +152,9 @@
 }
 
 .hdr-amber { color: #f59e0b; }
-.hdr-sky { color: #0ea5e9; }
 .hdr-red { color: #ef4444; }
 
 /* Tailwind 700 on the light theme, like detail.css, for a 4.5:1 contrast
    against the white dialog. */
 .hdr-light .hdr-amber { color: #b45309; }
-.hdr-light .hdr-sky { color: #0369a1; }
 .hdr-light .hdr-red { color: #b91c1c; }

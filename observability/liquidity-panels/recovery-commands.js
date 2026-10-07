@@ -25,6 +25,43 @@ const tradeCommands = (client, symbol) => [
   },
 ];
 
+const USDC_FAIL_ALPACA_TO_BASE =
+  'Alpaca to Base: the bot accepts this only before the burn, from a completed withdrawal ' +
+  'or a burn submission with no recorded burn. The burn runs on Ethereum: verify on Ethereum ' +
+  'that no CCTP burn left the bot wallet after this transfer started (its Started time) and ' +
+  'that the wallet has no pending transaction (pending nonce equals latest nonce); if you ' +
+  'are not certain, run resume-usdc instead. The funds left Alpaca, so the guard stays held ' +
+  'until you settle them with reconcile-usdc.';
+
+const USDC_FAIL_BASE_TO_ALPACA =
+  'Base to Alpaca: the bot accepts this only while the vault withdrawal is unrecorded, and ' +
+  "it does not check the chain. Wait until the transfer's attempt timeout has passed, then " +
+  "confirm on Base that the bot wallet made no OperatorWithdraw after the transfer's " +
+  'from_block and has no pending transaction (pending nonce equals latest nonce); if one ' +
+  'landed or you are not certain, run resume-usdc instead. While a recorded withdrawal is ' +
+  'still confirming, run resume-usdc. Once it has confirmed the bot refuses: stop the bot, ' +
+  'then confirm the transfer has no recorded burn, and on Base that no CCTP burn left the ' +
+  'bot wallet after this transfer started and the wallet has no pending transaction. If any ' +
+  'of that is not certain, ' +
+  'start the bot and run resume-usdc; else run the offline stox fail-usdc-transfer and move ' +
+  'the wallet USDC back by hand.';
+
+const USDC_BRIDGING_BASE_TO_ALPACA =
+  ' If the burn keeps failing, the running bot refuses fail-usdc-transfer here: see ' +
+  'fail-usdc-transfer in the CLI recovery guide for the offline path.';
+
+// usdcFailCheck in transfer.ts: the check before fail-usdc-transfer, or null
+// where the running bot always refuses it.
+const usdcFailCheck = (status, direction) => {
+  if (direction === 'alpaca_to_base') {
+    return status === 'withdrawing' || status === 'bridging' ? USDC_FAIL_ALPACA_TO_BASE : null;
+  }
+  if (direction === 'base_to_alpaca') return status === 'withdrawing' ? USDC_FAIL_BASE_TO_ALPACA : null;
+  return status === 'withdrawing' || status === 'bridging'
+    ? `${USDC_FAIL_ALPACA_TO_BASE} ${USDC_FAIL_BASE_TO_ALPACA}`
+    : null;
+};
+
 const transferCommands = (client, transfer) => {
   const status = String(transfer.status || '').toLowerCase();
   const failed = status === 'failed';
@@ -41,16 +78,18 @@ const transferCommands = (client, transfer) => {
       '<alpaca-to-base|base-to-alpaca>';
     const resume = {
       command: `${client} debug resume-usdc ${direction} ${id}`,
-      description: "Re-drive this USDC bridge on the bot's transfer worker from the stage it stopped at.",
+      description:
+        "Re-drive this USDC bridge on the bot's transfer worker from the stage it stopped at." +
+        (transfer.direction === 'base_to_alpaca' && status === 'bridging' ? USDC_BRIDGING_BASE_TO_ALPACA : ''),
       mode: 'requires-bot',
     };
-    if (status !== 'withdrawing') return [resume];
+    const check = usdcFailCheck(status, transfer.direction || null);
+    if (check === null) return [resume];
     return [
       resume,
       {
         command: `${client} debug fail-usdc-transfer ${id} --reason "<reason>"`,
-        description:
-          'Check the transfer first: the bot accepts this only before the burn, for an Alpaca to Base bridge whose withdrawal completed or a Base to Alpaca bridge whose vault withdrawal was not sent. Verify on-chain that no CCTP burn landed. After a Base to Alpaca vault withdrawal, stop the bot, run the offline stox fail-usdc-transfer and move the wallet USDC back by hand. If the Alpaca withdrawal completed, the guard stays held until you reconcile.',
+        description: `Check the transfer first. ${check}`,
         mode: 'requires-bot',
       },
     ];

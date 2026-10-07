@@ -1143,8 +1143,8 @@ impl InventoryView {
                 let inventory = self.equities.get(symbol);
                 // The primary chain's slot alone, never a cross-chain total:
                 // a wrapped share is worth its own chain's underlying, so the
-                // chains cannot be added. Every polled chain's slot is listed
-                // apart in `onchain_by_chain` instead.
+                // chains cannot be added. Every hedged chain's polled slot is
+                // listed apart in `onchain_by_chain` instead.
                 let (onchain_available, onchain_inflight) = inventory
                     .map_or((FractionalShares::ZERO, FractionalShares::ZERO), |item| {
                         venue_balances(item.onchain.get(&self.primary_chain).copied())
@@ -7099,6 +7099,7 @@ mod tests {
         let symbol = Symbol::new("AAPL").unwrap();
         let now = Utc::now();
         let view = InventoryView::default()
+            .with_hedged_chains([Chain::Base, Chain::Robinhood])
             .update_equity_at(
                 &symbol,
                 Chain::Base,
@@ -7145,6 +7146,7 @@ mod tests {
         let symbol = Symbol::new("AAPL").unwrap();
         let now = Utc::now();
         let view = InventoryView::default()
+            .with_hedged_chains([Chain::Base, Chain::Robinhood])
             .apply_inflight_redemptions_at(
                 Chain::Robinhood,
                 &BTreeMap::from([(symbol.clone(), shares(2))]),

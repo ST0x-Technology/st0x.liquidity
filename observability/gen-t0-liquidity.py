@@ -479,12 +479,6 @@ SIDE_MAPPINGS = [
 ]
 
 USD = [{"id": "unit", "value": "currencyUSD"}, {"id": "decimals", "value": 2}]
-USD_SIGNED = USD + [
-    {"id": "custom.cellOptions", "value": {"type": "color-text"}},
-    {"id": "thresholds", "value": {"mode": "absolute", "steps": [
-        {"color": "red", "value": None}, {"color": "text", "value": -0.01},
-        {"color": "green", "value": 0.01}]}},
-]
 
 # ==========================================================================
 # Value mappings shared by the row tables — the SPA capitalizes and
@@ -1084,8 +1078,11 @@ TRADES_H, TRANSFERS_H = 25, 26
 panels += native_inventory(w=13, x=0, y=1, heights=(8, 9, 35))
 
 # A row's detail dialog is the hidden `detail` variable: a table row's link
-# sets it to the row's id, the detail panel queries both logs for that id
+# sets it to the row's id, the detail panel picks that id out of the Trades
+# and Rebalances tables' own results (it queries only the events log itself)
 # and opens the dialog, and closing the dialog clears the variable again.
+# Do not add $detail to its A and B: they are the tables' results, not
+# queries.
 #
 # The id is read by the field NAME. The groupBy key keeps the raw field name
 # (jsonPayload.id); organize's rename only set its display name, and the Id
@@ -1117,13 +1114,16 @@ def detail_panel(x, y, trades_id, transfers_id):
     the script both frames, where "allRows" would draw a frame picker.
     MODE_LABELS (how each recovery command runs) is prepended from
     recovery-guide.json, like the header's guide, and the per-row command
-    builders from recovery-commands.js.
+    builders from recovery-commands.js, and the status-history order from
+    status-history.js.
     """
     with open(os.path.join(HERE, "liquidity-panels", "recovery-guide.json")) as f:
         mode_labels = json.load(f)["modeLabels"]
-    with open(os.path.join(HERE, "liquidity-panels", "recovery-commands.js")) as f:
-        # Its export line is for the SPA test; afterRender is not a module.
-        commands = "".join(line for line in f if not line.startswith("export "))
+    commands = ""
+    for module in ("recovery-commands.js", "status-history.js"):
+        with open(os.path.join(HERE, "liquidity-panels", module)) as f:
+            # Its export line is for the SPA test; afterRender is not a module.
+            commands += "".join(line for line in f if not line.startswith("export ")) + "\n"
     with open(os.path.join(HERE, "liquidity-panels", "detail.js")) as f:
         after_render = (f"const MODE_LABELS = {json.dumps(mode_labels)};\n\n"
                         + commands + "\n" + f.read())
@@ -1170,10 +1170,15 @@ def latest_status_table(title, desc, log, fields, shown, w, h, x, y,
     The exporter writes one log entry per status change (insertId
     `<id>:<status>`), so the raw feed holds several rows per trade or
     transfer. The plugin returns entries newest first, so groupBy on
-    jsonPayload.id with `first` keeps each entity's latest status.
+    jsonPayload.id with `first` keeps each entity's entry with the highest
+    timestamp. That is usually the latest status, but a status's timestamp
+    can be earlier than the one before it: a USDC bridge stamps
+    WithdrawalComplete with confirmed_at and the BridgingSubmitting after it
+    with the older initiated_at, so such a row can show withdrawing. The
+    detail dialog orders a bridge's statuses by its lifecycle instead.
 
     The id stays as the first column, an ⓘ that opens the row's detail
-    dialog; the Status cell opens it too (see DETAIL_URL).
+    dialog (see DETAIL_URL).
 
     fields: {payload leaf: column name}; the entry's own timestamp is
       always kept, as fields["timestamp"].
@@ -1452,8 +1457,7 @@ dashboards.append(make_dashboard(
 # audit's fallback ("keep currencyUSD on tiles, full locale in tables") was
 # only needed because no unit did both — this one does, so it's used on
 # both the tiles below and the Per Asset PnL table's dollar columns
-# (PNL_TABLE_USD_SIGNED further down); do NOT touch the shared USD_SIGNED
-# constant (line ~344) — Tab 1 owns it (its Exposure column).
+# (PNL_TABLE_USD_SIGNED further down).
 PNL_TILE_USD = "currency:financial:$"
 PNL_TABLE_USD_SIGNED = [
     {"id": "unit", "value": PNL_TILE_USD}, {"id": "decimals", "value": 2},
@@ -1525,7 +1529,7 @@ pnl_cols = [
     ("Total", "total"),
 ]
 # P5: the SPA's Volume column, in shares rather than USD, so it gets its own
-# override rather than joining unit_overrides' USD_SIGNED sweep below. The
+# override rather than joining unit_overrides' PNL_TABLE_USD_SIGNED sweep below. The
 # SPA places it right after Net; decimals=4 matches its "20.0723 sh"
 # precision. It counts a matched lot on both legs, so the exporter serves
 # 2 x matchedShares (verified against the entries page: their shares sum

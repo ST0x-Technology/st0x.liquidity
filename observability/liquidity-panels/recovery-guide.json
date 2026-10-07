@@ -2,8 +2,6 @@
   "source": "ST0x-Technology/st0x.liquidity dashboard/src/lib/transfer.ts RECOVERY_GUIDE, same commit as this file; regenerate from there, do not edit by hand",
   "modeLabels": {
     "requires-bot": "REST — requires the running bot",
-    "live-rpc-only": "live RPC — ensure the bot is not driving this same on-chain action",
-    "direct-db-live-rpc": "direct DB + live RPC — stop the bot / ensure it is not driving this id",
     "direct-db": "direct DB — stop the bot / ensure it is not driving this id"
   },
   "groups": [
@@ -40,8 +38,8 @@
         },
         {
           "command": "st0x-liquidity-client --env production debug fail-usdc-transfer <id> --reason \"<reason>\"",
-          "description": "Force a USDC bridge stuck before its burn into Failed. The bot accepts it for an Alpaca to Base bridge whose withdrawal completed, or a Base to Alpaca bridge whose vault withdrawal was not sent. If the Alpaca withdrawal completed, the guard stays held until reconcile-usdc settles the funds. After a Base to Alpaca vault withdrawal, the bot refuses it: stop the bot, run the offline stox fail-usdc-transfer, and move the wallet USDC back by hand.",
-          "whenToUse": "A USDC bridge is stuck before its CCTP burn and must be terminalized. Check the transfer and verify on-chain that no burn landed first.",
+          "description": "Force a USDC bridge stuck before its burn into Failed. Alpaca to Base: the bot accepts this only before the burn, from a completed withdrawal or a burn submission with no recorded burn. The burn runs on Ethereum: verify on Ethereum that no CCTP burn left the bot wallet after this transfer started (its Started time) and that the wallet has no pending transaction (pending nonce equals latest nonce); if you are not certain, run resume-usdc instead. The funds left Alpaca, so the guard stays held until you settle them with reconcile-usdc. Base to Alpaca: the bot accepts this only while the vault withdrawal is unrecorded, and it does not check the chain. Wait until the transfer's attempt timeout has passed, then confirm on Base that the bot wallet made no OperatorWithdraw after the transfer's from_block and has no pending transaction (pending nonce equals latest nonce); if one landed or you are not certain, run resume-usdc instead. While a recorded withdrawal is still confirming, run resume-usdc. Once it has confirmed the bot refuses: stop the bot, then confirm the transfer has no recorded burn, and on Base that no CCTP burn left the bot wallet after this transfer started and the wallet has no pending transaction. If any of that is not certain, start the bot and run resume-usdc; else run the offline stox fail-usdc-transfer and move the wallet USDC back by hand.",
+          "whenToUse": "A USDC bridge is stuck before its CCTP burn and must be terminalized. Run the check for its direction in the description first; if it is not certain, run resume-usdc.",
           "appliesTo": "USDC bridge (pre-burn stuck)",
           "mode": "requires-bot"
         },
@@ -56,7 +54,7 @@
           "command": "st0x-liquidity-client --env production debug reconcile-usdc <id> --reason <funds-moved-manually|deposit-credited-offline>",
           "description": "Mark a failed USDC bridge Reconciled after its funds were settled manually.",
           "whenToUse": "A USDC bridge failed after its funds left the source venue, and they were settled out-of-band.",
-          "appliesTo": "Post-burn USDC failure (DepositFailed, post-burn BridgingFailed, or BaseToAlpaca ConversionFailed)",
+          "appliesTo": "USDC failure with funds off the source venue (DepositFailed, any AlpacaToBase BridgingFailed, a post-burn BaseToAlpaca BridgingFailed, or BaseToAlpaca ConversionFailed)",
           "mode": "requires-bot"
         }
       ]
