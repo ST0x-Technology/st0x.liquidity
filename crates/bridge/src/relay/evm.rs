@@ -16,7 +16,7 @@ use super::proof::{
     PaymentTerms, RelayErc20Deposit, UnverifiedReason, check_payment, deposit_event,
 };
 use super::quote::depositErc20Call;
-use super::{QuoteStep, RelayOrderId, RelayQuote, StepTransaction};
+use super::{QuoteMismatch, QuoteStep, RelayOrderId, RelayQuote, StepTransaction};
 use crate::{
     DepositScan, HopDirection, PreparedSwap, PreparedSwapDeposit, SwapBridge, SwapDeposit,
     SwapPayment, SwapSide,
@@ -94,6 +94,9 @@ pub enum RelayBridgeError {
     },
     #[error("deposit credits depositor {actual}, the signing wallet is {expected}")]
     Depositor { expected: Address, actual: Address },
+    /// A step's calldata does not match the quote it is signed for.
+    #[error(transparent)]
+    Quote(#[from] QuoteMismatch),
     #[error("prepared approve has nonce {approve}, the deposit {deposit}: not consecutive")]
     PairNonces { approve: u64, deposit: u64 },
     #[error("deposit {tx} reverted")]
@@ -783,7 +786,7 @@ mod tests {
     use st0x_evm::local::RawPrivateKeyWallet;
 
     use super::super::test_chain::RelayChain;
-    use super::super::{BasisPoints, QuoteAmounts, QuoteFees, RelayRequestId};
+    use super::super::{BasisPoints, QuoteAmounts, QuoteFees, QuoteField, RelayRequestId};
     use super::*;
 
     type TestWallet = RawPrivateKeyWallet<DynProvider>;
@@ -1423,6 +1426,137 @@ mod tests {
                 RelayBridgeError::Depositor { actual, .. } if actual == other
             ),
             "{error:?}"
+        );
+    }
+
+    /// Why `prepare_deposit` refuses a quote for `order_id` whose step calldata
+    /// is `approve` and `deposit`.
+    async fn calldata_refusal(
+        harness: &Harness,
+        order_id: B256,
+        approve: IERC20::approveCall,
+        deposit: depositErc20Call,
+    ) -> QuoteMismatch {
+        let mut quote = quote(&harness.chain, order_id, true);
+        quote.approve.as_mut().unwrap().data = Bytes::from(approve.abi_encode());
+        quote.deposit.data = Bytes::from(deposit.abi_encode());
+
+        match harness
+            .bridge
+            .prepare_deposit(HopDirection::ToHub, &quote)
+            .await
+        {
+            Err(RelayBridgeError::Quote(mismatch)) => mismatch,
+            other => panic!("expected a quote mismatch, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn step_calldata_off_the_quote_is_refused_at_signing() {
+        let harness = Harness::new().await;
+        let order_id = B256::random();
+        let other = Address::repeat_byte(0x22);
+        let approve = IERC20::approveCall {
+            spender: harness.chain.depository,
+            amount: AMOUNT,
+        };
+        let deposit = depositErc20Call {
+            depositor: harness.chain.wallet(),
+            token: harness.chain.stable,
+            amount: AMOUNT,
+            id: order_id,
+        };
+
+        let spender = calldata_refusal(
+            &harness,
+            order_id,
+            IERC20::approveCall {
+                spender: other,
+                ..approve.clone()
+            },
+            deposit.clone(),
+        )
+        .await;
+        let approved = calldata_refusal(
+            &harness,
+            order_id,
+            IERC20::approveCall {
+                amount: AMOUNT + U256::from(1),
+                ..approve.clone()
+            },
+            deposit.clone(),
+        )
+        .await;
+        let token = calldata_refusal(
+            &harness,
+            order_id,
+            approve.clone(),
+            depositErc20Call {
+                token: other,
+                ..deposit.clone()
+            },
+        )
+        .await;
+        let deposited = calldata_refusal(
+            &harness,
+            order_id,
+            approve.clone(),
+            depositErc20Call {
+                amount: AMOUNT - U256::from(1),
+                ..deposit.clone()
+            },
+        )
+        .await;
+        let order = calldata_refusal(
+            &harness,
+            order_id,
+            approve,
+            depositErc20Call {
+                id: B256::ZERO,
+                ..deposit
+            },
+        )
+        .await;
+
+        assert!(
+            matches!(
+                spender,
+                QuoteMismatch::AddressMismatch { field: QuoteField::ApproveSpender, actual, .. }
+                    if actual == other
+            ),
+            "{spender:?}"
+        );
+        assert!(
+            matches!(
+                approved,
+                QuoteMismatch::AmountMismatch { field: QuoteField::ApproveAmount, expected, .. }
+                    if expected == AMOUNT
+            ),
+            "{approved:?}"
+        );
+        assert!(
+            matches!(
+                token,
+                QuoteMismatch::AddressMismatch { field: QuoteField::DepositToken, actual, .. }
+                    if actual == other
+            ),
+            "{token:?}"
+        );
+        assert!(
+            matches!(
+                deposited,
+                QuoteMismatch::AmountMismatch { field: QuoteField::DepositAmount, expected, .. }
+                    if expected == AMOUNT
+            ),
+            "{deposited:?}"
+        );
+        assert!(
+            matches!(
+                order,
+                QuoteMismatch::OrderIdMismatch { calldata, .. }
+                    if calldata == RelayOrderId(B256::ZERO)
+            ),
+            "{order:?}"
         );
     }
 
