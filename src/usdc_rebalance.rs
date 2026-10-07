@@ -1482,10 +1482,11 @@ impl UsdcRebalance {
     /// classification here at compile time.
     pub fn pre_burn_fail_eligibility(&self) -> PreBurnFailEligibility {
         match self {
-            // A Relay withdrawal left the stable outside the vault, and
-            // `FailBridging` refuses it: like the swap states, only a
-            // redeposit settles it.
+            // A chain-to-Alpaca Relay withdrawal left the stable outside
+            // the vault, and `FailBridging` refuses it: like the swap states,
+            // only a redeposit settles it.
             Self::WithdrawalComplete {
+                direction: RebalanceDirection::BaseToAlpaca,
                 corridor:
                     UsdcCorridor::HubRouted {
                         hop: HopKind::Relay,
@@ -4818,9 +4819,12 @@ impl UsdcRebalance {
                 pending_burn_tx: Some(_),
                 ..
             } => Err(UsdcRebalanceError::BurnAlreadyRecorded),
-            // A Relay withdrawal's stable is outside the vault: failing it
-            // would release the guard before a redeposit returns it.
+            // A chain-to-Alpaca Relay withdrawal's stable is outside the
+            // vault: failing it would release the guard before a redeposit
+            // returns it. An Alpaca-to-chain failure keeps the guard until
+            // reconcile, as on CCTP.
             Self::WithdrawalComplete {
+                direction: RebalanceDirection::BaseToAlpaca,
                 corridor:
                     corridor @ UsdcCorridor::HubRouted {
                         hop: HopKind::Relay,
