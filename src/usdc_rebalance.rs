@@ -5871,6 +5871,41 @@ mod tests {
         }
     }
 
+    /// A Relay transfer at `WithdrawalComplete` has its withdrawn stable
+    /// outside the vault, so `fail-usdc-transfer` must not fail it: only a
+    /// redeposit returns the stable. A CCTP one still fails as before.
+    #[tokio::test]
+    async fn relay_withdrawal_complete_refuses_a_pre_burn_fail() {
+        let relay =
+            replay::<UsdcRebalance>(withdrawn(RebalanceDirection::BaseToAlpaca, ROBINHOOD_RELAY))
+                .unwrap()
+                .unwrap();
+        assert_ne!(
+            relay.pre_burn_fail_eligibility(),
+            PreBurnFailEligibility::Eligible
+        );
+
+        let error = TestHarness::<UsdcRebalance>::with(())
+            .given(withdrawn(RebalanceDirection::BaseToAlpaca, ROBINHOOD_RELAY))
+            .when(UsdcRebalanceCommand::FailBridging {
+                reason: "operator".to_string(),
+            })
+            .await
+            .then_expect_error();
+        assert!(matches!(error, LifecycleError::Apply(_)), "got {error:?}");
+
+        let cctp = replay::<UsdcRebalance>(withdrawn(
+            RebalanceDirection::BaseToAlpaca,
+            UsdcCorridor::BASE_CCTP,
+        ))
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            cctp.pre_burn_fail_eligibility(),
+            PreBurnFailEligibility::Eligible
+        );
+    }
+
     /// An Ethereum-origin swap's input is held in the shared wallet until a
     /// pair is signed, then in flight; a Robinhood-origin swap holds nothing
     /// there.
