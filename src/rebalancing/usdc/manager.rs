@@ -740,11 +740,9 @@ impl std::fmt::Display for SettlementStall {
     }
 }
 
-impl<
-    Signer: Wallet,
-    B: Bridge<Error = CctpError, Attestation = AttestationResponse> + UsdcBridgeHelper,
-> CrossVenueCashTransfer<Signer, B>
-{
+/// The legs every hop shares: the conversion, the vault legs, the deposit
+/// send to Alpaca and the Ethereum credit ledger.
+impl<Signer: Wallet, B: UsdcBridgeHelper> CrossVenueCashTransfer<Signer, B> {
     pub fn new(
         alpaca_broker: InstrumentedAlpacaBroker,
         alpaca_wallet: Arc<AlpacaWalletService>,
@@ -1061,6 +1059,2013 @@ impl<
         Err(UsdcTransferError::SettlementRetryDeadlineElapsed { id: id.clone() })
     }
 
+    async fn fail_conversion(
+        &self,
+        id: &UsdcRebalanceId,
+        reason: String,
+    ) -> Result<(), UsdcTransferError> {
+        self.cqrs
+            .send(id, UsdcRebalanceCommand::FailConversion { reason })
+            .await?;
+        Ok(())
+    }
+
+    /// Re-reads settled cash after a definitive insufficient-balance
+    /// rejection and produces a strictly smaller, reserve-aware whole-cent
+    /// placement. The one-cent decrement guarantees progress when the fresh
+    /// read has not moved; taking the minimum prevents a later read from ever
+    /// increasing this aggregate's original intent.
+    async fn resized_usd_conversion_notional(
+        &self,
+        id: &UsdcRebalanceId,
+        previous: Positive<Usd>,
+    ) -> Result<Positive<Usd>, UsdcTransferError> {
+        let withdrawable_cash_cents = self.alpaca_broker.withdrawable_cash_cents().await?;
+        let capacity =
+            alpaca_to_base_usdc_capacity(withdrawable_cash_cents, self.reserved_cash)?
+                .ok_or_else(|| UsdcTransferError::WithdrawableCashUnavailable { id: id.clone() })?;
+
+        resize_usd_conversion_notional(id, previous, capacity)
+    }
+
+    /// Converts USD buying power to USDC in the crypto wallet.
+    ///
+    /// Used at the start of AlpacaToBase flow, before withdrawal. Placement
+    /// retries only definitive insufficient-USD rejections and reuses the
+    /// correlation ID across every resized request. A successful fill records
+    /// the actual USDC received for downstream withdrawal sizing; exhausting
+    /// the bound records one terminal conversion failure.
+    #[instrument(target = "rebalance", skip(self), fields(%id, %amount), level = tracing::Level::DEBUG)]
+    pub(crate) async fn execute_usd_to_usdc_conversion(
+        &self,
+        id: &UsdcRebalanceId,
+        amount: Usdc,
+    ) -> Result<Usdc, UsdcTransferError> {
+        let correlation_id = ClientOrderId::from_uuid(Uuid::new_v4());
+
+        info!(target: "rebalance", %amount, %correlation_id, "Starting USD to USDC conversion");
+
+        // The aggregate carries this leg's amount as `Usdc` for the shape its
+        // persisted events already have, but the buy spends it as dollars --
+        // named here so the order cannot be read as a USDC quantity. Built
+        // before the intent is recorded so a non-positive amount fails with
+        // no aggregate event and no broker order to reconcile.
+        let mut notional = Positive::new(Usd::new(amount.inner()))?;
+
+        // Record intent BEFORE placing order so we can track failures
+        self.cqrs
+            .send(
+                id,
+                UsdcRebalanceCommand::InitiateConversion {
+                    direction: RebalanceDirection::AlpacaToBase,
+                    corridor: self.corridor,
+                    amount,
+                    order_id: correlation_id.clone(),
+                },
+            )
+            .await?;
+
+        let mut attempt = 0;
+        let order = loop {
+            attempt += 1;
+            match self
+                .alpaca_broker
+                .convert_usdc_usd(ConversionOrder::BuyWithUsd(notional), &correlation_id)
+                .await
+            {
+                Ok(order) => break order,
+                // Only an insufficient-balance rejection can succeed with a
+                // smaller notional. Any other Alpaca rejection, including a
+                // `40310000` "no available quote", takes the fail-once arm below.
+                Err(error @ AlpacaBrokerApiError::UsdConversionInsufficientBalance { .. }) => {
+                    if attempt >= USD_CONVERSION_PLACEMENT_ATTEMPTS {
+                        warn!(
+                            target: "rebalance",
+                            %id,
+                            attempt,
+                            max_attempts = USD_CONVERSION_PLACEMENT_ATTEMPTS,
+                            %error,
+                            "USD to USDC conversion failed after exhausting insufficient-balance placement attempts"
+                        );
+                        self.fail_conversion(id, error.to_string()).await?;
+                        return Err(UsdcTransferError::AlpacaBrokerApi(error));
+                    }
+
+                    let resized = match self.resized_usd_conversion_notional(id, notional).await {
+                        Ok(resized) => resized,
+                        Err(resize_error) => {
+                            warn!(
+                                target: "rebalance",
+                                %id,
+                                attempt,
+                                error = %resize_error,
+                                "USD to USDC conversion retry could not be resized"
+                            );
+                            self.fail_conversion(id, resize_error.to_string()).await?;
+                            return match &resize_error {
+                                UsdcTransferError::AlpacaBrokerApi(error)
+                                    if error.backpressure().is_some() =>
+                                {
+                                    Err(UsdcTransferError::ConversionPlacementFailed {
+                                        id: id.clone(),
+                                    })
+                                }
+                                _ => Err(resize_error),
+                            };
+                        }
+                    };
+                    warn!(
+                        target: "rebalance",
+                        %id,
+                        attempt,
+                        previous = %notional,
+                        next = %resized,
+                        "Alpaca rejected USD-to-USDC placement for insufficient balance; retrying with fresh capacity"
+                    );
+                    notional = resized;
+                }
+                // The order's fate is unknown: it may still be live at the broker
+                // and still fill. Recording a failure would release the in-flight
+                // guard and let the trigger arm a second conversion for the same
+                // imbalance while real money can still move, so the aggregate is
+                // left at `Converting` for operator reconciliation instead.
+                Err(
+                    error @ (AlpacaBrokerApiError::ConversionCancelNotSettled { .. }
+                    | AlpacaBrokerApiError::ConversionOrderNotFound { .. }),
+                ) => {
+                    error!(target: "rebalance", %error, "USD to USDC conversion outcome unresolved");
+                    return Err(UsdcTransferError::ConversionOutcomeUnresolved {
+                        id: id.clone(),
+                        source: Box::new(error),
+                    });
+                }
+                Err(error) => {
+                    // Conversion placement fails fast on ANY error (RAI-1494:
+                    // deliberately NOT rescheduled, unlike the deposit/withdrawal
+                    // polls) -- retrying a placement risks submitting the order
+                    // twice against real money. A classified 429 must not reach
+                    // the job's backpressure classifier though:
+                    // `find_backpressure` walks the `.source()` chain, so
+                    // returning `AlpacaBrokerApi` here would let it downcast into
+                    // the underlying 429 and mistakenly reschedule an
+                    // already-terminalized aggregate. Return the
+                    // non-classifiable `ConversionPlacementFailed` only for that
+                    // case; every other placement failure (e.g. a terminally
+                    // rejected/canceled/expired order) keeps surfacing the
+                    // original `AlpacaBrokerApi` variant so its specific reason
+                    // is preserved for callers/tests that match on it.
+                    warn!(target: "rebalance", "USD to USDC conversion failed: {error}");
+                    self.fail_conversion(id, error.to_string()).await?;
+                    if error.backpressure().is_some() {
+                        return Err(UsdcTransferError::ConversionPlacementFailed {
+                            id: id.clone(),
+                        });
+                    }
+                    return Err(UsdcTransferError::AlpacaBrokerApi(error));
+                }
+            }
+        };
+
+        let conversion = self
+            .record_conversion_or_fail(id, &correlation_id, &order, ConversionDirection::UsdToUsdc)
+            .await?;
+        let received_amount = conversion.received_amount;
+
+        // The trigger's floor only covers the amount it *requests*; a stalled
+        // conversion whose remainder was cancelled delivers whatever filled,
+        // and Alpaca rejects a withdrawal below its minimum outright. Failing
+        // here rather than at the withdrawal is what keeps the rebalance
+        // terminalizable: `FailConversion` is only legal while the aggregate
+        // is still `Converting`, so confirming first would leave it holding
+        // the in-flight guard with no terminal transition left.
+        if received_amount.lt(&ALPACA_MINIMUM_WITHDRAWAL)? {
+            error!(target: "rebalance",
+                order_id = %order.id,
+                requested = %amount,
+                converted = %received_amount,
+                minimum = %*ALPACA_MINIMUM_WITHDRAWAL,
+                "USD to USDC conversion settled below Alpaca's withdrawal minimum; \
+                 no withdrawal will be attempted"
+            );
+            self.cqrs
+                .send(
+                    id,
+                    UsdcRebalanceCommand::FailConversion {
+                        reason: format!(
+                            "conversion settled at {received_amount}, below Alpaca's {} \
+                             withdrawal minimum; the converted USDC needs reconciliation \
+                             in the Alpaca crypto wallet",
+                            *ALPACA_MINIMUM_WITHDRAWAL
+                        ),
+                    },
+                )
+                .await?;
+            return Err(UsdcTransferError::ConversionBelowWithdrawalMinimum {
+                id: id.clone(),
+                converted: received_amount,
+                minimum: *ALPACA_MINIMUM_WITHDRAWAL,
+            });
+        }
+
+        self.cqrs
+            .send(id, UsdcRebalanceCommand::ConfirmConversion { conversion })
+            .await?;
+
+        info!(target: "rebalance",
+            order_id = %order.id,
+            requested = ?amount,
+            source_amount = ?conversion.source_amount,
+            received_amount = ?conversion.received_amount,
+            "USD to USDC conversion completed"
+        );
+        Ok(received_amount)
+    }
+
+    /// Converts USDC to USD buying power.
+    ///
+    /// Used at the end of BaseToAlpaca flow, after deposit is confirmed.
+    /// Places a sell order on USDC/USD and polls until filled.
+    ///
+    /// Returns the actual USD proceeds credited at Alpaca.
+    ///
+    /// # Event Sourcing Flow
+    ///
+    /// 1. Record intent via `InitiatePostDepositConversion` (aggregate
+    ///    enters `Converting` state)
+    /// 2. Place Alpaca order
+    /// 3. If order fails: emit `FailConversion` (aggregate enters
+    ///    `ConversionFailed` state)
+    /// 4. If order succeeds: emit `ConfirmConversion` (aggregate enters
+    ///    `ConversionComplete` state)
+    ///
+    /// The `order_id` in `InitiatePostDepositConversion` is a correlation
+    /// UUID generated upfront, not the actual Alpaca order ID.
+    #[instrument(target = "rebalance", skip(self), fields(%id, %amount), level = tracing::Level::DEBUG)]
+    pub(crate) async fn execute_usdc_to_usd_conversion(
+        &self,
+        id: &UsdcRebalanceId,
+        amount: Usdc,
+    ) -> Result<Usdc, UsdcTransferError> {
+        let correlation_id = ClientOrderId::from_uuid(Uuid::new_v4());
+
+        info!(target: "rebalance", %amount, %correlation_id, "Starting USDC to USD conversion");
+
+        // Built before the intent is recorded so a non-positive amount fails
+        // with no aggregate event and no broker order to reconcile.
+        let conversion_order = ConversionOrder::SellUsdc(Positive::new(amount)?);
+
+        // Record intent BEFORE placing order so we can track failures
+        self.cqrs
+            .send(
+                id,
+                UsdcRebalanceCommand::InitiatePostDepositConversion {
+                    order_id: correlation_id.clone(),
+                    amount,
+                },
+            )
+            .await?;
+
+        let order = match self
+            .alpaca_broker
+            .convert_usdc_usd(conversion_order, &correlation_id)
+            .await
+        {
+            Ok(order) => order,
+            // Identical broker state decides identically on both legs: the
+            // order's fate is unknown and it may still fill, so recording a
+            // durable failure against it is wrong here for the same reason it
+            // is wrong on the USD->USDC leg. Left unterminalized for operator
+            // reconciliation.
+            Err(
+                error @ (AlpacaBrokerApiError::ConversionCancelNotSettled { .. }
+                | AlpacaBrokerApiError::ConversionOrderNotFound { .. }),
+            ) => {
+                error!(target: "rebalance", %error, "USDC to USD conversion outcome unresolved");
+                return Err(UsdcTransferError::ConversionOutcomeUnresolved {
+                    id: id.clone(),
+                    source: Box::new(error),
+                });
+            }
+            Err(error) => {
+                // Conversion placement fails fast on ANY error (RAI-1494):
+                // same rationale as `execute_usd_to_usdc_conversion` above --
+                // only a classified 429 returns the non-classifiable
+                // `ConversionPlacementFailed`; every other placement failure
+                // keeps surfacing the original `AlpacaBrokerApi` variant.
+                warn!(target: "rebalance", "USDC to USD conversion failed: {error}");
+                self.cqrs
+                    .send(
+                        id,
+                        UsdcRebalanceCommand::FailConversion {
+                            reason: error.to_string(),
+                        },
+                    )
+                    .await?;
+                if error.backpressure().is_some() {
+                    return Err(UsdcTransferError::ConversionPlacementFailed { id: id.clone() });
+                }
+                return Err(UsdcTransferError::AlpacaBrokerApi(error));
+            }
+        };
+
+        let conversion = self
+            .record_conversion_or_fail(id, &correlation_id, &order, conversion_order.direction())
+            .await?;
+        let proceeds = conversion.received_amount;
+
+        // `source_amount` is the USDC actually sold. A stalled order whose
+        // remainder was cancelled sells less than was deposited, and the rest
+        // stays as USDC in the Alpaca crypto wallet -- a denomination the
+        // offchain cash inventory does not read, so the imbalance calculation
+        // cannot see it and no later rebalance sweeps it. Confirming here
+        // would report a rebalance that moved part of the cash as a complete
+        // success. Fail instead, naming the unconverted amount: the same
+        // treatment `resume_converting` already gives an identical broker
+        // outcome. This asymmetry with the USD->USDC leg is deliberate --
+        // there the unfilled remainder stays as USD buying power, which the
+        // inventory does see.
+        if conversion.source_amount.lt(&amount)? {
+            let unconverted = (amount - conversion.source_amount)?;
+
+            error!(target: "rebalance",
+                order_id = %order.id,
+                requested = %amount,
+                converted = %conversion.source_amount,
+                %unconverted,
+                "USDC to USD conversion filled short; unconverted USDC is stranded in the \
+                 Alpaca crypto wallet"
+            );
+            self.cqrs
+                .send(
+                    id,
+                    UsdcRebalanceCommand::FailConversion {
+                        reason: format!(
+                            "post-deposit conversion filled only {} of {}; {unconverted} \
+                             USDC needs reconciliation in the Alpaca crypto wallet",
+                            conversion.source_amount, amount
+                        ),
+                    },
+                )
+                .await?;
+            return Err(UsdcTransferError::PostDepositConversionShortFill {
+                id: id.clone(),
+                converted: conversion.source_amount,
+                unconverted,
+            });
+        }
+
+        self.cqrs
+            .send(id, UsdcRebalanceCommand::ConfirmConversion { conversion })
+            .await?;
+
+        info!(target: "rebalance",
+            order_id = %order.id,
+            requested = ?amount,
+            source_amount = ?conversion.source_amount,
+            received_amount = ?conversion.received_amount,
+            "USDC to USD conversion completed"
+        );
+        Ok(proceeds)
+    }
+
+    /// Bridges what was credited either way. Alpaca deducts its network fee and
+    /// fees from a withdrawal, so a shortfall up to the fees it reported is
+    /// expected and only logged; a larger one pages. A shortfall whose fees
+    /// cannot be read is logged without a page, as it is most likely a fee.
+    async fn report_short_withdrawal_credit(
+        &self,
+        id: &UsdcRebalanceId,
+        withdrawal_tx: TxHash,
+        requested: Usdc,
+        shortfall: U256,
+    ) {
+        let Some(reported_fees) = self.reported_withdrawal_fees(id).await else {
+            info!(
+                target: "rebalance",
+                %id,
+                %withdrawal_tx,
+                %requested,
+                shortfall = %display_usdc(shortfall),
+                "Alpaca withdrawal credited less USDC than requested; the reported fees could \
+                 not be read, bridging the credited amount"
+            );
+            return;
+        };
+
+        if shortfall <= reported_fees {
+            info!(
+                target: "rebalance",
+                %id,
+                %withdrawal_tx,
+                %requested,
+                shortfall = %display_usdc(shortfall),
+                reported_fees = %display_usdc(reported_fees),
+                "Alpaca withdrawal credited less USDC than requested, within the fees Alpaca \
+                 reported; bridging the credited amount"
+            );
+            return;
+        }
+
+        error!(
+            target: "operational_alert",
+            alert = true,
+            %id,
+            %withdrawal_tx,
+            %requested,
+            shortfall = %display_usdc(shortfall),
+            reported_fees = %display_usdc(reported_fees),
+            "Alpaca withdrawal credited less USDC than requested net of the fees Alpaca \
+             reported; bridging the credited amount"
+        );
+    }
+
+    /// The network fee plus fees Alpaca reports for the withdrawal of `id`, in
+    /// USDC base units, or `None` (with a warning) when they cannot be read.
+    async fn reported_withdrawal_fees(&self, id: &UsdcRebalanceId) -> Option<U256> {
+        let state = self
+            .cqrs
+            .load(id)
+            .await
+            .inspect_err(|error| {
+                warn!(target: "rebalance", %id, ?error, "Could not load the transfer to read its withdrawal fees");
+            })
+            .ok()
+            .flatten();
+
+        let Some(UsdcRebalance::WithdrawalComplete {
+            withdrawal_ref: Some(TransferRef::AlpacaId(transfer_id)),
+            ..
+        }) = state
+        else {
+            warn!(target: "rebalance", %id, ?state, "No Alpaca transfer id to read the withdrawal fees from");
+            return None;
+        };
+
+        let transfer = self
+            .alpaca_wallet
+            .get_transfer(&transfer_id)
+            .await
+            .inspect_err(|error| {
+                warn!(target: "rebalance", %id, %transfer_id, %error, "Could not read the Alpaca withdrawal to get its fees");
+            })
+            .ok()?;
+
+        let Some(fees) = transfer
+            .reported_fees()
+            .inspect_err(|error| {
+                warn!(target: "rebalance", %id, %transfer_id, ?error, "Could not total the Alpaca withdrawal fees");
+            })
+            .ok()?
+        else {
+            warn!(target: "rebalance", %id, %transfer_id, "Alpaca reported no fees for the withdrawal");
+            return None;
+        };
+
+        usdc_to_u256(fees)
+            .inspect_err(|error| {
+                warn!(target: "rebalance", %id, %transfer_id, %error, "Alpaca withdrawal fees are off the USDC grid");
+            })
+            .ok()
+    }
+
+    /// DURABLE confirmation re-check: fires on the redrive path
+    /// (`WithdrawalComplete` -> resume), where the primary gate in
+    /// `poll_and_confirm_withdrawal` does not re-run. Every failure is a
+    /// retryable wait, deadline-gated so a deterministic RPC failure (e.g. a
+    /// malformed tx hash from Alpaca) cannot redrive forever.
+    async fn require_withdrawal_tx_confirmed(
+        &self,
+        id: &UsdcRebalanceId,
+        tx: TxHash,
+        confirmed_at: DateTime<Utc>,
+    ) -> Result<(), UsdcTransferError> {
+        let required = self
+            .ethereum_required_confirmations
+            .ok_or(EthereumChainMissing)?;
+        let confirmations = match self.cctp_bridge.ethereum_tx_confirmations(tx).await {
+            Ok(confirmations) => confirmations,
+            Err(error) => {
+                self.check_settlement_deadline(
+                    id,
+                    confirmed_at,
+                    SettlementStall::ConfirmationCheckFailing,
+                )
+                .await?;
+                return Err(UsdcTransferError::SettlementCheckTransient {
+                    id: id.clone(),
+                    source: Box::new(error),
+                });
+            }
+        };
+
+        match confirmations {
+            None => {
+                self.check_settlement_deadline(id, confirmed_at, SettlementStall::TxNeverMined)
+                    .await?;
+                warn!(
+                    target: "rebalance",
+                    %id,
+                    %tx,
+                    "Withdrawal tx not yet mined on redrive; retrying"
+                );
+                Err(UsdcTransferError::WithdrawalTxUnderconfirmed {
+                    id: id.clone(),
+                    tx,
+                    required,
+                    actual: 0,
+                })
+            }
+            Some(confirmations) if confirmations < required => {
+                self.check_settlement_deadline(id, confirmed_at, SettlementStall::TxUnderconfirmed)
+                    .await?;
+                warn!(
+                    target: "rebalance",
+                    %id,
+                    %tx,
+                    confirmations,
+                    required,
+                    "Withdrawal tx under-confirmed on redrive; retrying"
+                );
+                Err(UsdcTransferError::WithdrawalTxUnderconfirmed {
+                    id: id.clone(),
+                    tx,
+                    required,
+                    actual: confirmations,
+                })
+            }
+            Some(_) => Ok(()),
+        }
+    }
+
+    /// Drives an Alpaca->Base transfer from `Bridged` to terminal: vault
+    /// deposit + `ConfirmDeposit`.
+    async fn continue_alpaca_to_base_from_bridged(
+        &self,
+        id: &UsdcRebalanceId,
+        amount_received: Usdc,
+    ) -> Result<(), UsdcTransferError> {
+        let amount_u256 = usdc_to_u256(amount_received)?;
+
+        let vault_deposit_block = self.deposit_to_vault(id, amount_u256).await?;
+        self.confirm_deposit(id, vault_deposit_block).await?;
+
+        Ok(())
+    }
+
+    #[instrument(target = "rebalance", skip(self), fields(%id, %amount), level = tracing::Level::DEBUG)]
+    async fn initiate_alpaca_withdrawal(
+        &self,
+        id: &UsdcRebalanceId,
+        amount: Usdc,
+    ) -> Result<Transfer, UsdcTransferError> {
+        // Defence in depth for the resume path. `execute_usd_to_usdc_conversion`
+        // refuses a sub-minimum fill while the aggregate is still `Converting`
+        // and `FailConversion` is legal, so a freshly converted rebalance never
+        // arrives here short. An aggregate that persisted `ConversionComplete`
+        // before that guard existed still can, and from there no failure
+        // transition remains -- so this refuses the call Alpaca would reject
+        // and leaves the aggregate for reconciliation rather than recording a
+        // terminal state it has no transition for. The job latches on this
+        // error instead of retrying, since every retry fails identically.
+        if amount.lt(&ALPACA_MINIMUM_WITHDRAWAL)? {
+            error!(target: "rebalance",
+                %id,
+                converted = %amount,
+                minimum = %*ALPACA_MINIMUM_WITHDRAWAL,
+                "Refusing an Alpaca withdrawal below the broker minimum; the converted \
+                 USDC needs reconciliation in the Alpaca crypto wallet"
+            );
+            return Err(UsdcTransferError::ConversionBelowWithdrawalMinimum {
+                id: id.clone(),
+                converted: amount,
+                minimum: *ALPACA_MINIMUM_WITHDRAWAL,
+            });
+        }
+
+        let usdc = TokenSymbol::new("USDC");
+        let positive_amount = Positive::new(amount)?;
+
+        let transfer = match self
+            .alpaca_wallet
+            .initiate_withdrawal(positive_amount, &usdc, &self.market_maker_wallet)
+            .await
+        {
+            Ok(transfer) => transfer,
+            Err(error) => {
+                warn!(target: "rebalance", "Alpaca withdrawal initiation failed: {error}");
+                return Err(UsdcTransferError::AlpacaWallet(error));
+            }
+        };
+
+        self.cqrs
+            .send(
+                id,
+                UsdcRebalanceCommand::Initiate {
+                    direction: RebalanceDirection::AlpacaToBase,
+                    corridor: self.corridor,
+                    amount,
+                    withdrawal: TransferRef::AlpacaId(transfer.id),
+                },
+            )
+            .await?;
+
+        info!(target: "rebalance", transfer_id = %transfer.id, "Alpaca withdrawal initiated");
+        Ok(transfer)
+    }
+
+    #[instrument(target = "rebalance", skip(self), fields(%id, %transfer_id), level = tracing::Level::DEBUG)]
+    async fn poll_and_confirm_withdrawal(
+        &self,
+        id: &UsdcRebalanceId,
+        transfer_id: &AlpacaTransferId,
+        initiated_at: DateTime<Utc>,
+    ) -> Result<TxHash, UsdcTransferError> {
+        let transfer = match self
+            .alpaca_wallet
+            .poll_transfer_until_complete(transfer_id)
+            .await
+        {
+            Ok(transfer) => transfer,
+            Err(error) => {
+                // CONSERVATIVE FAIL-CLOSED: every `AlpacaWalletError` returned by
+                // `poll_transfer_until_complete` (including ApiError{4xx/5xx},
+                // TransferTimeout, Reqwest, ParseError, TransferNotFound, and
+                // InvalidStatusTransition) is treated as INDETERMINATE -- the
+                // withdrawal may have already succeeded on Alpaca's side even if
+                // the poll did not confirm it. This is intentional: Alpaca's
+                // documented determinate terminal failure is delivered as
+                // `Ok(transfer)` with `status == TransferStatus::Failed` and no
+                // tx hash, which is handled below. Error responses from the polling
+                // endpoint do NOT constitute a determinate "funds never left" signal
+                // in the Alpaca Broker API, so we never emit `FailWithdrawal` on an
+                // error path.
+                //
+                // TransferNotFound specifically (the by-id endpoint returns 404)
+                // is also classified as INDETERMINATE here. This is intentionally
+                // fail-closed: an absent transfer ID does not confirm the
+                // withdrawal never left. Guard is held, re-poll continues. Recovery
+                // for a permanently-absent UUID is operational (see docs/cli-ops.md
+                // "Withdrawal poll inconclusive"), not automated.
+                //
+                // Alpaca Broker API: GET
+                // /v1/accounts/{account_id}/wallets/transfers/{transfer_id}
+                // (docs.alpaca.markets/us/reference/getcryptofundingtransfer-1).
+                // The transfer lifecycle terminates in COMPLETE or FAILED status
+                // delivered as a Transfer payload. HTTP 4xx/5xx responses are
+                // transient (auth, network, Alpaca-side load) and do not indicate
+                // the transfer's ultimate fate -- the same transfer ID must be
+                // re-polled to determine the outcome.
+                //
+                // Consequence of the conservative assumption: if a poll error is
+                // encountered the aggregate stays in Withdrawing (guard held,
+                // AlpacaTransferId recorded). The job redrive re-polls the same
+                // transfer ID. After 4 hours of failed polls the operator is paged.
+                // Worst case: a stuck operator page + manual intervention. No funds
+                // are lost and no re-withdrawal can occur, which is the correct
+                // safe failure direction for a money-movement operation.
+                warn!(
+                    target: "rebalance",
+                    %id, %transfer_id,
+                    "Alpaca withdrawal polling inconclusive; keeping Withdrawing \
+                     state for delayed redrive (will re-poll same transfer ID): {error}"
+                );
+                return Err(UsdcTransferError::WithdrawalPollInconclusive {
+                    id: id.clone(),
+                    initiated_at,
+                    source: error,
+                });
+            }
+        };
+
+        if let (TransferStatus::Failed, Some(tx_hash)) = (transfer.status, transfer.tx) {
+            warn!(
+                target: "rebalance",
+                %id, %transfer_id, %tx_hash,
+                "Alpaca withdrawal reported Failed with an on-chain tx hash; treating as \
+                 inconclusive and keeping Withdrawing state for delayed redrive"
+            );
+            return Err(UsdcTransferError::WithdrawalPollInconclusive {
+                id: id.clone(),
+                initiated_at,
+                source: AlpacaWalletError::FailedTransferHasTx {
+                    transfer_id: *transfer_id,
+                    tx_hash,
+                },
+            });
+        }
+
+        if transfer.status != TransferStatus::Complete {
+            let status = format!("{:?}", transfer.status);
+            self.cqrs
+                .send(
+                    id,
+                    UsdcRebalanceCommand::FailWithdrawal {
+                        reason: format!("Transfer ended in status: {status}"),
+                    },
+                )
+                .await?;
+            return Err(UsdcTransferError::WithdrawalFailed { status });
+        }
+
+        // The transfer is credited only from the tx that delivered its USDC, and
+        // Alpaca can report Complete before the hash. Stay `Withdrawing` and
+        // re-poll the same transfer id until the hash is present, but only up
+        // to the settlement deadline: a hash that never arrives would hold the
+        // cash guard forever.
+        let withdrawal_tx = match transfer.tx {
+            Some(withdrawal_tx) => withdrawal_tx,
+            None => {
+                self.await_completed_withdrawal_tx(id, transfer_id, initiated_at)
+                    .await?
+            }
+        };
+
+        self.refuse_withdrawal_tx_recorded_elsewhere(id, withdrawal_tx)
+            .await?;
+
+        // Advance the aggregate to WithdrawalComplete NOW, before the on-chain
+        // confirmation-depth check below. This is intentional: if the confirmation
+        // wait returns early (tx not yet mined or under-confirmed), the aggregate is
+        // already in WithdrawalComplete, so on apalis redrive the resume path enters
+        // continue_alpaca_to_base_from_withdrawal_complete and re-runs the
+        // confirmation check -- it never re-polls Alpaca. Without this ordering, a
+        // transient Alpaca API error on a redrive would hit the poll_transfer error arm
+        // and send FailWithdrawal against a withdrawal that already succeeded.
+        self.cqrs
+            .send(
+                id,
+                UsdcRebalanceCommand::ConfirmWithdrawal {
+                    withdrawal_tx: Some(withdrawal_tx),
+                },
+            )
+            .await?;
+
+        info!(target: "rebalance", "Alpaca withdrawal confirmed");
+
+        // PRIMARY settlement gate: wait for the configured required_confirmations
+        // on the on-chain tx that delivered the withdrawn USDC to the market-maker
+        // wallet. Alpaca reports "Complete" before the tx is visible network-wide on
+        // load-balanced RPC nodes, so reading the tx immediately after the status
+        // change can hit a lagging node. If the tx is not yet sufficiently
+        // confirmed, return WithdrawalTxUnderconfirmed (retryable) -- the aggregate
+        // is already in WithdrawalComplete and withdrawal_tx is persisted, so on
+        // apalis redrive the resume path enters
+        // continue_alpaca_to_base_from_withdrawal_complete and re-runs this same
+        // confirmation check durably before any burn.
+        let required = self
+            .ethereum_required_confirmations
+            .ok_or(EthereumChainMissing)?;
+        match self
+            .cctp_bridge
+            .ethereum_tx_confirmations(withdrawal_tx)
+            .await
+            .map_err(|error| UsdcTransferError::SettlementCheckTransient {
+                id: id.clone(),
+                source: Box::new(error),
+            })? {
+            None => {
+                warn!(
+                    target: "rebalance",
+                    %id,
+                    tx = %withdrawal_tx,
+                    "Alpaca withdrawal tx not yet mined; retrying"
+                );
+                return Err(UsdcTransferError::WithdrawalTxUnderconfirmed {
+                    id: id.clone(),
+                    tx: withdrawal_tx,
+                    required,
+                    actual: 0,
+                });
+            }
+            Some(confirmations) if confirmations < required => {
+                warn!(
+                    target: "rebalance",
+                    %id,
+                    tx = %withdrawal_tx,
+                    confirmations,
+                    required,
+                    "Alpaca withdrawal tx under-confirmed; retrying"
+                );
+                return Err(UsdcTransferError::WithdrawalTxUnderconfirmed {
+                    id: id.clone(),
+                    tx: withdrawal_tx,
+                    required,
+                    actual: confirmations,
+                });
+            }
+            Some(confirmations) => {
+                info!(
+                    target: "rebalance",
+                    %id,
+                    tx = %withdrawal_tx,
+                    confirmations,
+                    "Alpaca withdrawal tx confirmed on-chain"
+                );
+            }
+        }
+
+        Ok(withdrawal_tx)
+    }
+
+    /// Fails the transfer for reconciliation when another transfer already
+    /// recorded `withdrawal_tx`: it cannot be this withdrawal's delivery. The
+    /// tx is not recorded on this transfer. Skipped when the ledger pool is
+    /// not wired.
+    async fn refuse_withdrawal_tx_recorded_elsewhere(
+        &self,
+        id: &UsdcRebalanceId,
+        withdrawal_tx: TxHash,
+    ) -> Result<(), UsdcTransferError> {
+        let CreditLedger::Wired(pool) = &self.credit_ledger else {
+            debug!(target: "rebalance", %id, "Event store not wired; skipping the withdrawal tx uniqueness check");
+            return Ok(());
+        };
+
+        let Some(recorded_by) = withdrawal_tx_recorded_elsewhere(pool, id, withdrawal_tx)
+            .await
+            .map_err(|source| UsdcTransferError::WithdrawalTxLookupFailed {
+                id: id.clone(),
+                source,
+            })?
+        else {
+            return Ok(());
+        };
+
+        error!(
+            target: "rebalance",
+            %id,
+            %withdrawal_tx,
+            %recorded_by,
+            "Alpaca withdrawal tx is already recorded by another USDC transfer; failing for \
+             operator reconciliation"
+        );
+        self.cqrs
+            .send(
+                id,
+                UsdcRebalanceCommand::ConfirmWithdrawal {
+                    withdrawal_tx: None,
+                },
+            )
+            .await?;
+        self.cqrs
+            .send(
+                id,
+                UsdcRebalanceCommand::FailBridging {
+                    reason: format!(
+                        "withdrawal tx {withdrawal_tx} is already recorded by USDC rebalance \
+                         {recorded_by}; settle the withdrawn funds with \
+                         `transfer reconcile --kind usdc`"
+                    ),
+                },
+            )
+            .await?;
+
+        Err(UsdcTransferError::WithdrawalTxAlreadyRecorded {
+            id: id.clone(),
+            tx: withdrawal_tx,
+            recorded_by,
+        })
+    }
+
+    /// Alpaca reported the withdrawal Complete with no tx hash. Before the
+    /// settlement deadline this is inconclusive (delayed redrive). The
+    /// deadline counts from `initiated_at`, so a withdrawal Alpaca held
+    /// Pending past it can be first seen Complete after it: the hash then gets
+    /// one Alpaca polling timeout of grace before the transfer fails.
+    async fn await_completed_withdrawal_tx(
+        &self,
+        id: &UsdcRebalanceId,
+        transfer_id: &AlpacaTransferId,
+        initiated_at: DateTime<Utc>,
+    ) -> Result<TxHash, UsdcTransferError> {
+        let deadline_elapsed = (Utc::now() - initiated_at)
+            .to_std()
+            .is_ok_and(|elapsed| elapsed >= self.settlement_retry_deadline);
+
+        if !deadline_elapsed {
+            warn!(
+                target: "rebalance",
+                %id, %transfer_id,
+                "Alpaca withdrawal is complete but reports no tx hash yet; keeping \
+                 Withdrawing state for delayed redrive"
+            );
+            return Err(UsdcTransferError::WithdrawalPollInconclusive {
+                id: id.clone(),
+                initiated_at,
+                source: AlpacaWalletError::CompletedTransferMissingTx {
+                    transfer_id: *transfer_id,
+                },
+            });
+        }
+
+        warn!(
+            target: "rebalance",
+            %id, %transfer_id,
+            "Alpaca withdrawal is complete with no tx hash past the settlement deadline; \
+             waiting a grace for the hash before failing"
+        );
+        match self.alpaca_wallet.poll_transfer_tx_hash(transfer_id).await {
+            Ok(withdrawal_tx) => Ok(withdrawal_tx),
+            Err(AlpacaWalletError::TransferTimeout { .. }) => {
+                self.fail_completed_withdrawal_without_tx(id, transfer_id, initiated_at)
+                    .await
+            }
+            Err(error) => Err(UsdcTransferError::WithdrawalPollInconclusive {
+                id: id.clone(),
+                initiated_at,
+                source: error,
+            }),
+        }
+    }
+
+    /// Alpaca reported the withdrawal Complete but never its tx hash within
+    /// the settlement deadline. The funds left Alpaca, so this is a pre-burn
+    /// `BridgingFailed` (reconcile-eligible), never `FailWithdrawal`.
+    async fn fail_completed_withdrawal_without_tx(
+        &self,
+        id: &UsdcRebalanceId,
+        transfer_id: &AlpacaTransferId,
+        initiated_at: DateTime<Utc>,
+    ) -> Result<TxHash, UsdcTransferError> {
+        error!(
+            target: "rebalance",
+            %id,
+            %transfer_id,
+            %initiated_at,
+            "Alpaca withdrawal is complete but reported no tx hash before the settlement \
+             deadline; failing for operator reconciliation"
+        );
+
+        self.cqrs
+            .send(
+                id,
+                UsdcRebalanceCommand::ConfirmWithdrawal {
+                    withdrawal_tx: None,
+                },
+            )
+            .await?;
+        self.cqrs
+            .send(
+                id,
+                UsdcRebalanceCommand::FailBridging {
+                    reason: format!(
+                        "Alpaca withdrawal {transfer_id} completed but reported no tx hash \
+                         before the settlement deadline; settle the withdrawn funds with \
+                         `transfer reconcile --kind usdc`"
+                    ),
+                },
+            )
+            .await?;
+
+        Err(UsdcTransferError::WithdrawalTxMissing { id: id.clone() })
+    }
+
+    /// Submits, records and confirms the vault deposit, returning the block
+    /// that holds it.
+    #[instrument(target = "rebalance", skip(self), fields(%id, %amount), level = tracing::Level::DEBUG)]
+    async fn deposit_to_vault(
+        &self,
+        id: &UsdcRebalanceId,
+        amount: U256,
+    ) -> Result<Option<u64>, UsdcTransferError> {
+        // Submit the deposit and persist its tx hash as `InitiateDeposit` BEFORE
+        // confirming. `deposit_usdc` would submit AND confirm atomically, only
+        // recording the hash afterwards -- a crash during the (potentially long)
+        // confirmation wait would leave the aggregate in `Bridged`, and resume
+        // would re-enter here and submit a SECOND deposit for the same funds.
+        // Persisting the hash first lands a crash in `DepositInitiated`, whose
+        // resume arm re-verifies the recorded tx via `confirm_tx_receipt` instead of
+        // re-depositing.
+        let stable = self.corridor.chain().settlement_stable();
+        let deposit_tx = match self
+            .raindex
+            .submit_deposit(stable.address, self.vault_id, amount, stable.decimals)
+            .await
+        {
+            Ok(tx) => tx,
+            Err(error) => {
+                // The submission failed before any deposit tx was broadcast
+                // (`submit_pending` only returns a hash once the tx is accepted),
+                // so nothing moved. Leave the aggregate in `Bridged` and let
+                // apalis retry the deposit from there -- re-attempting is safe and
+                // cannot double-deposit. Do NOT emit `FailDeposit`: it is invalid
+                // from `Bridged` (only valid once a deposit has been initiated),
+                // and a transient submission error is not a terminal failure.
+                warn!(target: "rebalance", "Vault deposit submission failed: {error}");
+                return Err(UsdcTransferError::Vault(error));
+            }
+        };
+
+        self.cqrs
+            .send(
+                id,
+                UsdcRebalanceCommand::InitiateDeposit {
+                    deposit: TransferRef::OnchainTx(deposit_tx),
+                },
+            )
+            .await?;
+
+        // Confirm the recorded deposit. A failure here leaves the aggregate in
+        // `DepositInitiated` (the hash is persisted) rather than emitting
+        // `FailDeposit`: the deposit may still confirm, and the `DepositInitiated`
+        // resume arm re-checks it. Propagate so apalis retries from there.
+        let receipt = self.raindex.confirm_tx_receipt(deposit_tx).await?;
+
+        self.enqueue_bot_gas_cost(
+            self.corridor.chain(),
+            deposit_tx,
+            BotGasOperationCategory::VaultDeposit,
+        )
+        .await?;
+
+        info!(target: "rebalance", %deposit_tx, block_number = ?receipt.block_number, "Vault deposit submitted, recorded, and confirmed");
+        Ok(receipt.block_number)
+    }
+
+    #[instrument(target = "rebalance", skip(self), fields(%id), level = tracing::Level::DEBUG)]
+    async fn confirm_deposit(
+        &self,
+        id: &UsdcRebalanceId,
+        vault_deposit_block: Option<u64>,
+    ) -> Result<(), UsdcTransferError> {
+        self.cqrs
+            .send(
+                id,
+                UsdcRebalanceCommand::ConfirmDeposit {
+                    vault_deposit_block,
+                },
+            )
+            .await?;
+
+        info!(target: "rebalance", "Vault deposit confirmed");
+        Ok(())
+    }
+
+    /// Reserves the nonce of every signed deposit send persisted on
+    /// `Bridged` and rebroadcasts its exact bytes, so no other send from the
+    /// Ethereum wallet takes that nonce or waits behind a send no node holds
+    /// after a restart. Never fails startup: a send that cannot be restored
+    /// or rebroadcast is paged, and the transfer's resume broadcasts it again.
+    /// A failed listing, a failed load or an unparseable id counts as unmined,
+    /// so startup skips the Ethereum approvals and revokes that could take the
+    /// nonce of a send it did not reserve.
+    pub(crate) async fn restore_prepared_deposit_sends(
+        &self,
+        pool: &SqlitePool,
+    ) -> RestoredDepositSends {
+        let mut outcome = RestoredDepositSends::default();
+        let (ids, unparseable) = match prepared_deposit_send_ids(pool).await {
+            Ok(found) => found,
+            Err(error) => {
+                error!(target: "operational_alert", alert = true, ?error, "Could not list signed Alpaca deposit sends at startup; their nonces are not reserved until each transfer resumes, so startup skips Ethereum token approvals and allowance revokes");
+                outcome.unmined += 1;
+                return outcome;
+            }
+        };
+        if !unparseable.is_empty() {
+            error!(target: "operational_alert", alert = true, ?unparseable, "Signed Alpaca deposit sends with unparseable transfer ids were not restored at startup, so startup skips Ethereum token approvals and allowance revokes");
+            outcome.unmined += unparseable.len();
+        }
+
+        for id in ids {
+            match self.cqrs.load(&id).await {
+                Ok(Some(UsdcRebalance::Bridged { deposit_send, .. })) => {
+                    let Some((prepared, _)) = deposit_send.prepared() else {
+                        warn!(target: "rebalance", %id, "Transfer no longer holds a signed deposit send at startup");
+                        continue;
+                    };
+                    self.cctp_bridge.restore_usdc_on_ethereum(prepared).await;
+                    info!(target: "rebalance", %id, tx = %prepared.tx_hash(), nonce = prepared.nonce(), "Reserved the nonce of a signed Alpaca deposit send");
+                    outcome.restored += 1;
+
+                    if !self.rebroadcast_restored_deposit_send(&id, prepared).await {
+                        outcome.unmined += 1;
+                    }
+                }
+                Ok(state) => {
+                    warn!(target: "rebalance", %id, ?state, "Transfer left Bridged before its signed deposit send was restored");
+                }
+                Err(error) => {
+                    error!(target: "operational_alert", alert = true, %id, ?error, "Could not load a transfer with a signed Alpaca deposit send at startup; its nonce is not reserved until it resumes, so startup skips Ethereum token approvals and allowance revokes");
+                    outcome.unmined += 1;
+                }
+            }
+        }
+
+        outcome
+    }
+
+    /// Rebroadcasts a deposit send restored at startup and reports whether it
+    /// is mined. A failed rebroadcast pages; a send with no receipt, or whose
+    /// receipt cannot be read, counts as not mined.
+    async fn rebroadcast_restored_deposit_send(
+        &self,
+        id: &UsdcRebalanceId,
+        prepared: &PreparedTransaction,
+    ) -> bool {
+        let tx = prepared.tx_hash();
+        let nonce = prepared.nonce();
+        if let Err(error) = self.cctp_bridge.broadcast_usdc_on_ethereum(prepared).await {
+            error!(target: "operational_alert", alert = true, %id, %tx, nonce, ?error, "Could not rebroadcast a signed Alpaca deposit send at startup; its nonce stays reserved, so startup skips Ethereum token approvals and allowance revokes, and the transfer's resume broadcasts it again");
+            return false;
+        }
+
+        match self.cctp_bridge.ethereum_tx_confirmations(tx).await {
+            Ok(Some(_)) => true,
+            Ok(None) => {
+                warn!(target: "rebalance", %id, %tx, nonce, "Restored Alpaca deposit send is not mined yet at startup");
+                false
+            }
+            Err(error) => {
+                warn!(target: "rebalance", %id, %tx, nonce, ?error, "Could not read the receipt of a restored Alpaca deposit send at startup; treating it as not mined");
+                false
+            }
+        }
+    }
+
+    fn require_base_to_alpaca(
+        id: &UsdcRebalanceId,
+        direction: RebalanceDirection,
+    ) -> Result<(), UsdcTransferError> {
+        if matches!(direction, RebalanceDirection::BaseToAlpaca) {
+            Ok(())
+        } else {
+            Err(UsdcTransferError::ResumeDirectionMismatch {
+                id: id.clone(),
+                direction,
+            })
+        }
+    }
+
+    /// Resumes a Base->Alpaca transfer whose deposit send already happened.
+    ///
+    /// The recorded `deposit_ref` is the USDC SEND tx (minted USDC forwarded to
+    /// Alpaca's deposit address), not the mint tx. The send moved funds before
+    /// `InitiateDeposit` was recorded, so this re-polls Alpaca by it -- no
+    /// further send occurs.
+    async fn resume_base_to_alpaca_deposit(
+        &self,
+        id: &UsdcRebalanceId,
+        amount: Usdc,
+        deposit_ref: TransferRef,
+    ) -> Result<(), UsdcTransferError> {
+        let TransferRef::OnchainTx(send_tx) = deposit_ref else {
+            return Err(UsdcTransferError::DepositRefMustBeOnchain { id: id.clone() });
+        };
+        self.poll_alpaca_deposit_and_confirm(id, send_tx).await?;
+        self.execute_usdc_to_usd_conversion(id, amount).await?;
+        Ok(())
+    }
+
+    /// Resumes a transfer stalled at `Converting` (the post-deposit USDC->USD
+    /// conversion). The conversion's correlation id is the Alpaca
+    /// `client_order_id`, recorded before the order was placed, so resume looks
+    /// the order up and resolves deterministically instead of blindly failing:
+    /// a filled order confirms the conversion, a terminally-failed order fails
+    /// it, a still-settling order is retried, and an order that never reached
+    /// Alpaca (crash before placement) fails for operator reconciliation.
+    async fn resume_converting(
+        &self,
+        id: &UsdcRebalanceId,
+        correlation_id: ClientOrderId,
+    ) -> Result<(), UsdcTransferError> {
+        let Some(order) = self
+            .alpaca_broker
+            .find_conversion_order(&correlation_id)
+            .await?
+        else {
+            warn!(target: "rebalance", %correlation_id, "Conversion order never reached Alpaca on resume; failing for reconciliation");
+            self.cqrs
+                .send(
+                    id,
+                    UsdcRebalanceCommand::FailConversion {
+                        reason: format!("conversion order {correlation_id} never reached Alpaca"),
+                    },
+                )
+                .await?;
+            return Err(UsdcTransferError::ResumeIndeterminateConversion { id: id.clone() });
+        };
+
+        // Mirror the normal placement flow: a still-settling conversion is awaited
+        // to a terminal state rather than failing the job. Failing here would burn
+        // the finite apalis retry budget -- the order can settle slower than the
+        // per-attempt window -- and let the timeout sweep clear the in-progress
+        // guard while the conversion is still healthy, the partial-completion clobber
+        // this resume path exists to prevent.
+        // Gate on terminality rather than on `Pending` alone: a `suspended`,
+        // `replaced` or `calculated` order is reported as `Failed` but the
+        // broker may still resume and fill it, so failing on sight here would
+        // record a failed rebalance against live money -- the same drift the
+        // shared terminality rule exists to prevent.
+        let order = if order.classify().is_terminal() {
+            order
+        } else {
+            warn!(target: "rebalance", order_id = %order.id, "Resumed conversion not yet terminal; awaiting a terminal state");
+            self.alpaca_broker
+                .poll_conversion_to_terminal(order.id)
+                .await
+                .map_err(|error| match error {
+                    // The order's fate is unknown: it may still be live and
+                    // still fill. Mapping here is what routes the job to its
+                    // latch arm instead of the generic retry path, so resume
+                    // decides the same way as both direct conversion legs.
+                    error @ (AlpacaBrokerApiError::ConversionCancelNotSettled { .. }
+                    | AlpacaBrokerApiError::ConversionOrderNotFound { .. }) => {
+                        error!(target: "rebalance", %error, "Resumed conversion outcome unresolved");
+                        UsdcTransferError::ConversionOutcomeUnresolved {
+                            id: id.clone(),
+                            source: Box::new(error),
+                        }
+                    }
+                    other => other.into(),
+                })?
+        };
+
+        match order.classify() {
+            CryptoOrderOutcome::Filled => {
+                let conversion = conversion_amounts_from_order(
+                    &order,
+                    &correlation_id,
+                    ConversionDirection::UsdcToUsd,
+                )?;
+
+                self.cqrs
+                    .send(id, UsdcRebalanceCommand::ConfirmConversion { conversion })
+                    .await?;
+                info!(target: "rebalance", order_id = %order.id, received_amount = %conversion.received_amount, "Resumed conversion confirmed from already-filled order");
+                Ok(())
+            }
+            CryptoOrderOutcome::Pending => {
+                // `poll_conversion_to_terminal` returns only on a terminal state, so a
+                // Pending classification here is unreachable; fail indeterminate for
+                // operator follow-up rather than silently looping.
+                warn!(target: "rebalance", order_id = %order.id, "Resumed conversion still pending after awaiting terminal state");
+                Err(UsdcTransferError::ResumeIndeterminateConversion { id: id.clone() })
+            }
+            CryptoOrderOutcome::Failed(reason) => {
+                // Alpaca terminal statuses can carry a nonzero partial fill: real USDC
+                // converted before the order terminated. Surface it in the failure
+                // reason and logs so an operator reconciles the converted amount rather
+                // than recording a clean full failure that hides it. Conservatively
+                // treat an un-checkable fill as needing reconciliation.
+                let partial_fill = order
+                    .filled_quantity
+                    .filter(|filled| filled.is_zero().map(|zero| !zero).unwrap_or(true));
+
+                warn!(target: "rebalance", order_id = %order.id, ?reason, ?partial_fill, "Resumed conversion order failed terminally");
+                let partial_suffix = partial_fill
+                    .map(|filled| format!(" (partial fill {filled} needs reconciliation)"))
+                    .unwrap_or_default();
+                self.cqrs
+                    .send(
+                        id,
+                        UsdcRebalanceCommand::FailConversion {
+                            reason: format!("conversion order failed: {reason:?}{partial_suffix}"),
+                        },
+                    )
+                    .await?;
+                Err(UsdcTransferError::ResumeIndeterminateConversion { id: id.clone() })
+            }
+        }
+    }
+
+    /// Drives a FRESH transfer from `Bridged` to terminal: send the minted USDC
+    /// to Alpaca's deposit address, record the send, poll Alpaca for the
+    /// credit, then convert USDC->USD.
+    ///
+    /// # Why an explicit send (load-bearing)
+    ///
+    /// The CCTP mint credits the bot's OWN wallet
+    /// ([`execute_cctp_burn_on_base`](Self::execute_cctp_burn_on_base) sets the
+    /// burn's `mintRecipient` to `self.market_maker_wallet`), NOT an Alpaca
+    /// deposit address. Alpaca funds only when USDC is transferred to the
+    /// per-account deposit address from `get_wallet_address`. So this leg fetches
+    /// that address and SENDS the minted USDC there, then polls Alpaca by the
+    /// SEND tx (not the mint tx). The recorded `deposit_ref` is the SEND tx.
+    ///
+    /// # Fresh vs resume
+    ///
+    /// Reached right after this execution moved the transfer to `Bridged` (a
+    /// fresh mint, an adopted attested mint, or a `BridgingFailed` recovery),
+    /// so no send exists yet: it sends with no pre-send chain scan. The signed send is persisted on
+    /// `Bridged` before its broadcast, so a crash before `InitiateDeposit`
+    /// resumes by broadcasting those same bytes
+    /// ([`continue_from_bridged_resume`](Self::continue_from_bridged_resume)).
+    async fn continue_from_bridged_fresh(
+        &self,
+        id: &UsdcRebalanceId,
+        amount_received: Usdc,
+    ) -> Result<(), UsdcTransferError> {
+        let send_tx = self.send_alpaca_deposit(id, amount_received).await?;
+        self.finish_deposit(id, amount_received, send_tx).await
+    }
+
+    /// Resumes a transfer stalled at `Bridged`, then drives the deposit leg to
+    /// terminal.
+    ///
+    /// A signed send is broadcast again, byte for byte, and confirmed: it is
+    /// the only send this transfer can make, whether or not an earlier attempt
+    /// reached the network. Other transfers send the same amount to the same
+    /// deposit address from the shared wallet, so no other send is adopted.
+    /// With no signed send, see
+    /// [`send_unless_an_unrecorded_send_landed`](Self::send_unless_an_unrecorded_send_landed).
+    async fn continue_from_bridged_resume(
+        &self,
+        id: &UsdcRebalanceId,
+        amount_received: Usdc,
+        mint_tx: TxHash,
+        deposit_send: DepositSend,
+    ) -> Result<(), UsdcTransferError> {
+        let send_tx = match deposit_send.prepared() {
+            Some((prepared, prepared_at)) => {
+                info!(target: "rebalance", %id, tx = %prepared.tx_hash(), "Broadcasting the persisted Alpaca deposit send");
+                self.broadcast_and_confirm_deposit_send(id, prepared, prepared_at)
+                    .await?
+            }
+            None => {
+                self.send_unless_an_unrecorded_send_landed(id, amount_received, mint_tx)
+                    .await?
+            }
+        };
+        self.finish_deposit(id, amount_received, send_tx).await
+    }
+
+    /// Records the deposit send, polls Alpaca for the credit, then converts
+    /// USDC->USD. Shared tail of the fresh and resume `Bridged` paths.
+    async fn finish_deposit(
+        &self,
+        id: &UsdcRebalanceId,
+        amount_received: Usdc,
+        send_tx: TxHash,
+    ) -> Result<(), UsdcTransferError> {
+        self.cqrs
+            .send(
+                id,
+                UsdcRebalanceCommand::InitiateDeposit {
+                    deposit: TransferRef::OnchainTx(send_tx),
+                },
+            )
+            .await?;
+
+        self.poll_alpaca_deposit_and_confirm(id, send_tx).await?;
+        self.execute_usdc_to_usd_conversion(id, amount_received)
+            .await?;
+        Ok(())
+    }
+
+    /// Fetches Alpaca's per-account USDC (Ethereum) deposit address.
+    async fn fetch_alpaca_deposit_address(
+        &self,
+        id: &UsdcRebalanceId,
+    ) -> Result<Address, UsdcTransferError> {
+        let usdc = TokenSymbol::new("USDC");
+        let ethereum = Network::new("ethereum");
+
+        match self
+            .alpaca_wallet
+            .get_wallet_address(&usdc, &ethereum)
+            .await
+        {
+            Ok(address) => Ok(address),
+            Err(error) => {
+                warn!(target: "rebalance", %id, "Fetching Alpaca deposit address failed: {error}");
+                Err(UsdcTransferError::AlpacaWallet(error))
+            }
+        }
+    }
+
+    /// Sends the minted USDC to Alpaca's deposit address with no pre-send
+    /// scan (fresh path).
+    #[instrument(target = "rebalance", skip(self), fields(%id, %amount_received), level = tracing::Level::DEBUG)]
+    async fn send_alpaca_deposit(
+        &self,
+        id: &UsdcRebalanceId,
+        amount_received: Usdc,
+    ) -> Result<TxHash, UsdcTransferError> {
+        let deposit_address = self.fetch_alpaca_deposit_address(id).await?;
+        self.send_alpaca_deposit_to(id, deposit_address, amount_received)
+            .await
+    }
+
+    /// Resume with no signed send: sends unless a same-amount send from the
+    /// wallet to the deposit address landed after the mint and no other
+    /// transfer signed, attached or recorded it.
+    ///
+    /// Such a send can be this transfer's only if it reached `Bridged` on a
+    /// build that sent without persisting the signed send first. A send no
+    /// other transfer claims is never adopted either: the deposit fails for
+    /// operator reconciliation. With no event store wired no match can be
+    /// attributed, so any match fails the deposit. A scan or lookup failure
+    /// returns an error without sending.
+    #[instrument(target = "rebalance", skip(self), fields(%id, %amount_received, %mint_tx), level = tracing::Level::DEBUG)]
+    async fn send_unless_an_unrecorded_send_landed(
+        &self,
+        id: &UsdcRebalanceId,
+        amount_received: Usdc,
+        mint_tx: TxHash,
+    ) -> Result<TxHash, UsdcTransferError> {
+        let deposit_address = self.fetch_alpaca_deposit_address(id).await?;
+
+        // The deposit send lands at or after the mint.
+        let from_block = self
+            .cctp_bridge
+            .ethereum_tx_block(mint_tx)
+            .await
+            .map_err(|error| UsdcTransferError::Cctp(Box::new(error)))?;
+
+        let matches = self
+            .cctp_bridge
+            .find_recent_usdc_transfers(
+                self.market_maker_wallet,
+                deposit_address,
+                usdc_to_u256(amount_received)?,
+                from_block,
+            )
+            .await
+            .map_err(|error| UsdcTransferError::Cctp(Box::new(error)))?;
+
+        if let Some(unrecorded_tx) = self.first_unclaimed_deposit_send(id, matches).await? {
+            return Err(self
+                .fail_unresolved_deposit_send(
+                    id,
+                    UnresolvedDepositSend::UnrecordedSend { tx: unrecorded_tx },
+                )
+                .await);
+        }
+
+        self.send_alpaca_deposit_to(id, deposit_address, amount_received)
+            .await
+    }
+
+    /// The newest of `sends` that no other transfer signed, attached or
+    /// recorded. With no event store wired, the newest of `sends`.
+    async fn first_unclaimed_deposit_send(
+        &self,
+        id: &UsdcRebalanceId,
+        sends: Vec<TxHash>,
+    ) -> Result<Option<TxHash>, UsdcTransferError> {
+        let CreditLedger::Wired(pool) = &self.credit_ledger else {
+            return Ok(sends.first().copied());
+        };
+
+        for send_tx in sends {
+            let recorded_by = deposit_send_recorded_elsewhere(pool, id, send_tx)
+                .await
+                .map_err(|source| UsdcTransferError::DepositSendLookup {
+                    id: id.clone(),
+                    tx: send_tx,
+                    source,
+                })?;
+
+            match recorded_by {
+                Some(recorded_by) => {
+                    info!(target: "rebalance", %id, tx = %send_tx, %recorded_by, "Same-amount Alpaca deposit send belongs to another transfer; not this transfer's");
+                }
+                None => return Ok(Some(send_tx)),
+            }
+        }
+
+        Ok(None)
+    }
+
+    /// Checks the credit ledger, signs the send and persists it, then
+    /// broadcasts it and waits for it to confirm; `InitiateDeposit` then
+    /// records its hash.
+    async fn send_alpaca_deposit_to(
+        &self,
+        id: &UsdcRebalanceId,
+        deposit_address: Address,
+        amount_received: Usdc,
+    ) -> Result<TxHash, UsdcTransferError> {
+        let amount = usdc_to_u256(amount_received)?;
+
+        self.check_ethereum_credit_ledger(id, amount_received).await;
+
+        let (prepared, prepared_at) = self
+            .prepare_and_persist_deposit_send(id, deposit_address, amount)
+            .await?;
+
+        info!(target: "rebalance", %id, tx = %prepared.tx_hash(), %deposit_address, %amount_received, "Persisted the signed Alpaca deposit send");
+        self.broadcast_and_confirm_deposit_send(id, &prepared, prepared_at)
+            .await
+    }
+
+    /// Signs the deposit send and persists it (`PrepareDepositSend`) before
+    /// any broadcast, on a detached task so a job timeout cannot drop the
+    /// future between the two: a signed send that was never persisted keeps
+    /// its nonce reserved and stalls every later send from the wallet. A
+    /// failed write goes through `release_unpersisted_deposit_send`.
+    ///
+    /// Sign and persist run under `deposit_send_prepare`, after a reload: a
+    /// send another attempt persisted is returned instead of signing a
+    /// second one, whose nonce could be left as a gap.
+    async fn prepare_and_persist_deposit_send(
+        &self,
+        id: &UsdcRebalanceId,
+        deposit_address: Address,
+        amount: U256,
+    ) -> Result<(PreparedTransaction, DateTime<Utc>), UsdcTransferError> {
+        let cctp_bridge = Arc::clone(&self.cctp_bridge);
+        let cqrs = Arc::clone(&self.cqrs);
+        let prepare_lock = Arc::clone(&self.deposit_send_prepare);
+        let task_id = id.clone();
+        // As in `submit_and_record_burn`: `PrepareDepositSend` can outlive a
+        // cancelled job, so the task continues the job's projection slot.
+        let projection_slot =
+            crate::conductor::projection_pause::projection_slot_for_detached_work().await;
+
+        tokio::spawn(async move {
+            let _projection_slot = projection_slot;
+            let _prepare_guard = prepare_lock.lock().await;
+
+            if let Some(UsdcRebalance::Bridged { deposit_send, .. }) = cqrs.load(&task_id).await?
+                && let Some((persisted, prepared_at)) = deposit_send.prepared()
+            {
+                info!(target: "rebalance", id = %task_id, tx = %persisted.tx_hash(), "Another attempt persisted the signed Alpaca deposit send; not signing again");
+                return Ok((persisted.clone(), prepared_at));
+            }
+
+            let prepared = cctp_bridge
+                .prepare_usdc_on_ethereum(deposit_address, amount)
+                .await
+                .inspect_err(|error| {
+                    warn!(target: "rebalance", id = %task_id, %error, "Signing the Alpaca deposit send failed; nothing was sent");
+                })
+                .map_err(|error| UsdcTransferError::Cctp(Box::new(error)))?;
+
+            // Anchors this attempt's alert deadline; a resume reads the
+            // persisted time instead.
+            let prepared_at = Utc::now();
+            let persisted = cqrs
+                .send(
+                    &task_id,
+                    UsdcRebalanceCommand::PrepareDepositSend {
+                        prepared: prepared.clone(),
+                    },
+                )
+                .await;
+            if let Err(error) = persisted {
+                error!(target: "rebalance", id = %task_id, ?error, "Failed to persist the signed Alpaca deposit send; not broadcasting");
+                release_unpersisted_deposit_send(&*cctp_bridge, &cqrs, &task_id, &prepared).await;
+                return Err(error.into());
+            }
+
+            Ok((prepared, prepared_at))
+        })
+        .await
+        .map_err(|join_error| {
+            error!(target: "rebalance", %id, %join_error, "Deposit send prepare-and-persist task failed to join (panicked)");
+            UsdcTransferError::DepositSendTaskPanicked { id: id.clone() }
+        })?
+    }
+
+    /// Broadcasts the persisted deposit send and waits for it to confirm;
+    /// `InitiateDeposit` then records its hash. Every call sends the same signed bytes, so a crash,
+    /// timeout or failed write anywhere here is recovered by calling it again.
+    /// An outcome not known yet is `DepositSendReconciliationPending`, which
+    /// the job redrives; a revert fails the deposit for reconciliation.
+    async fn broadcast_and_confirm_deposit_send(
+        &self,
+        id: &UsdcRebalanceId,
+        prepared: &PreparedTransaction,
+        prepared_at: DateTime<Utc>,
+    ) -> Result<TxHash, UsdcTransferError> {
+        let expected = prepared.tx_hash();
+        let pending = |cause| UsdcTransferError::DepositSendReconciliationPending {
+            id: id.clone(),
+            tx: expected,
+            prepared_at,
+            cause,
+        };
+
+        self.cctp_bridge
+            .broadcast_usdc_on_ethereum(prepared)
+            .await
+            .map_err(|error| pending(DepositSendPending::Broadcast(Box::new(error))))?;
+
+        let status = self
+            .cctp_bridge
+            .confirm_usdc_on_ethereum(expected)
+            .await
+            .map_err(|error| pending(DepositSendPending::Confirmation(Box::new(error))))?;
+
+        match status {
+            UsdcTransferStatus::Confirmed => {
+                self.enqueue_bot_gas_cost(
+                    Chain::Ethereum,
+                    expected,
+                    BotGasOperationCategory::WalletTransfer,
+                )
+                .await?;
+                Ok(expected)
+            }
+            UsdcTransferStatus::Reverted => {
+                self.enqueue_bot_gas_cost(
+                    Chain::Ethereum,
+                    expected,
+                    BotGasOperationCategory::WalletTransfer,
+                )
+                .await?;
+                Err(self
+                    .fail_unresolved_deposit_send(
+                        id,
+                        UnresolvedDepositSend::SignedSendReverted { tx: expected },
+                    )
+                    .await)
+            }
+            // The same bytes are broadcast again on the redrive.
+            UsdcTransferStatus::Dropped => Err(pending(DepositSendPending::Dropped)),
+        }
+    }
+
+    /// Fails the deposit from `Bridged` for operator reconciliation. If that
+    /// write fails the error is retried, and the retry takes this path again:
+    /// it never signs a second send.
+    async fn fail_unresolved_deposit_send(
+        &self,
+        id: &UsdcRebalanceId,
+        cause: UnresolvedDepositSend,
+    ) -> UsdcTransferError {
+        error!(target: "rebalance", %id, %cause, "Alpaca deposit send cannot be resolved automatically; failing the deposit for operator reconciliation");
+
+        if let Err(error) = self
+            .cqrs
+            .send(
+                id,
+                UsdcRebalanceCommand::FailDeposit {
+                    reason: format!("{cause}; operator reconciliation required"),
+                },
+            )
+            .await
+        {
+            error!(target: "rebalance", %id, ?error, "Failed to commit FailDeposit for an unresolved deposit send; retrying");
+            return error.into();
+        }
+
+        UsdcTransferError::DepositSendUnresolved {
+            id: id.clone(),
+            cause,
+        }
+    }
+
+    #[instrument(target = "rebalance", skip(self), fields(%id, %amount), level = tracing::Level::DEBUG)]
+    async fn withdraw_from_vault(
+        &self,
+        id: &UsdcRebalanceId,
+        amount: Usdc,
+        amount_u256: U256,
+    ) -> Result<(), UsdcTransferError> {
+        // Record withdrawal intent and the chain head BEFORE the irreversible
+        // on-chain withdraw, so a crash mid-withdrawal resumes via a chain scan
+        // (`resume_withdrawal_submitting`) instead of blindly re-withdrawing.
+        let from_block = self.raindex.current_block().await?;
+        self.cqrs
+            .send(
+                id,
+                UsdcRebalanceCommand::BeginWithdrawal {
+                    direction: RebalanceDirection::BaseToAlpaca,
+                    corridor: self.corridor,
+                    amount,
+                    from_block,
+                },
+            )
+            .await?;
+
+        let stable = self.corridor.chain().settlement_stable();
+        let withdraw_tx = match self
+            .raindex
+            .withdraw(stable.address, self.vault_id, amount_u256, stable.decimals)
+            .await
+        {
+            Ok(tx) => tx,
+            Err(RaindexError::InsufficientVaultLiquidity {
+                token,
+                requested,
+                received,
+                broadcast: WithdrawBroadcast::NotBroadcast,
+            }) => {
+                return Err(self
+                    .reject_unsent_withdrawal(id, from_block, token, requested, received)
+                    .await);
+            }
+            Err(error) => return Err(classify_vault_withdrawal_error(id, from_block, error)),
+        };
+
+        self.record_vault_withdrawal(id, amount, withdraw_tx).await
+    }
+
+    /// Fails a transfer whose vault withdraw the vault could not cover and the
+    /// evm layer proved was rejected before broadcast. This is the only call
+    /// that issues this transfer's withdraw, and `BeginWithdrawal` precedes
+    /// it, so no withdraw for this transfer exists anywhere and failing it is
+    /// safe. The guard then clears and rebalancing plans again from fresh
+    /// balances instead of resuming into a scan that can never find a
+    /// withdrawal.
+    ///
+    /// If `RejectWithdrawal` cannot be confirmed, the transfer latches as for
+    /// any other under-funded withdraw: a redrive would only scan.
+    async fn reject_unsent_withdrawal(
+        &self,
+        id: &UsdcRebalanceId,
+        from_block: u64,
+        token: Address,
+        requested: U256,
+        received: U256,
+    ) -> UsdcTransferError {
+        warn!(target: "rebalance", %id, %token, %requested, %received, "Vault under-funded; withdraw rejected before broadcast; failing the transfer");
+
+        let rejected = UsdcTransferError::WithdrawalRejectedUnderfunded {
+            id: id.clone(),
+            token,
+            requested,
+            received,
+        };
+        let Err(error) = self
+            .cqrs
+            .send(
+                id,
+                UsdcRebalanceCommand::RejectWithdrawal {
+                    reason: format!(
+                        "inventory vault under-funded: requested {requested} of {token}, vault \
+                         could cover {received}; withdraw rejected before broadcast"
+                    ),
+                },
+            )
+            .await
+        else {
+            return rejected;
+        };
+
+        // A reactor error can surface after the event committed.
+        if let Ok(Some(UsdcRebalance::WithdrawalFailed {
+            withdrawal_ref: None,
+            ..
+        })) = self.cqrs.load(id).await
+        {
+            warn!(target: "rebalance", %id, ?error, "RejectWithdrawal committed but reported an error");
+            return rejected;
+        }
+
+        error!(target: "rebalance", %id, ?error, "Failed to record RejectWithdrawal; latching at WithdrawalSubmitting");
+        UsdcTransferError::InsufficientVaultLiquidity {
+            id: id.clone(),
+            from_block,
+            token,
+            requested,
+            received,
+        }
+    }
+
+    /// Resumes a transfer stalled at `WithdrawalSubmitting` by adopting the
+    /// already-mined withdrawal and recording it.
+    ///
+    /// Absence from mined logs is never permission to issue another withdrawal:
+    /// the original transaction may still be pending, or a load-balanced RPC
+    /// backend may not have observed it. [`Raindex::find_recent_withdrawal`]
+    /// therefore fails inconclusively instead of returning absence.
+    async fn resume_withdrawal_submitting(
+        &self,
+        id: &UsdcRebalanceId,
+        amount: Usdc,
+        amount_u256: U256,
+        from_block: u64,
+        initiated_at: DateTime<Utc>,
+    ) -> Result<(), UsdcTransferError> {
+        let (existing_tx, withdrawn) = self
+            .raindex
+            .find_recent_withdrawal(
+                self.corridor.chain().settlement_stable().address,
+                self.vault_id,
+                from_block,
+            )
+            .await
+            .map_err(|error| classify_vault_withdrawal_scan_error(id, initiated_at, error))?;
+
+        // The withdrawal for this transfer already landed on-chain; adopt it
+        // instead of re-withdrawing. If it realized a different amount than
+        // requested (vault under-funded -> partial fill), fail fast for
+        // operator reconciliation -- never burn more on Base than was actually
+        // withdrawn.
+        if withdrawn != amount_u256 {
+            return self
+                .fail_adopted_withdrawal_mismatch(id, amount, amount_u256, existing_tx, withdrawn)
+                .await;
+        }
+
+        info!(target: "rebalance", %existing_tx, "Adopting already-submitted vault withdrawal on resume");
+        self.record_vault_withdrawal(id, amount, existing_tx).await
+    }
+
+    /// Handles an adopted withdrawal that realized a different amount than
+    /// requested (vault under-funded -> partial fill): records the withdrawal's
+    /// bot-gas cost, fails the transfer for operator reconciliation, and
+    /// returns `AdoptedWithdrawalAmountMismatch`. Never re-withdraws or burns
+    /// more on Base than was actually withdrawn.
+    async fn fail_adopted_withdrawal_mismatch(
+        &self,
+        id: &UsdcRebalanceId,
+        amount: Usdc,
+        requested: U256,
+        existing_tx: TxHash,
+        withdrawn: U256,
+    ) -> Result<(), UsdcTransferError> {
+        warn!(target: "rebalance", %existing_tx, %withdrawn, %requested,
+            "Adopted withdrawal realized a different amount than requested; failing for reconciliation");
+        // Enqueue BEFORE `Initiate`/`FailWithdrawal` below, same as
+        // `record_vault_withdrawal`: the withdrawal happened on-chain
+        // regardless of the mismatch, so its gas cost is still owed a
+        // record, and the aggregate has not advanced past
+        // `WithdrawalSubmitting` yet, so propagating with `?` is safe --
+        // apalis redrives `resume_withdrawal_submitting`, which re-scans the
+        // same adopted withdrawal, re-attempts this enqueue, and (once it
+        // succeeds) proceeds to genuinely fail the transfer for
+        // reconciliation below.
+        self.enqueue_bot_gas_cost(
+            self.corridor.chain(),
+            existing_tx,
+            BotGasOperationCategory::VaultWithdraw,
+        )
+        .await?;
+        self.cqrs
+            .send(
+                id,
+                UsdcRebalanceCommand::Initiate {
+                    direction: RebalanceDirection::BaseToAlpaca,
+                    corridor: self.corridor,
+                    amount,
+                    withdrawal: TransferRef::OnchainTx(existing_tx),
+                },
+            )
+            .await?;
+        self.cqrs
+            .send(
+                id,
+                UsdcRebalanceCommand::FailWithdrawal {
+                    reason: format!(
+                        "adopted withdrawal {existing_tx} realized {withdrawn}, \
+                         requested {requested}"
+                    ),
+                },
+            )
+            .await?;
+        Err(UsdcTransferError::AdoptedWithdrawalAmountMismatch {
+            id: id.clone(),
+            withdrawn,
+            requested,
+        })
+    }
+
+    /// Records the submitted withdrawal transaction and confirms it. The vault
+    /// withdrawal waits for block inclusion, so confirmation is immediate.
+    async fn record_vault_withdrawal(
+        &self,
+        id: &UsdcRebalanceId,
+        amount: Usdc,
+        withdraw_tx: TxHash,
+    ) -> Result<(), UsdcTransferError> {
+        // Enqueue BEFORE `Initiate`/`ConfirmWithdrawal` (see
+        // `enqueue_bot_gas_cost`'s doc for why the ordering matters here).
+        self.enqueue_bot_gas_cost(
+            self.corridor.chain(),
+            withdraw_tx,
+            BotGasOperationCategory::VaultWithdraw,
+        )
+        .await?;
+
+        self.cqrs
+            .send(
+                id,
+                UsdcRebalanceCommand::Initiate {
+                    direction: RebalanceDirection::BaseToAlpaca,
+                    corridor: self.corridor,
+                    amount,
+                    withdrawal: TransferRef::OnchainTx(withdraw_tx),
+                },
+            )
+            .await?;
+        self.cqrs
+            .send(
+                id,
+                UsdcRebalanceCommand::ConfirmWithdrawal {
+                    withdrawal_tx: None,
+                },
+            )
+            .await?;
+
+        info!(target: "rebalance", %withdraw_tx, "Vault withdrawal completed");
+        Ok(())
+    }
+
+    /// Polls Alpaca for the deposit identified by the USDC `send_tx` (the
+    /// transfer of minted USDC to Alpaca's deposit address), then sends
+    /// `ConfirmDeposit`. Assumes the aggregate is already in `DepositInitiated`
+    /// (caller has sent `InitiateDeposit`, or we are resuming from that state).
+    #[instrument(target = "rebalance", skip(self), fields(%id, %send_tx), level = tracing::Level::DEBUG)]
+    async fn poll_alpaca_deposit_and_confirm(
+        &self,
+        id: &UsdcRebalanceId,
+        send_tx: TxHash,
+    ) -> Result<(), UsdcTransferError> {
+        info!(target: "rebalance", %send_tx, "Polling Alpaca for deposit detection");
+
+        let transfer = match self.alpaca_wallet.poll_deposit_by_tx_hash(&send_tx).await {
+            Ok(transfer) => transfer,
+            Err(error) => {
+                // Classify BEFORE emitting FailDeposit (RAI-1494): a broker
+                // rate-limit (429) is not a determinate "deposit failed"
+                // signal, only a transient throttle on the polling request
+                // itself. Leave the aggregate in DepositInitiated so the
+                // job's backpressure reschedule can re-poll the same send_tx
+                // once the delay elapses, mirroring
+                // `poll_and_confirm_withdrawal`'s conservative fail-closed
+                // pattern for indeterminate poll errors.
+                if error.backpressure().is_some() {
+                    warn!(
+                        target: "rebalance",
+                        %error,
+                        "Alpaca deposit polling hit broker rate-limiting; keeping \
+                         DepositInitiated state for delayed reschedule (will re-poll \
+                         the same send_tx)"
+                    );
+                    return Err(UsdcTransferError::AlpacaWallet(error));
+                }
+
+                warn!(target: "rebalance", "Alpaca deposit polling failed: {error}");
+                self.cqrs
+                    .send(
+                        id,
+                        UsdcRebalanceCommand::FailDeposit {
+                            reason: format!("Deposit polling failed: {error}"),
+                        },
+                    )
+                    .await?;
+                return Err(UsdcTransferError::AlpacaWallet(error));
+            }
+        };
+
+        if transfer.status != TransferStatus::Complete {
+            let status = format!("{:?}", transfer.status);
+            self.cqrs
+                .send(
+                    id,
+                    UsdcRebalanceCommand::FailDeposit {
+                        reason: format!("Deposit ended in status: {status}"),
+                    },
+                )
+                .await?;
+            return Err(UsdcTransferError::DepositFailed { status });
+        }
+
+        self.cqrs
+            .send(
+                id,
+                UsdcRebalanceCommand::ConfirmDeposit {
+                    vault_deposit_block: None,
+                },
+            )
+            .await?;
+
+        info!(target: "rebalance", "Alpaca deposit confirmed");
+        Ok(())
+    }
+
+    async fn record_conversion_or_fail(
+        &self,
+        id: &UsdcRebalanceId,
+        correlation_id: &ClientOrderId,
+        order: &CryptoOrderResponse,
+        direction: ConversionDirection,
+    ) -> Result<ConversionAmounts, UsdcTransferError> {
+        match conversion_amounts_from_order(order, correlation_id, direction) {
+            Ok(conversion) => Ok(conversion),
+            Err(error) => {
+                warn!(
+                    order_id = %order.id,
+                    ?direction,
+                    %error,
+                    "Failed to derive settled conversion amounts"
+                );
+                self.cqrs
+                    .send(
+                        id,
+                        UsdcRebalanceCommand::FailConversion {
+                            reason: error.to_string(),
+                        },
+                    )
+                    .await?;
+                Err(error)
+            }
+        }
+    }
+}
+
+/// The CCTP hop: the burn, the attestation and the mint, and the flows
+/// that run them.
+impl<
+    Signer: Wallet,
+    B: Bridge<Error = CctpError, Attestation = AttestationResponse> + UsdcBridgeHelper,
+> CrossVenueCashTransfer<Signer, B>
+{
     fn attestation_retry_deadline_at(
         &self,
         id: &UsdcRebalanceId,
@@ -1569,375 +3574,6 @@ impl<
             recorded: cctp_nonce,
             reconstructed,
         })
-    }
-
-    async fn fail_conversion(
-        &self,
-        id: &UsdcRebalanceId,
-        reason: String,
-    ) -> Result<(), UsdcTransferError> {
-        self.cqrs
-            .send(id, UsdcRebalanceCommand::FailConversion { reason })
-            .await?;
-        Ok(())
-    }
-
-    /// Re-reads settled cash after a definitive insufficient-balance
-    /// rejection and produces a strictly smaller, reserve-aware whole-cent
-    /// placement. The one-cent decrement guarantees progress when the fresh
-    /// read has not moved; taking the minimum prevents a later read from ever
-    /// increasing this aggregate's original intent.
-    async fn resized_usd_conversion_notional(
-        &self,
-        id: &UsdcRebalanceId,
-        previous: Positive<Usd>,
-    ) -> Result<Positive<Usd>, UsdcTransferError> {
-        let withdrawable_cash_cents = self.alpaca_broker.withdrawable_cash_cents().await?;
-        let capacity =
-            alpaca_to_base_usdc_capacity(withdrawable_cash_cents, self.reserved_cash)?
-                .ok_or_else(|| UsdcTransferError::WithdrawableCashUnavailable { id: id.clone() })?;
-
-        resize_usd_conversion_notional(id, previous, capacity)
-    }
-
-    /// Converts USD buying power to USDC in the crypto wallet.
-    ///
-    /// Used at the start of AlpacaToBase flow, before withdrawal. Placement
-    /// retries only definitive insufficient-USD rejections and reuses the
-    /// correlation ID across every resized request. A successful fill records
-    /// the actual USDC received for downstream withdrawal sizing; exhausting
-    /// the bound records one terminal conversion failure.
-    #[instrument(target = "rebalance", skip(self), fields(%id, %amount), level = tracing::Level::DEBUG)]
-    pub(crate) async fn execute_usd_to_usdc_conversion(
-        &self,
-        id: &UsdcRebalanceId,
-        amount: Usdc,
-    ) -> Result<Usdc, UsdcTransferError> {
-        let correlation_id = ClientOrderId::from_uuid(Uuid::new_v4());
-
-        info!(target: "rebalance", %amount, %correlation_id, "Starting USD to USDC conversion");
-
-        // The aggregate carries this leg's amount as `Usdc` for the shape its
-        // persisted events already have, but the buy spends it as dollars --
-        // named here so the order cannot be read as a USDC quantity. Built
-        // before the intent is recorded so a non-positive amount fails with
-        // no aggregate event and no broker order to reconcile.
-        let mut notional = Positive::new(Usd::new(amount.inner()))?;
-
-        // Record intent BEFORE placing order so we can track failures
-        self.cqrs
-            .send(
-                id,
-                UsdcRebalanceCommand::InitiateConversion {
-                    direction: RebalanceDirection::AlpacaToBase,
-                    corridor: self.corridor,
-                    amount,
-                    order_id: correlation_id.clone(),
-                },
-            )
-            .await?;
-
-        let mut attempt = 0;
-        let order = loop {
-            attempt += 1;
-            match self
-                .alpaca_broker
-                .convert_usdc_usd(ConversionOrder::BuyWithUsd(notional), &correlation_id)
-                .await
-            {
-                Ok(order) => break order,
-                // Only an insufficient-balance rejection can succeed with a
-                // smaller notional. Any other Alpaca rejection, including a
-                // `40310000` "no available quote", takes the fail-once arm below.
-                Err(error @ AlpacaBrokerApiError::UsdConversionInsufficientBalance { .. }) => {
-                    if attempt >= USD_CONVERSION_PLACEMENT_ATTEMPTS {
-                        warn!(
-                            target: "rebalance",
-                            %id,
-                            attempt,
-                            max_attempts = USD_CONVERSION_PLACEMENT_ATTEMPTS,
-                            %error,
-                            "USD to USDC conversion failed after exhausting insufficient-balance placement attempts"
-                        );
-                        self.fail_conversion(id, error.to_string()).await?;
-                        return Err(UsdcTransferError::AlpacaBrokerApi(error));
-                    }
-
-                    let resized = match self.resized_usd_conversion_notional(id, notional).await {
-                        Ok(resized) => resized,
-                        Err(resize_error) => {
-                            warn!(
-                                target: "rebalance",
-                                %id,
-                                attempt,
-                                error = %resize_error,
-                                "USD to USDC conversion retry could not be resized"
-                            );
-                            self.fail_conversion(id, resize_error.to_string()).await?;
-                            return match &resize_error {
-                                UsdcTransferError::AlpacaBrokerApi(error)
-                                    if error.backpressure().is_some() =>
-                                {
-                                    Err(UsdcTransferError::ConversionPlacementFailed {
-                                        id: id.clone(),
-                                    })
-                                }
-                                _ => Err(resize_error),
-                            };
-                        }
-                    };
-                    warn!(
-                        target: "rebalance",
-                        %id,
-                        attempt,
-                        previous = %notional,
-                        next = %resized,
-                        "Alpaca rejected USD-to-USDC placement for insufficient balance; retrying with fresh capacity"
-                    );
-                    notional = resized;
-                }
-                // The order's fate is unknown: it may still be live at the broker
-                // and still fill. Recording a failure would release the in-flight
-                // guard and let the trigger arm a second conversion for the same
-                // imbalance while real money can still move, so the aggregate is
-                // left at `Converting` for operator reconciliation instead.
-                Err(
-                    error @ (AlpacaBrokerApiError::ConversionCancelNotSettled { .. }
-                    | AlpacaBrokerApiError::ConversionOrderNotFound { .. }),
-                ) => {
-                    error!(target: "rebalance", %error, "USD to USDC conversion outcome unresolved");
-                    return Err(UsdcTransferError::ConversionOutcomeUnresolved {
-                        id: id.clone(),
-                        source: Box::new(error),
-                    });
-                }
-                Err(error) => {
-                    // Conversion placement fails fast on ANY error (RAI-1494:
-                    // deliberately NOT rescheduled, unlike the deposit/withdrawal
-                    // polls) -- retrying a placement risks submitting the order
-                    // twice against real money. A classified 429 must not reach
-                    // the job's backpressure classifier though:
-                    // `find_backpressure` walks the `.source()` chain, so
-                    // returning `AlpacaBrokerApi` here would let it downcast into
-                    // the underlying 429 and mistakenly reschedule an
-                    // already-terminalized aggregate. Return the
-                    // non-classifiable `ConversionPlacementFailed` only for that
-                    // case; every other placement failure (e.g. a terminally
-                    // rejected/canceled/expired order) keeps surfacing the
-                    // original `AlpacaBrokerApi` variant so its specific reason
-                    // is preserved for callers/tests that match on it.
-                    warn!(target: "rebalance", "USD to USDC conversion failed: {error}");
-                    self.fail_conversion(id, error.to_string()).await?;
-                    if error.backpressure().is_some() {
-                        return Err(UsdcTransferError::ConversionPlacementFailed {
-                            id: id.clone(),
-                        });
-                    }
-                    return Err(UsdcTransferError::AlpacaBrokerApi(error));
-                }
-            }
-        };
-
-        let conversion = self
-            .record_conversion_or_fail(id, &correlation_id, &order, ConversionDirection::UsdToUsdc)
-            .await?;
-        let received_amount = conversion.received_amount;
-
-        // The trigger's floor only covers the amount it *requests*; a stalled
-        // conversion whose remainder was cancelled delivers whatever filled,
-        // and Alpaca rejects a withdrawal below its minimum outright. Failing
-        // here rather than at the withdrawal is what keeps the rebalance
-        // terminalizable: `FailConversion` is only legal while the aggregate
-        // is still `Converting`, so confirming first would leave it holding
-        // the in-flight guard with no terminal transition left.
-        if received_amount.lt(&ALPACA_MINIMUM_WITHDRAWAL)? {
-            error!(target: "rebalance",
-                order_id = %order.id,
-                requested = %amount,
-                converted = %received_amount,
-                minimum = %*ALPACA_MINIMUM_WITHDRAWAL,
-                "USD to USDC conversion settled below Alpaca's withdrawal minimum; \
-                 no withdrawal will be attempted"
-            );
-            self.cqrs
-                .send(
-                    id,
-                    UsdcRebalanceCommand::FailConversion {
-                        reason: format!(
-                            "conversion settled at {received_amount}, below Alpaca's {} \
-                             withdrawal minimum; the converted USDC needs reconciliation \
-                             in the Alpaca crypto wallet",
-                            *ALPACA_MINIMUM_WITHDRAWAL
-                        ),
-                    },
-                )
-                .await?;
-            return Err(UsdcTransferError::ConversionBelowWithdrawalMinimum {
-                id: id.clone(),
-                converted: received_amount,
-                minimum: *ALPACA_MINIMUM_WITHDRAWAL,
-            });
-        }
-
-        self.cqrs
-            .send(id, UsdcRebalanceCommand::ConfirmConversion { conversion })
-            .await?;
-
-        info!(target: "rebalance",
-            order_id = %order.id,
-            requested = ?amount,
-            source_amount = ?conversion.source_amount,
-            received_amount = ?conversion.received_amount,
-            "USD to USDC conversion completed"
-        );
-        Ok(received_amount)
-    }
-
-    /// Converts USDC to USD buying power.
-    ///
-    /// Used at the end of BaseToAlpaca flow, after deposit is confirmed.
-    /// Places a sell order on USDC/USD and polls until filled.
-    ///
-    /// Returns the actual USD proceeds credited at Alpaca.
-    ///
-    /// # Event Sourcing Flow
-    ///
-    /// 1. Record intent via `InitiatePostDepositConversion` (aggregate
-    ///    enters `Converting` state)
-    /// 2. Place Alpaca order
-    /// 3. If order fails: emit `FailConversion` (aggregate enters
-    ///    `ConversionFailed` state)
-    /// 4. If order succeeds: emit `ConfirmConversion` (aggregate enters
-    ///    `ConversionComplete` state)
-    ///
-    /// The `order_id` in `InitiatePostDepositConversion` is a correlation
-    /// UUID generated upfront, not the actual Alpaca order ID.
-    #[instrument(target = "rebalance", skip(self), fields(%id, %amount), level = tracing::Level::DEBUG)]
-    pub(crate) async fn execute_usdc_to_usd_conversion(
-        &self,
-        id: &UsdcRebalanceId,
-        amount: Usdc,
-    ) -> Result<Usdc, UsdcTransferError> {
-        let correlation_id = ClientOrderId::from_uuid(Uuid::new_v4());
-
-        info!(target: "rebalance", %amount, %correlation_id, "Starting USDC to USD conversion");
-
-        // Built before the intent is recorded so a non-positive amount fails
-        // with no aggregate event and no broker order to reconcile.
-        let conversion_order = ConversionOrder::SellUsdc(Positive::new(amount)?);
-
-        // Record intent BEFORE placing order so we can track failures
-        self.cqrs
-            .send(
-                id,
-                UsdcRebalanceCommand::InitiatePostDepositConversion {
-                    order_id: correlation_id.clone(),
-                    amount,
-                },
-            )
-            .await?;
-
-        let order = match self
-            .alpaca_broker
-            .convert_usdc_usd(conversion_order, &correlation_id)
-            .await
-        {
-            Ok(order) => order,
-            // Identical broker state decides identically on both legs: the
-            // order's fate is unknown and it may still fill, so recording a
-            // durable failure against it is wrong here for the same reason it
-            // is wrong on the USD->USDC leg. Left unterminalized for operator
-            // reconciliation.
-            Err(
-                error @ (AlpacaBrokerApiError::ConversionCancelNotSettled { .. }
-                | AlpacaBrokerApiError::ConversionOrderNotFound { .. }),
-            ) => {
-                error!(target: "rebalance", %error, "USDC to USD conversion outcome unresolved");
-                return Err(UsdcTransferError::ConversionOutcomeUnresolved {
-                    id: id.clone(),
-                    source: Box::new(error),
-                });
-            }
-            Err(error) => {
-                // Conversion placement fails fast on ANY error (RAI-1494):
-                // same rationale as `execute_usd_to_usdc_conversion` above --
-                // only a classified 429 returns the non-classifiable
-                // `ConversionPlacementFailed`; every other placement failure
-                // keeps surfacing the original `AlpacaBrokerApi` variant.
-                warn!(target: "rebalance", "USDC to USD conversion failed: {error}");
-                self.cqrs
-                    .send(
-                        id,
-                        UsdcRebalanceCommand::FailConversion {
-                            reason: error.to_string(),
-                        },
-                    )
-                    .await?;
-                if error.backpressure().is_some() {
-                    return Err(UsdcTransferError::ConversionPlacementFailed { id: id.clone() });
-                }
-                return Err(UsdcTransferError::AlpacaBrokerApi(error));
-            }
-        };
-
-        let conversion = self
-            .record_conversion_or_fail(id, &correlation_id, &order, conversion_order.direction())
-            .await?;
-        let proceeds = conversion.received_amount;
-
-        // `source_amount` is the USDC actually sold. A stalled order whose
-        // remainder was cancelled sells less than was deposited, and the rest
-        // stays as USDC in the Alpaca crypto wallet -- a denomination the
-        // offchain cash inventory does not read, so the imbalance calculation
-        // cannot see it and no later rebalance sweeps it. Confirming here
-        // would report a rebalance that moved part of the cash as a complete
-        // success. Fail instead, naming the unconverted amount: the same
-        // treatment `resume_converting` already gives an identical broker
-        // outcome. This asymmetry with the USD->USDC leg is deliberate --
-        // there the unfilled remainder stays as USD buying power, which the
-        // inventory does see.
-        if conversion.source_amount.lt(&amount)? {
-            let unconverted = (amount - conversion.source_amount)?;
-
-            error!(target: "rebalance",
-                order_id = %order.id,
-                requested = %amount,
-                converted = %conversion.source_amount,
-                %unconverted,
-                "USDC to USD conversion filled short; unconverted USDC is stranded in the \
-                 Alpaca crypto wallet"
-            );
-            self.cqrs
-                .send(
-                    id,
-                    UsdcRebalanceCommand::FailConversion {
-                        reason: format!(
-                            "post-deposit conversion filled only {} of {}; {unconverted} \
-                             USDC needs reconciliation in the Alpaca crypto wallet",
-                            conversion.source_amount, amount
-                        ),
-                    },
-                )
-                .await?;
-            return Err(UsdcTransferError::PostDepositConversionShortFill {
-                id: id.clone(),
-                converted: conversion.source_amount,
-                unconverted,
-            });
-        }
-
-        self.cqrs
-            .send(id, UsdcRebalanceCommand::ConfirmConversion { conversion })
-            .await?;
-
-        info!(target: "rebalance",
-            order_id = %order.id,
-            requested = ?amount,
-            source_amount = ?conversion.source_amount,
-            received_amount = ?conversion.received_amount,
-            "USDC to USD conversion completed"
-        );
-        Ok(proceeds)
     }
 
     /// Executes the full Alpaca to Base rebalancing workflow.
@@ -2541,175 +4177,6 @@ impl<
         .await
     }
 
-    /// Bridges what was credited either way. Alpaca deducts its network fee and
-    /// fees from a withdrawal, so a shortfall up to the fees it reported is
-    /// expected and only logged; a larger one pages. A shortfall whose fees
-    /// cannot be read is logged without a page, as it is most likely a fee.
-    async fn report_short_withdrawal_credit(
-        &self,
-        id: &UsdcRebalanceId,
-        withdrawal_tx: TxHash,
-        requested: Usdc,
-        shortfall: U256,
-    ) {
-        let Some(reported_fees) = self.reported_withdrawal_fees(id).await else {
-            info!(
-                target: "rebalance",
-                %id,
-                %withdrawal_tx,
-                %requested,
-                shortfall = %display_usdc(shortfall),
-                "Alpaca withdrawal credited less USDC than requested; the reported fees could \
-                 not be read, bridging the credited amount"
-            );
-            return;
-        };
-
-        if shortfall <= reported_fees {
-            info!(
-                target: "rebalance",
-                %id,
-                %withdrawal_tx,
-                %requested,
-                shortfall = %display_usdc(shortfall),
-                reported_fees = %display_usdc(reported_fees),
-                "Alpaca withdrawal credited less USDC than requested, within the fees Alpaca \
-                 reported; bridging the credited amount"
-            );
-            return;
-        }
-
-        error!(
-            target: "operational_alert",
-            alert = true,
-            %id,
-            %withdrawal_tx,
-            %requested,
-            shortfall = %display_usdc(shortfall),
-            reported_fees = %display_usdc(reported_fees),
-            "Alpaca withdrawal credited less USDC than requested net of the fees Alpaca \
-             reported; bridging the credited amount"
-        );
-    }
-
-    /// The network fee plus fees Alpaca reports for the withdrawal of `id`, in
-    /// USDC base units, or `None` (with a warning) when they cannot be read.
-    async fn reported_withdrawal_fees(&self, id: &UsdcRebalanceId) -> Option<U256> {
-        let state = self
-            .cqrs
-            .load(id)
-            .await
-            .inspect_err(|error| {
-                warn!(target: "rebalance", %id, ?error, "Could not load the transfer to read its withdrawal fees");
-            })
-            .ok()
-            .flatten();
-
-        let Some(UsdcRebalance::WithdrawalComplete {
-            withdrawal_ref: Some(TransferRef::AlpacaId(transfer_id)),
-            ..
-        }) = state
-        else {
-            warn!(target: "rebalance", %id, ?state, "No Alpaca transfer id to read the withdrawal fees from");
-            return None;
-        };
-
-        let transfer = self
-            .alpaca_wallet
-            .get_transfer(&transfer_id)
-            .await
-            .inspect_err(|error| {
-                warn!(target: "rebalance", %id, %transfer_id, %error, "Could not read the Alpaca withdrawal to get its fees");
-            })
-            .ok()?;
-
-        let Some(fees) = transfer
-            .reported_fees()
-            .inspect_err(|error| {
-                warn!(target: "rebalance", %id, %transfer_id, ?error, "Could not total the Alpaca withdrawal fees");
-            })
-            .ok()?
-        else {
-            warn!(target: "rebalance", %id, %transfer_id, "Alpaca reported no fees for the withdrawal");
-            return None;
-        };
-
-        usdc_to_u256(fees)
-            .inspect_err(|error| {
-                warn!(target: "rebalance", %id, %transfer_id, %error, "Alpaca withdrawal fees are off the USDC grid");
-            })
-            .ok()
-    }
-
-    /// DURABLE confirmation re-check: fires on the redrive path
-    /// (`WithdrawalComplete` -> resume), where the primary gate in
-    /// `poll_and_confirm_withdrawal` does not re-run. Every failure is a
-    /// retryable wait, deadline-gated so a deterministic RPC failure (e.g. a
-    /// malformed tx hash from Alpaca) cannot redrive forever.
-    async fn require_withdrawal_tx_confirmed(
-        &self,
-        id: &UsdcRebalanceId,
-        tx: TxHash,
-        confirmed_at: DateTime<Utc>,
-    ) -> Result<(), UsdcTransferError> {
-        let required = self
-            .ethereum_required_confirmations
-            .ok_or(EthereumChainMissing)?;
-        let confirmations = match self.cctp_bridge.ethereum_tx_confirmations(tx).await {
-            Ok(confirmations) => confirmations,
-            Err(error) => {
-                self.check_settlement_deadline(
-                    id,
-                    confirmed_at,
-                    SettlementStall::ConfirmationCheckFailing,
-                )
-                .await?;
-                return Err(UsdcTransferError::SettlementCheckTransient {
-                    id: id.clone(),
-                    source: Box::new(error),
-                });
-            }
-        };
-
-        match confirmations {
-            None => {
-                self.check_settlement_deadline(id, confirmed_at, SettlementStall::TxNeverMined)
-                    .await?;
-                warn!(
-                    target: "rebalance",
-                    %id,
-                    %tx,
-                    "Withdrawal tx not yet mined on redrive; retrying"
-                );
-                Err(UsdcTransferError::WithdrawalTxUnderconfirmed {
-                    id: id.clone(),
-                    tx,
-                    required,
-                    actual: 0,
-                })
-            }
-            Some(confirmations) if confirmations < required => {
-                self.check_settlement_deadline(id, confirmed_at, SettlementStall::TxUnderconfirmed)
-                    .await?;
-                warn!(
-                    target: "rebalance",
-                    %id,
-                    %tx,
-                    confirmations,
-                    required,
-                    "Withdrawal tx under-confirmed on redrive; retrying"
-                );
-                Err(UsdcTransferError::WithdrawalTxUnderconfirmed {
-                    id: id.clone(),
-                    tx,
-                    required,
-                    actual: confirmations,
-                })
-            }
-            Some(_) => Ok(()),
-        }
-    }
-
     /// Drives an Alpaca->Base transfer from `Bridging`/`Attested` through to
     /// terminal. Re-polls the Circle attestation (idempotent for completed
     /// attestations) so we obtain a fresh [`AttestationResponse`] suitable
@@ -2906,21 +4373,6 @@ impl<
         ))
     }
 
-    /// Drives an Alpaca->Base transfer from `Bridged` to terminal: vault
-    /// deposit + `ConfirmDeposit`.
-    async fn continue_alpaca_to_base_from_bridged(
-        &self,
-        id: &UsdcRebalanceId,
-        amount_received: Usdc,
-    ) -> Result<(), UsdcTransferError> {
-        let amount_u256 = usdc_to_u256(amount_received)?;
-
-        let vault_deposit_block = self.deposit_to_vault(id, amount_u256).await?;
-        self.confirm_deposit(id, vault_deposit_block).await?;
-
-        Ok(())
-    }
-
     pub(crate) async fn execute_alpaca_to_base(
         &self,
         id: &UsdcRebalanceId,
@@ -2959,414 +4411,6 @@ impl<
 
         info!(target: "rebalance", "Alpaca to Base rebalance completed successfully");
         Ok(())
-    }
-
-    #[instrument(target = "rebalance", skip(self), fields(%id, %amount), level = tracing::Level::DEBUG)]
-    async fn initiate_alpaca_withdrawal(
-        &self,
-        id: &UsdcRebalanceId,
-        amount: Usdc,
-    ) -> Result<Transfer, UsdcTransferError> {
-        // Defence in depth for the resume path. `execute_usd_to_usdc_conversion`
-        // refuses a sub-minimum fill while the aggregate is still `Converting`
-        // and `FailConversion` is legal, so a freshly converted rebalance never
-        // arrives here short. An aggregate that persisted `ConversionComplete`
-        // before that guard existed still can, and from there no failure
-        // transition remains -- so this refuses the call Alpaca would reject
-        // and leaves the aggregate for reconciliation rather than recording a
-        // terminal state it has no transition for. The job latches on this
-        // error instead of retrying, since every retry fails identically.
-        if amount.lt(&ALPACA_MINIMUM_WITHDRAWAL)? {
-            error!(target: "rebalance",
-                %id,
-                converted = %amount,
-                minimum = %*ALPACA_MINIMUM_WITHDRAWAL,
-                "Refusing an Alpaca withdrawal below the broker minimum; the converted \
-                 USDC needs reconciliation in the Alpaca crypto wallet"
-            );
-            return Err(UsdcTransferError::ConversionBelowWithdrawalMinimum {
-                id: id.clone(),
-                converted: amount,
-                minimum: *ALPACA_MINIMUM_WITHDRAWAL,
-            });
-        }
-
-        let usdc = TokenSymbol::new("USDC");
-        let positive_amount = Positive::new(amount)?;
-
-        let transfer = match self
-            .alpaca_wallet
-            .initiate_withdrawal(positive_amount, &usdc, &self.market_maker_wallet)
-            .await
-        {
-            Ok(transfer) => transfer,
-            Err(error) => {
-                warn!(target: "rebalance", "Alpaca withdrawal initiation failed: {error}");
-                return Err(UsdcTransferError::AlpacaWallet(error));
-            }
-        };
-
-        self.cqrs
-            .send(
-                id,
-                UsdcRebalanceCommand::Initiate {
-                    direction: RebalanceDirection::AlpacaToBase,
-                    corridor: self.corridor,
-                    amount,
-                    withdrawal: TransferRef::AlpacaId(transfer.id),
-                },
-            )
-            .await?;
-
-        info!(target: "rebalance", transfer_id = %transfer.id, "Alpaca withdrawal initiated");
-        Ok(transfer)
-    }
-
-    #[instrument(target = "rebalance", skip(self), fields(%id, %transfer_id), level = tracing::Level::DEBUG)]
-    async fn poll_and_confirm_withdrawal(
-        &self,
-        id: &UsdcRebalanceId,
-        transfer_id: &AlpacaTransferId,
-        initiated_at: DateTime<Utc>,
-    ) -> Result<TxHash, UsdcTransferError> {
-        let transfer = match self
-            .alpaca_wallet
-            .poll_transfer_until_complete(transfer_id)
-            .await
-        {
-            Ok(transfer) => transfer,
-            Err(error) => {
-                // CONSERVATIVE FAIL-CLOSED: every `AlpacaWalletError` returned by
-                // `poll_transfer_until_complete` (including ApiError{4xx/5xx},
-                // TransferTimeout, Reqwest, ParseError, TransferNotFound, and
-                // InvalidStatusTransition) is treated as INDETERMINATE -- the
-                // withdrawal may have already succeeded on Alpaca's side even if
-                // the poll did not confirm it. This is intentional: Alpaca's
-                // documented determinate terminal failure is delivered as
-                // `Ok(transfer)` with `status == TransferStatus::Failed` and no
-                // tx hash, which is handled below. Error responses from the polling
-                // endpoint do NOT constitute a determinate "funds never left" signal
-                // in the Alpaca Broker API, so we never emit `FailWithdrawal` on an
-                // error path.
-                //
-                // TransferNotFound specifically (the by-id endpoint returns 404)
-                // is also classified as INDETERMINATE here. This is intentionally
-                // fail-closed: an absent transfer ID does not confirm the
-                // withdrawal never left. Guard is held, re-poll continues. Recovery
-                // for a permanently-absent UUID is operational (see docs/cli-ops.md
-                // "Withdrawal poll inconclusive"), not automated.
-                //
-                // Alpaca Broker API: GET
-                // /v1/accounts/{account_id}/wallets/transfers/{transfer_id}
-                // (docs.alpaca.markets/us/reference/getcryptofundingtransfer-1).
-                // The transfer lifecycle terminates in COMPLETE or FAILED status
-                // delivered as a Transfer payload. HTTP 4xx/5xx responses are
-                // transient (auth, network, Alpaca-side load) and do not indicate
-                // the transfer's ultimate fate -- the same transfer ID must be
-                // re-polled to determine the outcome.
-                //
-                // Consequence of the conservative assumption: if a poll error is
-                // encountered the aggregate stays in Withdrawing (guard held,
-                // AlpacaTransferId recorded). The job redrive re-polls the same
-                // transfer ID. After 4 hours of failed polls the operator is paged.
-                // Worst case: a stuck operator page + manual intervention. No funds
-                // are lost and no re-withdrawal can occur, which is the correct
-                // safe failure direction for a money-movement operation.
-                warn!(
-                    target: "rebalance",
-                    %id, %transfer_id,
-                    "Alpaca withdrawal polling inconclusive; keeping Withdrawing \
-                     state for delayed redrive (will re-poll same transfer ID): {error}"
-                );
-                return Err(UsdcTransferError::WithdrawalPollInconclusive {
-                    id: id.clone(),
-                    initiated_at,
-                    source: error,
-                });
-            }
-        };
-
-        if let (TransferStatus::Failed, Some(tx_hash)) = (transfer.status, transfer.tx) {
-            warn!(
-                target: "rebalance",
-                %id, %transfer_id, %tx_hash,
-                "Alpaca withdrawal reported Failed with an on-chain tx hash; treating as \
-                 inconclusive and keeping Withdrawing state for delayed redrive"
-            );
-            return Err(UsdcTransferError::WithdrawalPollInconclusive {
-                id: id.clone(),
-                initiated_at,
-                source: AlpacaWalletError::FailedTransferHasTx {
-                    transfer_id: *transfer_id,
-                    tx_hash,
-                },
-            });
-        }
-
-        if transfer.status != TransferStatus::Complete {
-            let status = format!("{:?}", transfer.status);
-            self.cqrs
-                .send(
-                    id,
-                    UsdcRebalanceCommand::FailWithdrawal {
-                        reason: format!("Transfer ended in status: {status}"),
-                    },
-                )
-                .await?;
-            return Err(UsdcTransferError::WithdrawalFailed { status });
-        }
-
-        // The transfer is credited only from the tx that delivered its USDC, and
-        // Alpaca can report Complete before the hash. Stay `Withdrawing` and
-        // re-poll the same transfer id until the hash is present, but only up
-        // to the settlement deadline: a hash that never arrives would hold the
-        // cash guard forever.
-        let withdrawal_tx = match transfer.tx {
-            Some(withdrawal_tx) => withdrawal_tx,
-            None => {
-                self.await_completed_withdrawal_tx(id, transfer_id, initiated_at)
-                    .await?
-            }
-        };
-
-        self.refuse_withdrawal_tx_recorded_elsewhere(id, withdrawal_tx)
-            .await?;
-
-        // Advance the aggregate to WithdrawalComplete NOW, before the on-chain
-        // confirmation-depth check below. This is intentional: if the confirmation
-        // wait returns early (tx not yet mined or under-confirmed), the aggregate is
-        // already in WithdrawalComplete, so on apalis redrive the resume path enters
-        // continue_alpaca_to_base_from_withdrawal_complete and re-runs the
-        // confirmation check -- it never re-polls Alpaca. Without this ordering, a
-        // transient Alpaca API error on a redrive would hit the poll_transfer error arm
-        // and send FailWithdrawal against a withdrawal that already succeeded.
-        self.cqrs
-            .send(
-                id,
-                UsdcRebalanceCommand::ConfirmWithdrawal {
-                    withdrawal_tx: Some(withdrawal_tx),
-                },
-            )
-            .await?;
-
-        info!(target: "rebalance", "Alpaca withdrawal confirmed");
-
-        // PRIMARY settlement gate: wait for the configured required_confirmations
-        // on the on-chain tx that delivered the withdrawn USDC to the market-maker
-        // wallet. Alpaca reports "Complete" before the tx is visible network-wide on
-        // load-balanced RPC nodes, so reading the tx immediately after the status
-        // change can hit a lagging node. If the tx is not yet sufficiently
-        // confirmed, return WithdrawalTxUnderconfirmed (retryable) -- the aggregate
-        // is already in WithdrawalComplete and withdrawal_tx is persisted, so on
-        // apalis redrive the resume path enters
-        // continue_alpaca_to_base_from_withdrawal_complete and re-runs this same
-        // confirmation check durably before any burn.
-        let required = self
-            .ethereum_required_confirmations
-            .ok_or(EthereumChainMissing)?;
-        match self
-            .cctp_bridge
-            .ethereum_tx_confirmations(withdrawal_tx)
-            .await
-            .map_err(|error| UsdcTransferError::SettlementCheckTransient {
-                id: id.clone(),
-                source: Box::new(error),
-            })? {
-            None => {
-                warn!(
-                    target: "rebalance",
-                    %id,
-                    tx = %withdrawal_tx,
-                    "Alpaca withdrawal tx not yet mined; retrying"
-                );
-                return Err(UsdcTransferError::WithdrawalTxUnderconfirmed {
-                    id: id.clone(),
-                    tx: withdrawal_tx,
-                    required,
-                    actual: 0,
-                });
-            }
-            Some(confirmations) if confirmations < required => {
-                warn!(
-                    target: "rebalance",
-                    %id,
-                    tx = %withdrawal_tx,
-                    confirmations,
-                    required,
-                    "Alpaca withdrawal tx under-confirmed; retrying"
-                );
-                return Err(UsdcTransferError::WithdrawalTxUnderconfirmed {
-                    id: id.clone(),
-                    tx: withdrawal_tx,
-                    required,
-                    actual: confirmations,
-                });
-            }
-            Some(confirmations) => {
-                info!(
-                    target: "rebalance",
-                    %id,
-                    tx = %withdrawal_tx,
-                    confirmations,
-                    "Alpaca withdrawal tx confirmed on-chain"
-                );
-            }
-        }
-
-        Ok(withdrawal_tx)
-    }
-
-    /// Fails the transfer for reconciliation when another transfer already
-    /// recorded `withdrawal_tx`: it cannot be this withdrawal's delivery. The
-    /// tx is not recorded on this transfer. Skipped when the ledger pool is
-    /// not wired.
-    async fn refuse_withdrawal_tx_recorded_elsewhere(
-        &self,
-        id: &UsdcRebalanceId,
-        withdrawal_tx: TxHash,
-    ) -> Result<(), UsdcTransferError> {
-        let CreditLedger::Wired(pool) = &self.credit_ledger else {
-            debug!(target: "rebalance", %id, "Event store not wired; skipping the withdrawal tx uniqueness check");
-            return Ok(());
-        };
-
-        let Some(recorded_by) = withdrawal_tx_recorded_elsewhere(pool, id, withdrawal_tx)
-            .await
-            .map_err(|source| UsdcTransferError::WithdrawalTxLookupFailed {
-                id: id.clone(),
-                source,
-            })?
-        else {
-            return Ok(());
-        };
-
-        error!(
-            target: "rebalance",
-            %id,
-            %withdrawal_tx,
-            %recorded_by,
-            "Alpaca withdrawal tx is already recorded by another USDC transfer; failing for \
-             operator reconciliation"
-        );
-        self.cqrs
-            .send(
-                id,
-                UsdcRebalanceCommand::ConfirmWithdrawal {
-                    withdrawal_tx: None,
-                },
-            )
-            .await?;
-        self.cqrs
-            .send(
-                id,
-                UsdcRebalanceCommand::FailBridging {
-                    reason: format!(
-                        "withdrawal tx {withdrawal_tx} is already recorded by USDC rebalance \
-                         {recorded_by}; settle the withdrawn funds with \
-                         `transfer reconcile --kind usdc`"
-                    ),
-                },
-            )
-            .await?;
-
-        Err(UsdcTransferError::WithdrawalTxAlreadyRecorded {
-            id: id.clone(),
-            tx: withdrawal_tx,
-            recorded_by,
-        })
-    }
-
-    /// Alpaca reported the withdrawal Complete with no tx hash. Before the
-    /// settlement deadline this is inconclusive (delayed redrive). The
-    /// deadline counts from `initiated_at`, so a withdrawal Alpaca held
-    /// Pending past it can be first seen Complete after it: the hash then gets
-    /// one Alpaca polling timeout of grace before the transfer fails.
-    async fn await_completed_withdrawal_tx(
-        &self,
-        id: &UsdcRebalanceId,
-        transfer_id: &AlpacaTransferId,
-        initiated_at: DateTime<Utc>,
-    ) -> Result<TxHash, UsdcTransferError> {
-        let deadline_elapsed = (Utc::now() - initiated_at)
-            .to_std()
-            .is_ok_and(|elapsed| elapsed >= self.settlement_retry_deadline);
-
-        if !deadline_elapsed {
-            warn!(
-                target: "rebalance",
-                %id, %transfer_id,
-                "Alpaca withdrawal is complete but reports no tx hash yet; keeping \
-                 Withdrawing state for delayed redrive"
-            );
-            return Err(UsdcTransferError::WithdrawalPollInconclusive {
-                id: id.clone(),
-                initiated_at,
-                source: AlpacaWalletError::CompletedTransferMissingTx {
-                    transfer_id: *transfer_id,
-                },
-            });
-        }
-
-        warn!(
-            target: "rebalance",
-            %id, %transfer_id,
-            "Alpaca withdrawal is complete with no tx hash past the settlement deadline; \
-             waiting a grace for the hash before failing"
-        );
-        match self.alpaca_wallet.poll_transfer_tx_hash(transfer_id).await {
-            Ok(withdrawal_tx) => Ok(withdrawal_tx),
-            Err(AlpacaWalletError::TransferTimeout { .. }) => {
-                self.fail_completed_withdrawal_without_tx(id, transfer_id, initiated_at)
-                    .await
-            }
-            Err(error) => Err(UsdcTransferError::WithdrawalPollInconclusive {
-                id: id.clone(),
-                initiated_at,
-                source: error,
-            }),
-        }
-    }
-
-    /// Alpaca reported the withdrawal Complete but never its tx hash within
-    /// the settlement deadline. The funds left Alpaca, so this is a pre-burn
-    /// `BridgingFailed` (reconcile-eligible), never `FailWithdrawal`.
-    async fn fail_completed_withdrawal_without_tx(
-        &self,
-        id: &UsdcRebalanceId,
-        transfer_id: &AlpacaTransferId,
-        initiated_at: DateTime<Utc>,
-    ) -> Result<TxHash, UsdcTransferError> {
-        error!(
-            target: "rebalance",
-            %id,
-            %transfer_id,
-            %initiated_at,
-            "Alpaca withdrawal is complete but reported no tx hash before the settlement \
-             deadline; failing for operator reconciliation"
-        );
-
-        self.cqrs
-            .send(
-                id,
-                UsdcRebalanceCommand::ConfirmWithdrawal {
-                    withdrawal_tx: None,
-                },
-            )
-            .await?;
-        self.cqrs
-            .send(
-                id,
-                UsdcRebalanceCommand::FailBridging {
-                    reason: format!(
-                        "Alpaca withdrawal {transfer_id} completed but reported no tx hash \
-                         before the settlement deadline; settle the withdrawn funds with \
-                         `transfer reconcile --kind usdc`"
-                    ),
-                },
-            )
-            .await?;
-
-        Err(UsdcTransferError::WithdrawalTxMissing { id: id.clone() })
     }
 
     /// Converts a `CctpError::MintRecoveryInconclusive` into the redrive
@@ -3666,169 +4710,6 @@ impl<
             "CCTP mint executed"
         );
         Ok(mint_receipt)
-    }
-
-    /// Submits, records and confirms the vault deposit, returning the block
-    /// that holds it.
-    #[instrument(target = "rebalance", skip(self), fields(%id, %amount), level = tracing::Level::DEBUG)]
-    async fn deposit_to_vault(
-        &self,
-        id: &UsdcRebalanceId,
-        amount: U256,
-    ) -> Result<Option<u64>, UsdcTransferError> {
-        // Submit the deposit and persist its tx hash as `InitiateDeposit` BEFORE
-        // confirming. `deposit_usdc` would submit AND confirm atomically, only
-        // recording the hash afterwards -- a crash during the (potentially long)
-        // confirmation wait would leave the aggregate in `Bridged`, and resume
-        // would re-enter here and submit a SECOND deposit for the same funds.
-        // Persisting the hash first lands a crash in `DepositInitiated`, whose
-        // resume arm re-verifies the recorded tx via `confirm_tx_receipt` instead of
-        // re-depositing.
-        let stable = self.corridor.chain().settlement_stable();
-        let deposit_tx = match self
-            .raindex
-            .submit_deposit(stable.address, self.vault_id, amount, stable.decimals)
-            .await
-        {
-            Ok(tx) => tx,
-            Err(error) => {
-                // The submission failed before any deposit tx was broadcast
-                // (`submit_pending` only returns a hash once the tx is accepted),
-                // so nothing moved. Leave the aggregate in `Bridged` and let
-                // apalis retry the deposit from there -- re-attempting is safe and
-                // cannot double-deposit. Do NOT emit `FailDeposit`: it is invalid
-                // from `Bridged` (only valid once a deposit has been initiated),
-                // and a transient submission error is not a terminal failure.
-                warn!(target: "rebalance", "Vault deposit submission failed: {error}");
-                return Err(UsdcTransferError::Vault(error));
-            }
-        };
-
-        self.cqrs
-            .send(
-                id,
-                UsdcRebalanceCommand::InitiateDeposit {
-                    deposit: TransferRef::OnchainTx(deposit_tx),
-                },
-            )
-            .await?;
-
-        // Confirm the recorded deposit. A failure here leaves the aggregate in
-        // `DepositInitiated` (the hash is persisted) rather than emitting
-        // `FailDeposit`: the deposit may still confirm, and the `DepositInitiated`
-        // resume arm re-checks it. Propagate so apalis retries from there.
-        let receipt = self.raindex.confirm_tx_receipt(deposit_tx).await?;
-
-        self.enqueue_bot_gas_cost(
-            self.corridor.chain(),
-            deposit_tx,
-            BotGasOperationCategory::VaultDeposit,
-        )
-        .await?;
-
-        info!(target: "rebalance", %deposit_tx, block_number = ?receipt.block_number, "Vault deposit submitted, recorded, and confirmed");
-        Ok(receipt.block_number)
-    }
-
-    #[instrument(target = "rebalance", skip(self), fields(%id), level = tracing::Level::DEBUG)]
-    async fn confirm_deposit(
-        &self,
-        id: &UsdcRebalanceId,
-        vault_deposit_block: Option<u64>,
-    ) -> Result<(), UsdcTransferError> {
-        self.cqrs
-            .send(
-                id,
-                UsdcRebalanceCommand::ConfirmDeposit {
-                    vault_deposit_block,
-                },
-            )
-            .await?;
-
-        info!(target: "rebalance", "Vault deposit confirmed");
-        Ok(())
-    }
-
-    /// Reserves the nonce of every signed deposit send persisted on
-    /// `Bridged` and rebroadcasts its exact bytes, so no other send from the
-    /// Ethereum wallet takes that nonce or waits behind a send no node holds
-    /// after a restart. Never fails startup: a send that cannot be restored
-    /// or rebroadcast is paged, and the transfer's resume broadcasts it again.
-    /// A failed listing, a failed load or an unparseable id counts as unmined,
-    /// so startup skips the Ethereum approvals and revokes that could take the
-    /// nonce of a send it did not reserve.
-    pub(crate) async fn restore_prepared_deposit_sends(
-        &self,
-        pool: &SqlitePool,
-    ) -> RestoredDepositSends {
-        let mut outcome = RestoredDepositSends::default();
-        let (ids, unparseable) = match prepared_deposit_send_ids(pool).await {
-            Ok(found) => found,
-            Err(error) => {
-                error!(target: "operational_alert", alert = true, ?error, "Could not list signed Alpaca deposit sends at startup; their nonces are not reserved until each transfer resumes, so startup skips Ethereum token approvals and allowance revokes");
-                outcome.unmined += 1;
-                return outcome;
-            }
-        };
-        if !unparseable.is_empty() {
-            error!(target: "operational_alert", alert = true, ?unparseable, "Signed Alpaca deposit sends with unparseable transfer ids were not restored at startup, so startup skips Ethereum token approvals and allowance revokes");
-            outcome.unmined += unparseable.len();
-        }
-
-        for id in ids {
-            match self.cqrs.load(&id).await {
-                Ok(Some(UsdcRebalance::Bridged { deposit_send, .. })) => {
-                    let Some((prepared, _)) = deposit_send.prepared() else {
-                        warn!(target: "rebalance", %id, "Transfer no longer holds a signed deposit send at startup");
-                        continue;
-                    };
-                    self.cctp_bridge.restore_usdc_on_ethereum(prepared).await;
-                    info!(target: "rebalance", %id, tx = %prepared.tx_hash(), nonce = prepared.nonce(), "Reserved the nonce of a signed Alpaca deposit send");
-                    outcome.restored += 1;
-
-                    if !self.rebroadcast_restored_deposit_send(&id, prepared).await {
-                        outcome.unmined += 1;
-                    }
-                }
-                Ok(state) => {
-                    warn!(target: "rebalance", %id, ?state, "Transfer left Bridged before its signed deposit send was restored");
-                }
-                Err(error) => {
-                    error!(target: "operational_alert", alert = true, %id, ?error, "Could not load a transfer with a signed Alpaca deposit send at startup; its nonce is not reserved until it resumes, so startup skips Ethereum token approvals and allowance revokes");
-                    outcome.unmined += 1;
-                }
-            }
-        }
-
-        outcome
-    }
-
-    /// Rebroadcasts a deposit send restored at startup and reports whether it
-    /// is mined. A failed rebroadcast pages; a send with no receipt, or whose
-    /// receipt cannot be read, counts as not mined.
-    async fn rebroadcast_restored_deposit_send(
-        &self,
-        id: &UsdcRebalanceId,
-        prepared: &PreparedTransaction,
-    ) -> bool {
-        let tx = prepared.tx_hash();
-        let nonce = prepared.nonce();
-        if let Err(error) = self.cctp_bridge.broadcast_usdc_on_ethereum(prepared).await {
-            error!(target: "operational_alert", alert = true, %id, %tx, nonce, ?error, "Could not rebroadcast a signed Alpaca deposit send at startup; its nonce stays reserved, so startup skips Ethereum token approvals and allowance revokes, and the transfer's resume broadcasts it again");
-            return false;
-        }
-
-        match self.cctp_bridge.ethereum_tx_confirmations(tx).await {
-            Ok(Some(_)) => true,
-            Ok(None) => {
-                warn!(target: "rebalance", %id, %tx, nonce, "Restored Alpaca deposit send is not mined yet at startup");
-                false
-            }
-            Err(error) => {
-                warn!(target: "rebalance", %id, %tx, nonce, ?error, "Could not read the receipt of a restored Alpaca deposit send at startup; treating it as not mined");
-                false
-            }
-        }
     }
 
     /// Executes the full Base to Alpaca rebalancing workflow.
@@ -4570,152 +5451,6 @@ impl<
         self.continue_from_bridged_fresh(id, amount_received).await
     }
 
-    fn require_base_to_alpaca(
-        id: &UsdcRebalanceId,
-        direction: RebalanceDirection,
-    ) -> Result<(), UsdcTransferError> {
-        if matches!(direction, RebalanceDirection::BaseToAlpaca) {
-            Ok(())
-        } else {
-            Err(UsdcTransferError::ResumeDirectionMismatch {
-                id: id.clone(),
-                direction,
-            })
-        }
-    }
-
-    /// Resumes a Base->Alpaca transfer whose deposit send already happened.
-    ///
-    /// The recorded `deposit_ref` is the USDC SEND tx (minted USDC forwarded to
-    /// Alpaca's deposit address), not the mint tx. The send moved funds before
-    /// `InitiateDeposit` was recorded, so this re-polls Alpaca by it -- no
-    /// further send occurs.
-    async fn resume_base_to_alpaca_deposit(
-        &self,
-        id: &UsdcRebalanceId,
-        amount: Usdc,
-        deposit_ref: TransferRef,
-    ) -> Result<(), UsdcTransferError> {
-        let TransferRef::OnchainTx(send_tx) = deposit_ref else {
-            return Err(UsdcTransferError::DepositRefMustBeOnchain { id: id.clone() });
-        };
-        self.poll_alpaca_deposit_and_confirm(id, send_tx).await?;
-        self.execute_usdc_to_usd_conversion(id, amount).await?;
-        Ok(())
-    }
-
-    /// Resumes a transfer stalled at `Converting` (the post-deposit USDC->USD
-    /// conversion). The conversion's correlation id is the Alpaca
-    /// `client_order_id`, recorded before the order was placed, so resume looks
-    /// the order up and resolves deterministically instead of blindly failing:
-    /// a filled order confirms the conversion, a terminally-failed order fails
-    /// it, a still-settling order is retried, and an order that never reached
-    /// Alpaca (crash before placement) fails for operator reconciliation.
-    async fn resume_converting(
-        &self,
-        id: &UsdcRebalanceId,
-        correlation_id: ClientOrderId,
-    ) -> Result<(), UsdcTransferError> {
-        let Some(order) = self
-            .alpaca_broker
-            .find_conversion_order(&correlation_id)
-            .await?
-        else {
-            warn!(target: "rebalance", %correlation_id, "Conversion order never reached Alpaca on resume; failing for reconciliation");
-            self.cqrs
-                .send(
-                    id,
-                    UsdcRebalanceCommand::FailConversion {
-                        reason: format!("conversion order {correlation_id} never reached Alpaca"),
-                    },
-                )
-                .await?;
-            return Err(UsdcTransferError::ResumeIndeterminateConversion { id: id.clone() });
-        };
-
-        // Mirror the normal placement flow: a still-settling conversion is awaited
-        // to a terminal state rather than failing the job. Failing here would burn
-        // the finite apalis retry budget -- the order can settle slower than the
-        // per-attempt window -- and let the timeout sweep clear the in-progress
-        // guard while the conversion is still healthy, the partial-completion clobber
-        // this resume path exists to prevent.
-        // Gate on terminality rather than on `Pending` alone: a `suspended`,
-        // `replaced` or `calculated` order is reported as `Failed` but the
-        // broker may still resume and fill it, so failing on sight here would
-        // record a failed rebalance against live money -- the same drift the
-        // shared terminality rule exists to prevent.
-        let order = if order.classify().is_terminal() {
-            order
-        } else {
-            warn!(target: "rebalance", order_id = %order.id, "Resumed conversion not yet terminal; awaiting a terminal state");
-            self.alpaca_broker
-                .poll_conversion_to_terminal(order.id)
-                .await
-                .map_err(|error| match error {
-                    // The order's fate is unknown: it may still be live and
-                    // still fill. Mapping here is what routes the job to its
-                    // latch arm instead of the generic retry path, so resume
-                    // decides the same way as both direct conversion legs.
-                    error @ (AlpacaBrokerApiError::ConversionCancelNotSettled { .. }
-                    | AlpacaBrokerApiError::ConversionOrderNotFound { .. }) => {
-                        error!(target: "rebalance", %error, "Resumed conversion outcome unresolved");
-                        UsdcTransferError::ConversionOutcomeUnresolved {
-                            id: id.clone(),
-                            source: Box::new(error),
-                        }
-                    }
-                    other => other.into(),
-                })?
-        };
-
-        match order.classify() {
-            CryptoOrderOutcome::Filled => {
-                let conversion = conversion_amounts_from_order(
-                    &order,
-                    &correlation_id,
-                    ConversionDirection::UsdcToUsd,
-                )?;
-
-                self.cqrs
-                    .send(id, UsdcRebalanceCommand::ConfirmConversion { conversion })
-                    .await?;
-                info!(target: "rebalance", order_id = %order.id, received_amount = %conversion.received_amount, "Resumed conversion confirmed from already-filled order");
-                Ok(())
-            }
-            CryptoOrderOutcome::Pending => {
-                // `poll_conversion_to_terminal` returns only on a terminal state, so a
-                // Pending classification here is unreachable; fail indeterminate for
-                // operator follow-up rather than silently looping.
-                warn!(target: "rebalance", order_id = %order.id, "Resumed conversion still pending after awaiting terminal state");
-                Err(UsdcTransferError::ResumeIndeterminateConversion { id: id.clone() })
-            }
-            CryptoOrderOutcome::Failed(reason) => {
-                // Alpaca terminal statuses can carry a nonzero partial fill: real USDC
-                // converted before the order terminated. Surface it in the failure
-                // reason and logs so an operator reconciles the converted amount rather
-                // than recording a clean full failure that hides it. Conservatively
-                // treat an un-checkable fill as needing reconciliation.
-                let partial_fill = order
-                    .filled_quantity
-                    .filter(|filled| filled.is_zero().map(|zero| !zero).unwrap_or(true));
-
-                warn!(target: "rebalance", order_id = %order.id, ?reason, ?partial_fill, "Resumed conversion order failed terminally");
-                let partial_suffix = partial_fill
-                    .map(|filled| format!(" (partial fill {filled} needs reconciliation)"))
-                    .unwrap_or_default();
-                self.cqrs
-                    .send(
-                        id,
-                        UsdcRebalanceCommand::FailConversion {
-                            reason: format!("conversion order failed: {reason:?}{partial_suffix}"),
-                        },
-                    )
-                    .await?;
-                Err(UsdcTransferError::ResumeIndeterminateConversion { id: id.clone() })
-            }
-        }
-    }
-
     /// Drives the transfer from `WithdrawalComplete` through to terminal:
     /// burn -> attestation -> mint -> deposit -> USDC->USD conversion.
     async fn continue_from_withdrawal_complete(
@@ -4886,633 +5621,6 @@ impl<
             .await?;
         self.continue_from_bridged_fresh(id, u256_to_usdc(mint_receipt.amount)?)
             .await
-    }
-
-    /// Drives a FRESH transfer from `Bridged` to terminal: send the minted USDC
-    /// to Alpaca's deposit address, record the send, poll Alpaca for the
-    /// credit, then convert USDC->USD.
-    ///
-    /// # Why an explicit send (load-bearing)
-    ///
-    /// The CCTP mint credits the bot's OWN wallet
-    /// ([`execute_cctp_burn_on_base`](Self::execute_cctp_burn_on_base) sets the
-    /// burn's `mintRecipient` to `self.market_maker_wallet`), NOT an Alpaca
-    /// deposit address. Alpaca funds only when USDC is transferred to the
-    /// per-account deposit address from `get_wallet_address`. So this leg fetches
-    /// that address and SENDS the minted USDC there, then polls Alpaca by the
-    /// SEND tx (not the mint tx). The recorded `deposit_ref` is the SEND tx.
-    ///
-    /// # Fresh vs resume
-    ///
-    /// Reached right after this execution moved the transfer to `Bridged` (a
-    /// fresh mint, an adopted attested mint, or a `BridgingFailed` recovery),
-    /// so no send exists yet: it sends with no pre-send chain scan. The signed send is persisted on
-    /// `Bridged` before its broadcast, so a crash before `InitiateDeposit`
-    /// resumes by broadcasting those same bytes
-    /// ([`continue_from_bridged_resume`](Self::continue_from_bridged_resume)).
-    async fn continue_from_bridged_fresh(
-        &self,
-        id: &UsdcRebalanceId,
-        amount_received: Usdc,
-    ) -> Result<(), UsdcTransferError> {
-        let send_tx = self.send_alpaca_deposit(id, amount_received).await?;
-        self.finish_deposit(id, amount_received, send_tx).await
-    }
-
-    /// Resumes a transfer stalled at `Bridged`, then drives the deposit leg to
-    /// terminal.
-    ///
-    /// A signed send is broadcast again, byte for byte, and confirmed: it is
-    /// the only send this transfer can make, whether or not an earlier attempt
-    /// reached the network. Other transfers send the same amount to the same
-    /// deposit address from the shared wallet, so no other send is adopted.
-    /// With no signed send, see
-    /// [`send_unless_an_unrecorded_send_landed`](Self::send_unless_an_unrecorded_send_landed).
-    async fn continue_from_bridged_resume(
-        &self,
-        id: &UsdcRebalanceId,
-        amount_received: Usdc,
-        mint_tx: TxHash,
-        deposit_send: DepositSend,
-    ) -> Result<(), UsdcTransferError> {
-        let send_tx = match deposit_send.prepared() {
-            Some((prepared, prepared_at)) => {
-                info!(target: "rebalance", %id, tx = %prepared.tx_hash(), "Broadcasting the persisted Alpaca deposit send");
-                self.broadcast_and_confirm_deposit_send(id, prepared, prepared_at)
-                    .await?
-            }
-            None => {
-                self.send_unless_an_unrecorded_send_landed(id, amount_received, mint_tx)
-                    .await?
-            }
-        };
-        self.finish_deposit(id, amount_received, send_tx).await
-    }
-
-    /// Records the deposit send, polls Alpaca for the credit, then converts
-    /// USDC->USD. Shared tail of the fresh and resume `Bridged` paths.
-    async fn finish_deposit(
-        &self,
-        id: &UsdcRebalanceId,
-        amount_received: Usdc,
-        send_tx: TxHash,
-    ) -> Result<(), UsdcTransferError> {
-        self.cqrs
-            .send(
-                id,
-                UsdcRebalanceCommand::InitiateDeposit {
-                    deposit: TransferRef::OnchainTx(send_tx),
-                },
-            )
-            .await?;
-
-        self.poll_alpaca_deposit_and_confirm(id, send_tx).await?;
-        self.execute_usdc_to_usd_conversion(id, amount_received)
-            .await?;
-        Ok(())
-    }
-
-    /// Fetches Alpaca's per-account USDC (Ethereum) deposit address.
-    async fn fetch_alpaca_deposit_address(
-        &self,
-        id: &UsdcRebalanceId,
-    ) -> Result<Address, UsdcTransferError> {
-        let usdc = TokenSymbol::new("USDC");
-        let ethereum = Network::new("ethereum");
-
-        match self
-            .alpaca_wallet
-            .get_wallet_address(&usdc, &ethereum)
-            .await
-        {
-            Ok(address) => Ok(address),
-            Err(error) => {
-                warn!(target: "rebalance", %id, "Fetching Alpaca deposit address failed: {error}");
-                Err(UsdcTransferError::AlpacaWallet(error))
-            }
-        }
-    }
-
-    /// Sends the minted USDC to Alpaca's deposit address with no pre-send
-    /// scan (fresh path).
-    #[instrument(target = "rebalance", skip(self), fields(%id, %amount_received), level = tracing::Level::DEBUG)]
-    async fn send_alpaca_deposit(
-        &self,
-        id: &UsdcRebalanceId,
-        amount_received: Usdc,
-    ) -> Result<TxHash, UsdcTransferError> {
-        let deposit_address = self.fetch_alpaca_deposit_address(id).await?;
-        self.send_alpaca_deposit_to(id, deposit_address, amount_received)
-            .await
-    }
-
-    /// Resume with no signed send: sends unless a same-amount send from the
-    /// wallet to the deposit address landed after the mint and no other
-    /// transfer signed, attached or recorded it.
-    ///
-    /// Such a send can be this transfer's only if it reached `Bridged` on a
-    /// build that sent without persisting the signed send first. A send no
-    /// other transfer claims is never adopted either: the deposit fails for
-    /// operator reconciliation. With no event store wired no match can be
-    /// attributed, so any match fails the deposit. A scan or lookup failure
-    /// returns an error without sending.
-    #[instrument(target = "rebalance", skip(self), fields(%id, %amount_received, %mint_tx), level = tracing::Level::DEBUG)]
-    async fn send_unless_an_unrecorded_send_landed(
-        &self,
-        id: &UsdcRebalanceId,
-        amount_received: Usdc,
-        mint_tx: TxHash,
-    ) -> Result<TxHash, UsdcTransferError> {
-        let deposit_address = self.fetch_alpaca_deposit_address(id).await?;
-
-        // The deposit send lands at or after the mint.
-        let from_block = self
-            .cctp_bridge
-            .ethereum_tx_block(mint_tx)
-            .await
-            .map_err(|error| UsdcTransferError::Cctp(Box::new(error)))?;
-
-        let matches = self
-            .cctp_bridge
-            .find_recent_usdc_transfers(
-                self.market_maker_wallet,
-                deposit_address,
-                usdc_to_u256(amount_received)?,
-                from_block,
-            )
-            .await
-            .map_err(|error| UsdcTransferError::Cctp(Box::new(error)))?;
-
-        if let Some(unrecorded_tx) = self.first_unclaimed_deposit_send(id, matches).await? {
-            return Err(self
-                .fail_unresolved_deposit_send(
-                    id,
-                    UnresolvedDepositSend::UnrecordedSend { tx: unrecorded_tx },
-                )
-                .await);
-        }
-
-        self.send_alpaca_deposit_to(id, deposit_address, amount_received)
-            .await
-    }
-
-    /// The newest of `sends` that no other transfer signed, attached or
-    /// recorded. With no event store wired, the newest of `sends`.
-    async fn first_unclaimed_deposit_send(
-        &self,
-        id: &UsdcRebalanceId,
-        sends: Vec<TxHash>,
-    ) -> Result<Option<TxHash>, UsdcTransferError> {
-        let CreditLedger::Wired(pool) = &self.credit_ledger else {
-            return Ok(sends.first().copied());
-        };
-
-        for send_tx in sends {
-            let recorded_by = deposit_send_recorded_elsewhere(pool, id, send_tx)
-                .await
-                .map_err(|source| UsdcTransferError::DepositSendLookup {
-                    id: id.clone(),
-                    tx: send_tx,
-                    source,
-                })?;
-
-            match recorded_by {
-                Some(recorded_by) => {
-                    info!(target: "rebalance", %id, tx = %send_tx, %recorded_by, "Same-amount Alpaca deposit send belongs to another transfer; not this transfer's");
-                }
-                None => return Ok(Some(send_tx)),
-            }
-        }
-
-        Ok(None)
-    }
-
-    /// Checks the credit ledger, signs the send and persists it, then
-    /// broadcasts it and waits for it to confirm; `InitiateDeposit` then
-    /// records its hash.
-    async fn send_alpaca_deposit_to(
-        &self,
-        id: &UsdcRebalanceId,
-        deposit_address: Address,
-        amount_received: Usdc,
-    ) -> Result<TxHash, UsdcTransferError> {
-        let amount = usdc_to_u256(amount_received)?;
-
-        self.check_ethereum_credit_ledger(id, amount_received).await;
-
-        let (prepared, prepared_at) = self
-            .prepare_and_persist_deposit_send(id, deposit_address, amount)
-            .await?;
-
-        info!(target: "rebalance", %id, tx = %prepared.tx_hash(), %deposit_address, %amount_received, "Persisted the signed Alpaca deposit send");
-        self.broadcast_and_confirm_deposit_send(id, &prepared, prepared_at)
-            .await
-    }
-
-    /// Signs the deposit send and persists it (`PrepareDepositSend`) before
-    /// any broadcast, on a detached task so a job timeout cannot drop the
-    /// future between the two: a signed send that was never persisted keeps
-    /// its nonce reserved and stalls every later send from the wallet. A
-    /// failed write goes through `release_unpersisted_deposit_send`.
-    ///
-    /// Sign and persist run under `deposit_send_prepare`, after a reload: a
-    /// send another attempt persisted is returned instead of signing a
-    /// second one, whose nonce could be left as a gap.
-    async fn prepare_and_persist_deposit_send(
-        &self,
-        id: &UsdcRebalanceId,
-        deposit_address: Address,
-        amount: U256,
-    ) -> Result<(PreparedTransaction, DateTime<Utc>), UsdcTransferError> {
-        let cctp_bridge = Arc::clone(&self.cctp_bridge);
-        let cqrs = Arc::clone(&self.cqrs);
-        let prepare_lock = Arc::clone(&self.deposit_send_prepare);
-        let task_id = id.clone();
-        // As in `submit_and_record_burn`: `PrepareDepositSend` can outlive a
-        // cancelled job, so the task continues the job's projection slot.
-        let projection_slot =
-            crate::conductor::projection_pause::projection_slot_for_detached_work().await;
-
-        tokio::spawn(async move {
-            let _projection_slot = projection_slot;
-            let _prepare_guard = prepare_lock.lock().await;
-
-            if let Some(UsdcRebalance::Bridged { deposit_send, .. }) = cqrs.load(&task_id).await?
-                && let Some((persisted, prepared_at)) = deposit_send.prepared()
-            {
-                info!(target: "rebalance", id = %task_id, tx = %persisted.tx_hash(), "Another attempt persisted the signed Alpaca deposit send; not signing again");
-                return Ok((persisted.clone(), prepared_at));
-            }
-
-            let prepared = cctp_bridge
-                .prepare_usdc_on_ethereum(deposit_address, amount)
-                .await
-                .inspect_err(|error| {
-                    warn!(target: "rebalance", id = %task_id, %error, "Signing the Alpaca deposit send failed; nothing was sent");
-                })
-                .map_err(|error| UsdcTransferError::Cctp(Box::new(error)))?;
-
-            // Anchors this attempt's alert deadline; a resume reads the
-            // persisted time instead.
-            let prepared_at = Utc::now();
-            let persisted = cqrs
-                .send(
-                    &task_id,
-                    UsdcRebalanceCommand::PrepareDepositSend {
-                        prepared: prepared.clone(),
-                    },
-                )
-                .await;
-            if let Err(error) = persisted {
-                error!(target: "rebalance", id = %task_id, ?error, "Failed to persist the signed Alpaca deposit send; not broadcasting");
-                release_unpersisted_deposit_send(&*cctp_bridge, &cqrs, &task_id, &prepared).await;
-                return Err(error.into());
-            }
-
-            Ok((prepared, prepared_at))
-        })
-        .await
-        .map_err(|join_error| {
-            error!(target: "rebalance", %id, %join_error, "Deposit send prepare-and-persist task failed to join (panicked)");
-            UsdcTransferError::DepositSendTaskPanicked { id: id.clone() }
-        })?
-    }
-
-    /// Broadcasts the persisted deposit send and waits for it to confirm;
-    /// `InitiateDeposit` then records its hash. Every call sends the same signed bytes, so a crash,
-    /// timeout or failed write anywhere here is recovered by calling it again.
-    /// An outcome not known yet is `DepositSendReconciliationPending`, which
-    /// the job redrives; a revert fails the deposit for reconciliation.
-    async fn broadcast_and_confirm_deposit_send(
-        &self,
-        id: &UsdcRebalanceId,
-        prepared: &PreparedTransaction,
-        prepared_at: DateTime<Utc>,
-    ) -> Result<TxHash, UsdcTransferError> {
-        let expected = prepared.tx_hash();
-        let pending = |cause| UsdcTransferError::DepositSendReconciliationPending {
-            id: id.clone(),
-            tx: expected,
-            prepared_at,
-            cause,
-        };
-
-        self.cctp_bridge
-            .broadcast_usdc_on_ethereum(prepared)
-            .await
-            .map_err(|error| pending(DepositSendPending::Broadcast(Box::new(error))))?;
-
-        let status = self
-            .cctp_bridge
-            .confirm_usdc_on_ethereum(expected)
-            .await
-            .map_err(|error| pending(DepositSendPending::Confirmation(Box::new(error))))?;
-
-        match status {
-            UsdcTransferStatus::Confirmed => {
-                self.enqueue_bot_gas_cost(
-                    Chain::Ethereum,
-                    expected,
-                    BotGasOperationCategory::WalletTransfer,
-                )
-                .await?;
-                Ok(expected)
-            }
-            UsdcTransferStatus::Reverted => {
-                self.enqueue_bot_gas_cost(
-                    Chain::Ethereum,
-                    expected,
-                    BotGasOperationCategory::WalletTransfer,
-                )
-                .await?;
-                Err(self
-                    .fail_unresolved_deposit_send(
-                        id,
-                        UnresolvedDepositSend::SignedSendReverted { tx: expected },
-                    )
-                    .await)
-            }
-            // The same bytes are broadcast again on the redrive.
-            UsdcTransferStatus::Dropped => Err(pending(DepositSendPending::Dropped)),
-        }
-    }
-
-    /// Fails the deposit from `Bridged` for operator reconciliation. If that
-    /// write fails the error is retried, and the retry takes this path again:
-    /// it never signs a second send.
-    async fn fail_unresolved_deposit_send(
-        &self,
-        id: &UsdcRebalanceId,
-        cause: UnresolvedDepositSend,
-    ) -> UsdcTransferError {
-        error!(target: "rebalance", %id, %cause, "Alpaca deposit send cannot be resolved automatically; failing the deposit for operator reconciliation");
-
-        if let Err(error) = self
-            .cqrs
-            .send(
-                id,
-                UsdcRebalanceCommand::FailDeposit {
-                    reason: format!("{cause}; operator reconciliation required"),
-                },
-            )
-            .await
-        {
-            error!(target: "rebalance", %id, ?error, "Failed to commit FailDeposit for an unresolved deposit send; retrying");
-            return error.into();
-        }
-
-        UsdcTransferError::DepositSendUnresolved {
-            id: id.clone(),
-            cause,
-        }
-    }
-
-    #[instrument(target = "rebalance", skip(self), fields(%id, %amount), level = tracing::Level::DEBUG)]
-    async fn withdraw_from_vault(
-        &self,
-        id: &UsdcRebalanceId,
-        amount: Usdc,
-        amount_u256: U256,
-    ) -> Result<(), UsdcTransferError> {
-        // Record withdrawal intent and the chain head BEFORE the irreversible
-        // on-chain withdraw, so a crash mid-withdrawal resumes via a chain scan
-        // (`resume_withdrawal_submitting`) instead of blindly re-withdrawing.
-        let from_block = self.raindex.current_block().await?;
-        self.cqrs
-            .send(
-                id,
-                UsdcRebalanceCommand::BeginWithdrawal {
-                    direction: RebalanceDirection::BaseToAlpaca,
-                    corridor: self.corridor,
-                    amount,
-                    from_block,
-                },
-            )
-            .await?;
-
-        let stable = self.corridor.chain().settlement_stable();
-        let withdraw_tx = match self
-            .raindex
-            .withdraw(stable.address, self.vault_id, amount_u256, stable.decimals)
-            .await
-        {
-            Ok(tx) => tx,
-            Err(RaindexError::InsufficientVaultLiquidity {
-                token,
-                requested,
-                received,
-                broadcast: WithdrawBroadcast::NotBroadcast,
-            }) => {
-                return Err(self
-                    .reject_unsent_withdrawal(id, from_block, token, requested, received)
-                    .await);
-            }
-            Err(error) => return Err(classify_vault_withdrawal_error(id, from_block, error)),
-        };
-
-        self.record_vault_withdrawal(id, amount, withdraw_tx).await
-    }
-
-    /// Fails a transfer whose vault withdraw the vault could not cover and the
-    /// evm layer proved was rejected before broadcast. This is the only call
-    /// that issues this transfer's withdraw, and `BeginWithdrawal` precedes
-    /// it, so no withdraw for this transfer exists anywhere and failing it is
-    /// safe. The guard then clears and rebalancing plans again from fresh
-    /// balances instead of resuming into a scan that can never find a
-    /// withdrawal.
-    ///
-    /// If `RejectWithdrawal` cannot be confirmed, the transfer latches as for
-    /// any other under-funded withdraw: a redrive would only scan.
-    async fn reject_unsent_withdrawal(
-        &self,
-        id: &UsdcRebalanceId,
-        from_block: u64,
-        token: Address,
-        requested: U256,
-        received: U256,
-    ) -> UsdcTransferError {
-        warn!(target: "rebalance", %id, %token, %requested, %received, "Vault under-funded; withdraw rejected before broadcast; failing the transfer");
-
-        let rejected = UsdcTransferError::WithdrawalRejectedUnderfunded {
-            id: id.clone(),
-            token,
-            requested,
-            received,
-        };
-        let Err(error) = self
-            .cqrs
-            .send(
-                id,
-                UsdcRebalanceCommand::RejectWithdrawal {
-                    reason: format!(
-                        "inventory vault under-funded: requested {requested} of {token}, vault \
-                         could cover {received}; withdraw rejected before broadcast"
-                    ),
-                },
-            )
-            .await
-        else {
-            return rejected;
-        };
-
-        // A reactor error can surface after the event committed.
-        if let Ok(Some(UsdcRebalance::WithdrawalFailed {
-            withdrawal_ref: None,
-            ..
-        })) = self.cqrs.load(id).await
-        {
-            warn!(target: "rebalance", %id, ?error, "RejectWithdrawal committed but reported an error");
-            return rejected;
-        }
-
-        error!(target: "rebalance", %id, ?error, "Failed to record RejectWithdrawal; latching at WithdrawalSubmitting");
-        UsdcTransferError::InsufficientVaultLiquidity {
-            id: id.clone(),
-            from_block,
-            token,
-            requested,
-            received,
-        }
-    }
-
-    /// Resumes a transfer stalled at `WithdrawalSubmitting` by adopting the
-    /// already-mined withdrawal and recording it.
-    ///
-    /// Absence from mined logs is never permission to issue another withdrawal:
-    /// the original transaction may still be pending, or a load-balanced RPC
-    /// backend may not have observed it. [`Raindex::find_recent_withdrawal`]
-    /// therefore fails inconclusively instead of returning absence.
-    async fn resume_withdrawal_submitting(
-        &self,
-        id: &UsdcRebalanceId,
-        amount: Usdc,
-        amount_u256: U256,
-        from_block: u64,
-        initiated_at: DateTime<Utc>,
-    ) -> Result<(), UsdcTransferError> {
-        let (existing_tx, withdrawn) = self
-            .raindex
-            .find_recent_withdrawal(
-                self.corridor.chain().settlement_stable().address,
-                self.vault_id,
-                from_block,
-            )
-            .await
-            .map_err(|error| classify_vault_withdrawal_scan_error(id, initiated_at, error))?;
-
-        // The withdrawal for this transfer already landed on-chain; adopt it
-        // instead of re-withdrawing. If it realized a different amount than
-        // requested (vault under-funded -> partial fill), fail fast for
-        // operator reconciliation -- never burn more on Base than was actually
-        // withdrawn.
-        if withdrawn != amount_u256 {
-            return self
-                .fail_adopted_withdrawal_mismatch(id, amount, amount_u256, existing_tx, withdrawn)
-                .await;
-        }
-
-        info!(target: "rebalance", %existing_tx, "Adopting already-submitted vault withdrawal on resume");
-        self.record_vault_withdrawal(id, amount, existing_tx).await
-    }
-
-    /// Handles an adopted withdrawal that realized a different amount than
-    /// requested (vault under-funded -> partial fill): records the withdrawal's
-    /// bot-gas cost, fails the transfer for operator reconciliation, and
-    /// returns `AdoptedWithdrawalAmountMismatch`. Never re-withdraws or burns
-    /// more on Base than was actually withdrawn.
-    async fn fail_adopted_withdrawal_mismatch(
-        &self,
-        id: &UsdcRebalanceId,
-        amount: Usdc,
-        requested: U256,
-        existing_tx: TxHash,
-        withdrawn: U256,
-    ) -> Result<(), UsdcTransferError> {
-        warn!(target: "rebalance", %existing_tx, %withdrawn, %requested,
-            "Adopted withdrawal realized a different amount than requested; failing for reconciliation");
-        // Enqueue BEFORE `Initiate`/`FailWithdrawal` below, same as
-        // `record_vault_withdrawal`: the withdrawal happened on-chain
-        // regardless of the mismatch, so its gas cost is still owed a
-        // record, and the aggregate has not advanced past
-        // `WithdrawalSubmitting` yet, so propagating with `?` is safe --
-        // apalis redrives `resume_withdrawal_submitting`, which re-scans the
-        // same adopted withdrawal, re-attempts this enqueue, and (once it
-        // succeeds) proceeds to genuinely fail the transfer for
-        // reconciliation below.
-        self.enqueue_bot_gas_cost(
-            self.corridor.chain(),
-            existing_tx,
-            BotGasOperationCategory::VaultWithdraw,
-        )
-        .await?;
-        self.cqrs
-            .send(
-                id,
-                UsdcRebalanceCommand::Initiate {
-                    direction: RebalanceDirection::BaseToAlpaca,
-                    corridor: self.corridor,
-                    amount,
-                    withdrawal: TransferRef::OnchainTx(existing_tx),
-                },
-            )
-            .await?;
-        self.cqrs
-            .send(
-                id,
-                UsdcRebalanceCommand::FailWithdrawal {
-                    reason: format!(
-                        "adopted withdrawal {existing_tx} realized {withdrawn}, \
-                         requested {requested}"
-                    ),
-                },
-            )
-            .await?;
-        Err(UsdcTransferError::AdoptedWithdrawalAmountMismatch {
-            id: id.clone(),
-            withdrawn,
-            requested,
-        })
-    }
-
-    /// Records the submitted withdrawal transaction and confirms it. The vault
-    /// withdrawal waits for block inclusion, so confirmation is immediate.
-    async fn record_vault_withdrawal(
-        &self,
-        id: &UsdcRebalanceId,
-        amount: Usdc,
-        withdraw_tx: TxHash,
-    ) -> Result<(), UsdcTransferError> {
-        // Enqueue BEFORE `Initiate`/`ConfirmWithdrawal` (see
-        // `enqueue_bot_gas_cost`'s doc for why the ordering matters here).
-        self.enqueue_bot_gas_cost(
-            self.corridor.chain(),
-            withdraw_tx,
-            BotGasOperationCategory::VaultWithdraw,
-        )
-        .await?;
-
-        self.cqrs
-            .send(
-                id,
-                UsdcRebalanceCommand::Initiate {
-                    direction: RebalanceDirection::BaseToAlpaca,
-                    corridor: self.corridor,
-                    amount,
-                    withdrawal: TransferRef::OnchainTx(withdraw_tx),
-                },
-            )
-            .await?;
-        self.cqrs
-            .send(
-                id,
-                UsdcRebalanceCommand::ConfirmWithdrawal {
-                    withdrawal_tx: None,
-                },
-            )
-            .await?;
-
-        info!(target: "rebalance", %withdraw_tx, "Vault withdrawal completed");
-        Ok(())
     }
 
     #[instrument(target = "rebalance", skip(self), fields(%id, %amount), level = tracing::Level::DEBUG)]
@@ -6297,108 +6405,6 @@ impl<
 
         self.record_cctp_mint(id, BridgeDirection::BaseToEthereum, mint_receipt)
             .await
-    }
-
-    /// Polls Alpaca for the deposit identified by the USDC `send_tx` (the
-    /// transfer of minted USDC to Alpaca's deposit address), then sends
-    /// `ConfirmDeposit`. Assumes the aggregate is already in `DepositInitiated`
-    /// (caller has sent `InitiateDeposit`, or we are resuming from that state).
-    #[instrument(target = "rebalance", skip(self), fields(%id, %send_tx), level = tracing::Level::DEBUG)]
-    async fn poll_alpaca_deposit_and_confirm(
-        &self,
-        id: &UsdcRebalanceId,
-        send_tx: TxHash,
-    ) -> Result<(), UsdcTransferError> {
-        info!(target: "rebalance", %send_tx, "Polling Alpaca for deposit detection");
-
-        let transfer = match self.alpaca_wallet.poll_deposit_by_tx_hash(&send_tx).await {
-            Ok(transfer) => transfer,
-            Err(error) => {
-                // Classify BEFORE emitting FailDeposit (RAI-1494): a broker
-                // rate-limit (429) is not a determinate "deposit failed"
-                // signal, only a transient throttle on the polling request
-                // itself. Leave the aggregate in DepositInitiated so the
-                // job's backpressure reschedule can re-poll the same send_tx
-                // once the delay elapses, mirroring
-                // `poll_and_confirm_withdrawal`'s conservative fail-closed
-                // pattern for indeterminate poll errors.
-                if error.backpressure().is_some() {
-                    warn!(
-                        target: "rebalance",
-                        %error,
-                        "Alpaca deposit polling hit broker rate-limiting; keeping \
-                         DepositInitiated state for delayed reschedule (will re-poll \
-                         the same send_tx)"
-                    );
-                    return Err(UsdcTransferError::AlpacaWallet(error));
-                }
-
-                warn!(target: "rebalance", "Alpaca deposit polling failed: {error}");
-                self.cqrs
-                    .send(
-                        id,
-                        UsdcRebalanceCommand::FailDeposit {
-                            reason: format!("Deposit polling failed: {error}"),
-                        },
-                    )
-                    .await?;
-                return Err(UsdcTransferError::AlpacaWallet(error));
-            }
-        };
-
-        if transfer.status != TransferStatus::Complete {
-            let status = format!("{:?}", transfer.status);
-            self.cqrs
-                .send(
-                    id,
-                    UsdcRebalanceCommand::FailDeposit {
-                        reason: format!("Deposit ended in status: {status}"),
-                    },
-                )
-                .await?;
-            return Err(UsdcTransferError::DepositFailed { status });
-        }
-
-        self.cqrs
-            .send(
-                id,
-                UsdcRebalanceCommand::ConfirmDeposit {
-                    vault_deposit_block: None,
-                },
-            )
-            .await?;
-
-        info!(target: "rebalance", "Alpaca deposit confirmed");
-        Ok(())
-    }
-
-    async fn record_conversion_or_fail(
-        &self,
-        id: &UsdcRebalanceId,
-        correlation_id: &ClientOrderId,
-        order: &CryptoOrderResponse,
-        direction: ConversionDirection,
-    ) -> Result<ConversionAmounts, UsdcTransferError> {
-        match conversion_amounts_from_order(order, correlation_id, direction) {
-            Ok(conversion) => Ok(conversion),
-            Err(error) => {
-                warn!(
-                    order_id = %order.id,
-                    ?direction,
-                    %error,
-                    "Failed to derive settled conversion amounts"
-                );
-                self.cqrs
-                    .send(
-                        id,
-                        UsdcRebalanceCommand::FailConversion {
-                            reason: error.to_string(),
-                        },
-                    )
-                    .await?;
-                Err(error)
-            }
-        }
     }
 }
 
