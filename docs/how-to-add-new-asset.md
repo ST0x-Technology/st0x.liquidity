@@ -262,12 +262,13 @@ chain's signing wallet, orderbook, `redemption_wallet` and
   that chain rebalances, the chain gets no transfer services, so tokens stranded
   there later are not recovered; the bot logs a startup warning for such an idle
   listing. Config errors name both chain and symbol. Enable a secondary listing
-  only after the complete recovery stack ships as release R and its chain
-  capability is available. For rollback, pause first, wait for recovery and
-  provider operations to drain and the wallet to empty, then disable rebalancing
-  and recovery together. Roll back the binary to R; older binaries do not safely
-  execute secondary recovery or signed pending issuer sends. Never delete a
-  compacted inventory snapshot to force replay.
+  only in release R, which ships the complete recovery stack, or later, and only
+  once its chain capability is available. For rollback, pause first, wait for
+  recovery and provider operations to drain and the wallet to empty, then
+  disable rebalancing and recovery together. Roll back the binary to R; older
+  binaries do not safely execute secondary recovery or signed pending issuer
+  sends. R itself enables Robinhood DNUT, so for that listing the pause is the
+  rollback. Never delete a compacted inventory snapshot to force replay.
 - `extended_hours_counter_trading`: Explicit opt-in for counter-trading during
   extended hours (pre-market and after-hours). Set to `"enabled"` to allow the
   bot to place offsetting broker trades outside regular market hours;
@@ -319,7 +320,11 @@ disables Base RKLB rebalancing (`1791378253362331`) also enables Robinhood DNUT,
 which the binary from before RAI-2596 refuses. So the new binary and that pin
 ship in one release, with the Robinhood switch-on
 ([RAI-2780](https://linear.app/makeitrain/issue/RAI-2780)). Do not release
-master without that pin.
+master without that pin. A tag rollback from that release is safe only before it
+has run any equity operation on any chain: every redemption it runs, on Base
+too, persists `SendPrepared`, which the previous release cannot load. After
+that, pause the Robinhood listing with a new st0x.registry generation plus a pin
+bump, or roll forward; going below R follows SPEC.md.
 
 ### Retiring an asset
 

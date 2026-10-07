@@ -154,19 +154,21 @@ required_confirmations = 1
 # cash does not, since USDG has no corridor yet. Staging watches the same
 # inventory and stays hedge-only, so only prod moves it. Gas is ETH.
 #
-# Rollback once Robinhood has moved equity: publish a st0x.registry
-# generation with the listing's Robinhood rebalancing at "paused" and bump
-# [registry].generation here; this file cannot set it, since [registry]
-# refuses inline equities tables. "paused" still runs the Robinhood startup
-# preflights (OPERATOR_ROLE, approvals, issuer and wrapper), so it does not
-# fix a release that fails to boot. A tag rollback is safe only while no
-# Robinhood mint, redemption or recovery is unfinished: older configs run
-# Robinhood prefunded with no redemption_wallet, and startup refuses to
-# build the services that unfinished work needs, so the bot stops on every
-# chain. So if the switch-on release does not boot and nothing on Robinhood
-# has moved, roll back to the previous release. Reverting only this table
-# to "prefunded" fails validate-config while the token file enables
-# Robinhood rebalancing.
+# Rollback: this release also ships the recovery stack (RAI-2596, release R
+# in SPEC.md), so the previous release is a binary below R. A tag rollback
+# is safe only before this release has run any equity operation on any
+# chain: every redemption it runs, on Base too, records a SendPrepared event
+# the previous release cannot load. So if the switch-on release does not
+# boot, roll back to the previous release. Once it has moved equity, the
+# stop is a paused generation on this release, or a roll forward. To pause,
+# publish a st0x.registry generation with the listing's Robinhood
+# rebalancing at "paused" and bump [registry].generation here; this file
+# cannot set it, since [registry] refuses inline equities tables. "paused" still runs the
+# Robinhood startup preflights (OPERATOR_ROLE, approvals, issuer and
+# wrapper), so it does not fix a release that fails to boot. A binary
+# rollback after that follows SPEC.md's rules for going below R. Reverting
+# only this table to "prefunded" fails validate-config while the token file
+# enables Robinhood rebalancing.
 #
 # Neither state is neutral for DNUT. "paused" keeps Robinhood's vault in
 # the total but stops it redeeming, so sells into that vault drain the
@@ -175,8 +177,7 @@ required_confirmations = 1
 # vault from the total, so Base (target 0.4, no operational_limit) is far
 # over its band and redeems several hundred DNUT in one operation: a
 # generation that disables Robinhood DNUT restores Base DNUT to 0.5, or
-# the operator expects that redemption. A tag rollback after the mints
-# redeems on Base the same way, from the old pin's 0.5 target.
+# the operator expects that redemption.
 
 [chains.robinhood]
 lifecycle = "active"

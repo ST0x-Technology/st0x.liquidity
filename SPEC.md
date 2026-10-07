@@ -5462,18 +5462,22 @@ complete venue balances and snapshot watermarks, including available shares.
 
 Ship the complete recovery reader and writer stack as release R before enabling
 any secondary-chain equity operation. R is the minimum safe rollback target for
-later chain activation, including
-[RAI-2780](https://linear.app/makeitrain/issue/RAI-2780). R refuses `enabled`
-and `paused` listings without recovery, and the production token file pinned
-before R has Base RKLB with rebalancing enabled and recovery disabled, so R
-refuses that pin at boot. The generation that disables Base RKLB rebalancing
-(`1791378253362331`) also enables Robinhood DNUT, which a pre-R binary refuses.
-So R and that pin ship in one release, together with the RAI-2780 production
-switch-on:
+every release after it. R refuses `enabled` and `paused` listings without
+recovery, and the production token file pinned before R has Base RKLB with
+rebalancing enabled and recovery disabled, so R refuses that pin at boot. The
+generation that disables Base RKLB rebalancing (`1791378253362331`) also enables
+Robinhood DNUT, which a pre-R binary refuses. So R and that pin ship in one
+release, together with the RAI-2780 production switch-on:
 
 1. Pin that generation in `config/prod/st0x-hedge.toml`, and add its copy as
    `tests/fixtures/tokens-production-<generation>.toml` in the same PR.
 2. Release R only with that pin. Do not release master without it.
+3. A tag rollback from R to the release before it is safe only before R has run
+   any equity operation on any chain: every redemption R runs, on Base too,
+   persists `SendPrepared`, which older binaries cannot load. After that, stop
+   the Robinhood listing with a paused generation on R (a new st0x.registry
+   generation plus a pin bump, since `[registry]` refuses inline equities
+   tables), or roll forward. A binary rollback below R follows the rules below.
 
 The production release gate runs `validate-config` without `--registry-file`, so
 it does not check the token file and passes a pin that R refuses. Check the pin
@@ -5484,7 +5488,9 @@ For a chain activation rollback, set the secondary listings to
 `rebalancing = "paused"`, keep recovery enabled, and let every transfer,
 provider request, resume job, recovery and wallet balance drain. Then disable
 rebalancing and recovery together. Rolling back the binary to R preserves every
-chain-qualified event and snapshot reader; it does not require deleting data.
+chain-qualified event and snapshot reader; it does not require deleting data. R
+itself carries the RAI-2780 switch-on, so that activation has no binary to roll
+back to: its rollback is the paused generation on R.
 
 A pre-R binary is not a safe rollback while a secondary has outstanding equity
 state, or while any chain, including Base, has a signed pending issuer send: an
