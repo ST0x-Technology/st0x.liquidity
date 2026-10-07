@@ -4617,11 +4617,15 @@ runs the chain-to-Alpaca side up to the confirmed deposit:
    (`max_quote_loss_bps`, the slippage floor, the Alpaca deposit minimum) and
    against the withdrawn amount. A refusal here leaves the transfer at
    `WithdrawalComplete` with its guard held: the USDG is in the wallet, and only
-   the redeposit step that follows may return it.
+   the redeposit step that follows may return it. The timeout sweep holds that
+   guard and pages, and `fail-usdc-transfer` refuses the transfer there.
 4. The approve and the deposit are signed together under the origin wallet's
    lock (the Ethereum wallet's deposit-send lock when Ethereum is the origin)
    and persisted in one event (`SwapDepositPrepared`) before either is
-   broadcast. A persist that fails releases both nonces, deposit first, unless a
+   broadcast, on a task a job timeout cannot cancel between the two. A quote
+   past its deadline or older than `quote_max_age_secs` is not signed: the
+   transfer holds its guard at `SwapQuoted` until the re-quote step that
+   follows. A persist that fails releases both nonces, deposit first, unless a
    reload shows the pair committed. When another send took the nonce between the
    two signs, the approve alone is persisted (`SwapApprovePrepared`) and
    broadcast, and the attempt retries.
@@ -4634,7 +4638,8 @@ runs the chain-to-Alpaca side up to the confirmed deposit:
 At startup the persisted pairs are restored before any other send from their
 wallet: pairs signed on the Ethereum wallet once, by the hub service, together
 with the Alpaca deposit sends; pairs signed on a corridor chain by that
-corridor's own service.
+corridor's own service. A pair on a corridor no service carries pages, and
+startup skips that chain's approvals and revokes.
 
 The swap states hold the corridor guard, are never reconcilable failures, and
 refuse `fail-usdc-transfer` (a deposit may be on chain). On the shared Ethereum
