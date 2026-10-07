@@ -236,6 +236,11 @@ pub enum QuoteMismatch {
         quoted: RelayOrderId,
         calldata: RelayOrderId,
     },
+    #[error("order data hashes to order {derived}, the quote names order {quoted}")]
+    OrderIdNotDerived {
+        derived: RelayOrderId,
+        quoted: RelayOrderId,
+    },
     #[error("order deadline {seconds} is not a representable time")]
     Deadline { seconds: u64 },
 }
@@ -1049,6 +1054,23 @@ pub(super) mod tests {
                         "0x266b12442f9b86ef731fae285c34f489217acdfcedd755422ce47db429992d85"
                     ))
                         && calldata == RelayOrderId(B256::repeat_byte(0x11))
+            ),
+            "{error:?}"
+        );
+    }
+
+    #[test]
+    fn order_data_the_order_id_does_not_commit_to_is_refused() {
+        let error = refusal(|body| body["protocol"]["v2"]["orderData"]["solver"] = json!(OTHER));
+
+        assert!(
+            matches!(
+                error,
+                QuoteMismatch::OrderIdNotDerived { derived, quoted }
+                    if quoted == RelayOrderId(b256!(
+                        "0x266b12442f9b86ef731fae285c34f489217acdfcedd755422ce47db429992d85"
+                    ))
+                        && derived != quoted
             ),
             "{error:?}"
         );
