@@ -1,0 +1,36 @@
+# Expected exporter output for settings.json, written by
+# scripts/liq-parity/golden.py from t0.devops revision 226c029.
+liq_settings_info{broker="alpaca",log_level="Debug",orderbook="0x0000000000000000000000000000000000000002",server_port="8080",trading_mode="",turnkey_organization="00000000-0000-0000-0000-000000000001",wallet_address="0x0000000000000000000000000000000000000001",wallet_kind="turnkey"} 1.0
+liq_settings_equity_target 0.5
+liq_settings_equity_deviation 0.2
+liq_settings_usdc_target 0.4
+liq_settings_cash_reserved 1000.25
+liq_settings_order_polling_seconds 5.0
+liq_settings_inventory_poll_seconds 15.0
+liq_settings_deployment_block 12345678.0
+liq_settings_execution_threshold_usd 2.5
+liq_asset_flags{counter_trading="enabled",extended_hours="true",rebalancing="true",symbol="AAPL"} 1.0
+liq_asset_counter_trading{symbol="AAPL"} 1.0
+liq_asset_extended_hours{symbol="AAPL"} 1.0
+liq_asset_rebalancing{symbol="AAPL"} 1.0
+liq_asset_flags{counter_trading="enabled",extended_hours="false",rebalancing="false",symbol="TSLA"} 1.0
+liq_asset_counter_trading{symbol="TSLA"} 1.0
+liq_asset_extended_hours{symbol="TSLA"} 0.0
+liq_asset_rebalancing{symbol="TSLA"} 0.0
+liq_asset_operational_limit{symbol="TSLA"} 100.0
+liq_asset_flags{counter_trading="disabled",extended_hours="unconfigured",rebalancing="true",symbol="SPYM"} 1.0
+liq_asset_counter_trading{symbol="SPYM"} 0.0
+liq_asset_rebalancing{symbol="SPYM"} 1.0
+liq_asset_flags{counter_trading="enabled",extended_hours="false",rebalancing="false",symbol="RKLB"} 1.0
+liq_asset_counter_trading{symbol="RKLB"} 1.0
+liq_asset_extended_hours{symbol="RKLB"} 0.0
+liq_asset_rebalancing{symbol="RKLB"} 0.0
+liq_usdc_onchain_available 0.0
+liq_usdc_onchain_inflight 0.0
+liq_usdc_offchain_available 0.0
+liq_usdc_offchain_inflight 0.0
+liq_usdc_alpaca_total 0.0
+liq_usdc_inflight_total 0.0
+liq_usdc_total 0.0
+liq_usdc_ratio 0.0
+liq_usdc_ratio_deviation -2.0

@@ -107,6 +107,66 @@ also covers startup failure, alerts through
 
 ## Metrics
 
+`/metrics` is the `metrics` recorder's output followed by the `liq_*` contract
+(see SPEC.md, "Prometheus metrics (`liq_*` contract)"). The contract lives in
+`src/metrics/liquidity.rs`; its builders live in the submodules beside it.
+
+Every `liq_*` block has a `# HELP` line and a `# TYPE <name> gauge` line (ADR
+0026). The exporter sidecar writes no `# TYPE` lines, so its names are untyped.
+Check a body with `promtool check metrics --lint=none --extended` (parse and
+cardinality, no lint; `--lint=none` alone is refused): the default lint warns on
+gauges whose names end in `_total` and on the `_ms` names, which keep the
+exporter's names on purpose.
+
+**Never use a `liq_` name in `metrics::counter!`, `gauge!`, `histogram!` or
+their `describe_*` forms.** The recorder never forgets a label set, so a
+departed symbol would keep its last value forever, and the name would get a
+second writer. A test scans `src/` for this.
+
+### Catalog
+
+| Name                                    | Labels                                                                                                                     | Family     | Published                                                                                          |
+| --------------------------------------- | -------------------------------------------------------------------------------------------------------------------------- | ---------- | -------------------------------------------------------------------------------------------------- |
+| `liq_bot_info`                          | `git_commit`                                                                                                               | `health`   | `1`; first 12 characters of the build commit (`dev` in local builds)                               |
+| `liq_bot_start_timestamp_seconds`       |                                                                                                                            | `health`   | Unix time the process started                                                                      |
+| `liq_settings_info`                     | `broker`, `log_level`, `orderbook`, `server_port`, `trading_mode`, `turnkey_organization`, `wallet_address`, `wallet_kind` | `settings` | `1`; a missing wallet or organization gives `""`, port 0 gives `""`, `trading_mode` is always `""` |
+| `liq_settings_equity_target`            |                                                                                                                            | `settings` | primary chain default target share; absent with only per-symbol targets                            |
+| `liq_settings_equity_deviation`         |                                                                                                                            | `settings` | always                                                                                             |
+| `liq_settings_usdc_target`              |                                                                                                                            | `settings` | the one active corridor's target (the primary chain's with several); absent without one            |
+| `liq_settings_usdc_deviation`           |                                                                                                                            | `settings` | as above                                                                                           |
+| `liq_settings_cash_reserved`            |                                                                                                                            | `settings` | absent when not configured                                                                         |
+| `liq_settings_execution_threshold_usd`  |                                                                                                                            | `settings` | dollar threshold; absent for a share-count threshold                                               |
+| `liq_settings_order_polling_seconds`    |                                                                                                                            | `settings` | always                                                                                             |
+| `liq_settings_inventory_poll_seconds`   |                                                                                                                            | `settings` | always                                                                                             |
+| `liq_settings_deployment_block`         |                                                                                                                            | `settings` | always                                                                                             |
+| `liq_asset_counter_trading`             | `symbol`                                                                                                                   | `settings` | `1` or `0`, every symbol the primary chain lists                                                   |
+| `liq_asset_extended_hours`              | `symbol`                                                                                                                   | `settings` | `1` or `0`; absent while counter trading is disabled                                               |
+| `liq_asset_rebalancing`                 | `symbol`                                                                                                                   | `settings` | `1` when the symbol starts new rebalancing operations                                              |
+| `liq_collector_last_success_ts_seconds` | `collector`                                                                                                                | store      | Unix time each family was last published                                                           |
+
+`symbol` labels drop a leading `wt` or `t` only before an uppercase letter
+(`tAAPL` and `wtAAPL` give `AAPL`; `tsla` stays).
+
+### Adding a family
+
+1. Spec the names in SPEC.md first. A new meaning gets a new name; an existing
+   name never changes meaning.
+2. Add the `LiqMetric` variants (name, help, sorted label keys, owning family)
+   and, for a new source, a `LiqFamily` variant with its `collector` string.
+   Extend the catalog test and this table.
+3. Write the builder in its own submodule. It takes a metrics-owned input type,
+   not a dashboard DTO, computes in exact types, and converts once with
+   `float_value` or `integer_value`. A value that does not convert is skipped
+   and logged.
+4. Publish with `LIQ_FAMILIES.replace(family, samples, now)`. Each call replaces
+   the whole family.
+5. Add a golden case: a fixture JSON under `src/metrics/liquidity/testdata/`, a
+   case in `scripts/liq-parity/golden.py`, and the expected `.prom` written by
+   running `python3 -I scripts/liq-parity/golden.py <exporter.py>` against a
+   local checkout of the exporter. The goldens have no `# TYPE` lines; the test
+   compares samples only. Extend `PORTED` and, where needed, `KNOWN_DIFFS` in
+   `scripts/liq-parity/compare.py`.
+
 ### Board pins
 
 Until consumers move to the bot, every `liq_` selector on the liquidity boards
