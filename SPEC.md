@@ -5463,18 +5463,17 @@ complete venue balances and snapshot watermarks, including available shares.
 Ship the complete recovery reader and writer stack as release R before enabling
 any secondary-chain equity operation. R is the minimum safe rollback target for
 later chain activation, including
-[RAI-2780](https://linear.app/makeitrain/issue/RAI-2780). This release does not
-change chain capability gates, listing modes, wallet funding, or allocation
-targets. R refuses `enabled` and `paused` listings without recovery, and the
-production token file pinned before R has Base RKLB with rebalancing enabled and
-recovery disabled, so R refuses that pin at boot. Roll out in this order:
+[RAI-2780](https://linear.app/makeitrain/issue/RAI-2780). R refuses `enabled`
+and `paused` listings without recovery, and the production token file pinned
+before R has Base RKLB with rebalancing enabled and recovery disabled, so R
+refuses that pin at boot. The generation that disables Base RKLB rebalancing
+(`1791378253362331`) also enables Robinhood DNUT, which a pre-R binary refuses.
+So R and that pin ship in one release, together with the RAI-2780 production
+switch-on:
 
-1. Publish a registry generation that enables RKLB's Base recovery (or disables
-   its rebalancing).
-2. Pin that generation in `config/prod/st0x-hedge.toml`, and add its copy as
+1. Pin that generation in `config/prod/st0x-hedge.toml`, and add its copy as
    `tests/fixtures/tokens-production-<generation>.toml` in the same PR.
-3. Release that config on the current binary.
-4. Only then deploy R.
+2. Release R only with that pin. Do not release master without it.
 
 The production release gate runs `validate-config` without `--registry-file`, so
 it does not check the token file and passes a pin that R refuses. Check the pin

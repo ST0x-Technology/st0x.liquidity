@@ -314,13 +314,12 @@ gate and fails only when the bot starts. Run this check yourself.
 
 **Recovery stack release (RAI-2596):** that release refuses an `enabled` or
 `paused` equity listing without recovery. The production pin from before it has
-Base RKLB with rebalancing enabled and recovery disabled. Before you deploy it:
-
-1. Publish a token file generation that enables RKLB's Base recovery (or
-   disables its rebalancing).
-2. Pin that generation and add its fixture copy, as above, in one PR.
-3. Release that config on the current binary.
-4. Deploy the new binary only after that.
+Base RKLB with rebalancing enabled and recovery disabled. The generation that
+disables Base RKLB rebalancing (`1791378253362331`) also enables Robinhood DNUT,
+which the binary from before RAI-2596 refuses. So the new binary and that pin
+ship in one release, with the Robinhood switch-on
+([RAI-2780](https://linear.app/makeitrain/issue/RAI-2780)). Do not release
+master without that pin.
 
 ### Retiring an asset
 
