@@ -2,6 +2,7 @@
 
 #[cfg(feature = "test-support")]
 use alloy::primitives::Address;
+use alloy::primitives::U256;
 use rain_math_float::{Float, FloatError};
 use serde::Deserialize;
 use serde::de::IgnoredAny;
@@ -78,8 +79,56 @@ pub enum RebalancingCtxError {
     UsdcEnabledWithoutCorridor,
     #[error("[rebalancing.usdc.corridors.ethereum]: the direct Ethereum corridor is not built")]
     EthereumCorridor,
-    #[error("[rebalancing.usdc.corridors.{chain}] hop = \"relay\": this build has no Relay hop")]
-    RelayHopNotBuilt { chain: Chain },
+    #[error(
+        "[rebalancing.usdc.corridors.{chain}] hop = \"relay\": the Relay hop is switched on by \
+         RAI-2986 (fill, refund and redeposit, Robinhood cash rebalancing, two-corridor sizing, \
+         the deploy gate); until then it does not load"
+    )]
+    RelayHopNotSwitchedOn { chain: Chain },
+    #[error("[rebalancing.usdc.corridors.{chain}] hop = \"relay\" needs a [relay] sub-table")]
+    RelayTableMissing { chain: Chain },
+    #[error("[rebalancing.usdc.corridors.{chain}.relay] is only for hop = \"relay\"")]
+    RelayTableOnCctpHop { chain: Chain },
+    #[error("[rebalancing.usdc.corridors.{chain}] hop = \"relay\": no Relay depository on {chain}")]
+    NoRelayDepository { chain: Chain },
+    #[error(
+        "[rebalancing.usdc.corridors.{chain}.relay] needs slippage_bps ({slippage_bps}) <= \
+         max_quote_loss_bps ({max_quote_loss_bps}) <= 10000"
+    )]
+    RelayBasisPoints {
+        chain: Chain,
+        slippage_bps: u16,
+        max_quote_loss_bps: u16,
+    },
+    #[error(
+        "[rebalancing.usdc.corridors.{chain}.relay] min_transfer ({min_transfer}) must be below \
+         max_transfer ({max_transfer})"
+    )]
+    RelayTransferRange {
+        chain: Chain,
+        min_transfer: Usdc,
+        max_transfer: Usdc,
+    },
+    #[error(
+        "[rebalancing.usdc.corridors.{chain}.relay] min_transfer ({min_transfer}) less \
+         max_quote_loss_bps must stay at least the Alpaca-to-Base minimum ({minimum})"
+    )]
+    RelayMinTransferBelowAlpacaMinimum {
+        chain: Chain,
+        min_transfer: Usdc,
+        minimum: Usdc,
+    },
+    #[error(
+        "[rebalancing.usdc.corridors.{chain}.relay] {key} ({amount}) is not a positive amount \
+         with at most 6 decimals"
+    )]
+    RelayAmount {
+        chain: Chain,
+        key: &'static str,
+        amount: Usdc,
+    },
+    #[error("[rebalancing.usdc.corridors.{chain}.relay] {key} must be non-zero")]
+    RelayZeroSetting { chain: Chain, key: &'static str },
     #[error("[rebalancing.usdc.corridors.{chain}] hop = \"cctp\": {source}")]
     CctpHopStableNotUsdc {
         chain: Chain,
@@ -164,7 +213,8 @@ fn default_usdc_conversion_failure_cooldown_secs() -> u64 {
 /// leave it unattended.
 const MAX_USDC_CONVERSION_FAILURE_COOLDOWN_SECS: u64 = 24 * 60 * 60;
 
-/// One `[rebalancing.usdc.corridors.<chain>]` table. Every key is required.
+/// One `[rebalancing.usdc.corridors.<chain>]` table. Every key is required;
+/// `relay` is required with `hop = "relay"` and refused otherwise.
 #[derive(Debug, Clone, Copy, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct UsdcCorridorConfig {
@@ -175,6 +225,124 @@ pub struct UsdcCorridorConfig {
     /// The band around `target` inside which nothing moves.
     #[serde(deserialize_with = "st0x_float_serde::deserialize_float_from_number_or_string")]
     pub deviation: Float,
+    #[serde(default)]
+    pub relay: Option<RelayHopConfig>,
+}
+
+/// `[rebalancing.usdc.corridors.<chain>.relay]`: a Relay hop's bounds. Every
+/// key is required.
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RelayHopConfig {
+    /// Sent with each quote: Relay's floor must not sit further below the
+    /// expected output.
+    pub slippage_bps: u16,
+    /// The most the expected output may lose to the input, fees included.
+    pub max_quote_loss_bps: u16,
+    #[serde(deserialize_with = "st0x_float_serde::deserialize_float_from_number_or_string")]
+    pub min_transfer: Float,
+    #[serde(deserialize_with = "st0x_float_serde::deserialize_float_from_number_or_string")]
+    pub max_transfer: Float,
+    pub quote_max_age_secs: u64,
+    /// The fill window, also sent as the quote's `ttl`.
+    pub fill_timeout_secs: u64,
+    pub max_refund_retries: u32,
+    pub max_deposit_revert_redrives: u32,
+}
+
+/// A validated Relay hop's bounds.
+#[derive(Debug, Clone, Copy)]
+pub struct RelayHopCtx {
+    pub slippage_bps: u16,
+    pub max_quote_loss_bps: u16,
+    /// The trigger declines a smaller transfer.
+    pub min_transfer: Usdc,
+    /// The trigger caps a transfer here.
+    pub max_transfer: Usdc,
+    pub quote_max_age: Duration,
+    pub fill_timeout: Duration,
+    pub max_refund_retries: u32,
+    pub max_deposit_revert_redrives: u32,
+}
+
+impl RelayHopConfig {
+    /// Checks the bounds against each other and the Alpaca-to-Base minimum.
+    fn validate(&self, chain: Chain) -> Result<RelayHopCtx, RebalancingCtxError> {
+        const SCALE: u16 = 10_000;
+
+        if self.slippage_bps > self.max_quote_loss_bps || self.max_quote_loss_bps > SCALE {
+            return Err(RebalancingCtxError::RelayBasisPoints {
+                chain,
+                slippage_bps: self.slippage_bps,
+                max_quote_loss_bps: self.max_quote_loss_bps,
+            });
+        }
+
+        for (key, value) in [
+            ("quote_max_age_secs", self.quote_max_age_secs),
+            ("fill_timeout_secs", self.fill_timeout_secs),
+            ("max_refund_retries", u64::from(self.max_refund_retries)),
+            (
+                "max_deposit_revert_redrives",
+                u64::from(self.max_deposit_revert_redrives),
+            ),
+        ] {
+            if value == 0 {
+                return Err(RebalancingCtxError::RelayZeroSetting { chain, key });
+            }
+        }
+
+        let min_transfer = Usdc::new(self.min_transfer);
+        let max_transfer = Usdc::new(self.max_transfer);
+        let min_units = base_units(chain, "min_transfer", min_transfer)?;
+        let max_units = base_units(chain, "max_transfer", max_transfer)?;
+
+        if min_units >= max_units {
+            return Err(RebalancingCtxError::RelayTransferRange {
+                chain,
+                min_transfer,
+                max_transfer,
+            });
+        }
+
+        let minimum = *ALPACA_TO_BASE_MINIMUM_TRANSFER;
+        let floor = min_units
+            .checked_mul(U256::from(SCALE - self.max_quote_loss_bps))
+            .map(|scaled| scaled / U256::from(SCALE));
+        let below_minimum = floor.is_none_or(|floor| {
+            minimum
+                .to_u256_6_decimals()
+                .is_ok_and(|minimum| floor < minimum)
+        });
+
+        if below_minimum {
+            return Err(RebalancingCtxError::RelayMinTransferBelowAlpacaMinimum {
+                chain,
+                min_transfer,
+                minimum,
+            });
+        }
+
+        Ok(RelayHopCtx {
+            slippage_bps: self.slippage_bps,
+            max_quote_loss_bps: self.max_quote_loss_bps,
+            min_transfer,
+            max_transfer,
+            quote_max_age: Duration::from_secs(self.quote_max_age_secs),
+            fill_timeout: Duration::from_secs(self.fill_timeout_secs),
+            max_refund_retries: self.max_refund_retries,
+            max_deposit_revert_redrives: self.max_deposit_revert_redrives,
+        })
+    }
+}
+
+/// `amount` in the stable's 6-decimal base units, refused unless positive.
+fn base_units(chain: Chain, key: &'static str, amount: Usdc) -> Result<U256, RebalancingCtxError> {
+    amount
+        .to_u256_6_decimals()
+        .ok()
+        .filter(|units| !units.is_zero())
+        .ok_or(RebalancingCtxError::RelayAmount { chain, key, amount })
 }
 
 /// A validated cash corridor: its route and its trigger band.
@@ -182,6 +350,12 @@ pub struct UsdcCorridorConfig {
 pub struct UsdcCorridorCtx {
     pub corridor: UsdcCorridor,
     pub threshold: ImbalanceThreshold,
+}
+
+/// A validated corridor table: the corridor and, on a Relay hop, its bounds.
+struct ValidatedCorridor {
+    usdc: UsdcCorridorCtx,
+    relay: Option<RelayHopCtx>,
 }
 
 /// Whether Base is a hedged chain holding a cash vault. Base via CCTP is then
@@ -201,6 +375,8 @@ pub(crate) enum BaseCashVault {
 pub struct UsdcCorridors {
     mode: OperationMode,
     by_chain: BTreeMap<Chain, UsdcCorridorCtx>,
+    /// The bounds of each Relay corridor, by its chain.
+    relay_hops: BTreeMap<Chain, RelayHopCtx>,
     served: BTreeSet<UsdcCorridor>,
     conversion_failure_cooldown: Duration,
 }
@@ -221,6 +397,16 @@ impl UsdcCorridors {
 
     pub fn serves(&self, corridor: UsdcCorridor) -> bool {
         self.served.contains(&corridor)
+    }
+
+    /// The bounds of the Relay corridor on `chain`, if it has one.
+    pub fn relay_hop(&self, chain: Chain) -> Option<&RelayHopCtx> {
+        self.relay_hops.get(&chain)
+    }
+
+    /// Every Relay corridor's bounds, by chain.
+    pub const fn relay_hops(&self) -> &BTreeMap<Chain, RelayHopCtx> {
+        &self.relay_hops
     }
 
     /// How long a failed pre-withdrawal USD->USDC conversion holds
@@ -296,6 +482,7 @@ impl UsdcCorridors {
         Self {
             mode: OperationMode::Disabled,
             by_chain: BTreeMap::new(),
+            relay_hops: BTreeMap::new(),
             served: BTreeSet::from([UsdcCorridor::BASE_CCTP]),
             conversion_failure_cooldown: Duration::from_secs(
                 default_usdc_conversion_failure_cooldown_secs(),
@@ -317,11 +504,19 @@ impl UsdcCorridors {
         Self {
             mode,
             by_chain,
+            relay_hops: BTreeMap::new(),
             served,
             conversion_failure_cooldown: Duration::from_secs(
                 default_usdc_conversion_failure_cooldown_secs(),
             ),
         }
+    }
+
+    /// The same corridors with `relay` as the bounds of `chain`'s Relay hop.
+    #[must_use]
+    pub fn with_relay_hop(mut self, chain: Chain, relay: RelayHopCtx) -> Self {
+        self.relay_hops.insert(chain, relay);
+        self
     }
 
     /// The same corridors with `cooldown` as the conversion-failure cooldown.
@@ -350,11 +545,26 @@ impl UsdcRebalancing {
             });
         }
 
-        let by_chain = self
+        let validated = self
             .corridors
             .iter()
             .map(|(chain, config)| Ok((*chain, self.validate_corridor(*chain, config)?)))
             .collect::<Result<BTreeMap<_, _>, RebalancingCtxError>>()?;
+
+        let relay_hops: BTreeMap<Chain, RelayHopCtx> = validated
+            .iter()
+            .filter_map(|(chain, corridor)| Some((*chain, corridor.relay?)))
+            .collect();
+
+        // Rule 6: every table is valid, and a Relay hop still does not load.
+        if let Some(chain) = relay_hops.keys().next() {
+            return Err(RebalancingCtxError::RelayHopNotSwitchedOn { chain: *chain });
+        }
+
+        let by_chain: BTreeMap<Chain, UsdcCorridorCtx> = validated
+            .into_iter()
+            .map(|(chain, corridor)| (chain, corridor.usdc))
+            .collect();
 
         if self.mode == OperationMode::Enabled && by_chain.is_empty() {
             return Err(RebalancingCtxError::UsdcEnabledWithoutCorridor);
@@ -373,6 +583,7 @@ impl UsdcRebalancing {
         Ok(UsdcCorridors {
             mode: self.mode,
             by_chain,
+            relay_hops,
             served,
             conversion_failure_cooldown: Duration::from_secs(self.conversion_failure_cooldown_secs),
         })
@@ -382,13 +593,28 @@ impl UsdcRebalancing {
         &self,
         chain: Chain,
         config: &UsdcCorridorConfig,
-    ) -> Result<UsdcCorridorCtx, RebalancingCtxError> {
+    ) -> Result<ValidatedCorridor, RebalancingCtxError> {
         if chain == Chain::Ethereum {
             return Err(RebalancingCtxError::EthereumCorridor);
         }
 
+        let relay = match (config.hop, &config.relay) {
+            (HopKind::Relay, None) => return Err(RebalancingCtxError::RelayTableMissing { chain }),
+            (HopKind::Cctp, Some(_)) => {
+                return Err(RebalancingCtxError::RelayTableOnCctpHop { chain });
+            }
+            (HopKind::Relay, Some(relay)) => {
+                if chain.relay_depository().is_none() {
+                    return Err(RebalancingCtxError::NoRelayDepository { chain });
+                }
+
+                Some(relay.validate(chain)?)
+            }
+            (HopKind::Cctp, None) => None,
+        };
+
         match config.hop {
-            HopKind::Relay => return Err(RebalancingCtxError::RelayHopNotBuilt { chain }),
+            HopKind::Relay => {}
             HopKind::Cctp => {
                 if chain.cctp_usdc().is_none() {
                     return Err(RebalancingCtxError::CctpHopStableNotUsdc {
@@ -422,12 +648,15 @@ impl UsdcRebalancing {
             return Err(RebalancingCtxError::LegacyUsdcThresholdMismatch { chain });
         }
 
-        Ok(UsdcCorridorCtx {
-            corridor: UsdcCorridor::HubRouted {
-                chain,
-                hop: config.hop,
+        Ok(ValidatedCorridor {
+            usdc: UsdcCorridorCtx {
+                corridor: UsdcCorridor::HubRouted {
+                    chain,
+                    hop: config.hop,
+                },
+                threshold,
             },
-            threshold,
+            relay,
         })
     }
 }
@@ -843,8 +1072,10 @@ mod tests {
             hop,
             target,
             deviation,
+            relay,
         } = config.usdc.corridors[&Chain::Base];
         assert_eq!(hop, HopKind::Cctp);
+        assert!(matches!(relay, None), "a cctp corridor has no relay table");
         assert!(target.eq(float!(0.5)).unwrap());
         assert!(deviation.eq(float!(0.3)).unwrap());
         assert_eq!(config.transfer_timeout_secs, 1800);
@@ -961,8 +1192,10 @@ mod tests {
             hop,
             target,
             deviation,
+            relay,
         } = config.usdc.corridors[&Chain::Base];
         assert_eq!(hop, HopKind::Cctp);
+        assert!(matches!(relay, None), "a cctp corridor has no relay table");
         assert!(target.eq(float!(0.4)).unwrap());
         assert!(deviation.eq(float!(0.15)).unwrap());
         assert_eq!(config.attestation_retry_deadline_secs, 7200);
@@ -1881,8 +2114,36 @@ mod tests {
         );
     }
 
+    /// A valid `relay` sub-table for `chain`, with `overrides` replacing
+    /// keys of the same name.
+    fn relay_corridor(chain: &str, overrides: &[(&str, &str)]) -> String {
+        let mut keys = vec![
+            ("slippage_bps", "30"),
+            ("max_quote_loss_bps", "50"),
+            ("min_transfer", "500"),
+            ("max_transfer", "50000"),
+            ("quote_max_age_secs", "60"),
+            ("fill_timeout_secs", "1800"),
+            ("max_refund_retries", "3"),
+            ("max_deposit_revert_redrives", "5"),
+        ];
+        for (key, value) in overrides {
+            let slot = keys.iter_mut().find(|(name, _)| name == key).unwrap();
+            slot.1 = value;
+        }
+        let relay = keys
+            .iter()
+            .map(|(key, value)| format!("{key} = {value}\n"))
+            .collect::<String>();
+
+        format!(
+            "[usdc]\nmode = \"enabled\"\n\n[usdc.corridors.{chain}]\nhop = \"relay\"\n\
+             target = 0.5\ndeviation = 0.05\n\n[usdc.corridors.{chain}.relay]\n{relay}"
+        )
+    }
+
     #[test]
-    fn relay_hop_is_refused_by_this_build() {
+    fn relay_table_required_for_relay_hop() {
         let error = corridor_error(
             r#"
             [usdc]
@@ -1898,8 +2159,198 @@ mod tests {
         assert!(
             matches!(
                 error,
-                RebalancingCtxError::RelayHopNotBuilt {
+                RebalancingCtxError::RelayTableMissing {
                     chain: Chain::Robinhood
+                }
+            ),
+            "got {error:?}"
+        );
+    }
+
+    /// A complete, valid `relay` sub-table still does not load: the hop is
+    /// switched on later.
+    #[test]
+    fn relay_hop_still_refused_at_load() {
+        let error = corridor_error(&relay_corridor("robinhood", &[]));
+
+        assert!(
+            matches!(
+                error,
+                RebalancingCtxError::RelayHopNotSwitchedOn {
+                    chain: Chain::Robinhood
+                }
+            ),
+            "got {error:?}"
+        );
+        assert!(error.to_string().contains("RAI-2986"), "got {error}");
+    }
+
+    #[test]
+    fn relay_table_on_a_cctp_hop_is_refused() {
+        let error = corridor_error(
+            r#"
+            [usdc]
+            mode = "enabled"
+
+            [usdc.corridors.base]
+            hop = "cctp"
+            target = 0.5
+            deviation = 0.05
+
+            [usdc.corridors.base.relay]
+            slippage_bps = 30
+            max_quote_loss_bps = 50
+            min_transfer = 500
+            max_transfer = 50000
+            quote_max_age_secs = 60
+            fill_timeout_secs = 1800
+            max_refund_retries = 3
+            max_deposit_revert_redrives = 5
+            "#,
+        );
+
+        assert!(
+            matches!(
+                error,
+                RebalancingCtxError::RelayTableOnCctpHop { chain: Chain::Base }
+            ),
+            "got {error:?}"
+        );
+    }
+
+    #[test]
+    fn relay_hop_on_a_chain_without_a_depository_is_refused() {
+        let error = corridor_error(&relay_corridor("hyperevm", &[]));
+
+        assert!(
+            matches!(
+                error,
+                RebalancingCtxError::NoRelayDepository {
+                    chain: Chain::HyperEvm
+                }
+            ),
+            "got {error:?}"
+        );
+    }
+
+    #[test]
+    fn relay_table_missing_a_key_or_carrying_an_unknown_one_is_refused() {
+        let (head, _) = valid_rebalancing_config_toml()
+            .split_once("[usdc]")
+            .unwrap();
+        let missing = relay_corridor("robinhood", &[]).replace("fill_timeout_secs = 1800\n", "");
+        let unknown = format!("{}hub = \"ethereum\"\n", relay_corridor("robinhood", &[]));
+
+        let error = toml::from_str::<RebalancingConfig>(&format!("{head}{missing}")).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("missing field `fill_timeout_secs`"),
+            "got {error}"
+        );
+
+        let error = toml::from_str::<RebalancingConfig>(&format!("{head}{unknown}")).unwrap_err();
+        assert!(
+            error.to_string().contains("unknown field `hub`"),
+            "got {error}"
+        );
+    }
+
+    #[test]
+    fn relay_slippage_above_the_loss_bound_is_refused() {
+        let error = corridor_error(&relay_corridor(
+            "robinhood",
+            &[("slippage_bps", "60"), ("max_quote_loss_bps", "50")],
+        ));
+
+        assert!(
+            matches!(
+                error,
+                RebalancingCtxError::RelayBasisPoints {
+                    chain: Chain::Robinhood,
+                    slippage_bps: 60,
+                    max_quote_loss_bps: 50,
+                }
+            ),
+            "got {error:?}"
+        );
+    }
+
+    #[test]
+    fn relay_loss_bound_above_ten_thousand_bps_is_refused() {
+        let error = corridor_error(&relay_corridor(
+            "robinhood",
+            &[("max_quote_loss_bps", "10001")],
+        ));
+
+        assert!(
+            matches!(
+                error,
+                RebalancingCtxError::RelayBasisPoints {
+                    max_quote_loss_bps: 10_001,
+                    ..
+                }
+            ),
+            "got {error:?}"
+        );
+    }
+
+    #[test]
+    fn relay_min_transfer_not_below_max_is_refused() {
+        let error = corridor_error(&relay_corridor(
+            "robinhood",
+            &[("min_transfer", "500"), ("max_transfer", "500")],
+        ));
+
+        assert!(
+            matches!(error, RebalancingCtxError::RelayTransferRange { .. }),
+            "got {error:?}"
+        );
+    }
+
+    /// 53 USDC less 50 bps is 52.735: below the Alpaca-to-Base minimum.
+    #[test]
+    fn relay_min_transfer_that_loses_below_the_alpaca_minimum_is_refused() {
+        let error = corridor_error(&relay_corridor("robinhood", &[("min_transfer", "53")]));
+
+        assert!(
+            matches!(
+                error,
+                RebalancingCtxError::RelayMinTransferBelowAlpacaMinimum { .. }
+            ),
+            "got {error:?}"
+        );
+    }
+
+    #[test]
+    fn relay_min_transfer_with_more_than_six_decimals_is_refused() {
+        let error = corridor_error(&relay_corridor(
+            "robinhood",
+            &[("min_transfer", "\"500.0000001\"")],
+        ));
+
+        assert!(
+            matches!(
+                error,
+                RebalancingCtxError::RelayAmount {
+                    key: "min_transfer",
+                    ..
+                }
+            ),
+            "got {error:?}"
+        );
+    }
+
+    #[test]
+    fn relay_zero_fill_timeout_is_refused() {
+        let error = corridor_error(&relay_corridor("robinhood", &[("fill_timeout_secs", "0")]));
+
+        assert!(
+            matches!(
+                error,
+                RebalancingCtxError::RelayZeroSetting {
+                    key: "fill_timeout_secs",
+                    ..
                 }
             ),
             "got {error:?}"
@@ -2153,7 +2604,7 @@ mod tests {
         assert!(
             matches!(
                 error,
-                RebalancingCtxError::RelayHopNotBuilt {
+                RebalancingCtxError::RelayTableMissing {
                     chain: Chain::Robinhood
                 }
             ),
