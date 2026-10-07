@@ -216,7 +216,8 @@ deposit that credits another depositor than the signing wallet.
   `approve(depository, amount)` when it falls short.
 - The deposit cannot be estimated while its approve is unmined, so it is signed
   with a pinned `RELAY_DEPOSIT_GAS_LIMIT` of 57,114, the larger `gasUsed` of the
-  funded test's deposits (49,083 on Ethereum), padded by the wallet to 85,671.
+  funded test's deposits (57,114 on Robinhood, 49,083 on Ethereum), padded by
+  the wallet to 85,671.
 
 Another send from the same wallet between the two signs takes the nonce in
 between. Then `prepare_deposit` discards only the deposit and returns
