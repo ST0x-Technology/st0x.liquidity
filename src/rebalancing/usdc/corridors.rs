@@ -462,6 +462,42 @@ mod tests {
         );
     }
 
+    /// A pair signed on a corridor chain's wallet and persisted on a
+    /// corridor the config no longer serves has no service to restore it:
+    /// startup pages its id and counts it unmined on that chain.
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn chain_signed_pair_on_an_unserved_corridor_pages_at_startup() {
+        let TwoCorridors {
+            transfers,
+            store,
+            pool,
+            ..
+        } = two_corridors().await;
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        crate::usdc_rebalance::record_swap_pair_for_test(
+            &store,
+            &id,
+            RebalanceDirection::BaseToAlpaca,
+            ROBINHOOD_RELAY,
+            None,
+            PreparedTransaction::for_test(TxHash::repeat_byte(0xc2), 61),
+        )
+        .await;
+
+        let by_chain = transfers.restore_chain_signed_swaps(&pool).await;
+
+        assert_eq!(
+            by_chain.get(&Chain::Robinhood),
+            Some(&RestoredDepositSends {
+                restored: 0,
+                unmined: 1,
+            })
+        );
+        assert!(logs_contain("operational_alert"));
+        assert!(logs_contain(&id.to_string()));
+    }
+
     /// The signed deposit sends belong to the one Ethereum wallet, so the
     /// startup restore runs once however many corridors are served.
     #[tokio::test]
