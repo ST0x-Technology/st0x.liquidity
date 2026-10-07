@@ -2305,7 +2305,10 @@ mod tests {
             .unwrap();
 
         let top_up = harness.chain.top_up_depository(AMOUNT).await;
-        harness.chain.deposit_from_deployer(AMOUNT, order_id).await;
+        harness
+            .chain
+            .deposit_from_deployer(harness.chain.deployer(), AMOUNT, order_id)
+            .await;
         harness.chain.mine(CONFIRMATIONS).await;
 
         let scan = harness
@@ -2324,6 +2327,43 @@ mod tests {
             matches!(
                 confirm,
                 RelayBridgeError::DepositUnverified { tx, .. } if tx == top_up
+            ),
+            "{confirm:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn third_party_deposit_crediting_our_wallet_is_not_ours() {
+        let harness = Harness::new().await;
+        let order_id = B256::random();
+        let from_block = harness
+            .bridge
+            .origin_block(HopDirection::ToHub)
+            .await
+            .unwrap();
+
+        let spoof = harness
+            .chain
+            .deposit_from_deployer(harness.chain.wallet(), U256::from(1), order_id)
+            .await;
+        harness.chain.mine(CONFIRMATIONS).await;
+
+        let scan = harness
+            .bridge
+            .find_recent_deposits(HopDirection::ToHub, &[RelayOrderId(order_id)], from_block)
+            .await
+            .unwrap();
+        let confirm = harness
+            .bridge
+            .confirm_deposit(HopDirection::ToHub, RelayOrderId(order_id), spoof)
+            .await
+            .unwrap_err();
+
+        assert_eq!(scan.deposits, vec![]);
+        assert!(
+            matches!(
+                confirm,
+                RelayBridgeError::DepositUnverified { tx, .. } if tx == spoof
             ),
             "{confirm:?}"
         );

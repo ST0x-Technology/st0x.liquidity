@@ -82,7 +82,7 @@ impl RelayChain {
         self.anvil.chain_id()
     }
 
-    fn deployer(&self) -> Address {
+    pub(super) fn deployer(&self) -> Address {
         self.address(self.deployer)
     }
 
@@ -164,15 +164,21 @@ impl RelayChain {
             .await
     }
 
-    /// A deposit for `order_id` from another account than our wallet.
-    pub(super) async fn deposit_from_deployer(&self, amount: U256, order_id: B256) -> TxHash {
+    /// A deposit for `order_id` from another account than our wallet, which
+    /// names `depositor` as its depositor.
+    pub(super) async fn deposit_from_deployer(
+        &self,
+        depositor: Address,
+        amount: U256,
+        order_id: B256,
+    ) -> TxHash {
         let deployer = self.deployer();
         self.mint(deployer, amount).await;
         self.send(deployer, self.stable, approve(self.depository, amount))
             .await;
 
         let calldata = MockDepository::depositErc20Call {
-            depositor: deployer,
+            depositor,
             token: self.stable,
             amount,
             id: order_id,
