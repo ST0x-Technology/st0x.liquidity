@@ -316,6 +316,18 @@ pub enum UsdcTransferError {
     /// persisted is sent by the retry, which otherwise signs one.
     #[error("USDC rebalance {id}: the Relay pair prepare task panicked")]
     SwapPrepareTaskPanicked { id: UsdcRebalanceId },
+    /// The recorded quote is past its deadline or older than the corridor's
+    /// `quote_max_age`: nothing was signed and the transfer holds its guard
+    /// at `SwapQuoted`.
+    #[error(
+        "USDC rebalance {id}: Relay quote from {quoted_at} (deadline {deadline}) expired; \
+         nothing was signed"
+    )]
+    SwapQuoteExpired {
+        id: UsdcRebalanceId,
+        quoted_at: DateTime<Utc>,
+        deadline: DateTime<Utc>,
+    },
     #[error(
         "USDC transfer corridor mismatch: transfer {id} runs on the {recorded} corridor, \
          this service serves {}; left untouched for the operator",
@@ -762,6 +774,7 @@ impl UsdcTransferError {
             | Self::SwapQuoteOutOfBounds { .. }
             | Self::SwapPairSplit { .. }
             | Self::SwapPrepareTaskPanicked { .. }
+            | Self::SwapQuoteExpired { .. }
             | Self::EthereumChainMissing(_) => None,
         }
     }
@@ -835,6 +848,7 @@ impl BotGasFailureClassifier for UsdcTransferError {
             | Self::SwapQuoteOutOfBounds { .. }
             | Self::SwapPairSplit { .. }
             | Self::SwapPrepareTaskPanicked { .. }
+            | Self::SwapQuoteExpired { .. }
             | Self::EthereumChainMissing(_) => false,
         }
     }
