@@ -937,12 +937,15 @@ impl ProofError {
 #[cfg(test)]
 mod tests {
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicU32, Ordering};
     use std::time::{Duration, SystemTime};
 
     use alloy::consensus::TxEnvelope;
     use alloy::eips::Decodable2718;
     use alloy::primitives::{B256, Signature};
-    use alloy::providers::{DynProvider, ProviderBuilder};
+    use alloy::providers::{DynProvider, ProviderBuilder, RootProvider};
+    use alloy::rpc::types::Log;
+    use alloy::transports::TransportResult;
 
     use st0x_evm::Evm;
     use st0x_evm::local::RawPrivateKeyWallet;
@@ -1021,6 +1024,50 @@ mod tests {
         let provider = ProviderBuilder::new()
             .connect_http(chain.endpoint().parse().unwrap())
             .erased();
+
+        RawPrivateKeyWallet::new(&chain.wallet_key(), provider, 1).unwrap()
+    }
+
+    /// A load-balanced node that answers its first `empty_answers` log queries
+    /// empty, as a replica behind the head does.
+    struct LaggingLogs {
+        inner: DynProvider,
+        empty_answers: AtomicU32,
+    }
+
+    #[async_trait]
+    impl Provider for LaggingLogs {
+        fn root(&self) -> &RootProvider {
+            self.inner.root()
+        }
+
+        async fn get_logs(&self, filter: &Filter) -> TransportResult<Vec<Log>> {
+            let lagging = self
+                .empty_answers
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
+                    left.checked_sub(1)
+                })
+                .is_ok();
+
+            if lagging {
+                return Ok(vec![]);
+            }
+
+            self.inner.get_logs(filter).await
+        }
+    }
+
+    /// Our wallet on `chain`, behind a node whose first `empty_answers` log
+    /// queries come back empty.
+    fn lagging_wallet(chain: &RelayChain, empty_answers: u32) -> TestWallet {
+        let inner = ProviderBuilder::new()
+            .connect_http(chain.endpoint().parse().unwrap())
+            .erased();
+        let provider = LaggingLogs {
+            inner,
+            empty_answers: AtomicU32::new(empty_answers),
+        }
+        .erased();
 
         RawPrivateKeyWallet::new(&chain.wallet_key(), provider, 1).unwrap()
     }
@@ -2442,6 +2489,33 @@ mod tests {
             }
         );
         assert_eq!(both.deposits, vec![ours, other]);
+    }
+
+    #[tokio::test]
+    async fn deposit_scan_finds_a_deposit_a_lagging_node_first_answers_empty() {
+        let harness = Harness::new().await;
+        let from_block = harness
+            .bridge
+            .origin_block(HopDirection::ToHub)
+            .await
+            .unwrap();
+        let deposit = harness.deposit_to_hub(B256::random()).await;
+        let bridge = RelayBridge::try_from_ctx(RelayCtx {
+            chain: Chain::Robinhood,
+            ethereum_wallet: wallet(&harness.hub),
+            chain_wallet: lagging_wallet(&harness.chain, 1),
+            ethereum_confirmations: CONFIRMATIONS,
+            chain_confirmations: CONFIRMATIONS,
+        })
+        .unwrap()
+        .with_local_contracts(contracts(&harness.hub), contracts(&harness.chain));
+
+        let scan = bridge
+            .find_recent_deposits(HopDirection::ToHub, &[deposit.order_id], from_block)
+            .await
+            .unwrap();
+
+        assert_eq!(scan.deposits, vec![deposit]);
     }
 
     #[tokio::test]
