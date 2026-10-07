@@ -101,13 +101,17 @@ impl<Signer: Wallet> RelayHop<Signer> {
             }
             Some(UsdcRebalance::SwapDepositPrepared {
                 quote,
+                split_approves,
                 approve,
                 deposit,
                 ..
-            }) => Ok(Some((
-                PreparedSwapDeposit { approve, deposit },
-                quote.order_id,
-            ))),
+            }) => {
+                self.broadcast_split_approves(&split_approves).await?;
+                Ok(Some((
+                    PreparedSwapDeposit { approve, deposit },
+                    quote.order_id,
+                )))
+            }
             Some(UsdcRebalance::SwapDeposited { .. }) => Ok(None),
             None => Err(UsdcTransferError::StateOffHop {
                 id: id.clone(),
@@ -152,12 +156,7 @@ impl<Signer: Wallet> RelayHop<Signer> {
         quoted_at: DateTime<Utc>,
         split_approves: &[PreparedTransaction],
     ) -> Result<PreparedSwapDeposit, UsdcTransferError> {
-        for approve in split_approves {
-            self.bridge
-                .broadcast_approve(TO_HUB, approve)
-                .await
-                .map_err(Box::new)?;
-        }
+        self.broadcast_split_approves(split_approves).await?;
 
         // A quote resumed after downtime or retries may be stale. Nothing
         // re-quotes a recorded quote yet, so the transfer stays at
@@ -196,6 +195,22 @@ impl<Signer: Wallet> RelayHop<Signer> {
                 Err(UsdcTransferError::SwapPairSplit { id: id.clone() })
             }
         }
+    }
+
+    /// Sends again, in nonce order, the approves that went out alone: the
+    /// pair's nonces follow theirs, and a node may have dropped them.
+    async fn broadcast_split_approves(
+        &self,
+        split_approves: &[PreparedTransaction],
+    ) -> Result<(), UsdcTransferError> {
+        for approve in split_approves {
+            self.bridge
+                .broadcast_approve(TO_HUB, approve)
+                .await
+                .map_err(Box::new)?;
+        }
+
+        Ok(())
     }
 
     /// Persists the signed pair. When the write fails, the nonces are
