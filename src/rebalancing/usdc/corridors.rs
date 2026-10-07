@@ -13,6 +13,7 @@ use async_trait::async_trait;
 use sqlx::SqlitePool;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
+use tracing::{error, warn};
 
 use st0x_bridge::BridgeDirection;
 use st0x_bridge::cctp::AttestationResponse;
@@ -28,7 +29,9 @@ use super::{
     UsdcRecheckError, UsdcTransferError, unserved_corridor,
 };
 use crate::rebalancing::equity::RecheckOutcome;
-use crate::usdc_rebalance::{UsdcRebalance, UsdcRebalanceId};
+use crate::usdc_rebalance::{
+    RebalanceDirection, UsdcRebalance, UsdcRebalanceId, prepared_swap_ids,
+};
 
 const CCTP_CORRIDOR_NOT_SERVED: CctpMintRecoveryError = CctpMintRecoveryError::CorridorNotServed {
     corridor: UsdcCorridor::BASE_CCTP,
@@ -95,6 +98,47 @@ impl UsdcCorridorTransfers {
 
         let served = self.by_corridor.keys().copied().collect::<BTreeSet<_>>();
         Err(unserved_corridor(id, requested, &served, state.as_ref()))
+    }
+
+    /// Pages the chain-signed Relay pairs persisted on a corridor no service
+    /// carries, whose nonces nothing restores, and returns how many there are
+    /// on each chain. A listing or load failure is paged by the hub's restore.
+    async fn page_unserved_chain_signed_swaps(&self, pool: &SqlitePool) -> BTreeMap<Chain, usize> {
+        let ids = match prepared_swap_ids(pool).await {
+            Ok((ids, _unparseable)) => ids,
+            Err(error) => {
+                warn!(target: "rebalance", ?error, "Could not list signed Relay pairs to check their corridors at startup");
+                return BTreeMap::new();
+            }
+        };
+
+        let mut unserved: BTreeMap<UsdcCorridor, Vec<UsdcRebalanceId>> = BTreeMap::new();
+        for id in ids {
+            match self.store.load(&id).await {
+                Ok(Some(state))
+                    if state.direction() == RebalanceDirection::BaseToAlpaca
+                        && !self.by_corridor.contains_key(&state.corridor()) =>
+                {
+                    unserved.entry(state.corridor()).or_default().push(id);
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    warn!(target: "rebalance", %id, ?error, "Could not load a transfer with a signed Relay pair to check its corridor at startup");
+                }
+            }
+        }
+
+        unserved
+            .into_iter()
+            .map(|(corridor, ids)| {
+                let chain = corridor.chain();
+                error!(target: "operational_alert", alert = true, %corridor, %chain, ?ids, "Signed Relay pairs on a corridor this build does not serve were not restored at startup; their nonces are not reserved, so startup skips {chain}'s approvals and revokes until a build serving {corridor} restores them");
+                (chain, ids.len())
+            })
+            .fold(BTreeMap::new(), |mut by_chain, (chain, count)| {
+                *by_chain.entry(chain).or_default() += count;
+                by_chain
+            })
     }
 
     /// The Base via CCTP service, the one corridor whose bridge carries a
@@ -182,7 +226,8 @@ impl RestorePreparedDepositSends for UsdcCorridorTransfers {
     }
 
     /// Runs on every service: each restores the Relay pairs signed on its own
-    /// corridor chain, one chain per service.
+    /// corridor chain, one chain per service. A pair on a corridor no service
+    /// carries is paged and counted unmined on its chain.
     async fn restore_chain_signed_swaps(
         &self,
         pool: &SqlitePool,
@@ -190,6 +235,11 @@ impl RestorePreparedDepositSends for UsdcCorridorTransfers {
         let mut by_chain = BTreeMap::new();
         for service in self.by_corridor.values() {
             by_chain.extend(service.restore_chain_signed_swaps(pool).await);
+        }
+
+        for (chain, unrestored) in self.page_unserved_chain_signed_swaps(pool).await {
+            let restored: &mut RestoredDepositSends = by_chain.entry(chain).or_default();
+            restored.unmined += unrestored;
         }
 
         by_chain
