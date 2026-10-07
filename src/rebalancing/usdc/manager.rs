@@ -7260,6 +7260,7 @@ mod tests {
     use alloy::consensus::{SignableTransaction as _, TxEip1559};
     use alloy::eips::eip2718::Encodable2718;
     use alloy::eips::eip2930::AccessList;
+    use alloy::network::EthereumWallet;
     use alloy::node_bindings::Anvil;
     use alloy::primitives::{B256, Bytes, TxKind, address, b256, fixed_bytes};
     use alloy::providers::ext::AnvilApi as _;
@@ -7267,6 +7268,7 @@ mod tests {
     use alloy::rpc::types::TransactionRequest;
     use alloy::signers::SignerSync as _;
     use alloy::signers::local::PrivateKeySigner;
+    use alloy::sol;
     use alloy::sol_types::{self, SolCall, SolEvent};
     use alloy::transports::{RpcError, TransportErrorKind};
     use httpmock::prelude::*;
@@ -7295,6 +7297,7 @@ mod tests {
         TestMintBurnToken, deploy_cctp_on_chain, link_chains, mint_usdc, set_max_burn_amount,
     };
     use st0x_bridge::corridor::HopKind;
+    use st0x_bridge::relay::{RelayCtx, deploy_relay_end};
     use st0x_config::{ChainCtx, HedgedChain};
     use st0x_event_sorcery::{AggregateError, LifecycleError, test_store};
     use st0x_evm::local::RawPrivateKeyWallet;
@@ -28337,5 +28340,98 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(queued, 0, "a reconciled transfer's job must not re-queue");
+    }
+
+    sol! {
+        #[sol(rpc)]
+        interface MintableStable {
+            function mint(address to, uint256 amount) external;
+        }
+    }
+
+    /// A mint credits our wallet without our wallet sending it, so a credit
+    /// read routed to the sent read (or either to the balance) fails here.
+    #[tokio::test]
+    async fn relay_bridge_serves_the_hub_legs_from_its_ethereum_stable() {
+        let (anvil, endpoint, private_key) = setup_anvil();
+        let wallet = anvil.addresses()[0];
+        let recipient = Address::repeat_byte(0xA1);
+        let minted = U256::from(5_000_000u64);
+        let amount = U256::from(2_000_000u64);
+        let deployer = ProviderBuilder::new()
+            .wallet(EthereumWallet::from(
+                PrivateKeySigner::from_slice(&anvil.keys()[1].to_bytes()).unwrap(),
+            ))
+            .connect_http(endpoint.parse().unwrap());
+        let contracts = deploy_relay_end(&deployer).await.unwrap();
+        let bridge = RelayBridge::try_from_ctx(RelayCtx {
+            chain: Chain::Robinhood,
+            ethereum_wallet: create_test_wallet(&endpoint, &private_key),
+            chain_wallet: create_test_wallet(&endpoint, &private_key),
+            ethereum_confirmations: 1,
+            chain_confirmations: 1,
+        })
+        .unwrap()
+        .with_local_contracts(contracts, contracts);
+        let helper: &dyn UsdcBridgeHelper = &bridge;
+
+        let mint_tx = MintableStable::new(contracts.stable, &deployer)
+            .mint(wallet, minted)
+            .send()
+            .await
+            .unwrap()
+            .watch()
+            .await
+            .unwrap();
+
+        assert_eq!(
+            helper.ethereum_usdc_credit(mint_tx, wallet).await.unwrap(),
+            minted
+        );
+        assert_eq!(
+            helper
+                .ethereum_usdc_sent(mint_tx, wallet, wallet)
+                .await
+                .unwrap(),
+            U256::ZERO,
+            "the mint is credited from the zero address, not sent by our wallet"
+        );
+
+        let prepared = helper
+            .prepare_usdc_on_ethereum(recipient, amount)
+            .await
+            .unwrap();
+        let tx = helper.broadcast_usdc_on_ethereum(&prepared).await.unwrap();
+
+        assert_eq!(
+            helper.confirm_usdc_on_ethereum(tx).await.unwrap(),
+            UsdcTransferStatus::Confirmed
+        );
+        assert_eq!(
+            helper
+                .ethereum_usdc_sent(tx, wallet, recipient)
+                .await
+                .unwrap(),
+            amount
+        );
+        assert_eq!(
+            helper.ethereum_usdc_credit(tx, recipient).await.unwrap(),
+            amount
+        );
+        assert_eq!(
+            helper.ethereum_usdc_balance(wallet).await.unwrap(),
+            minted - amount
+        );
+        assert_eq!(
+            helper
+                .find_recent_usdc_transfers(wallet, recipient, amount, 0)
+                .await
+                .unwrap(),
+            vec![tx]
+        );
+        assert_eq!(
+            helper.ethereum_tx_block(tx).await.unwrap(),
+            helper.ethereum_tx_block(mint_tx).await.unwrap() + 1
+        );
     }
 }
