@@ -5,7 +5,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use alloy::primitives::{Address, B256, Bytes, U256};
 use alloy::sol;
-use alloy::sol_types::SolCall;
+use alloy::sol_types::{SolCall, SolStruct};
 use serde::de::IgnoredAny;
 use serde::{Deserialize, Serialize};
 
@@ -19,6 +19,68 @@ sol! {
     /// Relay depository v2 entry point. The `id` is the order id that every
     /// later fill or refund carries, not the quote's request id.
     function depositErc20(address depositor, address token, uint256 amount, bytes32 id) external;
+}
+
+/// Relay's v1 order as its settlement SDK hashes it: `getOrderId` is the
+/// EIP-712 struct hash of `Order`, with every EVM address as 20 raw bytes.
+mod order_eip712 {
+    use alloy::sol;
+
+    sol! {
+        struct Order {
+            string version;
+            string solverChainId;
+            address solver;
+            uint256 salt;
+            Input[] inputs;
+            Output output;
+            Fee[] fees;
+        }
+
+        struct Input {
+            InputPayment payment;
+            InputRefund[] refunds;
+        }
+
+        struct InputPayment {
+            string chainId;
+            bytes currency;
+            uint256 amount;
+            uint256 weight;
+        }
+
+        struct InputRefund {
+            string chainId;
+            bytes recipient;
+            bytes currency;
+            uint256 minimumAmount;
+            uint32 deadline;
+            bytes extraData;
+        }
+
+        struct Output {
+            string chainId;
+            OutputPayment[] payments;
+            uint32 deadline;
+            bytes[] calls;
+            bytes extraData;
+        }
+
+        struct OutputPayment {
+            bytes recipient;
+            bytes currency;
+            uint256 minimumAmount;
+            uint256 expectedAmount;
+        }
+
+        struct Fee {
+            string recipientChainId;
+            bytes recipient;
+            string currencyChainId;
+            bytes currency;
+            uint256 amount;
+        }
+    }
 }
 
 /// An exact-input quote for moving `amount` of `origin`'s settlement stable to
@@ -71,7 +133,8 @@ impl std::fmt::Display for RelayOrderId {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RelayQuote {
     pub request_id: RelayRequestId,
-    /// Decoded from the deposit step's calldata.
+    /// Decoded from the deposit step's calldata, equal to
+    /// `protocol.v2.orderId` and to the hash of the checked order.
     pub order_id: RelayOrderId,
     pub amounts: QuoteAmounts,
     /// The order's `output.deadline`: until then the solver may still fill.
@@ -378,17 +441,22 @@ struct RawProtocol {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct RawProtocolV2 {
-    /// Must equal the deposit calldata's `id`, or the checked order is not the
-    /// one the deposit funds.
+    /// Must equal the deposit calldata's `id` and the hash of `order_data`,
+    /// or the checked order is not the one the deposit funds.
     order_id: B256,
     order_data: RawOrderData,
     payment_details: RawPaymentDetails,
 }
 
-/// Every live quote carries empty `fees` and `output.calls`; their entries are
-/// only counted, as no shape for them has been seen.
+/// Every live quote carries empty `fees`; their entries are only counted, as
+/// no shape for them has been seen.
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct RawOrderData {
+    version: String,
+    solver_chain_id: String,
+    solver: Address,
+    salt: U256,
     inputs: Vec<RawOrderInput>,
     fees: Vec<IgnoredAny>,
     output: RawOrderOutput,
@@ -409,6 +477,8 @@ struct RawInputPayment {
     currency: Address,
     #[serde(with = "decimal")]
     amount: U256,
+    #[serde(with = "decimal")]
+    weight: U256,
 }
 
 #[derive(Debug, Deserialize)]
@@ -418,6 +488,11 @@ struct RawRefund {
     chain_id: String,
     recipient: Address,
     currency: Address,
+    #[serde(with = "decimal")]
+    minimum_amount: U256,
+    /// Unix seconds.
+    deadline: u64,
+    extra_data: Bytes,
 }
 
 #[derive(Debug, Deserialize)]
@@ -426,9 +501,10 @@ struct RawOrderOutput {
     /// Relay's chain name, not the numeric id.
     chain_id: String,
     payments: Vec<RawPayment>,
-    calls: Vec<IgnoredAny>,
+    calls: Vec<Bytes>,
     /// Unix seconds.
     deadline: u64,
+    extra_data: Bytes,
 }
 
 #[derive(Debug, Deserialize)]
@@ -465,7 +541,7 @@ impl From<&RawCurrency> for QuotedCurrency {
 impl QuoteResponse {
     /// Checks the quote against `request` and the origin's pinned `depository`,
     /// and reads the order id from the deposit calldata, which must match
-    /// `protocol.v2.orderId`.
+    /// `protocol.v2.orderId` and the hash of the checked order.
     pub(super) fn validate(
         self,
         request: &QuoteRequest,
@@ -516,6 +592,11 @@ impl QuoteResponse {
             });
         }
 
+        let derived = derive_order_id(&self.protocol.v2.order_data)?;
+        if derived != quoted {
+            return Err(QuoteMismatch::OrderIdNotDerived { derived, quoted });
+        }
+
         let seconds = self.protocol.v2.order_data.output.deadline;
         let deadline = UNIX_EPOCH
             .checked_add(Duration::from_secs(seconds))
@@ -539,6 +620,75 @@ impl QuoteResponse {
             deposit,
         })
     }
+}
+
+/// Relay's `getOrderId` over the order as quoted. The fees hash as an empty
+/// list: a quote with an order fee is refused before this runs.
+fn derive_order_id(order: &RawOrderData) -> Result<RelayOrderId, QuoteMismatch> {
+    let address_bytes = |address: Address| Bytes::copy_from_slice(address.as_slice());
+    let deadline =
+        |seconds: u64| u32::try_from(seconds).map_err(|_| QuoteMismatch::Deadline { seconds });
+
+    let inputs = order
+        .inputs
+        .iter()
+        .map(|input| {
+            let refunds = input
+                .refunds
+                .iter()
+                .map(|refund| {
+                    Ok(order_eip712::InputRefund {
+                        chainId: refund.chain_id.clone(),
+                        recipient: address_bytes(refund.recipient),
+                        currency: address_bytes(refund.currency),
+                        minimumAmount: refund.minimum_amount,
+                        deadline: deadline(refund.deadline)?,
+                        extraData: refund.extra_data.clone(),
+                    })
+                })
+                .collect::<Result<_, QuoteMismatch>>()?;
+
+            Ok(order_eip712::Input {
+                payment: order_eip712::InputPayment {
+                    chainId: input.payment.chain_id.clone(),
+                    currency: address_bytes(input.payment.currency),
+                    amount: input.payment.amount,
+                    weight: input.payment.weight,
+                },
+                refunds,
+            })
+        })
+        .collect::<Result<_, QuoteMismatch>>()?;
+
+    let output = order_eip712::Output {
+        chainId: order.output.chain_id.clone(),
+        payments: order
+            .output
+            .payments
+            .iter()
+            .map(|payment| order_eip712::OutputPayment {
+                recipient: address_bytes(payment.recipient),
+                currency: address_bytes(payment.currency),
+                minimumAmount: payment.minimum_amount,
+                expectedAmount: payment.expected_amount,
+            })
+            .collect(),
+        deadline: deadline(order.output.deadline)?,
+        calls: order.output.calls.clone(),
+        extraData: order.output.extra_data.clone(),
+    };
+
+    let hashed = order_eip712::Order {
+        version: order.version.clone(),
+        solverChainId: order.solver_chain_id.clone(),
+        solver: order.solver,
+        salt: order.salt,
+        inputs,
+        output,
+        fees: vec![],
+    };
+
+    Ok(RelayOrderId(hashed.eip712_hash_struct()))
 }
 
 fn check_currency(
