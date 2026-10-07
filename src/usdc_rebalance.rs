@@ -318,6 +318,13 @@ pub enum UsdcRebalanceError {
     /// The confirmed deposit is not the persisted signed one.
     #[error("swap deposit {recorded} is not the signed deposit {prepared}")]
     SwapDepositHashMismatch { recorded: TxHash, prepared: TxHash },
+    /// A Relay transfer's withdrawn stable is outside the vault; failing it
+    /// would release the guard while only a redeposit can return the stable.
+    #[error(
+        "the {corridor} transfer's withdrawn stable is outside the vault; only a redeposit \
+         settles it, so it is not failed"
+    )]
+    RelayWithdrawalAwaitsRedeposit { corridor: UsdcCorridor },
     /// Command not valid for current state
     #[error("Command {command} not valid for state {state}")]
     InvalidCommand { command: String, state: String },
@@ -1472,6 +1479,17 @@ impl UsdcRebalance {
     /// classification here at compile time.
     pub fn pre_burn_fail_eligibility(&self) -> PreBurnFailEligibility {
         match self {
+            // A Relay withdrawal left the stable outside the vault, and
+            // `FailBridging` refuses it: like the swap states, only a
+            // redeposit settles it.
+            Self::WithdrawalComplete {
+                corridor:
+                    UsdcCorridor::HubRouted {
+                        hop: HopKind::Relay,
+                        ..
+                    },
+                ..
+            } => PreBurnFailEligibility::PostBurn,
             // The two states `FailBridging` accepts from before any burn.
             // `BridgingSubmitting` with no recorded burn is the only genuinely
             // pre-burn form; the operator still verifies on-chain that no
@@ -4727,6 +4745,18 @@ impl UsdcRebalance {
                 pending_burn_tx: Some(_),
                 ..
             } => Err(UsdcRebalanceError::BurnAlreadyRecorded),
+            // A Relay withdrawal's stable is outside the vault: failing it
+            // would release the guard before a redeposit returns it.
+            Self::WithdrawalComplete {
+                corridor:
+                    corridor @ UsdcCorridor::HubRouted {
+                        hop: HopKind::Relay,
+                        ..
+                    },
+                ..
+            } => Err(UsdcRebalanceError::RelayWithdrawalAwaitsRedeposit {
+                corridor: *corridor,
+            }),
             // Pre-burn failure: withdrawal succeeded and (for BridgingSubmitting
             // with no recorded burn) the burn intent was recorded but no burn tx
             // exists yet -- e.g. a USDC-to-U256 conversion error or a burn that
@@ -5880,9 +5910,9 @@ mod tests {
             replay::<UsdcRebalance>(withdrawn(RebalanceDirection::BaseToAlpaca, ROBINHOOD_RELAY))
                 .unwrap()
                 .unwrap();
-        assert_ne!(
+        assert_eq!(
             relay.pre_burn_fail_eligibility(),
-            PreBurnFailEligibility::Eligible
+            PreBurnFailEligibility::PostBurn
         );
 
         let error = TestHarness::<UsdcRebalance>::with(())
@@ -5892,7 +5922,15 @@ mod tests {
             })
             .await
             .then_expect_error();
-        assert!(matches!(error, LifecycleError::Apply(_)), "got {error:?}");
+        assert!(
+            matches!(
+                error,
+                LifecycleError::Apply(UsdcRebalanceError::RelayWithdrawalAwaitsRedeposit {
+                    corridor: ROBINHOOD_RELAY
+                })
+            ),
+            "got {error:?}"
+        );
 
         let cctp = replay::<UsdcRebalance>(withdrawn(
             RebalanceDirection::BaseToAlpaca,
