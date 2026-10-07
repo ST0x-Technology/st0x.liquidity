@@ -3,10 +3,13 @@
 //! This crate provides a generic `Bridge` trait for bridging USDC between chains.
 //! The default (no features) build ships only the trait and shared domain types.
 //! Enable the `cctp` feature for the Circle CCTP V2 implementation and the
-//! `relay` feature for the Relay API client.
+//! `relay` feature for the Relay client and [`SwapBridge`], its on-chain side.
 
 use alloy::primitives::{Address, B256, TxHash, U256};
 use async_trait::async_trait;
+
+#[cfg(feature = "relay")]
+use st0x_evm::PreparedTransaction;
 
 #[cfg(feature = "cctp")]
 pub mod cctp;
@@ -237,4 +240,185 @@ pub trait Bridge: Send + Sync + 'static {
     /// has a lower-bound block. For `BaseToEthereum` this is Base chain head;
     /// for `EthereumToBase` this is Ethereum chain head.
     async fn source_block(&self, direction: BridgeDirection) -> Result<u64, Self::Error>;
+}
+
+/// Which way a hop moves the stable, relative to the Ethereum hub.
+#[cfg(feature = "relay")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HopDirection {
+    /// From the corridor chain to the hub.
+    ToHub,
+    /// From the hub to the corridor chain.
+    FromHub,
+}
+
+/// What [`SwapBridge::prepare_deposit`] signed, not yet broadcast.
+///
+/// The caller persists it before broadcasting, so a retry sends the same
+/// bytes at the same nonces and never signs a second deposit.
+#[cfg(feature = "relay")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PreparedSwap {
+    Deposit(PreparedSwapDeposit),
+    /// Another send from the wallet took the nonce between the approve and
+    /// the deposit, so the deposit was discarded. The approve, an allowance
+    /// to the pinned depository, goes out alone through
+    /// [`SwapBridge::broadcast_approve`] to fill its nonce; the caller then
+    /// prepares the deposit again. The caller must persist and broadcast it:
+    /// a dropped approve leaves its nonce as a gap that every later send from
+    /// the wallet waits behind until restart.
+    ApproveOnly {
+        approve: PreparedTransaction,
+    },
+}
+
+/// The approve and deposit of one swap, at consecutive nonces.
+#[cfg(feature = "relay")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PreparedSwapDeposit {
+    /// `None` when the standing allowance already covers the deposit.
+    pub approve: Option<PreparedTransaction>,
+    pub deposit: PreparedTransaction,
+}
+
+/// A deposit found on the origin chain, from its receipt or a log scan.
+#[cfg(feature = "relay")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SwapDeposit<OrderId> {
+    pub tx: TxHash,
+    pub order_id: OrderId,
+    /// In the origin stable's smallest unit.
+    pub amount: U256,
+    pub block: u64,
+}
+
+/// What a deposit scan found, and how far it looked.
+#[cfg(feature = "relay")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DepositScan<OrderId> {
+    pub deposits: Vec<SwapDeposit<OrderId>>,
+    /// The last block the scan covered, the newest with the origin chain's
+    /// confirmations: a deposit mined later is not covered. Never below
+    /// `from_block - 1`, so a scan from an unconfirmed block leaves the
+    /// caller's cursor where it was.
+    pub scanned_to: u64,
+}
+
+/// The end of a swap a payment landed on.
+#[cfg(feature = "relay")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SwapSide {
+    Origin,
+    Destination,
+}
+
+/// A fill or refund proven on chain.
+#[cfg(feature = "relay")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SwapPayment {
+    pub tx: TxHash,
+    /// A fill is always on the destination; a refund may be on either side.
+    pub side: SwapSide,
+    /// In the smallest unit of that side's stable.
+    pub amount: U256,
+}
+
+/// The on-chain side of a swap hop: we deposit on the origin chain and a
+/// solver pays us on the destination chain from its own funds, or refunds us.
+///
+/// Sibling of [`Bridge`], whose burn and mint are both ours to send. Here only
+/// the deposit is ours; the payment is a transaction the solver sends, which
+/// [`SwapBridge::verify_fill`] and [`SwapBridge::verify_refund`] prove from
+/// chain data before anything trusts it.
+#[cfg(feature = "relay")]
+#[async_trait]
+pub trait SwapBridge: Send + Sync + 'static {
+    type Error: std::error::Error + Send + Sync + 'static;
+
+    /// The accepted quote a deposit funds.
+    type Quote: Send + Sync;
+
+    /// The key the deposit and its payment share.
+    type OrderId: Copy + Send + Sync;
+
+    /// Signs the quote's approve (when the allowance does not already cover
+    /// the deposit) and its deposit on the origin chain, without broadcasting,
+    /// or only the approve ([`PreparedSwap::ApproveOnly`]) when another send
+    /// split the pair.
+    ///
+    /// Not cancel-safe: dropped mid-call, it leaves a signed approve's nonce
+    /// reserved with nothing to send it, a gap later sends wait behind until
+    /// restart. Run it to completion, never under a timeout or `select!`.
+    async fn prepare_deposit(
+        &self,
+        direction: HopDirection,
+        quote: &Self::Quote,
+    ) -> Result<PreparedSwap, Self::Error>;
+
+    /// Releases the nonces of a prepared swap that was not persisted and so
+    /// will never be broadcast, the deposit's before the approve's.
+    async fn discard_prepared(&self, direction: HopDirection, prepared: &PreparedSwap);
+
+    /// Reserves the nonces of a persisted prepared swap after a restart. The
+    /// caller restores every persisted swap before any other send from the
+    /// origin wallet, which would otherwise take a nonce in the pair.
+    async fn restore_prepared(&self, direction: HopDirection, prepared: &PreparedSwap);
+
+    /// Broadcasts a prepared pair in nonce order and returns the deposit's
+    /// hash. Idempotent: a repeat sends the same bytes.
+    async fn broadcast_deposit(
+        &self,
+        direction: HopDirection,
+        prepared: &PreparedSwapDeposit,
+    ) -> Result<TxHash, Self::Error>;
+
+    /// Broadcasts the approve of a [`PreparedSwap::ApproveOnly`] and returns
+    /// its hash. Idempotent: a repeat sends the same bytes.
+    async fn broadcast_approve(
+        &self,
+        direction: HopDirection,
+        approve: &PreparedTransaction,
+    ) -> Result<TxHash, Self::Error>;
+
+    /// Waits for the deposit's receipt and checks that it funded `order_id`.
+    /// Short of the origin chain's confirmations it fails, to be retried.
+    async fn confirm_deposit(
+        &self,
+        direction: HopDirection,
+        order_id: Self::OrderId,
+        deposit_tx: TxHash,
+    ) -> Result<SwapDeposit<Self::OrderId>, Self::Error>;
+
+    /// Returns the origin chain's head, the floor for a later
+    /// [`SwapBridge::find_recent_deposits`].
+    async fn origin_block(&self, direction: HopDirection) -> Result<u64, Self::Error>;
+
+    /// Scans the origin chain from `from_block` to its confirmed blocks for
+    /// our deposits funding any of `order_ids`.
+    async fn find_recent_deposits(
+        &self,
+        direction: HopDirection,
+        order_ids: &[Self::OrderId],
+        from_block: u64,
+    ) -> Result<DepositScan<Self::OrderId>, Self::Error>;
+
+    /// Proves that the one tx in `txs` paid us at least `minimum_out` of the
+    /// destination stable for `order_id`.
+    async fn verify_fill(
+        &self,
+        direction: HopDirection,
+        order_id: Self::OrderId,
+        minimum_out: U256,
+        txs: &[TxHash],
+    ) -> Result<SwapPayment, Self::Error>;
+
+    /// Proves that the one tx in `txs` refunded us at most `deposited` for
+    /// `order_id`, in the stable of whichever side it landed on.
+    async fn verify_refund(
+        &self,
+        direction: HopDirection,
+        order_id: Self::OrderId,
+        deposited: U256,
+        txs: &[TxHash],
+    ) -> Result<SwapPayment, Self::Error>;
 }
