@@ -99,6 +99,12 @@ pub enum RelayBridgeError {
     Quote(#[from] QuoteMismatch),
     #[error("prepared approve has nonce {approve}, the deposit {deposit}: not consecutive")]
     PairNonces { approve: u64, deposit: u64 },
+    #[error("tx {tx} has {confirmations} confirmations, the bridge needs {required}")]
+    Unconfirmed {
+        tx: TxHash,
+        confirmations: u64,
+        required: u64,
+    },
     #[error("deposit {tx} reverted")]
     DepositReverted { tx: TxHash },
     #[error("deposit {tx} emitted no deposit for order {order_id} from our wallet")]
@@ -1400,6 +1406,58 @@ mod tests {
         assert_eq!(
             harness.chain.balance(harness.chain.depository).await,
             AMOUNT
+        );
+    }
+
+    #[tokio::test]
+    async fn deposit_and_payment_short_of_the_bridge_confirmations_are_unconfirmed() {
+        let harness = Harness::new().await;
+        harness.chain.mint(harness.chain.wallet(), AMOUNT).await;
+        harness.hub.mint(harness.hub.solver(), MINIMUM_OUT).await;
+        let order_id = B256::random();
+        let quote = quote(&harness.chain, order_id, true);
+        let prepared = harness
+            .bridge
+            .prepare_deposit(HopDirection::ToHub, &quote)
+            .await
+            .map(deposit_pair)
+            .unwrap();
+        let deposit = harness
+            .bridge
+            .broadcast_deposit(HopDirection::ToHub, &prepared)
+            .await
+            .unwrap();
+        let fill = harness
+            .hub
+            .pay(harness.hub.wallet(), MINIMUM_OUT, order_id)
+            .await;
+
+        let confirm = harness
+            .bridge
+            .confirm_deposit(HopDirection::ToHub, quote.order_id, deposit)
+            .await
+            .unwrap_err();
+        let verify = harness
+            .bridge
+            .verify_fill(HopDirection::ToHub, quote.order_id, MINIMUM_OUT, &[fill])
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                confirm,
+                RelayBridgeError::Unconfirmed { tx, confirmations: 1, required: CONFIRMATIONS }
+                    if tx == deposit
+            ),
+            "{confirm:?}"
+        );
+        assert!(
+            matches!(
+                verify,
+                RelayBridgeError::Unconfirmed { tx, confirmations: 1, required: CONFIRMATIONS }
+                    if tx == fill
+            ),
+            "{verify:?}"
         );
     }
 
