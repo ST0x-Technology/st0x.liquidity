@@ -1075,7 +1075,7 @@ mod tests {
             relay,
         } = config.usdc.corridors[&Chain::Base];
         assert_eq!(hop, HopKind::Cctp);
-        assert!(matches!(relay, None), "a cctp corridor has no relay table");
+        assert!(relay.is_none(), "a cctp corridor has no relay table");
         assert!(target.eq(float!(0.5)).unwrap());
         assert!(deviation.eq(float!(0.3)).unwrap());
         assert_eq!(config.transfer_timeout_secs, 1800);
@@ -1195,7 +1195,7 @@ mod tests {
             relay,
         } = config.usdc.corridors[&Chain::Base];
         assert_eq!(hop, HopKind::Cctp);
-        assert!(matches!(relay, None), "a cctp corridor has no relay table");
+        assert!(relay.is_none(), "a cctp corridor has no relay table");
         assert!(target.eq(float!(0.4)).unwrap());
         assert!(deviation.eq(float!(0.15)).unwrap());
         assert_eq!(config.attestation_retry_deadline_secs, 7200);
@@ -2117,7 +2117,7 @@ mod tests {
     /// A valid `relay` sub-table for `chain`, with `overrides` replacing
     /// keys of the same name.
     fn relay_corridor(chain: &str, overrides: &[(&str, &str)]) -> String {
-        let mut keys = vec![
+        let mut keys = [
             ("slippage_bps", "30"),
             ("max_quote_loss_bps", "50"),
             ("min_transfer", "500"),
@@ -2133,12 +2133,13 @@ mod tests {
         }
         let relay = keys
             .iter()
-            .map(|(key, value)| format!("{key} = {value}\n"))
-            .collect::<String>();
+            .map(|(key, value)| format!("{key} = {value}"))
+            .collect::<Vec<_>>()
+            .join("\n");
 
         format!(
             "[usdc]\nmode = \"enabled\"\n\n[usdc.corridors.{chain}]\nhop = \"relay\"\n\
-             target = 0.5\ndeviation = 0.05\n\n[usdc.corridors.{chain}.relay]\n{relay}"
+             target = 0.5\ndeviation = 0.05\n\n[usdc.corridors.{chain}.relay]\n{relay}\n"
         )
     }
 
