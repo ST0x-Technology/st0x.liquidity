@@ -1073,6 +1073,9 @@ pub(crate) struct RebalancingService {
     /// Transfers on a corridor this build does not serve whose page was
     /// delivered, so the sweep pages once, not every tick.
     corridor_not_served_alerted: Arc<RwLock<HashSet<UsdcRebalanceId>>>,
+    /// Relay transfers the sweep holds at `WithdrawalComplete` whose page was
+    /// delivered, so the sweep pages once, not every tick.
+    relay_withdrawal_hold_alerted: Arc<RwLock<HashSet<UsdcRebalanceId>>>,
     /// Every-corridor latch pages (startup's and one per runtime transfer)
     /// until each is delivered.
     pending_latch_pages: RwLock<VecDeque<String>>,
@@ -1152,6 +1155,13 @@ enum UsdcTimeoutCleanup {
     HeldForUnservedCorridor {
         corridor: UsdcCorridor,
         direction: RebalanceDirection,
+    },
+    /// A chain-to-Alpaca Relay transfer stopped at `WithdrawalComplete`: the
+    /// withdrawn stable sits in the chain wallet outside the vault, and only
+    /// a redeposit (not built yet) returns it, so the guard stays held.
+    HeldOutsideVault {
+        tracking: usdc::UsdcRebalanceTracking,
+        elapsed: Duration,
     },
 }
 
@@ -1492,6 +1502,7 @@ impl RebalancingService {
             unconfirmed_burn_hold_logged: Arc::new(RwLock::new(HashSet::new())),
             unconfirmed_burn_hold_alerted: Arc::new(RwLock::new(HashSet::new())),
             corridor_not_served_alerted: Arc::new(RwLock::new(HashSet::new())),
+            relay_withdrawal_hold_alerted: Arc::new(RwLock::new(HashSet::new())),
             pending_latch_pages: RwLock::new(VecDeque::new()),
             latch_paged: RwLock::new(HashSet::new()),
             unread_paged: RwLock::new(HashSet::new()),
@@ -2580,6 +2591,12 @@ impl RebalancingService {
                     self.page_unserved_corridor_once(&id, corridor, direction)
                         .await;
                 }
+                UsdcTimeoutCleanup::HeldOutsideVault { tracking, elapsed } => {
+                    self.usdc_guards
+                        .hold(tracking.corridor.chain(), &id, tracking.direction);
+                    self.page_relay_withdrawal_hold_once(&id, &tracking, elapsed)
+                        .await;
+                }
             }
         }
 
@@ -2645,6 +2662,52 @@ impl RebalancingService {
                     );
                 }
             }
+        }
+    }
+
+    /// Pages once per transfer (retried until delivered) that the sweep holds
+    /// a Relay transfer at `WithdrawalComplete`. The id is recorded before the
+    /// send and removed again if delivery fails, so a later sweep retries.
+    async fn page_relay_withdrawal_hold_once(
+        &self,
+        id: &UsdcRebalanceId,
+        tracking: &usdc::UsdcRebalanceTracking,
+        elapsed: Duration,
+    ) {
+        if !self
+            .relay_withdrawal_hold_alerted
+            .write()
+            .await
+            .insert(id.clone())
+        {
+            return;
+        }
+
+        error!(
+            target: "rebalance",
+            aggregate_id = %id,
+            corridor = %tracking.corridor,
+            ?elapsed,
+            "Relay USDC transfer timed out at WithdrawalComplete with its withdrawn stable \
+             outside the vault; holding the trigger guard"
+        );
+
+        let message = format!(
+            "USDC transfer {id} on the {} corridor timed out at WithdrawalComplete: the vault \
+             withdrawal moved the stable to the chain wallet and no Relay deposit is signed. \
+             Guard held. Elapsed: {elapsed:?}. Resume it with resume-usdc; it is not failed or \
+             released until a redeposit returns the stable to the vault.",
+            tracking.corridor,
+        );
+
+        if let Err(error) = self.notifier.notify(&message).await {
+            self.relay_withdrawal_hold_alerted.write().await.remove(id);
+            warn!(
+                target: "rebalance",
+                %id,
+                ?error,
+                "Failed to deliver the Relay withdrawal hold page; will retry next sweep"
+            );
         }
     }
 
@@ -3469,6 +3532,21 @@ impl RebalancingService {
                         elapsed,
                         corridor,
                         amount,
+                    }));
+                }
+                Ok(Some(UsdcRebalance::WithdrawalComplete {
+                    direction: RebalanceDirection::BaseToAlpaca,
+                    corridor:
+                        UsdcCorridor::HubRouted {
+                            hop: HopKind::Relay,
+                            ..
+                        },
+                    ..
+                })) => {
+                    drop(tracking_guard);
+                    return Ok(Some(UsdcTimeoutCleanup::HeldOutsideVault {
+                        tracking,
+                        elapsed,
                     }));
                 }
                 // Past the withdrawal with no confirmed burn: arming a job again
@@ -44658,6 +44736,14 @@ mod tests {
                 .cloned(),
             Some(id.clone()),
             "the transfer must stay the active rebalance",
+        );
+        assert!(
+            trigger
+                .relay_withdrawal_hold_alerted
+                .read()
+                .await
+                .contains(&id),
+            "the sweep must page that the stable is outside the vault",
         );
     }
 }
