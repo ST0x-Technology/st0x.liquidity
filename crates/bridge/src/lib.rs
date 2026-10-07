@@ -345,6 +345,10 @@ pub trait SwapBridge: Send + Sync + 'static {
     /// the deposit) and its deposit on the origin chain, without broadcasting,
     /// or only the approve ([`PreparedSwap::ApproveOnly`]) when another send
     /// split the pair.
+    ///
+    /// Not cancel-safe: dropped mid-call, it leaves a signed approve's nonce
+    /// reserved with nothing to send it, a gap later sends wait behind until
+    /// restart. Run it to completion, never under a timeout or `select!`.
     async fn prepare_deposit(
         &self,
         direction: HopDirection,
