@@ -669,15 +669,23 @@ impl<W: Wallet> RelayEnd<W> {
         })
     }
 
-    /// `tx`'s receipt once it has this end's confirmations. The wallet's wait
-    /// counts its own required confirmations, which may be fewer.
+    /// `tx`'s receipt once it has this end's confirmations in a canonical
+    /// block. The wallet's wait may count fewer confirmations, and a lagging
+    /// node can serve a receipt from a reorged-out block.
     async fn confirmed_receipt(&self, tx: TxHash) -> Result<TransactionReceipt, RelayBridgeError> {
         let receipt = self.wallet.await_receipt(tx).await?;
         let head = self.wallet.provider().get_block_number().await?;
 
-        let confirmations = receipt
-            .block_number
-            .and_then(|block| head.checked_sub(block))
+        let (Some(block), Some(block_hash)) = (receipt.block_number, receipt.block_hash) else {
+            return Err(RelayBridgeError::Unconfirmed {
+                tx,
+                confirmations: 0,
+                required: self.confirmations,
+            });
+        };
+
+        let confirmations = head
+            .checked_sub(block)
             .map_or(0, |depth| depth.saturating_add(1));
 
         if confirmations < self.confirmations {
@@ -686,6 +694,23 @@ impl<W: Wallet> RelayEnd<W> {
                 confirmations,
                 required: self.confirmations,
             });
+        }
+
+        let canonical = self
+            .wallet
+            .provider()
+            .get_block_by_number(block.into())
+            .await?;
+
+        if canonical.is_none_or(|canonical| canonical.header.hash != block_hash) {
+            warn!(
+                target: "bridge",
+                %tx,
+                block,
+                %block_hash,
+                "Relay receipt is not from the canonical block at its height"
+            );
+            return Err(RelayBridgeError::NotCanonical { tx, block });
         }
 
         Ok(receipt)
