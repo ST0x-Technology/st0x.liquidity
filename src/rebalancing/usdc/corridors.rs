@@ -18,7 +18,7 @@ use st0x_bridge::BridgeDirection;
 use st0x_bridge::cctp::AttestationResponse;
 use st0x_bridge::corridor::UsdcCorridor;
 use st0x_event_sorcery::Store;
-use st0x_evm::PreparedTransaction;
+use st0x_evm::{Chain, PreparedTransaction};
 use st0x_finance::Usdc;
 
 use super::manager::RecoveredCctpMint;
@@ -172,13 +172,27 @@ impl RecheckUsdcDeposit for UsdcCorridorTransfers {
     }
 }
 
-/// Runs once, on one service: the signed deposit sends all belong to the
-/// shared Ethereum wallet, and each must be restored exactly once or its
-/// nonce would be rebroadcast twice.
 #[async_trait]
 impl RestorePreparedDepositSends for UsdcCorridorTransfers {
+    /// Runs once, on one service: the signed deposit sends and the Relay
+    /// pairs signed on the Ethereum wallet all belong to it, and each must be
+    /// restored exactly once or its nonce would be rebroadcast twice.
     async fn restore_prepared_deposit_sends(&self, pool: &SqlitePool) -> RestoredDepositSends {
         self.hub.restore_prepared_deposit_sends(pool).await
+    }
+
+    /// Runs on every service: each restores the Relay pairs signed on its own
+    /// corridor chain, one chain per service.
+    async fn restore_chain_signed_swaps(
+        &self,
+        pool: &SqlitePool,
+    ) -> BTreeMap<Chain, RestoredDepositSends> {
+        let mut by_chain = BTreeMap::new();
+        for service in self.by_corridor.values() {
+            by_chain.extend(service.restore_chain_signed_swaps(pool).await);
+        }
+
+        by_chain
     }
 }
 
@@ -216,7 +230,6 @@ mod tests {
     use st0x_bridge::cctp::CctpError;
     use st0x_bridge::corridor::HopKind;
     use st0x_event_sorcery::test_store;
-    use st0x_evm::Chain;
     use st0x_float_macro::float;
 
     use super::*;
@@ -294,6 +307,13 @@ mod tests {
         async fn restore_prepared_deposit_sends(&self, _pool: &SqlitePool) -> RestoredDepositSends {
             *self.restores.lock().unwrap() += 1;
             RestoredDepositSends::default()
+        }
+
+        async fn restore_chain_signed_swaps(
+            &self,
+            _pool: &SqlitePool,
+        ) -> BTreeMap<Chain, RestoredDepositSends> {
+            BTreeMap::new()
         }
     }
 

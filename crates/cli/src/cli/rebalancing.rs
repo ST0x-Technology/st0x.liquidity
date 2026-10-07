@@ -761,6 +761,13 @@ fn is_bot_resumable_wait(error: &UsdcTransferError) -> bool {
         | UsdcTransferError::DepositSendUnresolved { .. }
         | UsdcTransferError::DepositSendTaskPanicked { .. }
         | UsdcTransferError::DepositSendLookup { .. }
+        | UsdcTransferError::StateOffHop { .. }
+        | UsdcTransferError::BasisPoints(_)
+        | UsdcTransferError::SwapDirectionNotBuilt { .. }
+        | UsdcTransferError::RelayApi(_)
+        | UsdcTransferError::RelayBridge(_)
+        | UsdcTransferError::SwapQuoteOutOfBounds { .. }
+        | UsdcTransferError::SwapPairSplit { .. }
         | UsdcTransferError::EthereumChainMissing(_) => false,
     }
 }
@@ -1162,6 +1169,9 @@ fn classify_fail_bridging_reload(state: Option<&UsdcRebalance>) -> FailBridgingO
             | UsdcRebalance::Bridging { .. }
             | UsdcRebalance::AwaitingAttestation { .. }
             | UsdcRebalance::Attested { .. }
+            | UsdcRebalance::SwapQuoted { .. }
+            | UsdcRebalance::SwapDepositPrepared { .. }
+            | UsdcRebalance::SwapDeposited { .. }
             | UsdcRebalance::Bridged { .. }
             | UsdcRebalance::DepositInitiated { .. }
             | UsdcRebalance::DepositConfirmed { .. }
@@ -1467,6 +1477,9 @@ pub(super) async fn clear_pending_burn_command<Writer: Write>(
         | UsdcRebalance::Bridging { .. }
         | UsdcRebalance::AwaitingAttestation { .. }
         | UsdcRebalance::Attested { .. }
+        | UsdcRebalance::SwapQuoted { .. }
+        | UsdcRebalance::SwapDepositPrepared { .. }
+        | UsdcRebalance::SwapDeposited { .. }
         | UsdcRebalance::Bridged { .. }
         | UsdcRebalance::BridgingFailed { .. }
         | UsdcRebalance::DepositInitiated { .. }

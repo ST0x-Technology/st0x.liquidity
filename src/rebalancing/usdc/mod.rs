@@ -9,6 +9,7 @@ mod corridors;
 mod driver_pause;
 mod job;
 mod manager;
+mod relay;
 
 pub(crate) use corridors::{CorridorTransfer, UsdcCorridorTransfers};
 pub(crate) use driver_pause::{
@@ -23,13 +24,15 @@ pub(crate) use job::{
 pub(crate) use manager::RecoveredCctpMint;
 pub(crate) use manager::{
     CctpMintRecoveryError, RecheckUsdcDeposit, RecoverCctpMint, RecoveredMintAmounts,
-    RestorePreparedDepositSends, RestoredDepositSends, UsdcRecheckError, u256_to_usdc,
+    RestorePreparedDepositSends, RestoredDepositSends, UsdcBridgeHelper, UsdcRecheckError,
+    u256_to_usdc,
 };
 pub use manager::{
     CrossVenueCashTransfer, DepositSendNotSuperseded, EthereumChainMissing,
     MarketMakingUsdcEndpoints, UsdcSettlementParams, deposit_send_required_confirmations,
     verify_deposit_send_superseded,
 };
+pub(crate) use relay::RelayHop;
 
 use std::collections::BTreeSet;
 use std::time::Duration;
@@ -42,7 +45,10 @@ use thiserror::Error;
 use tracing::error;
 
 use st0x_bridge::cctp::CctpError;
-use st0x_bridge::corridor::UsdcCorridor;
+use st0x_bridge::corridor::{HopKind, UsdcCorridor};
+use st0x_bridge::relay::{
+    BasisPointsOutOfRange, QuoteAcceptanceError, RelayBridgeError, RelayError,
+};
 use st0x_event_sorcery::SendError;
 use st0x_execution::{
     AlpacaBrokerApiError, AlpacaWalletError, ClientOrderId, InvalidSharesError, NotPositive,
@@ -273,6 +279,39 @@ pub enum UsdcTransferError {
     },
     #[error("USDC rebalance {id} cannot resume: aggregate is in terminal failure state")]
     PreviouslyFailedAggregate { id: UsdcRebalanceId },
+    /// A state the service's hop never reaches (a swap state on CCTP, a
+    /// burn state on Relay): the corridor check passed, so the store holds a
+    /// state its corridor cannot reach. Refused before any call.
+    #[error("USDC rebalance {id} is in {state}, which the {hop} hop never reaches")]
+    StateOffHop {
+        id: UsdcRebalanceId,
+        state: &'static str,
+        hop: HopKind,
+    },
+    #[error(transparent)]
+    BasisPoints(#[from] BasisPointsOutOfRange),
+    /// The Relay hop runs chain-to-Alpaca only in this build; refused before
+    /// any call.
+    #[error("USDC rebalance {id}: the Relay hop does not run {direction} yet; nothing was sent")]
+    SwapDirectionNotBuilt {
+        id: UsdcRebalanceId,
+        direction: RebalanceDirection,
+    },
+    #[error("Relay API error: {0}")]
+    RelayApi(#[from] Box<RelayError>),
+    #[error("Relay bridge error: {0}")]
+    RelayBridge(#[from] Box<RelayBridgeError>),
+    /// Relay's quote is outside the corridor's bounds.
+    #[error("USDC rebalance {id}: Relay quote refused: {source}")]
+    SwapQuoteOutOfBounds {
+        id: UsdcRebalanceId,
+        #[source]
+        source: QuoteAcceptanceError,
+    },
+    /// Another send took a nonce between the swap's approve and deposit: the
+    /// approve went out alone and the next attempt signs the deposit again.
+    #[error("USDC rebalance {id}: another send split the swap's approve and deposit; retrying")]
+    SwapPairSplit { id: UsdcRebalanceId },
     #[error(
         "USDC transfer corridor mismatch: transfer {id} runs on the {recorded} corridor, \
          this service serves {}; left untouched for the operator",
@@ -711,6 +750,13 @@ impl UsdcTransferError {
             | Self::DepositSendReconciliationPending { .. }
             | Self::DepositSendTaskPanicked { .. }
             | Self::DepositSendLookup { .. }
+            | Self::StateOffHop { .. }
+            | Self::BasisPoints(_)
+            | Self::SwapDirectionNotBuilt { .. }
+            | Self::RelayApi(_)
+            | Self::RelayBridge(_)
+            | Self::SwapQuoteOutOfBounds { .. }
+            | Self::SwapPairSplit { .. }
             | Self::EthereumChainMissing(_) => None,
         }
     }
@@ -776,6 +822,13 @@ impl BotGasFailureClassifier for UsdcTransferError {
             | Self::DepositSendReconciliationPending { .. }
             | Self::DepositSendTaskPanicked { .. }
             | Self::DepositSendLookup { .. }
+            | Self::StateOffHop { .. }
+            | Self::BasisPoints(_)
+            | Self::SwapDirectionNotBuilt { .. }
+            | Self::RelayApi(_)
+            | Self::RelayBridge(_)
+            | Self::SwapQuoteOutOfBounds { .. }
+            | Self::SwapPairSplit { .. }
             | Self::EthereumChainMissing(_) => false,
         }
     }

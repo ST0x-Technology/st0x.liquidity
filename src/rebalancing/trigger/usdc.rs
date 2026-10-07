@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 use tracing::{debug, trace, warn};
 
 use st0x_bridge::corridor::UsdcCorridor;
+use st0x_config::RelayHopCtx;
 use st0x_evm::Chain;
 use st0x_finance::{Usd, Usdc};
 
@@ -254,6 +255,9 @@ pub(super) enum UsdcRebalanceStage {
     WithdrawalConfirmed,
     BridgingInitiated,
     BridgeAttestationReceived,
+    SwapQuoted,
+    SwapDepositPrepared,
+    SwapDeposited,
     Bridged,
     DepositInitiated,
     DepositConfirmed,
@@ -268,6 +272,9 @@ impl std::fmt::Display for UsdcRebalanceStage {
             Self::WithdrawalConfirmed => write!(formatter, "WithdrawalConfirmed"),
             Self::BridgingInitiated => write!(formatter, "BridgingInitiated"),
             Self::BridgeAttestationReceived => write!(formatter, "BridgeAttestationReceived"),
+            Self::SwapQuoted => write!(formatter, "SwapQuoted"),
+            Self::SwapDepositPrepared => write!(formatter, "SwapDepositPrepared"),
+            Self::SwapDeposited => write!(formatter, "SwapDeposited"),
             Self::Bridged => write!(formatter, "Bridged"),
             Self::DepositInitiated => write!(formatter, "DepositInitiated"),
             Self::DepositConfirmed => write!(formatter, "DepositConfirmed"),
@@ -289,6 +296,9 @@ impl UsdcRebalanceStage {
             WithdrawalConfirmed { .. } => Some(Self::WithdrawalConfirmed),
             BridgingInitiated { .. } => Some(Self::BridgingInitiated),
             BridgeAttestationReceived { .. } => Some(Self::BridgeAttestationReceived),
+            SwapQuoted { .. } => Some(Self::SwapQuoted),
+            SwapDepositPrepared { .. } => Some(Self::SwapDepositPrepared),
+            SwapDeposited { .. } => Some(Self::SwapDeposited),
             Bridged { .. } | BridgingCompletionRecovered { .. } => Some(Self::Bridged),
             DepositInitiated { .. } => Some(Self::DepositInitiated),
             DepositConfirmed { .. } | DepositCompletionRecovered { .. } => {
@@ -302,6 +312,7 @@ impl UsdcRebalanceStage {
             | PendingBurnCleared { .. }
             | DepositSendPrepared { .. }
             | DepositSendAttached { .. }
+            | SwapApprovePrepared { .. }
             | AttestationTimedOut { .. }
             | ConversionConfirmed { .. }
             | ConversionFailed { .. }
@@ -330,6 +341,11 @@ impl UsdcRebalanceStage {
             (Self::BridgeAttestationReceived, BridgeAttestationReceived { attested_at, .. }) => {
                 Some(*attested_at)
             }
+            (Self::SwapQuoted, SwapQuoted { quoted_at, .. }) => Some(*quoted_at),
+            (Self::SwapDepositPrepared, SwapDepositPrepared { prepared_at, .. }) => {
+                Some(*prepared_at)
+            }
+            (Self::SwapDeposited, SwapDeposited { deposited_at, .. }) => Some(*deposited_at),
             (Self::Bridged, Bridged { minted_at, .. }) => Some(*minted_at),
             (Self::Bridged, BridgingCompletionRecovered { recovered_at, .. })
             | (Self::DepositConfirmed, DepositCompletionRecovered { recovered_at, .. }) => {
@@ -378,6 +394,10 @@ pub(crate) enum UsdcTriggerSkip {
     WithdrawableBelowMinimum,
     /// Imbalance exists but the amount is below [`ALPACA_TO_BASE_MINIMUM_TRANSFER`].
     BelowMinimumTransfer { excess: Usdc },
+    /// A Relay corridor's transfer is below its `min_transfer`.
+    BelowRelayMinimum { amount: Usdc, minimum: Usdc },
+    /// The Relay hop does not run Alpaca-to-chain yet.
+    RelayDirectionNotBuilt,
     /// Arithmetic error during imbalance calculation.
     ArithmeticError,
 }
@@ -576,6 +596,49 @@ pub(super) async fn check_imbalance_and_build_operation(
             Ok(UsdcRebalanceOperation::BaseToAlpaca { amount })
         }
     }
+}
+
+/// The chain's operational limit capped at a Relay corridor's
+/// `max_transfer`, whichever is smaller.
+pub(super) fn cap_to_relay_maximum(
+    usdc_limit: Option<Usdc>,
+    relay: &RelayHopCtx,
+) -> Result<Usdc, UsdcTriggerSkip> {
+    let Some(limit) = usdc_limit else {
+        return Ok(relay.max_transfer);
+    };
+
+    let below = limit.lt(&relay.max_transfer).map_err(|error| {
+        warn!(target: "rebalance", ?error, "Relay maximum-transfer comparison failed");
+        UsdcTriggerSkip::ArithmeticError
+    })?;
+
+    Ok(if below { limit } else { relay.max_transfer })
+}
+
+/// Keeps an operation a Relay corridor can run: chain-to-Alpaca, at or
+/// above its `min_transfer`.
+pub(super) fn fit_relay_bounds(
+    operation: UsdcRebalanceOperation,
+    relay: &RelayHopCtx,
+) -> Result<UsdcRebalanceOperation, UsdcTriggerSkip> {
+    let UsdcRebalanceOperation::BaseToAlpaca { amount } = operation else {
+        return Err(UsdcTriggerSkip::RelayDirectionNotBuilt);
+    };
+
+    let below = amount.lt(&relay.min_transfer).map_err(|error| {
+        warn!(target: "rebalance", ?error, "Relay minimum-transfer comparison failed");
+        UsdcTriggerSkip::ArithmeticError
+    })?;
+
+    if below {
+        return Err(UsdcTriggerSkip::BelowRelayMinimum {
+            amount,
+            minimum: relay.min_transfer,
+        });
+    }
+
+    Ok(operation)
 }
 
 fn cap_usdc(amount: Usdc, usdc_limit: Option<Usdc>) -> Usdc {
@@ -1030,6 +1093,9 @@ impl RebalancingService {
             WithdrawalConfirmed { .. }
             | BridgingInitiated { .. }
             | BridgeAttestationReceived { .. }
+            | SwapQuoted { .. }
+            | SwapDepositPrepared { .. }
+            | SwapDeposited { .. }
             | DepositInitiated { .. }
             | DepositConfirmed {
                 direction: RebalanceDirection::BaseToAlpaca,
@@ -1102,6 +1168,7 @@ impl RebalancingService {
             | PendingBurnCleared { .. }
             | DepositSendPrepared { .. }
             | DepositSendAttached { .. }
+            | SwapApprovePrepared { .. }
             | AttestationTimedOut { .. } => UsdcSettlementOutcome::Reconciled,
             // Withdrawal failure is always pre-burn -> reconcile to source.
             WithdrawalFailed { .. } if self.usdc_tracking.read().await.contains_key(id) => {
@@ -1998,6 +2065,75 @@ mod tests {
                 .await;
 
         assert_eq!(result, Err(UsdcTriggerSkip::NoImbalance));
+    }
+
+    fn relay_bounds() -> RelayHopCtx {
+        RelayHopCtx {
+            slippage_bps: 30,
+            max_quote_loss_bps: 50,
+            min_transfer: Usdc::new(float!(500)),
+            max_transfer: Usdc::new(float!(50000)),
+            quote_max_age: Duration::from_secs(60),
+            fill_timeout: Duration::from_secs(1800),
+            max_refund_retries: 3,
+            max_deposit_revert_redrives: 5,
+        }
+    }
+
+    #[test]
+    fn relay_corridor_caps_at_the_smaller_of_the_limit_and_max_transfer() {
+        let relay = relay_bounds();
+
+        assert_eq!(
+            cap_to_relay_maximum(None, &relay).unwrap(),
+            Usdc::new(float!(50000))
+        );
+        assert_eq!(
+            cap_to_relay_maximum(Some(Usdc::new(float!(80000))), &relay).unwrap(),
+            Usdc::new(float!(50000))
+        );
+        assert_eq!(
+            cap_to_relay_maximum(Some(Usdc::new(float!(1000))), &relay).unwrap(),
+            Usdc::new(float!(1000))
+        );
+    }
+
+    #[test]
+    fn relay_corridor_declines_below_min_transfer_and_alpaca_to_chain() {
+        let relay = relay_bounds();
+
+        assert_eq!(
+            fit_relay_bounds(
+                UsdcRebalanceOperation::BaseToAlpaca {
+                    amount: Usdc::new(float!(499.99))
+                },
+                &relay
+            ),
+            Err(UsdcTriggerSkip::BelowRelayMinimum {
+                amount: Usdc::new(float!(499.99)),
+                minimum: Usdc::new(float!(500)),
+            })
+        );
+        assert_eq!(
+            fit_relay_bounds(
+                UsdcRebalanceOperation::BaseToAlpaca {
+                    amount: Usdc::new(float!(500))
+                },
+                &relay
+            ),
+            Ok(UsdcRebalanceOperation::BaseToAlpaca {
+                amount: Usdc::new(float!(500))
+            })
+        );
+        assert_eq!(
+            fit_relay_bounds(
+                UsdcRebalanceOperation::AlpacaToBase {
+                    amount: Usdc::new(float!(5000))
+                },
+                &relay
+            ),
+            Err(UsdcTriggerSkip::RelayDirectionNotBuilt)
+        );
     }
 
     #[test]
