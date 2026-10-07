@@ -106,6 +106,8 @@ pub enum RelayBridgeError {
         confirmations: u64,
         required: u64,
     },
+    #[error("receipt of tx {tx} is not from the canonical block at height {block}")]
+    NotCanonical { tx: TxHash, block: u64 },
     #[error("deposit {tx} reverted")]
     DepositReverted { tx: TxHash },
     #[error("deposit {tx} emitted no deposit for order {order_id} from our wallet")]
@@ -1033,11 +1035,14 @@ mod tests {
         }
     }
 
-    /// Our corridor-chain wallet, with a hook on its first deposit signing.
+    /// Our corridor-chain wallet, with a hook on its first deposit signing, and
+    /// with `orphan_receipts` serving every receipt as a lagging node would
+    /// from a reorged-out block.
     struct PairWallet {
         inner: TestWallet,
         on_deposit: Mutex<Option<OnDepositSigning>>,
         stable: Address,
+        orphan_receipts: bool,
     }
 
     enum OnDepositSigning {
@@ -1148,7 +1153,13 @@ mod tests {
         }
 
         async fn await_receipt(&self, tx_hash: TxHash) -> Result<TransactionReceipt, EvmError> {
-            self.inner.await_receipt(tx_hash).await
+            let mut receipt = self.inner.await_receipt(tx_hash).await?;
+
+            if self.orphan_receipts {
+                receipt.block_hash = Some(B256::repeat_byte(0xee));
+            }
+
+            Ok(receipt)
         }
 
         async fn send(
@@ -1167,13 +1178,22 @@ mod tests {
         harness: &Harness,
         on_deposit: OnDepositSigning,
     ) -> RelayBridge<TestWallet, PairWallet> {
+        hooked_bridge(harness, Some(on_deposit), false)
+    }
+
+    fn hooked_bridge(
+        harness: &Harness,
+        on_deposit: Option<OnDepositSigning>,
+        orphan_receipts: bool,
+    ) -> RelayBridge<TestWallet, PairWallet> {
         RelayBridge::try_from_ctx(RelayCtx {
             chain: Chain::Robinhood,
             ethereum_wallet: wallet(&harness.hub),
             chain_wallet: PairWallet {
                 inner: wallet(&harness.chain),
-                on_deposit: Mutex::new(Some(on_deposit)),
+                on_deposit: Mutex::new(on_deposit),
                 stable: harness.chain.stable,
+                orphan_receipts,
             },
             ethereum_confirmations: CONFIRMATIONS,
             chain_confirmations: CONFIRMATIONS,
@@ -1498,6 +1518,44 @@ mod tests {
                 RelayBridgeError::Unconfirmed { tx, confirmations: 1, required: CONFIRMATIONS }
                     if tx == fill
             ),
+            "{verify:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn receipt_from_a_reorged_out_block_is_not_canonical() {
+        let harness = Harness::new().await;
+        let bridge = hooked_bridge(&harness, None, true);
+        let order_id = B256::random();
+        let refunded = AMOUNT - U256::from(4_846);
+        let deposit = harness.send_deposit_to_hub(order_id).await;
+        harness.chain.mint(harness.chain.solver(), refunded).await;
+        let refund = harness
+            .chain
+            .pay(harness.chain.wallet(), refunded, order_id)
+            .await;
+        harness.chain.mine(CONFIRMATIONS - 1).await;
+
+        let confirm = bridge
+            .confirm_deposit(HopDirection::ToHub, RelayOrderId(order_id), deposit)
+            .await
+            .unwrap_err();
+        let verify = bridge
+            .verify_refund(
+                HopDirection::ToHub,
+                RelayOrderId(order_id),
+                AMOUNT,
+                &[refund],
+            )
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(confirm, RelayBridgeError::NotCanonical { tx, .. } if tx == deposit),
+            "{confirm:?}"
+        );
+        assert!(
+            matches!(verify, RelayBridgeError::NotCanonical { tx, .. } if tx == refund),
             "{verify:?}"
         );
     }
