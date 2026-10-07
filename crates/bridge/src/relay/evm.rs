@@ -303,6 +303,20 @@ impl<EthWallet: Wallet, ChainWallet: Wallet> SwapBridge for RelayBridge<EthWalle
         }
     }
 
+    async fn discard_prepared(&self, direction: HopDirection, prepared: &PreparedSwap) {
+        match direction {
+            HopDirection::ToHub => self.chain.discard_prepared(prepared).await,
+            HopDirection::FromHub => self.hub.discard_prepared(prepared).await,
+        }
+    }
+
+    async fn restore_prepared(&self, direction: HopDirection, prepared: &PreparedSwap) {
+        match direction {
+            HopDirection::ToHub => self.chain.restore_prepared(prepared).await,
+            HopDirection::FromHub => self.hub.restore_prepared(prepared).await,
+        }
+    }
+
     async fn broadcast_deposit(
         &self,
         direction: HopDirection,
@@ -638,6 +652,33 @@ impl<W: Wallet> RelayEnd<W> {
         Ok(Some(Bytes::from(
             IERC20::approveCall { spender, amount }.abi_encode(),
         )))
+    }
+
+    /// The deposit goes first: discarding the approve while its deposit is
+    /// still held rewinds the wallet's nonces under the deposit.
+    async fn discard_prepared(&self, prepared: &PreparedSwap) {
+        let approve = match prepared {
+            PreparedSwap::Deposit(pair) => {
+                self.wallet.discard_prepared(pair.deposit.tx_hash()).await;
+                pair.approve.as_ref()
+            }
+            PreparedSwap::ApproveOnly { approve } => Some(approve),
+        };
+
+        if let Some(approve) = approve {
+            self.wallet.discard_prepared(approve.tx_hash()).await;
+        }
+    }
+
+    async fn restore_prepared(&self, prepared: &PreparedSwap) {
+        let (approve, deposit) = match prepared {
+            PreparedSwap::Deposit(pair) => (pair.approve.as_ref(), Some(&pair.deposit)),
+            PreparedSwap::ApproveOnly { approve } => (Some(approve), None),
+        };
+
+        for prepared in approve.into_iter().chain(deposit) {
+            self.wallet.restore_prepared(prepared).await;
+        }
     }
 
     async fn broadcast_deposit(
@@ -1386,12 +1427,12 @@ mod tests {
     }
 
     /// The nonces the wallet hands the next two sends it signs.
-    async fn next_two_nonces(wallet: &PairWallet) -> [u64; 2] {
+    async fn next_two_nonces(wallet: &impl Wallet) -> [u64; 2] {
         let mut nonces = [0; 2];
 
         for nonce in &mut nonces {
             *nonce = wallet
-                .prepare_pending(wallet.stable, probe_calldata(), "nonce probe")
+                .prepare_pending(Address::ZERO, probe_calldata(), "nonce probe")
                 .await
                 .unwrap()
                 .nonce();
@@ -1599,6 +1640,50 @@ mod tests {
             "{error:?}"
         );
         assert_eq!(next_two_nonces(&bridge.chain.wallet).await, [0, 1]);
+    }
+
+    #[tokio::test]
+    async fn discarded_swap_frees_its_nonces() {
+        let harness = Harness::new().await;
+        let quote = quote(&harness.chain, B256::random(), true);
+        let prepared = harness
+            .bridge
+            .prepare_deposit(HopDirection::ToHub, &quote)
+            .await
+            .unwrap();
+
+        harness
+            .bridge
+            .discard_prepared(HopDirection::ToHub, &prepared)
+            .await;
+
+        assert_eq!(next_two_nonces(&harness.bridge.chain.wallet).await, [0, 1]);
+    }
+
+    #[tokio::test]
+    async fn restored_swap_keeps_its_nonces_after_a_restart() {
+        let harness = Harness::new().await;
+        let quote = quote(&harness.chain, B256::random(), true);
+        let prepared = harness
+            .bridge
+            .prepare_deposit(HopDirection::ToHub, &quote)
+            .await
+            .unwrap();
+        let restarted = RelayBridge::try_from_ctx(RelayCtx {
+            chain: Chain::Robinhood,
+            ethereum_wallet: wallet(&harness.hub),
+            chain_wallet: wallet(&harness.chain),
+            ethereum_confirmations: CONFIRMATIONS,
+            chain_confirmations: CONFIRMATIONS,
+        })
+        .unwrap()
+        .with_local_contracts(contracts(&harness.hub), contracts(&harness.chain));
+
+        restarted
+            .restore_prepared(HopDirection::ToHub, &prepared)
+            .await;
+
+        assert_eq!(next_two_nonces(&restarted.chain.wallet).await, [2, 3]);
     }
 
     #[tokio::test]
