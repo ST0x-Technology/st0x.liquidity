@@ -674,6 +674,54 @@ mod tests {
         );
     }
 
+    /// Robinhood via Relay gets its own cash transfer service, which the
+    /// handles route its transfers to.
+    #[tokio::test]
+    async fn relay_corridor_builds_a_service() {
+        let server = MockServer::start();
+        let (services, chain_wallet) = make_services_with_mock_wallet(&server).await;
+        let robinhood_relay = UsdcCorridor::HubRouted {
+            chain: Chain::Robinhood,
+            hop: HopKind::Relay,
+        };
+
+        let pool = crate::test_utils::setup_test_db().await;
+        let usdc_store = Arc::new(test_store(pool.clone(), ()));
+
+        let handles = services
+            .into_usdc_corridor_transfers(
+                vec![corridor_endpoints(robinhood_relay, chain_wallet)],
+                &usdc_store,
+                &pool,
+                &BotGasReceiptCostEnqueuer::Disabled,
+                &UsdcDriverGate::unpaused(),
+            )
+            .unwrap();
+
+        let transfer = UsdcRebalanceId(Uuid::new_v4());
+        usdc_store
+            .send(
+                &transfer,
+                UsdcRebalanceCommand::BeginWithdrawal {
+                    direction: RebalanceDirection::BaseToAlpaca,
+                    corridor: robinhood_relay,
+                    amount: Usdc::new(float!(1)),
+                    from_block: 0,
+                },
+            )
+            .await
+            .unwrap();
+        let error = handles
+            .recheck_deposit
+            .recheck_deposit(&transfer, None)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, UsdcRecheckError::NotDepositFailed { ref id, .. } if *id == transfer),
+            "got {error:?}"
+        );
+    }
+
     /// A corridor with no bridge wired refuses startup by name rather than
     /// building a transfer that could never move cash.
     #[tokio::test]
