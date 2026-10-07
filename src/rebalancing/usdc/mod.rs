@@ -312,6 +312,10 @@ pub enum UsdcTransferError {
     /// approve went out alone and the next attempt signs the deposit again.
     #[error("USDC rebalance {id}: another send split the swap's approve and deposit; retrying")]
     SwapPairSplit { id: UsdcRebalanceId },
+    /// The task that signs and persists the swap pair panicked. A pair it
+    /// persisted is sent by the retry, which otherwise signs one.
+    #[error("USDC rebalance {id}: the Relay pair prepare task panicked")]
+    SwapPrepareTaskPanicked { id: UsdcRebalanceId },
     #[error(
         "USDC transfer corridor mismatch: transfer {id} runs on the {recorded} corridor, \
          this service serves {}; left untouched for the operator",
@@ -757,6 +761,7 @@ impl UsdcTransferError {
             | Self::RelayBridge(_)
             | Self::SwapQuoteOutOfBounds { .. }
             | Self::SwapPairSplit { .. }
+            | Self::SwapPrepareTaskPanicked { .. }
             | Self::EthereumChainMissing(_) => None,
         }
     }
@@ -829,6 +834,7 @@ impl BotGasFailureClassifier for UsdcTransferError {
             | Self::RelayBridge(_)
             | Self::SwapQuoteOutOfBounds { .. }
             | Self::SwapPairSplit { .. }
+            | Self::SwapPrepareTaskPanicked { .. }
             | Self::EthereumChainMissing(_) => false,
         }
     }
