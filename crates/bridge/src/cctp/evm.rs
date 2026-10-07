@@ -1641,7 +1641,6 @@ mod tests {
     use alloy::rpc::types::Log;
 
     use super::*;
-    use crate::stable_endpoint::{StableEndpointError, credit_in_receipt};
 
     /// Guards the values of the allowance constants against accidental change.
     ///
@@ -1738,106 +1737,6 @@ mod tests {
             to: Some(Address::ZERO),
             contract_address: None,
         }
-    }
-
-    const USDC: Address = Address::repeat_byte(0x11);
-    const WALLET: Address = Address::repeat_byte(0x22);
-
-    fn transfer_log(token: Address, to: Address, value: U256) -> Log {
-        let event = IERC20::Transfer {
-            from: Address::repeat_byte(0x33),
-            to,
-            value,
-        };
-
-        Log {
-            inner: PrimitiveLog {
-                address: token,
-                data: event.encode_log_data(),
-            },
-            block_hash: None,
-            block_number: None,
-            block_timestamp: None,
-            transaction_hash: Some(TxHash::ZERO),
-            transaction_index: None,
-            log_index: None,
-            removed: false,
-        }
-    }
-
-    #[test]
-    fn usdc_credit_sums_every_usdc_transfer_to_the_wallet() {
-        let receipt = receipt_with_logs(vec![
-            transfer_log(USDC, WALLET, U256::from(600_000u64)),
-            transfer_log(USDC, WALLET, U256::from(400_000u64)),
-        ]);
-
-        assert_eq!(
-            credit_in_receipt(&receipt, USDC, None, WALLET).unwrap(),
-            U256::from(1_000_000u64)
-        );
-    }
-
-    #[test]
-    fn usdc_credit_ignores_other_tokens_and_other_recipients() {
-        let other_token = Address::repeat_byte(0x44);
-        let elsewhere = Address::repeat_byte(0x55);
-        let receipt = receipt_with_logs(vec![
-            transfer_log(other_token, WALLET, U256::from(7_000_000u64)),
-            transfer_log(USDC, elsewhere, U256::from(9_000_000u64)),
-            transfer_log(USDC, WALLET, U256::from(1_000_000u64)),
-            mint_log(3, 5_000_000),
-        ]);
-
-        assert_eq!(
-            credit_in_receipt(&receipt, USDC, None, WALLET).unwrap(),
-            U256::from(1_000_000u64)
-        );
-    }
-
-    #[test]
-    fn usdc_credit_overflow_is_an_error() {
-        let receipt = receipt_with_logs(vec![
-            transfer_log(USDC, WALLET, U256::MAX),
-            transfer_log(USDC, WALLET, U256::from(1u64)),
-        ]);
-
-        let error = credit_in_receipt(&receipt, USDC, None, WALLET).unwrap_err();
-
-        assert!(
-            matches!(error, StableEndpointError::CreditOverflow { tx_hash } if tx_hash == TxHash::ZERO),
-            "got: {error:?}"
-        );
-    }
-
-    #[test]
-    fn usdc_credit_fails_on_an_undecodable_usdc_transfer_log() {
-        // The Transfer topic without its indexed from/to topics.
-        let malformed = Log {
-            inner: PrimitiveLog::new_unchecked(
-                USDC,
-                vec![IERC20::Transfer::SIGNATURE_HASH],
-                Bytes::new(),
-            ),
-            block_hash: None,
-            block_number: None,
-            block_timestamp: None,
-            transaction_hash: Some(TxHash::ZERO),
-            transaction_index: None,
-            log_index: None,
-            removed: false,
-        };
-        let receipt = receipt_with_logs(vec![
-            transfer_log(USDC, WALLET, U256::from(1_000_000u64)),
-            malformed,
-        ]);
-
-        let error = credit_in_receipt(&receipt, USDC, None, WALLET).unwrap_err();
-
-        assert!(
-            matches!(error, StableEndpointError::TransferLogDecode { tx_hash, .. } if tx_hash == TxHash::ZERO),
-            "got: {error:?}"
-        );
     }
 
     #[test]

@@ -7750,4 +7750,24 @@ mod tests {
         };
         assert_eq!(from_block, old_floor - 50);
     }
+
+    #[test]
+    fn stable_endpoint_credit_errors_map_to_the_usdc_cctp_variants() {
+        let tx_hash = TxHash::repeat_byte(0x42);
+
+        let overflow = CctpError::from(StableEndpointError::CreditOverflow { tx_hash });
+        assert!(
+            matches!(overflow, CctpError::UsdcCreditOverflow { tx_hash: mapped } if mapped == tx_hash),
+            "got: {overflow:?}"
+        );
+
+        let decode = CctpError::from(StableEndpointError::TransferLogDecode {
+            tx_hash,
+            source: alloy::sol_types::Error::custom("malformed Transfer log"),
+        });
+        assert!(
+            matches!(decode, CctpError::UsdcTransferLogDecode { tx_hash: mapped, .. } if mapped == tx_hash),
+            "got: {decode:?}"
+        );
+    }
 }

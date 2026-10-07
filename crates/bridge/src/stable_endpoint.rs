@@ -292,7 +292,7 @@ impl<'wallet, W: Wallet> StableEndpoint<'wallet, W> {
 /// `sender` only when one is given. A log carrying the `Transfer` topic that
 /// does not decode fails the read: skipping it would undercredit the
 /// transfer silently.
-pub(crate) fn credit_in_receipt(
+fn credit_in_receipt(
     receipt: &TransactionReceipt,
     stable: Address,
     sender: Option<Address>,
@@ -322,4 +322,140 @@ pub(crate) fn credit_in_receipt(
                 .checked_add(transfer.value)
                 .ok_or(StableEndpointError::CreditOverflow { tx_hash })
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use alloy::consensus::{Receipt, ReceiptEnvelope, ReceiptWithBloom};
+    use alloy::primitives::{Bloom, Log as PrimitiveLog};
+    use alloy::rpc::types::Log;
+
+    use super::*;
+
+    const USDC: Address = Address::repeat_byte(0x11);
+    const WALLET: Address = Address::repeat_byte(0x22);
+
+    fn rpc_log(inner: PrimitiveLog) -> Log {
+        Log {
+            inner,
+            block_hash: None,
+            block_number: None,
+            block_timestamp: None,
+            transaction_hash: Some(TxHash::ZERO),
+            transaction_index: None,
+            log_index: None,
+            removed: false,
+        }
+    }
+
+    fn transfer_log(token: Address, to: Address, value: U256) -> Log {
+        let event = IERC20::Transfer {
+            from: Address::repeat_byte(0x33),
+            to,
+            value,
+        };
+
+        rpc_log(PrimitiveLog {
+            address: token,
+            data: event.encode_log_data(),
+        })
+    }
+
+    fn receipt_with_logs(logs: Vec<Log>) -> TransactionReceipt {
+        TransactionReceipt {
+            inner: ReceiptEnvelope::Eip1559(ReceiptWithBloom {
+                receipt: Receipt {
+                    status: true.into(),
+                    cumulative_gas_used: 0,
+                    logs,
+                },
+                logs_bloom: Bloom::default(),
+            }),
+            transaction_hash: TxHash::ZERO,
+            transaction_index: Some(0),
+            block_hash: None,
+            block_number: Some(1),
+            gas_used: 0,
+            effective_gas_price: 0,
+            blob_gas_used: None,
+            blob_gas_price: None,
+            from: Address::ZERO,
+            to: Some(Address::ZERO),
+            contract_address: None,
+        }
+    }
+
+    #[test]
+    fn usdc_credit_sums_every_usdc_transfer_to_the_wallet() {
+        let receipt = receipt_with_logs(vec![
+            transfer_log(USDC, WALLET, U256::from(600_000u64)),
+            transfer_log(USDC, WALLET, U256::from(400_000u64)),
+        ]);
+
+        assert_eq!(
+            credit_in_receipt(&receipt, USDC, None, WALLET).unwrap(),
+            U256::from(1_000_000u64)
+        );
+    }
+
+    #[test]
+    fn usdc_credit_ignores_other_tokens_other_recipients_and_other_events() {
+        let other_token = Address::repeat_byte(0x44);
+        let elsewhere = Address::repeat_byte(0x55);
+        let approval = IERC20::Approval {
+            owner: Address::repeat_byte(0x33),
+            spender: WALLET,
+            value: U256::from(5_000_000u64),
+        };
+        let receipt = receipt_with_logs(vec![
+            transfer_log(other_token, WALLET, U256::from(7_000_000u64)),
+            transfer_log(USDC, elsewhere, U256::from(9_000_000u64)),
+            transfer_log(USDC, WALLET, U256::from(1_000_000u64)),
+            rpc_log(PrimitiveLog {
+                address: USDC,
+                data: approval.encode_log_data(),
+            }),
+        ]);
+
+        assert_eq!(
+            credit_in_receipt(&receipt, USDC, None, WALLET).unwrap(),
+            U256::from(1_000_000u64)
+        );
+    }
+
+    #[test]
+    fn usdc_credit_overflow_is_an_error() {
+        let receipt = receipt_with_logs(vec![
+            transfer_log(USDC, WALLET, U256::MAX),
+            transfer_log(USDC, WALLET, U256::from(1u64)),
+        ]);
+
+        let error = credit_in_receipt(&receipt, USDC, None, WALLET).unwrap_err();
+
+        assert!(
+            matches!(error, StableEndpointError::CreditOverflow { tx_hash } if tx_hash == TxHash::ZERO),
+            "got: {error:?}"
+        );
+    }
+
+    #[test]
+    fn usdc_credit_fails_on_an_undecodable_usdc_transfer_log() {
+        // The Transfer topic without its indexed from/to topics.
+        let malformed = rpc_log(PrimitiveLog::new_unchecked(
+            USDC,
+            vec![IERC20::Transfer::SIGNATURE_HASH],
+            Bytes::new(),
+        ));
+        let receipt = receipt_with_logs(vec![
+            transfer_log(USDC, WALLET, U256::from(1_000_000u64)),
+            malformed,
+        ]);
+
+        let error = credit_in_receipt(&receipt, USDC, None, WALLET).unwrap_err();
+
+        assert!(
+            matches!(error, StableEndpointError::TransferLogDecode { tx_hash, .. } if tx_hash == TxHash::ZERO),
+            "got: {error:?}"
+        );
+    }
 }
