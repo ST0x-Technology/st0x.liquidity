@@ -14,7 +14,7 @@ use chrono::{DateTime, Utc};
 use sqlx::SqlitePool;
 use std::collections::BTreeMap;
 use std::sync::Arc;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 use tokio::sync::Mutex;
 use tracing::{error, info, warn};
 
@@ -91,10 +91,11 @@ impl<Signer: Wallet> RelayHop<Signer> {
             Some(UsdcRebalance::SwapQuoted {
                 quote,
                 split_approves,
+                quoted_at,
                 ..
             }) => {
                 let pair = self
-                    .sign_swap_pair(cqrs, id, &quote, &split_approves)
+                    .sign_swap_pair(cqrs, id, &quote, quoted_at, &split_approves)
                     .await?;
                 Ok(Some((pair, quote.order_id)))
             }
@@ -141,12 +142,14 @@ impl<Signer: Wallet> RelayHop<Signer> {
 
     /// Signs the approve and deposit and persists both before either is
     /// broadcast. Approves that went out alone are sent again first, so the
-    /// pair is not signed behind a nonce no node holds.
+    /// pair is not signed behind a nonce no node holds. An expired quote is
+    /// not signed.
     async fn sign_swap_pair(
         &self,
         cqrs: &Store<UsdcRebalance>,
         id: &UsdcRebalanceId,
         quote: &SwapQuote,
+        quoted_at: DateTime<Utc>,
         split_approves: &[PreparedTransaction],
     ) -> Result<PreparedSwapDeposit, UsdcTransferError> {
         for approve in split_approves {
@@ -154,6 +157,19 @@ impl<Signer: Wallet> RelayHop<Signer> {
                 .broadcast_approve(TO_HUB, approve)
                 .await
                 .map_err(Box::new)?;
+        }
+
+        // A quote resumed after downtime or retries may be stale. Nothing
+        // re-quotes a recorded quote yet, so the transfer stays at
+        // `SwapQuoted` with its guard held until a re-quote or a redeposit
+        // is built to move it on.
+        if quote_expired(quote, quoted_at, self.bounds.quote_max_age, Utc::now()) {
+            warn!(target: "rebalance", %id, %quoted_at, deadline = %quote.deadline, max_age = ?self.bounds.quote_max_age, "Relay quote expired before its deposit was signed; not signing, the transfer holds its guard at SwapQuoted");
+            return Err(UsdcTransferError::SwapQuoteExpired {
+                id: id.clone(),
+                quoted_at,
+                deadline: quote.deadline,
+            });
         }
 
         // After a split the allowance may already cover the deposit: the
@@ -630,6 +646,21 @@ where
 
         envelopes.len()
     }
+}
+
+/// Whether `quote`, recorded at `quoted_at`, is past its deadline or older
+/// than `max_age` at `now`. An age that does not fit counts as expired.
+fn quote_expired(
+    quote: &SwapQuote,
+    quoted_at: DateTime<Utc>,
+    max_age: Duration,
+    now: DateTime<Utc>,
+) -> bool {
+    let stale_at = chrono::TimeDelta::from_std(max_age)
+        .ok()
+        .and_then(|max_age| quoted_at.checked_add_signed(max_age));
+
+    now >= quote.deadline || stale_at.is_none_or(|stale_at| now >= stale_at)
 }
 
 /// The persisted form of an accepted quote.
@@ -1684,12 +1715,17 @@ mod tests {
             record_quoted(&store, &id, quote).await;
             tokio::time::sleep(Duration::from_millis(100)).await;
 
-            let _refused = tokio::time::timeout(
+            let error = tokio::time::timeout(
                 Duration::from_secs(30),
                 transfer.resume_base_to_alpaca(&id, Usdc::new(float!(100)), ROBINHOOD_RELAY),
             )
             .await
-            .expect("the attempt ends");
+            .expect("the attempt ends")
+            .unwrap_err();
+            assert!(
+                matches!(&error, UsdcTransferError::SwapQuoteExpired { id: refused, .. } if *refused == id),
+                "got {error:?}"
+            );
 
             let state = store.load(&id).await.unwrap().unwrap();
             assert_eq!(state.state_name(), "SwapQuoted", "{state:?}");
