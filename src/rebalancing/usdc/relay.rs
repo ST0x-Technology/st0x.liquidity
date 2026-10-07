@@ -1303,6 +1303,9 @@ mod tests {
     enum OnDepositSigning {
         /// The signing returns this long after the deposit's nonce is taken.
         SlowAfterSigning(Duration),
+        /// Another send from this wallet takes the next nonce first, and is
+        /// broadcast so no nonce is left as a gap.
+        AnotherSendFirst { to: Address },
     }
 
     impl BroadcastWitness {
@@ -1373,14 +1376,28 @@ mod tests {
             note: &str,
         ) -> Result<PreparedTransaction, EvmError> {
             let hook = self.on_deposit_signing.lock().unwrap().take();
+            if let Some(OnDepositSigning::AnotherSendFirst { to }) = hook {
+                let calldata = IERC20::approveCall {
+                    spender: Address::repeat_byte(0x99),
+                    amount: U256::ZERO,
+                }
+                .abi_encode();
+                let another = self
+                    .inner
+                    .prepare_pending(to, calldata.into(), "another send")
+                    .await?;
+                self.inner
+                    .broadcast_prepared(&another, "another send")
+                    .await?;
+            }
+
             let prepared = self
                 .inner
                 .prepare_pending_with_gas_limit(contract, calldata, unpadded_gas_limit, note)
                 .await?;
 
-            match hook {
-                Some(OnDepositSigning::SlowAfterSigning(delay)) => tokio::time::sleep(delay).await,
-                None => {}
+            if let Some(OnDepositSigning::SlowAfterSigning(delay)) = hook {
+                tokio::time::sleep(delay).await;
             }
 
             Ok(prepared)
@@ -1832,5 +1849,194 @@ mod tests {
             panic!("expected SwapDeposited, got {state:?}");
         };
         assert_eq!(deposit_tx, deposit.tx_hash());
+    }
+
+    /// Another send takes the nonce between the approve and the deposit: the
+    /// approve is persisted on `SwapQuoted` and goes out alone, and the next
+    /// attempt sends it again, signs the deposit alone at the nonce after
+    /// the other send's and persists it with the split approve.
+    #[tokio::test]
+    async fn split_pair_sends_its_approve_alone_then_the_deposit() {
+        let anvil = spawn_anvil(Anvil::new());
+        let (wallet, contracts) = funded_relay_end(&anvil).await;
+        let store = Arc::new(test_store(setup_test_db().await, ()));
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let witness = Arc::new(
+            BroadcastWitness::new(wallet.clone(), store.clone(), id.clone()).on_deposit_signing(
+                OnDepositSigning::AnotherSendFirst {
+                    to: contracts.stable,
+                },
+            ),
+        );
+        let chain_wallet: TestWallet = witness.clone();
+        let server = MockServer::start();
+        let relay_api = MockServer::start();
+        let transfer = relay_transfer(
+            &server,
+            &relay_api,
+            wallet.clone(),
+            chain_wallet,
+            contracts,
+            store.clone(),
+        )
+        .await;
+        record_quoted(
+            &store,
+            &id,
+            exact_quote(&wallet, contracts, B256::repeat_byte(0x0d)).await,
+        )
+        .await;
+        let first_nonce = wallet
+            .provider()
+            .get_transaction_count(wallet.address())
+            .await
+            .unwrap();
+
+        let error = transfer
+            .resume_base_to_alpaca(&id, Usdc::new(float!(100)), ROBINHOOD_RELAY)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&error, UsdcTransferError::SwapPairSplit { id: split } if *split == id),
+            "got {error:?}"
+        );
+        let state = store.load(&id).await.unwrap().unwrap();
+        let UsdcRebalance::SwapQuoted { split_approves, .. } = &state else {
+            panic!("expected SwapQuoted, got {state:?}");
+        };
+        let [approve] = split_approves.as_slice() else {
+            panic!("expected one split approve, got {split_approves:?}");
+        };
+        assert_eq!(approve.nonce(), first_nonce);
+        assert_eq!(witness.broadcasts(), vec![approve.tx_hash()]);
+
+        tokio::time::timeout(
+            Duration::from_secs(30),
+            transfer.resume_base_to_alpaca(&id, Usdc::new(float!(100)), ROBINHOOD_RELAY),
+        )
+        .await
+        .expect("the deposit mines")
+        .unwrap();
+
+        let state = store.load(&id).await.unwrap().unwrap();
+        let UsdcRebalance::SwapDeposited { deposit_tx, .. } = state else {
+            panic!("expected SwapDeposited, got {state:?}");
+        };
+        assert_eq!(
+            witness.broadcasts(),
+            vec![approve.tx_hash(), approve.tx_hash(), deposit_tx],
+            "the split approve, again, then the deposit"
+        );
+        let persisted_at_deposit = witness.seen.lock().unwrap()[2].1.clone();
+        assert_eq!(
+            persisted_at_deposit,
+            vec![approve.tx_hash(), deposit_tx],
+            "SwapDepositPrepared holds the split approve and the deposit alone"
+        );
+        let deposit = wallet
+            .provider()
+            .get_transaction_by_hash(deposit_tx)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            alloy::consensus::Transaction::nonce(&deposit),
+            first_nonce + 2
+        );
+    }
+
+    /// A failed pair write that committed anyway is sent; one that did not
+    /// commit releases the pair's nonces for the next signing.
+    #[tokio::test]
+    async fn failed_pair_write_releases_nonces_only_when_not_persisted() {
+        let anvil = spawn_anvil(Anvil::new());
+        let (wallet, contracts) = funded_relay_end(&anvil).await;
+        let pool = setup_test_db().await;
+        let store = Arc::new(test_store(pool.clone(), ()));
+        let server = MockServer::start();
+        let relay_api = MockServer::start();
+        let transfer = relay_transfer(
+            &server,
+            &relay_api,
+            wallet.clone(),
+            wallet.clone(),
+            contracts,
+            store.clone(),
+        )
+        .await;
+
+        let committed = UsdcRebalanceId(Uuid::new_v4());
+        record_quoted(
+            &store,
+            &committed,
+            exact_quote(&wallet, contracts, B256::repeat_byte(0x0d)).await,
+        )
+        .await;
+        let persisted = PreparedSwapDeposit {
+            approve: None,
+            deposit: PreparedTransaction::for_test(TxHash::repeat_byte(0xd1), 40),
+        };
+        store
+            .send(
+                &committed,
+                UsdcRebalanceCommand::PrepareSwapDeposit {
+                    approve: None,
+                    deposit: persisted.deposit.clone(),
+                },
+            )
+            .await
+            .unwrap();
+        transfer
+            .hop
+            .persist_swap_pair(&store, &committed, &persisted)
+            .await
+            .unwrap();
+
+        let unpersisted = UsdcRebalanceId(Uuid::new_v4());
+        let quote = exact_quote(&wallet, contracts, B256::repeat_byte(0x0e)).await;
+        record_quoted(&store, &unpersisted, quote.clone()).await;
+        let first_nonce = wallet
+            .provider()
+            .get_transaction_count(wallet.address())
+            .await
+            .unwrap();
+        let PreparedSwap::Deposit(pair) = transfer
+            .hop
+            .bridge
+            .prepare_deposit(TO_HUB, &relay_quote(&quote, true).unwrap())
+            .await
+            .unwrap()
+        else {
+            panic!("expected a signed pair");
+        };
+        sqlx::query(
+            "CREATE TRIGGER refuse_swap_pair BEFORE INSERT ON events \
+             WHEN NEW.event_type = 'UsdcRebalanceEvent::SwapDepositPrepared' \
+             BEGIN SELECT RAISE(ABORT, 'refused for the test'); END",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        transfer
+            .hop
+            .persist_swap_pair(&store, &unpersisted, &pair)
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            store
+                .load(&unpersisted)
+                .await
+                .unwrap()
+                .unwrap()
+                .state_name(),
+            "SwapQuoted"
+        );
+        let next = wallet
+            .prepare_pending(contracts.stable, quote.approve.unwrap().data, "next send")
+            .await
+            .unwrap();
+        assert_eq!(next.nonce(), first_nonce, "the pair's nonces are released");
     }
 }
