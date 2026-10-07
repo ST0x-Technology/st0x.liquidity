@@ -99,8 +99,12 @@ to `RelayError::RateLimited { retry_after }` from the `Retry-After` header
   `protocol.v2.orderId`), the last word of the deposit calldata
   `depositErc20(address depositor, address token, uint256 amount, bytes32 id)`
   (selector `0xe8017952`). The client reads `RelayQuote::order_id` from that
-  calldata and refuses the quote unless it equals `protocol.v2.orderId`, so the
-  order it checks is the one the deposit funds.
+  calldata and refuses the quote unless it equals `protocol.v2.orderId` and the
+  id it derives from `protocol.v2.orderData`, so the order it checks is the one
+  the deposit funds. The derivation is Relay's settlement SDK `getOrderId`: the
+  EIP-712 struct hash of the v1 `Order` (`version`, `solverChainId`, `solver`,
+  `salt`, `inputs`, `output`, `fees`), with every EVM address as its 20 raw
+  bytes; it reproduces the id of every pinned quote.
 - **`ttl` does not bound the deadline.** The order's
   `protocol.v2.orderData.output.deadline` (and each refund's `deadline`) lands a
   week after the quote with `ttl` unset, `1800` or `60` (live, 2026-10-01; the
