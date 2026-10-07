@@ -895,7 +895,7 @@ mod tests {
     use crate::rebalancing::usdc::{MarketMakingUsdcEndpoints, UsdcSettlementParams};
     use crate::telemetry::TelemetrySender;
     use crate::telemetry::broker::InstrumentedAlpacaBroker;
-    use crate::test_utils::{anvil_wallet, setup_test_db, spawn_anvil};
+    use crate::test_utils::{TestAnvilInstance, anvil_wallet, setup_test_db, spawn_anvil};
     use crate::usdc_rebalance::TransferRef;
 
     type TestWallet = Arc<dyn Wallet<Provider = RootProvider>>;
@@ -1187,6 +1187,39 @@ mod tests {
         store: Arc<Store<UsdcRebalance>>,
         id: UsdcRebalanceId,
         seen: std::sync::Mutex<Vec<(TxHash, Vec<TxHash>)>>,
+        on_deposit_signing: std::sync::Mutex<Option<OnDepositSigning>>,
+    }
+
+    /// What the wallet does, once, when the transfer signs a Relay deposit.
+    enum OnDepositSigning {
+        /// The signing returns this long after the deposit's nonce is taken.
+        SlowAfterSigning(Duration),
+    }
+
+    impl BroadcastWitness {
+        fn new(inner: TestWallet, store: Arc<Store<UsdcRebalance>>, id: UsdcRebalanceId) -> Self {
+            Self {
+                inner,
+                store,
+                id,
+                seen: std::sync::Mutex::new(Vec::new()),
+                on_deposit_signing: std::sync::Mutex::new(None),
+            }
+        }
+
+        fn on_deposit_signing(self, hook: OnDepositSigning) -> Self {
+            *self.on_deposit_signing.lock().unwrap() = Some(hook);
+            self
+        }
+
+        fn broadcasts(&self) -> Vec<TxHash> {
+            self.seen
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(tx, _)| *tx)
+                .collect()
+        }
     }
 
     #[async_trait]
@@ -1230,9 +1263,18 @@ mod tests {
             unpadded_gas_limit: u64,
             note: &str,
         ) -> Result<PreparedTransaction, EvmError> {
-            self.inner
+            let hook = self.on_deposit_signing.lock().unwrap().take();
+            let prepared = self
+                .inner
                 .prepare_pending_with_gas_limit(contract, calldata, unpadded_gas_limit, note)
-                .await
+                .await?;
+
+            match hook {
+                Some(OnDepositSigning::SlowAfterSigning(delay)) => tokio::time::sleep(delay).await,
+                None => {}
+            }
+
+            Ok(prepared)
         }
 
         async fn broadcast_prepared(
@@ -1307,11 +1349,12 @@ mod tests {
         }
     }
 
-    /// The approve and the deposit are persisted in one event before either
-    /// is broadcast, and the deposit recorded is the persisted one.
-    #[tokio::test]
-    async fn relay_step_persists_both_envelopes_before_broadcast() {
-        let anvil = spawn_anvil(Anvil::new());
+    /// The quote's input, in the stable's base units.
+    const AMOUNT_IN: u64 = 100_000_000;
+
+    /// A deployed Relay end on `anvil` whose stable credits the bot wallet
+    /// (anvil's first key) with `AMOUNT_IN`.
+    async fn funded_relay_end(anvil: &TestAnvilInstance) -> (TestWallet, RelayEndContracts) {
         let key = B256::from_slice(&anvil.keys()[0].to_bytes());
         let wallet = anvil_wallet(anvil.endpoint_url(), &key);
         let deployer = ProviderBuilder::new()
@@ -1322,9 +1365,8 @@ mod tests {
         let contracts = st0x_bridge::relay::deploy_relay_end(&deployer)
             .await
             .unwrap();
-        let amount_in = U256::from(100_000_000u64);
         MintableStable::new(contracts.stable, &deployer)
-            .mint(wallet.address(), amount_in)
+            .mint(wallet.address(), U256::from(AMOUNT_IN))
             .send()
             .await
             .unwrap()
@@ -1332,30 +1374,20 @@ mod tests {
             .await
             .unwrap();
 
-        let store = Arc::new(test_store(setup_test_db().await, ()));
-        let id = UsdcRebalanceId(Uuid::new_v4());
-        let witness = Arc::new(BroadcastWitness {
-            inner: wallet.clone(),
-            store: store.clone(),
-            id: id.clone(),
-            seen: std::sync::Mutex::new(Vec::new()),
-        });
-        let chain_wallet: TestWallet = witness.clone();
-        let server = MockServer::start();
-        let relay_api = MockServer::start();
-        let transfer = relay_transfer(
-            &server,
-            &relay_api,
-            wallet.clone(),
-            chain_wallet,
-            contracts,
-            store.clone(),
-        )
-        .await;
+        (wallet, contracts)
+    }
 
-        let order_id = B256::repeat_byte(0x0d);
+    /// A live quote for `AMOUNT_IN` whose approve and deposit call
+    /// `contracts` for `wallet`.
+    async fn exact_quote(
+        wallet: &TestWallet,
+        contracts: RelayEndContracts,
+        order_id: B256,
+    ) -> SwapQuote {
+        let amount_in = U256::from(AMOUNT_IN);
         let chain_id = wallet.provider().get_chain_id().await.unwrap();
         let mut quote = crate::usdc_rebalance::swap_quote_for_test(amount_in, order_id);
+        quote.deadline = Utc::now() + chrono::Duration::hours(1);
         quote.approve = Some(SwapStep {
             chain_id,
             to: contracts.stable,
@@ -1380,6 +1412,12 @@ mod tests {
             .into(),
             value: U256::ZERO,
         };
+
+        quote
+    }
+
+    /// Records a Robinhood Relay transfer of `AMOUNT_IN` up to `SwapQuoted`.
+    async fn record_quoted(store: &Store<UsdcRebalance>, id: &UsdcRebalanceId, quote: SwapQuote) {
         for command in [
             UsdcRebalanceCommand::Initiate {
                 direction: RebalanceDirection::BaseToAlpaca,
@@ -1394,8 +1432,38 @@ mod tests {
                 quote: Box::new(quote),
             },
         ] {
-            store.send(&id, command).await.unwrap();
+            store.send(id, command).await.unwrap();
         }
+    }
+
+    /// The approve and the deposit are persisted in one event before either
+    /// is broadcast, and the deposit recorded is the persisted one.
+    #[tokio::test]
+    async fn relay_step_persists_both_envelopes_before_broadcast() {
+        let anvil = spawn_anvil(Anvil::new());
+        let (wallet, contracts) = funded_relay_end(&anvil).await;
+        let store = Arc::new(test_store(setup_test_db().await, ()));
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let witness = Arc::new(BroadcastWitness::new(
+            wallet.clone(),
+            store.clone(),
+            id.clone(),
+        ));
+        let chain_wallet: TestWallet = witness.clone();
+        let server = MockServer::start();
+        let relay_api = MockServer::start();
+        let transfer = relay_transfer(
+            &server,
+            &relay_api,
+            wallet.clone(),
+            chain_wallet,
+            contracts,
+            store.clone(),
+        )
+        .await;
+
+        let order_id = B256::repeat_byte(0x0d);
+        record_quoted(&store, &id, exact_quote(&wallet, contracts, order_id).await).await;
 
         transfer
             .resume_base_to_alpaca(&id, Usdc::new(float!(100)), ROBINHOOD_RELAY)
@@ -1414,7 +1482,7 @@ mod tests {
         assert_eq!(*signed_order_ids, vec![order_id]);
 
         let seen = witness.seen.lock().unwrap().clone();
-        let broadcast: Vec<TxHash> = seen.iter().map(|(tx, _)| *tx).collect();
+        let broadcast = witness.broadcasts();
         assert_eq!(
             broadcast.len(),
             2,
@@ -1427,5 +1495,90 @@ mod tests {
                 "both envelopes must be persisted before {tx} is broadcast"
             );
         }
+    }
+
+    /// A job timeout that cancels the attempt after the pair is signed and
+    /// before it is persisted must not split the two: the pair is persisted
+    /// at the nonces it took, and the redrive sends it.
+    #[tokio::test]
+    async fn cancelled_attempt_still_persists_its_signed_pair() {
+        let anvil = spawn_anvil(Anvil::new());
+        let (wallet, contracts) = funded_relay_end(&anvil).await;
+        let store = Arc::new(test_store(setup_test_db().await, ()));
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let witness = Arc::new(
+            BroadcastWitness::new(wallet.clone(), store.clone(), id.clone())
+                .on_deposit_signing(OnDepositSigning::SlowAfterSigning(Duration::from_secs(1))),
+        );
+        let chain_wallet: TestWallet = witness.clone();
+        let server = MockServer::start();
+        let relay_api = MockServer::start();
+        let transfer = relay_transfer(
+            &server,
+            &relay_api,
+            wallet.clone(),
+            chain_wallet,
+            contracts,
+            store.clone(),
+        )
+        .await;
+        record_quoted(
+            &store,
+            &id,
+            exact_quote(&wallet, contracts, B256::repeat_byte(0x0d)).await,
+        )
+        .await;
+        let first_nonce = wallet
+            .provider()
+            .get_transaction_count(wallet.address())
+            .await
+            .unwrap();
+
+        let Err(_elapsed) = tokio::time::timeout(
+            Duration::from_millis(300),
+            transfer.resume_base_to_alpaca(&id, Usdc::new(float!(100)), ROBINHOOD_RELAY),
+        )
+        .await
+        else {
+            panic!("the attempt must time out while the deposit is being signed");
+        };
+
+        let persisted = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if let Some(UsdcRebalance::SwapDepositPrepared {
+                    approve, deposit, ..
+                }) = store.load(&id).await.unwrap()
+                {
+                    return (approve, deposit);
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+        let Ok((approve, deposit)) = persisted else {
+            panic!(
+                "the cancelled attempt's signed pair must still be persisted, got {:?}",
+                store.load(&id).await.unwrap()
+            );
+        };
+        assert_eq!(
+            approve.as_ref().map(PreparedTransaction::nonce),
+            Some(first_nonce)
+        );
+        assert_eq!(deposit.nonce(), first_nonce + 1);
+
+        tokio::time::timeout(
+            Duration::from_secs(30),
+            transfer.resume_base_to_alpaca(&id, Usdc::new(float!(100)), ROBINHOOD_RELAY),
+        )
+        .await
+        .expect("the redrive sends the persisted pair")
+        .unwrap();
+
+        let state = store.load(&id).await.unwrap().unwrap();
+        let UsdcRebalance::SwapDeposited { deposit_tx, .. } = state else {
+            panic!("expected SwapDeposited, got {state:?}");
+        };
+        assert_eq!(deposit_tx, deposit.tx_hash());
     }
 }
