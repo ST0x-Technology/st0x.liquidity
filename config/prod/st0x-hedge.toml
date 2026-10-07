@@ -194,8 +194,10 @@ required_confirmations = 10
 # RaindexV6 on Robinhood Chain (st0x.raindex-deploy docs/CHAINS.md).
 orderbook = "0x37FC0EFec37D19f8A221aa4F8F7600C9ba2AcD20"
 inventory_mode = "managed"
-# No venue adapters: Bebop is off on Robinhood.
-inventory_adapters = []
+# Bebop's Robinhood RFQ hook; it holds OPERATOR_ROLE on the 4663 inventory.
+inventory_adapters = [
+  { venue = "bebop", operator = "0x242FdEc55623187E80A690ff15302e63dddd7130" },
+]
 # The single RaindexInventory on 4663; it owns the orders and vaults, so it
 # is the vault owner too. The bot wallet must hold OPERATOR_ROLE on it.
 inventory = "0x1eFd85E6C384fAD9B80C6D508E9098Eb91C4eD30"

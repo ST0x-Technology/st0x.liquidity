@@ -24,11 +24,12 @@ remain unavailable.
 
 Robinhood Chain (4663) is declared the same way: fills on its two launch
 equities (wtDNUT, wtFGI) are ingested, validated against USDG and hedged, with
-no inventory adapter mapped. The build values its gas (it pays gas in ETH), so
-`active` is reachable. Production runs it `active` and rebalances against Alpaca
-the listings the pinned token file enables there (DNUT); staging runs it as a
-prefunded hedge-only secondary with `rebalancing = "disabled"` on every asset.
-It cannot rebalance cash, because it has no CCTP domain.
+Bebop's Robinhood hook mapped as the inventory adapter. The build values its gas
+(it pays gas in ETH), so `active` is reachable. Production runs it `active` and
+rebalances against Alpaca the listings the pinned token file enables there
+(DNUT); staging runs it as a prefunded hedge-only secondary with
+`rebalancing = "disabled"` on every asset. It cannot rebalance cash, because it
+has no CCTP domain.
 
 ## Features
 
