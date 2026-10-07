@@ -309,11 +309,10 @@ impl RelayHopConfig {
         let floor = min_units
             .checked_mul(U256::from(SCALE - self.max_quote_loss_bps))
             .map(|scaled| scaled / U256::from(SCALE));
-        let below_minimum = floor.is_none_or(|floor| {
-            minimum
-                .to_u256_6_decimals()
-                .is_ok_and(|minimum| floor < minimum)
-        });
+        // A floor or minimum that does not convert fails the check.
+        let below_minimum = floor
+            .zip(minimum.to_u256_6_decimals().ok())
+            .is_none_or(|(floor, minimum)| floor < minimum);
 
         if below_minimum {
             return Err(RebalancingCtxError::RelayMinTransferBelowAlpacaMinimum {

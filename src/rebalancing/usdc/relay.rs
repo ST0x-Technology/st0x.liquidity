@@ -643,23 +643,72 @@ where
     /// nonce order (lone approves, then the pair), and returns how many it
     /// restored.
     async fn restore_swap_envelopes(&self, id: &UsdcRebalanceId, state: &UsdcRebalance) -> usize {
-        let envelopes = state.prepared_swap_envelopes();
+        let (split_approves, pair) = match state {
+            UsdcRebalance::SwapQuoted { split_approves, .. } => (split_approves.as_slice(), None),
+            UsdcRebalance::SwapDepositPrepared {
+                split_approves,
+                approve,
+                deposit,
+                ..
+            } => (
+                split_approves.as_slice(),
+                Some(PreparedSwapDeposit {
+                    approve: approve.clone(),
+                    deposit: deposit.clone(),
+                }),
+            ),
+            UsdcRebalance::Converting { .. }
+            | UsdcRebalance::ConversionComplete { .. }
+            | UsdcRebalance::ConversionFailed { .. }
+            | UsdcRebalance::WithdrawalSubmitting { .. }
+            | UsdcRebalance::Withdrawing { .. }
+            | UsdcRebalance::WithdrawalComplete { .. }
+            | UsdcRebalance::WithdrawalFailed { .. }
+            | UsdcRebalance::BridgingSubmitting { .. }
+            | UsdcRebalance::Bridging { .. }
+            | UsdcRebalance::AwaitingAttestation { .. }
+            | UsdcRebalance::Attested { .. }
+            | UsdcRebalance::SwapDeposited { .. }
+            | UsdcRebalance::Bridged { .. }
+            | UsdcRebalance::BridgingFailed { .. }
+            | UsdcRebalance::DepositInitiated { .. }
+            | UsdcRebalance::DepositConfirmed { .. }
+            | UsdcRebalance::DepositFailed { .. }
+            | UsdcRebalance::Reconciled { .. } => {
+                warn!(target: "rebalance", %id, state = state.state_name(), "Transfer holds no signed Relay envelope at startup");
+                return 0;
+            }
+        };
 
-        for prepared in &envelopes {
-            let envelope = PreparedSwap::ApproveOnly {
-                approve: (*prepared).clone(),
+        for approve in split_approves {
+            let lone = PreparedSwap::ApproveOnly {
+                approve: approve.clone(),
             };
-            self.hop.bridge.restore_prepared(TO_HUB, &envelope).await;
+            self.hop.bridge.restore_prepared(TO_HUB, &lone).await;
+        }
+        if let Some(pair) = &pair {
+            let signed = PreparedSwap::Deposit(pair.clone());
+            self.hop.bridge.restore_prepared(TO_HUB, &signed).await;
         }
 
-        for prepared in &envelopes {
-            if let Err(error) = self.hop.bridge.broadcast_approve(TO_HUB, prepared).await {
-                error!(target: "operational_alert", alert = true, %id, tx = %prepared.tx_hash(), nonce = prepared.nonce(), ?error, "Could not rebroadcast a signed Relay envelope at startup; its nonce stays reserved and the transfer's resume sends it again");
+        for approve in split_approves {
+            if let Err(error) = self.hop.bridge.broadcast_approve(TO_HUB, approve).await {
+                error!(target: "operational_alert", alert = true, %id, tx = %approve.tx_hash(), nonce = approve.nonce(), ?error, "Could not rebroadcast a lone Relay approve at startup; its nonce stays reserved and the transfer's resume sends it again");
             }
         }
-        info!(target: "rebalance", %id, restored = envelopes.len(), "Reserved the nonces of a signed Relay pair");
+        if let Some(pair) = &pair
+            && let Err(error) = self.hop.bridge.broadcast_deposit(TO_HUB, pair).await
+        {
+            error!(target: "operational_alert", alert = true, %id, deposit = %pair.deposit.tx_hash(), nonce = pair.deposit.nonce(), ?error, "Could not rebroadcast a signed Relay pair at startup; its nonces stay reserved and the transfer's resume sends it again");
+        }
 
-        envelopes.len()
+        let restored = split_approves.len()
+            + pair
+                .as_ref()
+                .map_or(0, |pair| usize::from(pair.approve.is_some()) + 1);
+        info!(target: "rebalance", %id, restored, "Reserved the nonces of the signed Relay envelopes");
+
+        restored
     }
 }
 
