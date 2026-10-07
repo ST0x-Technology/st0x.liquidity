@@ -4881,9 +4881,9 @@ enum UsdcRebalance {
         amount: Usdc,
         quote: SwapQuote,
         signed_order_ids: Vec<B256>,
-        // An approve signed alone when another send split the pair; it is
-        // broadcast before the pair is signed again.
-        split_approve: Option<PreparedTransaction>,
+        // Approves signed alone when another send split a pair; each is
+        // broadcast again before a pair is signed.
+        split_approves: Vec<PreparedTransaction>,
         initiated_at: DateTime<Utc>,
         quoted_at: DateTime<Utc>,
     },
@@ -4893,7 +4893,7 @@ enum UsdcRebalance {
         amount: Usdc,
         quote: SwapQuote,
         signed_order_ids: Vec<B256>,
-        split_approve: Option<PreparedTransaction>,
+        split_approves: Vec<PreparedTransaction>,
         // Both envelopes, signed at consecutive nonces and persisted in one
         // event before either is broadcast. `None` when the standing
         // allowance covered the deposit.

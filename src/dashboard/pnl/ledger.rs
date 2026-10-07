@@ -630,6 +630,10 @@ async fn ingest_rebalance(
         | UsdcRebalanceEvent::PendingBurnCleared { .. }
         | UsdcRebalanceEvent::DepositSendPrepared { .. }
         | UsdcRebalanceEvent::DepositSendAttached { .. }
+        | UsdcRebalanceEvent::SwapQuoted { .. }
+        | UsdcRebalanceEvent::SwapApprovePrepared { .. }
+        | UsdcRebalanceEvent::SwapDepositPrepared { .. }
+        | UsdcRebalanceEvent::SwapDeposited { .. }
         | UsdcRebalanceEvent::AttestationTimedOut { .. }
         | UsdcRebalanceEvent::BridgeAttestationReceived { .. }
         | UsdcRebalanceEvent::BridgingFailed { .. }
