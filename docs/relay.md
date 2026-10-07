@@ -61,8 +61,11 @@ Statuses: `waiting` (no deposit seen; the body is only `status` and
 `refund`, `failure`. `inTxHashes[]` are the deposits, `txHashes[]` the fills or
 refunds, `failReason` and `refundFailReason` a code or `"N/A"`. Both hash fields
 are arrays; the client keeps every entry, as `IntentStatusReport::deposit_txs`
-and `IntentStatusReport::txs`, whatever the status: a `failure` with
-`TRANSACTION_NOT_INCLUDED` may still list a tx that later confirms.
+and `IntentStatusReport::txs`, whatever the status.
+
+A `failure` with `TRANSACTION_NOT_INCLUDED` that still lists a tx is
+`IntentStatus::NotIncluded` (not terminal): that tx may confirm later. With no
+tx listed it is a terminal `Failure`.
 
 A `refund` counts as a paid refund (`IntentStatus::Refund`) only with at least
 one refund tx and no `refundFailReason`. With no refund tx it is
@@ -74,10 +77,10 @@ A `success` with no tx in `txHashes` is `IntentStatus::Filling` (not terminal):
 settlement needs a fill tx to prove.
 
 Terminal statuses are `Success`, a paid `Refund`, `RefundFailed` and `Failure`;
-`Filling` and `Refunding` are not. A status name the client does not know is
-`IntentStatus::Unknown` and stays non-terminal, so the transfer keeps waiting
-rather than settling on a guess. Known fail reasons are `SLIPPAGE`,
-`TOO_LITTLE_RECEIVED`, `SOLVER_CAPACITY_EXCEEDED`, `TTL_EXPIRED`,
+`Filling`, `Refunding` and `NotIncluded` are not. A status name the client does
+not know is `IntentStatus::Unknown` and stays non-terminal, so the transfer
+keeps waiting rather than settling on a guess. Known fail reasons are
+`SLIPPAGE`, `TOO_LITTLE_RECEIVED`, `SOLVER_CAPACITY_EXCEEDED`, `TTL_EXPIRED`,
 `DEPOSIT_CONFIRMATION_TIMEOUT`, `DEPOSIT_REORGED`, `BLOCKED_WALLET`,
 `TRANSACTION_NOT_INCLUDED`, plus `DEPOSITED_AMOUNT_TOO_LOW_TO_FILL` (seen on the
 forced refund, not in the docs).

@@ -11,8 +11,8 @@ pub struct IntentStatusReport {
     /// request.
     pub deposit_txs: Vec<TxHash>,
     /// Relay's `txHashes`, kept whatever the status: the fills on `Success`,
-    /// the refunds on `Refund`, and any tx Relay lists on the others (one may
-    /// still confirm after `TRANSACTION_NOT_INCLUDED`).
+    /// the refunds on `Refund`, the tx that may still confirm on
+    /// `NotIncluded`, and any tx Relay lists on the others.
     pub txs: Vec<TxHash>,
 }
 
@@ -158,6 +158,12 @@ impl From<StatusResponse> for IntentStatusReport {
                 None if response.tx_hashes.is_empty() => IntentStatus::Refunding { reason },
                 None => IntentStatus::Refund { reason },
             },
+            "failure"
+                if reason == Some(FailReason::TransactionNotIncluded)
+                    && !response.tx_hashes.is_empty() =>
+            {
+                IntentStatus::NotIncluded
+            }
             "failure" => IntentStatus::Failure { reason },
             _ => IntentStatus::Unknown(response.status),
         };
@@ -384,7 +390,7 @@ mod tests {
                 "txHashes": [
                     "0x0000000000000000000000000000000000000000000000000000000000000005",
                 ],
-                "failReason": "TRANSACTION_NOT_INCLUDED",
+                "failReason": "SOLVER_CAPACITY_EXCEEDED",
             })
             .to_string(),
         );
@@ -393,7 +399,7 @@ mod tests {
             report,
             IntentStatusReport {
                 status: IntentStatus::Failure {
-                    reason: Some(FailReason::TransactionNotIncluded),
+                    reason: Some(FailReason::SolverCapacityExceeded),
                 },
                 deposit_txs: vec![],
                 txs: vec![b256!(
@@ -424,6 +430,21 @@ mod tests {
                 "0x0000000000000000000000000000000000000000000000000000000000000007"
             )]
         );
+    }
+
+    #[test]
+    fn failure_not_included_with_no_tx_is_terminal() {
+        let report = report(
+            &json!({"status": "failure", "failReason": "TRANSACTION_NOT_INCLUDED"}).to_string(),
+        );
+
+        assert_eq!(
+            report.status,
+            IntentStatus::Failure {
+                reason: Some(FailReason::TransactionNotIncluded),
+            }
+        );
+        assert!(report.status.is_terminal());
     }
 
     #[test]
