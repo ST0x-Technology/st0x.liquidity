@@ -8,11 +8,12 @@
 //! the origin chain's depth (`SwapDeposited`). The transfer then waits there
 //! with its guard held.
 
-use alloy::primitives::{Address, TxHash, U256};
+use alloy::primitives::{Address, B256, TxHash, U256};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use sqlx::SqlitePool;
 use std::collections::BTreeMap;
+use std::sync::Arc;
 use std::time::SystemTime;
 use tokio::sync::Mutex;
 use tracing::{error, info, warn};
@@ -25,6 +26,7 @@ use st0x_bridge::relay::{
 };
 use st0x_bridge::{BridgeDirection, HopDirection, PreparedSwap, PreparedSwapDeposit, SwapBridge};
 use st0x_config::RelayHopCtx;
+use st0x_event_sorcery::Store;
 use st0x_evm::{Chain, MinedTx, PreparedTransaction, Wallet};
 use st0x_finance::Usdc;
 
@@ -73,7 +75,206 @@ impl<Signer> RelayHop<Signer> {
 /// The chain-to-Alpaca side of a Relay hop: the corridor chain is the origin.
 const TO_HUB: HopDirection = HopDirection::ToHub;
 
-impl<Signer: Wallet> CrossVenueCashTransfer<Signer, RelayHop<Signer>> {
+impl<Signer: Wallet> RelayHop<Signer> {
+    /// Signs and persists the pair, or picks up the one already persisted;
+    /// `None` once the deposit is confirmed. Read and signed under the chain
+    /// wallet's prepare lock: a timed-out attempt's prepare may have
+    /// persisted a pair this one must send instead of signing anew.
+    async fn prepare_swap_pair(
+        &self,
+        cqrs: &Store<UsdcRebalance>,
+        id: &UsdcRebalanceId,
+    ) -> Result<Option<(PreparedSwapDeposit, B256)>, UsdcTransferError> {
+        let _prepare = self.chain_send_prepare.lock().await;
+
+        match cqrs.load(id).await? {
+            Some(UsdcRebalance::SwapQuoted {
+                quote,
+                split_approves,
+                ..
+            }) => {
+                let pair = self
+                    .sign_swap_pair(cqrs, id, &quote, &split_approves)
+                    .await?;
+                Ok(Some((pair, quote.order_id)))
+            }
+            Some(UsdcRebalance::SwapDepositPrepared {
+                quote,
+                approve,
+                deposit,
+                ..
+            }) => Ok(Some((
+                PreparedSwapDeposit { approve, deposit },
+                quote.order_id,
+            ))),
+            Some(UsdcRebalance::SwapDeposited { .. }) => Ok(None),
+            None => Err(UsdcTransferError::StateOffHop {
+                id: id.clone(),
+                state: "Uninitialized",
+                hop: HopKind::Relay,
+            }),
+            Some(
+                state @ (UsdcRebalance::Converting { .. }
+                | UsdcRebalance::ConversionComplete { .. }
+                | UsdcRebalance::ConversionFailed { .. }
+                | UsdcRebalance::WithdrawalSubmitting { .. }
+                | UsdcRebalance::Withdrawing { .. }
+                | UsdcRebalance::WithdrawalComplete { .. }
+                | UsdcRebalance::WithdrawalFailed { .. }
+                | UsdcRebalance::BridgingSubmitting { .. }
+                | UsdcRebalance::Bridging { .. }
+                | UsdcRebalance::AwaitingAttestation { .. }
+                | UsdcRebalance::Attested { .. }
+                | UsdcRebalance::Bridged { .. }
+                | UsdcRebalance::BridgingFailed { .. }
+                | UsdcRebalance::DepositInitiated { .. }
+                | UsdcRebalance::DepositConfirmed { .. }
+                | UsdcRebalance::DepositFailed { .. }
+                | UsdcRebalance::Reconciled { .. }),
+            ) => Err(UsdcTransferError::StateOffHop {
+                id: id.clone(),
+                state: state.state_name(),
+                hop: HopKind::Relay,
+            }),
+        }
+    }
+
+    /// Signs the approve and deposit and persists both before either is
+    /// broadcast. Approves that went out alone are sent again first, so the
+    /// pair is not signed behind a nonce no node holds.
+    async fn sign_swap_pair(
+        &self,
+        cqrs: &Store<UsdcRebalance>,
+        id: &UsdcRebalanceId,
+        quote: &SwapQuote,
+        split_approves: &[PreparedTransaction],
+    ) -> Result<PreparedSwapDeposit, UsdcTransferError> {
+        for approve in split_approves {
+            self.bridge
+                .broadcast_approve(TO_HUB, approve)
+                .await
+                .map_err(Box::new)?;
+        }
+
+        // After a split the allowance may already cover the deposit: the
+        // bridge reads it and signs an approve only when it falls short.
+        let relay_quote = relay_quote(quote, split_approves.is_empty())?;
+        let prepared = self
+            .bridge
+            .prepare_deposit(TO_HUB, &relay_quote)
+            .await
+            .map_err(Box::new)?;
+
+        match prepared {
+            PreparedSwap::Deposit(pair) => {
+                self.persist_swap_pair(cqrs, id, &pair).await?;
+                Ok(pair)
+            }
+            PreparedSwap::ApproveOnly { approve } => {
+                self.persist_lone_approve(cqrs, id, &approve).await?;
+                self.bridge
+                    .broadcast_approve(TO_HUB, &approve)
+                    .await
+                    .map_err(Box::new)?;
+                warn!(target: "rebalance", %id, approve = %approve.tx_hash(), "Another send split the Relay pair; its approve went out alone");
+                Err(UsdcTransferError::SwapPairSplit { id: id.clone() })
+            }
+        }
+    }
+
+    /// Persists the signed pair. When the write fails, the nonces are
+    /// released only if a reload proves the pair was not persisted.
+    async fn persist_swap_pair(
+        &self,
+        cqrs: &Store<UsdcRebalance>,
+        id: &UsdcRebalanceId,
+        pair: &PreparedSwapDeposit,
+    ) -> Result<(), UsdcTransferError> {
+        let Err(error) = cqrs
+            .send(
+                id,
+                UsdcRebalanceCommand::PrepareSwapDeposit {
+                    approve: pair.approve.clone(),
+                    deposit: pair.deposit.clone(),
+                },
+            )
+            .await
+        else {
+            return Ok(());
+        };
+
+        match cqrs.load(id).await {
+            Ok(Some(UsdcRebalance::SwapDepositPrepared { deposit, .. }))
+                if deposit.tx_hash() == pair.deposit.tx_hash() =>
+            {
+                warn!(target: "rebalance", %id, ?error, "The failed Relay pair write committed; sending it");
+                Ok(())
+            }
+            Ok(Some(UsdcRebalance::SwapQuoted { .. })) => {
+                warn!(target: "rebalance", %id, ?error, "Releasing the nonces of a Relay pair that was not persisted");
+                self.bridge
+                    .discard_prepared(TO_HUB, &PreparedSwap::Deposit(pair.clone()))
+                    .await;
+                Err(error.into())
+            }
+            reload => {
+                let reload = reload.map(|state| state.map(|state| state.state_name()));
+                error!(target: "operational_alert", alert = true, %id, deposit = %pair.deposit.tx_hash(), ?reload, "Cannot tell whether a signed Relay pair was persisted; its nonces stay reserved and later sends from the chain wallet wait behind them until a restart");
+                Err(error.into())
+            }
+        }
+    }
+
+    /// Persists an approve signed alone. Its nonce is released only if a
+    /// reload proves it was not persisted.
+    async fn persist_lone_approve(
+        &self,
+        cqrs: &Store<UsdcRebalance>,
+        id: &UsdcRebalanceId,
+        approve: &PreparedTransaction,
+    ) -> Result<(), UsdcTransferError> {
+        let Err(error) = cqrs
+            .send(
+                id,
+                UsdcRebalanceCommand::PrepareSwapApprove {
+                    approve: approve.clone(),
+                },
+            )
+            .await
+        else {
+            return Ok(());
+        };
+
+        match cqrs.load(id).await {
+            Ok(Some(UsdcRebalance::SwapQuoted { split_approves, .. }))
+                if split_approves.contains(approve) =>
+            {
+                Ok(())
+            }
+            Ok(Some(UsdcRebalance::SwapQuoted { .. })) => {
+                self.bridge
+                    .discard_prepared(
+                        TO_HUB,
+                        &PreparedSwap::ApproveOnly {
+                            approve: approve.clone(),
+                        },
+                    )
+                    .await;
+                Err(error.into())
+            }
+            reload => {
+                let reload = reload.map(|state| state.map(|state| state.state_name()));
+                error!(target: "operational_alert", alert = true, %id, approve = %approve.tx_hash(), ?reload, "Cannot tell whether a lone Relay approve was persisted; its nonce stays reserved until a restart");
+                Err(error.into())
+            }
+        }
+    }
+}
+
+impl<Signer> CrossVenueCashTransfer<Signer, RelayHop<Signer>>
+where
+    Signer: Wallet + Send + Sync + 'static,
+{
     /// Drives a chain-to-Alpaca transfer on a Relay corridor from its
     /// recorded state. A state the Relay hop never reaches is refused.
     pub(crate) async fn resume_chain_to_alpaca_via_relay(
@@ -294,59 +495,8 @@ impl<Signer: Wallet> CrossVenueCashTransfer<Signer, RelayHop<Signer>> {
     /// Signs and persists the pair, or picks up the one already persisted,
     /// then broadcasts it and records the confirmed deposit.
     async fn send_swap_deposit(&self, id: &UsdcRebalanceId) -> Result<(), UsdcTransferError> {
-        let (pair, order_id) = {
-            let _prepare = self.hop.chain_send_prepare.lock().await;
-            // Read under the lock: a timed-out attempt's prepare may have
-            // persisted a pair this one must send instead of signing anew.
-            match self.cqrs.load(id).await? {
-                Some(UsdcRebalance::SwapQuoted {
-                    quote,
-                    split_approves,
-                    ..
-                }) => {
-                    let pair = self.sign_swap_pair(id, &quote, &split_approves).await?;
-                    (pair, quote.order_id)
-                }
-                Some(UsdcRebalance::SwapDepositPrepared {
-                    quote,
-                    approve,
-                    deposit,
-                    ..
-                }) => (PreparedSwapDeposit { approve, deposit }, quote.order_id),
-                Some(UsdcRebalance::SwapDeposited { .. }) => return Ok(()),
-                None => {
-                    return Err(UsdcTransferError::StateOffHop {
-                        id: id.clone(),
-                        state: "Uninitialized",
-                        hop: HopKind::Relay,
-                    });
-                }
-                Some(
-                    state @ (UsdcRebalance::Converting { .. }
-                    | UsdcRebalance::ConversionComplete { .. }
-                    | UsdcRebalance::ConversionFailed { .. }
-                    | UsdcRebalance::WithdrawalSubmitting { .. }
-                    | UsdcRebalance::Withdrawing { .. }
-                    | UsdcRebalance::WithdrawalComplete { .. }
-                    | UsdcRebalance::WithdrawalFailed { .. }
-                    | UsdcRebalance::BridgingSubmitting { .. }
-                    | UsdcRebalance::Bridging { .. }
-                    | UsdcRebalance::AwaitingAttestation { .. }
-                    | UsdcRebalance::Attested { .. }
-                    | UsdcRebalance::Bridged { .. }
-                    | UsdcRebalance::BridgingFailed { .. }
-                    | UsdcRebalance::DepositInitiated { .. }
-                    | UsdcRebalance::DepositConfirmed { .. }
-                    | UsdcRebalance::DepositFailed { .. }
-                    | UsdcRebalance::Reconciled { .. }),
-                ) => {
-                    return Err(UsdcTransferError::StateOffHop {
-                        id: id.clone(),
-                        state: state.state_name(),
-                        hop: HopKind::Relay,
-                    });
-                }
-            }
+        let Some((pair, order_id)) = self.prepare_and_persist_swap_pair(id).await? else {
+            return Ok(());
         };
 
         let deposit_tx = self
@@ -382,140 +532,32 @@ impl<Signer: Wallet> CrossVenueCashTransfer<Signer, RelayHop<Signer>> {
         Ok(())
     }
 
-    /// Signs the approve and deposit and persists both before either is
-    /// broadcast. Approves that went out alone are sent again first, so the
-    /// pair is not signed behind a nonce no node holds. Called under the
-    /// chain wallet's prepare lock.
-    async fn sign_swap_pair(
+    /// The pair to broadcast and its order id, `None` once the deposit is
+    /// confirmed. Runs on a detached task, as the Alpaca deposit send's
+    /// prepare does, so a job timeout cannot drop the future between the
+    /// signing and the persist: a pair signed and never persisted keeps its
+    /// nonces reserved and stalls every later send from the chain wallet.
+    async fn prepare_and_persist_swap_pair(
         &self,
         id: &UsdcRebalanceId,
-        quote: &SwapQuote,
-        split_approves: &[PreparedTransaction],
-    ) -> Result<PreparedSwapDeposit, UsdcTransferError> {
-        for approve in split_approves {
-            self.hop
-                .bridge
-                .broadcast_approve(TO_HUB, approve)
-                .await
-                .map_err(Box::new)?;
-        }
+    ) -> Result<Option<(PreparedSwapDeposit, B256)>, UsdcTransferError> {
+        let hop = Arc::clone(&self.hop);
+        let cqrs = Arc::clone(&self.cqrs);
+        let task_id = id.clone();
+        // `PrepareSwapDeposit` can outlive a cancelled job, so the task
+        // continues the job's projection slot.
+        let projection_slot =
+            crate::conductor::projection_pause::projection_slot_for_detached_work().await;
 
-        // After a split the allowance may already cover the deposit: the
-        // bridge reads it and signs an approve only when it falls short.
-        let relay_quote = relay_quote(quote, split_approves.is_empty())?;
-        let prepared = self
-            .hop
-            .bridge
-            .prepare_deposit(TO_HUB, &relay_quote)
-            .await
-            .map_err(Box::new)?;
-
-        match prepared {
-            PreparedSwap::Deposit(pair) => {
-                self.persist_swap_pair(id, &pair).await?;
-                Ok(pair)
-            }
-            PreparedSwap::ApproveOnly { approve } => {
-                self.persist_lone_approve(id, &approve).await?;
-                self.hop
-                    .bridge
-                    .broadcast_approve(TO_HUB, &approve)
-                    .await
-                    .map_err(Box::new)?;
-                warn!(target: "rebalance", %id, approve = %approve.tx_hash(), "Another send split the Relay pair; its approve went out alone");
-                Err(UsdcTransferError::SwapPairSplit { id: id.clone() })
-            }
-        }
-    }
-
-    /// Persists the signed pair. When the write fails, the nonces are
-    /// released only if a reload proves the pair was not persisted.
-    async fn persist_swap_pair(
-        &self,
-        id: &UsdcRebalanceId,
-        pair: &PreparedSwapDeposit,
-    ) -> Result<(), UsdcTransferError> {
-        let Err(error) = self
-            .cqrs
-            .send(
-                id,
-                UsdcRebalanceCommand::PrepareSwapDeposit {
-                    approve: pair.approve.clone(),
-                    deposit: pair.deposit.clone(),
-                },
-            )
-            .await
-        else {
-            return Ok(());
-        };
-
-        match self.cqrs.load(id).await {
-            Ok(Some(UsdcRebalance::SwapDepositPrepared { deposit, .. }))
-                if deposit.tx_hash() == pair.deposit.tx_hash() =>
-            {
-                warn!(target: "rebalance", %id, ?error, "The failed Relay pair write committed; sending it");
-                Ok(())
-            }
-            Ok(Some(UsdcRebalance::SwapQuoted { .. })) => {
-                warn!(target: "rebalance", %id, ?error, "Releasing the nonces of a Relay pair that was not persisted");
-                self.hop
-                    .bridge
-                    .discard_prepared(TO_HUB, &PreparedSwap::Deposit(pair.clone()))
-                    .await;
-                Err(error.into())
-            }
-            reload => {
-                let reload = reload.map(|state| state.map(|state| state.state_name()));
-                error!(target: "operational_alert", alert = true, %id, deposit = %pair.deposit.tx_hash(), ?reload, "Cannot tell whether a signed Relay pair was persisted; its nonces stay reserved and later sends from the chain wallet wait behind them until a restart");
-                Err(error.into())
-            }
-        }
-    }
-
-    /// Persists an approve signed alone. Its nonce is released only if a
-    /// reload proves it was not persisted.
-    async fn persist_lone_approve(
-        &self,
-        id: &UsdcRebalanceId,
-        approve: &PreparedTransaction,
-    ) -> Result<(), UsdcTransferError> {
-        let Err(error) = self
-            .cqrs
-            .send(
-                id,
-                UsdcRebalanceCommand::PrepareSwapApprove {
-                    approve: approve.clone(),
-                },
-            )
-            .await
-        else {
-            return Ok(());
-        };
-
-        match self.cqrs.load(id).await {
-            Ok(Some(UsdcRebalance::SwapQuoted { split_approves, .. }))
-                if split_approves.contains(approve) =>
-            {
-                Ok(())
-            }
-            Ok(Some(UsdcRebalance::SwapQuoted { .. })) => {
-                self.hop
-                    .bridge
-                    .discard_prepared(
-                        TO_HUB,
-                        &PreparedSwap::ApproveOnly {
-                            approve: approve.clone(),
-                        },
-                    )
-                    .await;
-                Err(error.into())
-            }
-            reload => {
-                let reload = reload.map(|state| state.map(|state| state.state_name()));
-                error!(target: "operational_alert", alert = true, %id, approve = %approve.tx_hash(), ?reload, "Cannot tell whether a lone Relay approve was persisted; its nonce stays reserved until a restart");
-                Err(error.into())
-            }
-        }
+        tokio::spawn(async move {
+            let _projection_slot = projection_slot;
+            hop.prepare_swap_pair(&cqrs, &task_id).await
+        })
+        .await
+        .map_err(|join_error| {
+            error!(target: "rebalance", %id, %join_error, "Relay pair prepare-and-persist task failed to join (panicked)");
+            UsdcTransferError::SwapPrepareTaskPanicked { id: id.clone() }
+        })?
     }
 
     /// Reserves the nonces of every Relay envelope this corridor signed on

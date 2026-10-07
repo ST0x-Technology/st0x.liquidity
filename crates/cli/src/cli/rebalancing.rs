@@ -772,6 +772,7 @@ fn is_bot_resumable_wait(error: &UsdcTransferError) -> bool {
         | UsdcTransferError::RelayBridge(_)
         | UsdcTransferError::SwapQuoteOutOfBounds { .. }
         | UsdcTransferError::SwapPairSplit { .. }
+        | UsdcTransferError::SwapPrepareTaskPanicked { .. }
         | UsdcTransferError::EthereumChainMissing(_) => false,
     }
 }
