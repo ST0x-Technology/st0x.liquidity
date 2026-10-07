@@ -182,7 +182,19 @@ vault <-> hop <-> Ethereum wallet <-> Alpaca.
   Pinned, never configured.
 - **Hop**: the leg that moves USDC between the corridor chain and the hub.
 - **Hop kind** (`HopKind`): how the hop moves it. `Cctp` is Circle's burn and
-  mint; `Relay` is reserved for Robinhood and no build wires it yet.
+  mint; `Relay` swaps Robinhood's USDG for USDC through Relay. A `relay` hop is
+  parsed and validated, but still refused at load.
+- **Hop evidence** (`HopEvidence`): what moved the cash across the hop, kept on
+  every post-hop `UsdcRebalance` state (`Cctp { burn_tx, mint_tx }`). Readers
+  that resolve one of its hashes on a chain take the chain from the corridor.
+- **Relay hop**: the corridor chain's stable deposited into Relay's
+  **depository** (pinned per chain in `Chain::relay_depository`) and paid out by
+  Relay's solver on the other end. Its states are `SwapQuoted` (the binding
+  **swap quote**, `SwapQuote`), `SwapDepositPrepared` (the approve and deposit
+  signed and persisted together, the **prepared pair**) and `SwapDeposited`.
+- **Signed order ids** (`signed_order_ids`): every Relay order id the transfer
+  ever signed a deposit for. Entries are never removed, so a late fill or refund
+  of any of them can still be matched.
 
 A corridor is configured under `[rebalancing.usdc.corridors.<chain>]` and
 recorded on each `UsdcRebalance` when it starts. Not to be confused with the
@@ -370,8 +382,9 @@ skipped as `CoolingDown`.
 ### Bridge
 
 Infrastructure for moving assets between chains. Used by USDC rebalancing to
-transfer stablecoins between Base (where the onchain venue operates) and
-Ethereum (where broker on/off-ramps are available), via Circle CCTP.
+transfer stablecoins between a corridor chain (where the onchain venue operates)
+and Ethereum (where broker on/off-ramps are available): Circle CCTP for Base,
+Relay for Robinhood (see USDC Corridor).
 
 ### Tokenization
 
