@@ -1488,6 +1488,155 @@ pub(super) mod tests {
     }
 
     #[test]
+    fn step_on_another_chain_is_refused() {
+        for (index, kind) in [(0, QuoteStep::Approve), (1, QuoteStep::Deposit)] {
+            let error =
+                refusal(|body| body["steps"][index]["items"][0]["data"]["chainId"] = json!(1));
+
+            assert!(
+                matches!(
+                    error,
+                    QuoteMismatch::StepChain { step, expected: 4663, actual: 1 } if step == kind
+                ),
+                "{error:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn step_sending_native_value_is_refused() {
+        for (index, kind) in [(0, QuoteStep::Approve), (1, QuoteStep::Deposit)] {
+            let error =
+                refusal(|body| body["steps"][index]["items"][0]["data"]["value"] = json!("1"));
+
+            assert!(
+                matches!(
+                    error,
+                    QuoteMismatch::StepValue { step, value }
+                        if step == kind && value == U256::from(1)
+                ),
+                "{error:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn step_calldata_that_does_not_decode_is_refused() {
+        for (index, kind, selector) in [
+            (0, QuoteStep::Approve, "0x095ea7b3"),
+            (1, QuoteStep::Deposit, "0xe8017952"),
+        ] {
+            let error =
+                refusal(|body| body["steps"][index]["items"][0]["data"]["data"] = json!(selector));
+
+            assert!(
+                matches!(error, QuoteMismatch::StepCalldata { step, .. } if step == kind),
+                "{error:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn approve_on_another_token_is_refused() {
+        let error = refusal(|body| body["steps"][0]["items"][0]["data"]["to"] = json!(OTHER));
+
+        assert!(
+            matches!(
+                error,
+                QuoteMismatch::AddressMismatch {
+                    field: QuoteField::ApproveTarget,
+                    expected,
+                    actual,
+                }
+                    if expected == ROBINHOOD_USDG && actual == OTHER
+            ),
+            "{error:?}"
+        );
+    }
+
+    #[test]
+    fn deposit_of_another_token_is_refused() {
+        let error = refusal(|body| {
+            let calldata = body["steps"][1]["items"][0]["data"]["data"]
+                .as_str()
+                .unwrap()
+                .replace(
+                    "5fc5360d0400a0fd4f2af552add042d716f1d168",
+                    "1111111111111111111111111111111111111111",
+                );
+            body["steps"][1]["items"][0]["data"]["data"] = json!(calldata);
+        });
+
+        assert!(
+            matches!(
+                error,
+                QuoteMismatch::AddressMismatch {
+                    field: QuoteField::DepositToken,
+                    expected,
+                    actual,
+                }
+                    if expected == ROBINHOOD_USDG && actual == OTHER
+            ),
+            "{error:?}"
+        );
+    }
+
+    #[test]
+    fn second_deposit_step_is_refused() {
+        let error = refusal(|body| {
+            let steps = body["steps"].as_array_mut().unwrap();
+            let deposit = steps[1].clone();
+            steps.push(deposit);
+        });
+
+        assert!(
+            matches!(
+                error,
+                QuoteMismatch::DuplicateStep {
+                    step: QuoteStep::Deposit
+                }
+            ),
+            "{error:?}"
+        );
+    }
+
+    #[test]
+    fn step_with_two_items_is_refused() {
+        let error = refusal(|body| {
+            let items = body["steps"][1]["items"].as_array_mut().unwrap();
+            let item = items[0].clone();
+            items.push(item);
+        });
+
+        assert!(
+            matches!(
+                error,
+                QuoteMismatch::ItemCount {
+                    step: QuoteStep::Deposit,
+                    count: 2,
+                }
+            ),
+            "{error:?}"
+        );
+    }
+
+    #[test]
+    fn quote_for_another_input_currency_is_refused() {
+        let error =
+            refusal(|body| body["details"]["currencyIn"]["currency"]["address"] = json!(OTHER));
+
+        assert!(
+            matches!(
+                error,
+                QuoteMismatch::InputCurrency { expected, actual }
+                    if expected == QuotedCurrency { chain_id: 4663, address: ROBINHOOD_USDG }
+                        && actual == QuotedCurrency { chain_id: 4663, address: OTHER }
+            ),
+            "{error:?}"
+        );
+    }
+
+    #[test]
     fn quote_naming_another_recipient_is_refused() {
         let error = refusal(|body| body["details"]["recipient"] = json!(OTHER));
 
