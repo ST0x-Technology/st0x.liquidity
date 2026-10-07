@@ -50,6 +50,9 @@ pub enum IntentStatus {
     Failure {
         reason: Option<FailReason>,
     },
+    /// Relay says `failure` with `TRANSACTION_NOT_INCLUDED` but lists a tx,
+    /// which may still confirm: [`IntentStatusReport::txs`] is never empty.
+    NotIncluded,
     /// A status name this build does not know, kept verbatim.
     Unknown(String),
 }
@@ -65,6 +68,7 @@ impl IntentStatus {
             | Self::InFlight(_)
             | Self::Filling
             | Self::Refunding { .. }
+            | Self::NotIncluded
             | Self::Unknown(_) => false,
         }
     }
@@ -396,6 +400,29 @@ mod tests {
                     "0x0000000000000000000000000000000000000000000000000000000000000005"
                 )],
             }
+        );
+    }
+
+    #[test]
+    fn failure_with_a_tx_not_yet_included_is_not_terminal() {
+        let report = report(
+            &json!({
+                "status": "failure",
+                "txHashes": [
+                    "0x0000000000000000000000000000000000000000000000000000000000000007",
+                ],
+                "failReason": "TRANSACTION_NOT_INCLUDED",
+            })
+            .to_string(),
+        );
+
+        assert_eq!(report.status, IntentStatus::NotIncluded);
+        assert!(!report.status.is_terminal());
+        assert_eq!(
+            report.txs,
+            vec![b256!(
+                "0x0000000000000000000000000000000000000000000000000000000000000007"
+            )]
         );
     }
 
