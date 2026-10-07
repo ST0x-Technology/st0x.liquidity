@@ -367,8 +367,8 @@ pub trait SwapBridge: Send + Sync + 'static {
         approve: &PreparedTransaction,
     ) -> Result<TxHash, Self::Error>;
 
-    /// Waits for the deposit to reach the origin chain's confirmations and
-    /// checks that it funded `order_id`.
+    /// Waits for the deposit's receipt and checks that it funded `order_id`.
+    /// Short of the origin chain's confirmations it fails, to be retried.
     async fn confirm_deposit(
         &self,
         direction: HopDirection,
