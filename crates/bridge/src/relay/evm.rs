@@ -114,6 +114,8 @@ pub enum RelayBridgeError {
     DepositUnverified { tx: TxHash, order_id: RelayOrderId },
     #[error("deposit log for order {order_id} carries no tx hash or block")]
     DepositLogIncomplete { order_id: RelayOrderId },
+    #[error("deposit log names tx {tx}, whose receipt the node does not have yet")]
+    DepositReceiptMissing { tx: TxHash },
     #[error("deposit scan from block {from_block} is ahead of the head {head}")]
     ScanAheadOfHead { from_block: u64, head: u64 },
     #[error("tx {tx} is on neither chain yet")]
@@ -655,6 +657,7 @@ impl<W: Wallet> RelayEnd<W> {
             .iter()
             .filter_map(|log| deposit_event(log, self.depository))
             .find(|event| self.is_ours(event) && RelayOrderId(event.id) == order_id)
+            .filter(|_| self.sent_by_us(&receipt))
             .ok_or(RelayBridgeError::DepositUnverified { tx, order_id })?;
 
         let block = receipt
@@ -716,8 +719,16 @@ impl<W: Wallet> RelayEnd<W> {
         Ok(receipt)
     }
 
+    /// The event's `from` is the caller-supplied depositor, so anyone can
+    /// name our wallet: [`Self::sent_by_us`] proves who paid.
     fn is_ours(&self, event: &RelayErc20Deposit) -> bool {
         event.from == self.wallet.address() && event.token == self.stable
+    }
+
+    /// The depository pulls the stable from the tx's sender, so a deposit is
+    /// ours only when our wallet called the depository itself.
+    fn sent_by_us(&self, receipt: &TransactionReceipt) -> bool {
+        receipt.from == self.wallet.address() && receipt.to == Some(self.depository)
     }
 
     /// `RelayErc20Deposit` has no indexed field, so every deposit log in the
@@ -768,6 +779,24 @@ impl<W: Wallet> RelayEnd<W> {
                 let (Some(tx), Some(block)) = (log.transaction_hash, log.block_number) else {
                     return Err(RelayBridgeError::DepositLogIncomplete { order_id });
                 };
+
+                let receipt = self
+                    .wallet
+                    .provider()
+                    .get_transaction_receipt(tx)
+                    .await?
+                    .ok_or(RelayBridgeError::DepositReceiptMissing { tx })?;
+
+                if !self.sent_by_us(&receipt) {
+                    warn!(
+                        target: "bridge",
+                        %tx,
+                        %order_id,
+                        from = %receipt.from,
+                        "Relay deposit names our wallet but another account sent it"
+                    );
+                    continue;
+                }
 
                 deposits.push(SwapDeposit {
                     tx,

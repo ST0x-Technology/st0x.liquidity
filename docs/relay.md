@@ -241,13 +241,15 @@ origin stable, for the order id.
 
 `find_recent_deposits` scans the depository's logs from a captured
 `origin_block` in 10,000-block chunks, decodes each, and returns our deposits
-for any of a set of order ids, with the last block it scanned. The scan stops at
-the newest block with the origin chain's confirmations, counting the inclusion
-block (`RelayCtx` takes each end's count, at least 1): a lagging load-balanced
-node may not have indexed the newest blocks, and a deposit there is not
-confirmed yet. Orders stay fillable for about a week (`RelayQuote::deadline`),
-so the scan takes whatever floor the caller gives it; no shorter window is
-assumed.
+for any of a set of order ids, with the last block it scanned. A deposit is ours
+only when our wallet sent its tx to the depository, which pulls the stable from
+the sender: the event's `from` is the caller-supplied depositor, which anyone
+can set to our wallet. `confirm_deposit` checks the same. The scan stops at the
+newest block with the origin chain's confirmations, counting the inclusion block
+(`RelayCtx` takes each end's count, at least 1): a lagging load-balanced node
+may not have indexed the newest blocks, and a deposit there is not confirmed
+yet. Orders stay fillable for about a week (`RelayQuote::deadline`), so the scan
+takes whatever floor the caller gives it; no shorter window is assumed.
 
 ### Proofs
 
