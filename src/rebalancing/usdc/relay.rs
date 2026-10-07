@@ -1733,4 +1733,89 @@ mod tests {
             assert_eq!(witness.broadcasts(), Vec::<TxHash>::new());
         }
     }
+
+    /// A pair persisted after an approve went out alone is resumed in
+    /// process: the lone approve is broadcast again before the pair, so the
+    /// deposit is not left behind a nonce the node may not hold.
+    #[tokio::test]
+    async fn resumed_prepared_pair_rebroadcasts_its_split_approves_first() {
+        let anvil = spawn_anvil(Anvil::new());
+        let (wallet, contracts) = funded_relay_end(&anvil).await;
+        let store = Arc::new(test_store(setup_test_db().await, ()));
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let witness = Arc::new(BroadcastWitness::new(
+            wallet.clone(),
+            store.clone(),
+            id.clone(),
+        ));
+        let chain_wallet: TestWallet = witness.clone();
+        let server = MockServer::start();
+        let relay_api = MockServer::start();
+        let transfer = relay_transfer(
+            &server,
+            &relay_api,
+            wallet.clone(),
+            chain_wallet,
+            contracts,
+            store.clone(),
+        )
+        .await;
+        let quote = exact_quote(&wallet, contracts, B256::repeat_byte(0x0d)).await;
+        let approve_step = quote.approve.clone().unwrap();
+        let deposit_step = quote.deposit.clone();
+        record_quoted(&store, &id, quote).await;
+
+        let approve = wallet
+            .prepare_pending(contracts.stable, approve_step.data, "split approve")
+            .await
+            .unwrap();
+        store
+            .send(
+                &id,
+                UsdcRebalanceCommand::PrepareSwapApprove {
+                    approve: approve.clone(),
+                },
+            )
+            .await
+            .unwrap();
+        let deposit = wallet
+            .prepare_pending_with_gas_limit(
+                contracts.depository,
+                deposit_step.data,
+                200_000,
+                "deposit",
+            )
+            .await
+            .unwrap();
+        store
+            .send(
+                &id,
+                UsdcRebalanceCommand::PrepareSwapDeposit {
+                    approve: None,
+                    deposit: deposit.clone(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let resumed = tokio::time::timeout(
+            Duration::from_secs(10),
+            transfer.resume_base_to_alpaca(&id, Usdc::new(float!(100)), ROBINHOOD_RELAY),
+        )
+        .await;
+
+        assert_eq!(
+            witness.broadcasts().first(),
+            Some(&approve.tx_hash()),
+            "the lone approve must be broadcast before the deposit"
+        );
+        resumed
+            .expect("the deposit mines once its approve is sent")
+            .unwrap();
+        let state = store.load(&id).await.unwrap().unwrap();
+        let UsdcRebalance::SwapDeposited { deposit_tx, .. } = state else {
+            panic!("expected SwapDeposited, got {state:?}");
+        };
+        assert_eq!(deposit_tx, deposit.tx_hash());
+    }
 }
