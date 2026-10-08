@@ -992,7 +992,10 @@ where
         split_approves: &[PreparedTransaction],
         reason: RedepositReason,
     ) -> Result<(), UsdcTransferError> {
-        self.hop.broadcast_split_approves(split_approves).await?;
+        let deadline = Instant::now() + self.hop.bounds.quote_max_age;
+        self.hop
+            .broadcast_split_approves(id, split_approves, deadline)
+            .await?;
         self.redeposit(id, reason).await
     }
 
