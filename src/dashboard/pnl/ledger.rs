@@ -1109,6 +1109,20 @@ mod tests {
 
     const WRAPPED_RATIO: u64 = 1_010_000_000_000_000_000;
 
+    /// A pool on the schema before unique event rowids, plus the Relay cost
+    /// table this release's ledger writes: the ledger never runs on a schema
+    /// without it, but these tests checkpoint it before the rowid upgrade.
+    async fn pool_before_unique_event_rowids() -> SqlitePool {
+        let pool = pool_migrated_up_to(LAST_MIGRATION_BEFORE_UNIQUE_EVENT_ROWIDS).await;
+        sqlx::raw_sql(include_str!(
+            "../../../migrations/20261008021843_pnl_relay_cost.sql"
+        ))
+        .execute(&pool)
+        .await
+        .unwrap();
+        pool
+    }
+
     /// Writes an `InventorySnapshot` event row and a snapshot covering it, so
     /// `compact_events` deletes it. Raw rows: the ledger never reads this
     /// aggregate and compaction only looks at type, id and sequence.
@@ -1214,7 +1228,7 @@ mod tests {
     /// number above that checkpoint, which no surviving row reaches.
     #[tokio::test]
     async fn upgrade_keeps_rowids_and_starts_above_a_checkpoint_on_deleted_rows() {
-        let pool = pool_migrated_up_to(LAST_MIGRATION_BEFORE_UNIQUE_EVENT_ROWIDS).await;
+        let pool = pool_before_unique_event_rowids().await;
         persist_event::<Position>(&pool, "AAPL", 1, &onchain_fill(1, 0)).await;
         persist_compactable_inventory_event(&pool, 1).await;
         persist_event::<Position>(&pool, "AAPL", 2, &onchain_fill(2, 0)).await;
@@ -1240,7 +1254,7 @@ mod tests {
     /// after a rollback: both run `LEDGER_VERSION` 2 or later.
     #[tokio::test]
     async fn upgrade_rebuilds_a_ledger_that_skipped_an_event() {
-        let pool = pool_migrated_up_to(LAST_MIGRATION_BEFORE_UNIQUE_EVENT_ROWIDS).await;
+        let pool = pool_before_unique_event_rowids().await;
         let ledger = PnlLedger::new(pool.clone());
         persist_wrapped_fill(&pool, 7, 1).await;
         ledger.catch_up().await.unwrap();
