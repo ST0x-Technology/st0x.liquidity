@@ -1260,13 +1260,21 @@ def detail_panel(x, y, trades_id, transfers_id):
     which makes Grafana redraw the panel when the variable changes.
     liquidity-panels/detail.js builds the dialog. renderMode "data" hands
     the script both frames, where "allRows" would draw a frame picker.
-    The status-history order is prepended from status-history.js.
+    MODE_LABELS (how each recovery command runs) is prepended from
+    recovery-guide.json, like the header's guide, and the per-row command
+    builders from recovery-commands.js, and the status-history order from
+    status-history.js.
     """
-    with open(os.path.join(HERE, "liquidity-panels", "status-history.js")) as f:
-        # Its export line is for the SPA test; afterRender is not a module.
-        history = "".join(line for line in f if not line.startswith("export "))
+    with open(os.path.join(HERE, "liquidity-panels", "recovery-guide.json")) as f:
+        mode_labels = json.load(f)["modeLabels"]
+    commands = ""
+    for module in ("recovery-commands.js", "status-history.js"):
+        with open(os.path.join(HERE, "liquidity-panels", module)) as f:
+            # Its export line is for the SPA test; afterRender is not a module.
+            commands += "".join(line for line in f if not line.startswith("export ")) + "\n"
     with open(os.path.join(HERE, "liquidity-panels", "detail.js")) as f:
-        after_render = history + "\n\n" + f.read()
+        after_render = (f"const MODE_LABELS = {json.dumps(mode_labels)};\n\n"
+                        + commands + "\n" + f.read())
     with open(os.path.join(HERE, "liquidity-panels", "detail.css")) as f:
         styles = f.read()
     return {

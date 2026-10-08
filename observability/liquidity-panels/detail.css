@@ -87,7 +87,8 @@
 
 .det-field > .det-muted { flex-shrink: 0; }
 
-.det-section-title {
+.det-section-title,
+.det-cli-title {
   margin-bottom: 8px;
   font-weight: 600;
 }
@@ -111,4 +112,34 @@
   height: 8px;
   border-radius: 9999px;
   background: currentColor;
+}
+
+.det-cli {
+  margin-top: 16px;
+  padding-top: 12px;
+  border-top: 1px solid var(--det-border);
+}
+
+.det-command {
+  margin-bottom: 8px;
+  padding: 8px 12px;
+  border: 1px solid var(--det-border);
+  border-radius: 6px;
+  background: var(--det-stripe);
+}
+
+.det-command pre {
+  margin: 0 0 6px;
+  padding: 6px 8px;
+  border-radius: 4px;
+  background: var(--det-card);
+  font-size: 12px;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+
+.det-mode {
+  display: inline-block;
+  margin-top: 4px;
+  font-size: 12px;
 }
