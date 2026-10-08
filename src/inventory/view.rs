@@ -3331,13 +3331,8 @@ impl InventoryView {
             }
         }
 
-        // Track current poll symbols for next cycle's cleanup. An active mint's
-        // symbol is left to the mint, whose terminal cleanup zeroes any residual.
-        view.previous_inflight_mint_symbols = mints
-            .keys()
-            .filter(|symbol| !view.active_mints.contains_key(*symbol))
-            .cloned()
-            .collect();
+        // Track current poll symbols for next cycle's cleanup.
+        view.previous_inflight_mint_symbols = mints.keys().cloned().collect();
 
         view.apply_inflight_redemptions_at(Chain::Base, redemptions, fetched_at, now)
     }
@@ -6936,7 +6931,8 @@ mod tests {
         assert_eq!(
             view.equity_inflight(&symbol, Venue::Hedging),
             Some(shares(20)),
-            "The poll must not mark an active mint's symbol for zeroing"
+            "A later poll that drops the symbol must leave an active mint's Hedging \
+             inflight to the mint"
         );
     }
 
