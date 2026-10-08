@@ -28,8 +28,8 @@ pub use quote::{
     AcceptedRelayQuote, QuoteFees, QuoteField, QuoteMismatch, QuoteRequest, QuoteStep,
     QuotedCurrency, RecordedRelayQuote, RelayOrderId, RelayQuote, RelayRequestId, StepTransaction,
 };
-#[cfg(feature = "mock")]
-pub use quote::{TestQuoteError, quote_body_for_test};
+#[cfg(any(test, feature = "mock"))]
+pub use quote::{TestQuote, TestQuoteError, quote_body_for_test};
 pub use status::{FailReason, InFlightStage, IntentStatus, IntentStatusReport};
 #[cfg(feature = "mock")]
 pub use test_contracts::deploy_relay_end;
