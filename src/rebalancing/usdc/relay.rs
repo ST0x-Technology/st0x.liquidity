@@ -1164,11 +1164,11 @@ where
                 }
             }
             // The deposit may be included again and then filled or
-            // refunded, so a reorg is waited out like any status that is not
-            // terminal, and holds unresolved past the fill window.
+            // refunded, so a reorg is waited out within the fill window like
+            // any status that is not terminal; past it, it fails the swap.
             IntentStatus::Failure {
                 reason: Some(FailReason::DepositReorged),
-            } => {
+            } if !past_window => {
                 warn!(target: "rebalance", %id, %deposit_tx, "Relay reports the deposit reorged out; it may be included again, so the transfer keeps waiting");
                 self.payment_pending(id, deposit_tx, wait).await
             }
@@ -1846,6 +1846,14 @@ struct PairSigning {
     deadline: Instant,
 }
 
+/// How a recheck records a payment it proves: on the deposited order of an
+/// unresolved escrow as a fill or refund, on a failed order as a late one.
+#[derive(Clone, Copy)]
+enum RecheckAdoption {
+    DepositedOrder,
+    FailedOrder { deposit_tx: TxHash },
+}
+
 /// What a deposit with no payment adopted is waiting within.
 #[derive(Clone, Copy)]
 enum PaymentWait {
@@ -2130,11 +2138,12 @@ impl<Signer> RecheckUsdcDeposit for CrossVenueCashTransfer<Signer, RelayHop<Sign
 where
     Signer: Wallet + Send + Sync + 'static,
 {
-    /// Reads a held escrow again: an unresolved one as the job's slow
-    /// re-check does, a failed one by its order's status. A payment that
-    /// proves is adopted and moved on (`Recovered`); otherwise nothing
-    /// changes. Every other state, and an operator deposit tx, is refused: a
-    /// Relay `DepositFailed` is settled with `transfer reconcile`.
+    /// Reads Relay's status of a held escrow's order again: the deposited
+    /// order of an unresolved escrow, or the failed one. A payment that
+    /// proves is adopted (`Recovered`) and left for the escrow's job, or a
+    /// `transfer resume`, to move on; otherwise nothing changes. Every other
+    /// state, and an operator deposit tx, is refused: a Relay `DepositFailed`
+    /// is settled with `transfer reconcile`.
     async fn recheck_deposit(
         &self,
         id: &UsdcRebalanceId,
@@ -2157,61 +2166,72 @@ where
             });
         }
 
-        match state {
-            UsdcRebalance::SwapEscrowUnresolved { .. } => {
-                match self.read_relay_payment(id).await {
-                    Ok(()) | Err(UsdcTransferError::SwapEscrowUnresolved { .. }) => {}
-                    Err(error) => return Err(UsdcRecheckError::Transfer(Box::new(error))),
-                }
-                // Still held, failed at Relay, or moved on with a payment.
-                Ok(
-                    match self
-                        .cqrs
-                        .load(id)
-                        .await
-                        .map_err(|error| Box::new(error.into()))?
-                    {
-                        Some(UsdcRebalance::SwapEscrowUnresolved { .. }) | None => {
-                            RecheckOutcome::LeftUnchanged
-                        }
-                        Some(UsdcRebalance::SwapFailed { .. }) => RecheckOutcome::NotRecoverable,
-                        Some(_) => RecheckOutcome::Recovered,
-                    },
-                )
-            }
+        let (direction, quote, adopt) = match state {
+            UsdcRebalance::SwapEscrowUnresolved {
+                direction, quote, ..
+            } => (direction, quote, RecheckAdoption::DepositedOrder),
             UsdcRebalance::SwapFailed {
                 direction,
                 quote,
                 deposit_tx,
                 ..
-            } => {
-                let Some(payment) = self
-                    .proven_order_payment(id, hop_direction(direction), &quote)
-                    .await
-                else {
-                    return Ok(RecheckOutcome::LeftUnchanged);
-                };
-                self.cqrs
-                    .send(
-                        id,
-                        UsdcRebalanceCommand::RecoverSwapCompletion {
-                            order_id: quote.order_id,
-                            deposit_tx,
-                            payment,
-                        },
-                    )
-                    .await
-                    .map_err(|error| Box::new(error.into()))?;
-                warn!(target: "rebalance", %id, order_id = %quote.order_id, ?payment, "Adopted a late payment of a failed Relay order");
-
-                self.continue_after_recovery(id).await.map_err(Box::new)?;
-                Ok(RecheckOutcome::Recovered)
+            } => (
+                direction,
+                quote,
+                RecheckAdoption::FailedOrder { deposit_tx },
+            ),
+            state => {
+                return Err(UsdcRecheckError::NotDepositFailed {
+                    id: id.clone(),
+                    state: state.state_name(),
+                });
             }
-            state => Err(UsdcRecheckError::NotDepositFailed {
-                id: id.clone(),
-                state: state.state_name(),
-            }),
-        }
+        };
+
+        let Some(payment) = self
+            .proven_order_payment(id, hop_direction(direction), &quote)
+            .await
+        else {
+            return Ok(RecheckOutcome::LeftUnchanged);
+        };
+        let command = match (adopt, payment) {
+            (
+                RecheckAdoption::DepositedOrder,
+                RecoveredSwapPayment::Fill {
+                    fill_tx,
+                    amount_received,
+                },
+            ) => UsdcRebalanceCommand::ConfirmSwapFill {
+                fill_tx,
+                amount_received,
+            },
+            (
+                RecheckAdoption::DepositedOrder,
+                RecoveredSwapPayment::Refund {
+                    refund_tx,
+                    side,
+                    amount_refunded,
+                },
+            ) => UsdcRebalanceCommand::RecordSwapRefund {
+                refund_tx,
+                side,
+                amount_refunded,
+            },
+            (RecheckAdoption::FailedOrder { deposit_tx }, payment) => {
+                UsdcRebalanceCommand::RecoverSwapCompletion {
+                    order_id: quote.order_id,
+                    deposit_tx,
+                    payment,
+                }
+            }
+        };
+        self.cqrs
+            .send(id, command)
+            .await
+            .map_err(|error| Box::new(error.into()))?;
+        warn!(target: "rebalance", %id, order_id = %quote.order_id, ?payment, "Recheck adopted a late Relay payment; the transfer's job or a resume moves it on");
+
+        Ok(RecheckOutcome::Recovered)
     }
 
     async fn verify_deposit_send_superseded(

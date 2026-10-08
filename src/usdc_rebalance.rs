@@ -3378,8 +3378,9 @@ fn proven_refund_amount(
 struct SwapRecoveryBase<'state> {
     direction: RebalanceDirection,
     corridor: UsdcCorridor,
-    /// The failed order of a `SwapFailed`.
-    failed: Option<&'state SwapQuote>,
+    /// The orders a late payment may be adopted for: the reverted ones of a
+    /// `SwapQuoted`, the failed one of a `SwapFailed`.
+    adoptable: &'state [SwapQuote],
     signed_order_ids: &'state [B256],
     reverted_quotes: &'state [SwapQuote],
     refund_requotes: u32,
@@ -6446,10 +6447,9 @@ impl UsdcRebalance {
     /// The signed order whose late payment this state can adopt: from
     /// `SwapQuoted` a reverted one, from `SwapFailed` the failed one.
     pub(crate) fn recoverable_order(&self, order_id: B256) -> Option<&SwapQuote> {
-        let base = self.swap_recovery_base()?;
-        base.failed
-            .into_iter()
-            .chain(base.reverted_quotes)
+        self.swap_recovery_base()?
+            .adoptable
+            .iter()
             .find(|quote| quote.order_id == order_id)
     }
 
@@ -6467,7 +6467,7 @@ impl UsdcRebalance {
             } => Some(SwapRecoveryBase {
                 direction: *direction,
                 corridor: *corridor,
-                failed: None,
+                adoptable: reverted_quotes,
                 signed_order_ids,
                 reverted_quotes,
                 refund_requotes: *refund_requotes,
@@ -6478,15 +6478,16 @@ impl UsdcRebalance {
                 corridor,
                 quote,
                 signed_order_ids,
+                reverted_quotes,
                 refund_requotes,
                 initiated_at,
                 ..
             } => Some(SwapRecoveryBase {
                 direction: *direction,
                 corridor: *corridor,
-                failed: Some(quote),
+                adoptable: std::slice::from_ref(quote.as_ref()),
                 signed_order_ids,
-                reverted_quotes: &[],
+                reverted_quotes,
                 refund_requotes: *refund_requotes,
                 initiated_at: *initiated_at,
             }),
