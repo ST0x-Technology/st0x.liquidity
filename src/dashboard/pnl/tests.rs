@@ -1320,6 +1320,108 @@ async fn source_loader_includes_persisted_cost_events() {
     );
 }
 
+/// Relay costs reach the report from persisted events: a fill's relayer fee
+/// as a cost and its swap gain as revenue, a refund's shortfall as a cost,
+/// beside a CCTP fee; a zero relayer fee books nothing.
+#[tokio::test]
+async fn relay_costs_reach_the_report_from_persisted_events() {
+    let relay_fill = UsdcRebalanceEvent::RelayFillVerified {
+        fill_tx: TxHash::random(),
+        amount_received: Usdc::new(float!(99.9)),
+        fee_collected: Usdc::new(float!(0.1)),
+        relayer_fee: Usdc::new(float!(0.3)),
+        filled_at: parse_timestamp("2026-05-15T12:01:00Z").unwrap(),
+    };
+    let refund_redeposited = UsdcRebalanceEvent::ReturnedToSource {
+        deposit_tx: TxHash::random(),
+        deposit_block: None,
+        redeposit_amount: Usdc::new(float!(99.4)),
+        shortfall: Usdc::new(float!(0.6)),
+        returned_at: parse_timestamp("2026-05-15T12:02:00Z").unwrap(),
+    };
+    let pool = pnl_test_pool(
+        vec![
+            seed_rebalance("1.5", "2026-05-15T12:00:00Z"),
+            SeedEvent::Rebalance(UsdcRebalanceId(Uuid::new_v4()).to_string(), relay_fill),
+            SeedEvent::Rebalance(
+                UsdcRebalanceId(Uuid::new_v4()).to_string(),
+                refund_redeposited,
+            ),
+        ],
+        position_rows(),
+    )
+    .await;
+
+    let report = build_pnl_report(&pool, &query(), Vec::new(), Utc::now())
+        .await
+        .unwrap();
+
+    let mut entries = report
+        .cost_entries
+        .iter()
+        .map(|entry| (entry.category, entry.effect, entry.amount_usd.as_str()))
+        .collect::<Vec<_>>();
+    entries.sort_unstable();
+    assert_eq!(
+        entries,
+        vec![
+            ("cctp_fee", "cost", "1.5"),
+            ("relay_fee", "cost", "0.3"),
+            ("relay_swap", "cost", "0.6"),
+            ("relay_swap", "revenue", "0.2"),
+        ]
+    );
+    let relay = report
+        .costs
+        .coverage
+        .iter()
+        .find(|coverage| coverage.source == "Relay swap costs")
+        .unwrap();
+    assert_eq!(
+        (relay.effect, relay.status, relay.amount_usd.as_str()),
+        ("cost", "included", "0.7")
+    );
+}
+
+/// A Relay fill above its fee-adjusted input nets a gain, shown as revenue.
+#[tokio::test]
+async fn relay_net_gain_shows_as_revenue_coverage() {
+    let pool = pnl_test_pool(
+        vec![SeedEvent::Rebalance(
+            UsdcRebalanceId(Uuid::new_v4()).to_string(),
+            UsdcRebalanceEvent::RelayFillVerified {
+                fill_tx: TxHash::random(),
+                amount_received: Usdc::new(float!(100.2)),
+                fee_collected: Usdc::new(float!(-0.2)),
+                relayer_fee: Usdc::new(float!(0)),
+                filled_at: parse_timestamp("2026-05-15T12:01:00Z").unwrap(),
+            },
+        )],
+        position_rows(),
+    )
+    .await;
+
+    let report = build_pnl_report(&pool, &query(), Vec::new(), Utc::now())
+        .await
+        .unwrap();
+
+    assert_eq!(
+        report.cost_entries.len(),
+        1,
+        "a zero relayer fee books nothing"
+    );
+    let relay = report
+        .costs
+        .coverage
+        .iter()
+        .find(|coverage| coverage.source == "Relay swap costs")
+        .unwrap();
+    assert_eq!(
+        (relay.effect, relay.status, relay.amount_usd.as_str()),
+        ("revenue", "included", "0.2")
+    );
+}
+
 #[tokio::test]
 async fn source_loader_includes_persisted_bot_gas_costs() {
     let pool = pnl_test_pool(
