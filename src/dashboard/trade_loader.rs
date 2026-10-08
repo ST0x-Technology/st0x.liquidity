@@ -685,6 +685,7 @@ mod tests {
         assert_eq!(trades[0].symbol, Symbol::new("AAPL").unwrap());
         assert_eq!(trades[0].venue, TradingVenue::Raindex);
         assert_eq!(trades[0].direction, Direction::Buy);
+        assert_eq!(trades[0].price, Some(Usd::new(float!(150))));
         assert_eq!(trades[0].outcome, TradeOutcome::Filled);
     }
 
@@ -841,6 +842,11 @@ mod tests {
         assert_eq!(trades.len(), 3);
         assert_eq!(find(&filled_id).outcome, TradeOutcome::Filled);
         assert_eq!(find(&filled_id).venue, TradingVenue::Alpaca);
+        assert_eq!(find(&filled_id).price, Some(Usd::new(float!(200))));
+        assert_eq!(find(&failed_id).price, None);
+        // A partial fill carried a price, but a cancelled trade has no fill
+        // price of its own.
+        assert_eq!(find(&cancelled_id).price, None);
         assert!(matches!(
             &find(&failed_id).outcome,
             TradeOutcome::Failed { error, .. } if error == "asset is not tradable"

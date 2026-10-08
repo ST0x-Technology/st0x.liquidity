@@ -14,6 +14,7 @@ const validTrade = (overrides: Record<string, unknown> = {}): unknown => ({
   direction: 'sell',
   symbol: 'AAPL',
   shares: '1.25',
+  price: '199.5',
   outcome: { status: 'filled' },
   ...overrides
 })
@@ -38,6 +39,16 @@ describe('trade payload validation', () => {
       symbol: 'TSLA',
       shares: '2'
     })
+  })
+
+  it('keeps an absent fill price as null', () => {
+    expect(parseTrade(validTrade({ price: null }))).toEqual(validTrade({ price: null }))
+  })
+
+  it('treats a payload from a backend that predates the fill price as unpriced', () => {
+    const { price: _price, ...withoutPrice } = validTrade() as Record<string, unknown>
+
+    expect(parseTrade(withoutPrice)).toEqual({ ...withoutPrice, price: null })
   })
 
   it.each(['bebop', 'uniswap_v4', 'unknown_onchain'])(
@@ -74,6 +85,9 @@ describe('trade payload validation', () => {
     ['negative total shares', { shares: '-0.1' }, 'shares'],
     ['non-numeric total shares', { shares: 'many' }, 'shares'],
     ['non-decimal total shares', { shares: '0x10' }, 'shares'],
+    ['non-decimal price', { price: '0x10' }, 'price'],
+    ['zero price', { price: '0' }, 'price'],
+    ['non-string price', { price: 199.5 }, 'price'],
     ['outcome variant', { outcome: { status: 'pending' } }, 'outcome.status'],
     [
       'negative filled shares',

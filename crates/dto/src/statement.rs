@@ -133,6 +133,7 @@ mod tests {
             direction: Direction::Buy,
             symbol: Symbol::new("AAPL").unwrap(),
             shares: Positive::new(FractionalShares::new(float!(10))).unwrap(),
+            price: None,
             outcome: crate::TradeOutcome::Filled,
         };
         let msg = Statement::TradeUpdate(trade);
