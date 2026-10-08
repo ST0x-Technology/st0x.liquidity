@@ -6700,7 +6700,7 @@ impl UsdcRebalance {
 
     /// The signed order whose late payment this state can adopt: from
     /// `SwapQuoted` a reverted one, from `SwapFailed` the failed one.
-    pub(crate) fn recoverable_order(&self, order_id: B256) -> Option<&SwapQuote> {
+    fn recoverable_order(&self, order_id: B256) -> Option<&SwapQuote> {
         self.swap_recovery_base()?
             .adoptable
             .iter()
