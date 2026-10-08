@@ -11,6 +11,7 @@ use tracing::{debug, trace, warn};
 use st0x_bridge::corridor::UsdcCorridor;
 use st0x_config::RelayHopCtx;
 use st0x_evm::Chain;
+use st0x_execution::HasZero;
 use st0x_finance::{Usd, Usdc};
 
 use super::{RebalancingService, RebalancingServiceError};
@@ -1257,11 +1258,14 @@ impl RebalancingService {
                 self.warn_if_post_burn_tracking_missing(id).await;
                 UsdcSettlementOutcome::Reconciled
             }
-            // The stable is back in the vault it left: reconcile inflight to
-            // the source, and leave the next check to the snapshot poll, which
-            // reads the vault after the redeposit's fees.
-            ReturnedToSource { .. } => {
-                self.cancel_tracked_usdc_rebalance(id).await?;
+            // The stable is back in the vault it left: credit what came back
+            // and drop what a refund kept, and leave the next check to the
+            // snapshot poll, which reads the vault itself.
+            ReturnedToSource {
+                redeposit_amount, ..
+            } => {
+                self.settle_tracked_usdc_rebalance(id, Some(*redeposit_amount))
+                    .await?;
                 UsdcSettlementOutcome::DeferredToSnapshot
             }
             // Operator reconciliation of a post-burn `DepositFailed`: the minted
@@ -1565,6 +1569,17 @@ impl RebalancingService {
         &self,
         id: &UsdcRebalanceId,
     ) -> Result<UsdcSettlementOutcome, RebalancingServiceError> {
+        self.settle_tracked_usdc_rebalance(id, None).await
+    }
+
+    /// Returns a stopped transfer's source inflight to available: all of it,
+    /// or only `returned` of it when the transfer put less back (a Relay
+    /// refund that kept fees), the rest released without a credit.
+    async fn settle_tracked_usdc_rebalance(
+        &self,
+        id: &UsdcRebalanceId,
+        returned: Option<Usdc>,
+    ) -> Result<UsdcSettlementOutcome, RebalancingServiceError> {
         let Some(tracking) = self.usdc_tracking.read().await.get(id).cloned() else {
             debug!(
                 target: "rebalance",
@@ -1583,11 +1598,19 @@ impl RebalancingService {
         let initiated_amount = tracking.initiated_amount;
         let now = Utc::now();
         let update = Box::new(move |inventory, chain| {
-            let cancelled =
-                Inventory::transfer(source_venue, TransferOp::Cancel, initiated_amount)(
+            let settled = match returned {
+                None => Inventory::transfer(source_venue, TransferOp::Cancel, initiated_amount)(
                     inventory, chain,
-                )?;
-            Inventory::with_last_rebalancing(now)(cancelled, chain)
+                )?,
+                Some(returned) => {
+                    let cancelled =
+                        Inventory::transfer(source_venue, TransferOp::Cancel, returned)(
+                            inventory, chain,
+                        )?;
+                    Inventory::set_inflight(source_venue, Usdc::ZERO)(cancelled, chain)?
+                }
+            };
+            Inventory::with_last_rebalancing(now)(settled, chain)
         });
 
         let mut inventory = self.inventory.write().await;

@@ -1669,6 +1669,15 @@ mod tests {
                 "deposit_confirmed_at",
                 false,
             ),
+            ("SwapFailed", "BaseToAlpaca", "failed_at", true),
+            ("ReturnedToSource", "BaseToAlpaca", "returned_at", true),
+            (
+                "SwapEscrowUnresolved",
+                "BaseToAlpaca",
+                "unresolved_at",
+                false,
+            ),
+            ("Redepositing", "BaseToAlpaca", "started_at", false),
         ];
 
         for (state, direction, timestamp_field, expected_terminal) in cases {

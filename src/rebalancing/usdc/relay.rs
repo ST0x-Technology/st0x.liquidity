@@ -495,8 +495,8 @@ where
                 ..
             }) => {
                 Self::require_base_to_alpaca(id, direction)?;
-                warn!(target: "rebalance", %id, %deposit_tx, %unresolved_at, "Relay deposit unresolved past its fill window; the transfer holds its guard");
-                Ok(())
+                info!(target: "rebalance", %id, %deposit_tx, %unresolved_at, "Reading Relay's status of a deposit unresolved past its fill window");
+                self.read_relay_payment(id).await
             }
 
             Some(UsdcRebalance::Redepositing { direction, .. }) => {
@@ -621,6 +621,7 @@ where
             quote,
             quoted_at,
             signed_order_ids,
+            split_approves,
             deposit_reverts,
             ..
         }) = self.cqrs.load(id).await?
@@ -631,8 +632,12 @@ where
         let max_reverts = self.hop.bounds.max_deposit_revert_redrives;
         if deposit_reverts >= max_reverts {
             warn!(target: "rebalance", %id, deposit_reverts, max_reverts, "Relay deposits kept reverting; returning the stable to the vault");
-            self.redeposit(id, RedepositReason::DepositRevertsExhausted)
-                .await?;
+            self.redeposit_after_split_approves(
+                id,
+                &split_approves,
+                RedepositReason::DepositRevertsExhausted,
+            )
+            .await?;
             return Ok(true);
         }
 
@@ -657,7 +662,12 @@ where
             }
             Err(error) if quote_refused(&error) => {
                 warn!(target: "rebalance", %id, %error, "Relay refused the re-quote; returning the stable to the vault");
-                self.redeposit(id, RedepositReason::QuoteRefused).await?;
+                self.redeposit_after_split_approves(
+                    id,
+                    &split_approves,
+                    RedepositReason::QuoteRefused,
+                )
+                .await?;
                 Ok(true)
             }
             Err(error) => {
@@ -770,19 +780,22 @@ where
         self.read_relay_payment(id).await
     }
 
-    /// Reads Relay's status of a `SwapDeposited` once, adopts a fill or a
-    /// refund only once it proves on chain, and ends the attempt with
-    /// `RelayFillPending` while there is neither, until the fill window
-    /// passes.
+    /// Reads Relay's status of a deposit once, adopts a fill or a refund only
+    /// once it proves on chain, and otherwise ends the attempt: with
+    /// `RelayFillPending` within the fill window, held at
+    /// `SwapEscrowUnresolved` past it.
     async fn read_relay_payment(&self, id: &UsdcRebalanceId) -> Result<(), UsdcTransferError> {
-        let Some(UsdcRebalance::SwapDeposited {
-            quote,
-            deposit_tx,
-            deposited_at,
-            ..
-        }) = self.cqrs.load(id).await?
-        else {
-            return Ok(());
+        let (quote, deposit_tx, wait) = match self.cqrs.load(id).await? {
+            Some(UsdcRebalance::SwapDeposited {
+                quote,
+                deposit_tx,
+                deposited_at,
+                ..
+            }) => (quote, deposit_tx, PaymentWait::FillWindow { deposited_at }),
+            Some(UsdcRebalance::SwapEscrowUnresolved {
+                quote, deposit_tx, ..
+            }) => (quote, deposit_tx, PaymentWait::Unresolved),
+            _ => return Ok(()),
         };
         let order_id = RelayOrderId(quote.order_id);
 
@@ -795,7 +808,7 @@ where
             Ok(report) => report,
             Err(error) => {
                 warn!(target: "rebalance", %id, %error, "Relay status read failed; reading it again later");
-                return self.payment_pending(id, deposit_tx, deposited_at).await;
+                return self.payment_pending(id, deposit_tx, wait, false).await;
             }
         };
 
@@ -808,7 +821,7 @@ where
                     .await;
                 match Self::proven_payment(id, proof)? {
                     Some(payment) => self.adopt_fill(id, payment).await,
-                    None => self.payment_pending(id, deposit_tx, deposited_at).await,
+                    None => self.payment_pending(id, deposit_tx, wait, true).await,
                 }
             }
             IntentStatus::Refund { reason } => {
@@ -819,7 +832,7 @@ where
                     .await;
                 match Self::proven_payment(id, proof)? {
                     Some(payment) => self.adopt_refund(id, payment, reason).await,
-                    None => self.payment_pending(id, deposit_tx, deposited_at).await,
+                    None => self.payment_pending(id, deposit_tx, wait, true).await,
                 }
             }
             status @ (IntentStatus::RefundFailed { .. } | IntentStatus::Failure { .. }) => {
@@ -839,7 +852,7 @@ where
             | IntentStatus::Filling
             | IntentStatus::Refunding { .. }
             | IntentStatus::NotIncluded
-            | IntentStatus::Unknown(_) => self.payment_pending(id, deposit_tx, deposited_at).await,
+            | IntentStatus::Unknown(_) => self.payment_pending(id, deposit_tx, wait, false).await,
         }
     }
 
@@ -932,19 +945,28 @@ where
         }
     }
 
-    /// Ends an attempt with no payment yet: `RelayFillPending` within the fill
-    /// window, the guard-holding `SwapEscrowUnresolved` once it has passed.
+    /// Ends an attempt with no payment adopted: `RelayFillPending` within the
+    /// fill window, or past it while Relay names a payment the chain does not
+    /// show yet (`paid`), and the guard-holding `SwapEscrowUnresolved` once
+    /// the window passed with neither. An unresolved escrow is read again only
+    /// on the operator's resume.
     async fn payment_pending(
         &self,
         id: &UsdcRebalanceId,
         deposit_tx: TxHash,
-        deposited_at: DateTime<Utc>,
+        wait: PaymentWait,
+        paid: bool,
     ) -> Result<(), UsdcTransferError> {
+        let PaymentWait::FillWindow { deposited_at } = wait else {
+            warn!(target: "rebalance", %id, %deposit_tx, paid, "Relay deposit still unresolved; it is read again on the next resume");
+            return Ok(());
+        };
+
         let window_end = chrono::TimeDelta::from_std(self.hop.bounds.fill_timeout)
             .ok()
             .and_then(|window| deposited_at.checked_add_signed(window));
 
-        if window_end.is_some_and(|window_end| Utc::now() < window_end) {
+        if paid || window_end.is_some_and(|window_end| Utc::now() < window_end) {
             return Err(UsdcTransferError::RelayFillPending {
                 id: id.clone(),
                 deposited_at,
@@ -956,6 +978,19 @@ where
             .await?;
         error!(target: "operational_alert", alert = true, %id, %deposit_tx, %deposited_at, fill_timeout = ?self.hop.bounds.fill_timeout, "Relay deposit has no fill and no refund past its fill window; the transfer holds its guard at SwapEscrowUnresolved");
         Ok(())
+    }
+
+    /// Sends again the approves of a `SwapQuoted` that went out alone, then
+    /// returns the stable to the vault: the vault deposit takes the nonce
+    /// after theirs, and a node may have dropped them.
+    async fn redeposit_after_split_approves(
+        &self,
+        id: &UsdcRebalanceId,
+        split_approves: &[PreparedTransaction],
+        reason: RedepositReason,
+    ) -> Result<(), UsdcTransferError> {
+        self.hop.broadcast_split_approves(split_approves).await?;
+        self.redeposit(id, reason).await
     }
 
     /// Starts returning the stable to the vault, then finishes it.
@@ -1164,6 +1199,15 @@ where
 
         restored
     }
+}
+
+/// What a deposit with no payment adopted is waiting within.
+#[derive(Clone, Copy)]
+enum PaymentWait {
+    /// The fill window, from the deposit's confirmation.
+    FillWindow { deposited_at: DateTime<Utc> },
+    /// Past the window: `SwapEscrowUnresolved`.
+    Unresolved,
 }
 
 /// Pages that a Relay pair prepare panicked: nonces it reserved and did not
@@ -2958,7 +3002,7 @@ mod tests {
         .await
         .expect("an attempt with no fill ends without waiting for it");
 
-        attempt.unwrap_err();
+        assert_fill_pending(&attempt);
         status.assert_calls(1);
         let state = store.load(&id).await.unwrap().unwrap();
         assert_eq!(state.state_name(), "SwapDeposited");
@@ -3010,6 +3054,61 @@ mod tests {
         assert_eq!(state.state_name(), "SwapEscrowUnresolved");
         assert!(state.holds_rebalance_guard());
         assert!(!state.is_reconcilable_failure());
+    }
+
+    /// The operator's resume of a deposit unresolved past its fill window
+    /// reads Relay's status once more: still unpaid, it stays held with no
+    /// redrive; failed at Relay, it becomes the reconcilable `SwapFailed`.
+    #[tokio::test]
+    async fn unresolved_escrow_resume_reads_relay_again() {
+        let anvil = spawn_anvil(Anvil::new());
+        let key = B256::from_slice(&anvil.keys()[0].to_bytes());
+        let wallet = anvil_wallet(anvil.endpoint_url(), &key);
+        let contracts = RelayEndContracts {
+            stable: Address::repeat_byte(0x51),
+            depository: Address::repeat_byte(0x52),
+        };
+
+        for (status_body, after) in [
+            (json!({"status": "pending"}), "SwapEscrowUnresolved"),
+            (
+                json!({"status": "failure", "failReason": "SOLVER_CAPACITY_EXCEEDED"}),
+                "SwapFailed",
+            ),
+        ] {
+            let server = MockServer::start();
+            let relay_api = MockServer::start();
+            let status = mock_status(&relay_api, status_body);
+            let store = Arc::new(test_store(setup_test_db().await, ()));
+            let transfer = relay_transfer(
+                &server,
+                &relay_api,
+                wallet.clone(),
+                wallet.clone(),
+                contracts,
+                store.clone(),
+            )
+            .await;
+            let id = UsdcRebalanceId(Uuid::new_v4());
+            record_deposited(&store, &id).await;
+            store
+                .send(&id, UsdcRebalanceCommand::RecordSwapEscrowUnresolved)
+                .await
+                .unwrap();
+
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                transfer.resume_base_to_alpaca(&id, Usdc::new(float!(100)), ROBINHOOD_RELAY),
+            )
+            .await
+            .expect("the attempt ends")
+            .unwrap();
+
+            status.assert_calls(1);
+            let state = store.load(&id).await.unwrap().unwrap();
+            assert_eq!(state.state_name(), after);
+            assert!(state.holds_rebalance_guard());
+        }
     }
 
     /// A refused binding quote after the vault withdrawal puts the withdrawn
@@ -3097,6 +3196,73 @@ mod tests {
         let state = store.load(&id).await.unwrap().unwrap();
         assert_eq!(state.state_name(), "ReturnedToSource", "{state:?}");
         assert!(!state.holds_rebalance_guard());
+        assert_eq!(rig.vault_usdg().await, U256::from(AMOUNT_IN));
+    }
+
+    /// A redeposit from `SwapQuoted` first sends again an approve that went
+    /// out alone: the vault deposit takes the nonce after it, and would wait
+    /// forever behind a nonce no node holds.
+    #[tokio::test]
+    async fn redeposit_sends_a_split_approve_first() {
+        let rig = RelayRig::deploy().await;
+        let server = MockServer::start();
+        let relay_api = MockServer::start();
+        relay_api.mock(|when, then| {
+            when.method(POST).path("/quote/v2");
+            then.status(400).json_body(json!({
+                "message": "No routes",
+                "errorCode": "NO_SWAP_ROUTES_FOUND",
+                "requestId": "0x00"
+            }));
+        });
+        let store = Arc::new(test_store(setup_test_db().await, ()));
+        let transfer = rig
+            .transfer(&server, &relay_api, store.clone(), relay_bounds())
+            .await;
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let mut quote = exact_quote(
+            &rig.chain.bot_wallet,
+            rig.chain_contracts,
+            B256::repeat_byte(0x0d),
+        )
+        .await;
+        let approve_step = quote.approve.clone().unwrap();
+        quote.deadline = Utc::now() - chrono::Duration::minutes(1);
+        record_quoted(&store, &id, quote).await;
+        let approve = rig
+            .chain
+            .bot_wallet
+            .prepare_pending(approve_step.to, approve_step.data, "split approve")
+            .await
+            .unwrap();
+        store
+            .send(
+                &id,
+                UsdcRebalanceCommand::PrepareSwapApprove {
+                    approve: approve.clone(),
+                },
+            )
+            .await
+            .unwrap();
+
+        tokio::time::timeout(
+            Duration::from_secs(30),
+            transfer.resume_base_to_alpaca(&id, Usdc::new(float!(100)), ROBINHOOD_RELAY),
+        )
+        .await
+        .expect("the redeposit mines once the approve before it is sent")
+        .unwrap();
+
+        let state = store.load(&id).await.unwrap().unwrap();
+        assert_eq!(state.state_name(), "ReturnedToSource", "{state:?}");
+        let approved = rig
+            .chain
+            .bot_wallet
+            .provider()
+            .get_transaction_receipt(approve.tx_hash())
+            .await
+            .unwrap();
+        assert!(approved.is_some(), "the split approve must be mined");
         assert_eq!(rig.vault_usdg().await, U256::from(AMOUNT_IN));
     }
 

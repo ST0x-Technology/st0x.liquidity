@@ -687,8 +687,9 @@ pub(super) async fn transfer_equity_command<Writer: Write>(
 /// errors (`WithdrawalTxUnderconfirmed`, `WithdrawalScanTransient`,
 /// `SettlementCheckTransient`), a non-backpressure
 /// `WithdrawalPollInconclusive` (Alpaca unreachable),
-/// `MintRecoveryInconclusive`, `DepositSendReconciliationPending` and
-/// `RelayFillPending`. The
+/// `MintRecoveryInconclusive`, `DepositSendReconciliationPending`, and the
+/// Relay waits `RelayFillPending`, `SwapDepositReverted` and
+/// `SwapPaymentUnverified`. The
 /// CLI must NOT keep redriving these itself: its process would race the
 /// bot's worker on the same aggregate (the CLI-vs-server race), so the first
 /// such outcome hands the transfer off to the running bot instead. Errors outside this set -- including
@@ -702,7 +703,9 @@ fn is_bot_resumable_wait(error: &UsdcTransferError) -> bool {
         | UsdcTransferError::SettlementCheckTransient { .. }
         | UsdcTransferError::MintRecoveryInconclusive { .. }
         | UsdcTransferError::DepositSendReconciliationPending { .. }
-        | UsdcTransferError::RelayFillPending { .. } => true,
+        | UsdcTransferError::RelayFillPending { .. }
+        | UsdcTransferError::SwapDepositReverted { .. }
+        | UsdcTransferError::SwapPaymentUnverified { .. } => true,
         UsdcTransferError::WithdrawalPollInconclusive { source, .. } => {
             source.backpressure().is_none()
         }
@@ -773,8 +776,6 @@ fn is_bot_resumable_wait(error: &UsdcTransferError) -> bool {
         | UsdcTransferError::SwapPrepareTaskPanicked { .. }
         | UsdcTransferError::SwapPrepareTimedOut { .. }
         | UsdcTransferError::SwapQuoteExpired { .. }
-        | UsdcTransferError::SwapDepositReverted { .. }
-        | UsdcTransferError::SwapPaymentUnverified { .. }
         | UsdcTransferError::EthereumChainMissing(_) => false,
     }
 }
@@ -2689,6 +2690,16 @@ mod tests {
                 id: id.clone(),
                 initiated_at: Utc::now(),
                 source: Box::new(CctpError::ScanInconclusive { from_block: 99 }),
+            },
+            UsdcTransferError::RelayFillPending {
+                id: id.clone(),
+                deposited_at: Utc::now(),
+            },
+            UsdcTransferError::SwapDepositReverted {
+                id: id.clone(),
+                deposit_tx: b256!(
+                    "0x0000000000000000000000000000000000000000000000000000000000000002"
+                ),
             },
             UsdcTransferError::WithdrawalPollInconclusive {
                 id,

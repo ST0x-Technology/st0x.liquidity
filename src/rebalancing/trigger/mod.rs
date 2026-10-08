@@ -10224,7 +10224,8 @@ mod tests {
     use crate::test_utils::rebalancing_enabled_equities;
     use crate::tokenized_equity_mint::TokenizedEquityMintCommand;
     use crate::usdc_rebalance::{
-        ConversionAmounts, TransferRef, UsdcRebalance, UsdcRebalanceCommand, UsdcRebalanceId,
+        ConversionAmounts, RedepositReason, RefundSide, TransferRef, UsdcRebalance,
+        UsdcRebalanceCommand, UsdcRebalanceId, swap_quote_for_test,
     };
     use crate::vault_lookup::MockVaultLookup;
     use crate::vault_registry::VaultRegistryCommand;
@@ -37386,7 +37387,7 @@ mod tests {
                 withdrawal_tx: None,
             },
             UsdcRebalanceEvent::SwapQuoted {
-                quote: Box::new(crate::usdc_rebalance::swap_quote_for_test(
+                quote: Box::new(swap_quote_for_test(
                     U256::from(100_000_000u64),
                     B256::repeat_byte(0x0d),
                 )),
@@ -37406,8 +37407,9 @@ mod tests {
     }
 
     /// A Relay transfer whose stable went back into its vault clears its
-    /// active claim and returns the reserved cash to the vault side; one Relay
-    /// failed with nothing paid back keeps its guard and claim.
+    /// active claim and guard, credits the vault side with what came back and
+    /// releases what the refund kept; one Relay failed with nothing paid back
+    /// keeps its guard and claim.
     #[tokio::test]
     async fn relay_returned_to_source_clears_and_swap_failed_preserves() {
         let robinhood_relay = UsdcCorridor::HubRouted {
@@ -37417,13 +37419,13 @@ mod tests {
         let refunded = [
             UsdcRebalanceEvent::SwapRefunded {
                 refund_tx: TxHash::repeat_byte(0xe1),
-                side: crate::usdc_rebalance::RefundSide::Origin,
+                side: RefundSide::Origin,
                 amount_refunded: usdc(99),
                 refunded_at: Utc::now(),
             },
             UsdcRebalanceEvent::RedepositStarted {
                 redeposit_amount: usdc(99),
-                reason: crate::usdc_rebalance::RedepositReason::Refunded,
+                reason: RedepositReason::Refunded,
                 started_at: Utc::now(),
             },
             UsdcRebalanceEvent::RedepositSubmitted {
@@ -37434,6 +37436,8 @@ mod tests {
         let returned = UsdcRebalanceEvent::ReturnedToSource {
             deposit_tx: TxHash::repeat_byte(0xd1),
             deposit_block: Some(3),
+            redeposit_amount: usdc(99),
+            shortfall: usdc(1),
             returned_at: Utc::now(),
         };
         let failed = UsdcRebalanceEvent::SwapFailed {
@@ -37449,6 +37453,11 @@ mod tests {
             ))
             .await;
             let id = UsdcRebalanceId(Uuid::new_v4());
+            trigger
+                .usdc_guards
+                .try_claim(Chain::Robinhood, &id, RebalanceDirection::BaseToAlpaca)
+                .unwrap()
+                .defuse();
             let initiated = make_usdc_initiated_on(
                 robinhood_relay,
                 RebalanceDirection::BaseToAlpaca,
@@ -37470,9 +37479,19 @@ mod tests {
                 .await
                 .active_usdc_rebalance()
                 .cloned();
+            let inventory = trigger.inventory.read().await.clone();
             if clears {
                 assert_eq!(active, None, "ReturnedToSource clears the active claim");
                 assert!(!trigger.usdc_tracking.read().await.contains_key(&id));
+                assert!(!trigger.usdc_guards.is_held(Chain::Robinhood));
+                assert_eq!(
+                    inventory.onchain_usdc_available_at(Chain::Robinhood),
+                    Some(usdc(499))
+                );
+                assert_eq!(
+                    inventory.onchain_usdc_inflight_at(Chain::Robinhood),
+                    Some(Usdc::ZERO)
+                );
             } else {
                 assert_eq!(
                     active,
@@ -43052,7 +43071,7 @@ mod tests {
             ];
             if quoted {
                 commands.push(UsdcRebalanceCommand::QuoteSwap {
-                    quote: Box::new(crate::usdc_rebalance::swap_quote_for_test(
+                    quote: Box::new(swap_quote_for_test(
                         U256::from(100_000_000u64),
                         B256::repeat_byte(0x0d),
                     )),
