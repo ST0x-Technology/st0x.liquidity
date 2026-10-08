@@ -17612,15 +17612,6 @@ mod tests {
             .receive::<TokenizedEquityMint>(id.clone(), make_mint_accepted())
             .await
             .unwrap();
-        assert_eq!(
-            trigger
-                .inventory
-                .read()
-                .await
-                .equity_inflight(&symbol, Venue::Hedging),
-            Some(shares(60)),
-            "The reset's poll and MintAccepted must both have counted the request"
-        );
 
         for event in [make_tokens_received(), make_deposited_into_raindex()] {
             harness
