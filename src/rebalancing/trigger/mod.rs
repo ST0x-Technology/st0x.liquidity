@@ -17353,11 +17353,9 @@ mod tests {
             "Hedging available must be debited by the mint exactly once"
         );
         drop(inventory);
-        assert!(
-            trigger
-                .divergence_gate
-                .pending_offchain_equity_reconciles()
-                .is_empty(),
+        assert_eq!(
+            trigger.divergence_gate.pending_offchain_equity_reconciles(),
+            Vec::<Symbol>::new(),
             "A correctly counted mint leaves no residual to reconcile"
         );
     }
