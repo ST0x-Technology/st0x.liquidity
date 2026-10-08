@@ -3771,6 +3771,63 @@ mod tests {
         );
     }
 
+    /// Reconciling an Alpaca-to-chain Relay transfer held at the hub with an
+    /// approve that went out alone tells the operator to restart the bot: the
+    /// running bot keeps that approve's nonce reserved, and later sends from
+    /// the Ethereum wallet wait behind it if it never mined.
+    #[tokio::test]
+    async fn reconcile_usdc_transfer_with_a_signed_relay_approve_requires_a_restart() {
+        let pool = setup_test_db().await;
+        let id = Uuid::from_u128(0xD5E3);
+        let (store, _projection) = StoreBuilder::<UsdcRebalance>::new(pool.clone())
+            .build(())
+            .await
+            .unwrap();
+        for command in [
+            UsdcRebalanceCommand::Initiate {
+                corridor: UsdcCorridor::HubRouted {
+                    chain: Chain::Robinhood,
+                    hop: HopKind::Relay,
+                },
+                direction: RebalanceDirection::AlpacaToBase,
+                amount: Usdc::new(float!(100)),
+                withdrawal: TransferRef::OnchainTx(B256::repeat_byte(0x01)),
+            },
+            UsdcRebalanceCommand::ConfirmWithdrawal {
+                withdrawal_tx: Some(B256::repeat_byte(0x01)),
+            },
+            UsdcRebalanceCommand::QuoteSwap {
+                quote: Box::new(st0x_hedge::operator::usdc_rebalance::swap_quote_for_test(
+                    alloy::primitives::U256::from(100_000_000u64),
+                    B256::repeat_byte(0x0e),
+                )),
+            },
+            UsdcRebalanceCommand::PrepareSwapApprove {
+                approve: PreparedTransaction::for_test(TxHash::repeat_byte(0xA7), 4),
+            },
+        ] {
+            store.send(&UsdcRebalanceId(id), command).await.unwrap();
+        }
+
+        let mut stdout = Vec::new();
+        reconcile_usdc_transfer_command(
+            &mut stdout,
+            id,
+            ReconcileReason::FundsMovedManually,
+            None,
+            &pool,
+            no_deposit_send_to_verify,
+        )
+        .await
+        .unwrap();
+
+        let output = String::from_utf8(stdout).unwrap();
+        assert!(
+            output.contains("Restart the bot to release the nonces of the signed Relay envelopes"),
+            "{output}"
+        );
+    }
+
     /// `--chain` picks the served corridor on that chain; it may be left out
     /// only while one corridor is served, and an unserved chain is refused.
     #[test]

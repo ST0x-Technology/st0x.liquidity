@@ -6649,8 +6649,8 @@ impl UsdcRebalance {
 }
 
 /// A Relay quote for `amount_in` in base units, as `QuoteSwap` records it.
-#[cfg(test)]
-pub(crate) fn swap_quote_for_test(amount_in: U256, order_id: B256) -> SwapQuote {
+#[cfg(any(test, feature = "test-support"))]
+pub fn swap_quote_for_test(amount_in: U256, order_id: B256) -> SwapQuote {
     SwapQuote {
         request_id: B256::repeat_byte(0x5e),
         order_id,
