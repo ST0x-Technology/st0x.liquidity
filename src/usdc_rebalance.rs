@@ -7119,6 +7119,181 @@ mod tests {
         }
     }
 
+    fn refunded_toward_chain(side: RefundSide) -> Vec<UsdcRebalanceEvent> {
+        [
+            deposited(RebalanceDirection::AlpacaToBase),
+            vec![UsdcRebalanceEvent::SwapRefunded {
+                refund_tx: TxHash::repeat_byte(0xe1),
+                side,
+                amount_refunded: Usdc::new(float!(99)),
+                refunded_at: Utc::now(),
+            }],
+        ]
+        .concat()
+    }
+
+    /// An Alpaca-to-chain refund paid in USDC at the hub is quoted again for
+    /// the refunded amount under a fresh order id, every signed one kept.
+    #[tokio::test]
+    async fn origin_refund_toward_chain_requotes_the_refunded_amount() {
+        let requote = swap_quote_for_test(U256::from(99_000_000u64), B256::repeat_byte(0x1e));
+
+        let events = TestHarness::<UsdcRebalance>::with(())
+            .given(refunded_toward_chain(RefundSide::Origin))
+            .when(UsdcRebalanceCommand::RequoteSwap {
+                quote: Box::new(requote.clone()),
+            })
+            .await
+            .events();
+        let state =
+            replay::<UsdcRebalance>([refunded_toward_chain(RefundSide::Origin), events].concat())
+                .unwrap()
+                .unwrap();
+
+        let UsdcRebalance::SwapQuoted {
+            direction,
+            amount,
+            quote,
+            signed_order_ids,
+            split_approves,
+            deposit_reverts,
+            ..
+        } = &state
+        else {
+            panic!("expected SwapQuoted, got {state:?}");
+        };
+        assert_eq!(*direction, RebalanceDirection::AlpacaToBase);
+        assert_eq!(*amount, Usdc::new(float!(99)));
+        assert_eq!(**quote, requote);
+        assert_eq!(*signed_order_ids, vec![B256::repeat_byte(0x0a)]);
+        assert!(split_approves.is_empty());
+        assert_eq!(*deposit_reverts, 0);
+        assert!(state.holds_rebalance_guard());
+        assert_eq!(
+            state.ethereum_wallet_credit(),
+            Some(EthereumWalletCredit::Held(Usdc::new(float!(99))))
+        );
+    }
+
+    /// A re-quote after a refund must be for the refunded amount, under an
+    /// order id never signed, and only for an Alpaca-to-chain refund at the
+    /// hub.
+    #[tokio::test]
+    async fn refund_requote_toward_chain_is_refused_off_its_bounds() {
+        let requote = |amount: u64, order_id: u8| UsdcRebalanceCommand::RequoteSwap {
+            quote: Box::new(swap_quote_for_test(
+                U256::from(amount),
+                B256::repeat_byte(order_id),
+            )),
+        };
+
+        let error = TestHarness::<UsdcRebalance>::with(())
+            .given(refunded_toward_chain(RefundSide::Origin))
+            .when(requote(99_500_000, 0x1e))
+            .await
+            .then_expect_error();
+        assert!(
+            matches!(
+                error,
+                LifecycleError::Apply(UsdcRebalanceError::SwapAmountMismatch { .. })
+            ),
+            "got {error:?}"
+        );
+
+        let error = TestHarness::<UsdcRebalance>::with(())
+            .given(refunded_toward_chain(RefundSide::Origin))
+            .when(requote(99_000_000, 0x0a))
+            .await
+            .then_expect_error();
+        assert!(
+            matches!(
+                error,
+                LifecycleError::Apply(UsdcRebalanceError::SwapOrderAlreadySigned { .. })
+            ),
+            "got {error:?}"
+        );
+
+        let base_to_alpaca_refund = [
+            deposited(RebalanceDirection::BaseToAlpaca),
+            vec![UsdcRebalanceEvent::SwapRefunded {
+                refund_tx: TxHash::repeat_byte(0xe1),
+                side: RefundSide::Origin,
+                amount_refunded: Usdc::new(float!(99)),
+                refunded_at: Utc::now(),
+            }],
+        ]
+        .concat();
+        for given in [
+            refunded_toward_chain(RefundSide::Destination),
+            base_to_alpaca_refund,
+        ] {
+            let error = TestHarness::<UsdcRebalance>::with(())
+                .given(given)
+                .when(requote(99_000_000, 0x1e))
+                .await
+                .then_expect_error();
+            assert!(
+                matches!(
+                    error,
+                    LifecycleError::Apply(UsdcRebalanceError::InvalidCommand { .. })
+                ),
+                "got {error:?}"
+            );
+        }
+    }
+
+    /// The Alpaca-to-chain holds keep the guard and are reconcilable: a
+    /// `SwapQuoted` past its revert budget and a refund either side. Every
+    /// Alpaca-to-chain swap state refuses `fail-usdc-transfer` with the Relay
+    /// hold.
+    #[tokio::test]
+    async fn relay_holds_toward_chain_classify_for_reconcile_and_fail() {
+        for events in [
+            quoted(RebalanceDirection::AlpacaToBase),
+            refunded_toward_chain(RefundSide::Origin),
+            refunded_toward_chain(RefundSide::Destination),
+        ] {
+            let state = replay::<UsdcRebalance>(events.clone()).unwrap().unwrap();
+            assert!(state.holds_rebalance_guard(), "{state:?}");
+            assert!(state.is_reconcilable_failure(), "{state:?}");
+
+            let reconciled = TestHarness::<UsdcRebalance>::with(())
+                .given(events.clone())
+                .when(UsdcRebalanceCommand::ReconcileStuckRebalance {
+                    reason: ReconcileReason::FundsMovedManually,
+                })
+                .await
+                .events();
+            let reconciled = replay::<UsdcRebalance>([events, reconciled].concat())
+                .unwrap()
+                .unwrap();
+            assert_eq!(reconciled.state_name(), "Reconciled");
+            assert!(!reconciled.holds_rebalance_guard());
+        }
+
+        for events in [
+            quoted(RebalanceDirection::AlpacaToBase),
+            prepared_pair(RebalanceDirection::AlpacaToBase),
+            deposited(RebalanceDirection::AlpacaToBase),
+            refunded_toward_chain(RefundSide::Origin),
+            refunded_toward_chain(RefundSide::Destination),
+            [
+                deposited(RebalanceDirection::AlpacaToBase),
+                vec![UsdcRebalanceEvent::SwapEscrowUnresolved {
+                    unresolved_at: Utc::now(),
+                }],
+            ]
+            .concat(),
+        ] {
+            let state = replay::<UsdcRebalance>(events).unwrap().unwrap();
+            assert_eq!(
+                state.pre_burn_fail_eligibility(),
+                PreBurnFailEligibility::RelayHeldOutsideVault,
+                "{state:?}"
+            );
+        }
+    }
+
     /// The chain-to-Alpaca Relay states after the deposit that hold the
     /// guard refuse `fail-usdc-transfer` with the Relay hold, not the CCTP
     /// post-burn steps: the stable is with Relay or on its way back.

@@ -2169,7 +2169,7 @@ mod tests {
     }
 
     #[test]
-    fn relay_corridor_declines_below_min_transfer_and_alpaca_to_chain() {
+    fn relay_corridor_declines_below_min_transfer_either_way() {
         let relay = relay_bounds();
 
         assert_eq!(
@@ -2202,7 +2202,21 @@ mod tests {
                 },
                 &relay
             ),
-            Err(UsdcTriggerSkip::RelayDirectionNotBuilt)
+            Ok(UsdcRebalanceOperation::AlpacaToBase {
+                amount: Usdc::new(float!(5000))
+            })
+        );
+        assert_eq!(
+            fit_relay_bounds(
+                UsdcRebalanceOperation::AlpacaToBase {
+                    amount: Usdc::new(float!(499.99))
+                },
+                &relay
+            ),
+            Err(UsdcTriggerSkip::BelowRelayMinimum {
+                amount: Usdc::new(float!(499.99)),
+                minimum: Usdc::new(float!(500)),
+            })
         );
     }
 
