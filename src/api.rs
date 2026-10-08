@@ -10938,6 +10938,59 @@ mod tests {
         );
     }
 
+    /// Reconciling an Alpaca-to-chain Relay transfer that still holds a
+    /// signed approve pages that the running bot keeps its nonce reserved:
+    /// later sends from the Ethereum wallet wait behind it until a restart
+    /// if it never mined.
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn reconcile_usdc_transfer_with_a_signed_relay_approve_pages_a_restart() {
+        let pool = crate::test_utils::setup_test_db().await;
+        let id = UsdcRebalanceId(uuid::Uuid::new_v4());
+        let store = standalone_usdc_store(&pool).await;
+        for command in [
+            UsdcRebalanceCommand::Initiate {
+                direction: RebalanceDirection::AlpacaToBase,
+                corridor: UsdcCorridor::HubRouted {
+                    chain: Chain::Robinhood,
+                    hop: HopKind::Relay,
+                },
+                amount: Usdc::new(float!(100)),
+                withdrawal: TransferRef::OnchainTx(TxHash::repeat_byte(0x22)),
+            },
+            UsdcRebalanceCommand::ConfirmWithdrawal {
+                withdrawal_tx: Some(TxHash::repeat_byte(0x22)),
+            },
+            UsdcRebalanceCommand::QuoteSwap {
+                quote: Box::new(crate::usdc_rebalance::swap_quote_for_test(
+                    alloy::primitives::U256::from(100_000_000u64),
+                    alloy::primitives::B256::repeat_byte(0x0e),
+                )),
+            },
+            UsdcRebalanceCommand::PrepareSwapApprove {
+                approve: PreparedTransaction::for_test(TxHash::repeat_byte(0xa7), 4),
+            },
+        ] {
+            store.send(&id, command).await.unwrap();
+        }
+
+        let resp = reconcile_stuck_usdc_transfer(
+            &store,
+            &LeftUnchangedUsdcRecheck,
+            &id,
+            ReconcileReason::from(ReconcileReasonWire::FundsMovedManually),
+            None,
+        )
+        .await;
+
+        let Ok(Json(_)) = resp else {
+            panic!("a held Relay swap must reconcile");
+        };
+        assert!(logs_contain(
+            "Restart the bot to release the nonces of its signed Relay envelopes"
+        ));
+    }
+
     #[tokio::test]
     async fn reconcile_usdc_transfer_rejects_a_pre_burn_in_flight_state() {
         let pool = crate::test_utils::setup_test_db().await;

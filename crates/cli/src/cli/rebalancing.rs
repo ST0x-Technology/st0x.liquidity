@@ -2385,7 +2385,7 @@ pub(crate) async fn resume_interrupted_transfers_command<W: Write>(
 
 #[cfg(test)]
 mod tests {
-    use alloy::primitives::{Address, B256, address, b256};
+    use alloy::primitives::{Address, B256, U256, address, b256};
     use chrono::Utc;
     use rain_math_float::Float;
     use std::collections::{BTreeMap, BTreeSet};
@@ -2428,7 +2428,7 @@ mod tests {
     use st0x_hedge::operator::rebalancing::usdc::DepositSendNotSuperseded;
     use st0x_hedge::operator::test_utils::try_setup_test_db;
     use st0x_hedge::operator::usdc_rebalance::{
-        ConversionAmounts, ReconcileReason, TransferRef, UsdcRebalanceCommand,
+        ConversionAmounts, ReconcileReason, TransferRef, UsdcRebalanceCommand, swap_quote_for_test,
     };
     use st0x_hedge::operator::vault_lookup::MockVaultLookup;
     use st0x_tokenization::mock::MockTokenizer;
@@ -3806,8 +3806,8 @@ mod tests {
                 withdrawal_tx: Some(B256::repeat_byte(0x01)),
             },
             UsdcRebalanceCommand::QuoteSwap {
-                quote: Box::new(st0x_hedge::operator::usdc_rebalance::swap_quote_for_test(
-                    alloy::primitives::U256::from(100_000_000u64),
+                quote: Box::new(swap_quote_for_test(
+                    U256::from(100_000_000u64),
                     B256::repeat_byte(0x0e),
                 )),
             },
