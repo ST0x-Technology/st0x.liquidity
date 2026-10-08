@@ -664,7 +664,7 @@ def tab_links(active):
     return links
 
 
-def pills(y):
+def pills(y, w=24):
     """The SPA's HeaderBar and SettingsBar as one Business Text row,
     repeated on every tab like the SPA repeats its header: the settings
     pills (broker, Equity and USDC targets with their bands, Trigger,
@@ -678,6 +678,9 @@ def pills(y):
     one in the lookback window. The recovery guide is static data exported
     from the SPA (liquidity-panels/recovery-guide.json) and prepended to
     the script.
+
+    w: the Dashboard tab narrows it to 23 to fit the detail panel beside
+    it (see detail_panel()).
     """
     def named(expr, name):
         return f'label_replace({expr}, "k", "{name}", "", "")'
@@ -713,7 +716,7 @@ def pills(y):
         "datasource": CM,
         "targets": [promql(expr, instant=True)],
         "transparent": True,
-        "gridPos": {"h": 1, "w": 24, "x": 0, "y": y},
+        "gridPos": {"h": 1, "w": w, "x": 0, "y": y},
         "transformations": [
             {"id": "labelsToFields", "options": {}},
             {"id": "merge", "options": {}},
@@ -823,7 +826,7 @@ dashboards = []
 # stacked right.
 # ==========================================================================
 panels = []
-panels += pills(0)
+panels += pills(0, w=23)
 
 def native_table(title, desc, expr, row_label, columns, w, h, x, y,
                  first_col, sort_by=None, widths=None, bars=(),
@@ -1222,16 +1225,96 @@ TRADES_H, TRANSFERS_H = 25, 26
 # fit left it a header and a scrollbar on windows under ~1600px tall.
 panels += native_inventory(w=13, x=0, y=1, heights=(8, 9, 35))
 
+# A row's detail dialog is the hidden `detail` variable: a table row's link
+# sets it to the row's id, the detail panel picks that id out of the Trades
+# and Rebalances tables' own results (it runs no query of its own) and
+# opens the dialog, and closing the dialog clears the variable again.
+# Do not add $detail to its A and B: they are the tables' results, not
+# queries.
+#
+# The id is read by the field NAME. The groupBy key keeps the raw field name
+# (jsonPayload.id); organize's rename only set its display name, and the Id
+# column's override replaces that with a blank header. ${__url.params:...}
+# already starts with "?", so the URL appends straight to it.
+DETAIL_URL = ('/d/${__dashboard.uid}/${__url.params:exclude:var-detail}'
+              '&var-detail=${__data.fields["jsonPayload.id"]}')
+
+
+DETAIL_VAR = {"type": "textbox", "name": "detail", "hide": 2, "query": "",
+              "current": {"text": "", "value": ""}, "options": []}
+
+
+def detail_panel(x, y, trades_id, transfers_id):
+    """The SPA's trade and transfer detail dialogs, opened from a row of the
+    Trades or Rebalances table (see DETAIL_URL).
+
+    The panel itself draws nothing; it takes the header row's last column so
+    the tab's panel heights stay as they are. It reads the Trades and
+    Rebalances tables' own results (the newest 500 entries of each log)
+    through the Dashboard datasource, so the board scans each log once per
+    refresh, and not per click: a query filtered on one id still scans the
+    whole window (about 13s for 30 days), so a click only picks the id out
+    of data the browser already has and the dialog opens at once. The
+    Dashboard datasource keeps each table's refId: Trades A, Rebalances B. The queries do not use
+    `$detail`, so a click does not re-run them; the script reads `${detail}`,
+    which makes Grafana redraw the panel when the variable changes.
+    liquidity-panels/detail.js builds the dialog. renderMode "data" hands
+    the script both frames, where "allRows" would draw a frame picker.
+    The status-history order is prepended from status-history.js.
+    """
+    with open(os.path.join(HERE, "liquidity-panels", "status-history.js")) as f:
+        # Its export line is for the SPA test; afterRender is not a module.
+        history = "".join(line for line in f if not line.startswith("export "))
+    with open(os.path.join(HERE, "liquidity-panels", "detail.js")) as f:
+        after_render = history + "\n\n" + f.read()
+    with open(os.path.join(HERE, "liquidity-panels", "detail.css")) as f:
+        styles = f.read()
+    return {
+        "id": nid(), "type": "marcusolsson-dynamictext-panel", "title": "",
+        "description": "The detail dialog of a Trades or Rebalances row: "
+                       "open it from the row's ⓘ.",
+        "datasource": {"type": "datasource", "uid": "-- Mixed --"},
+        "timeFrom": "30d", "hideTimeOverride": True,
+        "maxDataPoints": 500,
+        "targets": [
+            *({"refId": ref, "panelId": panel_id, "withTransforms": False,
+               "datasource": {"type": "datasource", "uid": "-- Dashboard --"}}
+              for ref, panel_id in (("A", trades_id), ("B", transfers_id))),
+        ],
+        "transparent": True,
+        "gridPos": {"h": 1, "w": 1, "x": x, "y": y},
+        "options": {
+            "renderMode": "data",
+            "editor": {"format": "auto", "language": "html"},
+            "content": "<div></div>",
+            "defaultContent": "<div></div>",
+            "helpers": "",
+            "afterRender": after_render,
+            "styles": styles,
+            "wrap": False,
+        },
+    }
+
+
 def latest_status_table(title, desc, log, fields, shown, w, h, x, y,
                         body_regex=None, number_columns=None, time_columns=(),
-                        overrides=(), sort_by=None):
+                        overrides=(), sort_by=None, ref="A"):
     """A Cloud Logging table with one row per entity at its latest status,
-    like the SPA's Trade History and Cross-venue Transfers cards.
+    like the SPA's Trade History and Cross-venue Transfers cards (here
+    Trades and Rebalances).
 
     The exporter writes one log entry per status change (insertId
     `<id>:<status>`), so the raw feed holds several rows per trade or
     transfer. The plugin returns entries newest first, so groupBy on
-    jsonPayload.id with `first` keeps each entity's latest status.
+    jsonPayload.id with `first` keeps each entity's entry with the highest
+    timestamp. That is usually the latest status, but a status's timestamp
+    can be earlier than the one before it: a USDC bridge stamps
+    WithdrawalComplete with confirmed_at and the BridgingSubmitting after it
+    with the older initiated_at, so such a row can show withdrawing. The
+    detail dialog orders a bridge's statuses by its lifecycle instead.
+
+    The id stays as the first column, an ⓘ that opens the row's detail
+    dialog (see DETAIL_URL).
 
     fields: {payload leaf: column name}; the entry's own timestamp is
       always kept, as fields["timestamp"].
@@ -1257,6 +1340,9 @@ def latest_status_table(title, desc, log, fields, shown, w, h, x, y,
            for name in time_columns])
     return {
         "id": nid(), "type": "table", "title": title, "description": desc,
+        # Without a version Grafana runs the table panel's old-version
+        # migration on load, which can drop field overrides.
+        "pluginVersion": "13.1.0",
         "datasource": CL,
         "timeFrom": "30d",
         # The plugin takes the row limit from maxDataPoints, which Grafana
@@ -1264,7 +1350,7 @@ def latest_status_table(title, desc, log, fields, shown, w, h, x, y,
         # 500 newest entries load in about 1.5s and still leave well over
         # the SPA's 100 rows after grouping by id.
         "maxDataPoints": 500,
-        "targets": [cloudlog(log)],
+        "targets": [cloudlog(log, ref=ref)],
         "gridPos": {"h": h, "w": w, "x": x, "y": y},
         "transformations": [
             # `labels` is a JSON object per row; extractFields lifts each
@@ -1292,9 +1378,10 @@ def latest_status_table(title, desc, log, fields, shown, w, h, x, y,
                    for name in shown},
             }}},
             {"id": "organize",
-             "options": {"excludeByName": {"Id": True},
-                         "indexByName": {f"{name} (first)": index
-                                         for index, name in enumerate(shown)},
+             "options": {"excludeByName": {},
+                         "indexByName": {"Id": 0, **{
+                             f"{name} (first)": index + 1
+                             for index, name in enumerate(shown)}},
                          "renameByName": {f"{name} (first)": name
                                           for name in shown}}},
             {"id": "sortBy", "options": {"fields": {}, "sort": [
@@ -1310,14 +1397,31 @@ def latest_status_table(title, desc, log, fields, shown, w, h, x, y,
                 *[{"matcher": {"id": "byName", "options": name},
                    "properties": TIME_FMT}
                   for name in [fields["timestamp"], *time_columns]],
+                # The ⓘ is the link's title: a data-links cell draws the
+                # title in place of the value. A value mapping would do the
+                # same, but it would also turn ${__data.fields[...]} into
+                # the ⓘ, since data links read a field's display text.
+                {"matcher": {"id": "byName", "options": "Id"},
+                 "properties": [
+                     {"id": "displayName", "value": " "},
+                     # Grafana's minimum column width; see native_inventory.
+                     {"id": "custom.width", "value": 50},
+                     {"id": "custom.align", "value": "center"},
+                     {"id": "custom.filterable", "value": False},
+                     {"id": "custom.cellOptions", "value": {"type": "data-links"}},
+                     {"id": "links", "value": [{
+                         "title": "ⓘ", "url": DETAIL_URL,
+                         "targetBlank": False, "oneClick": True}]}]},
                 *overrides,
             ],
         },
-        "options": {"showHeader": True, "cellHeight": "sm"},
+        # Medium rows: small ones read crowded, large ones waste the card.
+        "options": {"showHeader": True, "cellHeight": "md"},
     }
 
 
 def column(name, px, mappings=None, color_text=False):
+    # px None: the column stretches over the rest of the card.
     properties = [{"id": "custom.width", "value": px}] if px else []
     if mappings:
         properties.append({"id": "mappings", "value": mappings})
@@ -1329,43 +1433,45 @@ def column(name, px, mappings=None, color_text=False):
 
 
 panels.append(latest_status_table(
-    "Trade History",
+    "Trades",
     "Direct Raindex fills, fills routed through supported adapters such as "
     "Bebop, and the corresponding Alpaca hedge trades placed to offset "
-    "exposure. One row per trade at its latest status. Built from the "
-    "newest 500 status entries, so a busy period can push older rows out "
-    "of the 30-day window.",
+    "exposure. One row per trade at its latest status; its ⓘ "
+    "opens the details. Built from the newest 500 status entries, so a "
+    "busy period can push older rows out of the 30-day window.",
     'logName="projects/$env/logs/liquidity-trades"',
-    fields={"timestamp": "Time", "symbol": "Asset", "venue": "Venue",
+    # One timestamp, first: when the row last changed status.
+    fields={"timestamp": "Last updated", "symbol": "Asset", "venue": "Venue",
             "direction": "Side", "shares": "Size", "status": "Status"},
-    shown=["Time", "Asset", "Venue", "Side", "Size", "Status"],
+    shown=["Last updated", "Asset", "Venue", "Side", "Size", "Status"],
     w=11, h=TRADES_H, x=13, y=1,
     number_columns={"Size": 3},
     overrides=[
-        # No width on the last column: it takes what is left, so the
-        # table fills the card like the SPA's.
-        column("Time", 170), column("Asset", 80),
-        column("Venue", 110, VENUE_MAPPINGS, color_text=True),
-        column("Side", 70, SIDE_MAPPINGS, color_text=True),
-        column("Size", 110),
+        column("Last updated", 185), column("Asset", 85),
+        column("Venue", 115, VENUE_MAPPINGS, color_text=True),
+        column("Side", 75, SIDE_MAPPINGS, color_text=True),
+        column("Size", 100),
         column("Status", None, STATUS_CAP_MAPPINGS, color_text=True),
     ],
 ))
 
 panels.append(latest_status_table(
-    "Cross-venue Transfers",
+    "Rebalances",
     "Asset movements between venues to rebalance inventory: equity mints "
     "(Alpaca to onchain), redemptions (onchain to Alpaca), and USDC bridges "
-    "(Base/Ethereum via CCTP). One row per transfer at its latest status. "
+    "(Base/Ethereum via CCTP). One row per transfer at its latest status; "
+    "its ⓘ opens the details. "
     "A USDC bridge can show the previous status for a while: the exporter "
     "stamps each status with the transfer's updatedAt, which is not always "
     "later than the one before (bridging starts from initiated_at). "
     "Built from the newest 500 status entries, so a busy period can push "
     "older rows out of the 30-day window.",
     'logName="projects/$env/logs/liquidity-transfers"',
-    fields={"timestamp": "Updated", "started_at": "Started", "symbol": "Asset",
+    # One timestamp, first: when the row last changed status. The start
+    # time is in the row's detail dialog.
+    fields={"timestamp": "Last updated", "symbol": "Asset",
             "amount": "Amount", "status": "Status"},
-    shown=["Started", "Type", "Asset", "Amount", "Status", "Updated"],
+    shown=["Last updated", "Type", "Asset", "Amount", "Status"],
     # Type reads the direction for a USDC bridge and the kind for an equity
     # transfer, like the SPA's transferTypeLabel. A bridge's kind is
     # usdc_bridge and an equity transfer's direction is "", so each row can
@@ -1374,18 +1480,23 @@ panels.append(latest_status_table(
                '|equity_mint|equity_redemption)"',
     w=11, h=TRANSFERS_H, x=13, y=1 + TRADES_H,
     number_columns={"Amount": 3},
-    time_columns=["Started"],
     overrides=[
-        column("Started", 135), column("Type", 125, TYPE_MAPPINGS),
+        column("Last updated", 185), column("Type", 165, TYPE_MAPPINGS),
         # A USDC bridge carries no symbol; the SPA's Asset column reads
         # "USDC" for it.
-        column("Asset", 60, [{"type": "special", "options": {
+        column("Asset", 80, [{"type": "special", "options": {
             "match": "empty", "result": {"text": "USDC", "index": 0}}}]),
-        column("Amount", 85),
-        column("Status", 110, STATUS_DOT_MAPPINGS, color_text=True),
-        column("Updated", None),
+        column("Amount", 115),
+        column("Status", None, STATUS_DOT_MAPPINGS, color_text=True),
     ],
+    # B, not A: the detail panel reads both tables through the Dashboard
+    # datasource, which keeps each table's refId.
+    ref="B",
 ))
+panels.append(detail_panel(
+    x=23, y=0,
+    trades_id=next(p["id"] for p in panels if p.get("title") == "Trades"),
+    transfers_id=next(p["id"] for p in panels if p.get("title") == "Rebalances")))
 
 
 dashboards.append(make_dashboard(
@@ -1404,7 +1515,7 @@ dashboards.append(make_dashboard(
     "compute start-iap-tunnel <vm> 8080 "
     "--local-host-port=localhost:8080 --zone europe-west3-b "
     "--project $env (VM name = project id)",
-    panels, tab_links("Dashboard"), [ENV_VAR, SOURCE_VAR]))
+    panels, tab_links("Dashboard"), [ENV_VAR, SOURCE_VAR, DETAIL_VAR]))
 
 # ==========================================================================
 # Tab 2: Orders — the SPA's Raindex Orders table (+ ops extras).
