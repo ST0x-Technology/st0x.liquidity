@@ -45056,4 +45056,109 @@ mod tests {
             "the transfer must stay the active rebalance",
         );
     }
+
+    /// Stale tracking that still reads `WithdrawalConfirmed` while the store
+    /// is at a Relay state after the deposit that holds the guard: the stable
+    /// is with Relay or on its way back, so the sweep holds the guard.
+    #[tokio::test]
+    async fn sweep_holds_a_stale_relay_transfer_after_its_deposit() {
+        let refund = UsdcRebalanceCommand::RecordSwapRefund {
+            refund_tx: TxHash::repeat_byte(0xe1),
+            side: RefundSide::Destination,
+            amount_refunded: U256::from(99_000_000u64),
+        };
+        let fail = UsdcRebalanceCommand::FailSwap {
+            reason: "Relay reported Failure".to_string(),
+        };
+
+        for (after_deposit, expected) in [
+            (vec![refund], "SwapRefunded"),
+            (
+                vec![UsdcRebalanceCommand::RecordSwapEscrowUnresolved],
+                "SwapEscrowUnresolved",
+            ),
+            (vec![fail], "SwapFailed"),
+        ] {
+            let pool = crate::test_utils::setup_test_db().await;
+            let store = Arc::new(test_store::<UsdcRebalance>(pool.clone(), ()));
+            let id = UsdcRebalanceId(Uuid::new_v4());
+            let deposit = PreparedTransaction::for_test(TxHash::repeat_byte(0xa2), 6);
+            crate::usdc_rebalance::record_swap_pair_for_test(
+                &store,
+                &id,
+                RebalanceDirection::BaseToAlpaca,
+                ROBINHOOD_RELAY,
+                None,
+                deposit.clone(),
+            )
+            .await;
+            let confirm = UsdcRebalanceCommand::ConfirmSwapDeposit {
+                deposit_tx: deposit.tx_hash(),
+                deposit_block: 9,
+            };
+            for command in std::iter::once(confirm).chain(after_deposit) {
+                store.send(&id, command).await.unwrap();
+            }
+            assert_eq!(
+                store.load(&id).await.unwrap().unwrap().state_name(),
+                expected
+            );
+
+            let trigger = sweep_stale_relay_transfer(&pool, store, &id, usdc(100)).await;
+
+            assert!(
+                trigger.usdc_guards.is_held(Chain::Robinhood),
+                "the guard must stay held at {expected}",
+            );
+            assert!(
+                !trigger
+                    .timed_out_usdc_rebalances
+                    .read()
+                    .await
+                    .contains_key(&id),
+                "the sweep must not tombstone a transfer held at {expected}",
+            );
+        }
+    }
+
+    /// Stale tracking while the store is `Redepositing`: the stable is on
+    /// its way back to the vault, so the sweep holds the guard.
+    #[tokio::test]
+    async fn sweep_holds_a_stale_relay_transfer_while_redepositing() {
+        let pool = crate::test_utils::setup_test_db().await;
+        let store = Arc::new(test_store::<UsdcRebalance>(pool.clone(), ()));
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let amount = usdc(100);
+        for command in [
+            UsdcRebalanceCommand::Initiate {
+                direction: RebalanceDirection::BaseToAlpaca,
+                corridor: ROBINHOOD_RELAY,
+                amount,
+                withdrawal: TransferRef::OnchainTx(TxHash::repeat_byte(0x77)),
+            },
+            UsdcRebalanceCommand::ConfirmWithdrawal {
+                withdrawal_tx: None,
+            },
+            UsdcRebalanceCommand::BeginRedeposit {
+                reason: RedepositReason::QuoteRefused,
+            },
+        ] {
+            store.send(&id, command).await.unwrap();
+        }
+
+        let trigger = sweep_stale_relay_transfer(&pool, store, &id, amount).await;
+
+        assert!(
+            trigger.usdc_guards.is_held(Chain::Robinhood),
+            "the guard must stay held while the stable is on its way back",
+        );
+        assert!(
+            !trigger
+                .timed_out_usdc_rebalances
+                .read()
+                .await
+                .contains_key(&id),
+            "the sweep must not tombstone a redepositing transfer",
+        );
+    }
 }

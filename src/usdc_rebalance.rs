@@ -7102,6 +7102,49 @@ mod tests {
         }
     }
 
+    /// The chain-to-Alpaca Relay states after the deposit that hold the
+    /// guard refuse `fail-usdc-transfer` with the Relay hold, not the CCTP
+    /// post-burn steps: the stable is with Relay or on its way back.
+    #[test]
+    fn relay_states_after_the_deposit_refuse_a_pre_burn_fail_with_the_relay_hold() {
+        let after_deposit =
+            |event| [deposited(RebalanceDirection::BaseToAlpaca), vec![event]].concat();
+        let redepositing = [
+            withdrawn(RebalanceDirection::BaseToAlpaca, ROBINHOOD_RELAY),
+            vec![UsdcRebalanceEvent::RedepositStarted {
+                redeposit_amount: Usdc::new(float!(100)),
+                reason: RedepositReason::QuoteRefused,
+                started_at: Utc::now(),
+            }],
+        ]
+        .concat();
+
+        for events in [
+            after_deposit(UsdcRebalanceEvent::SwapRefunded {
+                refund_tx: TxHash::repeat_byte(0xe1),
+                side: RefundSide::Destination,
+                amount_refunded: Usdc::new(float!(99)),
+                refunded_at: Utc::now(),
+            }),
+            after_deposit(UsdcRebalanceEvent::SwapEscrowUnresolved {
+                unresolved_at: Utc::now(),
+            }),
+            after_deposit(UsdcRebalanceEvent::SwapFailed {
+                reason: "Relay reported Failure".to_string(),
+                failed_at: Utc::now(),
+            }),
+            redepositing,
+        ] {
+            let state = replay::<UsdcRebalance>(events).unwrap().unwrap();
+            assert!(state.holds_rebalance_guard(), "{state:?}");
+            assert_eq!(
+                state.pre_burn_fail_eligibility(),
+                PreBurnFailEligibility::RelayHeldOutsideVault,
+                "{state:?}"
+            );
+        }
+    }
+
     fn deposited(direction: RebalanceDirection) -> Vec<UsdcRebalanceEvent> {
         [
             prepared_pair(direction),
