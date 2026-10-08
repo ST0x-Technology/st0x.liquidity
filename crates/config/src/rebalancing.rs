@@ -81,8 +81,8 @@ pub enum RebalancingCtxError {
     EthereumCorridor,
     #[error(
         "[rebalancing.usdc.corridors.{chain}] hop = \"relay\": the Relay hop is switched on by \
-         RAI-2986 (fill, refund and redeposit, Robinhood cash rebalancing, two-corridor sizing, \
-         the deploy gate); until then it does not load"
+         RAI-2986 (Robinhood cash rebalancing, two-corridor sizing, the deploy gate); until \
+         then it does not load"
     )]
     RelayHopNotSwitchedOn { chain: Chain },
     #[error("[rebalancing.usdc.corridors.{chain}] hop = \"relay\" needs a [relay] sub-table")]

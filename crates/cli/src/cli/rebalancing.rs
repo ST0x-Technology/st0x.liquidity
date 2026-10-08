@@ -768,7 +768,6 @@ fn is_bot_resumable_wait(error: &UsdcTransferError) -> bool {
         | UsdcTransferError::DepositSendLookup { .. }
         | UsdcTransferError::StateOffHop { .. }
         | UsdcTransferError::BasisPoints(_)
-        | UsdcTransferError::SwapDirectionNotBuilt { .. }
         | UsdcTransferError::RelayApi(_)
         | UsdcTransferError::RelayBridge(_)
         | UsdcTransferError::SwapQuoteOutOfBounds { .. }
@@ -1315,12 +1314,12 @@ pub(super) async fn fail_usdc_transfer_command<Writer: Write>(
         }
         PreBurnFailEligibility::RelayHeldOutsideVault => {
             anyhow::bail!(
-                "fail-usdc-transfer: transfer {id} is a Relay transfer in {state:?}: the vault \
-                 withdrawal moved the stable outside the vault, to the chain wallet or to \
+                "fail-usdc-transfer: transfer {id} is a Relay transfer in {state:?}: its \
+                 withdrawal moved the stable outside the vault or Alpaca, to a wallet or to \
                  Relay, and no failure path settles it. Refusing to act -- resume it with \
                  `transfer resume` to finish the swap or the redeposit, or settle a failed swap \
-                 or a refund paid at the other end with `transfer reconcile`; only a redeposit \
-                 returns the stable to the vault."
+                 or a held swap with `transfer reconcile`; only a redeposit returns the stable \
+                 to the vault."
             );
         }
         // Already the pre-burn failed terminal, so there is nothing to fail
@@ -1579,9 +1578,9 @@ pub(super) async fn reconcile_usdc_transfer_command<Writer: Write>(
         anyhow::bail!(
             "transfer reconcile: transfer {id} is in state {state:?}, not a terminal \
              failure that strands the in-progress guard or off-venue funds (DepositFailed, \
-             post-burn BridgingFailed, AlpacaToBase BridgingFailed, or a BaseToAlpaca \
-             ConversionFailed), nor a Base->Alpaca Bridged with a signed deposit send. \
-             Refusing to act."
+             post-burn BridgingFailed, AlpacaToBase BridgingFailed, a BaseToAlpaca \
+             ConversionFailed, or a held Relay swap), nor a Base->Alpaca Bridged with a \
+             signed deposit send. Refusing to act."
         );
     }
 
@@ -1618,6 +1617,14 @@ pub(super) async fn reconcile_usdc_transfer_command<Writer: Write>(
              clear on the next sweep tick (within transfer_timeout). Restart the bot to \
              release the signed deposit send's nonce: until then later sends from the \
              Ethereum wallet wait behind it."
+        )?;
+    } else if state.has_signed_swap_envelopes() {
+        writeln!(
+            stdout,
+            "Reconciled USDC transfer {id} (reason: {reason:?}); the in-progress guard will \
+             clear on the next sweep tick (within transfer_timeout). Restart the bot to release \
+             the nonces of the signed Relay envelopes: until then, if one never mined, later \
+             sends from the wallet that signed it wait behind it."
         )?;
     } else {
         writeln!(
@@ -2378,7 +2385,7 @@ pub(crate) async fn resume_interrupted_transfers_command<W: Write>(
 
 #[cfg(test)]
 mod tests {
-    use alloy::primitives::{Address, B256, address, b256};
+    use alloy::primitives::{Address, B256, U256, address, b256};
     use chrono::Utc;
     use rain_math_float::Float;
     use std::collections::{BTreeMap, BTreeSet};
@@ -2421,7 +2428,7 @@ mod tests {
     use st0x_hedge::operator::rebalancing::usdc::DepositSendNotSuperseded;
     use st0x_hedge::operator::test_utils::try_setup_test_db;
     use st0x_hedge::operator::usdc_rebalance::{
-        ConversionAmounts, ReconcileReason, TransferRef, UsdcRebalanceCommand,
+        ConversionAmounts, ReconcileReason, TransferRef, UsdcRebalanceCommand, swap_quote_for_test,
     };
     use st0x_hedge::operator::vault_lookup::MockVaultLookup;
     use st0x_tokenization::mock::MockTokenizer;
@@ -3510,8 +3517,9 @@ mod tests {
             err_msg.ends_with(
                 ", not a terminal failure that strands the in-progress guard or \
                  off-venue funds (DepositFailed, post-burn BridgingFailed, \
-                 AlpacaToBase BridgingFailed, or a BaseToAlpaca ConversionFailed), nor \
-                 a Base->Alpaca Bridged with a signed deposit send. Refusing to act."
+                 AlpacaToBase BridgingFailed, a BaseToAlpaca ConversionFailed, or a held \
+                 Relay swap), nor a Base->Alpaca Bridged with a signed deposit send. \
+                 Refusing to act."
             ),
             "reconcile of an in-progress aggregate must refuse with the exact \
              contract text; got: {err_msg}"
@@ -3769,6 +3777,63 @@ mod tests {
                  from the Ethereum wallet wait behind it.\n",
                 id = UsdcRebalanceId(id),
             )
+        );
+    }
+
+    /// Reconciling an Alpaca-to-chain Relay transfer held at the hub with an
+    /// approve that went out alone tells the operator to restart the bot: the
+    /// running bot keeps that approve's nonce reserved, and later sends from
+    /// the Ethereum wallet wait behind it if it never mined.
+    #[tokio::test]
+    async fn reconcile_usdc_transfer_with_a_signed_relay_approve_requires_a_restart() {
+        let pool = setup_test_db().await;
+        let id = Uuid::from_u128(0xD5E3);
+        let (store, _projection) = StoreBuilder::<UsdcRebalance>::new(pool.clone())
+            .build(())
+            .await
+            .unwrap();
+        for command in [
+            UsdcRebalanceCommand::Initiate {
+                corridor: UsdcCorridor::HubRouted {
+                    chain: Chain::Robinhood,
+                    hop: HopKind::Relay,
+                },
+                direction: RebalanceDirection::AlpacaToBase,
+                amount: Usdc::new(float!(100)),
+                withdrawal: TransferRef::OnchainTx(B256::repeat_byte(0x01)),
+            },
+            UsdcRebalanceCommand::ConfirmWithdrawal {
+                withdrawal_tx: Some(B256::repeat_byte(0x01)),
+            },
+            UsdcRebalanceCommand::QuoteSwap {
+                quote: Box::new(swap_quote_for_test(
+                    U256::from(100_000_000u64),
+                    B256::repeat_byte(0x0e),
+                )),
+            },
+            UsdcRebalanceCommand::PrepareSwapApprove {
+                approve: PreparedTransaction::for_test(TxHash::repeat_byte(0xA7), 4),
+            },
+        ] {
+            store.send(&UsdcRebalanceId(id), command).await.unwrap();
+        }
+
+        let mut stdout = Vec::new();
+        reconcile_usdc_transfer_command(
+            &mut stdout,
+            id,
+            ReconcileReason::FundsMovedManually,
+            None,
+            &pool,
+            no_deposit_send_to_verify,
+        )
+        .await
+        .unwrap();
+
+        let output = String::from_utf8(stdout).unwrap();
+        assert!(
+            output.contains("Restart the bot to release the nonces of the signed Relay envelopes"),
+            "{output}"
         );
     }
 

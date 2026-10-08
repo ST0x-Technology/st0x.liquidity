@@ -123,9 +123,9 @@ and the system proves market fit.
     tables. Today the only corridor that loads is Base via CCTP: a `relay` hop
     is parsed and validated but still refused at load (rule 6 of the cash
     corridor rules).
-  - On a `relay` corridor the trigger caps a transfer at the smaller of the
-    chain's operational limit and the sub-table's `max_transfer`, and declines a
-    transfer below its `min_transfer`.
+  - On a `relay` corridor the trigger caps a transfer, either way, at the
+    smaller of the chain's operational limit and the sub-table's `max_transfer`,
+    and declines a transfer below its `min_transfer`.
   - Each corridor's transfers run on its own chain's orderbook, vault, wallet
     and gas check, and the USDC check runs every active corridor in chain order,
     each against its own band.
@@ -2071,9 +2071,9 @@ rule fails startup with a named error:
 5. `hop = "cctp"` on a chain whose settlement stable is not Circle's USDC
    (Robinhood), or on a chain this build has no CCTP domain for (HyperEVM).
 6. `hop = "relay"` on any chain, once its sub-table is valid: the Relay hop is
-   switched on by RAI-2986, which adds the Alpaca-to-chain side, Robinhood's
-   cash capability, two-corridor sizing and the deploy gate's Relay targets.
-   Until then a config naming it does not load.
+   switched on by RAI-2986, which adds Robinhood's cash capability, two-corridor
+   sizing and the deploy gate's Relay targets. Until then a config naming it
+   does not load.
 7. USDC mode enabled and a chain that is not disabled, whose cash table enables
    rebalancing, has no corridor table: there is no implicit corridor.
 8. No served corridor while a hedged chain has a cash table. The build serves
@@ -2107,7 +2107,7 @@ min_transfer = 500              # USDC; the trigger declines below it
 max_transfer = 50000            # USDC; the trigger caps at it
 quote_max_age_secs = 60         # a persisted quote older than this is re-quoted
 fill_timeout_secs = 1800        # the fill window, also sent as the quote's ttl
-max_refund_retries = 3          # Alpaca-to-chain re-quotes after a refund
+max_refund_retries = 3          # Alpaca-to-chain re-quotes after refunds
 max_deposit_revert_redrives = 5 # reverted deposits before the transfer holds
 ```
 
@@ -4525,8 +4525,13 @@ enum UsdcRebalance {
         // broadcast again before a pair is signed.
         split_approves: Vec<PreparedTransaction>,
         // Signed deposits that mined and reverted; at
-        // `max_deposit_revert_redrives` the stable goes back to the vault.
+        // `max_deposit_revert_redrives` the stable goes back to the vault
+        // (chain-to-Alpaca) or the transfer holds at the hub (Alpaca-to-chain).
         deposit_reverts: u32,
+        // Alpaca-to-chain re-quotes made after a refund, carried through the
+        // swap states; at `max_refund_retries` a refund holds. Zero for
+        // snapshots taken before this field existed.
+        refund_requotes: u32,
         initiated_at: DateTime<Utc>,
         quoted_at: DateTime<Utc>,
     },
@@ -4543,6 +4548,7 @@ enum UsdcRebalance {
         approve: Option<PreparedTransaction>,
         deposit: PreparedTransaction,
         deposit_reverts: u32,
+        refund_requotes: u32,
         initiated_at: DateTime<Utc>,
         prepared_at: DateTime<Utc>,
     },
@@ -4554,12 +4560,15 @@ enum UsdcRebalance {
         signed_order_ids: Vec<B256>,
         deposit_tx: TxHash,
         deposit_block: u64,
+        refund_requotes: u32,
         initiated_at: DateTime<Utc>,
         deposited_at: DateTime<Utc>,
     },
-    // Relay proved a refund of the deposit. On the origin side the stable is
-    // redeposited next; on the destination side it waits at the other end for
-    // the operator (or the Alpaca-to-chain side's re-quote), guard held.
+    // Relay proved a refund of the deposit. Chain-to-Alpaca: on the origin
+    // side the stable is redeposited next; on the destination side it waits at
+    // the other end for the operator, guard held. Alpaca-to-chain: an origin
+    // refund is re-quoted within the corridor's bounds, or held like a
+    // destination one.
     SwapRefunded {
         direction: RebalanceDirection,
         corridor: UsdcCorridor,
@@ -4570,6 +4579,7 @@ enum UsdcRebalance {
         refund_tx: TxHash,
         side: RefundSide,
         amount_refunded: Usdc,
+        refund_requotes: u32,
         initiated_at: DateTime<Utc>,
         refunded_at: DateTime<Utc>,
     },
@@ -4582,6 +4592,7 @@ enum UsdcRebalance {
         quote: SwapQuote,
         signed_order_ids: Vec<B256>,
         deposit_tx: TxHash,
+        refund_requotes: u32,
         initiated_at: DateTime<Utc>,
         unresolved_at: DateTime<Utc>,
     },
@@ -4697,8 +4708,9 @@ A Relay corridor (Robinhood) swaps the chain's USDG for the hub's USDC: we
 approve and deposit into Relay's depository on the origin chain, and Relay's
 solver pays us on the destination chain from its own funds, or refunds us. The
 swap states sit between `WithdrawalComplete` and the post-hop states. This build
-runs the chain-to-Alpaca side; every path after the vault withdraw ends in a
-proven fill or the stable back in the vault, never in a guard-freeing failure:
+runs both sides. On the chain-to-Alpaca side every path after the vault withdraw
+ends in a proven fill or the stable back in the vault, never in a guard-freeing
+failure:
 
 1. A pre-flight quote at dispatch, never persisted. A refusal, or a quote
    outside the sub-table's bounds, ends the attempt before anything is recorded,
@@ -4711,8 +4723,8 @@ proven fill or the stable back in the vault, never in a guard-freeing failure:
    transient failure (transport, rate limit, 5xx, a transient code) leaves the
    transfer at `WithdrawalComplete` with its guard held for the retry; the
    timeout sweep holds that guard and pages, there and at every swap state after
-   it, and `fail-usdc-transfer` refuses the transfer there with a
-   Relay-specific reason.
+   it, and `fail-usdc-transfer` refuses the transfer there with a Relay-specific
+   reason.
 4. The approve and the deposit are signed together under the origin wallet's
    lock (the Ethereum wallet's deposit-send lock when Ethereum is the origin)
    and persisted in one event (`SwapDepositPrepared`) before either is
@@ -4777,6 +4789,51 @@ proven fill or the stable back in the vault, never in a guard-freeing failure:
    does not confirm pages and keeps the guard; the operator settles the stable
    by hand and reconciles it.
 
+The Alpaca-to-chain side runs the same commands in the `AlpacaToBase` direction,
+with the hub as the origin. Every path after the Alpaca withdrawal ends in a
+proven fill deposited into the chain's vault, or holds the guard with the stable
+at the hub for `transfer reconcile`; there is no redeposit, as the stable never
+left a vault:
+
+1. A pre-flight quote for the requested amount at dispatch, before the USD
+   conversion, never persisted: a refusal moves nothing.
+2. The USD conversion and the Alpaca withdrawal to the hub, exactly as on a CCTP
+   corridor, then the withdrawal tx's confirmations and its USDC credit to our
+   wallet (a credit of nothing or above the nominal fails the transfer for
+   reconciliation, as on CCTP).
+3. The binding quote for the credited amount (`QuoteSwap` -> `SwapQuoted`). A
+   refusal pages and leaves the transfer at `WithdrawalComplete`, guard held:
+   once it times out the sweep re-arms its job on every tick, which quotes and
+   pages again, until a quote is accepted or the operator fails it
+   (`fail-usdc-transfer`) and reconciles the USDC at the hub. A transient
+   failure is retried.
+4. Before the pair is signed the shared Ethereum wallet's credit ledger is
+   checked against the swap's input, as before a CCTP burn: a shortfall pages
+   and does not stop the transfer. The pair is signed on the shared Ethereum
+   wallet under the one deposit-send lock every corridor's service holds for the
+   Alpaca deposit sends, so a Relay pair and a deposit send never take one
+   nonce. Expiry, re-quotes, the split pair, the timeout and the persist follow
+   step 4 above.
+5. Broadcast, the deposit's confirmations on Ethereum and the status reads
+   follow steps 5 and 6 above. A refused re-quote, or
+   `max_deposit_revert_redrives` reverted deposits, holds the transfer at
+   `SwapQuoted` with the USDC at the hub, guard held, paged, for
+   `transfer reconcile`, once the approves that went out alone are sent again.
+6. A fill proven on the corridor chain (`ConfirmSwapFill` -> `RelayFillVerified`
+   -> `Bridged`) is deposited into the chain's vault (`deposit4`) exactly as
+   after a CCTP mint: `DepositInitiated`, then `DepositConfirmed`, which clears
+   the guard.
+7. A refund paid in USDC at the hub (origin side) is re-quoted from
+   `amount_refunded` (`RequoteSwap` from `SwapRefunded` -> `SwapRequoted` ->
+   `SwapQuoted`, a fresh order id, every earlier one kept in
+   `signed_order_ids`), while fewer than `max_refund_retries` re-quotes followed
+   a refund (`refund_requotes`) and the refunded amount is at least
+   `min_transfer`; each such re-quote starts a fresh revert budget. Otherwise
+   the transfer holds at `SwapRefunded`, guard held, paged, for
+   `transfer reconcile`. A refund paid in the chain's stable (destination side)
+   holds the same way: the stable is in the chain wallet, not the vault. A
+   failure and an unresolved escrow follow step 8 above.
+
 At startup the persisted pairs are restored before any other send from their
 wallet: pairs signed on the Ethereum wallet once, by the hub service, together
 with the Alpaca deposit sends; pairs signed on a corridor chain by that
@@ -4784,17 +4841,24 @@ corridor's own service. A pair on a corridor no service carries pages, and
 startup skips that chain's approvals and revokes.
 
 Every swap state except `ReturnedToSource` holds the corridor guard and refuses
-`fail-usdc-transfer` (a deposit may be on chain). Only `SwapFailed`,
-`Redepositing` and a destination-side `SwapRefunded` are reconcilable. The
-operator exit of a chain-to-Alpaca transfer held at `WithdrawalComplete` or
-`SwapQuoted` is `transfer resume --kind usdc --direction to-alpaca`: the job
-re-quotes and signs, or redeposits on a refusal, as the bot's own retry does. On
-the shared Ethereum wallet's credit ledger an Ethereum-origin `SwapQuoted` is
-held credit, a persisted Ethereum pair is in flight, and a refund paid in
-Ethereum USDC (`SwapRefunded` on the Ethereum side) is held credit, so a Base
-deposit send cannot spend the USDC a Relay swap is about to deposit or was
-refunded. `transfer recheck --kind usdc` refuses Relay transfers in this build:
-a Relay `DepositFailed` is settled with `transfer reconcile`.
+`fail-usdc-transfer` (a deposit may be on chain), and the timeout sweep holds
+the guard of every one, in either direction. On the chain-to-Alpaca side only
+`SwapFailed`, `Redepositing` and a destination-side `SwapRefunded` are
+reconcilable; on the Alpaca-to-chain side `SwapFailed`, `SwapQuoted` and
+`SwapRefunded` are, as each holds the stable at the hub or in the chain wallet
+with no automated step left once paged. The operator exit of a chain-to-Alpaca
+transfer held at `WithdrawalComplete` or `SwapQuoted` is
+`transfer resume --kind usdc --direction to-alpaca`: the job re-quotes and
+signs, or redeposits on a refusal, as the bot's own retry does. An
+Alpaca-to-chain transfer held at `WithdrawalComplete` after a refused binding
+quote resumes the same way, `--direction to-raindex`, or is failed with
+`fail-usdc-transfer` and reconciled. On the shared Ethereum wallet's credit
+ledger an Ethereum-origin `SwapQuoted` is held credit, a persisted Ethereum pair
+is in flight, and a refund paid in Ethereum USDC (`SwapRefunded` on the Ethereum
+side) is held credit, so a Base deposit send cannot spend the USDC a Relay swap
+is about to deposit or was refunded. `transfer recheck --kind usdc` refuses
+Relay transfers in this build: a Relay `DepositFailed` is settled with
+`transfer reconcile`.
 
 ##### Crash-safe resume
 
@@ -4946,7 +5010,8 @@ enum UsdcRebalanceCommand {
 
     // Relay hop commands (see "Relay hop")
     // Records the binding quote on `WithdrawalComplete` of a Relay corridor;
-    // its input must equal the withdrawn amount.
+    // its input must equal the vault withdrawal, or be at most the Alpaca
+    // withdrawal (what its tx credited).
     QuoteSwap { quote: SwapQuote },
     // Persists an approve signed alone after another send split the pair.
     PrepareSwapApprove { approve: PreparedTransaction },
@@ -4956,8 +5021,9 @@ enum UsdcRebalanceCommand {
     // Records the persisted deposit once it has the origin chain's
     // confirmations; refused for any other tx.
     ConfirmSwapDeposit { deposit_tx: TxHash, deposit_block: u64 },
-    // Replaces an expired or already-signed quote on `SwapQuoted`; same input,
-    // an order id never signed before.
+    // Replaces an expired or already-signed quote on `SwapQuoted` (same
+    // input), or quotes again an Alpaca-to-chain refund paid at the hub (its
+    // input is `amount_refunded`); always an order id never signed before.
     RequoteSwap { quote: SwapQuote },
     // The persisted deposit mined and reverted; back to `SwapQuoted`.
     RecordSwapDepositReverted { deposit_tx: TxHash },
