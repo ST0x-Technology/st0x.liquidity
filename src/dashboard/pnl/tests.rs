@@ -1383,6 +1383,31 @@ async fn relay_costs_reach_the_report_from_persisted_events() {
     );
 }
 
+/// With no Relay event the Relay coverage row reads as not ingested.
+#[tokio::test]
+async fn relay_coverage_is_not_ingested_without_relay_costs() {
+    let pool = pnl_test_pool(
+        vec![seed_rebalance("1.5", "2026-05-15T12:00:00Z")],
+        position_rows(),
+    )
+    .await;
+
+    let report = build_pnl_report(&pool, &query(), Vec::new(), Utc::now())
+        .await
+        .unwrap();
+
+    let relay = report
+        .costs
+        .coverage
+        .iter()
+        .find(|coverage| coverage.source == "Relay swap costs")
+        .unwrap();
+    assert_eq!(
+        (relay.status, relay.amount_usd.as_str()),
+        ("not_ingested", "0")
+    );
+}
+
 /// A Relay fill above its fee-adjusted input nets a gain, shown as revenue.
 #[tokio::test]
 async fn relay_net_gain_shows_as_revenue_coverage() {
@@ -1405,9 +1430,14 @@ async fn relay_net_gain_shows_as_revenue_coverage() {
         .await
         .unwrap();
 
+    let entries = report
+        .cost_entries
+        .iter()
+        .map(|entry| (entry.category, entry.effect, entry.amount_usd.as_str()))
+        .collect::<Vec<_>>();
     assert_eq!(
-        report.cost_entries.len(),
-        1,
+        entries,
+        vec![("relay_swap", "revenue", "0.2")],
         "a zero relayer fee books nothing"
     );
     let relay = report
