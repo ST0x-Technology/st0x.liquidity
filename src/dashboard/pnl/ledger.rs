@@ -35,18 +35,19 @@ use st0x_event_sorcery::{
     events_since, head_rowid,
 };
 use st0x_execution::Direction;
+use st0x_finance::Usdc;
 use st0x_float_serde::format_float;
 
 use crate::bot_gas::{BotGasReceiptCost, BotGasReceiptCostEvent};
 use crate::position::{Position, PositionEvent, TradeId};
 use crate::tokenized_equity_mint::{TokenizedEquityMint, TokenizedEquityMintEvent};
-use crate::usdc_rebalance::{UsdcRebalance, UsdcRebalanceEvent};
+use crate::usdc_rebalance::{UsdcRebalance, UsdcRebalanceEvent, UsdcRebalanceId};
 
 /// Bumped when the ledger schema or the event-to-row mapping changes. A
 /// mismatch against the persisted `pnl_ledger_checkpoint.ledger_version`
 /// truncates every ledger table and resets the checkpoint to zero, making
 /// rebuild the same code path as first-deploy backfill.
-pub(crate) const LEDGER_VERSION: i64 = 2;
+pub(crate) const LEDGER_VERSION: i64 = 3;
 
 /// Rows fetched per entity per ingest batch. Bounds peak memory during
 /// backfill; each batch's rows and checkpoint advance commit atomically, so
@@ -62,6 +63,8 @@ pub(crate) const DIRECTION_SELL_TEXT: &str = "Sell";
 /// migration's CHECK admits and the read side parses back.
 pub(crate) const TOKENIZATION_FEE_SOURCE: &str = "tokenization_fee";
 pub(crate) const CCTP_FEE_SOURCE: &str = "cctp_fee";
+pub(crate) const RELAY_FEE_SOURCE: &str = "relay_fee";
+pub(crate) const RELAY_SWAP_SOURCE: &str = "relay_swap";
 
 /// Event-log head returned by [`PnlLedger::catch_up`]. Holding one is proof
 /// the ledger has been caught up through that rowid, which is what makes an
@@ -584,7 +587,7 @@ async fn insert_mint_fee(
         "INSERT INTO pnl_cost_entry \
          (event_rowid, source, aggregate_id, symbol, amount_usd, occurred_at) \
          VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
-         ON CONFLICT(event_rowid) DO NOTHING",
+         ON CONFLICT(event_rowid, source) DO NOTHING",
     )
     .bind(rowid)
     .bind(TOKENIZATION_FEE_SOURCE)
@@ -606,6 +609,18 @@ async fn ingest_rebalance(
         rowid, id, event, ..
     } = event;
     let (fee_collected, occurred_at) = match event {
+        UsdcRebalanceEvent::RelayFillVerified {
+            fee_collected,
+            relayer_fee,
+            filled_at,
+            ..
+        } => {
+            let swap = (fee_collected - relayer_fee)?;
+            for (source, amount) in [(RELAY_FEE_SOURCE, relayer_fee), (RELAY_SWAP_SOURCE, swap)] {
+                insert_rebalance_cost(tx, rowid, source, &id, amount, &filled_at).await?;
+            }
+            return Ok(());
+        }
         UsdcRebalanceEvent::Bridged {
             fee_collected,
             minted_at,
@@ -636,7 +651,6 @@ async fn ingest_rebalance(
         | UsdcRebalanceEvent::SwapDeposited { .. }
         | UsdcRebalanceEvent::SwapRequoted { .. }
         | UsdcRebalanceEvent::SwapDepositReverted { .. }
-        | UsdcRebalanceEvent::RelayFillVerified { .. }
         | UsdcRebalanceEvent::SwapRefunded { .. }
         | UsdcRebalanceEvent::SwapEscrowUnresolved { .. }
         | UsdcRebalanceEvent::SwapFailed { .. }
@@ -653,8 +667,20 @@ async fn ingest_rebalance(
         | UsdcRebalanceEvent::OperatorReconciled { .. } => return Ok(()),
     };
 
-    // A zero CCTP fee produces no entry, as in today's replay.
-    if fee_collected.inner().is_zero()? {
+    insert_rebalance_cost(tx, rowid, CCTP_FEE_SOURCE, &id, fee_collected, &occurred_at).await
+}
+
+/// Writes one hop cost of a `UsdcRebalance` event. A zero amount produces no
+/// entry, as in today's replay; a Relay swap's amount is signed.
+async fn insert_rebalance_cost(
+    tx: &mut Transaction<'_, Sqlite>,
+    rowid: i64,
+    source: &'static str,
+    id: &UsdcRebalanceId,
+    amount: Usdc,
+    occurred_at: &DateTime<Utc>,
+) -> Result<(), PnlLedgerError> {
+    if amount.inner().is_zero()? {
         return Ok(());
     }
 
@@ -662,13 +688,13 @@ async fn ingest_rebalance(
         "INSERT INTO pnl_cost_entry \
          (event_rowid, source, aggregate_id, symbol, amount_usd, occurred_at) \
          VALUES (?1, ?2, ?3, NULL, ?4, ?5) \
-         ON CONFLICT(event_rowid) DO NOTHING",
+         ON CONFLICT(event_rowid, source) DO NOTHING",
     )
     .bind(rowid)
-    .bind(CCTP_FEE_SOURCE)
+    .bind(source)
     .bind(id.to_string())
-    .bind(format_float(&fee_collected.inner())?)
-    .bind(canonical_timestamp(&occurred_at))
+    .bind(format_float(&amount.inner())?)
+    .bind(canonical_timestamp(occurred_at))
     .execute(&mut **tx)
     .await?;
 
@@ -774,6 +800,61 @@ mod tests {
             .fetch_one(pool)
             .await
             .unwrap()
+    }
+
+    /// A Relay fill books its relayer fee and the rest of its cost apart,
+    /// from one event; a fill above the fee-adjusted input books the swap
+    /// signed, as a gain.
+    #[tokio::test]
+    async fn relay_fill_books_its_relayer_fee_and_swap_cost() {
+        let pool = setup_test_db().await;
+        let fills = [
+            (
+                UsdcRebalanceId(Uuid::new_v4()).to_string(),
+                float!(0.5),
+                "0.2",
+            ),
+            (
+                UsdcRebalanceId(Uuid::new_v4()).to_string(),
+                float!(0.1),
+                "-0.2",
+            ),
+        ];
+        for (id, fee_collected, _) in &fills {
+            persist_event::<UsdcRebalance>(
+                &pool,
+                id,
+                1,
+                &UsdcRebalanceEvent::RelayFillVerified {
+                    fill_tx: TxHash::repeat_byte(0xf1),
+                    amount_received: Usdc::new(float!(99.5)),
+                    fee_collected: Usdc::new(*fee_collected),
+                    relayer_fee: Usdc::new(float!(0.3)),
+                    filled_at: timestamp(7),
+                },
+            )
+            .await;
+        }
+
+        PnlLedger::new(pool.clone()).catch_up().await.unwrap();
+
+        for (id, _, swap) in fills {
+            let rows: Vec<(String, Option<String>)> = sqlx::query_as(
+                "SELECT source, amount_usd FROM pnl_cost_entry WHERE aggregate_id = ?1 \
+                 ORDER BY source",
+            )
+            .bind(&id)
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+            assert_eq!(
+                rows,
+                vec![
+                    ("relay_fee".to_string(), Some("0.3".to_string())),
+                    ("relay_swap".to_string(), Some(swap.to_string())),
+                ]
+            );
+        }
     }
 
     #[tokio::test]
@@ -1134,7 +1215,7 @@ mod tests {
 
     /// A ledger that already skipped an event below its checkpoint is
     /// rebuilt after the upgrade, by this release or by the previous one
-    /// after a rollback: both run `LEDGER_VERSION` 2.
+    /// after a rollback: both run `LEDGER_VERSION` 2 or later.
     #[tokio::test]
     async fn upgrade_rebuilds_a_ledger_that_skipped_an_event() {
         let pool = pool_migrated_up_to(LAST_MIGRATION_BEFORE_UNIQUE_EVENT_ROWIDS).await;
