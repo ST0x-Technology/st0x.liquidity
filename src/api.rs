@@ -2816,6 +2816,13 @@ async fn fail_pre_burn_usdc_transfer(
              on-chain, or reconcile-usdc for a confirmed post-burn failure.",
             rebalance.state_name()
         )),
+        PreBurnFailEligibility::RelayHeldOutsideVault => Some(format!(
+            "Transfer {id} is a Relay transfer in {}: the vault withdrawal moved the stable \
+             outside the vault, to the chain wallet or to Relay, and no failure path settles \
+             it. Resume it with resume-usdc to finish the swap; only a redeposit returns the \
+             stable to the vault.",
+            rebalance.state_name()
+        )),
         PreBurnFailEligibility::AlreadyFailedPreBurn if rebalance.holds_rebalance_guard() => {
             Some(format!(
                 "Transfer {id} is already in pre-burn BridgingFailed, but the rebalancing \

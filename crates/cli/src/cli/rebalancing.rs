@@ -1303,6 +1303,15 @@ pub(super) async fn fail_usdc_transfer_command<Writer: Write>(
                  `transfer reconcile` for a confirmed post-burn failure."
             );
         }
+        PreBurnFailEligibility::RelayHeldOutsideVault => {
+            anyhow::bail!(
+                "fail-usdc-transfer: transfer {id} is a Relay transfer in {state:?}: the vault \
+                 withdrawal moved the stable outside the vault, to the chain wallet or to \
+                 Relay, and no failure path settles it. Refusing to act -- resume it with \
+                 `transfer resume` to finish the swap; only a redeposit returns the stable to \
+                 the vault."
+            );
+        }
         // Already the pre-burn failed terminal, so there is nothing to fail
         // again. Whether the operator is done depends on the direction: an
         // AlpacaToBase failure still holds the guard (the withdrawn funds are

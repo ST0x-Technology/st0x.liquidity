@@ -1266,6 +1266,10 @@ pub enum PreBurnFailEligibility {
     AlreadyFailedPreBurn,
     /// A CCTP burn may already be on-chain; failing would strand the funds.
     PostBurn,
+    /// A chain-to-Alpaca Relay transfer past its vault withdrawal: the stable
+    /// is outside the vault, in the chain wallet or with Relay. `FailBridging`
+    /// and the post-burn steps refuse it; resuming it or a redeposit settles it.
+    RelayHeldOutsideVault,
     /// Before the bridge boundary; `FailBridging` does not apply here.
     NotAtBridgeBoundary,
 }
@@ -1480,8 +1484,8 @@ impl UsdcRebalance {
     pub fn pre_burn_fail_eligibility(&self) -> PreBurnFailEligibility {
         match self {
             // A chain-to-Alpaca Relay withdrawal left the stable outside
-            // the vault, and `FailBridging` refuses it: like the swap states,
-            // only a redeposit settles it.
+            // the vault, and `FailBridging` refuses it and every swap state:
+            // only the swap or a redeposit settles it.
             Self::WithdrawalComplete {
                 direction: RebalanceDirection::BaseToAlpaca,
                 corridor:
@@ -1490,7 +1494,19 @@ impl UsdcRebalance {
                         ..
                     },
                 ..
-            } => PreBurnFailEligibility::PostBurn,
+            }
+            | Self::SwapQuoted {
+                direction: RebalanceDirection::BaseToAlpaca,
+                ..
+            }
+            | Self::SwapDepositPrepared {
+                direction: RebalanceDirection::BaseToAlpaca,
+                ..
+            }
+            | Self::SwapDeposited {
+                direction: RebalanceDirection::BaseToAlpaca,
+                ..
+            } => PreBurnFailEligibility::RelayHeldOutsideVault,
             // The two states `FailBridging` accepts from before any burn.
             // `BridgingSubmitting` with no recorded burn is the only genuinely
             // pre-burn form; the operator still verifies on-chain that no
@@ -1513,9 +1529,9 @@ impl UsdcRebalance {
             // (use `transfer resume`, which adopts / waits / pages, or
             // `clear-pending-burn` after verifying the burn never landed).
             // A BaseToAlpaca `ConversionFailed` is post-deposit, hence
-            // post-burn; an AlpacaToBase one is pre-withdrawal. Every swap
-            // state counts as post-burn: a lone approve or a signed deposit
-            // may be on chain, and `FailBridging` has no swap arm.
+            // post-burn; an AlpacaToBase one is pre-withdrawal. Every other
+            // swap state counts as post-burn: a lone approve or a signed
+            // deposit may be on chain, and `FailBridging` has no swap arm.
             Self::BridgingSubmitting {
                 pending_burn_tx: Some(_),
                 ..
@@ -5930,7 +5946,7 @@ mod tests {
             assert!(!state.is_reconcilable_failure(), "{state:?}");
             assert_eq!(
                 state.pre_burn_fail_eligibility(),
-                PreBurnFailEligibility::PostBurn,
+                PreBurnFailEligibility::RelayHeldOutsideVault,
                 "{state:?}"
             );
             assert_eq!(state.corridor(), ROBINHOOD_RELAY);
@@ -5948,7 +5964,7 @@ mod tests {
                 .unwrap();
         assert_eq!(
             relay.pre_burn_fail_eligibility(),
-            PreBurnFailEligibility::PostBurn
+            PreBurnFailEligibility::RelayHeldOutsideVault
         );
 
         let error = TestHarness::<UsdcRebalance>::with(())
