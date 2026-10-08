@@ -45299,9 +45299,8 @@ mod tests {
     }
 
     /// A Relay transfer stopped at `WithdrawalComplete` with no job row is
-    /// re-armed at startup in either direction, on its Relay corridor: the
-    /// job routes to the Relay service, whose resume takes the binding quote
-    /// and never a CCTP burn.
+    /// re-armed at startup in either direction, on its Relay corridor, which
+    /// the job routes by to the Relay service.
     #[tokio::test]
     async fn restart_in_withdrawal_complete_routes_to_relay_hop() {
         for direction in [
@@ -45359,6 +45358,18 @@ mod tests {
             RebalanceDirection::BaseToAlpaca,
             RebalanceDirection::AlpacaToBase,
         ] {
+            let redepositing = (direction == RebalanceDirection::BaseToAlpaca).then(|| {
+                (
+                    vec![
+                        quote.clone(),
+                        UsdcRebalanceCommand::BeginRedeposit {
+                            reason: RedepositReason::QuoteRefused,
+                        },
+                    ],
+                    "Redepositing",
+                    true,
+                )
+            });
             for (tail, expected, rearmed) in [
                 (vec![quote.clone()], "SwapQuoted", true),
                 (
@@ -45411,7 +45422,10 @@ mod tests {
                     "SwapFailed",
                     false,
                 ),
-            ] {
+            ]
+            .into_iter()
+            .chain(redepositing)
+            {
                 let pool = crate::test_utils::setup_test_db().await;
                 let store = test_store::<UsdcRebalance>(pool.clone(), ());
                 let id = UsdcRebalanceId(Uuid::new_v4());
@@ -45454,6 +45468,40 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A Relay transfer whose job apalis still owns is not re-armed again:
+    /// two jobs would drive one transfer.
+    #[tokio::test]
+    async fn relay_rearm_skips_a_transfer_whose_job_is_live() {
+        let pool = crate::test_utils::setup_test_db().await;
+        let store = test_store::<UsdcRebalance>(pool.clone(), ());
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        for command in relay_withdrawn(RebalanceDirection::BaseToAlpaca) {
+            store.send(&id, command).await.unwrap();
+        }
+        let trigger = relay_trigger().await;
+        trigger
+            .transfer_usdc_to_hedging_queue
+            .clone()
+            .push(TransferUsdcToHedging {
+                corridor: ROBINHOOD_RELAY,
+                id: id.clone(),
+                amount: usdc(100),
+                revert_redrive_attempts: 0,
+                backpressure_streak: BackpressureStreak::default(),
+            })
+            .await
+            .unwrap();
+
+        trigger.recover_usdc_guard(&pool, &store).await.unwrap();
+
+        assert_eq!(
+            count_pending_transfer_usdc_to_hedging_jobs(&trigger).await,
+            1,
+            "only the live job drives the transfer"
+        );
+        assert!(trigger.usdc_guards.is_held(Chain::Robinhood));
     }
 
     /// Pushes a job row for `id` and marks it failed with its retries spent.

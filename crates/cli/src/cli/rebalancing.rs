@@ -2718,6 +2718,16 @@ mod tests {
                     tx: b256!("0x0000000000000000000000000000000000000000000000000000000000000003"),
                 }),
             },
+            UsdcTransferError::SwapEscrowUnresolved {
+                id: id.clone(),
+                deposit_tx: B256::repeat_byte(0x04),
+            },
+            UsdcTransferError::RevertedSwapDepositLive {
+                id: id.clone(),
+                order_id: B256::repeat_byte(0x05),
+                request_id: B256::repeat_byte(0x06),
+                deposit_tx: B256::repeat_byte(0x07),
+            },
             UsdcTransferError::WithdrawalPollInconclusive {
                 id,
                 initiated_at: chrono::Utc::now(),

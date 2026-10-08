@@ -490,8 +490,9 @@ where
         }
         Err(error @ UsdcTransferError::RevertedSwapDepositLive { .. }) => {
             let message = format!(
-                "{error}. The transfer holds its guard; check the order with `stox relay status`. \
-                 It is read again in {SWAP_ESCROW_RECHECK_DELAY:?}."
+                "{error}. The transfer holds its guard; check the order with \
+                 `stox relay status <request>`. It is read again in \
+                 {SWAP_ESCROW_RECHECK_DELAY:?}."
             );
             if let Err(notify_error) = notifier.notify(&message).await {
                 warn!(target: "rebalance", error = ?notify_error, "Failed to deliver the reverted Relay deposit page");
@@ -3438,6 +3439,7 @@ mod tests {
             |id| UsdcTransferError::RevertedSwapDepositLive {
                 id: id.clone(),
                 order_id: B256::repeat_byte(0x0a),
+                request_id: B256::repeat_byte(0x5e),
                 deposit_tx: TxHash::repeat_byte(0xd2),
             },
         ];

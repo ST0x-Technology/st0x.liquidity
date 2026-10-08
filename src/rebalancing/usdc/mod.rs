@@ -363,12 +363,13 @@ pub enum UsdcTransferError {
     /// A deposit of a reverted order is on chain with no payment proven yet:
     /// nothing is signed or redeposited until it is.
     #[error(
-        "USDC rebalance {id}: deposit {deposit_tx} of the reverted Relay order {order_id} is on \
-         chain; signing nothing until its payment proves"
+        "USDC rebalance {id}: deposit {deposit_tx} of the reverted Relay order {order_id} \
+         (request {request_id}) is on chain; signing nothing until its payment proves"
     )]
     RevertedSwapDepositLive {
         id: UsdcRebalanceId,
         order_id: B256,
+        request_id: B256,
         deposit_tx: TxHash,
     },
     #[error(

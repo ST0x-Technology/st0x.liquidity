@@ -1067,8 +1067,9 @@ pub enum RelayCommand {
     ///
     /// `request_id` is the `requestId` of the transfer's quote, on its
     /// `SwapQuoted` or `SwapRequoted` event. Reads Relay's API only: no
-    /// wallet, database or bot. A status is not proof of a payment; the bot
-    /// adopts one only once it proves on chain.
+    /// wallet, bot or database state, though the usual config is loaded. A
+    /// status is not proof of a payment; the bot adopts one only once it
+    /// proves on chain.
     Status {
         /// Relay's request id (0x-prefixed, 32 bytes)
         request_id: B256,

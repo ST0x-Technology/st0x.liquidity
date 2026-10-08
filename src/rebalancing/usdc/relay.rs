@@ -1462,6 +1462,7 @@ where
             return Err(UsdcTransferError::RevertedSwapDepositLive {
                 id: id.clone(),
                 order_id,
+                request_id: quote.request_id,
                 deposit_tx: deposit.tx,
             });
         };
@@ -5423,8 +5424,14 @@ mod tests {
         assert!(
             matches!(
                 error,
-                UsdcTransferError::RevertedSwapDepositLive { order_id, deposit_tx, .. }
-                    if order_id == REVERTED_ORDER_ID && deposit_tx == late_deposit
+                UsdcTransferError::RevertedSwapDepositLive {
+                    order_id,
+                    request_id,
+                    deposit_tx,
+                    ..
+                } if order_id == REVERTED_ORDER_ID
+                    && request_id == B256::repeat_byte(0x5e)
+                    && deposit_tx == late_deposit
             ),
             "got {error:?}"
         );

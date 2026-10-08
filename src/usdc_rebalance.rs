@@ -616,8 +616,7 @@ pub enum UsdcRebalanceCommand {
     /// `SwapDeposited` and `SwapEscrowUnresolved`.
     FailSwap { reason: String },
     /// A fill or refund proven late for a signed order: a reverted one from
-    /// `SwapQuoted` or `SwapEscrowUnresolved`, or the failed or a reverted
-    /// one from `SwapFailed`.
+    /// `SwapQuoted`, or the failed one from `SwapFailed`.
     RecoverSwapCompletion {
         order_id: B256,
         deposit_tx: TxHash,
@@ -2550,8 +2549,9 @@ impl UsdcRebalance {
     /// - `BridgingFailed { direction: AlpacaToBase, burn_tx_hash: Some }`:
     ///   post-burn, no recovery job (only `BaseToAlpaca` is re-armed on
     ///   startup via `resumable_post_burn_transfer`).
-    /// - The Relay holds `SwapFailed`, a destination-side `SwapRefunded` and
-    ///   `Redepositing`: no startup re-arm, no `DepositConfirmed` path.
+    /// - The Relay holds `SwapFailed` and a destination-side `SwapRefunded`
+    ///   (no startup re-arm), and `Redepositing` (re-armed, but it ends in
+    ///   `ReturnedToSource`): no `DepositConfirmed` path.
     ///
     /// All of them are accepted by `transition_reconcile_stuck_rebalance` (the
     /// CLI `transfer reconcile` target), hold the guard on restart
@@ -3473,6 +3473,8 @@ impl EventSourced for UsdcRebalance {
     // v16: `refund_requotes` on `SwapQuoted`, `SwapDepositPrepared`,
     // `SwapDeposited`, `SwapRefunded` and `SwapEscrowUnresolved`; older
     // snapshots read it as 0.
+    // v17: `reverted_quotes` on the swap states, `quote` and
+    // `refund_requotes` on `SwapFailed`, and `SwapCompletionRecovered`.
     const SCHEMA_VERSION: u64 = 17;
 
     fn originate(event: &Self::Event) -> Option<Self> {

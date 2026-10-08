@@ -25,8 +25,13 @@ use tokio::sync::broadcast;
 use uuid::Uuid;
 
 use rain_math_float::Float;
+use st0x_bridge::cctp::{
+    CIRCLE_API_BASE, CctpCorridor, MESSAGE_TRANSMITTER_V2, TOKEN_MESSENGER_V2,
+};
 use st0x_bridge::corridor::{HopKind, UsdcCorridor};
-use st0x_bridge::relay::{BasisPoints, QuoteRequest, TestQuote, quote_body_for_test};
+use st0x_bridge::relay::{
+    BasisPoints, QuoteRequest, TestQuote, deploy_relay_end, quote_body_for_test,
+};
 use st0x_config::{
     AllocationCtx, ChainAssets, ChainCashAsset, ChainEquities, ChainEquityAsset, DeviationBand,
     ExecutionThreshold, OperationMode, RebalancingMode, RelayHopCtx, TargetShare, UsdcCorridors,
@@ -42,7 +47,7 @@ use st0x_execution::{
 };
 use st0x_finance::{Usd, Usdc};
 use st0x_float_macro::float;
-use st0x_raindex::{Raindex, RaindexService, RaindexVaultId};
+use st0x_raindex::{Raindex, RaindexContracts, RaindexService, RaindexVaultId};
 use st0x_tokenization::mock::MockTokenizer;
 use st0x_tokenization::{Tokenizer, issuer_request_id, tokenization_request_id};
 use st0x_wrapper::{MockWrapper, Wrapper};
@@ -80,13 +85,15 @@ use crate::rebalancing::equity::{
 };
 use crate::rebalancing::trigger::{GuardState, HeldRecovery, PendingMintResumes};
 use crate::rebalancing::usdc::{
-    TransferUsdcToHedging, TransferUsdcToMarketMaking, UsdcSettlementParams,
+    TransferUsdcToHedging, TransferUsdcToMarketMaking, UsdcDriverGate, UsdcSettlementParams,
 };
 use crate::rebalancing::{
     ChainRebalancingConfig, RebalancerServices, RebalancingSchedulers, RebalancingService,
     RebalancingServiceConfig, RelayHopSetup, UsdcCorridorEndpoints, UsdcTransferResumeHandles,
     drain_pending_jobs,
 };
+use crate::telemetry::TelemetrySender;
+use crate::telemetry::broker::InstrumentedAlpacaBroker;
 use crate::test_utils::{
     AnvilRaindexChain, TestAnvilInstance, anvil_wallet, erc20_balance, setup_test_pools,
     spawn_anvil,
@@ -4591,9 +4598,7 @@ impl RelayCorridorRig {
     /// Deploys Relay's stand-in stable and depository through `provider` and
     /// moves their code to `chain`'s pinned stable and depository.
     async fn etch_relay_end(provider: &impl Provider, chain: Chain) {
-        let local = st0x_bridge::relay::deploy_relay_end(provider)
-            .await
-            .unwrap();
+        let local = deploy_relay_end(provider).await.unwrap();
         for (deployed, pinned) in [
             (local.stable, chain.settlement_stable().address),
             (local.depository, chain.relay_depository().unwrap()),
@@ -4734,11 +4739,21 @@ impl RelayCorridorRig {
         tx
     }
 
-    fn raindex_contracts(&self) -> st0x_raindex::RaindexContracts {
-        st0x_raindex::RaindexContracts {
+    fn raindex_contracts(&self) -> RaindexContracts {
+        RaindexContracts {
             inventory: self.chain.orderbook,
             orderbook: self.chain.orderbook,
         }
+    }
+
+    /// The USDG `holder` holds on Robinhood.
+    async fn chain_usdg_of(&self, holder: Address) -> U256 {
+        erc20_balance(
+            &self.chain.bot_wallet,
+            Chain::Robinhood.settlement_stable().address,
+            holder,
+        )
+        .await
     }
 
     async fn vault_usdg(&self) -> U256 {
@@ -4784,21 +4799,18 @@ impl RelayCorridorRig {
             Arc::new(AlpacaWalletService::new(alpaca.base_url(), account_id, auth).unwrap());
 
         let services = RebalancerServices::new(
-            crate::telemetry::broker::InstrumentedAlpacaBroker::new(
-                broker,
-                crate::telemetry::TelemetrySender::disabled(),
-            ),
+            InstrumentedAlpacaBroker::new(broker, TelemetrySender::disabled()),
             alpaca_wallet,
             self.hub_wallet.clone(),
-            st0x_bridge::cctp::CctpCorridor::ethereum_base().unwrap(),
+            CctpCorridor::ethereum_base().unwrap(),
             UsdcSettlementParams {
                 attestation_retry_deadline: Duration::from_secs(3600),
                 settlement_retry_deadline: Duration::from_secs(3600),
                 ethereum_required_confirmations: Some(1),
                 reserved_cash: None,
-                circle_api_base: st0x_bridge::cctp::CIRCLE_API_BASE.to_string(),
-                token_messenger: st0x_bridge::cctp::TOKEN_MESSENGER_V2,
-                message_transmitter: st0x_bridge::cctp::MESSAGE_TRANSMITTER_V2,
+                circle_api_base: CIRCLE_API_BASE.to_string(),
+                token_messenger: TOKEN_MESSENGER_V2,
+                message_transmitter: MESSAGE_TRANSMITTER_V2,
             },
             BTreeMap::from([(
                 Chain::Robinhood,
@@ -4822,7 +4834,7 @@ impl RelayCorridorRig {
                 store,
                 pool,
                 &BotGasReceiptCostEnqueuer::Disabled,
-                &crate::rebalancing::usdc::UsdcDriverGate::unpaused(),
+                &UsdcDriverGate::unpaused(),
             )
             .unwrap()
     }
@@ -5018,6 +5030,17 @@ async fn robinhood_relay_round_trip_and_refund() {
         "the filled USDC went to Alpaca"
     );
     assert_eq!(rig.vault_usdg().await, U256::ZERO);
+    assert_eq!(
+        rig.chain_usdg_of(rig.chain.bot).await,
+        U256::ZERO,
+        "the withdrawn USDG left the wallet"
+    );
+    assert_eq!(
+        rig.chain_usdg_of(Chain::Robinhood.relay_depository().unwrap())
+            .await,
+        U256::from(RELAY_AMOUNT),
+        "the USDG went to Relay's depository"
+    );
     quote.delete();
     status.delete();
 
@@ -5094,6 +5117,22 @@ async fn robinhood_relay_round_trip_and_refund() {
     };
     assert_eq!(hop.destination_tx(), fill_tx);
     assert!(!state.holds_rebalance_guard());
+    let hub_usdc = Chain::Ethereum.settlement_stable().address;
+    assert_eq!(
+        erc20_balance(&rig.hub_wallet, hub_usdc, rig.hub_wallet.address()).await,
+        U256::ZERO,
+        "the withdrawn USDC left the hub wallet"
+    );
+    assert_eq!(
+        erc20_balance(
+            &rig.hub_wallet,
+            hub_usdc,
+            Chain::Ethereum.relay_depository().unwrap()
+        )
+        .await,
+        U256::from(RELAY_AMOUNT),
+        "the USDC went to Relay's depository"
+    );
     assert_eq!(
         rig.vault_usdg().await,
         U256::from(refunded + RELAY_FILLED),
