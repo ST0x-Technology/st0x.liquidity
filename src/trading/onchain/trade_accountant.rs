@@ -536,7 +536,7 @@ impl AccountForDexTrade {
             log_index = trade.log_index,
         );
         if let Err(error) = notifier.notify(&message).await {
-            warn!(target: "hedge", ?error, %message, "Disabled-asset alert delivery failed");
+            warn!(target: "hedge", ?error, alert_message = %message, "Disabled-asset alert delivery failed");
         }
     }
 }

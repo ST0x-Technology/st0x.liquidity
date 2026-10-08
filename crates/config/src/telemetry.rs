@@ -89,28 +89,39 @@ enum ConsoleTextStyle {
     Full,
 }
 
-/// Build the console fmt layer for `log_format`. The JSON arm is the single
-/// place the console JSON wire shape is defined, byte-identical to the rolling
-/// file layer, so every subscriber emits one JSON shape.
-fn console_fmt_layer<S>(
+/// Build the console fmt layer for `log_format`, writing to `writer`.
+///
+/// The JSON arm flattens each event: the message and the event fields are
+/// top-level keys next to `timestamp`, `level` and `target`, so a log shipper
+/// that parses the line finds the text at `message` (Cloud Logging:
+/// `jsonPayload.message`) and each field under its own name. Span context
+/// stays under `span` and `spans`. The rolling file layer keeps the nested
+/// `fields` shape on purpose (see [`file_fmt_layer`]).
+fn console_fmt_layer<S, W>(
     log_format: LogFormat,
     env_filter: EnvFilter,
     style: ConsoleTextStyle,
+    writer: W,
 ) -> Box<dyn Layer<S> + Send + Sync>
 where
     S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+    W: for<'writer> tracing_subscriber::fmt::MakeWriter<'writer> + Send + Sync + 'static,
 {
     match log_format {
         LogFormat::Json => tracing_subscriber::fmt::layer()
             .json()
+            .flatten_event(true)
+            .with_writer(writer)
             .with_filter(env_filter)
             .boxed(),
         LogFormat::Text => match style {
             ConsoleTextStyle::Compact => tracing_subscriber::fmt::layer()
                 .compact()
+                .with_writer(writer)
                 .with_filter(env_filter)
                 .boxed(),
             ConsoleTextStyle::Full => tracing_subscriber::fmt::layer()
+                .with_writer(writer)
                 .with_filter(env_filter)
                 .boxed(),
         },
@@ -252,8 +263,12 @@ impl TelemetryCtx {
         let otel_log_layer = OpenTelemetryTracingBridge::new(&logger_provider)
             .with_filter(mk_crate_filter(log_level));
 
-        let fmt_layer =
-            console_fmt_layer(log_format, mk_env_filter(log_level), ConsoleTextStyle::Full);
+        let fmt_layer = console_fmt_layer(
+            log_format,
+            mk_env_filter(log_level),
+            ConsoleTextStyle::Full,
+            std::io::stdout,
+        );
 
         let file_appender = file_logging.and_then(|file_logging| {
             match build_log_file_appender(file_logging.directory()) {
@@ -411,7 +426,12 @@ pub fn setup_tracing(
     let file_layer = file_fmt_layer(non_blocking, file_level);
     let count_layer = log_sink.map(|sink| log_count_layer(sink, file_level));
 
-    let fmt_layer = console_fmt_layer(log_format, env_filter, ConsoleTextStyle::Compact);
+    let fmt_layer = console_fmt_layer(
+        log_format,
+        env_filter,
+        ConsoleTextStyle::Compact,
+        std::io::stdout,
+    );
 
     let subscriber = Registry::default()
         .with(extra_layer)
@@ -430,6 +450,12 @@ pub fn setup_tracing(
 /// Builds the local JSON layer with only its configured threshold. Deliberately
 /// bypasses [`mk_env_filter`] so `RUST_LOG` can refine stdout diagnostics
 /// without increasing local disk volume.
+///
+/// The file shape is not flattened: the event text stays at
+/// `fields.message`. The dashboard's log panel and the t0.devops liquidity
+/// exporter (`ship_botlogs`, which feeds the `liquidity-botlogs` log) read
+/// `fields` and `fields.message` from `/logs`, which serves these files, so
+/// this shape is a contract of its own, separate from the console JSON.
 fn file_fmt_layer<S, W>(writer: W, level: tracing::Level) -> Box<dyn Layer<S> + Send + Sync>
 where
     S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
@@ -486,7 +512,12 @@ fn install_console_only_subscriber(
     extra_layer: Option<ExtraLayer>,
     env_filter: EnvFilter,
 ) {
-    let fmt_layer = console_fmt_layer(log_format, env_filter, ConsoleTextStyle::Compact);
+    let fmt_layer = console_fmt_layer(
+        log_format,
+        env_filter,
+        ConsoleTextStyle::Compact,
+        std::io::stdout,
+    );
 
     let subscriber = Registry::default().with(extra_layer).with(fmt_layer);
 
@@ -628,35 +659,157 @@ mod tests {
         }
     }
 
-    /// Pins the JSON console wire shape a log shipper parses: one JSON object
-    /// per line carrying `timestamp`, `level`, `target`, the event fields
-    /// under `fields`, and span fields under `span` -- the same shape as the
-    /// rolling file layer. A tracing-subscriber upgrade that changes this
-    /// shape must fail here, not in the shipper.
-    #[test]
-    fn json_console_layer_emits_one_parseable_object_per_line() {
-        let writer = SharedWriter::default();
-        let layer = tracing_subscriber::fmt::layer()
-            .json()
-            .with_writer(writer.clone());
+    /// Emits one ERROR alert line inside a span through `layer` and returns
+    /// the parsed line with its (wall-clock) timestamp removed.
+    fn emit_alert_line(
+        layer: Box<dyn Layer<Registry> + Send + Sync>,
+        writer: &SharedWriter,
+    ) -> serde_json::Value {
         let subscriber = Registry::default().with(layer);
 
         tracing::subscriber::with_default(subscriber, || {
             let span = tracing::info_span!("recheck", aggregate_id = "abc-123");
             let _entered = span.enter();
-            tracing::info!(target: "rebalance", "json shape pin");
+            tracing::error!(
+                target: "operational_alert",
+                alert = true,
+                kind = "Low gas",
+                "Low gas: json shape pin"
+            );
         });
 
         let bytes = writer.0.lock().clone();
         let output = std::str::from_utf8(&bytes).unwrap();
-        let line = output.lines().next().expect("one log line was emitted");
+        let mut lines = output.lines();
+        let line = lines.next().expect("one log line was emitted");
+        assert_eq!(lines.next(), None, "one event is one line: {output}");
 
-        let entry: serde_json::Value = serde_json::from_str(line).unwrap();
-        assert!(entry["timestamp"].is_string(), "missing timestamp: {entry}");
-        assert_eq!(entry["level"], "INFO");
-        assert_eq!(entry["target"], "rebalance");
-        assert_eq!(entry["fields"]["message"], "json shape pin");
-        assert_eq!(entry["span"]["aggregate_id"], "abc-123");
+        let mut entry: serde_json::Value = serde_json::from_str(line).unwrap();
+        let timestamp = entry
+            .as_object_mut()
+            .unwrap()
+            .remove("timestamp")
+            .expect("every line carries a timestamp");
+        assert!(timestamp.is_string(), "timestamp is a string: {timestamp}");
+        entry
+    }
+
+    /// Pins the console JSON a log shipper parses: the message and the event
+    /// fields are top-level keys, so the text is at `jsonPayload.message` and
+    /// an alert's `kind` at `jsonPayload.kind`. Span context stays nested. A
+    /// tracing-subscriber upgrade that changes this shape must fail here, not
+    /// in the shipper.
+    #[test]
+    fn json_console_layer_flattens_the_event_onto_the_line() {
+        let writer = SharedWriter::default();
+        let layer = console_fmt_layer(
+            LogFormat::Json,
+            mk_crate_filter(tracing::Level::TRACE),
+            ConsoleTextStyle::Compact,
+            writer.clone(),
+        );
+
+        let entry = emit_alert_line(layer, &writer);
+
+        assert_eq!(
+            entry,
+            serde_json::json!({
+                "level": "ERROR",
+                "target": "operational_alert",
+                "message": "Low gas: json shape pin",
+                "alert": true,
+                "kind": "Low gas",
+                "span": {"aggregate_id": "abc-123", "name": "recheck"},
+                "spans": [{"aggregate_id": "abc-123", "name": "recheck"}],
+            })
+        );
+    }
+
+    /// Both console styles flatten the same way: the style only selects the
+    /// text renderer.
+    #[test]
+    fn json_console_layer_ignores_the_text_style() {
+        let compact = SharedWriter::default();
+        let full = SharedWriter::default();
+
+        let compact_entry = emit_alert_line(
+            console_fmt_layer(
+                LogFormat::Json,
+                mk_crate_filter(tracing::Level::TRACE),
+                ConsoleTextStyle::Compact,
+                compact.clone(),
+            ),
+            &compact,
+        );
+        let full_entry = emit_alert_line(
+            console_fmt_layer(
+                LogFormat::Json,
+                mk_crate_filter(tracing::Level::TRACE),
+                ConsoleTextStyle::Full,
+                full.clone(),
+            ),
+            &full,
+        );
+
+        assert_eq!(compact_entry, full_entry);
+    }
+
+    /// The rolling file keeps the nested shape: the dashboard's log panel and
+    /// the exporter's `ship_botlogs` read the message under `fields` from
+    /// `/logs`, and
+    /// `/performance/reliability` reads the raw `"level":"ERROR"` substring.
+    #[test]
+    fn file_layer_keeps_the_nested_fields_shape() {
+        let writer = SharedWriter::default();
+        let layer = file_fmt_layer(writer.clone(), tracing::Level::TRACE);
+
+        let entry = emit_alert_line(layer, &writer);
+
+        assert_eq!(
+            entry,
+            serde_json::json!({
+                "level": "ERROR",
+                "target": "operational_alert",
+                "fields": {
+                    "message": "Low gas: json shape pin",
+                    "alert": true,
+                    "kind": "Low gas",
+                },
+                "span": {"aggregate_id": "abc-123", "name": "recheck"},
+                "spans": [{"aggregate_id": "abc-123", "name": "recheck"}],
+            })
+        );
+        let raw = String::from_utf8(writer.0.lock().clone()).unwrap();
+        assert!(raw.contains(r#""level":"ERROR""#), "{raw}");
+    }
+
+    /// Text output is unchanged by the JSON flattening: the alert text and
+    /// its fields stay on one human-readable line.
+    #[test]
+    fn text_console_layer_renders_the_message_and_fields() {
+        let writer = SharedWriter::default();
+        let layer = console_fmt_layer(
+            LogFormat::Text,
+            mk_crate_filter(tracing::Level::TRACE),
+            ConsoleTextStyle::Compact,
+            writer.clone(),
+        );
+        let subscriber = Registry::default().with(layer);
+
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::error!(
+                target: "operational_alert",
+                alert = true,
+                kind = "Low gas",
+                "Low gas: text shape pin"
+            );
+        });
+
+        let output = String::from_utf8(writer.0.lock().clone()).unwrap();
+        assert_eq!(output.lines().count(), 1, "{output}");
+        assert!(output.contains("Low gas: text shape pin"), "{output}");
+        assert!(output.contains("kind"), "{output}");
+        assert!(!output.trim_start().starts_with('{'), "{output}");
     }
 
     #[test]
@@ -902,5 +1055,137 @@ mod tests {
             "an invalid log dir must degrade to console-only logging (None file \
              guard) while the OTLP exporters stay live"
         );
+    }
+
+    /// The top-level keys the flattened console JSON writes itself. An event
+    /// field with one of these names writes a second key of that name on the
+    /// line, and a JSON reader keeps only one of them.
+    const RESERVED_CONSOLE_KEYS: [&str; 6] =
+        ["message", "timestamp", "level", "target", "span", "spans"];
+
+    /// The arguments of the tracing macro call that starts at `open` (just
+    /// after its `(`), split at top-level commas, up to the first argument
+    /// that is a string literal: that literal is the message, and the fields
+    /// come before it. String literals inside an argument are skipped whole,
+    /// so a `)` or `,` in a value does not end or split it.
+    fn macro_fields(source: &str, open: usize) -> Vec<String> {
+        let mut fields = Vec::new();
+        let mut current = String::new();
+        let mut depth = 0_u32;
+        let mut characters = source[open..].chars();
+        while let Some(character) = characters.next() {
+            match character {
+                '"' if depth == 0 && current.trim().is_empty() => break,
+                '"' => {
+                    current.push(character);
+                    let mut escaped = false;
+                    for inner in characters.by_ref() {
+                        current.push(inner);
+                        match inner {
+                            '\\' if !escaped => escaped = true,
+                            '"' if !escaped => break,
+                            _ => escaped = false,
+                        }
+                    }
+                    continue;
+                }
+                '(' | '[' | '{' => depth += 1,
+                ')' | ']' | '}' if depth == 0 => break,
+                ')' | ']' | '}' => depth -= 1,
+                ',' if depth == 0 => {
+                    fields.push(std::mem::take(&mut current));
+                    continue;
+                }
+                _ => {}
+            }
+            current.push(character);
+        }
+        fields.push(current);
+        fields
+    }
+
+    /// The field name a macro argument records, if it is a field: `name = x`,
+    /// `name` or `%name`/`?name` shorthand. `target: "x"` is the macro's
+    /// target, not a field.
+    fn field_name(argument: &str) -> Option<&str> {
+        let argument = argument.trim();
+        let name = argument
+            .split_once('=')
+            .map_or(argument, |(name, _)| name)
+            .trim()
+            .trim_start_matches(['%', '?']);
+        let is_identifier = !name.is_empty()
+            && name
+                .chars()
+                .all(|character| character.is_ascii_alphanumeric() || character == '_');
+        is_identifier.then_some(name)
+    }
+
+    /// No tracing event in the workspace records a field with a reserved
+    /// console key's name (docs/observability.md, "Console format").
+    #[test]
+    fn no_tracing_event_records_a_reserved_console_key() {
+        let macros = [
+            "trace!(", "debug!(", "info!(", "warn!(", "error!(", "event!(",
+        ];
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+        let mut pending = vec![root.join("src"), root.join("crates")];
+        let mut violations = Vec::new();
+
+        while let Some(path) = pending.pop() {
+            if path.is_dir() {
+                pending.extend(
+                    std::fs::read_dir(&path)
+                        .unwrap()
+                        .map(|entry| entry.unwrap().path()),
+                );
+                continue;
+            }
+            if path.extension().is_none_or(|extension| extension != "rs") {
+                continue;
+            }
+
+            let source = std::fs::read_to_string(&path).unwrap();
+            for call in macros {
+                for (offset, _) in source.match_indices(call) {
+                    let preceded_by_identifier =
+                        source[..offset]
+                            .chars()
+                            .next_back()
+                            .is_some_and(|character| {
+                                character.is_ascii_alphanumeric() || character == '_'
+                            });
+                    if preceded_by_identifier {
+                        continue;
+                    }
+                    for argument in macro_fields(&source, offset + call.len()) {
+                        if let Some(name) = field_name(&argument)
+                            && RESERVED_CONSOLE_KEYS.contains(&name)
+                        {
+                            let line = source[..offset].matches('\n').count() + 1;
+                            violations.push(format!("{}:{line}: {name}", path.display()));
+                        }
+                    }
+                }
+            }
+        }
+
+        assert_eq!(violations, Vec::<String>::new());
+    }
+
+    #[test]
+    fn the_field_scan_reads_fields_and_skips_the_target_and_format_arguments() {
+        // Split so the workspace scan does not read this fixture as a call.
+        let source = concat!(
+            "warn",
+            r#"!(target: "wallet", %contract, note = "a, b)", target, level = std::u32::MAX, "#,
+            r#"message = %format!("a: {x}"), "text {}", span)"#
+        );
+        let fields: Vec<_> = macro_fields(source, "warn!(".len())
+            .iter()
+            .filter_map(|argument| field_name(argument).map(str::to_string))
+            .collect();
+
+        assert_eq!(fields, ["contract", "note", "target", "level", "message"]);
     }
 }
