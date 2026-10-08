@@ -1,6 +1,53 @@
 //! Read-only Relay API lookups: what Relay says about one request, as the bot
 //! reads it. Touches no wallet, database or bot.
 
+use alloy::primitives::TxHash;
+use std::io::Write;
+
+use st0x_bridge::relay::{IntentStatusReport, RelayClient, RelayRequestId};
+
+/// Prints Relay's status of `request_id`: the parsed status, whether it is
+/// terminal, and every deposit and payment tx Relay lists. A status is not
+/// proof of a payment; the bot adopts one only once it proves on chain.
+pub(super) async fn relay_status_command<Writer: Write>(
+    stdout: &mut Writer,
+    client: &RelayClient,
+    request_id: RelayRequestId,
+) -> anyhow::Result<()> {
+    let IntentStatusReport {
+        status,
+        deposit_txs,
+        txs,
+    } = client.status(request_id).await?;
+
+    writeln!(stdout, "Relay request {request_id}")?;
+    writeln!(stdout, "   Status: {status:?}")?;
+    writeln!(
+        stdout,
+        "   Terminal: {}",
+        if status.is_terminal() { "yes" } else { "no" }
+    )?;
+    writeln!(stdout, "   Deposit txs: {}", tx_list(&deposit_txs))?;
+    writeln!(stdout, "   Fill or refund txs: {}", tx_list(&txs))?;
+    writeln!(
+        stdout,
+        "   A status is not proof: the bot adopts a payment only once it proves on chain."
+    )?;
+
+    Ok(())
+}
+
+fn tx_list(txs: &[TxHash]) -> String {
+    if txs.is_empty() {
+        return "none".to_string();
+    }
+
+    txs.iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 #[cfg(test)]
 mod tests {
     use alloy::primitives::B256;

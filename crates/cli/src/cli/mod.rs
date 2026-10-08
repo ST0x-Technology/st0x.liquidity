@@ -29,6 +29,7 @@ use std::sync::Arc;
 use tracing::info;
 use uuid::Uuid;
 
+use st0x_bridge::relay::{RelayClient, RelayRequestId};
 use st0x_config::{Ctx, Env, TokenSource};
 use st0x_evm::{Chain, OpenChainErrorRegistry, PreparedTransaction};
 use st0x_execution::alpaca_broker_api::AlpacaLimitPrice;
@@ -880,6 +881,12 @@ pub enum Commands {
         #[command(subcommand)]
         command: CctpCommand,
     },
+
+    /// Read what Relay says about a Relay hop's order.
+    Relay {
+        #[command(subcommand)]
+        command: RelayCommand,
+    },
 }
 
 /// Recover stuck asset transfers between trading venues.
@@ -1052,6 +1059,22 @@ pub enum CctpCommand {
     },
 }
 
+/// Read-only Relay API lookups.
+#[derive(Debug, Subcommand)]
+pub enum RelayCommand {
+    /// Print Relay's status of one request: its status, fail and refund fail
+    /// reasons, and every deposit and fill or refund tx Relay lists.
+    ///
+    /// `request_id` is the `requestId` of the transfer's quote, on its
+    /// `SwapQuoted` or `SwapRequoted` event. Reads Relay's API only: no
+    /// wallet, database or bot. A status is not proof of a payment; the bot
+    /// adopts one only once it proves on chain.
+    Status {
+        /// Relay's request id (0x-prefixed, 32 bytes)
+        request_id: B256,
+    },
+}
+
 #[derive(Debug, Parser)]
 #[command(name = "st0x-cli")]
 #[command(about = "A CLI tool for st0x liquidity operations")]
@@ -1202,6 +1225,9 @@ enum SimpleCommand {
         aggregate: AggregateView,
         id: Option<String>,
         all: bool,
+    },
+    RelayStatus {
+        request_id: B256,
     },
     Position {
         command: PositionRecoveryCommand,
@@ -1696,6 +1722,9 @@ fn classify_command(command: Commands) -> anyhow::Result<CommandRoute> {
                 command: TransferRecoveryCommand::ClearPendingBurn { id, reason },
             })
         }
+        Commands::Relay {
+            command: RelayCommand::Status { request_id },
+        } => CommandRoute::Simple(SimpleCommand::RelayStatus { request_id }),
     })
 }
 
@@ -1870,6 +1899,10 @@ async fn run_simple_command<W: Write>(
         }
         SimpleCommand::RebuildView { aggregate, id, all } => {
             rebuild_view(stdout, pool, aggregate, id, all).await
+        }
+        SimpleCommand::RelayStatus { request_id } => {
+            let client = RelayClient::new(None)?;
+            relay::relay_status_command(stdout, &client, RelayRequestId(request_id)).await
         }
         SimpleCommand::Position { command } => {
             run_position_command(stdout, pool, command, ctx.execution_threshold).await
