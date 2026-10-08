@@ -54,8 +54,8 @@ use super::{
 use crate::native_gas::TransferGasRoute;
 use crate::rebalancing::equity::RecheckOutcome;
 use crate::usdc_rebalance::{
-    RebalanceDirection, RedepositReason, RefundSide, SwapQuote, SwapStep, TransferRef,
-    UsdcRebalance, UsdcRebalanceCommand, UsdcRebalanceId, prepared_swap_ids,
+    RebalanceDirection, RecoveredSwapPayment, RedepositReason, RefundSide, SwapQuote, SwapStep,
+    TransferRef, UsdcRebalance, UsdcRebalanceCommand, UsdcRebalanceId, prepared_swap_ids,
 };
 
 /// One Relay corridor's hop: the bridge that signs the deposit and proves
@@ -524,7 +524,7 @@ where
                 ..
             }) => {
                 Self::require_base_to_alpaca(id, direction)?;
-                warn!(target: "rebalance", %id, %refund_tx, %amount_refunded, "Relay refunded the deposit in USDC at the hub; the transfer holds its guard for the operator to move it and reconcile");
+                error!(target: "operational_alert", alert = true, %id, %refund_tx, %amount_refunded, "Relay refunded the deposit in USDC at the hub; the transfer holds its guard for the operator to move it and reconcile");
                 Ok(())
             }
 
@@ -672,7 +672,7 @@ where
                 amount_refunded,
                 ..
             }) => {
-                warn!(target: "rebalance", %id, %refund_tx, %amount_refunded, "Relay refunded the deposit in the chain's stable to the chain wallet; the transfer holds its guard for the operator to move it and reconcile");
+                error!(target: "operational_alert", alert = true, %id, %refund_tx, %amount_refunded, "Relay refunded the deposit in the chain's stable to the chain wallet; the transfer holds its guard for the operator to move it and reconcile");
                 Ok(())
             }
 
@@ -870,6 +870,7 @@ where
             quote,
             quoted_at,
             signed_order_ids,
+            reverted_quotes,
             split_approves,
             deposit_reverts,
             ..
@@ -877,6 +878,15 @@ where
         else {
             return Ok(false);
         };
+
+        // A reverted deposit a reorg landed must be settled before anything
+        // else spends the stable: a new pair, a redeposit or a hold.
+        if self
+            .adopt_reverted_deposit(id, direction, &reverted_quotes, &split_approves)
+            .await?
+        {
+            return Ok(true);
+        }
 
         let max_reverts = self.hop.bounds.max_deposit_revert_redrives;
         if deposit_reverts >= max_reverts {
@@ -1153,6 +1163,15 @@ where
                     None => self.payment_pending(id, deposit_tx, wait).await,
                 }
             }
+            // The deposit may be included again and then filled or
+            // refunded, so a reorg is waited out within the fill window like
+            // any status that is not terminal; past it, it fails the swap.
+            IntentStatus::Failure {
+                reason: Some(FailReason::DepositReorged),
+            } if !past_window => {
+                warn!(target: "rebalance", %id, %deposit_tx, "Relay reports the deposit reorged out; it may be included again, so the transfer keeps waiting");
+                self.payment_pending(id, deposit_tx, wait).await
+            }
             status @ (IntentStatus::RefundFailed { .. } | IntentStatus::Failure { .. }) => {
                 self.cqrs
                     .send(
@@ -1256,10 +1275,7 @@ where
         reason: Option<FailReason>,
         direction: RebalanceDirection,
     ) -> Result<(), UsdcTransferError> {
-        let side = match payment.side {
-            SwapSide::Origin => RefundSide::Origin,
-            SwapSide::Destination => RefundSide::Destination,
-        };
+        let side = refund_side(payment.side);
         self.cqrs
             .send(
                 id,
@@ -1271,21 +1287,37 @@ where
             )
             .await?;
 
+        info!(target: "rebalance", %id, refund_tx = %payment.tx, amount = %payment.amount, ?side, ?reason, "Relay refund proven");
+        self.continue_refund(id, direction, side, payment.tx, reason)
+            .await
+    }
+
+    /// Moves a recorded refund on: toward the hub an origin-side one back
+    /// into the vault, from it an origin-side one quoted again; one paid at
+    /// the other end holds for the operator.
+    async fn continue_refund(
+        &self,
+        id: &UsdcRebalanceId,
+        direction: RebalanceDirection,
+        side: RefundSide,
+        refund_tx: TxHash,
+        reason: Option<FailReason>,
+    ) -> Result<(), UsdcTransferError> {
         match (direction, side) {
             (RebalanceDirection::BaseToAlpaca, RefundSide::Origin) => {
-                warn!(target: "rebalance", %id, refund_tx = %payment.tx, amount = %payment.amount, ?reason, "Relay refunded the deposit on the origin chain; returning it to the vault");
+                warn!(target: "rebalance", %id, %refund_tx, ?reason, "Relay refunded the deposit on the origin chain; returning it to the vault");
                 self.redeposit(id, RedepositReason::Refunded).await
             }
             (RebalanceDirection::BaseToAlpaca, RefundSide::Destination) => {
-                error!(target: "operational_alert", alert = true, %id, refund_tx = %payment.tx, amount = %payment.amount, ?reason, "Relay refunded the deposit in USDC at the hub; the transfer holds its guard until the operator moves it and reconciles");
+                error!(target: "operational_alert", alert = true, %id, %refund_tx, ?reason, "Relay refunded the deposit in USDC at the hub; the transfer holds its guard until the operator moves it and reconciles");
                 Ok(())
             }
             (RebalanceDirection::AlpacaToBase, RefundSide::Origin) => {
-                warn!(target: "rebalance", %id, refund_tx = %payment.tx, amount = %payment.amount, ?reason, "Relay refunded the deposit in USDC at the hub; quoting it again");
+                warn!(target: "rebalance", %id, %refund_tx, ?reason, "Relay refunded the deposit in USDC at the hub; quoting it again");
                 self.requote_refund_toward_chain(id).await
             }
             (RebalanceDirection::AlpacaToBase, RefundSide::Destination) => {
-                error!(target: "operational_alert", alert = true, %id, refund_tx = %payment.tx, amount = %payment.amount, ?reason, "Relay refunded the deposit in the chain's stable to the chain wallet, not the vault; the transfer holds its guard until the operator moves it and reconciles");
+                error!(target: "operational_alert", alert = true, %id, %refund_tx, ?reason, "Relay refunded the deposit in the chain's stable to the chain wallet, not the vault; the transfer holds its guard until the operator moves it and reconciles");
                 Ok(())
             }
         }
@@ -1355,17 +1387,21 @@ where
     }
 
     /// Ends an attempt with no payment: `RelayFillPending` within the fill
-    /// window, the guard-holding `SwapEscrowUnresolved` once it has passed.
-    /// An unresolved escrow is read again only on the operator's resume.
+    /// window, the guard-holding `SwapEscrowUnresolved` once it has passed,
+    /// paged when it is recorded and read again slowly after.
     async fn payment_pending(
         &self,
         id: &UsdcRebalanceId,
         deposit_tx: TxHash,
         wait: PaymentWait,
     ) -> Result<(), UsdcTransferError> {
+        let unresolved = || UsdcTransferError::SwapEscrowUnresolved {
+            id: id.clone(),
+            deposit_tx,
+        };
         let PaymentWait::FillWindow { deposited_at } = wait else {
-            error!(target: "operational_alert", alert = true, %id, %deposit_tx, "Relay deposit still unresolved past its fill window; the transfer holds its guard, and the next resume reads Relay again");
-            return Ok(());
+            warn!(target: "rebalance", %id, %deposit_tx, "Relay deposit still unresolved past its fill window; the transfer holds its guard and reads Relay again later");
+            return Err(unresolved());
         };
 
         if !wait.is_past(self.hop.bounds.fill_timeout, Utc::now()) {
@@ -1378,8 +1414,176 @@ where
         self.cqrs
             .send(id, UsdcRebalanceCommand::RecordSwapEscrowUnresolved)
             .await?;
-        error!(target: "operational_alert", alert = true, %id, %deposit_tx, %deposited_at, fill_timeout = ?self.hop.bounds.fill_timeout, "Relay deposit has no fill and no refund past its fill window; the transfer holds its guard at SwapEscrowUnresolved");
-        Ok(())
+        error!(target: "operational_alert", alert = true, %id, %deposit_tx, %deposited_at, fill_timeout = ?self.hop.bounds.fill_timeout, "Relay deposit has no fill and no refund past its fill window; the transfer holds its guard at SwapEscrowUnresolved and reads Relay again every 30 minutes");
+        Err(unresolved())
+    }
+
+    /// Scans the origin chain for our deposits of `reverted` orders, one of
+    /// which a reorg may have landed: `false` when none is on chain. A found
+    /// deposit is adopted once its payment proves, after the approves that
+    /// went out alone are sent again; until then the attempt ends with
+    /// `RevertedSwapDepositLive`, signing and redepositing nothing.
+    async fn adopt_reverted_deposit(
+        &self,
+        id: &UsdcRebalanceId,
+        direction: RebalanceDirection,
+        reverted: &[SwapQuote],
+        split_approves: &[PreparedTransaction],
+    ) -> Result<bool, UsdcTransferError> {
+        let Some(from_block) = reverted.iter().map(|quote| quote.origin_from_block).min() else {
+            return Ok(false);
+        };
+        let side = hop_direction(direction);
+        let order_ids = reverted
+            .iter()
+            .map(|quote| RelayOrderId(quote.order_id))
+            .collect::<Vec<_>>();
+
+        let scan = self
+            .hop
+            .bridge
+            .find_recent_deposits(side, &order_ids, from_block)
+            .await
+            .map_err(Box::new)?;
+        let Some((deposit, quote)) = scan.deposits.iter().find_map(|deposit| {
+            let RelayOrderId(order_id) = deposit.order_id;
+            reverted
+                .iter()
+                .find(|quote| quote.order_id == order_id)
+                .map(|quote| (deposit, quote))
+        }) else {
+            info!(target: "rebalance", %id, from_block, scanned_to = scan.scanned_to, reverted = reverted.len(), "No deposit of a reverted Relay order is on chain");
+            return Ok(false);
+        };
+
+        let order_id = quote.order_id;
+        error!(target: "operational_alert", alert = true, %id, deposit_tx = %deposit.tx, %order_id, block = deposit.block, "A deposit of a reverted Relay order is on chain; the transfer signs and redeposits nothing until its payment proves");
+        let Some(payment) = self.proven_order_payment(id, side, quote).await? else {
+            return Err(UsdcTransferError::RevertedSwapDepositLive {
+                id: id.clone(),
+                order_id,
+                request_id: quote.request_id,
+                deposit_tx: deposit.tx,
+            });
+        };
+
+        let deadline = Instant::now() + self.hop.bounds.quote_max_age;
+        self.hop
+            .broadcast_split_approves(id, split_approves, side, deadline)
+            .await?;
+        self.cqrs
+            .send(
+                id,
+                UsdcRebalanceCommand::RecoverSwapCompletion {
+                    order_id,
+                    deposit_tx: deposit.tx,
+                    payment,
+                },
+            )
+            .await?;
+        warn!(target: "rebalance", %id, %order_id, deposit_tx = %deposit.tx, ?payment, "Adopted the late payment of a reverted Relay order");
+
+        Box::pin(self.continue_after_recovery(id)).await?;
+        Ok(true)
+    }
+
+    /// The fill or refund of `quote`'s order that Relay reports and the chain
+    /// proves, `None` while Relay reports none or it is not provable yet. A
+    /// payment the chain contradicts pages and is `SwapPaymentUnverified`.
+    async fn proven_order_payment(
+        &self,
+        id: &UsdcRebalanceId,
+        side: HopDirection,
+        quote: &SwapQuote,
+    ) -> Result<Option<RecoveredSwapPayment>, UsdcTransferError> {
+        let order_id = RelayOrderId(quote.order_id);
+        let report = match self
+            .hop
+            .client
+            .status(RelayRequestId(quote.request_id))
+            .await
+        {
+            Ok(report) => report,
+            Err(error) => {
+                warn!(target: "rebalance", %id, order_id = %quote.order_id, %error, "Relay status read failed; reading it again later");
+                return Ok(None);
+            }
+        };
+
+        let (proof, fill) = match report.status {
+            IntentStatus::Success => (
+                self.hop
+                    .bridge
+                    .verify_fill(side, order_id, quote.minimum_out, &report.txs)
+                    .await,
+                true,
+            ),
+            IntentStatus::Refund { .. } => (
+                self.hop
+                    .bridge
+                    .verify_refund(side, order_id, quote.amount_in, &report.txs)
+                    .await,
+                false,
+            ),
+            status @ (IntentStatus::Waiting
+            | IntentStatus::InFlight(_)
+            | IntentStatus::Filling
+            | IntentStatus::Refunding { .. }
+            | IntentStatus::RefundFailed { .. }
+            | IntentStatus::Failure { .. }
+            | IntentStatus::NotIncluded
+            | IntentStatus::Unknown(_)) => {
+                info!(target: "rebalance", %id, order_id = %quote.order_id, ?status, "Relay reports no payment of the order");
+                return Ok(None);
+            }
+        };
+
+        Ok(Self::proven_payment(id, proof, false)?.map(|payment| {
+            if fill {
+                RecoveredSwapPayment::Fill {
+                    fill_tx: payment.tx,
+                    amount_received: payment.amount,
+                }
+            } else {
+                RecoveredSwapPayment::Refund {
+                    refund_tx: payment.tx,
+                    side: refund_side(payment.side),
+                    amount_refunded: payment.amount,
+                }
+            }
+        }))
+    }
+
+    /// Moves an adopted late payment on as any other: a fill as after the
+    /// hop, a refund as `continue_refund` does.
+    async fn continue_after_recovery(&self, id: &UsdcRebalanceId) -> Result<(), UsdcTransferError> {
+        match self.cqrs.load(id).await? {
+            Some(UsdcRebalance::Bridged {
+                direction: RebalanceDirection::AlpacaToBase,
+                amount_received,
+                ..
+            }) => {
+                self.continue_alpaca_to_base_from_bridged(id, amount_received)
+                    .await
+            }
+            Some(UsdcRebalance::SwapRefunded {
+                direction,
+                side,
+                refund_tx,
+                amount_refunded,
+                ..
+            }) => {
+                info!(target: "rebalance", %id, %refund_tx, %amount_refunded, "Moving the adopted Relay refund on");
+                self.continue_refund(id, direction, side, refund_tx, None)
+                    .await
+            }
+            Some(state) => self.resume_base_to_alpaca_past_hop(id, state).await,
+            None => Err(UsdcTransferError::StateOffHop {
+                id: id.clone(),
+                state: "Uninitialized",
+                hop: HopKind::Relay,
+            }),
+        }
     }
 
     /// Sends again the approves of a `SwapQuoted` that went out alone, then
@@ -1648,6 +1852,14 @@ struct PairSigning {
     deadline: Instant,
 }
 
+/// How a recheck records a payment it proves: on the deposited order of an
+/// unresolved escrow as a fill or refund, on a failed order as a late one.
+#[derive(Clone, Copy)]
+enum RecheckAdoption {
+    DepositedOrder,
+    FailedOrder { deposit_tx: TxHash },
+}
+
 /// What a deposit with no payment adopted is waiting within.
 #[derive(Clone, Copy)]
 enum PaymentWait {
@@ -1783,6 +1995,13 @@ fn quote_refused(error: &UsdcTransferError) -> bool {
             | RelayError::HttpStatus { .. } => false,
         },
         _ => false,
+    }
+}
+
+const fn refund_side(side: SwapSide) -> RefundSide {
+    match side {
+        SwapSide::Origin => RefundSide::Origin,
+        SwapSide::Destination => RefundSide::Destination,
     }
 }
 
@@ -1925,13 +2144,16 @@ impl<Signer> RecheckUsdcDeposit for CrossVenueCashTransfer<Signer, RelayHop<Sign
 where
     Signer: Wallet + Send + Sync + 'static,
 {
-    /// Not built for Relay yet: every recorded state is refused before any
-    /// call, the operator's deposit tx with it. A Relay `DepositFailed` is
-    /// settled with `transfer reconcile`.
+    /// Reads Relay's status of a held escrow's order again: the deposited
+    /// order of an unresolved escrow, or the failed one. A payment that
+    /// proves is adopted (`Recovered`) and left for the escrow's job, or a
+    /// `transfer resume`, to move on; otherwise nothing changes. Every other
+    /// state, and an operator deposit tx, is refused: a Relay `DepositFailed`
+    /// is settled with `transfer reconcile`.
     async fn recheck_deposit(
         &self,
         id: &UsdcRebalanceId,
-        _operator_deposit_tx: Option<TxHash>,
+        operator_deposit_tx: Option<TxHash>,
     ) -> Result<RecheckOutcome, UsdcRecheckError> {
         let state = self
             .cqrs
@@ -1942,10 +2164,89 @@ where
         self.require_served_corridor(id, self.corridor, Some(&state))
             .map_err(Box::new)?;
 
-        Err(UsdcRecheckError::NotDepositFailed {
-            id: id.clone(),
-            state: state.state_name(),
-        })
+        if let Some(tx) = operator_deposit_tx {
+            return Err(UsdcRecheckError::DepositTxNotApplicable {
+                id: id.clone(),
+                tx,
+                state: state.state_name(),
+            });
+        }
+
+        let (direction, quote, adopt) = match state {
+            UsdcRebalance::SwapEscrowUnresolved {
+                direction, quote, ..
+            } => (direction, quote, RecheckAdoption::DepositedOrder),
+            UsdcRebalance::SwapFailed {
+                direction,
+                quote,
+                deposit_tx,
+                ..
+            } => (
+                direction,
+                quote,
+                RecheckAdoption::FailedOrder { deposit_tx },
+            ),
+            state => {
+                return Err(UsdcRecheckError::NotDepositFailed {
+                    id: id.clone(),
+                    state: state.state_name(),
+                });
+            }
+        };
+
+        let Some(payment) = self
+            .proven_order_payment(id, hop_direction(direction), &quote)
+            .await
+            .map_err(Box::new)?
+        else {
+            return Ok(RecheckOutcome::LeftUnchanged);
+        };
+        let command = match (adopt, payment) {
+            (
+                RecheckAdoption::DepositedOrder,
+                RecoveredSwapPayment::Fill {
+                    fill_tx,
+                    amount_received,
+                },
+            ) => UsdcRebalanceCommand::ConfirmSwapFill {
+                fill_tx,
+                amount_received,
+            },
+            (
+                RecheckAdoption::DepositedOrder,
+                RecoveredSwapPayment::Refund {
+                    refund_tx,
+                    side,
+                    amount_refunded,
+                },
+            ) => UsdcRebalanceCommand::RecordSwapRefund {
+                refund_tx,
+                side,
+                amount_refunded,
+            },
+            (RecheckAdoption::FailedOrder { deposit_tx }, payment) => {
+                UsdcRebalanceCommand::RecoverSwapCompletion {
+                    order_id: quote.order_id,
+                    deposit_tx,
+                    payment,
+                }
+            }
+        };
+        self.cqrs
+            .send(id, command)
+            .await
+            .map_err(|error| Box::new(error.into()))?;
+        if let RecoveredSwapPayment::Refund {
+            refund_tx,
+            side: RefundSide::Destination,
+            amount_refunded,
+        } = payment
+        {
+            error!(target: "operational_alert", alert = true, %id, %refund_tx, %amount_refunded, "Recheck adopted a Relay refund paid at the other end; the transfer holds its guard until the operator moves it and reconciles");
+        }
+        warn!(target: "rebalance", %id, order_id = %quote.order_id, ?payment, "Recheck adopted a late Relay payment; the transfer's job or a resume moves it on");
+
+        Ok(RecheckOutcome::Recovered)
     }
 
     async fn verify_deposit_send_superseded(
@@ -2024,6 +2325,7 @@ mod tests {
         AnvilRaindexChain, TestAnvilInstance, anvil_wallet, erc20_balance, setup_test_db,
         spawn_anvil,
     };
+    use crate::usdc_rebalance::HopEvidence;
 
     type TestWallet = Arc<dyn Wallet<Provider = RootProvider>>;
 
@@ -3390,6 +3692,48 @@ mod tests {
             tx
         }
 
+        /// Our hub wallet's own approve and deposit of `AMOUNT_IN` USDC for
+        /// `order_id`, mined past the hub's confirmations, as a reverted
+        /// deposit a reorg landed would be. Returns the deposit tx.
+        async fn deposit_on_hub(&self, order_id: B256) -> TxHash {
+            let amount = U256::from(AMOUNT_IN);
+            self.hub_wallet
+                .send(
+                    self.hub_contracts.stable,
+                    IERC20::approveCall {
+                        spender: self.hub_contracts.depository,
+                        amount,
+                    }
+                    .abi_encode()
+                    .into(),
+                    "approve",
+                )
+                .await
+                .unwrap();
+            let deposit = self
+                .hub_wallet
+                .send(
+                    self.hub_contracts.depository,
+                    depositErc20Call {
+                        depositor: self.hub_wallet.address(),
+                        token: self.hub_contracts.stable,
+                        amount,
+                        id: order_id,
+                    }
+                    .abi_encode()
+                    .into(),
+                    "deposit",
+                )
+                .await
+                .unwrap();
+            self.hub_wallet
+                .provider()
+                .anvil_mine(Some(2), None)
+                .await
+                .unwrap();
+            deposit.transaction_hash
+        }
+
         async fn hub_usdc(&self) -> U256 {
             erc20_balance(
                 &self.hub_wallet,
@@ -3517,14 +3861,18 @@ mod tests {
         record_deposited(&store, &id).await;
         tokio::time::sleep(Duration::from_millis(20)).await;
 
-        tokio::time::timeout(
+        let error = tokio::time::timeout(
             Duration::from_secs(5),
             transfer.resume_base_to_alpaca(&id, Usdc::new(float!(100)), ROBINHOOD_RELAY),
         )
         .await
         .expect("the attempt ends")
-        .unwrap();
+        .unwrap_err();
 
+        assert!(
+            matches!(error, UsdcTransferError::SwapEscrowUnresolved { id: ref held, .. } if *held == id),
+            "the job reads the escrow again slowly, got {error:?}"
+        );
         let state = store.load(&id).await.unwrap().unwrap();
         assert_eq!(state.state_name(), "SwapEscrowUnresolved");
         assert!(state.holds_rebalance_guard());
@@ -3601,11 +3949,12 @@ mod tests {
             depository: Address::repeat_byte(0x52),
         };
 
-        for (status_body, after) in [
-            (json!({"status": "pending"}), "SwapEscrowUnresolved"),
+        for (status_body, after, read_again) in [
+            (json!({"status": "pending"}), "SwapEscrowUnresolved", true),
             (
                 json!({"status": "failure", "failReason": "SOLVER_CAPACITY_EXCEEDED"}),
                 "SwapFailed",
+                false,
             ),
         ] {
             let server = MockServer::start();
@@ -3628,14 +3977,21 @@ mod tests {
                 .await
                 .unwrap();
 
-            tokio::time::timeout(
+            let attempt = tokio::time::timeout(
                 Duration::from_secs(5),
                 transfer.resume_base_to_alpaca(&id, Usdc::new(float!(100)), ROBINHOOD_RELAY),
             )
             .await
-            .expect("the attempt ends")
-            .unwrap();
+            .expect("the attempt ends");
 
+            assert_eq!(
+                matches!(attempt, Err(UsdcTransferError::SwapEscrowUnresolved { .. })),
+                read_again,
+                "{after}: {attempt:?}"
+            );
+            if !read_again {
+                attempt.unwrap();
+            }
             status.assert_calls(1);
             let state = store.load(&id).await.unwrap().unwrap();
             assert_eq!(state.state_name(), after);
@@ -4937,5 +5293,740 @@ mod tests {
                 .is_some(),
             "the split approve is sent before the hold"
         );
+    }
+
+    /// Relay's status of one request only, by its id.
+    fn mock_status_of(
+        relay_api: &MockServer,
+        request_id: B256,
+        body: serde_json::Value,
+    ) -> httpmock::Mock<'_> {
+        relay_api.mock(|when, then| {
+            when.method(GET)
+                .path("/intents/status/v3")
+                .query_param("requestId", request_id.to_string());
+            then.status(200).json_body(body);
+        })
+    }
+
+    const REVERTED_ORDER_ID: B256 = B256::repeat_byte(0x0a);
+
+    /// Records an Alpaca-to-Robinhood transfer whose deposit for
+    /// `REVERTED_ORDER_ID` (request `0x5e..`) reverted, re-quoted under
+    /// `TOWARD_CHAIN_ORDER_ID` with request `0x6f..`, no pair signed for it.
+    async fn record_reverted_and_requoted_toward_chain(
+        rig: &RelayRig,
+        store: &Store<UsdcRebalance>,
+        id: &UsdcRebalanceId,
+    ) {
+        record_quoted_toward_chain(
+            store,
+            id,
+            exact_quote(&rig.hub_wallet, rig.hub_contracts, REVERTED_ORDER_ID).await,
+        )
+        .await;
+        let reverted = PreparedTransaction::for_test(TxHash::repeat_byte(0xa7), 40);
+        let mut requoted =
+            exact_quote(&rig.hub_wallet, rig.hub_contracts, TOWARD_CHAIN_ORDER_ID).await;
+        requoted.request_id = B256::repeat_byte(0x6f);
+        for command in [
+            UsdcRebalanceCommand::PrepareSwapDeposit {
+                approve: None,
+                deposit: reverted.clone(),
+            },
+            UsdcRebalanceCommand::RecordSwapDepositReverted {
+                deposit_tx: reverted.tx_hash(),
+            },
+            UsdcRebalanceCommand::RequoteSwap {
+                quote: Box::new(requoted),
+            },
+        ] {
+            store.send(id, command).await.unwrap();
+        }
+    }
+
+    /// A reorg landed the deposit of a reverted order after its re-quote:
+    /// the escrow scan finds it before the new order is signed, the fill
+    /// Relay paid for it is proven and adopted, and the filled USDG goes into
+    /// the vault. Nothing is quoted, signed or read for the new order.
+    #[tokio::test]
+    async fn late_fill_of_superseded_order_id_is_adopted() {
+        let rig = RelayRig::deploy().await;
+        rig.withdraw_to_hub(U256::from(AMOUNT_IN)).await;
+        let late_deposit = rig.deposit_on_hub(REVERTED_ORDER_ID).await;
+        let fill_tx = rig
+            .fill_on_chain(U256::from(AMOUNT_IN), REVERTED_ORDER_ID)
+            .await;
+        let server = MockServer::start();
+        let relay_api = MockServer::start();
+        let reverted_status = mock_status_of(
+            &relay_api,
+            B256::repeat_byte(0x5e),
+            json!({"status": "success", "inTxHashes": [late_deposit], "txHashes": [fill_tx]}),
+        );
+        let new_status = mock_status_of(
+            &relay_api,
+            B256::repeat_byte(0x6f),
+            json!({"status": "waiting"}),
+        );
+        let quotes = mock_quote_unavailable(&relay_api);
+        let store = Arc::new(test_store(setup_test_db().await, ()));
+        let transfer = rig
+            .transfer(&server, &relay_api, store.clone(), relay_bounds())
+            .await;
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        record_reverted_and_requoted_toward_chain(&rig, &store, &id).await;
+
+        tokio::time::timeout(
+            Duration::from_secs(60),
+            transfer.resume_alpaca_to_base(&id, Usdc::new(float!(100)), ROBINHOOD_RELAY),
+        )
+        .await
+        .expect("the attempt ends")
+        .unwrap();
+
+        let state = store.load(&id).await.unwrap().unwrap();
+        let UsdcRebalance::DepositConfirmed { hop, .. } = &state else {
+            panic!("expected DepositConfirmed, got {state:?}");
+        };
+        assert_eq!(
+            *hop,
+            HopEvidence::Relay {
+                deposit_tx: late_deposit,
+                fill_tx,
+                deposit_id: REVERTED_ORDER_ID,
+            }
+        );
+        assert!(!state.holds_rebalance_guard());
+        assert_eq!(rig.vault_usdg().await, U256::from(AMOUNT_IN));
+        reverted_status.assert_calls(1);
+        new_status.assert_calls(0);
+        quotes.assert_calls(0);
+    }
+
+    /// A reverted order's deposit found on chain with no payment proven yet
+    /// holds the transfer at `SwapQuoted`: nothing is signed for the new
+    /// order, and the attempt ends for a slow re-read.
+    #[tokio::test]
+    async fn live_reverted_deposit_signs_nothing_until_it_is_paid() {
+        let rig = RelayRig::deploy().await;
+        rig.withdraw_to_hub(U256::from(AMOUNT_IN)).await;
+        let late_deposit = rig.deposit_on_hub(REVERTED_ORDER_ID).await;
+        let server = MockServer::start();
+        let relay_api = MockServer::start();
+        mock_status_of(
+            &relay_api,
+            B256::repeat_byte(0x5e),
+            json!({"status": "pending", "inTxHashes": [late_deposit], "txHashes": []}),
+        );
+        let quotes = mock_quote_unavailable(&relay_api);
+        let store = Arc::new(test_store(setup_test_db().await, ()));
+        let transfer = rig
+            .transfer(&server, &relay_api, store.clone(), relay_bounds())
+            .await;
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        record_reverted_and_requoted_toward_chain(&rig, &store, &id).await;
+
+        let error = tokio::time::timeout(
+            Duration::from_secs(60),
+            transfer.resume_alpaca_to_base(&id, Usdc::new(float!(100)), ROBINHOOD_RELAY),
+        )
+        .await
+        .expect("the attempt ends")
+        .unwrap_err();
+
+        assert!(
+            matches!(
+                error,
+                UsdcTransferError::RevertedSwapDepositLive {
+                    order_id,
+                    request_id,
+                    deposit_tx,
+                    ..
+                } if order_id == REVERTED_ORDER_ID
+                    && request_id == B256::repeat_byte(0x5e)
+                    && deposit_tx == late_deposit
+            ),
+            "got {error:?}"
+        );
+        let state = store.load(&id).await.unwrap().unwrap();
+        let UsdcRebalance::SwapQuoted {
+            quote,
+            signed_order_ids,
+            ..
+        } = &state
+        else {
+            panic!("expected SwapQuoted, got {state:?}");
+        };
+        assert_eq!(quote.order_id, TOWARD_CHAIN_ORDER_ID);
+        assert_eq!(*signed_order_ids, vec![REVERTED_ORDER_ID], "no new pair");
+        quotes.assert_calls(0);
+    }
+
+    /// An escrow left unresolved past its fill window adopts a refund Relay
+    /// paid later on the origin chain, and returns it to the vault.
+    #[tokio::test]
+    async fn unresolved_escrow_adopts_late_refund() {
+        let rig = RelayRig::deploy().await;
+        let order_id = B256::repeat_byte(0x0d);
+        let server = MockServer::start();
+        let relay_api = MockServer::start();
+        let mut pending = mock_status(&relay_api, json!({"status": "pending"}));
+        let store = Arc::new(test_store(setup_test_db().await, ()));
+        let transfer = rig
+            .transfer(
+                &server,
+                &relay_api,
+                store.clone(),
+                RelayHopCtx {
+                    fill_timeout: Duration::from_millis(1),
+                    ..relay_bounds()
+                },
+            )
+            .await;
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        record_quoted(
+            &store,
+            &id,
+            exact_quote(&rig.chain.bot_wallet, rig.chain_contracts, order_id).await,
+        )
+        .await;
+
+        let held = tokio::time::timeout(
+            Duration::from_secs(60),
+            transfer.resume_base_to_alpaca(&id, Usdc::new(float!(100)), ROBINHOOD_RELAY),
+        )
+        .await
+        .expect("the attempt ends");
+        let Err(UsdcTransferError::SwapEscrowUnresolved { .. }) = held else {
+            panic!("expected SwapEscrowUnresolved, got {held:?}");
+        };
+        pending.delete();
+
+        let refunded = U256::from(99_500_000_u64);
+        let refund_tx = rig.refund_on_chain(refunded, order_id).await;
+        mock_status(
+            &relay_api,
+            json!({"status": "refund", "txHashes": [refund_tx], "failReason": "SOLVER_CAPACITY_EXCEEDED"}),
+        );
+        tokio::time::timeout(
+            Duration::from_secs(60),
+            transfer.resume_base_to_alpaca(&id, Usdc::new(float!(100)), ROBINHOOD_RELAY),
+        )
+        .await
+        .expect("the attempt ends")
+        .unwrap();
+
+        let state = store.load(&id).await.unwrap().unwrap();
+        assert_eq!(state.state_name(), "ReturnedToSource", "{state:?}");
+        assert!(!state.holds_rebalance_guard());
+        assert_eq!(rig.vault_usdg().await, refunded);
+    }
+
+    /// `transfer recheck` of an order Relay failed adopts the fill Relay paid
+    /// since and reports it recovered, without moving it on in the request;
+    /// the resume the operator queues then deposits it into the vault.
+    #[tokio::test]
+    async fn recheck_adopts_late_fill() {
+        let rig = RelayRig::deploy().await;
+        let fill_tx = rig
+            .fill_on_chain(U256::from(AMOUNT_IN), TOWARD_CHAIN_ORDER_ID)
+            .await;
+        let server = MockServer::start();
+        let relay_api = MockServer::start();
+        mock_status(
+            &relay_api,
+            json!({"status": "success", "inTxHashes": [], "txHashes": [fill_tx]}),
+        );
+        let store = Arc::new(test_store(setup_test_db().await, ()));
+        let transfer = rig
+            .transfer(&server, &relay_api, store.clone(), relay_bounds())
+            .await;
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        record_deposited_toward_chain(&store, &id, TOWARD_CHAIN_ORDER_ID).await;
+        store
+            .send(
+                &id,
+                UsdcRebalanceCommand::FailSwap {
+                    reason: "Relay reported Failure".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let outcome =
+            tokio::time::timeout(Duration::from_secs(60), transfer.recheck_deposit(&id, None))
+                .await
+                .expect("the recheck ends")
+                .unwrap();
+
+        assert_eq!(outcome, RecheckOutcome::Recovered);
+        let state = store.load(&id).await.unwrap().unwrap();
+        let UsdcRebalance::Bridged { hop, .. } = &state else {
+            panic!("expected Bridged, got {state:?}");
+        };
+        assert_eq!(hop.destination_tx(), fill_tx);
+        assert!(state.holds_rebalance_guard());
+        assert_eq!(
+            rig.vault_usdg().await,
+            U256::ZERO,
+            "not moved on in the recheck"
+        );
+
+        tokio::time::timeout(
+            Duration::from_secs(60),
+            transfer.resume_alpaca_to_base(&id, Usdc::new(float!(100)), ROBINHOOD_RELAY),
+        )
+        .await
+        .expect("the resume ends")
+        .unwrap();
+        let state = store.load(&id).await.unwrap().unwrap();
+        assert_eq!(state.state_name(), "DepositConfirmed", "{state:?}");
+        assert_eq!(rig.vault_usdg().await, U256::from(AMOUNT_IN));
+    }
+
+    /// `transfer recheck` of an unresolved escrow adopts the fill Relay paid
+    /// since and leaves moving it on to the job that re-reads the escrow.
+    #[tokio::test]
+    async fn recheck_of_an_unresolved_escrow_adopts_and_leaves_it_to_the_job() {
+        let rig = RelayRig::deploy().await;
+        let fill_tx = rig
+            .fill_on_chain(U256::from(AMOUNT_IN), TOWARD_CHAIN_ORDER_ID)
+            .await;
+        let server = MockServer::start();
+        let relay_api = MockServer::start();
+        mock_status(
+            &relay_api,
+            json!({"status": "success", "inTxHashes": [], "txHashes": [fill_tx]}),
+        );
+        let store = Arc::new(test_store(setup_test_db().await, ()));
+        let transfer = rig
+            .transfer(&server, &relay_api, store.clone(), relay_bounds())
+            .await;
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        record_deposited_toward_chain(&store, &id, TOWARD_CHAIN_ORDER_ID).await;
+        store
+            .send(&id, UsdcRebalanceCommand::RecordSwapEscrowUnresolved)
+            .await
+            .unwrap();
+
+        let outcome =
+            tokio::time::timeout(Duration::from_secs(60), transfer.recheck_deposit(&id, None))
+                .await
+                .expect("the recheck ends")
+                .unwrap();
+
+        assert_eq!(outcome, RecheckOutcome::Recovered);
+        let state = store.load(&id).await.unwrap().unwrap();
+        let UsdcRebalance::Bridged { hop, .. } = &state else {
+            panic!("expected Bridged, got {state:?}");
+        };
+        assert_eq!(hop.destination_tx(), fill_tx);
+        assert_eq!(rig.vault_usdg().await, U256::ZERO, "the job deposits it");
+    }
+
+    /// A deposit Relay still reports reorged out past the fill window is a
+    /// Relay failure with nothing paid back: it holds at the reconcilable
+    /// `SwapFailed`, guard held.
+    #[tokio::test]
+    async fn deposit_reorged_past_the_fill_window_fails_the_swap() {
+        let anvil = spawn_anvil(Anvil::new());
+        let key = B256::from_slice(&anvil.keys()[0].to_bytes());
+        let wallet = anvil_wallet(anvil.endpoint_url(), &key);
+        let contracts = RelayEndContracts {
+            stable: Address::repeat_byte(0x51),
+            depository: Address::repeat_byte(0x52),
+        };
+        let server = MockServer::start();
+        let relay_api = MockServer::start();
+        mock_status(
+            &relay_api,
+            json!({"status": "failure", "failReason": "DEPOSIT_REORGED"}),
+        );
+        let store = Arc::new(test_store(setup_test_db().await, ()));
+        let transfer = relay_transfer_with_bounds(
+            &server,
+            &relay_api,
+            wallet.clone(),
+            wallet,
+            contracts,
+            store.clone(),
+            RelayHopCtx {
+                fill_timeout: Duration::from_millis(1),
+                ..relay_bounds()
+            },
+        )
+        .await;
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        record_deposited(&store, &id).await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            transfer.resume_base_to_alpaca(&id, Usdc::new(float!(100)), ROBINHOOD_RELAY),
+        )
+        .await
+        .expect("the attempt ends")
+        .unwrap();
+
+        let state = store.load(&id).await.unwrap().unwrap();
+        assert_eq!(state.state_name(), "SwapFailed");
+        assert!(state.holds_rebalance_guard());
+        assert!(state.is_reconcilable_failure());
+    }
+
+    /// A refund paid at the other end that a recheck adopts pages at once,
+    /// and every resume of it pages again: the stable sits outside the vault
+    /// and Alpaca, guard held, until the operator moves it.
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn refund_adopted_at_the_other_end_pages_on_recheck_and_resume() {
+        let rig = RelayRig::deploy().await;
+        let order_id = B256::repeat_byte(0x0d);
+        let refund_tx = rig
+            .refund_on_hub(U256::from(99_500_000_u64), order_id)
+            .await;
+        let server = MockServer::start();
+        let relay_api = MockServer::start();
+        mock_status(
+            &relay_api,
+            json!({"status": "refund", "txHashes": [refund_tx], "failReason": "SOLVER_CAPACITY_EXCEEDED"}),
+        );
+        let store = Arc::new(test_store(setup_test_db().await, ()));
+        let transfer = rig
+            .transfer(&server, &relay_api, store.clone(), relay_bounds())
+            .await;
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        record_deposited(&store, &id).await;
+        store
+            .send(
+                &id,
+                UsdcRebalanceCommand::FailSwap {
+                    reason: "Relay reported Failure".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let outcome =
+            tokio::time::timeout(Duration::from_secs(60), transfer.recheck_deposit(&id, None))
+                .await
+                .expect("the recheck ends")
+                .unwrap();
+
+        assert_eq!(outcome, RecheckOutcome::Recovered);
+        let state = store.load(&id).await.unwrap().unwrap();
+        assert!(
+            matches!(
+                state,
+                UsdcRebalance::SwapRefunded {
+                    side: RefundSide::Destination,
+                    ..
+                }
+            ),
+            "{state:?}"
+        );
+        let pages = |phrase: &'static str| {
+            move |lines: &[&str]| {
+                lines
+                    .iter()
+                    .any(|line| line.contains("operational_alert") && line.contains(phrase))
+                    .then_some(())
+                    .ok_or_else(|| format!("no operational alert says {phrase:?}"))
+            }
+        };
+        logs_assert(pages(
+            "Recheck adopted a Relay refund paid at the other end",
+        ));
+
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            transfer.resume_base_to_alpaca(&id, Usdc::new(float!(100)), ROBINHOOD_RELAY),
+        )
+        .await
+        .expect("the resume ends")
+        .unwrap();
+        logs_assert(pages(
+            "the transfer holds its guard for the operator to move it",
+        ));
+    }
+
+    /// A payment Relay names that the chain contradicts (here a fill below
+    /// the quote's floor) is not taken for no payment on recheck: it pages
+    /// and the recheck fails with the unverified payment, changing nothing.
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn recheck_of_a_payment_that_does_not_prove_pages_and_fails() {
+        let rig = RelayRig::deploy().await;
+        let short_fill = rig
+            .fill_on_hub(U256::from(AMOUNT_IN - 1), B256::repeat_byte(0x0d))
+            .await;
+        let server = MockServer::start();
+        let relay_api = MockServer::start();
+        mock_status(
+            &relay_api,
+            json!({"status": "success", "inTxHashes": [], "txHashes": [short_fill]}),
+        );
+        let store = Arc::new(test_store(setup_test_db().await, ()));
+        let transfer = rig
+            .transfer(&server, &relay_api, store.clone(), relay_bounds())
+            .await;
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        record_deposited(&store, &id).await;
+        store
+            .send(
+                &id,
+                UsdcRebalanceCommand::FailSwap {
+                    reason: "Relay reported Failure".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let error =
+            tokio::time::timeout(Duration::from_secs(60), transfer.recheck_deposit(&id, None))
+                .await
+                .expect("the recheck ends")
+                .unwrap_err();
+
+        assert!(
+            matches!(
+                &error,
+                UsdcRecheckError::Transfer(transfer)
+                    if matches!(**transfer, UsdcTransferError::SwapPaymentUnverified { .. })
+            ),
+            "got {error:?}"
+        );
+        assert_eq!(
+            store.load(&id).await.unwrap().unwrap().state_name(),
+            "SwapFailed"
+        );
+        logs_assert(|lines: &[&str]| {
+            lines
+                .iter()
+                .any(|line| {
+                    line.contains("operational_alert")
+                        && line.contains("The Relay payment does not prove on chain")
+                })
+                .then_some(())
+                .ok_or_else(|| "no operational alert for the unproven payment".to_string())
+        });
+    }
+
+    /// `transfer recheck` of a failed order Relay still reports unpaid
+    /// changes nothing; it refuses an operator deposit tx and a Relay state
+    /// that is not a held escrow.
+    #[tokio::test]
+    async fn recheck_leaves_an_unpaid_failure_and_refuses_other_relay_states() {
+        let anvil = spawn_anvil(Anvil::new());
+        let key = B256::from_slice(&anvil.keys()[0].to_bytes());
+        let wallet = anvil_wallet(anvil.endpoint_url(), &key);
+        let contracts = RelayEndContracts {
+            stable: Address::repeat_byte(0x51),
+            depository: Address::repeat_byte(0x52),
+        };
+        let server = MockServer::start();
+        let relay_api = MockServer::start();
+        mock_status(
+            &relay_api,
+            json!({"status": "failure", "failReason": "SOLVER_CAPACITY_EXCEEDED"}),
+        );
+        let store = Arc::new(test_store(setup_test_db().await, ()));
+        let transfer = relay_transfer(
+            &server,
+            &relay_api,
+            wallet.clone(),
+            wallet,
+            contracts,
+            store.clone(),
+        )
+        .await;
+        let deposited = UsdcRebalanceId(Uuid::new_v4());
+        record_deposited(&store, &deposited).await;
+        let failed = UsdcRebalanceId(Uuid::new_v4());
+        record_deposited(&store, &failed).await;
+        store
+            .send(
+                &failed,
+                UsdcRebalanceCommand::FailSwap {
+                    reason: "Relay reported Failure".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            transfer.recheck_deposit(&failed, None).await.unwrap(),
+            RecheckOutcome::LeftUnchanged
+        );
+        assert_eq!(
+            store.load(&failed).await.unwrap().unwrap().state_name(),
+            "SwapFailed"
+        );
+
+        let error = transfer
+            .recheck_deposit(&failed, Some(TxHash::repeat_byte(0x44)))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, UsdcRecheckError::DepositTxNotApplicable { .. }),
+            "got {error:?}"
+        );
+
+        let error = transfer
+            .recheck_deposit(&deposited, None)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                UsdcRecheckError::NotDepositFailed {
+                    state: "SwapDeposited",
+                    ..
+                }
+            ),
+            "got {error:?}"
+        );
+    }
+
+    /// Relay reporting the deposit reorged is not a failure: the deposit may
+    /// be included again, so the transfer keeps waiting at `SwapDeposited`.
+    #[tokio::test]
+    async fn deposit_reorged_keeps_waiting_for_the_payment() {
+        let anvil = spawn_anvil(Anvil::new());
+        let key = B256::from_slice(&anvil.keys()[0].to_bytes());
+        let wallet = anvil_wallet(anvil.endpoint_url(), &key);
+        let contracts = RelayEndContracts {
+            stable: Address::repeat_byte(0x51),
+            depository: Address::repeat_byte(0x52),
+        };
+        let server = MockServer::start();
+        let relay_api = MockServer::start();
+        mock_status(
+            &relay_api,
+            json!({"status": "failure", "failReason": "DEPOSIT_REORGED"}),
+        );
+        let store = Arc::new(test_store(setup_test_db().await, ()));
+        let transfer = relay_transfer(
+            &server,
+            &relay_api,
+            wallet.clone(),
+            wallet,
+            contracts,
+            store.clone(),
+        )
+        .await;
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        record_deposited(&store, &id).await;
+
+        let attempt = tokio::time::timeout(
+            Duration::from_secs(5),
+            transfer.resume_base_to_alpaca(&id, Usdc::new(float!(100)), ROBINHOOD_RELAY),
+        )
+        .await
+        .expect("the attempt ends");
+
+        assert_fill_pending(&attempt);
+        let state = store.load(&id).await.unwrap().unwrap();
+        assert_eq!(state.state_name(), "SwapDeposited");
+        assert!(state.holds_rebalance_guard());
+    }
+
+    /// After a restart, a pair signed and persisted before the crash is
+    /// restored and sent as the same bytes at the same nonces: the restarted
+    /// wallet signs nothing, and the deposit recorded is the persisted one.
+    #[tokio::test]
+    async fn restart_rebroadcasts_persisted_pair_never_resigns() {
+        let anvil = spawn_anvil(Anvil::new());
+        let (wallet, contracts) = funded_relay_end(&anvil).await;
+        let pool = setup_test_db().await;
+        let store = Arc::new(test_store(pool.clone(), ()));
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let quote = exact_quote(&wallet, contracts, B256::repeat_byte(0x0d)).await;
+        let approve_step = quote.approve.clone().unwrap();
+        let deposit_step = quote.deposit.clone();
+        record_quoted(&store, &id, quote).await;
+
+        // Signed by the process that then crashed, before any broadcast.
+        let approve = wallet
+            .prepare_pending(contracts.stable, approve_step.data, "approve")
+            .await
+            .unwrap();
+        let deposit = wallet
+            .prepare_pending_with_gas_limit(
+                contracts.depository,
+                deposit_step.data,
+                200_000,
+                "deposit",
+            )
+            .await
+            .unwrap();
+        store
+            .send(
+                &id,
+                UsdcRebalanceCommand::PrepareSwapDeposit {
+                    approve: Some(approve.clone()),
+                    deposit: deposit.clone(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let key = B256::from_slice(&anvil.keys()[0].to_bytes());
+        let restarted = Arc::new(
+            BroadcastWitness::new(
+                anvil_wallet(anvil.endpoint_url(), &key),
+                store.clone(),
+                id.clone(),
+            )
+            .on_deposit_signing(OnDepositSigning::Panic),
+        );
+        let chain_wallet: TestWallet = restarted.clone();
+        let server = MockServer::start();
+        let relay_api = MockServer::start();
+        let transfer = relay_transfer(
+            &server,
+            &relay_api,
+            chain_wallet.clone(),
+            chain_wallet,
+            contracts,
+            store.clone(),
+        )
+        .await;
+
+        let restored = transfer.restore_chain_signed_swaps(&pool).await;
+        assert_eq!(
+            restored
+                .get(&Chain::Robinhood)
+                .map(|outcome| outcome.restored),
+            Some(2)
+        );
+        let resumed = tokio::time::timeout(
+            Duration::from_secs(10),
+            transfer.resume_base_to_alpaca(&id, Usdc::new(float!(100)), ROBINHOOD_RELAY),
+        )
+        .await
+        .expect("the attempt ends");
+
+        assert_fill_pending(&resumed);
+        assert!(
+            restarted
+                .broadcasts()
+                .iter()
+                .all(|tx| *tx == approve.tx_hash() || *tx == deposit.tx_hash()),
+            "only the persisted envelopes are sent: {:?}",
+            restarted.broadcasts()
+        );
+        let state = store.load(&id).await.unwrap().unwrap();
+        let UsdcRebalance::SwapDeposited {
+            deposit_tx,
+            signed_order_ids,
+            ..
+        } = &state
+        else {
+            panic!("expected SwapDeposited, got {state:?}");
+        };
+        assert_eq!(*deposit_tx, deposit.tx_hash());
+        assert_eq!(*signed_order_ids, vec![B256::repeat_byte(0x0d)]);
     }
 }

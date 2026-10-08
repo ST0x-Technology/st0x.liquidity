@@ -46,7 +46,7 @@ reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sqlx.workspace = true
-st0x-bridge = { workspace = true, features = ["cctp"] }
+st0x-bridge = { workspace = true, features = ["cctp", "relay"] }
 st0x-config.workspace = true
 st0x-event-sorcery.workspace = true
 st0x-evm.workspace = true

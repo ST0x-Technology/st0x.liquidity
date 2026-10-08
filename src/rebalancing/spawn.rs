@@ -177,6 +177,9 @@ pub(crate) struct RebalancerServices<Signer: Wallet> {
     /// Settlement tuning shared by every corridor.
     settlement: UsdcSettlementParams,
     relay_hops: BTreeMap<Chain, RelayHopSetup>,
+    /// Where an in-process test serves Relay's API.
+    #[cfg(test)]
+    relay_api_base: Option<String>,
 }
 
 impl<Signer: Wallet + Clone + 'static> RebalancerServices<Signer> {
@@ -195,7 +198,17 @@ impl<Signer: Wallet + Clone + 'static> RebalancerServices<Signer> {
             cctp_corridor,
             settlement,
             relay_hops,
+            #[cfg(test)]
+            relay_api_base: None,
         }
+    }
+
+    /// Points every Relay hop's API client at `api_base`.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn with_relay_api_base(mut self, api_base: String) -> Self {
+        self.relay_api_base = Some(api_base);
+        self
     }
 
     /// Builds one cross-venue cash transfer per served corridor, each on its
@@ -365,6 +378,11 @@ impl<Signer: Wallet + Clone + 'static> RebalancerServices<Signer> {
         })
         .map_err(Box::new)?;
         let client = RelayClient::new(None).map_err(Box::new)?;
+        #[cfg(test)]
+        let client = match &self.relay_api_base {
+            Some(api_base) => client.with_api_base(api_base.clone()),
+            None => client,
+        };
 
         Ok(RelayHop::new(bridge, client, setup.bounds, hub_wallet))
     }
@@ -629,6 +647,7 @@ mod tests {
             cctp_corridor: CctpCorridor::ethereum_base().unwrap(),
             settlement: make_test_settlement(&rebalancing_ctx),
             relay_hops: robinhood_relay_hops(),
+            relay_api_base: None,
         };
 
         (services, base_wallet)

@@ -20,7 +20,9 @@ use crate::inventory::{
     ActiveUsdcRebalance, BroadcastingInventory, Imbalance, ImbalanceThreshold, Inventory,
     InventoryError, InventoryViewError, TransferOp, Venue,
 };
-use crate::usdc_rebalance::{RebalanceDirection, UsdcRebalanceEvent, UsdcRebalanceId};
+use crate::usdc_rebalance::{
+    RebalanceDirection, SwapRecovery, UsdcRebalanceEvent, UsdcRebalanceId,
+};
 
 /// Dispatch decision returned by [`check_imbalance_and_build_operation`].
 /// The trigger maps each variant to the corresponding apalis job queue.
@@ -308,12 +310,20 @@ impl UsdcRebalanceStage {
             }
             SwapDepositPrepared { .. } => Some(Self::SwapDepositPrepared),
             SwapDeposited { .. } => Some(Self::SwapDeposited),
-            SwapRefunded { .. } => Some(Self::SwapRefunded),
+            SwapRefunded { .. }
+            | SwapCompletionRecovered {
+                payment: SwapRecovery::Refund { .. },
+                ..
+            } => Some(Self::SwapRefunded),
             SwapEscrowUnresolved { .. } => Some(Self::SwapEscrowUnresolved),
             RedepositStarted { .. } | RedepositSubmitted { .. } => Some(Self::Redepositing),
-            Bridged { .. } | BridgingCompletionRecovered { .. } | RelayFillVerified { .. } => {
-                Some(Self::Bridged)
-            }
+            Bridged { .. }
+            | BridgingCompletionRecovered { .. }
+            | RelayFillVerified { .. }
+            | SwapCompletionRecovered {
+                payment: SwapRecovery::Fill { .. },
+                ..
+            } => Some(Self::Bridged),
             DepositInitiated { .. } => Some(Self::DepositInitiated),
             DepositConfirmed { .. } | DepositCompletionRecovered { .. } => {
                 Some(Self::DepositConfirmed)
@@ -361,7 +371,14 @@ impl UsdcRebalanceStage {
                 Some(*quoted_at)
             }
             (Self::SwapQuoted, SwapDepositReverted { reverted_at, .. }) => Some(*reverted_at),
-            (Self::SwapRefunded, SwapRefunded { refunded_at, .. }) => Some(*refunded_at),
+            (Self::SwapRefunded, SwapRefunded { refunded_at, .. })
+            | (
+                Self::SwapRefunded | Self::Bridged,
+                SwapCompletionRecovered {
+                    recovered_at: refunded_at,
+                    ..
+                },
+            ) => Some(*refunded_at),
             (Self::SwapEscrowUnresolved, SwapEscrowUnresolved { unresolved_at }) => {
                 Some(*unresolved_at)
             }
@@ -1123,6 +1140,10 @@ impl RebalancingService {
             | SwapDeposited { .. }
             | SwapRefunded { .. }
             | SwapEscrowUnresolved { .. }
+            | SwapCompletionRecovered {
+                payment: SwapRecovery::Refund { .. },
+                ..
+            }
             | RedepositStarted { .. }
             | RedepositSubmitted { .. }
             | DepositInitiated { .. }
@@ -1152,6 +1173,12 @@ impl RebalancingService {
             }
             | RelayFillVerified {
                 amount_received, ..
+            }
+            | SwapCompletionRecovered {
+                payment: SwapRecovery::Fill {
+                    amount_received, ..
+                },
+                ..
             } => {
                 // `BridgingCompletionRecovered` un-fails a post-burn
                 // `BridgingFailed` back to `Bridged`: the mint is now confirmed,

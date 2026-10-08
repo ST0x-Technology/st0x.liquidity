@@ -599,7 +599,13 @@ impl StoredOperation {
             UsdcRebalanceEvent::WithdrawalSubmitting {
                 direction,
                 amount,
-                submitting_at,
+                submitting_at: withdrawal_at,
+                ..
+            }
+            | UsdcRebalanceEvent::Initiated {
+                direction,
+                amount,
+                initiated_at: withdrawal_at,
                 ..
             } => {
                 self.direction.get_or_insert(*direction);
@@ -610,24 +616,9 @@ impl StoredOperation {
                 // record a mid-pipeline timestamp when the reactor first
                 // observes an `AlpacaToBase` op here after a deploy.
                 if *direction == RebalanceDirection::BaseToAlpaca {
-                    self.started_at.get_or_insert(*submitting_at);
+                    self.started_at.get_or_insert(*withdrawal_at);
                 }
-                self.open_once(Withdrawal, *submitting_at);
-            }
-            UsdcRebalanceEvent::Initiated {
-                direction,
-                amount,
-                initiated_at,
-                ..
-            } => {
-                self.direction.get_or_insert(*direction);
-                self.amount.get_or_insert(*amount);
-                // Same direction gating as `WithdrawalSubmitting`: the
-                // withdrawal is the genuine first phase only for `BaseToAlpaca`.
-                if *direction == RebalanceDirection::BaseToAlpaca {
-                    self.started_at.get_or_insert(*initiated_at);
-                }
-                self.open_once(Withdrawal, *initiated_at);
+                self.open_once(Withdrawal, *withdrawal_at);
             }
             UsdcRebalanceEvent::WithdrawalConfirmed { confirmed_at, .. } => {
                 self.close(
@@ -726,6 +717,10 @@ impl StoredOperation {
             UsdcRebalanceEvent::BridgingFailed { failed_at, .. } => {
                 self.close_open_stages(*failed_at, StoredStageOutcome::Failed);
                 self.status = StoredStatus::Failed;
+            }
+            // A late Relay payment un-fails a `SwapFailed`.
+            UsdcRebalanceEvent::SwapCompletionRecovered { .. } => {
+                self.status = StoredStatus::InProgress;
             }
             UsdcRebalanceEvent::BridgingCompletionRecovered { recovered_at, .. } => {
                 self.close_open_stages(*recovered_at, StoredStageOutcome::Succeeded);
@@ -1023,6 +1018,7 @@ fn observed_at(event: &UsdcRebalanceEvent) -> DateTime<Utc> {
         UsdcRebalanceEvent::AttestationTimedOut { timed_out_at, .. } => *timed_out_at,
         UsdcRebalanceEvent::Bridged { minted_at, .. } => *minted_at,
         UsdcRebalanceEvent::BridgingCompletionRecovered { recovered_at, .. }
+        | UsdcRebalanceEvent::SwapCompletionRecovered { recovered_at, .. }
         | UsdcRebalanceEvent::DepositCompletionRecovered { recovered_at } => *recovered_at,
         UsdcRebalanceEvent::DepositInitiated {
             deposit_initiated_at,

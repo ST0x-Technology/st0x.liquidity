@@ -283,3 +283,11 @@ decimals, so the amounts compare unit for unit; Relay quotes a refund minimum of
 0). A refund paid on the destination chain looks exactly like a fill, so the
 side alone does not tell them apart: Relay's status does. A failed check is
 `FillUnverified` or `RefundUnverified` with an `UnverifiedReason`.
+
+## Operator lookup
+
+`stox relay status <request_id>` reads `GET /intents/status/v3` once with the
+same client the bot uses and prints the parsed status, its reasons and every tx
+Relay lists. What the bot does with each state, and the operator action for
+every hold, is in `docs/cli-ops.md` ("Robinhood Relay transfer runbook") and
+SPEC.md ("Relay recovery").

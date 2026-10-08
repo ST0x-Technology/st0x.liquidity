@@ -410,7 +410,12 @@ pub(crate) struct AnvilRaindexChain {
 #[cfg(test)]
 impl AnvilRaindexChain {
     pub(crate) async fn deploy() -> Self {
-        let anvil = spawn_anvil(Anvil::new());
+        Self::deploy_on(Anvil::new()).await
+    }
+
+    /// Deploys on the chain `anvil` describes, e.g. with a chain's real id.
+    pub(crate) async fn deploy_on(anvil: Anvil) -> Self {
+        let anvil = spawn_anvil(anvil);
         let endpoint = anvil.endpoint_url();
         let bot_key = B256::from_slice(&anvil.keys()[0].to_bytes());
         let deployer_key = B256::from_slice(&anvil.keys()[1].to_bytes());

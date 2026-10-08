@@ -203,6 +203,13 @@ vault <-> hop <-> Ethereum wallet <-> Alpaca.
 - **Signed order ids** (`signed_order_ids`): every Relay order id the transfer
   ever signed a deposit for. Entries are never removed, so a late fill or refund
   of any of them can still be matched.
+- **Reverted quotes** (`reverted_quotes`): the quotes of signed deposits that
+  mined and reverted. A reorg may still land one, so the **escrow scan** looks
+  for our deposits of their order ids in the origin chain's depository before a
+  new pair is signed or the stable is redeposited.
+- **Late adoption** (`RecoverSwapCompletion` -> `SwapCompletionRecovered`): a
+  fill or refund of a signed order proven after the transfer stopped waiting for
+  it, adopted into `Bridged` or `SwapRefunded`.
 
 A corridor is configured under `[rebalancing.usdc.corridors.<chain>]` and
 recorded on each `UsdcRebalance` when it starts. Not to be confused with the
