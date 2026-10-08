@@ -4828,10 +4828,11 @@ left a vault:
    `SwapQuoted`, a fresh order id, every earlier one kept in
    `signed_order_ids`), while fewer than `max_refund_retries` re-quotes followed
    a refund (`refund_requotes`) and the refunded amount is at least
-   `min_transfer`. Otherwise the transfer holds at `SwapRefunded`, guard held,
-   paged, for `transfer reconcile`. A refund paid in the chain's stable
-   (destination side) holds the same way: the stable is in the chain wallet, not
-   the vault. A failure and an unresolved escrow follow step 8 above.
+   `min_transfer`; each such re-quote starts a fresh revert budget. Otherwise
+   the transfer holds at `SwapRefunded`, guard held, paged, for
+   `transfer reconcile`. A refund paid in the chain's stable (destination side)
+   holds the same way: the stable is in the chain wallet, not the vault. A
+   failure and an unresolved escrow follow step 8 above.
 
 At startup the persisted pairs are restored before any other send from their
 wallet: pairs signed on the Ethereum wallet once, by the hub service, together
