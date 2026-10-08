@@ -1355,6 +1355,8 @@ mod tests {
         /// Another send from this wallet takes the next nonce first, and is
         /// broadcast so no nonce is left as a gap.
         AnotherSendFirst { to: Address },
+        /// The signing panics before the deposit's nonce is taken.
+        Panic,
     }
 
     impl BroadcastWitness {
@@ -1425,6 +1427,10 @@ mod tests {
             note: &str,
         ) -> Result<PreparedTransaction, EvmError> {
             let hook = self.on_deposit_signing.lock().unwrap().take();
+            assert!(
+                !matches!(hook, Some(OnDepositSigning::Panic)),
+                "the deposit signing panics for the test"
+            );
             if let Some(OnDepositSigning::AnotherSendFirst { to }) = hook {
                 let calldata = IERC20::approveCall {
                     spender: Address::repeat_byte(0x99),
@@ -1813,6 +1819,63 @@ mod tests {
             assert!(state.holds_rebalance_guard());
             assert_eq!(witness.broadcasts(), Vec::<TxHash>::new());
         }
+    }
+
+    /// A panic while the pair is signed pages an operational alert: the
+    /// nonces it reserved stall the chain wallet until a restart.
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn panicked_swap_prepare_pages_an_operational_alert() {
+        let anvil = spawn_anvil(Anvil::new());
+        let (wallet, contracts) = funded_relay_end(&anvil).await;
+        let store = Arc::new(test_store(setup_test_db().await, ()));
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let witness = Arc::new(
+            BroadcastWitness::new(wallet.clone(), store.clone(), id.clone())
+                .on_deposit_signing(OnDepositSigning::Panic),
+        );
+        let chain_wallet: TestWallet = witness.clone();
+        let server = MockServer::start();
+        let relay_api = MockServer::start();
+        let transfer = relay_transfer(
+            &server,
+            &relay_api,
+            wallet.clone(),
+            chain_wallet,
+            contracts,
+            store.clone(),
+        )
+        .await;
+        record_quoted(
+            &store,
+            &id,
+            exact_quote(&wallet, contracts, B256::repeat_byte(0x0d)).await,
+        )
+        .await;
+
+        let error = transfer
+            .resume_base_to_alpaca(&id, Usdc::new(float!(100)), ROBINHOOD_RELAY)
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(&error, UsdcTransferError::SwapPrepareTaskPanicked { id: panicked } if *panicked == id),
+            "got {error:?}"
+        );
+        logs_assert(|lines: &[&str]| {
+            lines
+                .iter()
+                .any(|line| {
+                    line.contains("operational_alert")
+                        && line.contains("stall later sends from the chain wallet until a restart")
+                })
+                .then_some(())
+                .ok_or_else(|| "no operational alert says the nonces stall the wallet".to_string())
+        });
+        assert_eq!(
+            store.load(&id).await.unwrap().unwrap().state_name(),
+            "SwapQuoted"
+        );
     }
 
     /// A pair persisted after an approve went out alone is resumed in
