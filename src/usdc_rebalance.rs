@@ -1592,6 +1592,12 @@ impl UsdcRebalance {
         self.prepared_deposit_send().is_some()
     }
 
+    /// Whether the transfer holds a signed Relay envelope, whose nonce the
+    /// running bot keeps reserved until a restart.
+    pub fn has_signed_swap_envelopes(&self) -> bool {
+        !self.prepared_swap_envelopes().is_empty()
+    }
+
     /// The signed deposit send of a BaseToAlpaca `Bridged`, if there is one.
     pub fn prepared_deposit_send(&self) -> Option<&PreparedTransaction> {
         match self {

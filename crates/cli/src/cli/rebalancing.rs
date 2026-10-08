@@ -1578,9 +1578,9 @@ pub(super) async fn reconcile_usdc_transfer_command<Writer: Write>(
         anyhow::bail!(
             "transfer reconcile: transfer {id} is in state {state:?}, not a terminal \
              failure that strands the in-progress guard or off-venue funds (DepositFailed, \
-             post-burn BridgingFailed, AlpacaToBase BridgingFailed, or a BaseToAlpaca \
-             ConversionFailed), nor a Base->Alpaca Bridged with a signed deposit send. \
-             Refusing to act."
+             post-burn BridgingFailed, AlpacaToBase BridgingFailed, a BaseToAlpaca \
+             ConversionFailed, or a held Relay swap), nor a Base->Alpaca Bridged with a \
+             signed deposit send. Refusing to act."
         );
     }
 
@@ -1617,6 +1617,14 @@ pub(super) async fn reconcile_usdc_transfer_command<Writer: Write>(
              clear on the next sweep tick (within transfer_timeout). Restart the bot to \
              release the signed deposit send's nonce: until then later sends from the \
              Ethereum wallet wait behind it."
+        )?;
+    } else if state.has_signed_swap_envelopes() {
+        writeln!(
+            stdout,
+            "Reconciled USDC transfer {id} (reason: {reason:?}); the in-progress guard will \
+             clear on the next sweep tick (within transfer_timeout). Restart the bot to release \
+             the nonces of the signed Relay envelopes: until then, if one never mined, later \
+             sends from the wallet that signed it wait behind it."
         )?;
     } else {
         writeln!(
@@ -3509,8 +3517,9 @@ mod tests {
             err_msg.ends_with(
                 ", not a terminal failure that strands the in-progress guard or \
                  off-venue funds (DepositFailed, post-burn BridgingFailed, \
-                 AlpacaToBase BridgingFailed, or a BaseToAlpaca ConversionFailed), nor \
-                 a Base->Alpaca Bridged with a signed deposit send. Refusing to act."
+                 AlpacaToBase BridgingFailed, a BaseToAlpaca ConversionFailed, or a held \
+                 Relay swap), nor a Base->Alpaca Bridged with a signed deposit send. \
+                 Refusing to act."
             ),
             "reconcile of an in-progress aggregate must refuse with the exact \
              contract text; got: {err_msg}"

@@ -2468,9 +2468,9 @@ async fn reconcile_stuck_usdc_transfer(
                 error: format!(
                     "Transfer {id} is in {}, not a reconcilable terminal failure \
                      (DepositFailed, post-burn BridgingFailed, a BaseToAlpaca \
-                     ConversionFailed, or an AlpacaToBase BridgingFailed) nor a \
-                     BaseToAlpaca Bridged with a signed deposit send; refusing \
-                     to reconcile.",
+                     ConversionFailed, an AlpacaToBase BridgingFailed, or a held Relay \
+                     swap) nor a BaseToAlpaca Bridged with a signed deposit send; \
+                     refusing to reconcile.",
                     rebalance.state_name()
                 ),
             }),
