@@ -384,7 +384,7 @@ pub(crate) async fn alert_dead_letter(
         return;
     }
     if reason == DeadLetterReason::ResidualAfterClose {
-        error!(target: "operational_alert", alert = true, %symbol, message,
+        error!(target: "operational_alert", alert = true, %symbol, detail = message,
             "Residual exposure remains after the latched close; reconciliation continues");
     }
 

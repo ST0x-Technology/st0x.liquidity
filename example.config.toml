@@ -7,7 +7,8 @@ log_level = "debug"
 # log_dir = "/mnt/data/logs"
 # file_log_level = "info"
 # Console log output format: "text" (human readable, the default) or "json"
-# (one JSON object per line, for log shippers reading journald).
+# (one flattened JSON object per line, for log shippers that parse it: the
+# text is at "message" and each event field is a top-level key).
 log_format = "text"
 # Log query link printed by CLI transfer commands, with "{id}" substituted.
 # Author it together with the log shipper config that stamps the labels the
