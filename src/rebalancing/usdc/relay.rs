@@ -5745,6 +5745,68 @@ mod tests {
         ));
     }
 
+    /// A payment Relay names that the chain contradicts (here a fill below
+    /// the quote's floor) is not taken for no payment on recheck: it pages
+    /// and the recheck fails with the unverified payment, changing nothing.
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn recheck_of_a_payment_that_does_not_prove_pages_and_fails() {
+        let rig = RelayRig::deploy().await;
+        let short_fill = rig
+            .fill_on_hub(U256::from(AMOUNT_IN - 1), B256::repeat_byte(0x0d))
+            .await;
+        let server = MockServer::start();
+        let relay_api = MockServer::start();
+        mock_status(
+            &relay_api,
+            json!({"status": "success", "inTxHashes": [], "txHashes": [short_fill]}),
+        );
+        let store = Arc::new(test_store(setup_test_db().await, ()));
+        let transfer = rig
+            .transfer(&server, &relay_api, store.clone(), relay_bounds())
+            .await;
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        record_deposited(&store, &id).await;
+        store
+            .send(
+                &id,
+                UsdcRebalanceCommand::FailSwap {
+                    reason: "Relay reported Failure".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let error =
+            tokio::time::timeout(Duration::from_secs(60), transfer.recheck_deposit(&id, None))
+                .await
+                .expect("the recheck ends")
+                .unwrap_err();
+
+        assert!(
+            matches!(
+                &error,
+                UsdcRecheckError::Transfer(transfer)
+                    if matches!(**transfer, UsdcTransferError::SwapPaymentUnverified { .. })
+            ),
+            "got {error:?}"
+        );
+        assert_eq!(
+            store.load(&id).await.unwrap().unwrap().state_name(),
+            "SwapFailed"
+        );
+        logs_assert(|lines: &[&str]| {
+            lines
+                .iter()
+                .any(|line| {
+                    line.contains("operational_alert")
+                        && line.contains("The Relay payment does not prove on chain")
+                })
+                .then_some(())
+                .ok_or_else(|| "no operational alert for the unproven payment".to_string())
+        });
+    }
+
     /// `transfer recheck` of a failed order Relay still reports unpaid
     /// changes nothing; it refuses an operator deposit tx and a Relay state
     /// that is not a held escrow.
