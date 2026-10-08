@@ -1,0 +1,17 @@
+# HELP liq_bot_info Always 1; git_commit is the first 12 characters of the running build
+# TYPE liq_bot_info gauge
+liq_bot_info{git_commit="0123456789ab"} 1
+# TYPE liq_bot_start_timestamp_seconds gauge
+liq_bot_start_timestamp_seconds 1700000000.0
+# TYPE liq_settings_equity_target gauge
+liq_settings_equity_target 0.5
+# TYPE liq_settings_usdc_target gauge
+liq_settings_usdc_target 0.45
+# TYPE liq_settings_cash_reserved gauge
+liq_settings_cash_reserved 1000
+# TYPE liq_asset_rebalancing gauge
+liq_asset_rebalancing{symbol="AAPL"} 1
+# TYPE liq_collector_last_success_ts_seconds gauge
+liq_collector_last_success_ts_seconds{collector="settings"} 1700000100
+# TYPE hedge_trades_total counter
+hedge_trades_total{direction="buy",symbol="AAPL"} 3

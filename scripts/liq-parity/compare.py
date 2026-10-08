@@ -1,0 +1,349 @@
+#!/usr/bin/env python3
+"""Compares the bot's liq_* series with the exporter sidecar's.
+
+    python3 scripts/liq-parity/compare.py [--drop-list] [--known-diffs] \\
+        BOT.prom EXPORTER.prom [BOT.prom EXPORTER.prom ...]
+
+Each pair is one snapshot of both /metrics bodies taken within the same
+second. With several pairs (for example three, two minutes apart) only
+findings present in every pair are reported: the bot publishes on events and
+the exporter polls, so a one-off difference is timing, not a defect.
+
+Findings, per series `(name, sorted labels)`:
+
+  missing from bot  the exporter has it and its name is ported
+  extra in bot      the bot has it and neither side should
+  value differs     both have it and the values differ by more than 1e-9
+                    relative
+
+and, per name both sides publish:
+
+  type differs      the `# TYPE` lines disagree; a name without one is
+                    untyped
+
+Exporter names not ported yet are listed once and are not findings. Lines
+that are not liq_* (the bot recorder's own metrics) are ignored.
+
+--drop-list removes the names nobody reads, which the bot never ports.
+--known-diffs applies the documented differences below, including
+KNOWN_TYPE_DIFF: the bot types every liq_* name as a gauge and the exporter
+writes no `# TYPE` lines, so bot gauge against exporter untyped is expected.
+Any other type difference (for example a bot counter) is still a finding.
+
+A finding is identified by its series alone, not by its kind or the values
+it prints, so a series that disagrees in every pair is reported even when
+its values move or its kind changes (for example missing in one pair and a
+different value in the next). The report shows the last pair's message.
+
+Exit status: 0 with no findings, 1 with findings, 2 when a snapshot is not
+UTF-8 Prometheus text or holds none of the ported liq_* series (a wrong
+file, an empty body, an HTML or JSON error page, or a degraded target that
+only reports liq_up).
+
+
+Items that port more names extend PORTED, BOT_ONLY and KNOWN_DIFFS.
+"""
+
+import argparse
+import math
+import re
+import sys
+
+# Exporter names the bot publishes with the same labels and meaning.
+PORTED = {
+    "liq_bot_info",
+    "liq_bot_start_timestamp_seconds",
+    "liq_settings_info",
+    "liq_settings_equity_target",
+    "liq_settings_equity_deviation",
+    "liq_settings_usdc_target",
+    "liq_settings_usdc_deviation",
+    "liq_settings_cash_reserved",
+    "liq_settings_execution_threshold_usd",
+    "liq_settings_order_polling_seconds",
+    "liq_settings_inventory_poll_seconds",
+    "liq_settings_deployment_block",
+    "liq_asset_counter_trading",
+    "liq_asset_extended_hours",
+    "liq_asset_rebalancing",
+}
+
+# Names only the bot publishes.
+BOT_ONLY = {
+    "liq_collector_last_success_ts_seconds",
+}
+
+# Exporter names that are not ported, because nothing reads them or the bot
+# has a native replacement.
+DROP_LIST = {
+    "liq_up",
+    "liq_exporter_last_success_ts_seconds",
+    "liq_exporter_collect_seconds",
+    "liq_asset_flags",
+    "liq_asset_operational_limit",
+    "liq_position_net",
+    "liq_equity_onchain_inflight",
+    "liq_equity_offchain_inflight",
+    "liq_usdc_withdrawable",
+    "liq_hedge_cycles_24h",
+    "liq_hedge_fill_count_24h",
+    "liq_failure_event_last_ts_seconds",
+    "liq_job_queue_oldest_pending_ts_seconds",
+    "liq_rebalance_operations",
+    "liq_rebalance_skipped",
+    "liq_poll_duration_ms_samples",
+    "liq_dependency_latency_ms_samples",
+    "liq_rebalance_stage_ms_samples",
+    "liq_raindex_order_vault_balance",
+    "liq_raindex_order_io_ratio",
+    "liq_raindex_order_created_ts_seconds",
+}
+
+# Documented differences. ("absolute", tolerance): values may differ by up to
+# the tolerance. "values": keys are compared, values are not. "ignore": the
+# name is not compared at all. The item that ports a name adds its entry, with
+# the evidence for it.
+KNOWN_DIFFS = {
+    # The exporter derives the start from integer uptime at poll time.
+    "liq_bot_start_timestamp_seconds": ("absolute", 2.0),
+    # The endpoint the exporter reads truncates at 50,000 entries and counts
+    # an exact window; the bot counts every entry in one-minute buckets.
+    "liq_reliability_log_count_24h": "values",
+    "liq_log_target_count_24h": "values",
+}
+
+# (bot type, exporter type) that --known-diffs accepts for every name. The
+# bot publishes every liq_* name as a gauge; the exporter is untyped.
+KNOWN_TYPE_DIFF = ("gauge", "untyped")
+
+RELATIVE_TOLERANCE = 1e-9
+
+# The Prometheus text format, one sample line at a time. A line that does not
+# match the whole grammar makes the snapshot unusable rather than being read
+# loosely.
+_LABEL = r'[A-Za-z_][A-Za-z0-9_]*\s*=\s*"(?:[^"\\\n]|\\[\\"n])*"'
+_LABEL_PAIR = re.compile(r'([A-Za-z_][A-Za-z0-9_]*)\s*=\s*"((?:[^"\\\n]|\\[\\"n])*)"')
+# A decimal float, Inf, Infinity, or NaN (any case, as Go reads them). Python's float() also takes forms such as
+# `1_0` that Prometheus rejects, so the token is checked before conversion.
+_VALUE = (r"[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?"
+          r"|[+-]?(?i:inf(?:inity)?)|(?i:nan)")
+_SAMPLE_LINE = re.compile(
+    r"(?P<name>[A-Za-z_:][A-Za-z0-9_:]*)"
+    r"(?:\{\s*(?:(?P<labels>" + _LABEL + r"(?:\s*,\s*" + _LABEL + r")*)\s*,?\s*)?\})?"
+    r"\s+(?P<value>" + _VALUE + r")"
+    r"(?:\s+(?P<timestamp>-?[0-9]+))?"
+)
+_UNESCAPE = {"\\\\": "\\", '\\"': '"', "\\n": "\n"}
+# Like Prometheus, blanks after the `#` are optional: `#TYPE` is a TYPE line.
+_TYPE_LINE = re.compile(r"#[ \t]*TYPE(?:[ \t]+(?P<rest>.*))?")
+_TYPE_BODY = re.compile(
+    r"(?P<name>[A-Za-z_:][A-Za-z0-9_:]*)[ \t]+"
+    r"(?P<type>counter|gauge|histogram|summary|untyped)[ \t]*")
+
+
+def parse_exposition(text):
+    """`(name, sorted label tuple) -> value` for every sample line."""
+    if text and not text.endswith("\n"):
+        raise ValueError("no line feed after the last line")
+    series = {}
+    # Only LF ends a line. splitlines() would also split on characters such as
+    # U+2028, which HELP text and label values may hold.
+    for raw in text.split("\n"):
+        line = raw.strip(" \t")
+        if not line or line.startswith("#"):
+            continue
+        match = _SAMPLE_LINE.fullmatch(line)
+        if match is None:
+            raise ValueError(f"not a sample line: {raw!r}")
+        labels = [(key, re.sub(r"\\[\\\"n]", lambda m: _UNESCAPE[m.group()], value))
+                  for key, value in _LABEL_PAIR.findall(match.group("labels") or "")]
+        if len({label for label, _ in labels}) != len(labels):
+            raise ValueError(f"repeated label name: {raw!r}")
+        key = (match.group("name"), tuple(sorted(labels)))
+        if key in series:
+            raise ValueError(f"repeated series: {raw!r}")
+        series[key] = float(match.group("value"))
+    return series
+
+
+def parse_types(text):
+    """`name -> type` for every `# TYPE` line. Other comments are ignored.
+    Like Prometheus, a TYPE line must come before the first sample of its
+    name."""
+    types = {}
+    sampled = set()
+    for raw in text.split("\n"):
+        line = raw.strip(" \t")
+        match = _TYPE_LINE.fullmatch(line)
+        if match is None:
+            sample = _SAMPLE_LINE.fullmatch(line)
+            if sample is not None:
+                sampled.add(sample.group("name"))
+            continue
+        body = _TYPE_BODY.fullmatch(match.group("rest") or "")
+        if body is None:
+            raise ValueError(f"not a TYPE line: {raw!r}")
+        if body.group("name") in types:
+            raise ValueError(f"repeated TYPE: {raw!r}")
+        if body.group("name") in sampled:
+            raise ValueError(f"TYPE after a sample: {raw!r}")
+        types[body.group("name")] = body.group("type")
+    return types
+
+
+def escape_label_value(value):
+    """Prometheus text escaping, so a finding stays on one line."""
+    return value.replace("\\", "\\\\").replace('"', '\\"').replace("\n", "\\n")
+
+
+def format_series(key):
+    name, labels = key
+    if not labels:
+        return name
+    rendered = ",".join(f'{label}="{escape_label_value(value)}"' for label, value in labels)
+    return f"{name}{{{rendered}}}"
+
+
+def values_differ(bot, exporter, rule):
+    if rule == "values":
+        return False
+    if math.isnan(bot) or math.isnan(exporter):
+        return not (math.isnan(bot) and math.isnan(exporter))
+    if isinstance(rule, tuple):
+        return abs(bot - exporter) > rule[1]
+    return not math.isclose(bot, exporter, rel_tol=RELATIVE_TOLERANCE)
+
+
+def type_findings(bot_text, exporter_text, dropped, known_diffs):
+    """`{(name, "# TYPE"): message}` for each liq_* name both sides publish
+    whose types differ. A KNOWN_DIFFS rule only skips values, so a name it
+    ignores still has its type compared. A string never equals a label tuple,
+    so the key cannot collide with a series."""
+    def names(text):
+        return {name for name, _ in parse_exposition(text)
+                if name.startswith("liq_") and name not in dropped}
+
+    bot_types = parse_types(bot_text)
+    exporter_types = parse_types(exporter_text)
+    findings = {}
+    for name in names(bot_text) & names(exporter_text):
+        types = (bot_types.get(name, "untyped"), exporter_types.get(name, "untyped"))
+        if types[0] != types[1] and not (known_diffs and types == KNOWN_TYPE_DIFF):
+            findings[(name, "# TYPE")] = (
+                f"type differs: {name} bot={types[0]} exporter={types[1]}")
+    return findings
+
+
+def compare_pair(bot_text, exporter_text, drop_list, known_diffs):
+    """Returns ({series: message}, not_ported_names) for one pair."""
+    known = KNOWN_DIFFS if known_diffs else {}
+    dropped = DROP_LIST if drop_list else set()
+
+    def compared(key):
+        name = key[0]
+        return (name.startswith("liq_") and name not in dropped
+                and known.get(name) != "ignore")
+
+    bot = {key: value for key, value in parse_exposition(bot_text).items()
+           if compared(key)}
+    exporter = {key: value for key, value in parse_exposition(exporter_text).items()
+                if compared(key)}
+
+    published = {name for name, _ in bot}
+    not_ported = {name for name, _ in exporter
+                  if name not in PORTED and name not in published}
+    exporter = {key: value for key, value in exporter.items()
+                if key[0] not in not_ported}
+
+    findings = type_findings(bot_text, exporter_text, dropped, known_diffs)
+    for key in exporter.keys() - bot.keys():
+        findings[key] = f"missing from bot: {format_series(key)}"
+    for key in bot.keys() - exporter.keys():
+        if key[0] not in BOT_ONLY:
+            findings[key] = f"extra in bot: {format_series(key)}"
+    for key in bot.keys() & exporter.keys():
+        if values_differ(bot[key], exporter[key], known.get(key[0])):
+            findings[key] = (
+                f"value differs: {format_series(key)} "
+                f"bot={bot[key]!r} exporter={exporter[key]!r}")
+    return findings, not_ported
+
+
+def compare(pairs, drop_list, known_diffs):
+    """Findings present in every pair, and the union of unported names."""
+    persistent = None
+    latest = {}
+    not_ported = set()
+    for bot_text, exporter_text in pairs:
+        findings, unported = compare_pair(bot_text, exporter_text, drop_list, known_diffs)
+        series = findings.keys()
+        persistent = set(series) if persistent is None else persistent & series
+        latest = findings
+        not_ported |= unported
+    return sorted(latest[identity] for identity in persistent or ()), sorted(not_ported)
+
+
+def unusable_snapshots(paths, texts):
+    """`path: reason` for each body that is not UTF-8, does not parse, or has
+    no liq_* sample. An undecodable body is passed as None."""
+    unusable = []
+    for path, text in zip(paths, texts):
+        if text is None:
+            unusable.append(f"{path}: not UTF-8 text")
+            continue
+        try:
+            series = parse_exposition(text)
+            parse_types(text)
+        except ValueError as error:
+            message = str(error)
+            reason = message.split(":", 1)[0] if message.startswith("repeated") \
+                else "not a Prometheus text body"
+            unusable.append(f"{path}: {reason}")
+            continue
+        if not any(name in PORTED for name, _ in series):
+            unusable.append(f"{path}: no ported liq_* series")
+    return unusable
+
+
+def report(pairs, findings, not_ported):
+    lines = [f"compared {pairs} snapshot pair(s); findings present in every pair:"]
+    lines += findings or ["none"]
+    if not_ported:
+        lines.append("not yet ported (exporter-only names, ignored): "
+                     + ", ".join(not_ported))
+    lines.append(f"{len(findings)} finding(s)")
+    return "\n".join(lines) + "\n"
+
+
+def main(argv):
+    parser = argparse.ArgumentParser(description=__doc__.split("\n", 1)[0])
+    parser.add_argument("--drop-list", action="store_true",
+                        help="skip exporter names the bot never ports")
+    parser.add_argument("--known-diffs", action="store_true",
+                        help="apply the documented differences")
+    parser.add_argument("files", nargs="+", metavar="BOT.prom EXPORTER.prom")
+    args = parser.parse_args(argv)
+    if len(args.files) % 2:
+        parser.error("files come in BOT.prom EXPORTER.prom pairs")
+
+    texts = []
+    for path in args.files:
+        with open(path, "rb") as f:
+            body = f.read()
+        try:
+            texts.append(body.decode("utf-8"))
+        except UnicodeDecodeError:
+            texts.append(None)
+    unusable = unusable_snapshots(args.files, texts)
+    if unusable:
+        sys.stderr.write("unusable snapshot(s):\n" + "".join(f"  {line}\n" for line in unusable))
+        return 2
+    pairs = list(zip(texts[::2], texts[1::2]))
+
+    findings, not_ported = compare(pairs, args.drop_list, args.known_diffs)
+    sys.stdout.write(report(len(pairs), findings, not_ported))
+    return 1 if findings else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

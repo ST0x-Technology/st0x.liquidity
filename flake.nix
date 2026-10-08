@@ -426,6 +426,7 @@
                     cargo clippy --workspace --all-targets --all-features
                     cargo fmt -- --check
                     python3 observability/gen-t0-liquidity.py --check
+                    python3 scripts/liq-parity/test_compare.py
                   '
 
                   nix develop .#ci-audit -c bash -c './scripts/test-rust-audit.sh && ./scripts/audit-rust.sh'
@@ -850,7 +851,7 @@
             # deploy scripts. abiEnv is needed because build.rs / sol! macros
             # consume ST0X_*_ABI at compile time. foundry is required because
             # tests spawn anvil for local EVM simulation. python3 runs the
-            # board generator check.
+            # board generator check and the liq-parity script tests.
             ci-backend = pkgs.mkShell (
               {
                 buildInputs =
