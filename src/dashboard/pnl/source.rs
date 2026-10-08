@@ -11,10 +11,13 @@ use rain_math_float::Float;
 use sqlx::{QueryBuilder, Sqlite, SqlitePool};
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::task;
+use tracing::warn;
 
-use st0x_execution::alpaca_broker_api::AccountActivity;
+use st0x_execution::alpaca_broker_api::{AccountActivitiesQuery, AccountActivity};
+use st0x_execution::{AlpacaBrokerApiCtx, AlpacaBrokerApiError};
 use st0x_float_serde::format_float;
 
 use crate::portfolio_snapshot::{
@@ -23,7 +26,8 @@ use crate::portfolio_snapshot::{
 
 use super::builder::build_pnl_response_from_rows;
 use super::ledger::{
-    CCTP_FEE_SOURCE, DIRECTION_BUY_TEXT, DIRECTION_SELL_TEXT, LedgerHead, TOKENIZATION_FEE_SOURCE,
+    CCTP_FEE_SOURCE, DIRECTION_BUY_TEXT, DIRECTION_SELL_TEXT, LedgerHead, PnlLedger,
+    TOKENIZATION_FEE_SOURCE,
 };
 use super::query::{PnlError, PnlQuery};
 use super::response::{PnlCapitalSummary, PnlResponse};
@@ -43,7 +47,13 @@ pub(crate) struct PnlReportAdmission(Arc<Semaphore>);
 
 impl PnlReportAdmission {
     fn new() -> Self {
-        Self(Arc::new(Semaphore::new(MAX_CONCURRENT_PNL_REPORTS)))
+        Self::with_permits(MAX_CONCURRENT_PNL_REPORTS)
+    }
+
+    /// An admission of its own, so a caller that is not a live `/pnl`
+    /// request never takes one of the live request permits.
+    pub(crate) fn with_permits(permits: usize) -> Self {
+        Self(Arc::new(Semaphore::new(permits)))
     }
 
     fn try_acquire(&self) -> Result<OwnedSemaphorePermit, tokio::sync::TryAcquireError> {
@@ -85,6 +95,70 @@ where
     run_pnl_replay_with_permit(permit, replay)
         .await
         .map(|(result, _permit)| result)
+}
+
+/// Deadline for bringing the PnL ledger current before one report.
+/// Catch-up work is proportional to the un-ingested backlog, not to the
+/// request, and concurrent callers serialize on the ledger's internal mutex
+/// before any admission control -- so past this deadline the report sheds
+/// instead of queueing behind ingestion. The boot-path catch-up stays
+/// unbounded: first-deploy backfill may legitimately exceed any request
+/// deadline. Cancellation is safe because each ingest batch commits its rows
+/// and checkpoint atomically; an elapsed deadline only rolls back the
+/// in-flight batch.
+pub(crate) const PNL_CATCH_UP_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// What one report reads besides the query.
+pub(crate) struct PnlReportDeps<'a> {
+    pub(crate) pool: &'a SqlitePool,
+    pub(crate) ledger: &'a PnlLedger,
+    pub(crate) broker: &'a AlpacaBrokerApiCtx,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum PnlReportError {
+    #[error(transparent)]
+    Report(#[from] PnlError),
+    #[error("PnL ledger catch-up exceeded its {:?} deadline", PNL_CATCH_UP_TIMEOUT)]
+    CatchUpTimeout,
+    #[error("failed to fetch Alpaca account activities")]
+    Activities(#[source] Box<AlpacaBrokerApiError>),
+}
+
+/// One PnL report, the way `GET /pnl` builds it: validate the query, bring
+/// the ledger current within [`PNL_CATCH_UP_TIMEOUT`], check `asOfRowid`
+/// against the head, take a permit from `admission`, fetch the Alpaca
+/// activities for the window and replay. Every caller runs its own catch-up,
+/// so each report sees the events ingested before it.
+pub(crate) async fn run_pnl_report(
+    deps: &PnlReportDeps<'_>,
+    query: &PnlQuery,
+    admission: &PnlReportAdmission,
+) -> Result<PnlResponse, PnlReportError> {
+    let after = query.activity_after()?;
+    let until = query.activity_until()?;
+    query.symbol_filter(&mut Vec::new())?;
+
+    let head = tokio::time::timeout(PNL_CATCH_UP_TIMEOUT, deps.ledger.catch_up())
+        .await
+        .map_err(|_elapsed| {
+            warn!("PnL ledger catch-up exceeded its deadline");
+            PnlReportError::CatchUpTimeout
+        })?
+        .map_err(PnlError::Ledger)?;
+    validate_pnl_snapshot_rowid(head, query)?;
+    let permit = acquire_pnl_report_permit(admission)?;
+
+    let activities = deps
+        .broker
+        .fetch_account_activities(&AccountActivitiesQuery::pnl(after, until))
+        .await
+        .map_err(|error| PnlReportError::Activities(Box::new(error)))?;
+
+    Ok(
+        build_pnl_report_with_permit(deps.pool, query, activities, Utc::now(), permit, head)
+            .await?,
+    )
 }
 
 #[cfg(test)]
