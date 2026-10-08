@@ -1500,8 +1500,9 @@ pub enum PreBurnFailEligibility {
     /// A CCTP burn may already be on-chain; failing would strand the funds.
     PostBurn,
     /// A chain-to-Alpaca Relay transfer past its vault withdrawal: the stable
-    /// is outside the vault, in the chain wallet or with Relay. `FailBridging`
-    /// and the post-burn steps refuse it; resuming it or a redeposit settles it.
+    /// is outside the vault, in the chain wallet, with Relay or on its way
+    /// back. `FailBridging` and the post-burn steps refuse it; resuming it, a
+    /// redeposit or `transfer reconcile` settles it.
     RelayHeldOutsideVault,
     /// Before the bridge boundary; `FailBridging` does not apply here.
     NotAtBridgeBoundary,
@@ -1752,7 +1753,7 @@ impl UsdcRebalance {
         match self {
             // A chain-to-Alpaca Relay withdrawal left the stable outside
             // the vault, and `FailBridging` refuses it and every swap state:
-            // only the swap or a redeposit settles it.
+            // only the swap, a redeposit or `transfer reconcile` settles it.
             Self::WithdrawalComplete {
                 direction: RebalanceDirection::BaseToAlpaca,
                 corridor:
@@ -1771,6 +1772,22 @@ impl UsdcRebalance {
                 ..
             }
             | Self::SwapDeposited {
+                direction: RebalanceDirection::BaseToAlpaca,
+                ..
+            }
+            | Self::SwapRefunded {
+                direction: RebalanceDirection::BaseToAlpaca,
+                ..
+            }
+            | Self::SwapEscrowUnresolved {
+                direction: RebalanceDirection::BaseToAlpaca,
+                ..
+            }
+            | Self::SwapFailed {
+                direction: RebalanceDirection::BaseToAlpaca,
+                ..
+            }
+            | Self::Redepositing {
                 direction: RebalanceDirection::BaseToAlpaca,
                 ..
             } => PreBurnFailEligibility::RelayHeldOutsideVault,
@@ -7531,7 +7548,7 @@ mod tests {
             assert_eq!(state.ethereum_wallet_credit(), credit, "{state:?}");
             assert_eq!(
                 state.pre_burn_fail_eligibility(),
-                PreBurnFailEligibility::PostBurn,
+                PreBurnFailEligibility::RelayHeldOutsideVault,
                 "{state:?}"
             );
         }

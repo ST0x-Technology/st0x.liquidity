@@ -102,8 +102,9 @@ use crate::unwrapped_equity_recovery::{
     UnwrappedEquityRecoveryJob, UnwrappedEquityRecoveryJobQueue,
 };
 use crate::usdc_rebalance::{
-    CooldownFailure, InterruptedUsdcRebalances, RebalanceDirection, UsdcRebalance,
-    UsdcRebalanceEvent, UsdcRebalanceId, any_rebalance_holds_guard, interrupted_usdc_rebalance_ids,
+    CooldownFailure, InterruptedUsdcRebalances, PreBurnFailEligibility, RebalanceDirection,
+    UsdcRebalance, UsdcRebalanceEvent, UsdcRebalanceId, any_rebalance_holds_guard,
+    interrupted_usdc_rebalance_ids,
 };
 use crate::vault_registry::{VaultRegistry, VaultRegistryId};
 use crate::wrapped_equity_recovery::aggregate::WrappedEquityRecoveryId;
@@ -1157,9 +1158,10 @@ enum UsdcTimeoutCleanup {
         direction: RebalanceDirection,
     },
     /// A chain-to-Alpaca Relay transfer stopped after its withdrawal, at
-    /// `WithdrawalComplete` or a swap state: the withdrawn stable is outside
-    /// the vault, in the chain wallet or with Relay, and only the swap or a
-    /// redeposit (not built yet) settles it, so the guard stays held.
+    /// `WithdrawalComplete` or a swap state that holds the guard: the
+    /// withdrawn stable is outside the vault, in the chain wallet, with Relay
+    /// or on its way back, and only the swap, a redeposit or
+    /// `transfer reconcile` settles it, so the guard stays held.
     HeldOutsideVault {
         tracking: usdc::UsdcRebalanceTracking,
         elapsed: Duration,
@@ -2715,7 +2717,7 @@ impl RebalancingService {
             "USDC transfer {id} on the {} corridor timed out at {state}: the vault withdrawal \
              moved the stable out of the vault, to the chain wallet or to Relay. Guard held. \
              Elapsed: {elapsed:?}. Resume it with resume-usdc; it is not failed or released \
-             until the swap or a redeposit settles the stable.",
+             until the swap, a redeposit or reconcile-usdc settles the stable.",
             tracking.corridor,
         );
 
@@ -3554,30 +3556,12 @@ impl RebalancingService {
                     }));
                 }
                 // Tracking can lag the store, so every chain-to-Alpaca Relay
-                // state after the withdrawal holds: a deposit may be on chain.
-                Ok(Some(
-                    state @ (UsdcRebalance::WithdrawalComplete {
-                        direction: RebalanceDirection::BaseToAlpaca,
-                        corridor:
-                            UsdcCorridor::HubRouted {
-                                hop: HopKind::Relay,
-                                ..
-                            },
-                        ..
-                    }
-                    | UsdcRebalance::SwapQuoted {
-                        direction: RebalanceDirection::BaseToAlpaca,
-                        ..
-                    }
-                    | UsdcRebalance::SwapDepositPrepared {
-                        direction: RebalanceDirection::BaseToAlpaca,
-                        ..
-                    }
-                    | UsdcRebalance::SwapDeposited {
-                        direction: RebalanceDirection::BaseToAlpaca,
-                        ..
-                    }),
-                )) => {
+                // state after the withdrawal that `fail-usdc-transfer` refuses
+                // with the Relay hold holds here too: a deposit may be on chain.
+                Ok(Some(state))
+                    if state.pre_burn_fail_eligibility()
+                        == PreBurnFailEligibility::RelayHeldOutsideVault =>
+                {
                     drop(tracking_guard);
                     return Ok(Some(UsdcTimeoutCleanup::HeldOutsideVault {
                         tracking,

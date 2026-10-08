@@ -1318,8 +1318,9 @@ pub(super) async fn fail_usdc_transfer_command<Writer: Write>(
                 "fail-usdc-transfer: transfer {id} is a Relay transfer in {state:?}: the vault \
                  withdrawal moved the stable outside the vault, to the chain wallet or to \
                  Relay, and no failure path settles it. Refusing to act -- resume it with \
-                 `transfer resume` to finish the swap; only a redeposit returns the stable to \
-                 the vault."
+                 `transfer resume` to finish the swap or the redeposit, or settle a failed swap \
+                 or a refund paid at the other end with `transfer reconcile`; only a redeposit \
+                 returns the stable to the vault."
             );
         }
         // Already the pre-burn failed terminal, so there is nothing to fail
