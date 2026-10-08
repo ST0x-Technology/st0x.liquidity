@@ -277,11 +277,34 @@ its `pnl_<window>` collector time stops advancing.
    compares samples only. Extend `PORTED` and, where needed, `KNOWN_DIFFS` in
    `scripts/liq-parity/compare.py`.
 
-### Board pins
+### Board source
 
-Until consumers move to the bot, every `liq_` selector on the liquidity boards
-reads `job="t0-liquidity-exporter"`. `observability/gen-t0-liquidity.py` adds
-the matcher and fails if any `liq_` selector is left unpinned.
+Both the exporter sidecar and the bot serve `liq_*`, so a selector without a job
+would add the two together. The liquidity boards have a `Source` variable,
+`$source`, and every `liq_` selector on them reads `job=~"$source"`:
+
+| Source               | Job matcher                          |
+| -------------------- | ------------------------------------ |
+| `exporter` (default) | `t0-liquidity-exporter`              |
+| `bot`                | `t0-liquidity\|t0-liquidity-staging` |
+
+The bot's job is `t0-liquidity` in production and `t0-liquidity-staging` in
+staging. `$env` already picks the project, so one regex covers both. PromQL
+anchors a regex matcher, so `bot` never matches the exporter job.
+
+The bot never emits `liq_up`, so the header's Bot pill reads the exporter's
+`liq_up` on the exporter source and the bot scrape's own `up` on the bot source:
+`max(liq_up{job=~"$source"}) or max(up{job=~"$source",job!="t0-liquidity-exporter"})`.
+A stopped bot shows red on either source. A stopped exporter shows no data, not
+red, because the exporter's own `up` says nothing about the bot.
+
+Pick `bot` to compare the two side by side. Stage 4 of the migration flips the
+default to `bot` in `SOURCE_VAR`, a one-line change; a later stage removes the
+variable with the exporter. The log tables (Trades, Rebalances, Logs) read the
+exporter's log names on either source until the bot writes its own.
+
+`observability/gen-t0-liquidity.py` adds the matcher and fails if any `liq_`
+selector is left without exactly `job=~"$source"`.
 `python3 observability/gen-t0-liquidity.py --check` (run in CI) fails when the
 committed board JSON differs from the generator output.
 
