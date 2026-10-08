@@ -28,6 +28,7 @@ use tracing::{debug, error, warn};
 use st0x_float_serde::format_float;
 
 pub(crate) mod inventory;
+pub(crate) mod log_counts;
 pub(crate) mod performance;
 pub(crate) mod prices;
 pub(crate) mod refresh;
@@ -88,6 +89,8 @@ pub(crate) enum LiqMetric {
     HedgeLatencyMsSamples,
     OpenExposureFillCount,
     OpenExposureOldestTsSeconds,
+    ReliabilityLogCount24h,
+    LogTargetCount24h,
     FailureEventCount24h,
     JobQueue,
     BlockLagBlocks,
@@ -108,7 +111,7 @@ impl LiqMetric {
     /// Every variant, for the catalog tests. A new variant needs an entry
     /// here and its name in the catalog test.
     #[cfg(test)]
-    pub(crate) const ALL: [Self; 61] = [
+    pub(crate) const ALL: [Self; 63] = [
         Self::BotInfo,
         Self::BotStartTimestampSeconds,
         Self::SettingsInfo,
@@ -156,6 +159,8 @@ impl LiqMetric {
         Self::HedgeLatencyMsSamples,
         Self::OpenExposureFillCount,
         Self::OpenExposureOldestTsSeconds,
+        Self::ReliabilityLogCount24h,
+        Self::LogTargetCount24h,
         Self::FailureEventCount24h,
         Self::JobQueue,
         Self::BlockLagBlocks,
@@ -221,6 +226,8 @@ impl LiqMetric {
             Self::HedgeLatencyMsSamples => "liq_hedge_latency_ms_samples",
             Self::OpenExposureFillCount => "liq_open_exposure_fill_count",
             Self::OpenExposureOldestTsSeconds => "liq_open_exposure_oldest_ts_seconds",
+            Self::ReliabilityLogCount24h => "liq_reliability_log_count_24h",
+            Self::LogTargetCount24h => "liq_log_target_count_24h",
             Self::FailureEventCount24h => "liq_failure_event_count_24h",
             Self::JobQueue => "liq_job_queue",
             Self::BlockLagBlocks => "liq_block_lag_blocks",
@@ -335,6 +342,14 @@ impl LiqMetric {
             Self::OpenExposureOldestTsSeconds => {
                 "Block time of the oldest fill not yet covered by a hedge"
             }
+            Self::ReliabilityLogCount24h => {
+                "Error and warning log events over the last 24 hours, by level (error, warning); \
+                 0 without file logging"
+            }
+            Self::LogTargetCount24h => {
+                "Error and warning log events over the last 24 hours, by target and level (ERROR, \
+                 WARN); only targets with events"
+            }
             Self::FailureEventCount24h => {
                 "Money-at-risk lifecycle failure events over the last 24 hours, by event type"
             }
@@ -418,6 +433,8 @@ impl LiqMetric {
             Self::HedgeLatencyMsSamples => &["stage"],
             Self::FailureEventCount24h => &["event_type"],
             Self::JobQueue => &["job_type", "state"],
+            Self::ReliabilityLogCount24h => &["level"],
+            Self::LogTargetCount24h => &["level", "target"],
             Self::PollDurationMs => &["chain", "quantile"],
             Self::DependencyCalls24h | Self::DependencyErrors24h => &["dependency", "operation"],
             Self::DependencyLatencyMs => &["dependency", "operation", "quantile"],
@@ -499,7 +516,10 @@ impl LiqMetric {
             | Self::HedgeLatencyMsSamples
             | Self::OpenExposureFillCount
             | Self::OpenExposureOldestTsSeconds => Some(LiqFamily::Latencies),
-            Self::FailureEventCount24h | Self::JobQueue => Some(LiqFamily::Reliability),
+            Self::ReliabilityLogCount24h
+            | Self::LogTargetCount24h
+            | Self::FailureEventCount24h
+            | Self::JobQueue => Some(LiqFamily::Reliability),
             Self::BlockLagBlocks
             | Self::BlockLagSampledTsSeconds
             | Self::PollCycles24h
@@ -1128,6 +1148,8 @@ pub(crate) mod tests {
                 "liq_hedge_latency_ms_samples",
                 "liq_open_exposure_fill_count",
                 "liq_open_exposure_oldest_ts_seconds",
+                "liq_reliability_log_count_24h",
+                "liq_log_target_count_24h",
                 "liq_failure_event_count_24h",
                 "liq_job_queue",
                 "liq_block_lag_blocks",

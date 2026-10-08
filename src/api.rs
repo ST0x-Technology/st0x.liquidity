@@ -471,12 +471,12 @@ async fn logs(State(state): State<AppState>, Query(query): Query<LogsQuery>) -> 
     })
 }
 
-struct LogFilter {
-    search_lower: Option<String>,
-    levels: Option<Vec<String>>,
-    targets: Option<Vec<String>>,
-    since: Option<DateTime<Utc>>,
-    until: Option<DateTime<Utc>>,
+pub(crate) struct LogFilter {
+    pub(crate) search_lower: Option<String>,
+    pub(crate) levels: Option<Vec<String>>,
+    pub(crate) targets: Option<Vec<String>>,
+    pub(crate) since: Option<DateTime<Utc>>,
+    pub(crate) until: Option<DateTime<Utc>>,
 }
 
 /// Reads log entries from `log_dir` in newest-first order, applying filters.
@@ -497,137 +497,25 @@ fn read_matching_entries(
     offset: usize,
     limit: usize,
 ) -> (Vec<serde_json::Value>, usize, bool) {
-    use std::io::BufRead;
-
-    let Ok(dir) = std::fs::read_dir(log_dir) else {
-        return (Vec::new(), 0, false);
-    };
-
-    let mut log_files: Vec<_> = dir
-        .filter_map(Result::ok)
-        .filter(|entry| {
-            entry
-                .file_name()
-                .to_str()
-                .is_some_and(|name| name.starts_with("st0x-hedge.log"))
-        })
-        .collect();
-
-    // Sort by name then reverse so newest files are read first.
-    log_files.sort_by_key(std::fs::DirEntry::file_name);
-    log_files.reverse();
-
-    // Pre-compute level filter strings for fast raw-line matching.
-    // JSON format: `"level":"INFO"` — we match this substring directly.
-    let level_needles: Option<Vec<String>> = filter.levels.as_ref().map(|levels| {
-        levels
-            .iter()
-            .map(|lvl| format!("\"level\":\"{lvl}\""))
-            .collect()
-    });
-
-    let target_needles: Option<Vec<String>> = filter.targets.as_ref().map(|targets| {
-        targets
-            .iter()
-            .map(|tgt| format!("\"target\":\"{tgt}\""))
-            .collect()
-    });
-
+    let needles = LineNeedles::new(filter);
     let page_end = offset + limit;
     let mut total: usize = 0;
     let mut page_entries: Vec<serde_json::Value> = Vec::new();
 
+    // The endpoint reads what it can: an unreadable directory, file or line
+    // leaves those entries out of the page.
+    let Ok((log_files, _)) = matching_log_files(log_dir, filter) else {
+        return (Vec::new(), 0, false);
+    };
+
     for file_entry in &log_files {
-        // Date-based file skipping: the date suffix (e.g. "2026-04-27")
-        // lets us skip entire files outside the time window.
-        if let Some(since) = filter.since
-            && let Some(file_date) = extract_log_file_date(file_entry)
-        {
-            let file_end_of_day = file_date
-                .and_hms_opt(23, 59, 59)
-                .map(|ndt| DateTime::<Utc>::from_naive_utc_and_offset(ndt, Utc));
-
-            if let Some(eod) = file_end_of_day
-                && eod < since
-            {
-                continue;
-            }
-        }
-
-        if let Some(until) = filter.until
-            && let Some(file_date) = extract_log_file_date(file_entry)
-        {
-            let file_start_of_day = file_date
-                .and_hms_opt(0, 0, 0)
-                .map(|ndt| DateTime::<Utc>::from_naive_utc_and_offset(ndt, Utc));
-
-            if let Some(sod) = file_start_of_day
-                && sod > until
-            {
-                continue;
-            }
-        }
-
-        let Ok(file) = std::fs::File::open(file_entry.path()) else {
-            continue;
-        };
-        let reader = std::io::BufReader::new(file);
-
-        // Read lines into a vec for this file so we can reverse (newest last
-        // in file -> newest first for display). We only collect lines that
-        // pass the cheap string-level filters.
+        // Collect this file's matches so they can be reversed: the newest
+        // entry is last in the file and first on the page.
         let mut file_matches: Vec<serde_json::Value> = Vec::new();
-
-        for line_result in reader.lines() {
-            let Ok(line) = line_result else {
-                continue;
-            };
-
-            // Fast string-level filtering BEFORE JSON parsing.
-            if let Some(needles) = &level_needles
-                && !needles.iter().any(|needle| line.contains(needle))
-            {
-                continue;
-            }
-
-            if let Some(needles) = &target_needles
-                && !needles.iter().any(|needle| line.contains(needle))
-            {
-                continue;
-            }
-
-            if let Some(query) = &filter.search_lower
-                && !line.to_lowercase().contains(query.as_str())
-            {
-                continue;
-            }
-
-            // Expensive: parse JSON only for lines that passed string filters.
-            let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) else {
-                continue;
-            };
-
-            // Time-range filter requires parsed timestamp.
-            if (filter.since.is_some() || filter.until.is_some())
-                && let Some(ts_str) = value["timestamp"].as_str()
-                && let Ok(ts) = DateTime::parse_from_rfc3339(ts_str)
-            {
-                let ts_utc = ts.with_timezone(&Utc);
-
-                if let Some(since) = filter.since
-                    && ts_utc < since
-                {
-                    continue;
-                }
-
-                if let Some(until) = filter.until
-                    && ts_utc > until
-                {
-                    continue;
-                }
-            }
-
+        if let Err(error) = visit_file_entries(&file_entry.path(), filter, &needles, |value| {
             file_matches.push(value);
+        }) {
+            debug!(%error, file = ?file_entry.path(), "Skipped unreadable log lines");
         }
 
         file_matches.reverse();
@@ -650,6 +538,204 @@ fn read_matching_entries(
     let has_more = total > page_end;
 
     (page_entries, total, has_more)
+}
+
+/// Calls `visit` with every entry in `log_dir` that passes `filter`, newest
+/// file first and in file order within a file, without holding them all.
+///
+/// A missing directory, a file removed after the listing, and a line that is
+/// not UTF-8 are skipped, as the endpoints skip them. Any other read error is
+/// returned once the files are read, so a caller that must not miss entries
+/// can retry.
+pub(crate) fn visit_matching_entries(
+    log_dir: &str,
+    filter: &LogFilter,
+    mut visit: impl FnMut(serde_json::Value),
+) -> Result<(), std::io::Error> {
+    let needles = LineNeedles::new(filter);
+    let (log_files, mut first_error) = match matching_log_files(log_dir, filter) {
+        Ok(listing) => listing,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+
+    for file_entry in &log_files {
+        if let Err(error) = visit_file_entries(&file_entry.path(), filter, &needles, &mut visit) {
+            first_error.get_or_insert(error);
+        }
+    }
+
+    first_error.map_or(Ok(()), Err)
+}
+
+/// The level and target filters as raw-line substrings, so most lines are
+/// rejected before the JSON parse. JSON format: `"level":"INFO"`.
+struct LineNeedles {
+    levels: Option<Vec<String>>,
+    targets: Option<Vec<String>>,
+}
+
+impl LineNeedles {
+    fn new(filter: &LogFilter) -> Self {
+        Self {
+            levels: filter.levels.as_ref().map(|levels| {
+                levels
+                    .iter()
+                    .map(|lvl| format!("\"level\":\"{lvl}\""))
+                    .collect()
+            }),
+            targets: filter.targets.as_ref().map(|targets| {
+                targets
+                    .iter()
+                    .map(|tgt| format!("\"target\":\"{tgt}\""))
+                    .collect()
+            }),
+        }
+    }
+}
+
+/// The log files in `log_dir`, newest first, without the files whose date
+/// lies wholly outside the filter's `since`/`until` window.
+///
+/// An entry the listing fails to read is left out, and the first such error
+/// is returned beside the files.
+fn matching_log_files(
+    log_dir: &str,
+    filter: &LogFilter,
+) -> Result<(Vec<std::fs::DirEntry>, Option<std::io::Error>), std::io::Error> {
+    let mut listing_error = None;
+    let mut log_files: Vec<_> = std::fs::read_dir(log_dir)?
+        .filter_map(|entry| match entry {
+            Ok(entry) => Some(entry),
+            Err(error) => {
+                listing_error.get_or_insert(error);
+                None
+            }
+        })
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| name.starts_with("st0x-hedge.log"))
+        })
+        .collect();
+
+    // Sort by name then reverse so newest files are read first.
+    log_files.sort_by_key(std::fs::DirEntry::file_name);
+    log_files.reverse();
+
+    log_files.retain(|file_entry| {
+        // Date-based file skipping: the date suffix (e.g. "2026-04-27")
+        // lets us skip entire files outside the time window.
+        if let Some(since) = filter.since
+            && let Some(file_date) = extract_log_file_date(file_entry)
+        {
+            let file_end_of_day = file_date
+                .and_hms_opt(23, 59, 59)
+                .map(|ndt| DateTime::<Utc>::from_naive_utc_and_offset(ndt, Utc));
+
+            if let Some(eod) = file_end_of_day
+                && eod < since
+            {
+                return false;
+            }
+        }
+
+        if let Some(until) = filter.until
+            && let Some(file_date) = extract_log_file_date(file_entry)
+        {
+            let file_start_of_day = file_date
+                .and_hms_opt(0, 0, 0)
+                .map(|ndt| DateTime::<Utc>::from_naive_utc_and_offset(ndt, Utc));
+
+            if let Some(sod) = file_start_of_day
+                && sod > until
+            {
+                return false;
+            }
+        }
+
+        true
+    });
+
+    Ok((log_files, listing_error))
+}
+
+/// Calls `visit` with each entry of one file that passes the filters, in
+/// file order. A file removed since the listing and a line that is not UTF-8
+/// are skipped. Any other read error stops reading the file and is
+/// returned, with the entries before it already visited: a persistent error
+/// such as reading a directory would otherwise repeat forever.
+fn visit_file_entries(
+    path: &std::path::Path,
+    filter: &LogFilter,
+    needles: &LineNeedles,
+    mut visit: impl FnMut(serde_json::Value),
+) -> Result<(), std::io::Error> {
+    use std::io::BufRead;
+
+    let file = match std::fs::File::open(path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    };
+    let reader = std::io::BufReader::new(file);
+
+    for line_result in reader.lines() {
+        let line = match line_result {
+            Ok(line) => line,
+            Err(error) if error.kind() == std::io::ErrorKind::InvalidData => continue,
+            Err(error) => return Err(error),
+        };
+
+        // Fast string-level filtering BEFORE JSON parsing.
+        if let Some(needles) = &needles.levels
+            && !needles.iter().any(|needle| line.contains(needle))
+        {
+            continue;
+        }
+
+        if let Some(needles) = &needles.targets
+            && !needles.iter().any(|needle| line.contains(needle))
+        {
+            continue;
+        }
+
+        if let Some(query) = &filter.search_lower
+            && !line.to_lowercase().contains(query.as_str())
+        {
+            continue;
+        }
+
+        // Expensive: parse JSON only for lines that passed string filters.
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) else {
+            continue;
+        };
+
+        // Time-range filter requires parsed timestamp.
+        if (filter.since.is_some() || filter.until.is_some())
+            && let Some(ts_str) = value["timestamp"].as_str()
+            && let Ok(ts) = DateTime::parse_from_rfc3339(ts_str)
+        {
+            let ts_utc = ts.with_timezone(&Utc);
+
+            if let Some(since) = filter.since
+                && ts_utc < since
+            {
+                continue;
+            }
+
+            if let Some(until) = filter.until
+                && ts_utc > until
+            {
+                continue;
+            }
+        }
+
+        visit(value);
+    }
+
+    Ok(())
 }
 
 /// Extracts the date from a log filename like `st0x-hedge.log.2026-04-27`.
