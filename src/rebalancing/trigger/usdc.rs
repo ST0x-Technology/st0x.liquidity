@@ -422,8 +422,6 @@ pub(crate) enum UsdcTriggerSkip {
     BelowMinimumTransfer { excess: Usdc },
     /// A Relay corridor's transfer is below its `min_transfer`.
     BelowRelayMinimum { amount: Usdc, minimum: Usdc },
-    /// The Relay hop does not run Alpaca-to-chain yet.
-    RelayDirectionNotBuilt,
     /// Arithmetic error during imbalance calculation.
     ArithmeticError,
 }
@@ -642,15 +640,14 @@ pub(super) fn cap_to_relay_maximum(
     Ok(if below { limit } else { relay.max_transfer })
 }
 
-/// Keeps an operation a Relay corridor can run: chain-to-Alpaca, at or
-/// above its `min_transfer`.
+/// Keeps an operation a Relay corridor can run: either way, at or above
+/// its `min_transfer`.
 pub(super) fn fit_relay_bounds(
     operation: UsdcRebalanceOperation,
     relay: &RelayHopCtx,
 ) -> Result<UsdcRebalanceOperation, UsdcTriggerSkip> {
-    let UsdcRebalanceOperation::BaseToAlpaca { amount } = operation else {
-        return Err(UsdcTriggerSkip::RelayDirectionNotBuilt);
-    };
+    let (UsdcRebalanceOperation::BaseToAlpaca { amount }
+    | UsdcRebalanceOperation::AlpacaToBase { amount }) = operation;
 
     let below = amount.lt(&relay.min_transfer).map_err(|error| {
         warn!(target: "rebalance", ?error, "Relay minimum-transfer comparison failed");

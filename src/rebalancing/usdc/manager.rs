@@ -544,7 +544,7 @@ pub struct CrossVenueCashTransfer<Signer: Wallet, B = CctpBridge<Signer, Signer>
     /// waits for a timed-out attempt's prepare and takes its persisted send
     /// instead of signing at the next nonce. Shared by every corridor's
     /// service, since all sign on the one Ethereum wallet.
-    deposit_send_prepare: Arc<tokio::sync::Mutex<()>>,
+    pub(super) deposit_send_prepare: Arc<tokio::sync::Mutex<()>>,
     /// The USDC driver gate the conductor's workers claim. The detached burn
     /// task claims through it too, so an operator pause waits for a burn
     /// whose execution was cancelled. `None` where no operator pause exists.
@@ -1148,7 +1148,7 @@ impl<Signer: Wallet, B: UsdcBridgeHelper> CrossVenueCashTransfer<Signer, B> {
         Err(UsdcTransferError::SettlementRetryDeadlineElapsed { id: id.clone() })
     }
 
-    async fn fail_conversion(
+    pub(super) async fn fail_conversion(
         &self,
         id: &UsdcRebalanceId,
         reason: String,
@@ -1686,9 +1686,215 @@ impl<Signer: Wallet, B: UsdcBridgeHelper> CrossVenueCashTransfer<Signer, B> {
         }
     }
 
+    /// The USDC the Alpaca withdrawal tx paid the market-maker wallet, and
+    /// that tx, once it has its confirmations: what the hop moves, never the
+    /// wallet balance, as the wallet is shared and its balance can hold USDC
+    /// that belongs to no transfer or to another one. A missing tx, or a
+    /// credit of nothing, above nominal or not computable, fails the transfer
+    /// for operator reconciliation.
+    pub(super) async fn credited_alpaca_withdrawal(
+        &self,
+        id: &UsdcRebalanceId,
+        amount: Usdc,
+        withdrawal_tx: Option<TxHash>,
+        confirmed_at: DateTime<Utc>,
+    ) -> Result<(U256, TxHash), UsdcTransferError> {
+        // A legacy aggregate can carry a >6-decimal Alpaca fill recorded
+        // before the ingress boundary was introduced, and `usdc_to_u256`
+        // below refuses off-grid amounts. Pass it through the same boundary
+        // here so every resume path moves an on-chain-representable amount.
+        let amount = normalize_alpaca_usdc(amount)?;
+        let nominal = usdc_to_u256(amount)?;
+
+        // A legacy aggregate, or the no-hash deadline path interrupted between
+        // ConfirmWithdrawal and FailBridging: nothing to credit the transfer from.
+        let Some(withdrawal_tx) = withdrawal_tx else {
+            error!(
+                target: "rebalance",
+                %id,
+                "Alpaca withdrawal has no recorded tx hash; cannot credit the transfer, \
+                 failing for operator reconciliation"
+            );
+            self.cqrs
+                .send(
+                    id,
+                    UsdcRebalanceCommand::FailBridging {
+                        reason: "no recorded withdrawal tx hash; cannot credit the \
+                                 Ethereum USDC to this withdrawal"
+                            .into(),
+                    },
+                )
+                .await?;
+            return Err(UsdcTransferError::WithdrawalTxMissing { id: id.clone() });
+        };
+
+        self.require_withdrawal_tx_confirmed(id, withdrawal_tx, confirmed_at)
+            .await?;
+
+        let credited = match self
+            .hop
+            .ethereum_usdc_credit(withdrawal_tx, self.market_maker_wallet)
+            .await
+        {
+            Ok(credited) => credited,
+            // The receipt was read but its credit cannot be computed; a reread
+            // gives the same answer, so fail now instead of redriving.
+            Err(
+                error @ (CctpError::UsdcTransferLogDecode { .. }
+                | CctpError::UsdcCreditOverflow { .. }),
+            ) => {
+                error!(
+                    target: "rebalance",
+                    %id,
+                    %withdrawal_tx,
+                    ?error,
+                    "Alpaca withdrawal tx credit cannot be computed; failing for operator \
+                     reconciliation"
+                );
+                self.cqrs
+                    .send(
+                        id,
+                        UsdcRebalanceCommand::FailBridging {
+                            reason: format!(
+                                "withdrawal tx {withdrawal_tx} USDC credit cannot be \
+                                 computed: {error}; operator reconciliation required"
+                            ),
+                        },
+                    )
+                    .await?;
+                return Err(UsdcTransferError::WithdrawalCreditUnreadable {
+                    id: id.clone(),
+                    tx: withdrawal_tx,
+                    source: Box::new(error),
+                });
+            }
+            // Deadline-gated like the confirmation check: a persistent receipt-read
+            // failure must not redrive forever unbounded.
+            Err(error) => {
+                self.check_settlement_deadline(
+                    id,
+                    confirmed_at,
+                    SettlementStall::CreditReadFailing,
+                )
+                .await?;
+                return Err(UsdcTransferError::SettlementCheckTransient {
+                    id: id.clone(),
+                    source: Box::new(error),
+                });
+            }
+        };
+
+        if credited.is_zero() || credited > nominal {
+            // The tx Alpaca reported did not pay this withdrawal: nothing, or
+            // more than was withdrawn. Moving it would move funds that are not
+            // this transfer's, so fail for operator reconciliation.
+            error!(
+                target: "rebalance",
+                %id,
+                %withdrawal_tx,
+                credited_raw = %credited,
+                nominal = %amount,
+                "Alpaca withdrawal tx credit does not match the withdrawal; failing \
+                 for operator reconciliation"
+            );
+            self.cqrs
+                .send(
+                    id,
+                    UsdcRebalanceCommand::FailBridging {
+                        reason: format!(
+                            "withdrawal tx {withdrawal_tx} credited {credited} base units \
+                             against nominal {amount}; operator reconciliation required"
+                        ),
+                    },
+                )
+                .await?;
+            return Err(UsdcTransferError::WithdrawalCreditMismatch {
+                id: id.clone(),
+                tx: withdrawal_tx,
+                credited,
+                nominal: amount,
+            });
+        }
+
+        if credited < nominal {
+            self.report_short_withdrawal_credit(id, withdrawal_tx, amount, nominal - credited)
+                .await;
+        }
+
+        Ok((credited, withdrawal_tx))
+    }
+
+    /// Re-verifies the recorded Alpaca-to-chain vault deposit on chain and
+    /// confirms it; a dropped deposit records `FailDeposit` for operator
+    /// reconciliation.
+    pub(super) async fn resume_alpaca_to_base_deposit_initiated(
+        &self,
+        id: &UsdcRebalanceId,
+        deposit_ref: TransferRef,
+    ) -> Result<(), UsdcTransferError> {
+        // Re-verify the persisted deposit tx on chain before
+        // transitioning to `DepositConfirmed`. The aggregate
+        // records the deposit hash at `InitiateDeposit` time,
+        // but a process restart between that event and the
+        // confirmation can land on a chain where the tx has
+        // been reorged out, dropped, or never mined. Trusting
+        // the persisted state alone would mark the rebalance
+        // complete while the funds aren't actually deposited.
+        let TransferRef::OnchainTx(deposit_tx) = deposit_ref else {
+            return Err(UsdcTransferError::DepositRefMustBeOnchain { id: id.clone() });
+        };
+        match self.raindex.confirm_tx_receipt(deposit_tx).await {
+            Ok(receipt) => {
+                // `deposit_to_vault`'s fresh path enqueues the `VaultDeposit`
+                // bot-gas job right after this same `confirm_tx_receipt` call, before
+                // ever reaching `DepositConfirmed`. A crash between
+                // `InitiateDeposit` and that enqueue lands here, and no
+                // resume path re-enters `deposit_to_vault` once past
+                // `DepositInitiated` -- so the enqueue must be repeated here
+                // too, or the cost fact is lost permanently once
+                // `confirm_deposit` advances the aggregate to its terminal
+                // state.
+                self.enqueue_bot_gas_cost(
+                    self.corridor.chain(),
+                    deposit_tx,
+                    BotGasOperationCategory::VaultDeposit,
+                )
+                .await?;
+                self.confirm_deposit(id, receipt.block_number).await
+            }
+            // A dropped tx (gone from the mempool, will never mine) is a
+            // terminal failure -- distinct from a still-pending tx that
+            // `confirm_tx_receipt` merely couldn't confirm yet. Without this, a
+            // dropped deposit retries forever until the breaker trips.
+            // Record FailDeposit so an operator can reconcile, then
+            // surface the error.
+            Err(error) if error.is_transaction_dropped() => {
+                warn!(
+                    target: "rebalance",
+                    %deposit_tx,
+                    "Recorded deposit tx was dropped from the mempool; recording \
+                     terminal FailDeposit for operator reconciliation",
+                );
+                self.cqrs
+                    .send(
+                        id,
+                        UsdcRebalanceCommand::FailDeposit {
+                            reason: format!(
+                                "Deposit tx {deposit_tx} dropped from the mempool \
+                                 and will not mine"
+                            ),
+                        },
+                    )
+                    .await?;
+                Err(UsdcTransferError::Vault(error))
+            }
+            Err(error) => Err(UsdcTransferError::Vault(error)),
+        }
+    }
+
     /// Drives an Alpaca->Base transfer from `Bridged` to terminal: vault
     /// deposit + `ConfirmDeposit`.
-    async fn continue_alpaca_to_base_from_bridged(
+    pub(super) async fn continue_alpaca_to_base_from_bridged(
         &self,
         id: &UsdcRebalanceId,
         amount_received: Usdc,
@@ -1702,7 +1908,7 @@ impl<Signer: Wallet, B: UsdcBridgeHelper> CrossVenueCashTransfer<Signer, B> {
     }
 
     #[instrument(target = "rebalance", skip(self), fields(%id, %amount), level = tracing::Level::DEBUG)]
-    async fn initiate_alpaca_withdrawal(
+    pub(super) async fn initiate_alpaca_withdrawal(
         &self,
         id: &UsdcRebalanceId,
         amount: Usdc,
@@ -1763,7 +1969,7 @@ impl<Signer: Wallet, B: UsdcBridgeHelper> CrossVenueCashTransfer<Signer, B> {
     }
 
     #[instrument(target = "rebalance", skip(self), fields(%id, %transfer_id), level = tracing::Level::DEBUG)]
-    async fn poll_and_confirm_withdrawal(
+    pub(super) async fn poll_and_confirm_withdrawal(
         &self,
         id: &UsdcRebalanceId,
         transfer_id: &AlpacaTransferId,
@@ -4078,64 +4284,8 @@ impl<
                 deposit_ref,
                 ..
             }) => {
-                // Re-verify the persisted deposit tx on chain before
-                // transitioning to `DepositConfirmed`. The aggregate
-                // records the deposit hash at `InitiateDeposit` time,
-                // but a process restart between that event and the
-                // confirmation can land on a chain where the tx has
-                // been reorged out, dropped, or never mined. Trusting
-                // the persisted state alone would mark the rebalance
-                // complete while the funds aren't actually deposited.
-                let TransferRef::OnchainTx(deposit_tx) = deposit_ref else {
-                    return Err(UsdcTransferError::DepositRefMustBeOnchain { id: id.clone() });
-                };
-                match self.raindex.confirm_tx_receipt(deposit_tx).await {
-                    Ok(receipt) => {
-                        // `deposit_to_vault`'s fresh path enqueues the `VaultDeposit`
-                        // bot-gas job right after this same `confirm_tx_receipt` call, before
-                        // ever reaching `DepositConfirmed`. A crash between
-                        // `InitiateDeposit` and that enqueue lands here, and no
-                        // resume path re-enters `deposit_to_vault` once past
-                        // `DepositInitiated` -- so the enqueue must be repeated here
-                        // too, or the cost fact is lost permanently once
-                        // `confirm_deposit` advances the aggregate to its terminal
-                        // state.
-                        self.enqueue_bot_gas_cost(
-                            self.corridor.chain(),
-                            deposit_tx,
-                            BotGasOperationCategory::VaultDeposit,
-                        )
-                        .await?;
-                        self.confirm_deposit(id, receipt.block_number).await
-                    }
-                    // A dropped tx (gone from the mempool, will never mine) is a
-                    // terminal failure -- distinct from a still-pending tx that
-                    // `confirm_tx_receipt` merely couldn't confirm yet. Without this, a
-                    // dropped deposit retries forever until the breaker trips.
-                    // Record FailDeposit so an operator can reconcile, then
-                    // surface the error.
-                    Err(error) if error.is_transaction_dropped() => {
-                        warn!(
-                            target: "rebalance",
-                            %deposit_tx,
-                            "Recorded deposit tx was dropped from the mempool; recording \
-                             terminal FailDeposit for operator reconciliation",
-                        );
-                        self.cqrs
-                            .send(
-                                id,
-                                UsdcRebalanceCommand::FailDeposit {
-                                    reason: format!(
-                                        "Deposit tx {deposit_tx} dropped from the mempool \
-                                         and will not mine"
-                                    ),
-                                },
-                            )
-                            .await?;
-                        Err(UsdcTransferError::Vault(error))
-                    }
-                    Err(error) => Err(UsdcTransferError::Vault(error)),
-                }
+                self.resume_alpaca_to_base_deposit_initiated(id, deposit_ref)
+                    .await
             }
 
             // Terminal-success no-ops: an AlpacaToBase deposit already
@@ -4326,127 +4476,9 @@ impl<
         initiated_at: DateTime<Utc>,
         confirmed_at: DateTime<Utc>,
     ) -> Result<(), UsdcTransferError> {
-        // A legacy aggregate can carry a >6-decimal Alpaca fill recorded
-        // before the ingress boundary was introduced, and `usdc_to_u256`
-        // below refuses off-grid amounts. Pass it through the same boundary
-        // here so every resume path burns an on-chain-representable amount.
-        let amount = normalize_alpaca_usdc(amount)?;
-        let nominal = usdc_to_u256(amount)?;
-
-        // A legacy aggregate, or the no-hash deadline path interrupted between
-        // ConfirmWithdrawal and FailBridging: nothing to credit the transfer from.
-        let Some(withdrawal_tx) = withdrawal_tx else {
-            error!(
-                target: "rebalance",
-                %id,
-                "Alpaca withdrawal has no recorded tx hash; cannot credit the transfer, \
-                 failing for operator reconciliation"
-            );
-            self.cqrs
-                .send(
-                    id,
-                    UsdcRebalanceCommand::FailBridging {
-                        reason: "no recorded withdrawal tx hash; cannot credit the \
-                                 Ethereum USDC to this withdrawal"
-                            .into(),
-                    },
-                )
-                .await?;
-            return Err(UsdcTransferError::WithdrawalTxMissing { id: id.clone() });
-        };
-
-        self.require_withdrawal_tx_confirmed(id, withdrawal_tx, confirmed_at)
+        let (credited, withdrawal_tx) = self
+            .credited_alpaca_withdrawal(id, amount, withdrawal_tx, confirmed_at)
             .await?;
-
-        let credited = match self
-            .hop
-            .ethereum_usdc_credit(withdrawal_tx, self.market_maker_wallet)
-            .await
-        {
-            Ok(credited) => credited,
-            // The receipt was read but its credit cannot be computed; a reread
-            // gives the same answer, so fail now instead of redriving.
-            Err(
-                error @ (CctpError::UsdcTransferLogDecode { .. }
-                | CctpError::UsdcCreditOverflow { .. }),
-            ) => {
-                error!(
-                    target: "rebalance",
-                    %id,
-                    %withdrawal_tx,
-                    ?error,
-                    "Alpaca withdrawal tx credit cannot be computed; failing for operator \
-                     reconciliation"
-                );
-                self.cqrs
-                    .send(
-                        id,
-                        UsdcRebalanceCommand::FailBridging {
-                            reason: format!(
-                                "withdrawal tx {withdrawal_tx} USDC credit cannot be \
-                                 computed: {error}; operator reconciliation required"
-                            ),
-                        },
-                    )
-                    .await?;
-                return Err(UsdcTransferError::WithdrawalCreditUnreadable {
-                    id: id.clone(),
-                    tx: withdrawal_tx,
-                    source: Box::new(error),
-                });
-            }
-            // Deadline-gated like the confirmation check: a persistent receipt-read
-            // failure must not redrive forever unbounded.
-            Err(error) => {
-                self.check_settlement_deadline(
-                    id,
-                    confirmed_at,
-                    SettlementStall::CreditReadFailing,
-                )
-                .await?;
-                return Err(UsdcTransferError::SettlementCheckTransient {
-                    id: id.clone(),
-                    source: Box::new(error),
-                });
-            }
-        };
-
-        if credited.is_zero() || credited > nominal {
-            // The tx Alpaca reported did not pay this withdrawal: nothing, or
-            // more than was withdrawn. Burning would move funds that are not
-            // this transfer's, so fail for operator reconciliation.
-            error!(
-                target: "rebalance",
-                %id,
-                %withdrawal_tx,
-                credited_raw = %credited,
-                nominal = %amount,
-                "Alpaca withdrawal tx credit does not match the withdrawal; failing \
-                 for operator reconciliation"
-            );
-            self.cqrs
-                .send(
-                    id,
-                    UsdcRebalanceCommand::FailBridging {
-                        reason: format!(
-                            "withdrawal tx {withdrawal_tx} credited {credited} base units \
-                             against nominal {amount}; operator reconciliation required"
-                        ),
-                    },
-                )
-                .await?;
-            return Err(UsdcTransferError::WithdrawalCreditMismatch {
-                id: id.clone(),
-                tx: withdrawal_tx,
-                credited,
-                nominal: amount,
-            });
-        }
-
-        if credited < nominal {
-            self.report_short_withdrawal_credit(id, withdrawal_tx, amount, nominal - credited)
-                .await;
-        }
 
         // The burn lands in a strictly later block than the withdrawal
         // (find_recent_burn uses block > from_block), so the withdrawal block

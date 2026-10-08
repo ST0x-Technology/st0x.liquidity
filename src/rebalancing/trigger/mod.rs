@@ -1157,10 +1157,10 @@ enum UsdcTimeoutCleanup {
         corridor: UsdcCorridor,
         direction: RebalanceDirection,
     },
-    /// A chain-to-Alpaca Relay transfer stopped after its withdrawal, at
+    /// A Relay transfer stopped after its withdrawal, at a chain-to-Alpaca
     /// `WithdrawalComplete` or a swap state that holds the guard: the
-    /// withdrawn stable is outside the vault, in the chain wallet, with Relay
-    /// or on its way back, and only the swap, a redeposit or
+    /// withdrawn stable is outside the vault or Alpaca, in a wallet, with
+    /// Relay or on its way back, and only the swap, a redeposit or
     /// `transfer reconcile` settles it, so the guard stays held.
     HeldOutsideVault {
         tracking: usdc::UsdcRebalanceTracking,
@@ -2709,13 +2709,13 @@ impl RebalancingService {
             corridor = %tracking.corridor,
             ?elapsed,
             state,
-            "Relay USDC transfer timed out after its vault withdrawal with the stable outside \
-             the vault; holding the trigger guard"
+            "Relay USDC transfer timed out after its withdrawal with the stable outside the \
+             vault or Alpaca; holding the trigger guard"
         );
 
         let message = format!(
-            "USDC transfer {id} on the {} corridor timed out at {state}: the vault withdrawal \
-             moved the stable out of the vault, to the chain wallet or to Relay. Guard held. \
+            "USDC transfer {id} on the {} corridor timed out at {state}: its withdrawal moved \
+             the stable out of the vault or Alpaca, to a wallet or to Relay. Guard held. \
              Elapsed: {elapsed:?}. Resume it with resume-usdc; it is not failed or released \
              until the swap, a redeposit or reconcile-usdc settles the stable.",
             tracking.corridor,
@@ -3555,9 +3555,9 @@ impl RebalancingService {
                         amount,
                     }));
                 }
-                // Tracking can lag the store, so every chain-to-Alpaca Relay
-                // state after the withdrawal that `fail-usdc-transfer` refuses
-                // with the Relay hold holds here too: a deposit may be on chain.
+                // Tracking can lag the store, so every Relay state after the
+                // withdrawal that `fail-usdc-transfer` refuses with the Relay
+                // hold holds here too, either way: a deposit may be on chain.
                 Ok(Some(state))
                     if state.pre_burn_fail_eligibility()
                         == PreBurnFailEligibility::RelayHeldOutsideVault =>

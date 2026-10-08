@@ -2817,11 +2817,11 @@ async fn fail_pre_burn_usdc_transfer(
             rebalance.state_name()
         )),
         PreBurnFailEligibility::RelayHeldOutsideVault => Some(format!(
-            "Transfer {id} is a Relay transfer in {}: the vault withdrawal moved the stable \
-             outside the vault, to the chain wallet or to Relay, and no failure path settles \
+            "Transfer {id} is a Relay transfer in {}: its withdrawal moved the stable \
+             outside the vault or Alpaca, to a wallet or to Relay, and no failure path settles \
              it. Resume it with resume-usdc to finish the swap or the redeposit, or settle a \
-             failed swap or a refund paid at the other end with reconcile-usdc; only a \
-             redeposit returns the stable to the vault.",
+             failed swap or a held swap with reconcile-usdc; only a redeposit returns the \
+             stable to the vault.",
             rebalance.state_name()
         )),
         PreBurnFailEligibility::AlreadyFailedPreBurn if rebalance.holds_rebalance_guard() => {

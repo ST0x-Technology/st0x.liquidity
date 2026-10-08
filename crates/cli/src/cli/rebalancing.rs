@@ -768,7 +768,6 @@ fn is_bot_resumable_wait(error: &UsdcTransferError) -> bool {
         | UsdcTransferError::DepositSendLookup { .. }
         | UsdcTransferError::StateOffHop { .. }
         | UsdcTransferError::BasisPoints(_)
-        | UsdcTransferError::SwapDirectionNotBuilt { .. }
         | UsdcTransferError::RelayApi(_)
         | UsdcTransferError::RelayBridge(_)
         | UsdcTransferError::SwapQuoteOutOfBounds { .. }
@@ -1315,12 +1314,12 @@ pub(super) async fn fail_usdc_transfer_command<Writer: Write>(
         }
         PreBurnFailEligibility::RelayHeldOutsideVault => {
             anyhow::bail!(
-                "fail-usdc-transfer: transfer {id} is a Relay transfer in {state:?}: the vault \
-                 withdrawal moved the stable outside the vault, to the chain wallet or to \
+                "fail-usdc-transfer: transfer {id} is a Relay transfer in {state:?}: its \
+                 withdrawal moved the stable outside the vault or Alpaca, to a wallet or to \
                  Relay, and no failure path settles it. Refusing to act -- resume it with \
                  `transfer resume` to finish the swap or the redeposit, or settle a failed swap \
-                 or a refund paid at the other end with `transfer reconcile`; only a redeposit \
-                 returns the stable to the vault."
+                 or a held swap with `transfer reconcile`; only a redeposit returns the stable \
+                 to the vault."
             );
         }
         // Already the pre-burn failed terminal, so there is nothing to fail

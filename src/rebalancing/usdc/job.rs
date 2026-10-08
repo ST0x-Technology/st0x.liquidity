@@ -1855,6 +1855,10 @@ impl Job<TransferUsdcToMarketMakingCtx> for TransferUsdcToMarketMaking {
             ControlFlow::Break(outcome) => return outcome,
             ControlFlow::Continue(result) => result,
         };
+        let result = match intercept_relay_wait(self, &ctx.job_queue, &ctx.notifier, result).await {
+            ControlFlow::Break(outcome) => return outcome,
+            ControlFlow::Continue(result) => result,
+        };
 
         self.settle_transfer_outcome(ctx, result).await
     }

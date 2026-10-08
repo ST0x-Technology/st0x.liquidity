@@ -290,13 +290,6 @@ pub enum UsdcTransferError {
     },
     #[error(transparent)]
     BasisPoints(#[from] BasisPointsOutOfRange),
-    /// The Relay hop runs chain-to-Alpaca only in this build; refused before
-    /// any call.
-    #[error("USDC rebalance {id}: the Relay hop does not run {direction} yet; nothing was sent")]
-    SwapDirectionNotBuilt {
-        id: UsdcRebalanceId,
-        direction: RebalanceDirection,
-    },
     #[error("Relay API error: {0}")]
     RelayApi(#[from] Box<RelayError>),
     #[error("Relay bridge error: {0}")]
@@ -800,7 +793,6 @@ impl UsdcTransferError {
             | Self::DepositSendLookup { .. }
             | Self::StateOffHop { .. }
             | Self::BasisPoints(_)
-            | Self::SwapDirectionNotBuilt { .. }
             | Self::RelayApi(_)
             | Self::RelayBridge(_)
             | Self::SwapQuoteOutOfBounds { .. }
@@ -878,7 +870,6 @@ impl BotGasFailureClassifier for UsdcTransferError {
             | Self::DepositSendLookup { .. }
             | Self::StateOffHop { .. }
             | Self::BasisPoints(_)
-            | Self::SwapDirectionNotBuilt { .. }
             | Self::RelayApi(_)
             | Self::RelayBridge(_)
             | Self::SwapQuoteOutOfBounds { .. }
