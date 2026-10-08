@@ -8229,6 +8229,60 @@ mod tests {
         }
     }
 
+    /// A refund of the failed order adopted from `SwapFailed` keeps the
+    /// reverted orders watched, so the re-quote that follows it still scans
+    /// for their deposits before it signs.
+    #[tokio::test]
+    async fn refund_adopted_from_a_failed_swap_keeps_the_reverted_orders_watched() {
+        let failed = [
+            reverted_and_requoted(RebalanceDirection::AlpacaToBase),
+            vec![
+                UsdcRebalanceEvent::SwapDepositPrepared {
+                    approve: None,
+                    deposit: PreparedTransaction::for_test(TxHash::repeat_byte(0xb2), 7),
+                    prepared_at: Utc::now(),
+                },
+                UsdcRebalanceEvent::SwapDeposited {
+                    deposit_tx: TxHash::repeat_byte(0xb2),
+                    deposit_block: 10,
+                    deposited_at: Utc::now(),
+                },
+                UsdcRebalanceEvent::SwapFailed {
+                    reason: "Relay reported Failure".to_string(),
+                    failed_at: Utc::now(),
+                },
+            ],
+        ]
+        .concat();
+
+        let events = TestHarness::<UsdcRebalance>::with(())
+            .given(failed.clone())
+            .when(UsdcRebalanceCommand::RecoverSwapCompletion {
+                order_id: B256::repeat_byte(0x0b),
+                deposit_tx: TxHash::repeat_byte(0xb2),
+                payment: RecoveredSwapPayment::Refund {
+                    refund_tx: TxHash::repeat_byte(0xe1),
+                    side: RefundSide::Origin,
+                    amount_refunded: U256::from(99_000_000u64),
+                },
+            })
+            .await
+            .events();
+        let state = replay::<UsdcRebalance>([failed, events].concat())
+            .unwrap()
+            .unwrap();
+        let UsdcRebalance::SwapRefunded {
+            quote,
+            reverted_quotes,
+            ..
+        } = &state
+        else {
+            panic!("expected SwapRefunded, got {state:?}");
+        };
+        assert_eq!(quote.order_id, B256::repeat_byte(0x0b));
+        assert_eq!(*reverted_quotes, vec![hundred_usdc_quote(0x0a)]);
+    }
+
     /// A late fill of the order Relay failed is adopted from `SwapFailed`,
     /// which then moves on as any `Bridged`; a state with no failed or
     /// reverted order refuses it.

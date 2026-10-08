@@ -5483,7 +5483,8 @@ mod tests {
     }
 
     /// `transfer recheck` of an order Relay failed adopts the fill Relay paid
-    /// since, deposits it into the vault and reports it recovered.
+    /// since and reports it recovered, without moving it on in the request;
+    /// the resume the operator queues then deposits it into the vault.
     #[tokio::test]
     async fn recheck_adopts_late_fill() {
         let rig = RelayRig::deploy().await;
@@ -5520,12 +5521,117 @@ mod tests {
 
         assert_eq!(outcome, RecheckOutcome::Recovered);
         let state = store.load(&id).await.unwrap().unwrap();
-        let UsdcRebalance::DepositConfirmed { hop, .. } = &state else {
-            panic!("expected DepositConfirmed, got {state:?}");
+        let UsdcRebalance::Bridged { hop, .. } = &state else {
+            panic!("expected Bridged, got {state:?}");
         };
         assert_eq!(hop.destination_tx(), fill_tx);
-        assert!(!state.holds_rebalance_guard());
+        assert!(state.holds_rebalance_guard());
+        assert_eq!(
+            rig.vault_usdg().await,
+            U256::ZERO,
+            "not moved on in the recheck"
+        );
+
+        tokio::time::timeout(
+            Duration::from_secs(60),
+            transfer.resume_alpaca_to_base(&id, Usdc::new(float!(100)), ROBINHOOD_RELAY),
+        )
+        .await
+        .expect("the resume ends")
+        .unwrap();
+        let state = store.load(&id).await.unwrap().unwrap();
+        assert_eq!(state.state_name(), "DepositConfirmed", "{state:?}");
         assert_eq!(rig.vault_usdg().await, U256::from(AMOUNT_IN));
+    }
+
+    /// `transfer recheck` of an unresolved escrow adopts the fill Relay paid
+    /// since and leaves moving it on to the job that re-reads the escrow.
+    #[tokio::test]
+    async fn recheck_of_an_unresolved_escrow_adopts_and_leaves_it_to_the_job() {
+        let rig = RelayRig::deploy().await;
+        let fill_tx = rig
+            .fill_on_chain(U256::from(AMOUNT_IN), TOWARD_CHAIN_ORDER_ID)
+            .await;
+        let server = MockServer::start();
+        let relay_api = MockServer::start();
+        mock_status(
+            &relay_api,
+            json!({"status": "success", "inTxHashes": [], "txHashes": [fill_tx]}),
+        );
+        let store = Arc::new(test_store(setup_test_db().await, ()));
+        let transfer = rig
+            .transfer(&server, &relay_api, store.clone(), relay_bounds())
+            .await;
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        record_deposited_toward_chain(&store, &id, TOWARD_CHAIN_ORDER_ID).await;
+        store
+            .send(&id, UsdcRebalanceCommand::RecordSwapEscrowUnresolved)
+            .await
+            .unwrap();
+
+        let outcome =
+            tokio::time::timeout(Duration::from_secs(60), transfer.recheck_deposit(&id, None))
+                .await
+                .expect("the recheck ends")
+                .unwrap();
+
+        assert_eq!(outcome, RecheckOutcome::Recovered);
+        let state = store.load(&id).await.unwrap().unwrap();
+        let UsdcRebalance::Bridged { hop, .. } = &state else {
+            panic!("expected Bridged, got {state:?}");
+        };
+        assert_eq!(hop.destination_tx(), fill_tx);
+        assert_eq!(rig.vault_usdg().await, U256::ZERO, "the job deposits it");
+    }
+
+    /// A deposit Relay still reports reorged out past the fill window is a
+    /// Relay failure with nothing paid back: it holds at the reconcilable
+    /// `SwapFailed`, where a recheck can still adopt a later payment.
+    #[tokio::test]
+    async fn deposit_reorged_past_the_fill_window_fails_the_swap() {
+        let anvil = spawn_anvil(Anvil::new());
+        let key = B256::from_slice(&anvil.keys()[0].to_bytes());
+        let wallet = anvil_wallet(anvil.endpoint_url(), &key);
+        let contracts = RelayEndContracts {
+            stable: Address::repeat_byte(0x51),
+            depository: Address::repeat_byte(0x52),
+        };
+        let server = MockServer::start();
+        let relay_api = MockServer::start();
+        mock_status(
+            &relay_api,
+            json!({"status": "failure", "failReason": "DEPOSIT_REORGED"}),
+        );
+        let store = Arc::new(test_store(setup_test_db().await, ()));
+        let transfer = relay_transfer_with_bounds(
+            &server,
+            &relay_api,
+            wallet.clone(),
+            wallet,
+            contracts,
+            store.clone(),
+            RelayHopCtx {
+                fill_timeout: Duration::from_millis(1),
+                ..relay_bounds()
+            },
+        )
+        .await;
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        record_deposited(&store, &id).await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            transfer.resume_base_to_alpaca(&id, Usdc::new(float!(100)), ROBINHOOD_RELAY),
+        )
+        .await
+        .expect("the attempt ends")
+        .unwrap();
+
+        let state = store.load(&id).await.unwrap().unwrap();
+        assert_eq!(state.state_name(), "SwapFailed");
+        assert!(state.holds_rebalance_guard());
+        assert!(state.is_reconcilable_failure());
     }
 
     /// `transfer recheck` of a failed order Relay still reports unpaid
