@@ -104,6 +104,7 @@ impl TurnkeyApiPrivateKey {
     ///
     /// Returns a typed [`TurnkeyValueError`] when `value` is not hexadecimal,
     /// is not exactly 32 bytes, or is not a valid P-256 scalar.
+    /// Accepts an optional `0x` prefix and stores lowercase, unprefixed hex.
     pub fn try_new(value: String) -> Result<Self, TurnkeyValueError> {
         value.try_into()
     }
@@ -113,20 +114,20 @@ impl TryFrom<String> for TurnkeyApiPrivateKey {
     type Error = TurnkeyValueError;
 
     fn try_from(value: String) -> Result<Self, Self::Error> {
-        parse_api_private_key(&value)?;
+        let key = parse_api_private_key(&value)?;
 
-        Ok(Self(value))
+        Ok(Self(hex::encode(key.private_key())))
     }
 }
 
 fn parse_api_private_key(value: &str) -> Result<TurnkeyP256ApiKey, TurnkeyValueError> {
     let decoded = hex::decode(value).map_err(TurnkeyValueError::InvalidApiPrivateKeyHex)?;
     let observed_length = decoded.len();
-    let _: [u8; 32] = decoded
+    let bytes: [u8; 32] = decoded
         .try_into()
         .map_err(|_| TurnkeyValueError::InvalidApiPrivateKeyLength { observed_length })?;
 
-    TurnkeyP256ApiKey::from_strings(value, None).map_err(TurnkeyValueError::InvalidApiPrivateKey)
+    TurnkeyP256ApiKey::from_bytes(bytes, None).map_err(TurnkeyValueError::InvalidApiPrivateKey)
 }
 
 impl std::fmt::Debug for TurnkeyApiPrivateKey {
@@ -825,7 +826,7 @@ impl TracingTurnkeyClient {
                 ActivityStatus::Failed => {
                     return Err(TurnkeyClientError::ActivityFailed(activity.failure).into());
                 }
-                ActivityStatus::ConsensusNeeded => {
+                ActivityStatus::ConsensusNeeded | ActivityStatus::AuthenticatorsNeeded => {
                     return Err(TurnkeyClientError::ActivityRequiresApproval(activity.id).into());
                 }
                 ActivityStatus::Unspecified
@@ -1417,7 +1418,11 @@ mod tests {
     use alloy::signers::Signer;
     use alloy::signers::local::PrivateKeySigner;
     use alloy::sol_types::SolValue;
+    use base64::Engine as _;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
     use httpmock::MockServer;
+    use p256::ecdsa::signature::Verifier as _;
+    use p256::ecdsa::{Signature as P256Signature, VerifyingKey};
 
     use crate::inflight_nonces::NonceOwnership;
     use crate::submit::release_in_flight_after_wait;
@@ -1600,6 +1605,49 @@ mod tests {
                     NonceOwnership::Ours
                 );
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn local_api_stamp_authenticates_exact_request_bytes() {
+        let api_private_key = TurnkeyApiPrivateKey::try_new(format!("0x{:064x}", 1)).unwrap();
+        let body = br#"{"type":"ACTIVITY_TYPE_SIGN_TRANSACTION_V2"}"#;
+        let StampHeader { name, value } = ApiStamper::local(&api_private_key)
+            .unwrap()
+            .stamp(body)
+            .await
+            .unwrap();
+        assert_eq!(name, "X-Stamp");
+
+        let decoded = URL_SAFE_NO_PAD.decode(value).unwrap();
+        let stamp: serde_json::Value = serde_json::from_slice(&decoded).unwrap();
+        assert_eq!(stamp.as_object().unwrap().len(), 3);
+        assert_eq!(stamp["scheme"], "SIGNATURE_SCHEME_TK_API_P256");
+        // SEC1 compressed P-256 generator: the public key for scalar one.
+        let public_key = "036b17d1f2e12c4247f8bce6e563a440f277037d812deb33a0f4a13945d898c296";
+        assert_eq!(stamp["publicKey"], public_key);
+        let verifying_key =
+            VerifyingKey::from_sec1_bytes(&hex::decode(public_key).unwrap()).unwrap();
+        let signature =
+            P256Signature::from_der(&hex::decode(stamp["signature"].as_str().unwrap()).unwrap())
+                .unwrap();
+        verifying_key.verify(body, &signature).unwrap();
+        verifying_key
+            .verify(b"modified request bytes", &signature)
+            .unwrap_err();
+    }
+
+    #[test]
+    fn api_private_key_canonicalizes_optional_hex_prefix() {
+        let canonical = format!("{:064x}", 0xab);
+
+        for value in [
+            canonical.to_uppercase(),
+            format!("0x{}", canonical.to_uppercase()),
+        ] {
+            let TurnkeyApiPrivateKey(key) = TurnkeyApiPrivateKey::try_new(value).unwrap();
+
+            assert_eq!(key, canonical);
         }
     }
 
@@ -2215,6 +2263,7 @@ mod tests {
                 .json_body_includes(
                     serde_json::json!({
                         "type": "ACTIVITY_TYPE_SIGN_RAW_PAYLOAD_V2",
+                        "generateAppProofs": null,
                         "parameters": {
                             "signWith": address.to_string(),
                             "payload": payload_json,
@@ -2601,6 +2650,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn signing_activity_needing_approval_returns_its_id_without_retry() {
+        for status in [
+            "ACTIVITY_STATUS_CONSENSUS_NEEDED",
+            "ACTIVITY_STATUS_AUTHENTICATORS_NEEDED",
+        ] {
+            let server = MockServer::start();
+            let mut response = pending_activity_body();
+            response["activity"]["id"] = serde_json::json!("approval-needed-activity");
+            response["activity"]["status"] = serde_json::json!(status);
+            let mock = server.mock(|when, then| {
+                when.method("POST")
+                    .path("/public/v1/submit/sign_transaction");
+                then.status(200)
+                    .header("Content-Type", "application/json")
+                    .json_body(response);
+            });
+            let client = mock_client(&server);
+            let error = client
+                .process_activity(
+                    &serde_json::json!({"type": "ACTIVITY_TYPE_SIGN_TRANSACTION_V2"}),
+                    "/public/v1/submit/sign_transaction",
+                )
+                .await
+                .unwrap_err();
+            let TurnkeyRequestError::Client(TurnkeyClientError::ActivityRequiresApproval(id)) =
+                error
+            else {
+                panic!("expected approval requirement for {status}, got {error:?}");
+            };
+            assert_eq!(id, "approval-needed-activity");
+            mock.assert_calls(1);
+        }
+    }
+
+    #[tokio::test]
     async fn sign_transaction_exhausts_retries_while_activity_stays_pending() {
         let server = MockServer::start();
 
@@ -2816,9 +2900,7 @@ mod tests {
             },
             credentials: TurnkeyCredentials {
                 // A random P-256 scalar, hex-encoded — the exact shape the
-                // secrets file carries. (turnkey_api_key_stamper 0.4 has no
-                // private-key accessor on its generated keys, so mint one
-                // directly with p256.)
+                // secrets file carries.
                 api_private_key: Some(test_api_private_key()),
             },
             provider,

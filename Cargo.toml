@@ -162,7 +162,7 @@ rain-math-float = { path = ".tmp/rain-math-float/crates/float" }
 name = "st0x-hedge"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.90"
+rust-version = "1.94"
 
 [[bin]]
 name = "verify-approvals"
