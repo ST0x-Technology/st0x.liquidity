@@ -5507,6 +5507,50 @@ impl RebalancingService {
         };
     }
 
+    /// Zeroes any Hedging inflight left on `symbol` once its mint is terminal.
+    ///
+    /// Only mints put equity inflight at Hedging, and a symbol has at most one
+    /// active mint, so a residual here is phantom: e.g. a provider poll
+    /// hydrated on restart that already listed this mint's request. Left in
+    /// place it blocks the symbol's rebalancing and snapshots until restart.
+    /// A request still pending at the provider is restored by its next poll.
+    async fn clear_residual_hedging_inflight(
+        &self,
+        id: &IssuerRequestId,
+        symbol: &Symbol,
+        chain: Chain,
+    ) -> Result<(), RebalancingServiceError> {
+        let mut inventory = self.inventory.write().await;
+        let residual = inventory.equity_inflight(symbol, Venue::Hedging);
+        if residual
+            .map(|amount| amount.is_zero())
+            .transpose()?
+            .is_none_or(|is_zero| is_zero)
+        {
+            return Ok(());
+        }
+
+        warn!(
+            target: "rebalance",
+            id = %id,
+            %symbol,
+            ?residual,
+            "Terminal mint left a non-zero Hedging inflight; zeroing it and \
+             forcing an offchain equity reconcile"
+        );
+        *inventory = inventory.clone().clear_equity_inflight_at(
+            symbol,
+            chain,
+            Venue::Hedging,
+            Utc::now(),
+        )?;
+        drop(inventory);
+
+        self.divergence_gate
+            .request_offchain_equity_reconcile(symbol);
+        Ok(())
+    }
+
     /// Sets `active_redemptions[symbol] = id` while the aggregate is
     /// alive, clears it on terminal events. Mirrors `redemption_tracking`.
     async fn update_active_redemption(
@@ -9523,6 +9567,20 @@ impl RebalancingService {
             .await;
 
         let is_terminal = if Self::is_terminal_mint_event(&event) {
+            // Not `?`: an error here must not skip the terminal cleanup below,
+            // which would latch the symbol's tracking and in-progress guard.
+            if let Err(error) = self
+                .clear_residual_hedging_inflight(&id, &symbol, tracking.chain)
+                .await
+            {
+                error!(
+                    target: "rebalance",
+                    id = %id,
+                    %symbol,
+                    ?error,
+                    "Failed to clear residual Hedging inflight after terminal mint"
+                );
+            }
             self.mint_tracking.write().await.remove(&id);
             self.queue_terminal_mint_reservation_release(&id, &symbol)
                 .await;
@@ -17277,6 +17335,69 @@ mod tests {
             inventory.equity_available(&symbol, Venue::Hedging),
             Some(shares(50))
         );
+        drop(inventory);
+    }
+
+    #[tokio::test]
+    async fn terminal_mint_clears_hedging_inflight_a_hydrated_poll_left() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let inventory = InventoryView::default()
+            .with_equity(symbol.clone(), shares(0), shares(0))
+            .update_equity(
+                &symbol,
+                Inventory::available(Venue::MarketMaking, Operator::Add, shares(20)),
+                Utc::now(),
+            )
+            .unwrap()
+            .update_equity(
+                &symbol,
+                Inventory::available(Venue::Hedging, Operator::Add, shares(80)),
+                Utc::now(),
+            )
+            .unwrap();
+
+        let reactor = make_trigger_with_inventory_and_registry(inventory, &symbol).await;
+        let trigger = reactor.clone();
+        let harness = ReactorHarness::new(Arc::clone(&trigger));
+        let id = issuer_request_id("mint-after-hydrated-poll");
+
+        // Startup hydration replays a persisted poll that listed this mint's
+        // request before any active mint was restored.
+        apply_and_dispatch_snapshot(
+            reactor.clone(),
+            InventorySnapshotId {
+                orderbook: TEST_ORDERBOOK,
+                owner: TEST_ORDER_OWNER,
+            },
+            InventorySnapshotEvent::InflightEquity {
+                mints: BTreeMap::from([(symbol.clone(), shares(30))]),
+                redemptions: BTreeMap::new(),
+                fetched_at: Utc::now(),
+                base_redemptions_chain_scoped: true,
+            },
+        )
+        .await
+        .unwrap();
+
+        for event in [
+            make_mint_requested(&symbol, float!(30)),
+            make_mint_accepted(),
+            make_tokens_received(),
+            make_deposited_into_raindex(),
+        ] {
+            harness
+                .receive::<TokenizedEquityMint>(id.clone(), event)
+                .await
+                .unwrap();
+        }
+
+        let inventory = trigger.inventory.read().await;
+        assert_eq!(
+            inventory.equity_inflight(&symbol, Venue::Hedging),
+            Some(shares(0)),
+            "The terminal mint must zero the residual Hedging inflight"
+        );
+        assert!(!inventory.equity_venues(&symbol).unwrap().has_inflight);
         drop(inventory);
     }
 

@@ -3265,6 +3265,10 @@ impl InventoryView {
     /// because a stale poll could otherwise re-introduce inflight that was
     /// already cleared by a completed transfer.
     ///
+    /// Skips symbols with an active mint: the mint reactor owns their Hedging
+    /// inflight from `MintRequested` on. A poll that lists the request before
+    /// `MintAccepted` lands would otherwise count the shares a second time.
+    ///
     /// Mints are inflight at Hedging (shares leaving offchain broker toward
     /// onchain). Redemptions are inflight at MarketMaking (shares leaving
     /// onchain toward offchain broker).
@@ -3281,6 +3285,17 @@ impl InventoryView {
 
         // Set inflight for symbols present in the poll.
         for (symbol, &quantity) in mints {
+            if view.active_mints.contains_key(symbol) {
+                debug!(
+                    target: "inventory",
+                    %symbol,
+                    ?quantity,
+                    "Skipping mint inflight snapshot: an active mint owns \
+                     the symbol's Hedging inflight"
+                );
+                continue;
+            }
+
             if view.is_stale_for_symbol(symbol, fetched_at) {
                 debug!(
                     target: "inventory",
@@ -3311,8 +3326,13 @@ impl InventoryView {
             }
         }
 
-        // Track current poll symbols for next cycle's cleanup.
-        view.previous_inflight_mint_symbols = mints.keys().cloned().collect();
+        // Track current poll symbols for next cycle's cleanup. Symbols with an
+        // active mint were not set above, so the poll owns nothing to zero.
+        view.previous_inflight_mint_symbols = mints
+            .keys()
+            .filter(|symbol| !view.active_mints.contains_key(*symbol))
+            .cloned()
+            .collect();
 
         view.apply_inflight_redemptions_at(Chain::Base, redemptions, fetched_at, now)
     }
@@ -6877,6 +6897,41 @@ mod tests {
             Some(shares(20)),
             "New inflight must be preserved when previous poll marker \
              was cleared by MintAccepted"
+        );
+    }
+
+    #[test]
+    fn inflight_poll_leaves_active_mint_hedging_inflight_to_the_mint() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let now = Utc::now();
+        let pending = BTreeMap::from([(symbol.clone(), shares(20))]);
+
+        let view = InventoryView::default()
+            .with_equity(symbol.clone(), shares(50), shares(50))
+            .set_active_mint(symbol.clone(), Chain::Base, IssuerRequestId::generate())
+            .apply_inflight_snapshot(&pending, &BTreeMap::new(), now, now)
+            .unwrap();
+
+        assert_eq!(
+            view.equity_inflight(&symbol, Venue::Hedging),
+            Some(FractionalShares::ZERO),
+            "The poll must not count an active mint's request"
+        );
+
+        let view = view
+            .update_equity(
+                &symbol,
+                Inventory::transfer(Venue::Hedging, TransferOp::Start, shares(20)),
+                now,
+            )
+            .unwrap()
+            .apply_inflight_snapshot(&BTreeMap::new(), &BTreeMap::new(), now, now)
+            .unwrap();
+
+        assert_eq!(
+            view.equity_inflight(&symbol, Venue::Hedging),
+            Some(shares(20)),
+            "The poll must not mark an active mint's symbol for zeroing"
         );
     }
 
