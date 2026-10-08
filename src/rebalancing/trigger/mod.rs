@@ -5531,6 +5531,13 @@ impl RebalancingService {
             .transpose()?
             .is_none_or(|is_zero| is_zero)
         {
+            debug!(
+                target: "rebalance",
+                id = %id,
+                %symbol,
+                ?residual,
+                "No residual Hedging inflight to clear after terminal mint"
+            );
             return Ok(());
         }
 
