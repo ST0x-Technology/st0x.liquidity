@@ -26,6 +26,7 @@ use crate::position::Position;
 
 pub(crate) mod equity_price;
 mod event;
+pub(crate) mod order_loader;
 pub(crate) mod pnl;
 mod trade_loader;
 pub(crate) mod transfer_loader;

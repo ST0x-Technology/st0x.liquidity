@@ -781,7 +781,11 @@ fn spawn_auxiliary_supervisor(
         )
         .with_task("liq-state-refresh", liq_state_refresh)
         .with_task("liq-performance-refresh", liq_performance_refresh)
-        .with_task("liq-pnl-refresh", liq_pnl_refresh);
+        .with_task("liq-pnl-refresh", liq_pnl_refresh)
+        .with_task(
+            "liq-orders-refresh",
+            metrics::liquidity::orders::LiqOrdersRefresh::new(ctx.clone(), pool.clone()),
+        );
 
     match equity_price_task {
         Some(task) => builder.with_task("dashboard-equity-prices", task),
