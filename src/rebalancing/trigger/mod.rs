@@ -17448,7 +17448,7 @@ mod tests {
         assert_eq!(
             inventory.equity_available(&symbol, Venue::Hedging),
             Some(shares(50)),
-            "Clearing a phantom residual must not credit it back to Hedging available"
+            "Clearing the residual must not credit it back to Hedging available"
         );
         drop(inventory);
         assert_eq!(
