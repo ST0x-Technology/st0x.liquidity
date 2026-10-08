@@ -3331,8 +3331,8 @@ impl InventoryView {
             }
         }
 
-        // Track current poll symbols for next cycle's cleanup. Symbols with an
-        // active mint were not set above, so the poll owns nothing to zero.
+        // Track current poll symbols for next cycle's cleanup. An active mint's
+        // symbol is left to the mint, whose terminal cleanup zeroes any residual.
         view.previous_inflight_mint_symbols = mints
             .keys()
             .filter(|symbol| !view.active_mints.contains_key(*symbol))
