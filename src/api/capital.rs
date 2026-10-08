@@ -44,6 +44,7 @@ use super::{
     ops_precondition_error, quiesce_usdc_driver, spawn_detached, usdc_resume_error_response,
 };
 use crate::AppState;
+use crate::alerts::AlertKind;
 use crate::cctp_burn::{
     BotCctpBridge, BurnNotSuperseded, BurnReceiptFate, CctpBurnOperation, CctpBurnOperationCommand,
     CctpBurnOperationId, CctpBurnStatus, CctpSourceChain, NonceTakenBy, RequestedBurn,
@@ -855,7 +856,7 @@ async fn broadcast_and_answer<Held: Send + 'static>(
                 return Ok((response, std::future::ready(()).boxed()));
             }
         }
-        error!(target: "operational_alert", alert = true, %operation_id, %burn_tx, ?direction, %failure, "A recorded CCTP burn could not be sent, and its receipt does not prove its outcome");
+        error!(target: "operational_alert", alert = true, kind = AlertKind::CapitalCctpBurnSendUnproven.as_str(), %operation_id, %burn_tx, ?direction, %failure, "A recorded CCTP burn could not be sent, and its receipt does not prove its outcome");
         return Err((
             StatusCode::BAD_GATEWAY,
             Json(ErrorResponse {
@@ -956,7 +957,7 @@ async fn release_unpersisted_burn(
             ))
         }
         Err(error) => {
-            error!(target: "operational_alert", alert = true, %operation_id, %burn_tx, nonce, ?error, "Cannot tell whether a signed CCTP burn was recorded; its nonce stays reserved and every later send from the source wallet waits behind it until a restart");
+            error!(target: "operational_alert", alert = true, kind = AlertKind::CapitalCctpBurnRecordUnknown.as_str(), %operation_id, %burn_tx, nonce, ?error, "Cannot tell whether a signed CCTP burn was recorded; its nonce stays reserved and every later send from the source wallet waits behind it until a restart");
             Err((
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(ErrorResponse {

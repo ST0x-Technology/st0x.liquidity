@@ -32,7 +32,7 @@ use st0x_tokenization::{TokenizationRequestType, Tokenizer, TokenizerError};
 use super::BroadcastingInventory;
 use super::divergence::{InventoryDivergenceRecoveryCtx, ReconciliationGeneration};
 use super::view::{HedgeOrderGateCorrection, InventoryScope, Venue};
-use crate::alerts::Notifier;
+use crate::alerts::{AlertKind, Notifier};
 use crate::inventory::freshness::PollFreshness;
 use crate::inventory::snapshot::{
     InventorySnapshot, InventorySnapshotCommand, InventorySnapshotId,
@@ -254,7 +254,10 @@ async fn report_hedge_order_gate_corrections(
         "Removed or replaced {} hedge-order gate(s) against durable Position state: {actionable_corrections:?}",
         actionable_corrections.len()
     );
-    if let Err(error) = notifier.notify(&message).await {
+    if let Err(error) = notifier
+        .notify(AlertKind::HedgeOrderGateCorrected, &message)
+        .await
+    {
         error!(
             target: "inventory",
             ?error,

@@ -8670,6 +8670,23 @@ for one release, then rejected -- `chat_id`/`message_thread_id` in the
 secrets file. Deployed config versions still carry the former, deployed secret
 versions the latter, and the previous build required them.)
 
+Every alert line also carries a `kind` field: the alert class from a closed set
+in the bot. A kind the `operational_alerts` extractor already classifies has
+exactly the extractor's label, so the alert rules keyed on `kind` match the
+field unchanged; the bot pins that list against the rules. A kind the extractor
+does not know yet pages as unclassified until the extractor and the rules learn
+it. A wrapper alert that embeds a rendered error (a dead-lettered job, a
+supervised worker's terminal failure) takes the most specific known kind named
+in its text, as the extractor does, and falls back to its own kind. The message
+text stays the same. A text log line also renders `kind="..."` after the
+message, and the extractor takes the rightmost phrase on the line, so a text
+line now classifies by the field unless a later field names another phrase. This
+changes a text-mode label only for an alert whose embedded runtime text named a
+different phrase. The phrase extractor is transitional: once the
+`operational_alerts` pager reads the `kind` field, the extracted and
+not-extracted split goes; the text classifier stays until wrapper alerts take
+their kind from the error type.
+
 ### BaseToAlpaca deposit send
 
 The CCTP mint on the BaseToAlpaca leg sets `mintRecipient` to the bot's own

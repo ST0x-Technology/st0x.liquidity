@@ -33,7 +33,7 @@ use super::{
     WITHDRAWAL_RECONCILIATION_REDRIVE_DELAY, issuer_send_redrive, page_underlying_mismatch,
     withdrawal_reconciliation_redrive_delay,
 };
-use crate::alerts::Notifier;
+use crate::alerts::{AlertKind, Notifier};
 #[cfg(test)]
 use crate::bot_gas::BotGasReceiptCostEnqueuer;
 use crate::bot_gas::redrive::{BotGasFailureClassifier, redrive_on_bot_gas_failure};
@@ -164,6 +164,7 @@ impl Job<ResumeTokenizationCtx> for ResumeTokenizationAggregate {
     const PERFORM_TIMEOUT: Option<std::time::Duration> = None;
     const TERMINAL_FAILURE_MSG: &'static str = "Interrupted tokenization aggregate failed all resume retries; \
          the aggregate remains stuck. Operator action required.";
+    const TERMINAL_FAILURE_KIND: AlertKind = AlertKind::TokenizationResumeFailed;
 
     #[cfg(any(test, feature = "test-support"))]
     const JOB_KIND: crate::conductor::job::JobKind =
@@ -443,6 +444,18 @@ mod tests {
     use crate::rebalancing::equity::EquityTransferServices;
     use crate::tokenized_equity_mint::{TokenizedEquityMint, TokenizedEquityMintCommand};
     use crate::vault_lookup::MockVaultLookup;
+
+    #[test]
+    fn terminal_failure_message_carries_its_kind() {
+        assert_eq!(
+            AlertKind::most_specific_in(
+                <ResumeTokenizationAggregate as Job<ResumeTokenizationCtx>>::TERMINAL_FAILURE_MSG
+            ),
+            Some(
+                <ResumeTokenizationAggregate as Job<ResumeTokenizationCtx>>::TERMINAL_FAILURE_KIND
+            )
+        );
+    }
 
     /// The aggregate driver keeps its existing unbounded execution policy;
     /// signed sends to the issuer now remain safe when transport calls are retried.

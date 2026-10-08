@@ -20,6 +20,7 @@ use st0x_wrapper::WrapperError;
 
 use super::allocation::EquityPlanError;
 use super::{RebalancingService, TokenAddressError};
+use crate::alerts::AlertKind;
 use crate::conductor::job::{Job, JobQueue, Label, QueuePushError};
 use crate::dashboard::equity_price::EquityPriceStore;
 use crate::inventory::EquityVenuesError;
@@ -611,6 +612,7 @@ pub(crate) fn claim_guard_for_recovery_or_orphan(
             error!(
                 target: "operational_alert",
                 alert = true,
+                kind = AlertKind::RecoveryClaimHeldForOtherChain.as_str(),
                 %symbol,
                 %held_chain,
                 claiming_chain = %chain,
