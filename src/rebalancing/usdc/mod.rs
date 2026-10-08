@@ -313,7 +313,8 @@ pub enum UsdcTransferError {
     #[error("USDC rebalance {id}: another send split the swap's approve and deposit; retrying")]
     SwapPairSplit { id: UsdcRebalanceId },
     /// The task that signs and persists the swap pair panicked. A pair it
-    /// persisted is sent by the retry, which otherwise signs one.
+    /// persisted is sent by the retry; nonces it reserved and did not persist
+    /// stall later sends from the chain wallet until a restart.
     #[error("USDC rebalance {id}: the Relay pair prepare task panicked")]
     SwapPrepareTaskPanicked { id: UsdcRebalanceId },
     /// The recorded quote is past its deadline or older than the corridor's
