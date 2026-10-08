@@ -17438,6 +17438,75 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn post_acceptance_mint_failure_clears_hedging_inflight_an_untracked_poll_left() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let inventory = InventoryView::default()
+            .with_equity(symbol.clone(), shares(0), shares(0))
+            .update_equity(
+                &symbol,
+                Inventory::available(Venue::MarketMaking, Operator::Add, shares(20)),
+                Utc::now(),
+            )
+            .unwrap()
+            .update_equity(
+                &symbol,
+                Inventory::available(Venue::Hedging, Operator::Add, shares(80)),
+                Utc::now(),
+            )
+            .unwrap();
+
+        let reactor = make_trigger_with_inventory_and_registry(inventory, &symbol).await;
+        let trigger = reactor.clone();
+        let harness = ReactorHarness::new(Arc::clone(&trigger));
+        let id = issuer_request_id("failed-mint-after-untracked-poll");
+
+        apply_and_dispatch_snapshot(
+            reactor.clone(),
+            InventorySnapshotId {
+                orderbook: TEST_ORDERBOOK,
+                owner: TEST_ORDER_OWNER,
+            },
+            InventorySnapshotEvent::InflightEquity {
+                mints: BTreeMap::from([(symbol.clone(), shares(30))]),
+                redemptions: BTreeMap::new(),
+                fetched_at: Utc::now(),
+                base_redemptions_chain_scoped: true,
+            },
+        )
+        .await
+        .unwrap();
+
+        for event in [
+            make_mint_requested(&symbol, float!(30)),
+            make_mint_accepted(),
+            make_mint_acceptance_failed(),
+        ] {
+            harness
+                .receive::<TokenizedEquityMint>(id.clone(), event)
+                .await
+                .unwrap();
+        }
+
+        let inventory = trigger.inventory.read().await;
+        assert_eq!(
+            inventory.equity_inflight(&symbol, Venue::Hedging),
+            Some(shares(0)),
+            "The failed mint must zero the residual Hedging inflight"
+        );
+        assert_eq!(
+            inventory.equity_available(&symbol, Venue::Hedging),
+            Some(shares(80)),
+            "The failed mint must restore Hedging available exactly once"
+        );
+        drop(inventory);
+        assert_eq!(
+            trigger.divergence_gate.pending_offchain_equity_reconciles(),
+            vec![symbol.clone()],
+            "Clearing a residual must force the next broker snapshot through"
+        );
+    }
+
+    #[tokio::test]
     async fn mint_acceptance_failed_via_reactor_restores_imbalance() {
         let symbol = Symbol::new("AAPL").unwrap();
         // 20 onchain, 80 offchain = imbalanced
