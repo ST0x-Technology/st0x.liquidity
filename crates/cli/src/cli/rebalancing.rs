@@ -4688,6 +4688,46 @@ mod tests {
         );
     }
 
+    /// A chain-to-Alpaca Relay transfer at `WithdrawalComplete` is refused
+    /// with the Relay hold, not the CCTP post-burn steps, which refuse it too.
+    #[tokio::test]
+    async fn fail_usdc_transfer_names_the_relay_withdrawal_hold() {
+        let pool = setup_test_db().await;
+        let id = Uuid::from_u128(0xBEEF_0002_00AA);
+        let (store, _projection) = StoreBuilder::<UsdcRebalance>::new(pool.clone())
+            .build(())
+            .await
+            .unwrap();
+        for command in [
+            UsdcRebalanceCommand::Initiate {
+                corridor: UsdcCorridor::HubRouted {
+                    chain: Chain::Robinhood,
+                    hop: HopKind::Relay,
+                },
+                direction: RebalanceDirection::BaseToAlpaca,
+                amount: Usdc::new(float!(100)),
+                withdrawal: TransferRef::OnchainTx(B256::repeat_byte(0x01)),
+            },
+            UsdcRebalanceCommand::ConfirmWithdrawal {
+                withdrawal_tx: None,
+            },
+        ] {
+            store.send(&UsdcRebalanceId(id), command).await.unwrap();
+        }
+
+        let mut stdout = Vec::new();
+        let err_msg =
+            fail_usdc_transfer_command(&mut stdout, id, &"should fail".parse().unwrap(), &pool)
+                .await
+                .unwrap_err()
+                .to_string();
+
+        assert!(err_msg.contains("WithdrawalComplete"), "{err_msg}");
+        assert!(err_msg.contains("outside the vault"), "{err_msg}");
+        assert!(err_msg.contains("redeposit"), "{err_msg}");
+        assert!(!err_msg.contains("clear-pending-burn"), "{err_msg}");
+    }
+
     #[tokio::test]
     async fn fail_usdc_transfer_rejects_post_burn_awaiting_attestation() {
         // AwaitingAttestation is also accepted by transition_fail_bridging and

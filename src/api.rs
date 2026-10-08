@@ -11555,6 +11555,67 @@ mod tests {
         ));
     }
 
+    /// A chain-to-Alpaca Relay transfer past its withdrawal is refused with
+    /// the Relay hold, not the CCTP post-burn steps, which refuse it too.
+    #[tokio::test]
+    async fn fail_pre_burn_usdc_transfer_names_the_relay_hold() {
+        let pool = crate::test_utils::setup_test_db().await;
+        let store = standalone_usdc_store(&pool).await;
+        let relay = UsdcCorridor::HubRouted {
+            chain: Chain::Robinhood,
+            hop: HopKind::Relay,
+        };
+        let withdrawn = UsdcRebalanceId(uuid::Uuid::new_v4());
+        for command in [
+            UsdcRebalanceCommand::Initiate {
+                direction: RebalanceDirection::BaseToAlpaca,
+                corridor: relay,
+                amount: Usdc::new(float!(100)),
+                withdrawal: TransferRef::OnchainTx(TxHash::repeat_byte(0x22)),
+            },
+            UsdcRebalanceCommand::ConfirmWithdrawal {
+                withdrawal_tx: None,
+            },
+        ] {
+            store.send(&withdrawn, command).await.unwrap();
+        }
+        let deposited = UsdcRebalanceId(uuid::Uuid::new_v4());
+        crate::usdc_rebalance::record_swap_pair_for_test(
+            &store,
+            &deposited,
+            RebalanceDirection::BaseToAlpaca,
+            relay,
+            None,
+            PreparedTransaction::for_test(TxHash::repeat_byte(0xa2), 6),
+        )
+        .await;
+
+        for (id, state) in [
+            (&withdrawn, "WithdrawalComplete"),
+            (&deposited, "SwapDepositPrepared"),
+        ] {
+            let Err((status, Json(error))) =
+                fail_pre_burn_usdc_transfer(&store, id, "audit".to_string()).await
+            else {
+                panic!("a Relay transfer past its withdrawal must be refused");
+            };
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            assert!(error.error.contains(state), "{}", error.error);
+            assert!(error.error.contains("outside the vault"), "{}", error.error);
+            assert!(error.error.contains("redeposit"), "{}", error.error);
+            assert!(
+                !error.error.contains("clear-pending-burn"),
+                "{}",
+                error.error
+            );
+            assert_eq!(
+                load_usdc_rebalance(&pool, id).await.state_name(),
+                state,
+                "the refused transfer is left as it was"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn fail_pre_burn_usdc_transfer_refuses_a_post_burn_failure() {
         let pool = crate::test_utils::setup_test_db().await;
