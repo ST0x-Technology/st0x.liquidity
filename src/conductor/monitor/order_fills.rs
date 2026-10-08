@@ -68,7 +68,7 @@
 //! surfaces a `removed: true` log as a warning rather than masking it, as
 //! defense in depth.
 
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use alloy::eips::BlockNumberOrTag;
 use alloy::providers::Provider;
@@ -80,8 +80,10 @@ use tokio::time::MissedTickBehavior;
 use tracing::{debug, info, warn};
 
 use st0x_config::{HedgedChain, IngestionCutoff};
+use st0x_evm::Chain;
 
 use crate::conductor::job::QueuePushError;
+use crate::metrics::liquidity::integer_value;
 use crate::onchain::OnChainError;
 use crate::onchain::backfill::{
     BackfillJobQueue, BackfillRange, backfill_start_from_checkpoint, load_backfill_checkpoint,
@@ -152,6 +154,7 @@ impl<P: Provider + Clone + Send + Sync + 'static> SupervisedTask for OrderFillMo
             // poll_once performs -- while excluding the poll-cycle telemetry
             // write below, which would otherwise measure itself.
             let poll_duration = tick.elapsed();
+            record_poll_cycle_metrics(self.evm_ctx.chain, &result, skipped, poll_duration);
 
             // The poll-cycle outcome is a success/failure discriminator, so the
             // structured PollOutcome on the success path is collapsed to `()`.
@@ -186,6 +189,85 @@ impl<P: Provider + Clone + Send + Sync + 'static> SupervisedTask for OrderFillMo
             }
         }
     }
+}
+
+/// The `outcome` label of `order_fill_poll_cycles_total`. Unlike the
+/// SQLite poll-cycle row, it tells a paused cycle apart from a healthy one:
+/// a paused cycle succeeds but ingests nothing, so `ok` would hide the stall.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PollCycleOutcome {
+    Ok,
+    Paused,
+    Error,
+}
+
+impl PollCycleOutcome {
+    fn of(result: &Result<PollOutcome, OrderFillMonitorError>) -> Self {
+        match result {
+            Ok(outcome) if outcome.pauses_ingestion() => Self::Paused,
+            Ok(_) => Self::Ok,
+            Err(_) => Self::Error,
+        }
+    }
+
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Ok => "ok",
+            Self::Paused => "paused",
+            Self::Error => "error",
+        }
+    }
+}
+
+/// The native counterpart of the poll-cycle telemetry row: one cycle, its
+/// skipped ticks and its duration, under the watcher's chain.
+fn record_poll_cycle_metrics(
+    chain: Chain,
+    result: &Result<PollOutcome, OrderFillMonitorError>,
+    skipped: u64,
+    duration: Duration,
+) {
+    let chain = chain.as_str();
+    let outcome = PollCycleOutcome::of(result);
+
+    metrics::counter!(
+        "order_fill_poll_cycles_total",
+        "chain" => chain,
+        "outcome" => outcome.as_str(),
+    )
+    .increment(1);
+    metrics::counter!("order_fill_poll_skipped_ticks_total", "chain" => chain).increment(skipped);
+    metrics::histogram!("order_fill_poll_duration_seconds", "chain" => chain).record(duration);
+}
+
+/// Sets the chain's block-lag gauge, and the time of that sample, when the
+/// sample knows the lag. An unknown lag (no cutoff block or no checkpoint
+/// yet) leaves both at their last values, so a stale sample time shows
+/// that the lag is held.
+fn publish_block_lag(sample: &BlockLagSample) {
+    let Some(lag) = sample.lag_blocks() else {
+        return;
+    };
+
+    let lag = match integer_value(lag) {
+        Ok(lag) => lag,
+        Err(error) => {
+            warn!(target: "orderbook", %error, "Skipped the block-lag gauge");
+            return;
+        }
+    };
+    let sampled_at = match SystemTime::from(sample.sampled_at).duration_since(UNIX_EPOCH) {
+        Ok(since_epoch) => since_epoch.as_secs_f64(),
+        Err(error) => {
+            warn!(target: "orderbook", %error, "Skipped the block-lag gauge: sample predates the Unix epoch");
+            return;
+        }
+    };
+
+    let chain = sample.chain.as_str();
+    metrics::gauge!("order_fill_block_lag_blocks", "chain" => chain).set(lag);
+    metrics::gauge!("order_fill_block_lag_sampled_timestamp_seconds", "chain" => chain)
+        .set(sampled_at);
 }
 
 /// How often expired telemetry rows are pruned.
@@ -264,6 +346,22 @@ enum PollOutcome {
     /// configured ahead of it. Nothing to ingest yet; no committed progress is at
     /// risk.
     CutoffBehindDeployment,
+}
+
+impl PollOutcome {
+    /// Whether the cycle paused ingestion while committed progress exists:
+    /// the cycle succeeds, but no fill is ingested until the cutoff recovers.
+    const fn pauses_ingestion(self) -> bool {
+        match self {
+            Self::NoCutoffWithCheckpoint | Self::CutoffBehindCheckpoint => true,
+            Self::RangeInFlight
+            | Self::NoCutoffColdStart
+            | Self::Enqueued { .. }
+            | Self::CaughtUp
+            | Self::CutoffWithinQuietSkew
+            | Self::CutoffBehindDeployment => false,
+        }
+    }
 }
 
 /// Maximum backwards deviation from the checkpoint that is tolerated quietly
@@ -346,6 +444,7 @@ impl<P: Provider + Clone> OrderFillMonitor<P> {
             cutoff_block: cutoff_opt,
             last_processed_block: sampled_checkpoint,
         };
+        publish_block_lag(&sample);
         if let Err(error) = record_block_lag(&self.pool, &sample).await {
             warn!(target: "orderbook", ?error, "Failed to record block-lag telemetry");
         }
@@ -616,6 +715,8 @@ pub(crate) async fn probe_cutoff_block_support<P: Provider>(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use alloy::providers::ProviderBuilder;
     use alloy::providers::mock::Asserter;
     use alloy::rpc::types::{Block, Transaction};
@@ -625,6 +726,7 @@ mod tests {
     use st0x_evm::Chain;
 
     use super::*;
+    use crate::metrics::liquidity::tests::{SeriesKey, parse_exposition, series};
     use crate::test_utils::setup_test_pools;
 
     /// Builds a mock block at `number` for use in mock provider responses.
@@ -1475,6 +1577,186 @@ mod tests {
             backfill_job_count(&apalis_pool).await,
             2,
             "once the orphan reaches a terminal state the poller enqueues a new range"
+        );
+    }
+
+    fn rendered(
+        handle: &metrics_exporter_prometheus::PrometheusHandle,
+    ) -> BTreeMap<SeriesKey, f64> {
+        parse_exposition(&handle.render())
+    }
+
+    #[test]
+    fn poll_cycle_metrics_count_cycles_skips_and_duration_per_chain() {
+        let recorder = crate::metrics::local_recorder();
+        let handle = recorder.handle();
+
+        metrics::with_local_recorder(&recorder, || {
+            record_poll_cycle_metrics(
+                Chain::Base,
+                &Ok(PollOutcome::CaughtUp),
+                0,
+                Duration::from_millis(40),
+            );
+            record_poll_cycle_metrics(
+                Chain::Base,
+                &Err(OrderFillMonitorError::Rpc(
+                    TransportErrorKind::backend_gone(),
+                )),
+                2,
+                Duration::from_millis(300),
+            );
+            record_poll_cycle_metrics(
+                Chain::Robinhood,
+                &Ok(PollOutcome::NoCutoffWithCheckpoint),
+                1,
+                Duration::from_secs(2),
+            );
+        });
+
+        let rendered = rendered(&handle);
+        let cycles = |chain: &str, outcome: &str| {
+            rendered
+                .get(&series(
+                    "order_fill_poll_cycles_total",
+                    &[("chain", chain), ("outcome", outcome)],
+                ))
+                .copied()
+        };
+        assert_eq!(cycles("base", "ok"), Some(1.0));
+        assert_eq!(cycles("base", "error"), Some(1.0));
+        assert_eq!(cycles("base", "paused"), None);
+        assert_eq!(cycles("robinhood", "paused"), Some(1.0));
+        assert_eq!(cycles("robinhood", "ok"), None);
+        assert_eq!(cycles("robinhood", "error"), None);
+        let skipped = |chain: &str| {
+            rendered
+                .get(&series(
+                    "order_fill_poll_skipped_ticks_total",
+                    &[("chain", chain)],
+                ))
+                .copied()
+        };
+        assert_eq!(skipped("base"), Some(2.0));
+        assert_eq!(skipped("robinhood"), Some(1.0));
+        let bucket = |chain: &str, le: &str| {
+            rendered
+                .get(&series(
+                    "order_fill_poll_duration_seconds_bucket",
+                    &[("chain", chain), ("le", le)],
+                ))
+                .copied()
+        };
+        assert_eq!(bucket("base", "0.05"), Some(1.0));
+        assert_eq!(bucket("base", "0.5"), Some(2.0));
+        assert_eq!(bucket("robinhood", "1"), Some(0.0));
+        assert_eq!(bucket("robinhood", "2.5"), Some(1.0));
+    }
+
+    #[test]
+    fn poll_cycle_outcome_marks_a_paused_ingestion_apart_from_ok() {
+        let paused = [
+            PollOutcome::NoCutoffWithCheckpoint,
+            PollOutcome::CutoffBehindCheckpoint,
+        ];
+        let ok = [
+            PollOutcome::RangeInFlight,
+            PollOutcome::NoCutoffColdStart,
+            PollOutcome::Enqueued {
+                from_block: 1,
+                to_block: 2,
+            },
+            PollOutcome::CaughtUp,
+            PollOutcome::CutoffWithinQuietSkew,
+            PollOutcome::CutoffBehindDeployment,
+        ];
+
+        for outcome in paused {
+            assert_eq!(
+                PollCycleOutcome::of(&Ok(outcome)),
+                PollCycleOutcome::Paused,
+                "{outcome:?}"
+            );
+        }
+        for outcome in ok {
+            assert_eq!(
+                PollCycleOutcome::of(&Ok(outcome)),
+                PollCycleOutcome::Ok,
+                "{outcome:?}"
+            );
+        }
+        let error = OrderFillMonitorError::Rpc(TransportErrorKind::backend_gone());
+        assert_eq!(PollCycleOutcome::of(&Err(error)), PollCycleOutcome::Error);
+        assert_eq!(PollCycleOutcome::Paused.as_str(), "paused");
+    }
+
+    /// The gauge and its sample time follow each poll that knows the lag. A
+    /// paused poll with no cutoff block keeps both, so the sample time goes
+    /// stale while the lag is held.
+    #[tokio::test]
+    async fn poll_once_sets_the_block_lag_gauge_and_its_sample_time() {
+        let recorder = crate::metrics::local_recorder();
+        let handle = recorder.handle();
+        let _local = metrics::set_default_local_recorder(&recorder);
+        let gauge = |handle, name| {
+            rendered(handle)
+                .get(&series(name, &[("chain", "base")]))
+                .copied()
+        };
+        let lag = |handle| gauge(handle, "order_fill_block_lag_blocks");
+        let sampled_at = |handle| gauge(handle, "order_fill_block_lag_sampled_timestamp_seconds");
+        let first = DateTime::from_timestamp(1_800_000_000, 0).unwrap();
+        let second = first + chrono::Duration::seconds(5);
+        let third = second + chrono::Duration::seconds(5);
+
+        let asserter = Asserter::new();
+        push_tick(&asserter, 105, Some(102));
+        push_tick(&asserter, 105, Some(102));
+        push_tick(&asserter, 106, None);
+        let provider = ProviderBuilder::new().connect_mocked_client(asserter);
+        // A deployment block past the cutoff keeps every poll from enqueuing,
+        // so no range is in flight when the third poll reaches the cutoff.
+        let (mut monitor, pool, _apalis_pool, evm_ctx) =
+            setup_with_deployment_block(provider, 200).await;
+
+        assert_eq!(
+            monitor.poll_once(first).await.unwrap(),
+            PollOutcome::CutoffBehindDeployment
+        );
+        assert_eq!(lag(&handle), None, "no checkpoint yet, so no lag");
+        assert_eq!(sampled_at(&handle), None);
+
+        crate::onchain::backfill::save_backfill_checkpoint(&pool, &evm_ctx, 99)
+            .await
+            .unwrap();
+        assert_eq!(
+            monitor.poll_once(second).await.unwrap(),
+            PollOutcome::CutoffBehindDeployment
+        );
+        assert_eq!(lag(&handle), Some(3.0));
+        assert_eq!(sampled_at(&handle), Some(1_800_000_005.0));
+
+        let outcome = monitor.poll_once(third).await;
+        assert_eq!(
+            outcome.as_ref().ok(),
+            Some(&PollOutcome::NoCutoffWithCheckpoint)
+        );
+        record_poll_cycle_metrics(Chain::Base, &outcome, 0, Duration::from_millis(10));
+        let cycles = |outcome: &str| {
+            rendered(&handle)
+                .get(&series(
+                    "order_fill_poll_cycles_total",
+                    &[("chain", "base"), ("outcome", outcome)],
+                ))
+                .copied()
+        };
+        assert_eq!(cycles("paused"), Some(1.0));
+        assert_eq!(cycles("ok"), None);
+        assert_eq!(lag(&handle), Some(3.0), "an unknown lag keeps the last one");
+        assert_eq!(
+            sampled_at(&handle),
+            Some(1_800_000_005.0),
+            "the sample time stays at the last known lag"
         );
     }
 
