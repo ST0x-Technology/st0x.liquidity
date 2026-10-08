@@ -145,8 +145,8 @@ use crate::rebalancing::usdc::{
 };
 use crate::rebalancing::{
     BaseWallet, ChainRebalancingConfig, ChainWallets, EthereumWallet, RebalancerServices,
-    RebalancingSchedulers, RebalancingService, RebalancingServiceConfig, UsdcCorridorEndpoints,
-    to_wrapped_equities, usdc_gas_readiness_by_chain,
+    RebalancingSchedulers, RebalancingService, RebalancingServiceConfig, RelayHopSetup,
+    UsdcCorridorEndpoints, to_wrapped_equities, usdc_gas_readiness_by_chain,
 };
 use crate::startup::StartupToken;
 use crate::telemetry::broker::InstrumentedAlpacaBroker;
@@ -3408,12 +3408,32 @@ async fn build_rebalancer_services<Signer: Wallet + Clone>(
         telemetry,
     );
 
+    let relay_hops = rebalancing_ctx
+        .usdc
+        .relay_hops()
+        .iter()
+        .map(|(chain, bounds)| {
+            let chain_confirmations = chains.required_confirmations(*chain).with_context(|| {
+                format!("the {chain} Relay corridor needs a [chains.{chain}] table")
+            })?;
+
+            Ok((
+                *chain,
+                RelayHopSetup {
+                    bounds: *bounds,
+                    chain_confirmations,
+                },
+            ))
+        })
+        .collect::<anyhow::Result<BTreeMap<_, _>>>()?;
+
     Ok(RebalancerServices::new(
         broker,
         alpaca_wallet,
         ethereum_wallet,
         rebalancing_ctx.cctp_corridor,
         UsdcSettlementParams::for_chains(rebalancing_ctx, chains, reserved_cash),
+        relay_hops,
     ))
 }
 
@@ -3935,6 +3955,18 @@ fn spawn_rebalancing_infrastructure<Signer: Wallet + Clone>(
         );
         if unmined > 0 {
             unmined_restore_chains.insert(Chain::Ethereum);
+        }
+
+        // Each Relay corridor's pairs signed on its own chain's wallet.
+        for (chain, RestoredDepositSends { restored, unmined }) in usdc_handles
+            .restore_deposit_sends
+            .restore_chain_signed_swaps(&deps.pool)
+            .await
+        {
+            info!(target: "rebalance", %chain, restored, unmined, "Restored and rebroadcast the signed Relay pairs");
+            if unmined > 0 {
+                unmined_restore_chains.insert(chain);
+            }
         }
 
         // Likewise for the signed burns of the capital `cctp-bridge` route:

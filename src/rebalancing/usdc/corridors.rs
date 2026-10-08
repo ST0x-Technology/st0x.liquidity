@@ -13,12 +13,13 @@ use async_trait::async_trait;
 use sqlx::SqlitePool;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
+use tracing::{error, warn};
 
 use st0x_bridge::BridgeDirection;
 use st0x_bridge::cctp::AttestationResponse;
 use st0x_bridge::corridor::UsdcCorridor;
 use st0x_event_sorcery::Store;
-use st0x_evm::PreparedTransaction;
+use st0x_evm::{Chain, PreparedTransaction};
 use st0x_finance::Usdc;
 
 use super::manager::RecoveredCctpMint;
@@ -28,7 +29,9 @@ use super::{
     UsdcRecheckError, UsdcTransferError, unserved_corridor,
 };
 use crate::rebalancing::equity::RecheckOutcome;
-use crate::usdc_rebalance::{UsdcRebalance, UsdcRebalanceId};
+use crate::usdc_rebalance::{
+    RebalanceDirection, UsdcRebalance, UsdcRebalanceId, prepared_swap_ids,
+};
 
 const CCTP_CORRIDOR_NOT_SERVED: CctpMintRecoveryError = CctpMintRecoveryError::CorridorNotServed {
     corridor: UsdcCorridor::BASE_CCTP,
@@ -95,6 +98,47 @@ impl UsdcCorridorTransfers {
 
         let served = self.by_corridor.keys().copied().collect::<BTreeSet<_>>();
         Err(unserved_corridor(id, requested, &served, state.as_ref()))
+    }
+
+    /// Pages the chain-signed Relay pairs persisted on a corridor no service
+    /// carries, whose nonces nothing restores, and returns how many there are
+    /// on each chain. A listing or load failure is paged by the hub's restore.
+    async fn page_unserved_chain_signed_swaps(&self, pool: &SqlitePool) -> BTreeMap<Chain, usize> {
+        let ids = match prepared_swap_ids(pool).await {
+            Ok((ids, _unparseable)) => ids,
+            Err(error) => {
+                warn!(target: "rebalance", ?error, "Could not list signed Relay pairs to check their corridors at startup");
+                return BTreeMap::new();
+            }
+        };
+
+        let mut unserved: BTreeMap<UsdcCorridor, Vec<UsdcRebalanceId>> = BTreeMap::new();
+        for id in ids {
+            match self.store.load(&id).await {
+                Ok(Some(state))
+                    if state.direction() == RebalanceDirection::BaseToAlpaca
+                        && !self.by_corridor.contains_key(&state.corridor()) =>
+                {
+                    unserved.entry(state.corridor()).or_default().push(id);
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    warn!(target: "rebalance", %id, ?error, "Could not load a transfer with a signed Relay pair to check its corridor at startup");
+                }
+            }
+        }
+
+        unserved
+            .into_iter()
+            .map(|(corridor, ids)| {
+                let chain = corridor.chain();
+                error!(target: "operational_alert", alert = true, %corridor, %chain, ?ids, "Signed Relay pairs on a corridor this build does not serve were not restored at startup; their nonces are not reserved, so startup skips {chain}'s approvals and revokes until a build serving {corridor} restores them");
+                (chain, ids.len())
+            })
+            .fold(BTreeMap::new(), |mut by_chain, (chain, count)| {
+                *by_chain.entry(chain).or_default() += count;
+                by_chain
+            })
     }
 
     /// The Base via CCTP service, the one corridor whose bridge carries a
@@ -172,13 +216,33 @@ impl RecheckUsdcDeposit for UsdcCorridorTransfers {
     }
 }
 
-/// Runs once, on one service: the signed deposit sends all belong to the
-/// shared Ethereum wallet, and each must be restored exactly once or its
-/// nonce would be rebroadcast twice.
 #[async_trait]
 impl RestorePreparedDepositSends for UsdcCorridorTransfers {
+    /// Runs once, on one service: the signed deposit sends and the Relay
+    /// pairs signed on the Ethereum wallet all belong to it, and each must be
+    /// restored exactly once or its nonce would be rebroadcast twice.
     async fn restore_prepared_deposit_sends(&self, pool: &SqlitePool) -> RestoredDepositSends {
         self.hub.restore_prepared_deposit_sends(pool).await
+    }
+
+    /// Runs on every service: each restores the Relay pairs signed on its own
+    /// corridor chain, one chain per service. A pair on a corridor no service
+    /// carries is paged and counted unmined on its chain.
+    async fn restore_chain_signed_swaps(
+        &self,
+        pool: &SqlitePool,
+    ) -> BTreeMap<Chain, RestoredDepositSends> {
+        let mut by_chain = BTreeMap::new();
+        for service in self.by_corridor.values() {
+            by_chain.extend(service.restore_chain_signed_swaps(pool).await);
+        }
+
+        for (chain, unrestored) in self.page_unserved_chain_signed_swaps(pool).await {
+            let restored: &mut RestoredDepositSends = by_chain.entry(chain).or_default();
+            restored.unmined += unrestored;
+        }
+
+        by_chain
     }
 }
 
@@ -216,7 +280,6 @@ mod tests {
     use st0x_bridge::cctp::CctpError;
     use st0x_bridge::corridor::HopKind;
     use st0x_event_sorcery::test_store;
-    use st0x_evm::Chain;
     use st0x_float_macro::float;
 
     use super::*;
@@ -294,6 +357,13 @@ mod tests {
         async fn restore_prepared_deposit_sends(&self, _pool: &SqlitePool) -> RestoredDepositSends {
             *self.restores.lock().unwrap() += 1;
             RestoredDepositSends::default()
+        }
+
+        async fn restore_chain_signed_swaps(
+            &self,
+            _pool: &SqlitePool,
+        ) -> BTreeMap<Chain, RestoredDepositSends> {
+            BTreeMap::new()
         }
     }
 
@@ -440,6 +510,42 @@ mod tests {
             ),
             "got {error:?}"
         );
+    }
+
+    /// A pair signed on a corridor chain's wallet and persisted on a
+    /// corridor the config no longer serves has no service to restore it:
+    /// startup pages its id and counts it unmined on that chain.
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn chain_signed_pair_on_an_unserved_corridor_pages_at_startup() {
+        let TwoCorridors {
+            transfers,
+            store,
+            pool,
+            ..
+        } = two_corridors().await;
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        crate::usdc_rebalance::record_swap_pair_for_test(
+            &store,
+            &id,
+            RebalanceDirection::BaseToAlpaca,
+            ROBINHOOD_RELAY,
+            None,
+            PreparedTransaction::for_test(TxHash::repeat_byte(0xc2), 61),
+        )
+        .await;
+
+        let by_chain = transfers.restore_chain_signed_swaps(&pool).await;
+
+        assert_eq!(
+            by_chain.get(&Chain::Robinhood),
+            Some(&RestoredDepositSends {
+                restored: 0,
+                unmined: 1,
+            })
+        );
+        assert!(logs_contain("operational_alert"));
+        assert!(logs_contain(&id.to_string()));
     }
 
     /// The signed deposit sends belong to the one Ethereum wallet, so the

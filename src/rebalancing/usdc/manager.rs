@@ -12,7 +12,7 @@ use chrono::{DateTime, Utc};
 use itertools::Itertools;
 use rain_math_float::Float;
 use sqlx::SqlitePool;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::{debug, error, info, instrument, warn};
@@ -21,7 +21,7 @@ use uuid::Uuid;
 use st0x_bridge::cctp::{
     AttestationResponse, CctpBridge, CctpError, MintScanFloorCheck, UsdcTransferStatus,
 };
-use st0x_bridge::corridor::UsdcCorridor;
+use st0x_bridge::corridor::{HopKind, UsdcCorridor};
 use st0x_bridge::relay::RelayBridge;
 use st0x_bridge::{Attestation, Bridge, BridgeDirection, BurnReceipt, BurnTxStatus, MintReceipt};
 use st0x_config::{
@@ -51,7 +51,8 @@ use crate::telemetry::broker::InstrumentedAlpacaBroker;
 use crate::usdc_rebalance::{
     ConversionAmounts, DepositSend, EthereumWalletCredit, RebalanceDirection, TransferRef,
     UsdcRebalance, UsdcRebalanceCommand, UsdcRebalanceId, deposit_send_recorded_elsewhere,
-    open_ethereum_credits, prepared_deposit_send_ids, withdrawal_tx_recorded_elsewhere,
+    open_ethereum_credits, prepared_deposit_send_ids, prepared_swap_ids,
+    withdrawal_tx_recorded_elsewhere,
 };
 
 /// Attempts to commit `RecordPendingBurn` in the detached submit-and-record
@@ -521,19 +522,20 @@ fn resize_usd_conversion_notional(
 pub struct CrossVenueCashTransfer<Signer: Wallet, B = CctpBridge<Signer, Signer>> {
     alpaca_broker: InstrumentedAlpacaBroker,
     alpaca_wallet: Arc<AlpacaWalletService>,
-    cctp_bridge: Arc<B>,
+    /// The hop between the corridor chain and the Ethereum hub.
+    pub(super) hop: Arc<B>,
     raindex: Arc<RaindexService<Signer>>,
-    cqrs: Arc<Store<UsdcRebalance>>,
+    pub(super) cqrs: Arc<Store<UsdcRebalance>>,
     /// The corridor this service moves cash on; a transfer recorded on
     /// another is refused before any send.
-    corridor: UsdcCorridor,
-    market_maker_wallet: Address,
+    pub(super) corridor: UsdcCorridor,
+    pub(super) market_maker_wallet: Address,
     vault_id: RaindexVaultId,
     attestation_retry_deadline: Duration,
     settlement_retry_deadline: Duration,
     ethereum_required_confirmations: Option<u64>,
     reserved_cash: Option<Usd>,
-    gas_readiness: ConfiguredGasReadiness,
+    pub(super) gas_readiness: ConfiguredGasReadiness,
     /// Enqueues bot-gas cost recording after CCTP burn/mint confirmations and
     /// the USDC-to-Alpaca wallet transfer succeed (ADR 0017).
     bot_gas_enqueuer: BotGasReceiptCostEnqueuer,
@@ -837,7 +839,7 @@ impl<Signer: Wallet, B: UsdcBridgeHelper> CrossVenueCashTransfer<Signer, B> {
     pub fn new(
         alpaca_broker: InstrumentedAlpacaBroker,
         alpaca_wallet: Arc<AlpacaWalletService>,
-        cctp_bridge: Arc<B>,
+        hop: Arc<B>,
         raindex: Arc<RaindexService<Signer>>,
         cqrs: Arc<Store<UsdcRebalance>>,
         market_making_endpoints: MarketMakingUsdcEndpoints,
@@ -847,7 +849,7 @@ impl<Signer: Wallet, B: UsdcBridgeHelper> CrossVenueCashTransfer<Signer, B> {
         Self {
             alpaca_broker,
             alpaca_wallet,
-            cctp_bridge,
+            hop,
             raindex,
             cqrs,
             corridor: market_making_endpoints.corridor,
@@ -867,7 +869,7 @@ impl<Signer: Wallet, B: UsdcBridgeHelper> CrossVenueCashTransfer<Signer, B> {
 
     /// Refuses, before any call, a transfer this service's corridor does not
     /// carry (see [`refuse_unserved_corridor`]).
-    fn require_served_corridor(
+    pub(super) fn require_served_corridor(
         &self,
         id: &UsdcRebalanceId,
         requested: UsdcCorridor,
@@ -956,7 +958,7 @@ impl<Signer: Wallet, B: UsdcBridgeHelper> CrossVenueCashTransfer<Signer, B> {
         let in_flight = possible - outstanding;
 
         let balance = match self
-            .cctp_bridge
+            .hop
             .ethereum_usdc_balance(self.market_maker_wallet)
             .await
         {
@@ -1023,11 +1025,7 @@ impl<Signer: Wallet, B: UsdcBridgeHelper> CrossVenueCashTransfer<Signer, B> {
             return None;
         };
 
-        match self
-            .cctp_bridge
-            .ethereum_tx_confirmations(withdrawal_tx)
-            .await
-        {
+        match self.hop.ethereum_tx_confirmations(withdrawal_tx).await {
             Ok(Some(confirmations)) if confirmations >= required => {}
             Ok(_) => return None,
             Err(error) => {
@@ -1037,7 +1035,7 @@ impl<Signer: Wallet, B: UsdcBridgeHelper> CrossVenueCashTransfer<Signer, B> {
         }
 
         let credited = self
-            .cctp_bridge
+            .hop
             .ethereum_usdc_credit(withdrawal_tx, self.market_maker_wallet)
             .await
             .inspect_err(|error| {
@@ -1633,7 +1631,7 @@ impl<Signer: Wallet, B: UsdcBridgeHelper> CrossVenueCashTransfer<Signer, B> {
         let required = self
             .ethereum_required_confirmations
             .ok_or(EthereumChainMissing)?;
-        let confirmations = match self.cctp_bridge.ethereum_tx_confirmations(tx).await {
+        let confirmations = match self.hop.ethereum_tx_confirmations(tx).await {
             Ok(confirmations) => confirmations,
             Err(error) => {
                 self.check_settlement_deadline(
@@ -1907,7 +1905,7 @@ impl<Signer: Wallet, B: UsdcBridgeHelper> CrossVenueCashTransfer<Signer, B> {
             .ethereum_required_confirmations
             .ok_or(EthereumChainMissing)?;
         match self
-            .cctp_bridge
+            .hop
             .ethereum_tx_confirmations(withdrawal_tx)
             .await
             .map_err(|error| UsdcTransferError::SettlementCheckTransient {
@@ -2225,11 +2223,14 @@ impl<Signer: Wallet, B: UsdcBridgeHelper> CrossVenueCashTransfer<Signer, B> {
                         warn!(target: "rebalance", %id, "Transfer no longer holds a signed deposit send at startup");
                         continue;
                     };
-                    self.cctp_bridge.restore_usdc_on_ethereum(prepared).await;
+                    self.hop.restore_usdc_on_ethereum(prepared).await;
                     info!(target: "rebalance", %id, tx = %prepared.tx_hash(), nonce = prepared.nonce(), "Reserved the nonce of a signed Alpaca deposit send");
                     outcome.restored += 1;
 
-                    if !self.rebroadcast_restored_deposit_send(&id, prepared).await {
+                    if !self
+                        .rebroadcast_restored_send(&id, prepared, "Alpaca deposit send")
+                        .await
+                    {
                         outcome.unmined += 1;
                     }
                 }
@@ -2243,38 +2244,120 @@ impl<Signer: Wallet, B: UsdcBridgeHelper> CrossVenueCashTransfer<Signer, B> {
             }
         }
 
+        self.restore_ethereum_signed_swaps(pool, &mut outcome).await;
+
         outcome
     }
 
-    /// Rebroadcasts a deposit send restored at startup and reports whether it
-    /// is mined. A failed rebroadcast pages; a send with no receipt, or whose
-    /// receipt cannot be read, counts as not mined.
-    async fn rebroadcast_restored_deposit_send(
+    /// Reserves and rebroadcasts the Relay envelopes signed on the Ethereum
+    /// wallet (an Alpaca-to-chain swap, whatever its corridor), which share
+    /// its nonces with the deposit sends. Runs once, with them: a
+    /// chain-signed swap is its corridor service's to restore.
+    async fn restore_ethereum_signed_swaps(
+        &self,
+        pool: &SqlitePool,
+        outcome: &mut RestoredDepositSends,
+    ) {
+        let (ids, unparseable) = match prepared_swap_ids(pool).await {
+            Ok(found) => found,
+            Err(error) => {
+                error!(target: "operational_alert", alert = true, ?error, "Could not list signed Relay pairs at startup; startup skips Ethereum token approvals and allowance revokes");
+                outcome.unmined += 1;
+                return;
+            }
+        };
+        if !unparseable.is_empty() {
+            error!(target: "operational_alert", alert = true, ?unparseable, "Signed Relay pairs with unparseable transfer ids were not restored at startup, so startup skips Ethereum token approvals and allowance revokes");
+            outcome.unmined += unparseable.len();
+        }
+
+        for id in ids {
+            match self.cqrs.load(&id).await {
+                Ok(Some(state)) if state.direction() == RebalanceDirection::AlpacaToBase => {
+                    for prepared in state.prepared_swap_envelopes() {
+                        self.hop.restore_usdc_on_ethereum(prepared).await;
+                        info!(target: "rebalance", %id, tx = %prepared.tx_hash(), nonce = prepared.nonce(), "Reserved the nonce of a signed Relay envelope on the Ethereum wallet");
+                        outcome.restored += 1;
+
+                        if !self
+                            .rebroadcast_restored_send(&id, prepared, "Relay envelope")
+                            .await
+                        {
+                            outcome.unmined += 1;
+                        }
+                    }
+                }
+                Ok(Some(_)) => {}
+                Ok(None) => {
+                    warn!(target: "rebalance", %id, "Signed Relay pair has events but no state at startup");
+                }
+                Err(error) => {
+                    error!(target: "operational_alert", alert = true, %id, ?error, "Could not load a transfer with a signed Relay pair at startup; startup skips Ethereum token approvals and allowance revokes");
+                    outcome.unmined += 1;
+                }
+            }
+        }
+    }
+
+    /// Checks on the Ethereum wallet that `superseding_tx` took the signed
+    /// deposit send's nonce, so the send can never mine.
+    pub(super) async fn verify_hub_deposit_send_superseded(
         &self,
         id: &UsdcRebalanceId,
         prepared: &PreparedTransaction,
+        superseding_tx: Option<TxHash>,
+    ) -> Result<(), DepositSendNotSuperseded> {
+        let required_confirmations = self
+            .ethereum_required_confirmations
+            .ok_or(EthereumChainMissing)?;
+        let event_store = match &self.credit_ledger {
+            CreditLedger::Wired(pool) => Some(pool),
+            CreditLedger::Unwired => None,
+        };
+
+        verify_deposit_send_superseded(
+            &*self.hop,
+            event_store,
+            id,
+            prepared,
+            superseding_tx,
+            self.market_maker_wallet,
+            required_confirmations,
+        )
+        .await
+    }
+
+    /// Rebroadcasts a send restored at startup on the Ethereum wallet (`what`
+    /// names it in the logs) and reports whether it is mined. A failed
+    /// rebroadcast pages; a send with no receipt, or whose receipt cannot be
+    /// read, counts as not mined.
+    async fn rebroadcast_restored_send(
+        &self,
+        id: &UsdcRebalanceId,
+        prepared: &PreparedTransaction,
+        what: &'static str,
     ) -> bool {
         let tx = prepared.tx_hash();
         let nonce = prepared.nonce();
-        if let Err(error) = self.cctp_bridge.broadcast_usdc_on_ethereum(prepared).await {
-            error!(target: "operational_alert", alert = true, %id, %tx, nonce, ?error, "Could not rebroadcast a signed Alpaca deposit send at startup; its nonce stays reserved, so startup skips Ethereum token approvals and allowance revokes, and the transfer's resume broadcasts it again");
+        if let Err(error) = self.hop.broadcast_usdc_on_ethereum(prepared).await {
+            error!(target: "operational_alert", alert = true, %id, %tx, nonce, ?error, "Could not rebroadcast a signed {what} at startup; its nonce stays reserved, so startup skips Ethereum token approvals and allowance revokes, and the transfer's resume broadcasts it again");
             return false;
         }
 
-        match self.cctp_bridge.ethereum_tx_confirmations(tx).await {
+        match self.hop.ethereum_tx_confirmations(tx).await {
             Ok(Some(_)) => true,
             Ok(None) => {
-                warn!(target: "rebalance", %id, %tx, nonce, "Restored Alpaca deposit send is not mined yet at startup");
+                warn!(target: "rebalance", %id, %tx, nonce, "Restored {what} is not mined yet at startup");
                 false
             }
             Err(error) => {
-                warn!(target: "rebalance", %id, %tx, nonce, ?error, "Could not read the receipt of a restored Alpaca deposit send at startup; treating it as not mined");
+                warn!(target: "rebalance", %id, %tx, nonce, ?error, "Could not read the receipt of a restored {what} at startup; treating it as not mined");
                 false
             }
         }
     }
 
-    fn require_base_to_alpaca(
+    pub(super) fn require_base_to_alpaca(
         id: &UsdcRebalanceId,
         direction: RebalanceDirection,
     ) -> Result<(), UsdcTransferError> {
@@ -2288,13 +2371,110 @@ impl<Signer: Wallet, B: UsdcBridgeHelper> CrossVenueCashTransfer<Signer, B> {
         }
     }
 
+    /// Resumes a chain-to-Alpaca transfer past its hop: the deposit send to
+    /// Alpaca and the USDC->USD conversion, the same whatever the hop.
+    pub(super) async fn resume_base_to_alpaca_past_hop(
+        &self,
+        id: &UsdcRebalanceId,
+        state: UsdcRebalance,
+    ) -> Result<(), UsdcTransferError> {
+        match state {
+            UsdcRebalance::Bridged {
+                direction,
+                amount_received,
+                hop,
+                deposit_send,
+                ..
+            } => {
+                Self::require_base_to_alpaca(id, direction)?;
+                self.continue_from_bridged_resume(
+                    id,
+                    amount_received,
+                    hop.destination_tx(),
+                    deposit_send,
+                )
+                .await
+            }
+
+            UsdcRebalance::DepositInitiated {
+                direction,
+                amount,
+                deposit_ref,
+                ..
+            } => {
+                Self::require_base_to_alpaca(id, direction)?;
+                self.resume_base_to_alpaca_deposit(id, amount, deposit_ref)
+                    .await
+            }
+
+            UsdcRebalance::DepositConfirmed {
+                direction: RebalanceDirection::BaseToAlpaca,
+                amount,
+                ..
+            } => {
+                self.execute_usdc_to_usd_conversion(id, amount).await?;
+                Ok(())
+            }
+
+            UsdcRebalance::DepositConfirmed {
+                direction: RebalanceDirection::AlpacaToBase,
+                ..
+            } => {
+                warn!(
+                    target: "rebalance",
+                    %id,
+                    "resume_base_to_alpaca called on AlpacaToBase DepositConfirmed; \
+                     treating as no-op terminal",
+                );
+                Ok(())
+            }
+
+            UsdcRebalance::Converting {
+                direction,
+                order_id,
+                ..
+            } => {
+                Self::require_base_to_alpaca(id, direction)?;
+                self.resume_converting(id, order_id).await
+            }
+
+            UsdcRebalance::ConversionComplete { direction, .. } => {
+                Self::require_base_to_alpaca(id, direction)?;
+                Ok(())
+            }
+
+            state @ (UsdcRebalance::WithdrawalSubmitting { .. }
+            | UsdcRebalance::Withdrawing { .. }
+            | UsdcRebalance::WithdrawalComplete { .. }
+            | UsdcRebalance::WithdrawalFailed { .. }
+            | UsdcRebalance::ConversionFailed { .. }
+            | UsdcRebalance::BridgingSubmitting { .. }
+            | UsdcRebalance::Bridging { .. }
+            | UsdcRebalance::AwaitingAttestation { .. }
+            | UsdcRebalance::Attested { .. }
+            | UsdcRebalance::BridgingFailed { .. }
+            | UsdcRebalance::SwapQuoted { .. }
+            | UsdcRebalance::SwapDepositPrepared { .. }
+            | UsdcRebalance::SwapDeposited { .. }
+            | UsdcRebalance::DepositFailed { .. }
+            | UsdcRebalance::Reconciled { .. }) => {
+                let UsdcCorridor::HubRouted { hop, .. } = self.corridor;
+                Err(UsdcTransferError::StateOffHop {
+                    id: id.clone(),
+                    state: state.state_name(),
+                    hop,
+                })
+            }
+        }
+    }
+
     /// Resumes a Base->Alpaca transfer whose deposit send already happened.
     ///
     /// The recorded `deposit_ref` is the USDC SEND tx (minted USDC forwarded to
     /// Alpaca's deposit address), not the mint tx. The send moved funds before
     /// `InitiateDeposit` was recorded, so this re-polls Alpaca by it -- no
     /// further send occurs.
-    async fn resume_base_to_alpaca_deposit(
+    pub(super) async fn resume_base_to_alpaca_deposit(
         &self,
         id: &UsdcRebalanceId,
         amount: Usdc,
@@ -2315,7 +2495,7 @@ impl<Signer: Wallet, B: UsdcBridgeHelper> CrossVenueCashTransfer<Signer, B> {
     /// a filled order confirms the conversion, a terminally-failed order fails
     /// it, a still-settling order is retried, and an order that never reached
     /// Alpaca (crash before placement) fails for operator reconciliation.
-    async fn resume_converting(
+    pub(super) async fn resume_converting(
         &self,
         id: &UsdcRebalanceId,
         correlation_id: ClientOrderId,
@@ -2460,7 +2640,7 @@ impl<Signer: Wallet, B: UsdcBridgeHelper> CrossVenueCashTransfer<Signer, B> {
     /// deposit address from the shared wallet, so no other send is adopted.
     /// With no signed send, see
     /// [`send_unless_an_unrecorded_send_landed`](Self::send_unless_an_unrecorded_send_landed).
-    async fn continue_from_bridged_resume(
+    pub(super) async fn continue_from_bridged_resume(
         &self,
         id: &UsdcRebalanceId,
         amount_received: Usdc,
@@ -2559,13 +2739,13 @@ impl<Signer: Wallet, B: UsdcBridgeHelper> CrossVenueCashTransfer<Signer, B> {
 
         // The deposit send lands at or after the mint.
         let from_block = self
-            .cctp_bridge
+            .hop
             .ethereum_tx_block(mint_tx)
             .await
             .map_err(|error| UsdcTransferError::Cctp(Box::new(error)))?;
 
         let matches = self
-            .cctp_bridge
+            .hop
             .find_recent_usdc_transfers(
                 self.market_maker_wallet,
                 deposit_address,
@@ -2656,7 +2836,7 @@ impl<Signer: Wallet, B: UsdcBridgeHelper> CrossVenueCashTransfer<Signer, B> {
         deposit_address: Address,
         amount: U256,
     ) -> Result<(PreparedTransaction, DateTime<Utc>), UsdcTransferError> {
-        let cctp_bridge = Arc::clone(&self.cctp_bridge);
+        let hop = Arc::clone(&self.hop);
         let cqrs = Arc::clone(&self.cqrs);
         let prepare_lock = Arc::clone(&self.deposit_send_prepare);
         let task_id = id.clone();
@@ -2676,7 +2856,7 @@ impl<Signer: Wallet, B: UsdcBridgeHelper> CrossVenueCashTransfer<Signer, B> {
                 return Ok((persisted.clone(), prepared_at));
             }
 
-            let prepared = cctp_bridge
+            let prepared = hop
                 .prepare_usdc_on_ethereum(deposit_address, amount)
                 .await
                 .inspect_err(|error| {
@@ -2697,7 +2877,7 @@ impl<Signer: Wallet, B: UsdcBridgeHelper> CrossVenueCashTransfer<Signer, B> {
                 .await;
             if let Err(error) = persisted {
                 error!(target: "rebalance", id = %task_id, ?error, "Failed to persist the signed Alpaca deposit send; not broadcasting");
-                release_unpersisted_deposit_send(&*cctp_bridge, &cqrs, &task_id, &prepared).await;
+                release_unpersisted_deposit_send(&*hop, &cqrs, &task_id, &prepared).await;
                 return Err(error.into());
             }
 
@@ -2729,13 +2909,13 @@ impl<Signer: Wallet, B: UsdcBridgeHelper> CrossVenueCashTransfer<Signer, B> {
             cause,
         };
 
-        self.cctp_bridge
+        self.hop
             .broadcast_usdc_on_ethereum(prepared)
             .await
             .map_err(|error| pending(DepositSendPending::Broadcast(Box::new(error))))?;
 
         let status = self
-            .cctp_bridge
+            .hop
             .confirm_usdc_on_ethereum(expected)
             .await
             .map_err(|error| pending(DepositSendPending::Confirmation(Box::new(error))))?;
@@ -2800,7 +2980,7 @@ impl<Signer: Wallet, B: UsdcBridgeHelper> CrossVenueCashTransfer<Signer, B> {
     }
 
     #[instrument(target = "rebalance", skip(self), fields(%id, %amount), level = tracing::Level::DEBUG)]
-    async fn withdraw_from_vault(
+    pub(super) async fn withdraw_from_vault(
         &self,
         id: &UsdcRebalanceId,
         amount: Usdc,
@@ -2914,7 +3094,7 @@ impl<Signer: Wallet, B: UsdcBridgeHelper> CrossVenueCashTransfer<Signer, B> {
     /// the original transaction may still be pending, or a load-balanced RPC
     /// backend may not have observed it. [`Raindex::find_recent_withdrawal`]
     /// therefore fails inconclusively instead of returning absence.
-    async fn resume_withdrawal_submitting(
+    pub(super) async fn resume_withdrawal_submitting(
         &self,
         id: &UsdcRebalanceId,
         amount: Usdc,
@@ -3216,7 +3396,7 @@ impl<
         direction: BridgeDirection,
         burn_tx: TxHash,
     ) -> Result<AttestationPollOutcome, UsdcTransferError> {
-        match self.cctp_bridge.poll_attestation(direction, burn_tx).await {
+        match self.hop.poll_attestation(direction, burn_tx).await {
             Ok(response) => Ok(AttestationPollOutcome::Received(response)),
             Err(CctpError::AttestationTimeout { attempts, source }) => {
                 warn!(
@@ -3297,11 +3477,7 @@ impl<
         cctp_nonce: B256,
         initiated_at: DateTime<Utc>,
     ) -> Result<AttestationResponse, UsdcTransferError> {
-        let error = match self
-            .cctp_bridge
-            .poll_attestation(mint_direction, burn_tx)
-            .await
-        {
+        let error = match self.hop.poll_attestation(mint_direction, burn_tx).await {
             Ok(response) => return Ok(response),
             Err(error @ CctpError::AttestationTimeout { .. }) => {
                 return Err(self
@@ -3312,7 +3488,7 @@ impl<
         };
 
         match self
-            .cctp_bridge
+            .hop
             .mint_nonce_consumed(mint_direction, cctp_nonce)
             .await
         {
@@ -3379,7 +3555,7 @@ impl<
         error: CctpError,
     ) -> UsdcTransferError {
         match self
-            .cctp_bridge
+            .hop
             .mint_nonce_consumed(mint_direction, cctp_nonce)
             .await
         {
@@ -3474,7 +3650,7 @@ impl<
         // propagate the error and let the job retry rather than latching a
         // terminal `FailBridging` and stranding already-burned USDC behind manual
         // reconciliation.
-        let mint_scan_from_block = match self.cctp_bridge.destination_block(direction).await {
+        let mint_scan_from_block = match self.hop.destination_block(direction).await {
             Ok(block) => block,
             Err(error) => {
                 warn!(
@@ -3550,10 +3726,7 @@ impl<
         // the aggregate to `BridgingFailed` for operator reconciliation rather
         // than wedging it in `Attested` while the worker exhausts retries --
         // mirroring the hard-error arm of `poll_cctp_attestation`.
-        let response = match self
-            .cctp_bridge
-            .reconstruct_attestation(message, attestation)
-        {
+        let response = match self.hop.reconstruct_attestation(message, attestation) {
             Ok(response) => response,
             Err(error) => {
                 warn!(target: "rebalance", %id, ?error, "Reconstructing attestation from the persisted envelope failed");
@@ -4069,6 +4242,14 @@ impl<
                 | DepositFailed { .. }
                 | ConversionFailed { .. },
             ) => Err(UsdcTransferError::PreviouslyFailedAggregate { id: id.clone() }),
+
+            Some(
+                state @ (SwapQuoted { .. } | SwapDepositPrepared { .. } | SwapDeposited { .. }),
+            ) => Err(UsdcTransferError::StateOffHop {
+                id: id.clone(),
+                state: state.state_name(),
+                hop: HopKind::Cctp,
+            }),
         }
     }
 
@@ -4152,7 +4333,7 @@ impl<
             .await?;
 
         let credited = match self
-            .cctp_bridge
+            .hop
             .ethereum_usdc_credit(withdrawal_tx, self.market_maker_wallet)
             .await
         {
@@ -4245,7 +4426,7 @@ impl<
         // (find_recent_burn uses block > from_block), so the withdrawal block
         // is an exclusive scan lower bound that excludes a prior identical burn.
         let burn_from_block = self
-            .cctp_bridge
+            .hop
             .ethereum_tx_block(withdrawal_tx)
             .await
             .map_err(|error| UsdcTransferError::SettlementCheckTransient {
@@ -4430,7 +4611,7 @@ impl<
         initiated_at: DateTime<Utc>,
     ) -> Result<Option<MintReceipt>, UsdcTransferError> {
         let mint_receipt = match self
-            .cctp_bridge
+            .hop
             .find_attested_mint(mint_direction, attestation, mint_scan_from_block)
             .await
         {
@@ -4713,7 +4894,7 @@ impl<
         initiated_at: DateTime<Utc>,
     ) -> Result<MintReceipt, UsdcTransferError> {
         let mint_receipt = match self
-            .cctp_bridge
+            .hop
             .mint(BridgeDirection::EthereumToBase, &attestation_response)
             .await
         {
@@ -5056,9 +5237,9 @@ impl<
                 direction: RebalanceDirection::BaseToAlpaca,
                 deposit_ref: None,
                 amount,
-                mint_tx_hash,
+                hop,
                 ..
-            }) => (amount, mint_tx_hash),
+            }) => (amount, hop.destination_tx()),
             Some(UsdcRebalance::DepositFailed {
                 direction: RebalanceDirection::BaseToAlpaca,
                 deposit_ref: Some(TransferRef::OnchainTx(recorded)),
@@ -5101,7 +5282,7 @@ impl<
             .map_err(Box::new)?;
         let expected = usdc_to_u256(amount).map_err(Box::new)?;
         let sent = self
-            .cctp_bridge
+            .hop
             .ethereum_usdc_sent(send_tx, self.market_maker_wallet, deposit_address)
             .await
             .map_err(|source| match source {
@@ -5127,7 +5308,7 @@ impl<
         // The legacy scan that leads here starts at the mint block; an older
         // send, such as a manual one recorded nowhere, paid something else.
         let block = |tx| async move {
-            self.cctp_bridge
+            self.hop
                 .ethereum_tx_block(tx)
                 .await
                 .map_err(|source| UsdcRecheckError::DepositTxRead {
@@ -5313,64 +5494,13 @@ impl<
                 .await
             }
 
-            Some(UsdcRebalance::Bridged {
-                direction,
-                amount_received,
-                mint_tx_hash,
-                deposit_send,
-                ..
-            }) => {
-                Self::require_base_to_alpaca(id, direction)?;
-                self.continue_from_bridged_resume(id, amount_received, mint_tx_hash, deposit_send)
-                    .await
-            }
-
-            Some(UsdcRebalance::DepositInitiated {
-                direction,
-                amount,
-                deposit_ref,
-                ..
-            }) => {
-                Self::require_base_to_alpaca(id, direction)?;
-                self.resume_base_to_alpaca_deposit(id, amount, deposit_ref)
-                    .await
-            }
-
-            Some(UsdcRebalance::DepositConfirmed {
-                direction: RebalanceDirection::BaseToAlpaca,
-                amount,
-                ..
-            }) => {
-                self.execute_usdc_to_usd_conversion(id, amount).await?;
-                Ok(())
-            }
-
-            Some(UsdcRebalance::DepositConfirmed {
-                direction: RebalanceDirection::AlpacaToBase,
-                ..
-            }) => {
-                warn!(
-                    target: "rebalance",
-                    %id,
-                    "resume_base_to_alpaca called on AlpacaToBase DepositConfirmed; \
-                     treating as no-op terminal",
-                );
-                Ok(())
-            }
-
-            Some(UsdcRebalance::Converting {
-                direction,
-                order_id,
-                ..
-            }) => {
-                Self::require_base_to_alpaca(id, direction)?;
-                self.resume_converting(id, order_id).await
-            }
-
-            Some(UsdcRebalance::ConversionComplete { direction, .. }) => {
-                Self::require_base_to_alpaca(id, direction)?;
-                Ok(())
-            }
+            Some(
+                state @ (UsdcRebalance::Bridged { .. }
+                | UsdcRebalance::DepositInitiated { .. }
+                | UsdcRebalance::DepositConfirmed { .. }
+                | UsdcRebalance::Converting { .. }
+                | UsdcRebalance::ConversionComplete { .. }),
+            ) => self.resume_base_to_alpaca_past_hop(id, state).await,
 
             // A post-burn BridgingFailed is recoverable: the CCTP burn consumed
             // the source USDC and the mint may have landed (e.g. a transient
@@ -5397,6 +5527,16 @@ impl<
             // Operator-reconciled is a clearing terminal: the transfer was
             // resolved out-of-band, so a resume has nothing to drive.
             Some(UsdcRebalance::Reconciled { .. }) => Ok(()),
+
+            Some(
+                state @ (UsdcRebalance::SwapQuoted { .. }
+                | UsdcRebalance::SwapDepositPrepared { .. }
+                | UsdcRebalance::SwapDeposited { .. }),
+            ) => Err(UsdcTransferError::StateOffHop {
+                id: id.clone(),
+                state: state.state_name(),
+                hop: HopKind::Cctp,
+            }),
         }
     }
 
@@ -5443,7 +5583,7 @@ impl<
         // a transient poll/mint error must leave it recoverable for the next
         // redrive, not re-fail it.
         let attestation = match self
-            .cctp_bridge
+            .hop
             .poll_attestation(BridgeDirection::BaseToEthereum, burn_tx_hash)
             .await
         {
@@ -5480,7 +5620,7 @@ impl<
         // Idempotent: if the nonce was already consumed, `mint` returns the
         // existing receipt via `recover_already_minted` instead of re-minting.
         let mint_receipt = match self
-            .cctp_bridge
+            .hop
             .mint(BridgeDirection::BaseToEthereum, &attestation)
             .await
         {
@@ -5786,7 +5926,7 @@ impl<
         let reburn_on_empty = pending_burn_tx.is_some();
 
         let burn_receipt = match self
-            .cctp_bridge
+            .hop
             .find_recent_burn(
                 BridgeDirection::BaseToEthereum,
                 amount,
@@ -5888,11 +6028,7 @@ impl<
         let burn_tx = self
             .submit_and_record_burn(id, direction, amount, recipient)
             .await?;
-        match self
-            .cctp_bridge
-            .confirm_burn(direction, burn_tx, amount)
-            .await
-        {
+        match self.hop.confirm_burn(direction, burn_tx, amount).await {
             Ok(burn_receipt) => return Ok(burn_receipt),
             Err(error) if error.is_revert() => {
                 self.enqueue_cctp_burn_gas_cost(direction, burn_tx).await?;
@@ -5920,11 +6056,7 @@ impl<
         let burn_tx = self
             .submit_and_record_burn(id, direction, amount, recipient)
             .await?;
-        match self
-            .cctp_bridge
-            .confirm_burn(direction, burn_tx, amount)
-            .await
-        {
+        match self.hop.confirm_burn(direction, burn_tx, amount).await {
             Ok(burn_receipt) => Ok(burn_receipt),
             Err(error) if error.is_revert() => {
                 self.enqueue_cctp_burn_gas_cost(direction, burn_tx).await?;
@@ -5967,7 +6099,7 @@ impl<
         amount: U256,
         recipient: Address,
     ) -> Result<TxHash, UsdcTransferError> {
-        let cctp_bridge = Arc::clone(&self.cctp_bridge);
+        let hop = Arc::clone(&self.hop);
         let cqrs = Arc::clone(&self.cqrs);
         let task_id = id.clone();
         // Claimed while the calling execution still holds its own claim, and
@@ -6002,7 +6134,7 @@ impl<
 
             let burn_tx = match tokio::time::timeout(
                 BURN_BROADCAST_TIMEOUT,
-                cctp_bridge.submit_burn(direction, amount, recipient),
+                hop.submit_burn(direction, amount, recipient),
             )
             .await
             {
@@ -6140,7 +6272,7 @@ impl<
         };
 
         let status = self
-            .cctp_bridge
+            .hop
             .burn_status(direction, burn_tx)
             .await
             .map_err(|error| UsdcTransferError::SettlementCheckTransient {
@@ -6161,7 +6293,7 @@ impl<
                 // receipt is already mined-success, so a non-revert confirm error
                 // (e.g. MessageSentEventNotFound) is the actionable failure -> Cctp.
                 let burn_receipt = self
-                    .cctp_bridge
+                    .hop
                     .confirm_burn(direction, burn_tx, amount)
                     .await
                     .map_err(|error| {
@@ -6273,7 +6405,7 @@ impl<
         let from_block = match burn_from_block {
             Some(block) => block,
             None => self
-                .cctp_bridge
+                .hop
                 .source_block(BridgeDirection::EthereumToBase)
                 .await
                 .map_err(|error| UsdcTransferError::SettlementCheckTransient {
@@ -6345,7 +6477,7 @@ impl<
         let reburn_on_empty = pending_burn_tx.is_some();
 
         let burn_receipt = match self
-            .cctp_bridge
+            .hop
             .find_recent_burn(
                 BridgeDirection::EthereumToBase,
                 amount,
@@ -6459,7 +6591,7 @@ impl<
         // leg to terminal. That resume is operator-triggered today (CLI/apalis
         // redrive); a pre-burn failure has no mint to adopt and stays terminal.
         let mint_receipt = match self
-            .cctp_bridge
+            .hop
             .mint(BridgeDirection::BaseToEthereum, &attestation_response)
             .await
         {
@@ -6533,7 +6665,7 @@ fn total_credits(
 /// than risk reusing it under bytes that can still be sent, and pages: every
 /// later send from the wallet waits behind it until a restart.
 async fn release_unpersisted_deposit_send<Helper: UsdcBridgeHelper + ?Sized>(
-    cctp_bridge: &Helper,
+    hop: &Helper,
     cqrs: &Store<UsdcRebalance>,
     id: &UsdcRebalanceId,
     prepared: &PreparedTransaction,
@@ -6552,7 +6684,7 @@ async fn release_unpersisted_deposit_send<Helper: UsdcBridgeHelper + ?Sized>(
         }
 
         warn!(target: "rebalance", %id, %tx, nonce, ?persisted, "Releasing the nonce of a signed Alpaca deposit send that was not persisted");
-        cctp_bridge.discard_usdc_on_ethereum(prepared).await;
+        hop.discard_usdc_on_ethereum(prepared).await;
         return;
     }
 
@@ -6560,7 +6692,7 @@ async fn release_unpersisted_deposit_send<Helper: UsdcBridgeHelper + ?Sized>(
     error!(target: "operational_alert", alert = true, %id, %tx, nonce, ?reload, "Cannot tell whether a signed Alpaca deposit send was persisted; its nonce stays reserved and later Ethereum wallet sends wait behind it until a restart");
 }
 
-fn usdc_to_u256(usdc: Usdc) -> Result<U256, UsdcTransferError> {
+pub(super) fn usdc_to_u256(usdc: Usdc) -> Result<U256, UsdcTransferError> {
     Ok(usdc.to_u256_6_decimals()?)
 }
 
@@ -6985,27 +7117,44 @@ pub(crate) struct RestoredDepositSends {
     pub(crate) unmined: usize,
 }
 
-/// Trait-erased startup hook that reserves the nonces of persisted signed
-/// Alpaca deposit sends and rebroadcasts them before the jobs run.
+/// Trait-erased startup hooks that reserve the nonces of persisted signed
+/// sends and rebroadcast them before the jobs run.
 #[async_trait::async_trait]
 pub(crate) trait RestorePreparedDepositSends: Send + Sync + 'static {
+    /// The Ethereum wallet's: the Alpaca deposit sends and the Relay pairs
+    /// signed there. Run once, on one service.
     async fn restore_prepared_deposit_sends(&self, pool: &SqlitePool) -> RestoredDepositSends;
+
+    /// The Relay pairs this service signed on its corridor chain's wallet,
+    /// by that chain. Run on every service.
+    async fn restore_chain_signed_swaps(
+        &self,
+        pool: &SqlitePool,
+    ) -> BTreeMap<Chain, RestoredDepositSends>;
 }
 
 #[async_trait::async_trait]
-impl<Chain> RestorePreparedDepositSends for CrossVenueCashTransfer<Chain>
+impl<Signer> RestorePreparedDepositSends for CrossVenueCashTransfer<Signer>
 where
-    Chain: Wallet + Send + Sync + 'static,
+    Signer: Wallet + Send + Sync + 'static,
 {
     async fn restore_prepared_deposit_sends(&self, pool: &SqlitePool) -> RestoredDepositSends {
         Self::restore_prepared_deposit_sends(self, pool).await
     }
+
+    /// A CCTP hop signs nothing on its chain before the burn it records.
+    async fn restore_chain_signed_swaps(
+        &self,
+        _pool: &SqlitePool,
+    ) -> BTreeMap<Chain, RestoredDepositSends> {
+        BTreeMap::new()
+    }
 }
 
 #[async_trait::async_trait]
-impl<Chain> RecheckUsdcDeposit for CrossVenueCashTransfer<Chain>
+impl<Signer> RecheckUsdcDeposit for CrossVenueCashTransfer<Signer>
 where
-    Chain: Wallet + Send + Sync + 'static,
+    Signer: Wallet + Send + Sync + 'static,
 {
     async fn recheck_deposit(
         &self,
@@ -7021,24 +7170,8 @@ where
         prepared: &PreparedTransaction,
         superseding_tx: Option<TxHash>,
     ) -> Result<(), DepositSendNotSuperseded> {
-        let required_confirmations = self
-            .ethereum_required_confirmations
-            .ok_or(EthereumChainMissing)?;
-        let event_store = match &self.credit_ledger {
-            CreditLedger::Wired(pool) => Some(pool),
-            CreditLedger::Unwired => None,
-        };
-
-        verify_deposit_send_superseded(
-            &*self.cctp_bridge,
-            event_store,
-            id,
-            prepared,
-            superseding_tx,
-            self.market_maker_wallet,
-            required_confirmations,
-        )
-        .await
+        self.verify_hub_deposit_send_superseded(id, prepared, superseding_tx)
+            .await
     }
 }
 
@@ -7177,7 +7310,7 @@ where
         direction: BridgeDirection,
         burn_tx: TxHash,
     ) -> Result<AttestationResponse, CctpMintRecoveryError> {
-        self.cctp_bridge
+        self.hop
             .fetch_attestation(direction, burn_tx)
             .await
             .map_err(|source| CctpMintRecoveryError::Attestation { burn_tx, source })
@@ -7190,7 +7323,7 @@ where
         attestation: AttestationResponse,
     ) -> Result<RecoveredCctpMint, CctpMintRecoveryError> {
         let receipt = self
-            .cctp_bridge
+            .hop
             .mint(direction, &attestation)
             .await
             .map_err(|source| CctpMintRecoveryError::Mint { burn_tx, source })?;
@@ -7320,7 +7453,8 @@ mod tests {
         TestAnvilInstance, persist_event, setup_test_apalis_pool, spawn_anvil, spawn_anvil_pair,
     };
     use crate::usdc_rebalance::{
-        RebalanceDirection, ReconcileReason, TransferRef, UsdcRebalanceError, UsdcRebalanceEvent,
+        HopEvidence, RebalanceDirection, ReconcileReason, TransferRef, UsdcRebalanceError,
+        UsdcRebalanceEvent,
     };
     use st0x_finance::UsdcConversionError;
 
@@ -14987,7 +15121,15 @@ mod tests {
             .unwrap_err();
 
         let final_state = cqrs.load(&id).await.unwrap().expect("aggregate exists");
-        let UsdcRebalance::Bridged { mint_tx_hash, .. } = final_state else {
+        let UsdcRebalance::Bridged {
+            hop:
+                HopEvidence::Cctp {
+                    mint_tx: mint_tx_hash,
+                    ..
+                },
+            ..
+        } = final_state
+        else {
             panic!("Expected Bridged after adopting the existing mint, got: {final_state:?}");
         };
         assert_eq!(mint_tx_hash, mint_receipt.tx);
@@ -15155,7 +15297,15 @@ mod tests {
             .expect("resume must mint this transfer's own nonce");
 
         let state = cqrs.load(&id).await.unwrap().expect("aggregate exists");
-        let UsdcRebalance::Bridged { mint_tx_hash, .. } = state else {
+        let UsdcRebalance::Bridged {
+            hop:
+                HopEvidence::Cctp {
+                    mint_tx: mint_tx_hash,
+                    ..
+                },
+            ..
+        } = state
+        else {
             panic!("Expected Bridged after the mint leg, got: {state:?}");
         };
         assert_eq!(mint_tx_hash, own_mint.tx);
@@ -15939,7 +16089,15 @@ mod tests {
             .unwrap_err();
 
         let final_state = cqrs.load(&id).await.unwrap().expect("aggregate exists");
-        let UsdcRebalance::Bridged { mint_tx_hash, .. } = final_state else {
+        let UsdcRebalance::Bridged {
+            hop:
+                HopEvidence::Cctp {
+                    mint_tx: mint_tx_hash,
+                    ..
+                },
+            ..
+        } = final_state
+        else {
             panic!(
                 "Expected Bridged after recovering a post-burn BridgingFailed, got: {final_state:?}"
             );
@@ -18067,7 +18225,7 @@ mod tests {
         );
 
         let next = restarted
-            .cctp_bridge
+            .hop
             .prepare_usdc_on_ethereum(ALPACA_DEPOSIT_ADDRESS, U256::from(1u64))
             .await
             .unwrap();
@@ -20171,6 +20329,61 @@ mod tests {
                 balance: U256::from(100_000_000u64),
             },
             "the paid withdrawal's credit must count as held"
+        );
+        assert!(logs_contain("operational_alert"));
+    }
+
+    /// An Ethereum-origin Relay swap's quoted input is held in the shared
+    /// wallet, so a Base deposit send checking the wallet counts it and pages
+    /// a shortfall instead of reading that USDC as its own.
+    #[tracing_test::traced_test]
+    #[tokio::test]
+    async fn relay_credit_held_on_ethereum_pages_shortfall_on_base_deposit_send() {
+        let market_maker_wallet = address!("0x2222222222222222222222222222222222222222");
+        let chain = deploy_ethereum_usdc_chain_with_balance(
+            U256::from(100_000_000u64),
+            market_maker_wallet,
+        )
+        .await;
+        let server = MockServer::start();
+        let pool = SqlitePool::connect(":memory:").await.unwrap();
+        sqlx::migrate!().run(&pool).await.unwrap();
+        let (manager, cqrs) =
+            manager_with_ledger_on_chain(&chain, &server, market_maker_wallet, pool).await;
+
+        let swap = UsdcRebalanceId(Uuid::new_v4());
+        for command in [
+            UsdcRebalanceCommand::Initiate {
+                direction: RebalanceDirection::AlpacaToBase,
+                corridor: ROBINHOOD_RELAY,
+                amount: usdc("100"),
+                withdrawal: TransferRef::OnchainTx(chain.mint_tx),
+            },
+            UsdcRebalanceCommand::ConfirmWithdrawal {
+                withdrawal_tx: Some(chain.mint_tx),
+            },
+            UsdcRebalanceCommand::QuoteSwap {
+                quote: Box::new(crate::usdc_rebalance::swap_quote_for_test(
+                    U256::from(100_000_000u64),
+                    B256::repeat_byte(0x0d),
+                )),
+            },
+        ] {
+            cqrs.send(&swap, command).await.unwrap();
+        }
+
+        let base_send = manager
+            .check_ethereum_credit_ledger(&UsdcRebalanceId(Uuid::new_v4()), usdc("100"))
+            .await;
+
+        assert_eq!(
+            base_send,
+            CreditLedgerCheck::Shortfall {
+                outstanding: U256::from(200_000_000u64),
+                in_flight: U256::ZERO,
+                balance: U256::from(100_000_000u64),
+            },
+            "the quoted swap input must count as held"
         );
         assert!(logs_contain("operational_alert"));
     }
@@ -23001,11 +23214,7 @@ mod tests {
 
         // from_block must equal the withdrawal tx block exactly, proving the scan
         // bound is derived from the tx rather than the raw chain head.
-        let expected_from_block = manager
-            .cctp_bridge
-            .ethereum_tx_block(withdrawal_tx)
-            .await
-            .unwrap();
+        let expected_from_block = manager.hop.ethereum_tx_block(withdrawal_tx).await.unwrap();
 
         assert_eq!(
             from_block, expected_from_block,
@@ -23433,7 +23642,7 @@ mod tests {
 
         assert!(matches!(error, UsdcTransferError::BotGasEnqueue(_)));
         assert_eq!(
-            manager.cctp_bridge.submit_call_count.load(Ordering::SeqCst),
+            manager.hop.submit_call_count.load(Ordering::SeqCst),
             1,
             "the replacement burn must not be submitted before accounting is durable"
         );
@@ -23469,7 +23678,7 @@ mod tests {
 
         assert!(matches!(error, UsdcTransferError::BotGasEnqueue(_)));
         assert_eq!(
-            manager.cctp_bridge.submit_call_count.load(Ordering::SeqCst),
+            manager.hop.submit_call_count.load(Ordering::SeqCst),
             0,
             "recovery must not submit a replacement burn after enqueue failure"
         );
@@ -24716,7 +24925,7 @@ mod tests {
             .await
             .unwrap();
 
-        let seen = manager.cctp_bridge.states_seen_by_ledger();
+        let seen = manager.hop.states_seen_by_ledger();
         assert_eq!(seen.len(), 1, "one ledger check per burn; got: {seen:?}");
         assert!(
             matches!(seen[0], UsdcRebalance::WithdrawalComplete { .. }),
@@ -24765,7 +24974,7 @@ mod tests {
             .await
             .unwrap();
 
-        let seen = manager.cctp_bridge.states_seen_by_ledger();
+        let seen = manager.hop.states_seen_by_ledger();
         assert_eq!(seen.len(), 1, "one ledger check per burn; got: {seen:?}");
         assert!(
             matches!(
@@ -24808,7 +25017,7 @@ mod tests {
             .unwrap();
 
         let reverted_burn = TxHash::from([1u8; 32]);
-        let seen = manager.cctp_bridge.states_seen_by_ledger();
+        let seen = manager.hop.states_seen_by_ledger();
         assert_eq!(
             seen.len(),
             1,

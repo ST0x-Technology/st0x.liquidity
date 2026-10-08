@@ -72,10 +72,11 @@
 //!
 //! [`AlpacaWalletService`]: st0x_execution::AlpacaWalletService
 
-use alloy::primitives::{B256, TxHash};
+use alloy::primitives::{Address, B256, Bytes, TxHash, U256};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use itertools::{Either, Itertools};
+use rain_math_float::Float;
 use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
 use std::fmt::{Display, Formatter};
@@ -83,7 +84,7 @@ use std::str::FromStr;
 use tracing::warn;
 use uuid::Uuid;
 
-use st0x_bridge::corridor::{UsdcCorridor, legacy_base_cctp};
+use st0x_bridge::corridor::{HopKind, UsdcCorridor, legacy_base_cctp};
 use st0x_dto::{TransferOperation, UsdcBridgeOperation, UsdcBridgeStatus};
 use st0x_event_sorcery::{DomainEvent, EventSourced, SendError, Store, Table};
 use st0x_evm::{Chain, PreparedTransaction};
@@ -298,6 +299,32 @@ pub enum UsdcRebalanceError {
     /// Deposit has not been initiated yet
     #[error("Deposit has not been initiated")]
     DepositNotInitiated,
+    /// A swap command on a corridor whose hop is not Relay.
+    #[error("the {corridor} corridor has no swap hop")]
+    NotSwapCorridor { corridor: UsdcCorridor },
+    /// The quote's input is not what the withdrawal left to swap: all of it
+    /// from a vault withdraw, at most it (and more than zero) from Alpaca.
+    #[error("swap quote input {quoted} does not fit the withdrawn {withdrawn}")]
+    SwapAmountMismatch { withdrawn: Usdc, quoted: U256 },
+    /// An amount could not be converted between USDC and base units.
+    #[error("swap amount {amount} does not convert to the stable's base units")]
+    SwapAmountUnconvertible { amount: Usdc },
+    #[error("swap quote input {amount_in} does not convert to USDC")]
+    SwapInputUnconvertible { amount_in: U256 },
+    /// A swap deposit pair is already persisted for this transfer; another
+    /// one could deposit twice.
+    #[error("a swap deposit is already signed for this transfer")]
+    SwapDepositAlreadyPrepared,
+    /// The confirmed deposit is not the persisted signed one.
+    #[error("swap deposit {recorded} is not the signed deposit {prepared}")]
+    SwapDepositHashMismatch { recorded: TxHash, prepared: TxHash },
+    /// A Relay transfer's withdrawn stable is outside the vault; failing it
+    /// would release the guard while only a redeposit can return the stable.
+    #[error(
+        "the {corridor} transfer's withdrawn stable is outside the vault; only a redeposit \
+         settles it, so it is not failed"
+    )]
+    RelayWithdrawalAwaitsRedeposit { corridor: UsdcCorridor },
     /// Command not valid for current state
     #[error("Command {command} not valid for state {state}")]
     InvalidCommand { command: String, state: String },
@@ -505,6 +532,24 @@ pub enum UsdcRebalanceCommand {
         fee_collected: Usdc,
         minted_at: DateTime<Utc>,
     },
+    /// Record the binding swap quote. Valid only from `WithdrawalComplete` on
+    /// a Relay corridor.
+    QuoteSwap { quote: Box<SwapQuote> },
+    /// Persist an approve signed alone after another send split the pair.
+    /// Valid only from `SwapQuoted`.
+    PrepareSwapApprove { approve: PreparedTransaction },
+    /// Persist the signed approve and deposit together before either is
+    /// broadcast. Valid only from `SwapQuoted`.
+    PrepareSwapDeposit {
+        approve: Option<PreparedTransaction>,
+        deposit: PreparedTransaction,
+    },
+    /// Record the persisted deposit once it has the origin chain's
+    /// confirmations. Valid only from `SwapDepositPrepared`.
+    ConfirmSwapDeposit {
+        deposit_tx: TxHash,
+        deposit_block: u64,
+    },
     /// Persist the signed BaseToAlpaca deposit send before its first
     /// broadcast. Pure: the orchestrator signs, then broadcasts only once this
     /// is durable. Valid only from a BaseToAlpaca `Bridged` with no send.
@@ -707,6 +752,29 @@ pub enum UsdcRebalanceEvent {
         prepared: PreparedTransaction,
         prepared_at: DateTime<Utc>,
     },
+    /// The binding swap quote was accepted after the withdrawal.
+    SwapQuoted {
+        quote: Box<SwapQuote>,
+        quoted_at: DateTime<Utc>,
+    },
+    /// An approve signed alone, persisted before its broadcast.
+    SwapApprovePrepared {
+        approve: PreparedTransaction,
+        prepared_at: DateTime<Utc>,
+    },
+    /// The swap's approve and deposit, persisted together before either is
+    /// broadcast.
+    SwapDepositPrepared {
+        approve: Option<PreparedTransaction>,
+        deposit: PreparedTransaction,
+        prepared_at: DateTime<Utc>,
+    },
+    /// The swap deposit has the origin chain's confirmations.
+    SwapDeposited {
+        deposit_tx: TxHash,
+        deposit_block: u64,
+        deposited_at: DateTime<Utc>,
+    },
     /// Bridging failed. Preserves burn data when available for debugging.
     BridgingFailed {
         burn_tx_hash: Option<TxHash>,
@@ -797,6 +865,10 @@ impl DomainEvent for UsdcRebalanceEvent {
             Self::AttestationTimedOut { .. } => "UsdcRebalanceEvent::AttestationTimedOut",
             Self::Bridged { .. } => "UsdcRebalanceEvent::Bridged",
             Self::DepositSendPrepared { .. } => "UsdcRebalanceEvent::DepositSendPrepared",
+            Self::SwapQuoted { .. } => "UsdcRebalanceEvent::SwapQuoted",
+            Self::SwapApprovePrepared { .. } => "UsdcRebalanceEvent::SwapApprovePrepared",
+            Self::SwapDepositPrepared { .. } => "UsdcRebalanceEvent::SwapDepositPrepared",
+            Self::SwapDeposited { .. } => "UsdcRebalanceEvent::SwapDeposited",
             Self::BridgingFailed { .. } => "UsdcRebalanceEvent::BridgingFailed",
             Self::BridgingCompletionRecovered { .. } => {
                 "UsdcRebalanceEvent::BridgingCompletionRecovered"
@@ -846,6 +918,56 @@ impl DepositSend {
             } => Some((prepared, *prepared_at)),
         }
     }
+}
+
+/// What moved a transfer's cash across its hop, kept on every post-hop
+/// state. A reader that resolves one of its hashes on a chain takes the chain
+/// from the corridor.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum HopEvidence {
+    /// The CCTP burn and the mint that paid it out.
+    Cctp { burn_tx: TxHash, mint_tx: TxHash },
+}
+
+impl HopEvidence {
+    /// The tx that paid the cash out on the destination chain.
+    pub(crate) const fn destination_tx(self) -> TxHash {
+        match self {
+            Self::Cctp { mint_tx, .. } => mint_tx,
+        }
+    }
+}
+
+/// One transaction a Relay quote asks the origin wallet to send.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SwapStep {
+    pub chain_id: u64,
+    pub to: Address,
+    pub data: Bytes,
+    pub value: U256,
+}
+
+/// The accepted Relay quote a swap deposit funds, persisted whole so a resume
+/// signs exactly what was accepted. Amounts are in the stables' smallest unit.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SwapQuote {
+    pub request_id: B256,
+    pub order_id: B256,
+    pub amount_in: U256,
+    pub expected_out: U256,
+    pub minimum_out: U256,
+    pub slippage_bps: u16,
+    /// In the origin stable, already out of `expected_out`.
+    pub relayer_fee: U256,
+    /// In the origin chain's native token: Relay's estimate of our gas.
+    pub gas_fee: U256,
+    /// Until then the solver may still fill.
+    pub deadline: DateTime<Utc>,
+    pub approve: Option<SwapStep>,
+    pub deposit: SwapStep,
+    /// The origin chain's head read before the quote: no deposit for this
+    /// order sits below it.
+    pub origin_from_block: u64,
 }
 
 /// USDC rebalance aggregate state machine.
@@ -1004,6 +1126,48 @@ pub enum UsdcRebalance {
         initiated_at: DateTime<Utc>,
         attested_at: DateTime<Utc>,
     },
+    /// The binding Relay quote is recorded and no deposit is signed yet.
+    /// `split_approves` are approves that went out alone after another send
+    /// split a pair; each is broadcast before a pair is signed again.
+    SwapQuoted {
+        direction: RebalanceDirection,
+        corridor: UsdcCorridor,
+        /// The swap's input, in the origin stable.
+        amount: Usdc,
+        quote: Box<SwapQuote>,
+        /// Every order id a deposit was ever signed for; never shrinks.
+        signed_order_ids: Vec<B256>,
+        split_approves: Vec<PreparedTransaction>,
+        initiated_at: DateTime<Utc>,
+        quoted_at: DateTime<Utc>,
+    },
+    /// The approve and deposit are signed and persisted, maybe broadcast.
+    SwapDepositPrepared {
+        direction: RebalanceDirection,
+        corridor: UsdcCorridor,
+        amount: Usdc,
+        quote: Box<SwapQuote>,
+        signed_order_ids: Vec<B256>,
+        split_approves: Vec<PreparedTransaction>,
+        /// `None` when the standing allowance covered the deposit.
+        approve: Option<PreparedTransaction>,
+        deposit: PreparedTransaction,
+        initiated_at: DateTime<Utc>,
+        prepared_at: DateTime<Utc>,
+    },
+    /// The deposit has the origin chain's confirmations; Relay's solver pays
+    /// the destination next, or refunds.
+    SwapDeposited {
+        direction: RebalanceDirection,
+        corridor: UsdcCorridor,
+        amount: Usdc,
+        quote: Box<SwapQuote>,
+        signed_order_ids: Vec<B256>,
+        deposit_tx: TxHash,
+        deposit_block: u64,
+        initiated_at: DateTime<Utc>,
+        deposited_at: DateTime<Utc>,
+    },
     /// USDC has been minted on destination chain via CCTP
     Bridged {
         direction: RebalanceDirection,
@@ -1015,8 +1179,7 @@ pub enum UsdcRebalance {
         amount_received: Usdc,
         /// CCTP fee collected during the bridge (from MintAndWithdraw event)
         fee_collected: Usdc,
-        burn_tx_hash: TxHash,
-        mint_tx_hash: TxHash,
+        hop: HopEvidence,
         initiated_at: DateTime<Utc>,
         minted_at: DateTime<Utc>,
         /// Progress of the BaseToAlpaca deposit send. `NotStarted` for
@@ -1042,8 +1205,7 @@ pub enum UsdcRebalance {
         #[serde(default = "legacy_base_cctp")]
         corridor: UsdcCorridor,
         amount: Usdc,
-        burn_tx_hash: TxHash,
-        mint_tx_hash: TxHash,
+        hop: HopEvidence,
         deposit_ref: TransferRef,
         initiated_at: DateTime<Utc>,
         deposit_initiated_at: DateTime<Utc>,
@@ -1054,8 +1216,7 @@ pub enum UsdcRebalance {
         #[serde(default = "legacy_base_cctp")]
         corridor: UsdcCorridor,
         amount: Usdc,
-        burn_tx_hash: TxHash,
-        mint_tx_hash: TxHash,
+        hop: HopEvidence,
         initiated_at: DateTime<Utc>,
         deposit_confirmed_at: DateTime<Utc>,
     },
@@ -1065,8 +1226,7 @@ pub enum UsdcRebalance {
         #[serde(default = "legacy_base_cctp")]
         corridor: UsdcCorridor,
         amount: Usdc,
-        burn_tx_hash: TxHash,
-        mint_tx_hash: TxHash,
+        hop: HopEvidence,
         deposit_ref: Option<TransferRef>,
         reason: String,
         initiated_at: DateTime<Utc>,
@@ -1106,6 +1266,10 @@ pub enum PreBurnFailEligibility {
     AlreadyFailedPreBurn,
     /// A CCTP burn may already be on-chain; failing would strand the funds.
     PostBurn,
+    /// A chain-to-Alpaca Relay transfer past its vault withdrawal: the stable
+    /// is outside the vault, in the chain wallet or with Relay. `FailBridging`
+    /// and the post-burn steps refuse it; resuming it or a redeposit settles it.
+    RelayHeldOutsideVault,
     /// Before the bridge boundary; `FailBridging` does not apply here.
     NotAtBridgeBoundary,
 }
@@ -1125,6 +1289,9 @@ impl UsdcRebalance {
             | Self::Bridging { corridor, .. }
             | Self::AwaitingAttestation { corridor, .. }
             | Self::Attested { corridor, .. }
+            | Self::SwapQuoted { corridor, .. }
+            | Self::SwapDepositPrepared { corridor, .. }
+            | Self::SwapDeposited { corridor, .. }
             | Self::Bridged { corridor, .. }
             | Self::BridgingFailed { corridor, .. }
             | Self::DepositInitiated { corridor, .. }
@@ -1149,6 +1316,9 @@ impl UsdcRebalance {
             Self::Bridging { .. } => "Bridging",
             Self::AwaitingAttestation { .. } => "AwaitingAttestation",
             Self::Attested { .. } => "Attested",
+            Self::SwapQuoted { .. } => "SwapQuoted",
+            Self::SwapDepositPrepared { .. } => "SwapDepositPrepared",
+            Self::SwapDeposited { .. } => "SwapDeposited",
             Self::Bridged { .. } => "Bridged",
             Self::BridgingFailed { .. } => "BridgingFailed",
             Self::DepositInitiated { .. } => "DepositInitiated",
@@ -1185,6 +1355,9 @@ impl UsdcRebalance {
             | Self::Bridging { .. }
             | Self::AwaitingAttestation { .. }
             | Self::Attested { .. }
+            | Self::SwapQuoted { .. }
+            | Self::SwapDepositPrepared { .. }
+            | Self::SwapDeposited { .. }
             | Self::BridgingFailed { .. }
             | Self::Bridged {
                 direction: RebalanceDirection::AlpacaToBase,
@@ -1194,6 +1367,43 @@ impl UsdcRebalance {
             | Self::DepositConfirmed { .. }
             | Self::DepositFailed { .. }
             | Self::Reconciled { .. } => None,
+        }
+    }
+
+    /// The signed Relay pair of a `SwapDepositPrepared`, after any approves
+    /// that went out alone, or of a `SwapQuoted`'s lone approves: every
+    /// envelope a restart must restore, in nonce order.
+    pub(crate) fn prepared_swap_envelopes(&self) -> Vec<&PreparedTransaction> {
+        match self {
+            Self::SwapQuoted { split_approves, .. } => split_approves.iter().collect(),
+            Self::SwapDepositPrepared {
+                split_approves,
+                approve,
+                deposit,
+                ..
+            } => split_approves
+                .iter()
+                .chain(approve)
+                .chain(std::iter::once(deposit))
+                .collect(),
+            Self::Converting { .. }
+            | Self::ConversionComplete { .. }
+            | Self::ConversionFailed { .. }
+            | Self::WithdrawalSubmitting { .. }
+            | Self::Withdrawing { .. }
+            | Self::WithdrawalComplete { .. }
+            | Self::WithdrawalFailed { .. }
+            | Self::BridgingSubmitting { .. }
+            | Self::Bridging { .. }
+            | Self::AwaitingAttestation { .. }
+            | Self::Attested { .. }
+            | Self::SwapDeposited { .. }
+            | Self::Bridged { .. }
+            | Self::BridgingFailed { .. }
+            | Self::DepositInitiated { .. }
+            | Self::DepositConfirmed { .. }
+            | Self::DepositFailed { .. }
+            | Self::Reconciled { .. } => Vec::new(),
         }
     }
 
@@ -1250,6 +1460,9 @@ impl UsdcRebalance {
             | Self::Bridging { .. }
             | Self::AwaitingAttestation { .. }
             | Self::Attested { .. }
+            | Self::SwapQuoted { .. }
+            | Self::SwapDepositPrepared { .. }
+            | Self::SwapDeposited { .. }
             | Self::Bridged { .. }
             | Self::DepositInitiated { .. }
             | Self::DepositConfirmed { .. }
@@ -1270,6 +1483,30 @@ impl UsdcRebalance {
     /// classification here at compile time.
     pub fn pre_burn_fail_eligibility(&self) -> PreBurnFailEligibility {
         match self {
+            // A chain-to-Alpaca Relay withdrawal left the stable outside
+            // the vault, and `FailBridging` refuses it and every swap state:
+            // only the swap or a redeposit settles it.
+            Self::WithdrawalComplete {
+                direction: RebalanceDirection::BaseToAlpaca,
+                corridor:
+                    UsdcCorridor::HubRouted {
+                        hop: HopKind::Relay,
+                        ..
+                    },
+                ..
+            }
+            | Self::SwapQuoted {
+                direction: RebalanceDirection::BaseToAlpaca,
+                ..
+            }
+            | Self::SwapDepositPrepared {
+                direction: RebalanceDirection::BaseToAlpaca,
+                ..
+            }
+            | Self::SwapDeposited {
+                direction: RebalanceDirection::BaseToAlpaca,
+                ..
+            } => PreBurnFailEligibility::RelayHeldOutsideVault,
             // The two states `FailBridging` accepts from before any burn.
             // `BridgingSubmitting` with no recorded burn is the only genuinely
             // pre-burn form; the operator still verifies on-chain that no
@@ -1292,11 +1529,16 @@ impl UsdcRebalance {
             // (use `transfer resume`, which adopts / waits / pages, or
             // `clear-pending-burn` after verifying the burn never landed).
             // A BaseToAlpaca `ConversionFailed` is post-deposit, hence
-            // post-burn; an AlpacaToBase one is pre-withdrawal.
+            // post-burn; an AlpacaToBase one is pre-withdrawal. Every other
+            // swap state counts as post-burn: a lone approve or a signed
+            // deposit may be on chain, and `FailBridging` has no swap arm.
             Self::BridgingSubmitting {
                 pending_burn_tx: Some(_),
                 ..
             }
+            | Self::SwapQuoted { .. }
+            | Self::SwapDepositPrepared { .. }
+            | Self::SwapDeposited { .. }
             | Self::BridgingFailed { .. }
             | Self::Bridging { .. }
             | Self::AwaitingAttestation { .. }
@@ -1480,6 +1722,27 @@ impl UsdcRebalance {
                 attested_at: updated_at,
                 ..
             }
+            | Self::SwapQuoted {
+                direction,
+                amount,
+                initiated_at,
+                quoted_at: updated_at,
+                ..
+            }
+            | Self::SwapDepositPrepared {
+                direction,
+                amount,
+                initiated_at,
+                prepared_at: updated_at,
+                ..
+            }
+            | Self::SwapDeposited {
+                direction,
+                amount,
+                initiated_at,
+                deposited_at: updated_at,
+                ..
+            }
             | Self::Bridged {
                 direction,
                 amount_received: amount,
@@ -1602,8 +1865,23 @@ impl UsdcRebalance {
                 // A signed send may be on chain, mined or not yet.
                 DepositSend::Prepared { .. } => EthereumWalletCredit::InFlight(*amount_received),
             }),
+            // An Ethereum-origin swap: quoted, its input is still in the
+            // wallet; once a pair is signed it may be on chain.
+            Self::SwapQuoted {
+                direction: RebalanceDirection::AlpacaToBase,
+                amount,
+                ..
+            } => Some(EthereumWalletCredit::Held(*amount)),
+            Self::SwapDepositPrepared {
+                direction: RebalanceDirection::AlpacaToBase,
+                amount,
+                ..
+            } => Some(EthereumWalletCredit::InFlight(*amount)),
             Self::BridgingSubmitting { .. }
             | Self::Bridged { .. }
+            | Self::SwapQuoted { .. }
+            | Self::SwapDepositPrepared { .. }
+            | Self::SwapDeposited { .. }
             | Self::Converting { .. }
             | Self::ConversionComplete { .. }
             | Self::ConversionFailed { .. }
@@ -1646,6 +1924,9 @@ impl UsdcRebalance {
             | Self::Bridging { .. }
             | Self::AwaitingAttestation { .. }
             | Self::Attested { .. }
+            | Self::SwapQuoted { .. }
+            | Self::SwapDepositPrepared { .. }
+            | Self::SwapDeposited { .. }
             | Self::Bridged { .. }
             | Self::DepositInitiated { .. }
             // DepositFailed is post-burn/post-mint (the CCTP mint already
@@ -1770,6 +2051,9 @@ impl UsdcRebalance {
             | Self::Bridging { direction, .. }
             | Self::AwaitingAttestation { direction, .. }
             | Self::Attested { direction, .. }
+            | Self::SwapQuoted { direction, .. }
+            | Self::SwapDepositPrepared { direction, .. }
+            | Self::SwapDeposited { direction, .. }
             | Self::Bridged { direction, .. }
             | Self::BridgingFailed { direction, .. }
             | Self::DepositInitiated { direction, .. }
@@ -1858,6 +2142,9 @@ impl UsdcRebalance {
             | Self::Bridging { .. }
             | Self::AwaitingAttestation { .. }
             | Self::Attested { .. }
+            | Self::SwapQuoted { .. }
+            | Self::SwapDepositPrepared { .. }
+            | Self::SwapDeposited { .. }
             | Self::Bridged { .. }
             | Self::DepositInitiated { .. }
             | Self::DepositConfirmed { .. }
@@ -1911,6 +2198,9 @@ impl UsdcRebalance {
             | Self::Bridging { amount, .. }
             | Self::AwaitingAttestation { amount, .. }
             | Self::Attested { amount, .. }
+            | Self::SwapQuoted { amount, .. }
+            | Self::SwapDepositPrepared { amount, .. }
+            | Self::SwapDeposited { amount, .. }
             | Self::BridgingFailed { amount, .. }
             | Self::DepositInitiated { amount, .. }
             | Self::DepositConfirmed { amount, .. }
@@ -1985,6 +2275,11 @@ impl UsdcRebalance {
             | Self::Bridging { .. }
             | Self::AwaitingAttestation { .. }
             | Self::Attested { .. }
+            // The Relay hop's job resumes its own swap states; startup does
+            // not re-arm them yet.
+            | Self::SwapQuoted { .. }
+            | Self::SwapDepositPrepared { .. }
+            | Self::SwapDeposited { .. }
             | Self::Bridged { .. }
             | Self::DepositInitiated { .. }
             | Self::DepositConfirmed { .. }
@@ -2049,6 +2344,10 @@ pub(crate) async fn interrupted_usdc_rebalance_ids(
                'UsdcRebalanceEvent::BridgingInitiated', \
                'UsdcRebalanceEvent::BridgeAttestationReceived', \
                'UsdcRebalanceEvent::AttestationTimedOut', \
+               'UsdcRebalanceEvent::SwapQuoted', \
+               'UsdcRebalanceEvent::SwapApprovePrepared', \
+               'UsdcRebalanceEvent::SwapDepositPrepared', \
+               'UsdcRebalanceEvent::SwapDeposited', \
                'UsdcRebalanceEvent::Bridged', \
                'UsdcRebalanceEvent::DepositSendPrepared', \
                'UsdcRebalanceEvent::BridgingFailed', \
@@ -2177,6 +2476,41 @@ pub(crate) async fn prepared_deposit_send_ids(
             AND last_ev.sequence = latest.max_seq \
          WHERE last_ev.aggregate_type = 'UsdcRebalance' \
            AND last_ev.event_type = 'UsdcRebalanceEvent::DepositSendPrepared' \
+         ORDER BY latest.aggregate_id",
+    )
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows.into_iter().partition_map(|raw| {
+        raw.parse::<UsdcRebalanceId>()
+            .map_or_else(|_| Either::Right(raw), Either::Left)
+    }))
+}
+
+/// The `UsdcRebalance` aggregates whose latest event persisted a signed Relay
+/// envelope not yet confirmed (`SwapApprovePrepared`, `SwapDepositPrepared`),
+/// so startup can reserve their nonces before any other send takes them.
+/// Unparseable ids are returned apart, for the caller to page.
+pub(crate) async fn prepared_swap_ids(
+    pool: &SqlitePool,
+) -> Result<(Vec<UsdcRebalanceId>, Vec<String>), sqlx::Error> {
+    let rows: Vec<String> = sqlx::query_scalar(
+        "WITH latest AS ( \
+             SELECT aggregate_id, MAX(sequence) AS max_seq \
+             FROM events \
+             WHERE aggregate_type = 'UsdcRebalance' \
+             GROUP BY aggregate_id \
+         ) \
+         SELECT latest.aggregate_id \
+         FROM events last_ev \
+         INNER JOIN latest \
+             ON last_ev.aggregate_id = latest.aggregate_id \
+            AND last_ev.sequence = latest.max_seq \
+         WHERE last_ev.aggregate_type = 'UsdcRebalance' \
+           AND last_ev.event_type IN ( \
+               'UsdcRebalanceEvent::SwapApprovePrepared', \
+               'UsdcRebalanceEvent::SwapDepositPrepared' \
+           ) \
          ORDER BY latest.aggregate_id",
     )
     .fetch_all(pool)
@@ -2387,8 +2721,8 @@ pub(crate) async fn deposit_send_recorded_elsewhere(
 
 /// The `UsdcRebalance` aggregates whose latest event leaves them in a state
 /// that can hold Ethereum wallet credit (`WithdrawalComplete`,
-/// `BridgingSubmitting`, `Bridged`), so the credit ledger does not replay
-/// finished transfers.
+/// `BridgingSubmitting`, `SwapQuoted`, `SwapDepositPrepared`, `Bridged`), so
+/// the credit ledger does not replay finished transfers.
 async fn ethereum_credit_candidate_ids(pool: &SqlitePool) -> Result<Vec<String>, sqlx::Error> {
     sqlx::query_scalar(
         "WITH latest AS ( \
@@ -2408,6 +2742,9 @@ async fn ethereum_credit_candidate_ids(pool: &SqlitePool) -> Result<Vec<String>,
                'UsdcRebalanceEvent::BridgingSubmitting', \
                'UsdcRebalanceEvent::PendingBurnRecorded', \
                'UsdcRebalanceEvent::PendingBurnCleared', \
+               'UsdcRebalanceEvent::SwapQuoted', \
+               'UsdcRebalanceEvent::SwapApprovePrepared', \
+               'UsdcRebalanceEvent::SwapDepositPrepared', \
                'UsdcRebalanceEvent::Bridged', \
                'UsdcRebalanceEvent::DepositSendPrepared', \
                'UsdcRebalanceEvent::BridgingCompletionRecovered' \
@@ -2416,6 +2753,24 @@ async fn ethereum_credit_candidate_ids(pool: &SqlitePool) -> Result<Vec<String>,
     )
     .fetch_all(pool)
     .await
+}
+
+/// The swap's input as USDC: both Relay stables have 6 decimals.
+fn swap_input(quote: &SwapQuote) -> Result<Usdc, UsdcRebalanceError> {
+    Float::from_fixed_decimal(quote.amount_in, 6)
+        .map(Usdc::new)
+        .map_err(|_| UsdcRebalanceError::SwapInputUnconvertible {
+            amount_in: quote.amount_in,
+        })
+}
+
+/// `signed` with `order_id` added unless it is already there.
+fn with_order_id(signed: &[B256], order_id: B256) -> Vec<B256> {
+    signed
+        .iter()
+        .copied()
+        .chain((!signed.contains(&order_id)).then_some(order_id))
+        .collect()
 }
 
 #[async_trait]
@@ -2487,7 +2842,10 @@ impl EventSourced for UsdcRebalance {
     // there was.
     // v13: `WithdrawalFailed.withdrawal_ref` is optional: `RejectWithdrawal`
     // fails a withdrawal rejected before it was sent, which has no reference.
-    const SCHEMA_VERSION: u64 = 13;
+    // v14: the post-hop states carry `hop: HopEvidence` in place of the burn
+    // and mint hashes, and the Relay swap states exist. Events are unchanged,
+    // so replay rebuilds every snapshot into the new shape.
+    const SCHEMA_VERSION: u64 = 14;
 
     fn originate(event: &Self::Event) -> Option<Self> {
         use UsdcRebalanceEvent::*;
@@ -2921,8 +3279,10 @@ impl EventSourced for UsdcRebalance {
                 amount: *amount,
                 amount_received: *amount_received,
                 fee_collected: *fee_collected,
-                burn_tx_hash: *burn_tx_hash,
-                mint_tx_hash: *mint_tx_hash,
+                hop: HopEvidence::Cctp {
+                    burn_tx: *burn_tx_hash,
+                    mint_tx: *mint_tx_hash,
+                },
                 initiated_at: *initiated_at,
                 minted_at: *minted_at,
                 deposit_send: DepositSend::NotStarted,
@@ -2953,8 +3313,10 @@ impl EventSourced for UsdcRebalance {
                 amount: *amount,
                 amount_received: *amount_received,
                 fee_collected: *fee_collected,
-                burn_tx_hash: *burn_tx_hash,
-                mint_tx_hash: *mint_tx_hash,
+                hop: HopEvidence::Cctp {
+                    burn_tx: *burn_tx_hash,
+                    mint_tx: *mint_tx_hash,
+                },
                 initiated_at: *initiated_at,
                 minted_at: *recovered_at,
                 deposit_send: DepositSend::NotStarted,
@@ -3014,6 +3376,108 @@ impl EventSourced for UsdcRebalance {
             },
 
             (
+                SwapQuoted { quote, quoted_at },
+                Self::WithdrawalComplete {
+                    direction,
+                    corridor,
+                    initiated_at,
+                    ..
+                },
+            ) => Self::SwapQuoted {
+                direction: *direction,
+                corridor: *corridor,
+                amount: swap_input(quote)?,
+                quote: quote.clone(),
+                signed_order_ids: Vec::new(),
+                split_approves: Vec::new(),
+                initiated_at: *initiated_at,
+                quoted_at: *quoted_at,
+            },
+
+            (
+                SwapApprovePrepared { approve, .. },
+                Self::SwapQuoted {
+                    direction,
+                    corridor,
+                    amount,
+                    quote,
+                    signed_order_ids,
+                    split_approves,
+                    initiated_at,
+                    quoted_at,
+                },
+            ) => Self::SwapQuoted {
+                direction: *direction,
+                corridor: *corridor,
+                amount: *amount,
+                quote: quote.clone(),
+                signed_order_ids: signed_order_ids.clone(),
+                split_approves: split_approves
+                    .iter()
+                    .chain(std::iter::once(approve))
+                    .cloned()
+                    .collect(),
+                initiated_at: *initiated_at,
+                quoted_at: *quoted_at,
+            },
+
+            (
+                SwapDepositPrepared {
+                    approve,
+                    deposit,
+                    prepared_at,
+                },
+                Self::SwapQuoted {
+                    direction,
+                    corridor,
+                    amount,
+                    quote,
+                    signed_order_ids,
+                    split_approves,
+                    initiated_at,
+                    ..
+                },
+            ) => Self::SwapDepositPrepared {
+                direction: *direction,
+                corridor: *corridor,
+                amount: *amount,
+                quote: quote.clone(),
+                signed_order_ids: with_order_id(signed_order_ids, quote.order_id),
+                split_approves: split_approves.clone(),
+                approve: approve.clone(),
+                deposit: deposit.clone(),
+                initiated_at: *initiated_at,
+                prepared_at: *prepared_at,
+            },
+
+            (
+                SwapDeposited {
+                    deposit_tx,
+                    deposit_block,
+                    deposited_at,
+                },
+                Self::SwapDepositPrepared {
+                    direction,
+                    corridor,
+                    amount,
+                    quote,
+                    signed_order_ids,
+                    initiated_at,
+                    ..
+                },
+            ) => Self::SwapDeposited {
+                direction: *direction,
+                corridor: *corridor,
+                amount: *amount,
+                quote: quote.clone(),
+                signed_order_ids: signed_order_ids.clone(),
+                deposit_tx: *deposit_tx,
+                deposit_block: *deposit_block,
+                initiated_at: *initiated_at,
+                deposited_at: *deposited_at,
+            },
+
+            (
                 DepositSendPrepared {
                     prepared,
                     prepared_at,
@@ -3024,8 +3488,7 @@ impl EventSourced for UsdcRebalance {
                     amount,
                     amount_received,
                     fee_collected,
-                    burn_tx_hash,
-                    mint_tx_hash,
+                    hop,
                     initiated_at,
                     minted_at,
                     deposit_send: DepositSend::NotStarted,
@@ -3036,8 +3499,7 @@ impl EventSourced for UsdcRebalance {
                 amount: *amount,
                 amount_received: *amount_received,
                 fee_collected: *fee_collected,
-                burn_tx_hash: *burn_tx_hash,
-                mint_tx_hash: *mint_tx_hash,
+                hop: *hop,
                 initiated_at: *initiated_at,
                 minted_at: *minted_at,
                 deposit_send: DepositSend::Prepared {
@@ -3055,8 +3517,7 @@ impl EventSourced for UsdcRebalance {
                     direction,
                     corridor,
                     amount_received,
-                    burn_tx_hash,
-                    mint_tx_hash,
+                    hop,
                     initiated_at,
                     ..
                 },
@@ -3064,8 +3525,7 @@ impl EventSourced for UsdcRebalance {
                 direction: *direction,
                 corridor: *corridor,
                 amount: *amount_received,
-                burn_tx_hash: *burn_tx_hash,
-                mint_tx_hash: *mint_tx_hash,
+                hop: *hop,
                 deposit_ref: deposit_ref.clone(),
                 initiated_at: *initiated_at,
                 deposit_initiated_at: *deposit_initiated_at,
@@ -3080,8 +3540,7 @@ impl EventSourced for UsdcRebalance {
                     direction,
                     corridor,
                     amount,
-                    burn_tx_hash,
-                    mint_tx_hash,
+                    hop,
                     initiated_at,
                     ..
                 },
@@ -3089,8 +3548,7 @@ impl EventSourced for UsdcRebalance {
                 direction: *direction,
                 corridor: *corridor,
                 amount: *amount,
-                burn_tx_hash: *burn_tx_hash,
-                mint_tx_hash: *mint_tx_hash,
+                hop: *hop,
                 initiated_at: *initiated_at,
                 deposit_confirmed_at: *deposit_confirmed_at,
             },
@@ -3105,8 +3563,7 @@ impl EventSourced for UsdcRebalance {
                     direction,
                     corridor,
                     amount,
-                    burn_tx_hash,
-                    mint_tx_hash,
+                    hop,
                     initiated_at,
                     ..
                 }
@@ -3114,8 +3571,7 @@ impl EventSourced for UsdcRebalance {
                     direction,
                     corridor,
                     amount_received: amount,
-                    burn_tx_hash,
-                    mint_tx_hash,
+                    hop,
                     initiated_at,
                     ..
                 },
@@ -3123,8 +3579,7 @@ impl EventSourced for UsdcRebalance {
                 direction: *direction,
                 corridor: *corridor,
                 amount: *amount,
-                burn_tx_hash: *burn_tx_hash,
-                mint_tx_hash: *mint_tx_hash,
+                hop: *hop,
                 deposit_ref: deposit_ref.clone(),
                 reason: reason.clone(),
                 initiated_at: *initiated_at,
@@ -3139,8 +3594,7 @@ impl EventSourced for UsdcRebalance {
                     direction: RebalanceDirection::BaseToAlpaca,
                     corridor,
                     amount,
-                    burn_tx_hash,
-                    mint_tx_hash,
+                    hop,
                     deposit_ref: None,
                     reason,
                     initiated_at,
@@ -3150,8 +3604,7 @@ impl EventSourced for UsdcRebalance {
                 direction: RebalanceDirection::BaseToAlpaca,
                 corridor: *corridor,
                 amount: *amount,
-                burn_tx_hash: *burn_tx_hash,
-                mint_tx_hash: *mint_tx_hash,
+                hop: *hop,
                 deposit_ref: Some(TransferRef::OnchainTx(*send_tx)),
                 reason: reason.clone(),
                 initiated_at: *initiated_at,
@@ -3168,8 +3621,7 @@ impl EventSourced for UsdcRebalance {
                     direction: RebalanceDirection::BaseToAlpaca,
                     corridor,
                     amount,
-                    burn_tx_hash,
-                    mint_tx_hash,
+                    hop,
                     deposit_ref: Some(TransferRef::OnchainTx(_)),
                     initiated_at,
                     ..
@@ -3178,8 +3630,7 @@ impl EventSourced for UsdcRebalance {
                 direction: RebalanceDirection::BaseToAlpaca,
                 corridor: *corridor,
                 amount: *amount,
-                burn_tx_hash: *burn_tx_hash,
-                mint_tx_hash: *mint_tx_hash,
+                hop: *hop,
                 initiated_at: *initiated_at,
                 deposit_confirmed_at: *recovered_at,
             },
@@ -3268,6 +3719,9 @@ impl EventSourced for UsdcRebalance {
                     | Self::Bridging { .. }
                     | Self::AwaitingAttestation { .. }
                     | Self::Attested { .. }
+                    | Self::SwapQuoted { .. }
+                    | Self::SwapDepositPrepared { .. }
+                    | Self::SwapDeposited { .. }
                     | Self::BridgingFailed { .. }
                     | Self::Bridged { .. }
                     | Self::DepositInitiated { .. }
@@ -3410,6 +3864,11 @@ impl EventSourced for UsdcRebalance {
             #[cfg(any(test, feature = "test-support"))]
             ConfirmBridgingAt { .. } => Err(UsdcRebalanceError::AttestationNotReceived),
 
+            QuoteSwap { .. }
+            | PrepareSwapApprove { .. }
+            | PrepareSwapDeposit { .. }
+            | ConfirmSwapDeposit { .. } => Err(UsdcRebalanceError::WithdrawalNotConfirmed),
+
             InitiateDeposit { .. } | PrepareDepositSend { .. } => {
                 Err(UsdcRebalanceError::BridgingNotCompleted)
             }
@@ -3535,6 +3994,15 @@ impl EventSourced for UsdcRebalance {
             }
 
             RecordPendingBurn { burn_tx } => self.transition_record_pending_burn(burn_tx),
+            QuoteSwap { quote } => self.transition_quote_swap(quote),
+            PrepareSwapApprove { approve } => self.transition_prepare_swap_approve(approve),
+            PrepareSwapDeposit { approve, deposit } => {
+                self.transition_prepare_swap_deposit(approve, deposit)
+            }
+            ConfirmSwapDeposit {
+                deposit_tx,
+                deposit_block,
+            } => self.transition_confirm_swap_deposit(deposit_tx, deposit_block),
             PrepareDepositSend { prepared } => self.transition_prepare_deposit_send(prepared),
             ClearPendingBurn => self.transition_clear_pending_burn(),
 
@@ -3853,6 +4321,9 @@ impl UsdcRebalance {
             | Self::Bridging { .. }
             | Self::AwaitingAttestation { .. }
             | Self::Attested { .. }
+            | Self::SwapQuoted { .. }
+            | Self::SwapDepositPrepared { .. }
+            | Self::SwapDeposited { .. }
             | Self::Bridged { .. }
             | Self::BridgingFailed { .. }
             | Self::DepositInitiated { .. }
@@ -3878,6 +4349,9 @@ impl UsdcRebalance {
             | Self::Bridging { .. }
             | Self::AwaitingAttestation { .. }
             | Self::Attested { .. }
+            | Self::SwapQuoted { .. }
+            | Self::SwapDepositPrepared { .. }
+            | Self::SwapDeposited { .. }
             | Self::Bridged { .. }
             | Self::BridgingFailed { .. }
             | Self::DepositInitiated { .. }
@@ -3922,6 +4396,14 @@ impl UsdcRebalance {
     ) -> Result<Vec<UsdcRebalanceEvent>, UsdcRebalanceError> {
         use UsdcRebalanceEvent::*;
         match self {
+            // A swap hop has no CCTP leg, and its funds have left the
+            // vault: nothing here applies to it.
+            Self::SwapQuoted { .. }
+            | Self::SwapDepositPrepared { .. }
+            | Self::SwapDeposited { .. } => Err(UsdcRebalanceError::InvalidCommand {
+                command: "BeginBridging".to_string(),
+                state: self.state_name().to_string(),
+            }),
             Self::Converting { .. }
             | Self::ConversionComplete { .. }
             | Self::ConversionFailed { .. }
@@ -3995,6 +4477,14 @@ impl UsdcRebalance {
     ) -> Result<Vec<UsdcRebalanceEvent>, UsdcRebalanceError> {
         use UsdcRebalanceEvent::*;
         match self {
+            // A swap hop has no CCTP leg, and its funds have left the
+            // vault: nothing here applies to it.
+            Self::SwapQuoted { .. }
+            | Self::SwapDepositPrepared { .. }
+            | Self::SwapDeposited { .. } => Err(UsdcRebalanceError::InvalidCommand {
+                command: "InitiateBridging".to_string(),
+                state: self.state_name().to_string(),
+            }),
             Self::Converting { .. }
             | Self::ConversionComplete { .. }
             | Self::ConversionFailed { .. }
@@ -4033,6 +4523,14 @@ impl UsdcRebalance {
     ) -> Result<Vec<UsdcRebalanceEvent>, UsdcRebalanceError> {
         use UsdcRebalanceEvent::*;
         match self {
+            // A swap hop has no CCTP leg, and its funds have left the
+            // vault: nothing here applies to it.
+            Self::SwapQuoted { .. }
+            | Self::SwapDepositPrepared { .. }
+            | Self::SwapDeposited { .. } => Err(UsdcRebalanceError::InvalidCommand {
+                command: "RecordPendingBurn".to_string(),
+                state: self.state_name().to_string(),
+            }),
             Self::Converting { .. }
             | Self::ConversionComplete { .. }
             | Self::ConversionFailed { .. }
@@ -4064,6 +4562,14 @@ impl UsdcRebalance {
     fn transition_clear_pending_burn(&self) -> Result<Vec<UsdcRebalanceEvent>, UsdcRebalanceError> {
         use UsdcRebalanceEvent::*;
         match self {
+            // A swap hop has no CCTP leg, and its funds have left the
+            // vault: nothing here applies to it.
+            Self::SwapQuoted { .. }
+            | Self::SwapDepositPrepared { .. }
+            | Self::SwapDeposited { .. } => Err(UsdcRebalanceError::InvalidCommand {
+                command: "ClearPendingBurn".to_string(),
+                state: self.state_name().to_string(),
+            }),
             Self::Converting { .. }
             | Self::ConversionComplete { .. }
             | Self::ConversionFailed { .. }
@@ -4103,6 +4609,14 @@ impl UsdcRebalance {
     ) -> Result<Vec<UsdcRebalanceEvent>, UsdcRebalanceError> {
         use UsdcRebalanceEvent::*;
         match self {
+            // A swap hop has no CCTP leg, and its funds have left the
+            // vault: nothing here applies to it.
+            Self::SwapQuoted { .. }
+            | Self::SwapDepositPrepared { .. }
+            | Self::SwapDeposited { .. } => Err(UsdcRebalanceError::InvalidCommand {
+                command: "ReceiveAttestation".to_string(),
+                state: self.state_name().to_string(),
+            }),
             Self::Converting { .. }
             | Self::ConversionComplete { .. }
             | Self::ConversionFailed { .. }
@@ -4139,6 +4653,14 @@ impl UsdcRebalance {
     ) -> Result<Vec<UsdcRebalanceEvent>, UsdcRebalanceError> {
         use UsdcRebalanceEvent::*;
         match self {
+            // A swap hop has no CCTP leg, and its funds have left the
+            // vault: nothing here applies to it.
+            Self::SwapQuoted { .. }
+            | Self::SwapDepositPrepared { .. }
+            | Self::SwapDeposited { .. } => Err(UsdcRebalanceError::InvalidCommand {
+                command: "TimeoutAttestation".to_string(),
+                state: self.state_name().to_string(),
+            }),
             Self::Converting { .. }
             | Self::ConversionComplete { .. }
             | Self::ConversionFailed { .. }
@@ -4178,6 +4700,14 @@ impl UsdcRebalance {
     ) -> Result<Vec<UsdcRebalanceEvent>, UsdcRebalanceError> {
         use UsdcRebalanceEvent::*;
         match self {
+            // A swap hop has no CCTP leg, and its funds have left the
+            // vault: nothing here applies to it.
+            Self::SwapQuoted { .. }
+            | Self::SwapDepositPrepared { .. }
+            | Self::SwapDeposited { .. } => Err(UsdcRebalanceError::InvalidCommand {
+                command: "ConfirmBridging".to_string(),
+                state: self.state_name().to_string(),
+            }),
             Self::Converting { .. }
             | Self::ConversionComplete { .. }
             | Self::ConversionFailed { .. }
@@ -4209,6 +4739,14 @@ impl UsdcRebalance {
     ) -> Result<Vec<UsdcRebalanceEvent>, UsdcRebalanceError> {
         use UsdcRebalanceEvent::*;
         match self {
+            // A swap hop has no CCTP leg, and its funds have left the
+            // vault: nothing here applies to it.
+            Self::SwapQuoted { .. }
+            | Self::SwapDepositPrepared { .. }
+            | Self::SwapDeposited { .. } => Err(UsdcRebalanceError::InvalidCommand {
+                command: "FailBridging".to_string(),
+                state: self.state_name().to_string(),
+            }),
             Self::Converting { .. }
             | Self::ConversionComplete { .. }
             | Self::ConversionFailed { .. }
@@ -4224,6 +4762,21 @@ impl UsdcRebalance {
                 pending_burn_tx: Some(_),
                 ..
             } => Err(UsdcRebalanceError::BurnAlreadyRecorded),
+            // A chain-to-Alpaca Relay withdrawal's stable is outside the
+            // vault: failing it would release the guard before a redeposit
+            // returns it. An Alpaca-to-chain failure keeps the guard until
+            // reconcile, as on CCTP.
+            Self::WithdrawalComplete {
+                direction: RebalanceDirection::BaseToAlpaca,
+                corridor:
+                    corridor @ UsdcCorridor::HubRouted {
+                        hop: HopKind::Relay,
+                        ..
+                    },
+                ..
+            } => Err(UsdcRebalanceError::RelayWithdrawalAwaitsRedeposit {
+                corridor: *corridor,
+            }),
             // Pre-burn failure: withdrawal succeeded and (for BridgingSubmitting
             // with no recorded burn) the burn intent was recorded but no burn tx
             // exists yet -- e.g. a USDC-to-U256 conversion error or a burn that
@@ -4302,6 +4855,162 @@ impl UsdcRebalance {
         }
     }
 
+    /// Records the binding swap quote on a Relay corridor's
+    /// `WithdrawalComplete`. A vault withdraw swaps all it withdrew; an Alpaca
+    /// withdrawal swaps what it credited, which fees may leave below nominal.
+    fn transition_quote_swap(
+        &self,
+        quote: Box<SwapQuote>,
+    ) -> Result<Vec<UsdcRebalanceEvent>, UsdcRebalanceError> {
+        let Self::WithdrawalComplete {
+            direction,
+            corridor,
+            amount,
+            ..
+        } = self
+        else {
+            return Err(UsdcRebalanceError::InvalidCommand {
+                command: "QuoteSwap".to_string(),
+                state: self.state_name().to_string(),
+            });
+        };
+
+        let UsdcCorridor::HubRouted {
+            hop: HopKind::Relay,
+            ..
+        } = corridor
+        else {
+            return Err(UsdcRebalanceError::NotSwapCorridor {
+                corridor: *corridor,
+            });
+        };
+
+        let withdrawn = amount
+            .to_u256_6_decimals()
+            .map_err(|_| UsdcRebalanceError::SwapAmountUnconvertible { amount: *amount })?;
+        let fits = match direction {
+            RebalanceDirection::BaseToAlpaca => quote.amount_in == withdrawn,
+            RebalanceDirection::AlpacaToBase => {
+                quote.amount_in > U256::ZERO && quote.amount_in <= withdrawn
+            }
+        };
+
+        if !fits {
+            return Err(UsdcRebalanceError::SwapAmountMismatch {
+                withdrawn: *amount,
+                quoted: quote.amount_in,
+            });
+        }
+
+        swap_input(&quote)?;
+
+        Ok(vec![UsdcRebalanceEvent::SwapQuoted {
+            quote,
+            quoted_at: Utc::now(),
+        }])
+    }
+
+    /// Persists an approve signed alone after another send split the pair.
+    fn transition_prepare_swap_approve(
+        &self,
+        approve: PreparedTransaction,
+    ) -> Result<Vec<UsdcRebalanceEvent>, UsdcRebalanceError> {
+        match self {
+            Self::SwapQuoted { .. } => Ok(vec![UsdcRebalanceEvent::SwapApprovePrepared {
+                approve,
+                prepared_at: Utc::now(),
+            }]),
+            Self::SwapDepositPrepared { .. } | Self::SwapDeposited { .. } => {
+                Err(UsdcRebalanceError::SwapDepositAlreadyPrepared)
+            }
+            Self::Converting { .. }
+            | Self::ConversionComplete { .. }
+            | Self::ConversionFailed { .. }
+            | Self::WithdrawalSubmitting { .. }
+            | Self::Withdrawing { .. }
+            | Self::WithdrawalComplete { .. }
+            | Self::WithdrawalFailed { .. }
+            | Self::BridgingSubmitting { .. }
+            | Self::Bridging { .. }
+            | Self::AwaitingAttestation { .. }
+            | Self::Attested { .. }
+            | Self::Bridged { .. }
+            | Self::BridgingFailed { .. }
+            | Self::DepositInitiated { .. }
+            | Self::DepositConfirmed { .. }
+            | Self::DepositFailed { .. }
+            | Self::Reconciled { .. } => Err(UsdcRebalanceError::InvalidCommand {
+                command: "PrepareSwapApprove".to_string(),
+                state: self.state_name().to_string(),
+            }),
+        }
+    }
+
+    /// Persists the signed swap pair before either envelope is broadcast.
+    fn transition_prepare_swap_deposit(
+        &self,
+        approve: Option<PreparedTransaction>,
+        deposit: PreparedTransaction,
+    ) -> Result<Vec<UsdcRebalanceEvent>, UsdcRebalanceError> {
+        match self {
+            Self::SwapQuoted { .. } => Ok(vec![UsdcRebalanceEvent::SwapDepositPrepared {
+                approve,
+                deposit,
+                prepared_at: Utc::now(),
+            }]),
+            Self::SwapDepositPrepared { .. } | Self::SwapDeposited { .. } => {
+                Err(UsdcRebalanceError::SwapDepositAlreadyPrepared)
+            }
+            Self::Converting { .. }
+            | Self::ConversionComplete { .. }
+            | Self::ConversionFailed { .. }
+            | Self::WithdrawalSubmitting { .. }
+            | Self::Withdrawing { .. }
+            | Self::WithdrawalComplete { .. }
+            | Self::WithdrawalFailed { .. }
+            | Self::BridgingSubmitting { .. }
+            | Self::Bridging { .. }
+            | Self::AwaitingAttestation { .. }
+            | Self::Attested { .. }
+            | Self::Bridged { .. }
+            | Self::BridgingFailed { .. }
+            | Self::DepositInitiated { .. }
+            | Self::DepositConfirmed { .. }
+            | Self::DepositFailed { .. }
+            | Self::Reconciled { .. } => Err(UsdcRebalanceError::InvalidCommand {
+                command: "PrepareSwapDeposit".to_string(),
+                state: self.state_name().to_string(),
+            }),
+        }
+    }
+
+    /// Records the persisted deposit as confirmed; any other tx is refused.
+    fn transition_confirm_swap_deposit(
+        &self,
+        deposit_tx: TxHash,
+        deposit_block: u64,
+    ) -> Result<Vec<UsdcRebalanceEvent>, UsdcRebalanceError> {
+        let Self::SwapDepositPrepared { deposit, .. } = self else {
+            return Err(UsdcRebalanceError::InvalidCommand {
+                command: "ConfirmSwapDeposit".to_string(),
+                state: self.state_name().to_string(),
+            });
+        };
+
+        if deposit.tx_hash() != deposit_tx {
+            return Err(UsdcRebalanceError::SwapDepositHashMismatch {
+                recorded: deposit_tx,
+                prepared: deposit.tx_hash(),
+            });
+        }
+
+        Ok(vec![UsdcRebalanceEvent::SwapDeposited {
+            deposit_tx,
+            deposit_block,
+            deposited_at: Utc::now(),
+        }])
+    }
+
     /// Persists the signed BaseToAlpaca deposit send before its broadcast.
     fn transition_prepare_deposit_send(
         &self,
@@ -4329,7 +5038,10 @@ impl UsdcRebalance {
                 deposit_send,
                 ..
             } => Ok(deposit_send.clone()),
-            Self::Converting { .. }
+            Self::SwapQuoted { .. }
+            | Self::SwapDepositPrepared { .. }
+            | Self::SwapDeposited { .. }
+            | Self::Converting { .. }
             | Self::ConversionComplete { .. }
             | Self::ConversionFailed { .. }
             | Self::WithdrawalSubmitting { .. }
@@ -4364,7 +5076,10 @@ impl UsdcRebalance {
     ) -> Result<Vec<UsdcRebalanceEvent>, UsdcRebalanceError> {
         use UsdcRebalanceEvent::*;
         match self {
-            Self::Converting { .. }
+            Self::SwapQuoted { .. }
+            | Self::SwapDepositPrepared { .. }
+            | Self::SwapDeposited { .. }
+            | Self::Converting { .. }
             | Self::ConversionComplete { .. }
             | Self::ConversionFailed { .. }
             | Self::WithdrawalSubmitting { .. }
@@ -4417,7 +5132,10 @@ impl UsdcRebalance {
     ) -> Result<Vec<UsdcRebalanceEvent>, UsdcRebalanceError> {
         use UsdcRebalanceEvent::*;
         match self {
-            Self::Converting { .. }
+            Self::SwapQuoted { .. }
+            | Self::SwapDepositPrepared { .. }
+            | Self::SwapDeposited { .. }
+            | Self::Converting { .. }
             | Self::ConversionComplete { .. }
             | Self::ConversionFailed { .. }
             | Self::WithdrawalSubmitting { .. }
@@ -4450,7 +5168,10 @@ impl UsdcRebalance {
     ) -> Result<Vec<UsdcRebalanceEvent>, UsdcRebalanceError> {
         use UsdcRebalanceEvent::*;
         match self {
-            Self::Converting { .. }
+            Self::SwapQuoted { .. }
+            | Self::SwapDepositPrepared { .. }
+            | Self::SwapDeposited { .. }
+            | Self::Converting { .. }
             | Self::ConversionComplete { .. }
             | Self::ConversionFailed { .. }
             | Self::WithdrawalSubmitting { .. }
@@ -4649,6 +5370,86 @@ impl UsdcRebalance {
     }
 }
 
+/// A Relay quote for `amount_in` in base units, as `QuoteSwap` records it.
+#[cfg(test)]
+pub(crate) fn swap_quote_for_test(amount_in: U256, order_id: B256) -> SwapQuote {
+    SwapQuote {
+        request_id: B256::repeat_byte(0x5e),
+        order_id,
+        amount_in,
+        expected_out: amount_in,
+        minimum_out: amount_in,
+        slippage_bps: 30,
+        relayer_fee: U256::ZERO,
+        gas_fee: U256::ZERO,
+        deadline: DateTime::<Utc>::UNIX_EPOCH,
+        approve: None,
+        deposit: SwapStep {
+            chain_id: 1,
+            to: Address::ZERO,
+            data: Bytes::new(),
+            value: U256::ZERO,
+        },
+        origin_from_block: 0,
+    }
+}
+
+/// Records a 100 USDC transfer on `corridor` up to a persisted swap pair:
+/// withdrawn, quoted, and `approve` and `deposit` signed.
+#[cfg(test)]
+pub(crate) async fn record_swap_pair_for_test(
+    store: &Store<UsdcRebalance>,
+    id: &UsdcRebalanceId,
+    direction: RebalanceDirection,
+    corridor: UsdcCorridor,
+    approve: Option<PreparedTransaction>,
+    deposit: PreparedTransaction,
+) {
+    let amount = Usdc::new(Float::from_fixed_decimal(U256::from(100u64), 0).unwrap());
+    let withdrawal_tx = TxHash::repeat_byte(0x77);
+
+    store
+        .send(
+            id,
+            UsdcRebalanceCommand::Initiate {
+                direction,
+                corridor,
+                amount,
+                withdrawal: TransferRef::OnchainTx(withdrawal_tx),
+            },
+        )
+        .await
+        .unwrap();
+    store
+        .send(
+            id,
+            UsdcRebalanceCommand::ConfirmWithdrawal {
+                withdrawal_tx: Some(withdrawal_tx),
+            },
+        )
+        .await
+        .unwrap();
+    store
+        .send(
+            id,
+            UsdcRebalanceCommand::QuoteSwap {
+                quote: Box::new(swap_quote_for_test(
+                    U256::from(100_000_000u64),
+                    B256::repeat_byte(0x0d),
+                )),
+            },
+        )
+        .await
+        .unwrap();
+    store
+        .send(
+            id,
+            UsdcRebalanceCommand::PrepareSwapDeposit { approve, deposit },
+        )
+        .await
+        .unwrap();
+}
+
 #[cfg(test)]
 mod tests {
     use alloy::primitives::fixed_bytes;
@@ -4670,6 +5471,560 @@ mod tests {
         fixed_bytes!("0xa01ca42d9082e926a81dc287d973a8f072dfa1b20a4fbf7b20f3abda1b376278");
     const OTHER_CCTP_NONCE: B256 =
         fixed_bytes!("0x524cd90eb8dffcb29fcc163aa8258d84e6cc25abc0b4700d704936812ee39824");
+
+    const LEGACY_BURN: &str = "0x00000000000000000000000000000000000000000000000000000000000000b1";
+    const LEGACY_MINT: &str = "0x00000000000000000000000000000000000000000000000000000000000000a1";
+
+    /// A persisted event payload from before corridors and hop evidence.
+    fn legacy(payload: serde_json::Value) -> UsdcRebalanceEvent {
+        from_value(payload).expect("legacy event payload must deserialize")
+    }
+
+    fn legacy_hop() -> HopEvidence {
+        HopEvidence::Cctp {
+            burn_tx: LEGACY_BURN.parse().unwrap(),
+            mint_tx: LEGACY_MINT.parse().unwrap(),
+        }
+    }
+
+    /// The burn half of a legacy Base->Alpaca stream, up to the attestation.
+    fn legacy_base_to_alpaca_burn() -> Vec<UsdcRebalanceEvent> {
+        vec![
+            legacy(json!({"WithdrawalSubmitting": {
+                "direction": "BaseToAlpaca", "amount": "100", "from_block": 7,
+                "submitting_at": "2026-01-01T00:00:00Z"}})),
+            legacy(json!({"Initiated": {
+                "direction": "BaseToAlpaca", "amount": "100",
+                "withdrawal_ref": {"OnchainTx": "0x00000000000000000000000000000000000000000000000000000000000000c1"},
+                "initiated_at": "2026-01-01T00:00:01Z"}})),
+            legacy(json!({"WithdrawalConfirmed": {"confirmed_at": "2026-01-01T00:00:02Z"}})),
+            legacy(
+                json!({"BridgingSubmitting": {"from_block": 8, "submitting_at": "2026-01-01T00:00:03Z"}}),
+            ),
+            legacy(json!({"BridgingInitiated": {
+                "burn_tx_hash": LEGACY_BURN, "burned_at": "2026-01-01T00:00:04Z"}})),
+            legacy(json!({"BridgeAttestationReceived": {
+                "attestation": [1, 2, 3],
+                "cctp_nonce": "0xa01ca42d9082e926a81dc287d973a8f072dfa1b20a4fbf7b20f3abda1b376278",
+                "attested_at": "2026-01-01T00:00:05Z"}})),
+        ]
+    }
+
+    fn legacy_bridged() -> UsdcRebalanceEvent {
+        legacy(json!({"Bridged": {
+            "mint_tx_hash": LEGACY_MINT, "amount_received": "99.99", "fee_collected": "0.01",
+            "minted_at": "2026-01-01T00:00:06Z"}}))
+    }
+
+    fn replayed_hop(events: Vec<UsdcRebalanceEvent>) -> (&'static str, Option<HopEvidence>) {
+        let state = replay::<UsdcRebalance>(events).unwrap().unwrap();
+        let hop = match &state {
+            UsdcRebalance::Bridged { hop, .. }
+            | UsdcRebalance::DepositInitiated { hop, .. }
+            | UsdcRebalance::DepositConfirmed { hop, .. }
+            | UsdcRebalance::DepositFailed { hop, .. } => Some(*hop),
+            _ => None,
+        };
+
+        (state.state_name(), hop)
+    }
+
+    /// Every post-hop state of every legacy stream shape replays into
+    /// `HopEvidence::Cctp` from the recorded burn and mint, on Base via CCTP.
+    #[test]
+    fn legacy_events_replay_into_hop_evidence() {
+        let burn = legacy_base_to_alpaca_burn();
+        let bridged = [burn.clone(), vec![legacy_bridged()]].concat();
+
+        assert_eq!(
+            replayed_hop(bridged.clone()),
+            ("Bridged", Some(legacy_hop()))
+        );
+
+        let initiated = [
+            bridged.clone(),
+            vec![legacy(json!({"DepositInitiated": {
+                "deposit_ref": {"OnchainTx": "0x00000000000000000000000000000000000000000000000000000000000000d1"},
+                "deposit_initiated_at": "2026-01-01T00:00:07Z"}}))],
+        ]
+        .concat();
+        assert_eq!(
+            replayed_hop(initiated.clone()),
+            ("DepositInitiated", Some(legacy_hop()))
+        );
+
+        let confirmed = [
+            initiated.clone(),
+            vec![legacy(json!({"DepositConfirmed": {
+                "direction": "BaseToAlpaca", "deposit_confirmed_at": "2026-01-01T00:00:08Z"}}))],
+        ]
+        .concat();
+        assert_eq!(
+            replayed_hop(confirmed),
+            ("DepositConfirmed", Some(legacy_hop()))
+        );
+
+        let failed_in_bridged = [
+            bridged,
+            vec![legacy(json!({"DepositFailed": {
+                "deposit_ref": null, "reason": "send unresolved",
+                "failed_at": "2026-01-01T00:00:07Z"}}))],
+        ]
+        .concat();
+        assert_eq!(
+            replayed_hop(failed_in_bridged.clone()),
+            ("DepositFailed", Some(legacy_hop()))
+        );
+
+        let attached = [
+            failed_in_bridged,
+            vec![legacy(json!({"DepositSendAttached": {
+                "send_tx": "0x00000000000000000000000000000000000000000000000000000000000000d2",
+                "attached_at": "2026-01-01T00:00:09Z"}}))],
+        ]
+        .concat();
+        assert_eq!(
+            replayed_hop(attached.clone()),
+            ("DepositFailed", Some(legacy_hop()))
+        );
+
+        let recovered_deposit = [
+            attached,
+            vec![legacy(json!({"DepositCompletionRecovered": {
+                "recovered_at": "2026-01-01T00:00:10Z"}}))],
+        ]
+        .concat();
+        assert_eq!(
+            replayed_hop(recovered_deposit),
+            ("DepositConfirmed", Some(legacy_hop()))
+        );
+
+        let failed_in_initiated = [
+            initiated,
+            vec![legacy(json!({"DepositFailed": {
+                "deposit_ref": {"OnchainTx": "0x00000000000000000000000000000000000000000000000000000000000000d1"},
+                "reason": "Alpaca deadline", "failed_at": "2026-01-01T00:00:09Z"}}))],
+        ]
+        .concat();
+        assert_eq!(
+            replayed_hop(failed_in_initiated),
+            ("DepositFailed", Some(legacy_hop()))
+        );
+
+        let recovered_bridge = [
+            burn,
+            vec![
+                legacy(json!({"BridgingFailed": {
+                    "burn_tx_hash": LEGACY_BURN,
+                    "cctp_nonce": "0xa01ca42d9082e926a81dc287d973a8f072dfa1b20a4fbf7b20f3abda1b376278",
+                    "reason": "mint receipt", "failed_at": "2026-01-01T00:00:06Z"}})),
+                legacy(json!({"BridgingCompletionRecovered": {
+                    "mint_tx_hash": LEGACY_MINT, "amount_received": "99.99",
+                    "fee_collected": "0.01", "recovered_at": "2026-01-01T00:00:07Z"}})),
+            ],
+        ]
+        .concat();
+        assert_eq!(
+            replayed_hop(recovered_bridge.clone()),
+            ("Bridged", Some(legacy_hop()))
+        );
+
+        let prepared_send = [
+            recovered_bridge,
+            vec![UsdcRebalanceEvent::DepositSendPrepared {
+                prepared: PreparedTransaction::for_test(TxHash::repeat_byte(0xd3), 4),
+                prepared_at: Utc::now(),
+            }],
+        ]
+        .concat();
+        let state = replay::<UsdcRebalance>(prepared_send).unwrap().unwrap();
+        assert!(
+            matches!(state, UsdcRebalance::Bridged { hop, corridor, .. }
+                if hop == legacy_hop() && corridor == UsdcCorridor::BASE_CCTP),
+            "got {state:?}"
+        );
+    }
+
+    /// The Alpaca->Base legacy shape: the Alpaca withdrawal, the burn on
+    /// Ethereum, the mint on Base and the vault deposit.
+    #[test]
+    fn legacy_alpaca_to_base_stream_replays_into_hop_evidence() {
+        let events = vec![
+            legacy(json!({"Initiated": {
+                "direction": "AlpacaToBase", "amount": "100",
+                "withdrawal_ref": {"AlpacaId": "6f1a8a62-2a3b-4f6c-9a1e-1d2c3b4a5e6f"},
+                "initiated_at": "2026-01-01T00:00:01Z"}})),
+            legacy(json!({"WithdrawalConfirmed": {"confirmed_at": "2026-01-01T00:00:02Z"}})),
+            legacy(json!({"BridgingInitiated": {
+                "burn_tx_hash": LEGACY_BURN, "burned_at": "2026-01-01T00:00:04Z"}})),
+            legacy(json!({"BridgeAttestationReceived": {
+                "attestation": [1], "cctp_nonce": "0xa01ca42d9082e926a81dc287d973a8f072dfa1b20a4fbf7b20f3abda1b376278",
+                "attested_at": "2026-01-01T00:00:05Z"}})),
+            legacy_bridged(),
+            legacy(json!({"DepositInitiated": {
+                "deposit_ref": {"OnchainTx": "0x00000000000000000000000000000000000000000000000000000000000000d1"},
+                "deposit_initiated_at": "2026-01-01T00:00:07Z"}})),
+            legacy(json!({"DepositConfirmed": {
+                "direction": "AlpacaToBase", "deposit_confirmed_at": "2026-01-01T00:00:08Z"}})),
+        ];
+
+        assert_eq!(
+            replayed_hop(events),
+            ("DepositConfirmed", Some(legacy_hop()))
+        );
+    }
+
+    /// 100 USDC withdrawn on `corridor` in `direction`, at `WithdrawalComplete`.
+    fn withdrawn(direction: RebalanceDirection, corridor: UsdcCorridor) -> Vec<UsdcRebalanceEvent> {
+        vec![
+            UsdcRebalanceEvent::Initiated {
+                direction,
+                corridor,
+                amount: Usdc::new(float!(100)),
+                withdrawal_ref: TransferRef::OnchainTx(TxHash::repeat_byte(0x77)),
+                initiated_at: Utc::now(),
+            },
+            UsdcRebalanceEvent::WithdrawalConfirmed {
+                confirmed_at: Utc::now(),
+                withdrawal_tx: Some(TxHash::repeat_byte(0x77)),
+            },
+        ]
+    }
+
+    fn hundred_usdc_quote(order_id: u8) -> SwapQuote {
+        swap_quote_for_test(U256::from(100_000_000u64), B256::repeat_byte(order_id))
+    }
+
+    #[tokio::test]
+    async fn swap_quote_on_a_cctp_corridor_is_refused() {
+        let error = TestHarness::<UsdcRebalance>::with(())
+            .given(withdrawn(
+                RebalanceDirection::BaseToAlpaca,
+                UsdcCorridor::BASE_CCTP,
+            ))
+            .when(UsdcRebalanceCommand::QuoteSwap {
+                quote: Box::new(hundred_usdc_quote(1)),
+            })
+            .await
+            .then_expect_error();
+
+        assert!(
+            matches!(
+                error,
+                LifecycleError::Apply(UsdcRebalanceError::NotSwapCorridor {
+                    corridor: UsdcCorridor::BASE_CCTP
+                })
+            ),
+            "got {error:?}"
+        );
+    }
+
+    /// A vault withdraw swaps all it withdrew; an Alpaca withdrawal may swap
+    /// less (its fees), never more.
+    #[tokio::test]
+    async fn swap_quote_input_must_fit_the_withdrawal() {
+        let short = swap_quote_for_test(U256::from(99_000_000u64), B256::repeat_byte(1));
+
+        let error = TestHarness::<UsdcRebalance>::with(())
+            .given(withdrawn(RebalanceDirection::BaseToAlpaca, ROBINHOOD_RELAY))
+            .when(UsdcRebalanceCommand::QuoteSwap {
+                quote: Box::new(short.clone()),
+            })
+            .await
+            .then_expect_error();
+        assert!(
+            matches!(
+                error,
+                LifecycleError::Apply(UsdcRebalanceError::SwapAmountMismatch { .. })
+            ),
+            "got {error:?}"
+        );
+
+        let events = TestHarness::<UsdcRebalance>::with(())
+            .given(withdrawn(RebalanceDirection::AlpacaToBase, ROBINHOOD_RELAY))
+            .when(UsdcRebalanceCommand::QuoteSwap {
+                quote: Box::new(short),
+            })
+            .await
+            .events();
+        let state = replay::<UsdcRebalance>(
+            [
+                withdrawn(RebalanceDirection::AlpacaToBase, ROBINHOOD_RELAY),
+                events,
+            ]
+            .concat(),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(state.amount(), Usdc::new(float!(99)));
+
+        let error = TestHarness::<UsdcRebalance>::with(())
+            .given(withdrawn(RebalanceDirection::AlpacaToBase, ROBINHOOD_RELAY))
+            .when(UsdcRebalanceCommand::QuoteSwap {
+                quote: Box::new(swap_quote_for_test(
+                    U256::from(100_000_001u64),
+                    B256::repeat_byte(1),
+                )),
+            })
+            .await
+            .then_expect_error();
+        assert!(
+            matches!(
+                error,
+                LifecycleError::Apply(UsdcRebalanceError::SwapAmountMismatch { .. })
+            ),
+            "got {error:?}"
+        );
+    }
+
+    fn quoted(direction: RebalanceDirection) -> Vec<UsdcRebalanceEvent> {
+        [
+            withdrawn(direction, ROBINHOOD_RELAY),
+            vec![UsdcRebalanceEvent::SwapQuoted {
+                quote: Box::new(hundred_usdc_quote(0x0a)),
+                quoted_at: Utc::now(),
+            }],
+        ]
+        .concat()
+    }
+
+    fn prepared_pair(direction: RebalanceDirection) -> Vec<UsdcRebalanceEvent> {
+        [
+            quoted(direction),
+            vec![UsdcRebalanceEvent::SwapDepositPrepared {
+                approve: Some(PreparedTransaction::for_test(TxHash::repeat_byte(0xa1), 5)),
+                deposit: PreparedTransaction::for_test(TxHash::repeat_byte(0xa2), 6),
+                prepared_at: Utc::now(),
+            }],
+        ]
+        .concat()
+    }
+
+    /// The pair is persisted once, with the quote's order id added to the
+    /// signed ids; a second pair is refused.
+    #[tokio::test]
+    async fn swap_pair_is_persisted_once_and_records_its_order_id() {
+        let state = replay::<UsdcRebalance>(prepared_pair(RebalanceDirection::BaseToAlpaca))
+            .unwrap()
+            .unwrap();
+        let UsdcRebalance::SwapDepositPrepared {
+            signed_order_ids,
+            approve,
+            deposit,
+            ..
+        } = &state
+        else {
+            panic!("expected SwapDepositPrepared, got {state:?}");
+        };
+        assert_eq!(*signed_order_ids, vec![B256::repeat_byte(0x0a)]);
+        assert_eq!(
+            approve.as_ref().map(PreparedTransaction::tx_hash),
+            Some(TxHash::repeat_byte(0xa1))
+        );
+        assert_eq!(deposit.tx_hash(), TxHash::repeat_byte(0xa2));
+        assert_eq!(
+            state
+                .prepared_swap_envelopes()
+                .iter()
+                .map(|prepared| prepared.nonce())
+                .collect::<Vec<_>>(),
+            vec![5, 6]
+        );
+
+        let error = TestHarness::<UsdcRebalance>::with(())
+            .given(prepared_pair(RebalanceDirection::BaseToAlpaca))
+            .when(UsdcRebalanceCommand::PrepareSwapDeposit {
+                approve: None,
+                deposit: PreparedTransaction::for_test(TxHash::repeat_byte(0xa3), 7),
+            })
+            .await
+            .then_expect_error();
+        assert!(
+            matches!(
+                error,
+                LifecycleError::Apply(UsdcRebalanceError::SwapDepositAlreadyPrepared)
+            ),
+            "got {error:?}"
+        );
+    }
+
+    /// An approve that went out alone stays on the record, ahead of the pair
+    /// signed after it.
+    #[test]
+    fn lone_approve_is_restored_before_the_pair_signed_after_it() {
+        let events = [
+            quoted(RebalanceDirection::BaseToAlpaca),
+            vec![
+                UsdcRebalanceEvent::SwapApprovePrepared {
+                    approve: PreparedTransaction::for_test(TxHash::repeat_byte(0xb1), 3),
+                    prepared_at: Utc::now(),
+                },
+                UsdcRebalanceEvent::SwapDepositPrepared {
+                    approve: None,
+                    deposit: PreparedTransaction::for_test(TxHash::repeat_byte(0xb2), 5),
+                    prepared_at: Utc::now(),
+                },
+            ],
+        ]
+        .concat();
+
+        let state = replay::<UsdcRebalance>(events).unwrap().unwrap();
+
+        assert_eq!(
+            state
+                .prepared_swap_envelopes()
+                .iter()
+                .map(|prepared| prepared.nonce())
+                .collect::<Vec<_>>(),
+            vec![3, 5]
+        );
+    }
+
+    #[tokio::test]
+    async fn swap_deposit_confirms_only_the_signed_deposit() {
+        let error = TestHarness::<UsdcRebalance>::with(())
+            .given(prepared_pair(RebalanceDirection::BaseToAlpaca))
+            .when(UsdcRebalanceCommand::ConfirmSwapDeposit {
+                deposit_tx: TxHash::repeat_byte(0xff),
+                deposit_block: 9,
+            })
+            .await
+            .then_expect_error();
+        assert!(
+            matches!(
+                error,
+                LifecycleError::Apply(UsdcRebalanceError::SwapDepositHashMismatch { .. })
+            ),
+            "got {error:?}"
+        );
+
+        let events = TestHarness::<UsdcRebalance>::with(())
+            .given(prepared_pair(RebalanceDirection::BaseToAlpaca))
+            .when(UsdcRebalanceCommand::ConfirmSwapDeposit {
+                deposit_tx: TxHash::repeat_byte(0xa2),
+                deposit_block: 9,
+            })
+            .await
+            .events();
+        let state = replay::<UsdcRebalance>(
+            [prepared_pair(RebalanceDirection::BaseToAlpaca), events].concat(),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(
+            matches!(
+                &state,
+                UsdcRebalance::SwapDeposited { deposit_tx, deposit_block: 9, signed_order_ids, .. }
+                    if *deposit_tx == TxHash::repeat_byte(0xa2)
+                        && *signed_order_ids == vec![B256::repeat_byte(0x0a)]
+            ),
+            "got {state:?}"
+        );
+    }
+
+    /// Every swap state holds the guard, is no reconcilable failure and
+    /// refuses `fail-usdc-transfer`.
+    #[test]
+    fn swap_states_hold_the_guard_and_refuse_a_pre_burn_fail() {
+        let deposited = [
+            prepared_pair(RebalanceDirection::BaseToAlpaca),
+            vec![UsdcRebalanceEvent::SwapDeposited {
+                deposit_tx: TxHash::repeat_byte(0xa2),
+                deposit_block: 9,
+                deposited_at: Utc::now(),
+            }],
+        ]
+        .concat();
+
+        for events in [
+            quoted(RebalanceDirection::BaseToAlpaca),
+            prepared_pair(RebalanceDirection::BaseToAlpaca),
+            deposited,
+        ] {
+            let state = replay::<UsdcRebalance>(events).unwrap().unwrap();
+            assert!(state.holds_rebalance_guard(), "{state:?}");
+            assert!(!state.is_reconcilable_failure(), "{state:?}");
+            assert_eq!(
+                state.pre_burn_fail_eligibility(),
+                PreBurnFailEligibility::RelayHeldOutsideVault,
+                "{state:?}"
+            );
+            assert_eq!(state.corridor(), ROBINHOOD_RELAY);
+        }
+    }
+
+    /// A Relay transfer at `WithdrawalComplete` has its withdrawn stable
+    /// outside the vault, so `fail-usdc-transfer` must not fail it: only a
+    /// redeposit returns the stable. A CCTP one still fails as before.
+    #[tokio::test]
+    async fn relay_withdrawal_complete_refuses_a_pre_burn_fail() {
+        let relay =
+            replay::<UsdcRebalance>(withdrawn(RebalanceDirection::BaseToAlpaca, ROBINHOOD_RELAY))
+                .unwrap()
+                .unwrap();
+        assert_eq!(
+            relay.pre_burn_fail_eligibility(),
+            PreBurnFailEligibility::RelayHeldOutsideVault
+        );
+
+        let error = TestHarness::<UsdcRebalance>::with(())
+            .given(withdrawn(RebalanceDirection::BaseToAlpaca, ROBINHOOD_RELAY))
+            .when(UsdcRebalanceCommand::FailBridging {
+                reason: "operator".to_string(),
+            })
+            .await
+            .then_expect_error();
+        assert!(
+            matches!(
+                error,
+                LifecycleError::Apply(UsdcRebalanceError::RelayWithdrawalAwaitsRedeposit {
+                    corridor: ROBINHOOD_RELAY
+                })
+            ),
+            "got {error:?}"
+        );
+
+        let cctp = replay::<UsdcRebalance>(withdrawn(
+            RebalanceDirection::BaseToAlpaca,
+            UsdcCorridor::BASE_CCTP,
+        ))
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            cctp.pre_burn_fail_eligibility(),
+            PreBurnFailEligibility::Eligible
+        );
+    }
+
+    /// An Ethereum-origin swap's input is held in the shared wallet until a
+    /// pair is signed, then in flight; a Robinhood-origin swap holds nothing
+    /// there.
+    #[test]
+    fn ethereum_origin_swap_holds_then_sends_ethereum_credit() {
+        let held = replay::<UsdcRebalance>(quoted(RebalanceDirection::AlpacaToBase))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            held.ethereum_wallet_credit(),
+            Some(EthereumWalletCredit::Held(Usdc::new(float!(100))))
+        );
+
+        let in_flight = replay::<UsdcRebalance>(prepared_pair(RebalanceDirection::AlpacaToBase))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            in_flight.ethereum_wallet_credit(),
+            Some(EthereumWalletCredit::InFlight(Usdc::new(float!(100))))
+        );
+
+        for events in [
+            quoted(RebalanceDirection::BaseToAlpaca),
+            prepared_pair(RebalanceDirection::BaseToAlpaca),
+        ] {
+            let state = replay::<UsdcRebalance>(events).unwrap().unwrap();
+            assert_eq!(state.ethereum_wallet_credit(), None, "{state:?}");
+        }
+    }
 
     // An event persisted before `mint_scan_from_block` existed must still
     // deserialize on replay -- to `None`, not a hard error -- so older aggregates
@@ -6567,8 +7922,10 @@ mod tests {
             amount,
             amount_received: amount,
             fee_collected: Usdc::new(float!(0.01)),
-            burn_tx_hash: burn_tx,
-            mint_tx_hash: burn_tx,
+            hop: HopEvidence::Cctp {
+                burn_tx,
+                mint_tx: burn_tx,
+            },
             initiated_at: now,
             minted_at: now,
             deposit_send: DepositSend::NotStarted,
@@ -6695,8 +8052,10 @@ mod tests {
             amount,
             amount_received: Usdc::new(float!(320)),
             fee_collected: Usdc::new(float!(1)),
-            burn_tx_hash: burn_tx,
-            mint_tx_hash: burn_tx,
+            hop: HopEvidence::Cctp {
+                burn_tx,
+                mint_tx: burn_tx,
+            },
             initiated_at: now,
             minted_at: now,
             deposit_send: DepositSend::NotStarted,
@@ -6720,8 +8079,10 @@ mod tests {
             corridor: UsdcCorridor::BASE_CCTP,
             direction: RebalanceDirection::AlpacaToBase,
             amount,
-            burn_tx_hash: burn_tx,
-            mint_tx_hash: burn_tx,
+            hop: HopEvidence::Cctp {
+                burn_tx,
+                mint_tx: burn_tx,
+            },
             deposit_ref: None,
             reason: "boom".to_string(),
             initiated_at: now,
@@ -6746,8 +8107,10 @@ mod tests {
             amount: requested,
             amount_received: Usdc::new(float!(320)),
             fee_collected: Usdc::new(float!(1)),
-            burn_tx_hash: burn_tx,
-            mint_tx_hash: burn_tx,
+            hop: HopEvidence::Cctp {
+                burn_tx,
+                mint_tx: burn_tx,
+            },
             initiated_at: now,
             minted_at: now,
             deposit_send: DepositSend::NotStarted,
@@ -6787,8 +8150,10 @@ mod tests {
             corridor: UsdcCorridor::BASE_CCTP,
             direction: RebalanceDirection::AlpacaToBase,
             amount: requested,
-            burn_tx_hash: burn_tx,
-            mint_tx_hash: burn_tx,
+            hop: HopEvidence::Cctp {
+                burn_tx,
+                mint_tx: burn_tx,
+            },
             deposit_ref: None,
             reason: "deposit reverted".to_string(),
             initiated_at: now,
@@ -8241,8 +9606,7 @@ mod tests {
                 state,
                 UsdcRebalance::Bridged {
                     direction: RebalanceDirection::BaseToAlpaca,
-                    burn_tx_hash: state_burn_tx,
-                    mint_tx_hash: state_mint_tx,
+                    hop: HopEvidence::Cctp { burn_tx: state_burn_tx, mint_tx: state_mint_tx },
                     amount_received: state_received,
                     fee_collected: state_fee,
                     ..
@@ -8367,8 +9731,11 @@ mod tests {
         let Some(UsdcRebalance::DepositConfirmed {
             direction: RebalanceDirection::BaseToAlpaca,
             amount,
-            burn_tx_hash,
-            mint_tx_hash,
+            hop:
+                HopEvidence::Cctp {
+                    burn_tx: burn_tx_hash,
+                    mint_tx: mint_tx_hash,
+                },
             deposit_confirmed_at,
             ..
         }) = state
@@ -10788,8 +12155,7 @@ mod tests {
             corridor: UsdcCorridor::BASE_CCTP,
             direction: RebalanceDirection::AlpacaToBase,
             amount: Usdc::new(float!(1000)),
-            burn_tx_hash: burn_tx,
-            mint_tx_hash: mint_tx,
+            hop: HopEvidence::Cctp { burn_tx, mint_tx },
             initiated_at,
             deposit_confirmed_at: confirmed_at,
         };
@@ -10820,8 +12186,7 @@ mod tests {
             corridor: UsdcCorridor::BASE_CCTP,
             direction: RebalanceDirection::BaseToAlpaca,
             amount: Usdc::new(float!(1000)),
-            burn_tx_hash: burn_tx,
-            mint_tx_hash: mint_tx,
+            hop: HopEvidence::Cctp { burn_tx, mint_tx },
             initiated_at,
             deposit_confirmed_at: confirmed_at,
         };
@@ -10902,8 +12267,7 @@ mod tests {
             corridor: UsdcCorridor::BASE_CCTP,
             direction: RebalanceDirection::BaseToAlpaca,
             amount: Usdc::new(float!(750)),
-            burn_tx_hash: burn_tx,
-            mint_tx_hash: mint_tx,
+            hop: HopEvidence::Cctp { burn_tx, mint_tx },
             deposit_ref: None,
             reason: "deposit timeout".to_string(),
             initiated_at,
@@ -11278,8 +12642,7 @@ mod tests {
             amount: Usdc::new(float!(2000)),
             amount_received: Usdc::new(float!(1998)),
             fee_collected: Usdc::new(float!(2)),
-            burn_tx_hash: burn_tx,
-            mint_tx_hash: mint_tx,
+            hop: HopEvidence::Cctp { burn_tx, mint_tx },
             initiated_at,
             minted_at,
             deposit_send: DepositSend::NotStarted,
@@ -11313,8 +12676,7 @@ mod tests {
             corridor: UsdcCorridor::BASE_CCTP,
             direction: RebalanceDirection::BaseToAlpaca,
             amount: Usdc::new(float!(3000)),
-            burn_tx_hash: burn_tx,
-            mint_tx_hash: mint_tx,
+            hop: HopEvidence::Cctp { burn_tx, mint_tx },
             deposit_ref: TransferRef::AlpacaId(AlpacaTransferId::from(Uuid::new_v4())),
             initiated_at,
             deposit_initiated_at,
@@ -11368,8 +12730,10 @@ mod tests {
             amount,
             amount_received: credited,
             fee_collected: Usdc::new(float!(0.01)),
-            burn_tx_hash: BURN_TX,
-            mint_tx_hash: MINT_TX,
+            hop: HopEvidence::Cctp {
+                burn_tx: BURN_TX,
+                mint_tx: MINT_TX,
+            },
             initiated_at: now,
             minted_at: now,
             deposit_send: DepositSend::NotStarted,
@@ -11399,8 +12763,10 @@ mod tests {
             amount,
             amount_received: credited,
             fee_collected: Usdc::new(float!(0.01)),
-            burn_tx_hash: BURN_TX,
-            mint_tx_hash: MINT_TX,
+            hop: HopEvidence::Cctp {
+                burn_tx: BURN_TX,
+                mint_tx: MINT_TX,
+            },
             initiated_at: now,
             minted_at: now,
             deposit_send,
@@ -11435,8 +12801,10 @@ mod tests {
                 corridor: UsdcCorridor::BASE_CCTP,
                 direction: BaseToAlpaca,
                 amount,
-                burn_tx_hash: BURN_TX,
-                mint_tx_hash: MINT_TX,
+                hop: HopEvidence::Cctp {
+                    burn_tx: BURN_TX,
+                    mint_tx: MINT_TX
+                },
                 deposit_ref: TransferRef::OnchainTx(BURN_TX),
                 initiated_at: now,
                 deposit_initiated_at: now,
@@ -11534,8 +12902,10 @@ mod tests {
                 amount,
                 amount_received: amount,
                 fee_collected: Usdc::new(float!(0.0)),
-                burn_tx_hash: BURN_TX,
-                mint_tx_hash: MINT_TX,
+                hop: HopEvidence::Cctp {
+                    burn_tx: BURN_TX,
+                    mint_tx: MINT_TX
+                },
                 initiated_at: now,
                 minted_at: now,
                 deposit_send: DepositSend::NotStarted,
@@ -11547,8 +12917,10 @@ mod tests {
                 corridor: UsdcCorridor::BASE_CCTP,
                 direction: AlpacaToBase,
                 amount,
-                burn_tx_hash: BURN_TX,
-                mint_tx_hash: MINT_TX,
+                hop: HopEvidence::Cctp {
+                    burn_tx: BURN_TX,
+                    mint_tx: MINT_TX
+                },
                 deposit_ref: withdrawal_ref.clone(),
                 initiated_at: now,
                 deposit_initiated_at: now,
@@ -11561,8 +12933,10 @@ mod tests {
                 corridor: UsdcCorridor::BASE_CCTP,
                 direction: BaseToAlpaca,
                 amount,
-                burn_tx_hash: BURN_TX,
-                mint_tx_hash: MINT_TX,
+                hop: HopEvidence::Cctp {
+                    burn_tx: BURN_TX,
+                    mint_tx: MINT_TX
+                },
                 deposit_ref: Some(withdrawal_ref),
                 reason: "deposit failed".to_string(),
                 initiated_at: now,
@@ -11644,8 +13018,10 @@ mod tests {
                 corridor: UsdcCorridor::BASE_CCTP,
                 direction: AlpacaToBase,
                 amount,
-                burn_tx_hash: BURN_TX,
-                mint_tx_hash: MINT_TX,
+                hop: HopEvidence::Cctp {
+                    burn_tx: BURN_TX,
+                    mint_tx: MINT_TX
+                },
                 initiated_at: now,
                 deposit_confirmed_at: now,
             }
@@ -11656,8 +13032,10 @@ mod tests {
                 corridor: UsdcCorridor::BASE_CCTP,
                 direction: BaseToAlpaca,
                 amount,
-                burn_tx_hash: BURN_TX,
-                mint_tx_hash: MINT_TX,
+                hop: HopEvidence::Cctp {
+                    burn_tx: BURN_TX,
+                    mint_tx: MINT_TX
+                },
                 initiated_at: now,
                 deposit_confirmed_at: now,
             }
@@ -11723,8 +13101,10 @@ mod tests {
             corridor: UsdcCorridor::BASE_CCTP,
             direction: BaseToAlpaca,
             amount,
-            burn_tx_hash: BURN_TX,
-            mint_tx_hash: MINT_TX,
+            hop: HopEvidence::Cctp {
+                burn_tx: BURN_TX,
+                mint_tx: MINT_TX,
+            },
             deposit_ref: Some(withdrawal_ref.clone()),
             reason: "deposit rejected".to_string(),
             initiated_at: now,
@@ -11743,8 +13123,10 @@ mod tests {
             corridor: UsdcCorridor::BASE_CCTP,
             direction: AlpacaToBase,
             amount,
-            burn_tx_hash: BURN_TX,
-            mint_tx_hash: MINT_TX,
+            hop: HopEvidence::Cctp {
+                burn_tx: BURN_TX,
+                mint_tx: MINT_TX,
+            },
             deposit_ref: Some(withdrawal_ref),
             reason: "deposit rejected".to_string(),
             initiated_at: now,
@@ -11872,8 +13254,10 @@ mod tests {
                 amount,
                 amount_received: amount,
                 fee_collected: Usdc::new(float!(0.0)),
-                burn_tx_hash: BURN_TX,
-                mint_tx_hash: MINT_TX,
+                hop: HopEvidence::Cctp {
+                    burn_tx: BURN_TX,
+                    mint_tx: MINT_TX
+                },
                 initiated_at: now,
                 minted_at: now,
                 deposit_send: DepositSend::NotStarted,
@@ -11887,8 +13271,10 @@ mod tests {
                 corridor: UsdcCorridor::BASE_CCTP,
                 direction: AlpacaToBase,
                 amount,
-                burn_tx_hash: BURN_TX,
-                mint_tx_hash: MINT_TX,
+                hop: HopEvidence::Cctp {
+                    burn_tx: BURN_TX,
+                    mint_tx: MINT_TX
+                },
                 deposit_ref: withdrawal_ref.clone(),
                 initiated_at: now,
                 deposit_initiated_at: now,
@@ -11902,8 +13288,10 @@ mod tests {
                 corridor: UsdcCorridor::BASE_CCTP,
                 direction: BaseToAlpaca,
                 amount,
-                burn_tx_hash: BURN_TX,
-                mint_tx_hash: MINT_TX,
+                hop: HopEvidence::Cctp {
+                    burn_tx: BURN_TX,
+                    mint_tx: MINT_TX
+                },
                 initiated_at: now,
                 deposit_confirmed_at: now,
             }
@@ -13375,7 +14763,11 @@ mod tests {
             .unwrap();
         let UsdcRebalance::DepositFailed {
             amount,
-            mint_tx_hash,
+            hop:
+                HopEvidence::Cctp {
+                    mint_tx: mint_tx_hash,
+                    ..
+                },
             ..
         } = &state
         else {
@@ -13541,8 +14933,10 @@ mod tests {
             amount: Usdc::new(float!(100)),
             amount_received: Usdc::new(float!(99.99)),
             fee_collected: Usdc::new(float!(0.01)),
-            burn_tx_hash: BURN_TX,
-            mint_tx_hash: MINT_TX,
+            hop: HopEvidence::Cctp {
+                burn_tx: BURN_TX,
+                mint_tx: MINT_TX,
+            },
             initiated_at: now,
             minted_at: now,
             deposit_send: DepositSend::Prepared {

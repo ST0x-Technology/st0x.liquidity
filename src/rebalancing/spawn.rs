@@ -9,7 +9,8 @@ use tracing::info;
 
 use st0x_bridge::cctp::{CctpBridge, CctpCorridor, CctpCtx, CctpError};
 use st0x_bridge::corridor::{HopKind, UsdcCorridor};
-use st0x_config::{ChainEquityAsset, OnchainWalletCtx};
+use st0x_bridge::relay::{RelayBridge, RelayBridgeError, RelayClient, RelayCtx, RelayError};
+use st0x_config::{ChainEquityAsset, OnchainWalletCtx, RelayHopCtx};
 use st0x_event_sorcery::Store;
 use st0x_evm::{Chain, Wallet};
 use st0x_execution::{AlpacaWalletService, EmptySymbolError, Symbol};
@@ -17,9 +18,10 @@ use st0x_raindex::{RaindexContracts, RaindexService, RaindexVaultId};
 use st0x_wrapper::WrappedEquity;
 
 use super::usdc::{
-    CorridorTransfer, CrossVenueCashTransfer, MarketMakingUsdcEndpoints, RecheckUsdcDeposit,
-    RecoverCctpMint, RestorePreparedDepositSends, ResumeAlpacaToBase, ResumeBaseToAlpaca,
-    UsdcCorridorTransfers, UsdcDriverGate, UsdcSettlementParams,
+    CorridorTransfer, CrossVenueCashTransfer, EthereumChainMissing, MarketMakingUsdcEndpoints,
+    RecheckUsdcDeposit, RecoverCctpMint, RelayHop, RestorePreparedDepositSends, ResumeAlpacaToBase,
+    ResumeBaseToAlpaca, UsdcBridgeHelper, UsdcCorridorTransfers, UsdcDriverGate,
+    UsdcSettlementParams,
 };
 use crate::bot_gas::BotGasReceiptCostEnqueuer;
 use crate::native_gas::{ConfiguredGasReadiness, GasReadiness};
@@ -31,6 +33,14 @@ use crate::usdc_rebalance::UsdcRebalance;
 pub(crate) enum SpawnRebalancerError {
     #[error("failed to create CCTP bridge: {0}")]
     Cctp(#[from] Box<CctpError>),
+    #[error("failed to create the Relay bridge: {0}")]
+    RelayBridge(#[from] Box<RelayBridgeError>),
+    #[error("failed to create the Relay API client: {0}")]
+    RelayClient(#[from] Box<RelayError>),
+    #[error("the {corridor} corridor has no Relay bounds or chain confirmations")]
+    RelayHopUnconfigured { corridor: UsdcCorridor },
+    #[error(transparent)]
+    EthereumChainMissing(#[from] EthereumChainMissing),
     #[error("failed to create wrapper service: {0}")]
     Wrapper(#[from] EmptySymbolError),
     #[error("no cash transfer service can be built for the {corridor} corridor")]
@@ -145,16 +155,28 @@ impl ChainWallets<Arc<dyn Wallet<Provider = RootProvider>>> {
     }
 }
 
+/// What a Relay corridor's hop is built from: the corridor's bounds and the
+/// confirmations its chain requires.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct RelayHopSetup {
+    pub(crate) bounds: RelayHopCtx,
+    pub(crate) chain_confirmations: u64,
+}
+
 /// External service clients for rebalancing operations: the Alpaca broker
-/// and wallet every cash corridor shares, the Ethereum hub wallet and the
-/// CCTP pair a CCTP corridor bridges over.
+/// and wallet every cash corridor shares, the Ethereum hub wallet, the CCTP
+/// pair a CCTP corridor bridges over, and each Relay corridor's setup.
 pub(crate) struct RebalancerServices<Signer: Wallet> {
     broker: InstrumentedAlpacaBroker,
     wallet: Arc<AlpacaWalletService>,
+    /// The one Ethereum wallet every hop signs hub sends on: each bridge
+    /// gets a clone, which shares its nonce reservations and in-flight
+    /// record, so a Relay pair and a deposit send never take one nonce.
     ethereum_wallet: Signer,
     cctp_corridor: CctpCorridor,
     /// Settlement tuning shared by every corridor.
     settlement: UsdcSettlementParams,
+    relay_hops: BTreeMap<Chain, RelayHopSetup>,
 }
 
 impl<Signer: Wallet + Clone + 'static> RebalancerServices<Signer> {
@@ -164,6 +186,7 @@ impl<Signer: Wallet + Clone + 'static> RebalancerServices<Signer> {
         ethereum_wallet: Signer,
         cctp_corridor: CctpCorridor,
         settlement: UsdcSettlementParams,
+        relay_hops: BTreeMap<Chain, RelayHopSetup>,
     ) -> Self {
         Self {
             broker,
@@ -171,6 +194,7 @@ impl<Signer: Wallet + Clone + 'static> RebalancerServices<Signer> {
             ethereum_wallet,
             cctp_corridor,
             settlement,
+            relay_hops,
         }
     }
 
@@ -195,33 +219,14 @@ impl<Signer: Wallet + Clone + 'static> RebalancerServices<Signer> {
         let mut by_corridor = BTreeMap::new();
         for endpoints in corridors {
             let corridor = endpoints.corridor;
-            let chain_wallet = endpoints.chain_wallet.clone();
-            let bridge = self.corridor_bridge(corridor, chain_wallet.clone())?;
-            let raindex = Arc::new(RaindexService::new(
-                chain_wallet.clone(),
-                endpoints.contracts,
-                chain_wallet.address(),
-            ));
-            let transfer: Arc<dyn CorridorTransfer> = Arc::new(
-                CrossVenueCashTransfer::new(
-                    self.broker.clone(),
-                    self.wallet.clone(),
-                    bridge,
-                    raindex,
-                    usdc.clone(),
-                    MarketMakingUsdcEndpoints::new(
-                        corridor,
-                        chain_wallet.address(),
-                        endpoints.vault_id,
-                    ),
-                    &self.settlement,
-                    bot_gas_enqueuer.clone(),
-                )
-                .with_gas_readiness(endpoints.gas_readiness)
-                .with_credit_ledger(pool.clone())
-                .with_driver_gate(driver_gate.clone())
-                .with_deposit_send_lock(Arc::clone(&deposit_send_lock)),
-            );
+            let shared = SharedTransferParts {
+                usdc,
+                pool,
+                bot_gas_enqueuer,
+                driver_gate,
+                deposit_send_lock: &deposit_send_lock,
+            };
+            let transfer = self.corridor_transfer(endpoints, &shared)?;
 
             if by_corridor.insert(corridor, transfer).is_some() {
                 return Err(SpawnRebalancerError::DuplicateCorridor { corridor });
@@ -243,44 +248,136 @@ impl<Signer: Wallet + Clone + 'static> RebalancerServices<Signer> {
         })
     }
 
-    /// The bridge `corridor` hops over. Only Base via CCTP is wired: the
-    /// CCTP pair is Ethereum and Base, so any other corridor refuses startup
-    /// by name.
-    fn corridor_bridge(
+    /// The cash transfer service of one corridor, on the bridge its hop
+    /// takes: CCTP for Base, Relay for a chain with a Relay depository. Any
+    /// other corridor refuses startup by name.
+    fn corridor_transfer(
         &self,
-        corridor: UsdcCorridor,
-        chain_wallet: Signer,
-    ) -> Result<Arc<CctpBridge<Signer, Signer>>, SpawnRebalancerError> {
+        endpoints: UsdcCorridorEndpoints<Signer>,
+        shared: &SharedTransferParts<'_>,
+    ) -> Result<Arc<dyn CorridorTransfer>, SpawnRebalancerError> {
+        let corridor = endpoints.corridor;
+        let chain_wallet = endpoints.chain_wallet.clone();
+
         match corridor {
             UsdcCorridor::HubRouted {
                 chain: Chain::Base,
                 hop: HopKind::Cctp,
             } => {
-                let bridge = CctpBridge::try_from_ctx(CctpCtx {
-                    corridor: self.cctp_corridor,
-                    ethereum_wallet: self.ethereum_wallet.clone(),
-                    base_wallet: chain_wallet,
-                    #[cfg(feature = "test-support")]
-                    circle_api_base: self.settlement.circle_api_base.clone(),
-                    #[cfg(feature = "test-support")]
-                    token_messenger: self.settlement.token_messenger,
-                    #[cfg(feature = "test-support")]
-                    message_transmitter: self.settlement.message_transmitter,
-                })
-                .map_err(|error| SpawnRebalancerError::Cctp(Box::new(error)))?;
-
-                Ok(Arc::new(bridge))
+                let bridge = Arc::new(self.cctp_bridge(chain_wallet)?);
+                Ok(Arc::new(self.cash_transfer(bridge, endpoints, shared)))
             }
             UsdcCorridor::HubRouted {
-                chain: Chain::Base,
+                chain,
                 hop: HopKind::Relay,
+            } => {
+                let hop = Arc::new(self.relay_hop(corridor, chain, chain_wallet)?);
+                Ok(Arc::new(self.cash_transfer(hop, endpoints, shared)))
             }
-            | UsdcCorridor::HubRouted {
+            UsdcCorridor::HubRouted {
                 chain: Chain::Ethereum | Chain::HyperEvm | Chain::Robinhood,
-                hop: HopKind::Cctp | HopKind::Relay,
+                hop: HopKind::Cctp,
             } => Err(SpawnRebalancerError::UnwiredCorridor { corridor }),
         }
     }
+
+    /// One corridor's service over `hop`, on its chain's orderbook, vault,
+    /// wallet and gas check.
+    fn cash_transfer<Hop>(
+        &self,
+        hop: Arc<Hop>,
+        endpoints: UsdcCorridorEndpoints<Signer>,
+        shared: &SharedTransferParts<'_>,
+    ) -> CrossVenueCashTransfer<Signer, Hop>
+    where
+        Hop: UsdcBridgeHelper,
+    {
+        let chain_wallet = endpoints.chain_wallet;
+        let raindex = Arc::new(RaindexService::new(
+            chain_wallet.clone(),
+            endpoints.contracts,
+            chain_wallet.address(),
+        ));
+
+        CrossVenueCashTransfer::new(
+            self.broker.clone(),
+            self.wallet.clone(),
+            hop,
+            raindex,
+            shared.usdc.clone(),
+            MarketMakingUsdcEndpoints::new(
+                endpoints.corridor,
+                chain_wallet.address(),
+                endpoints.vault_id,
+            ),
+            &self.settlement,
+            shared.bot_gas_enqueuer.clone(),
+        )
+        .with_gas_readiness(endpoints.gas_readiness)
+        .with_credit_ledger(shared.pool.clone())
+        .with_driver_gate(shared.driver_gate.clone())
+        .with_deposit_send_lock(Arc::clone(shared.deposit_send_lock))
+    }
+
+    /// The CCTP pair of Ethereum and Base, on the shared Ethereum wallet.
+    fn cctp_bridge(
+        &self,
+        base_wallet: Signer,
+    ) -> Result<CctpBridge<Signer, Signer>, SpawnRebalancerError> {
+        CctpBridge::try_from_ctx(CctpCtx {
+            corridor: self.cctp_corridor,
+            ethereum_wallet: self.ethereum_wallet.clone(),
+            base_wallet,
+            #[cfg(feature = "test-support")]
+            circle_api_base: self.settlement.circle_api_base.clone(),
+            #[cfg(feature = "test-support")]
+            token_messenger: self.settlement.token_messenger,
+            #[cfg(feature = "test-support")]
+            message_transmitter: self.settlement.message_transmitter,
+        })
+        .map_err(|error| SpawnRebalancerError::Cctp(Box::new(error)))
+    }
+
+    /// The Relay hop between `chain` and the hub, on the shared Ethereum
+    /// wallet. Quotes run on Relay's unauthenticated limits.
+    fn relay_hop(
+        &self,
+        corridor: UsdcCorridor,
+        chain: Chain,
+        chain_wallet: Signer,
+    ) -> Result<RelayHop<Signer>, SpawnRebalancerError> {
+        let setup = self
+            .relay_hops
+            .get(&chain)
+            .ok_or(SpawnRebalancerError::RelayHopUnconfigured { corridor })?;
+        let ethereum_confirmations = self
+            .settlement
+            .ethereum_required_confirmations
+            .ok_or(EthereumChainMissing)?;
+        let hub_wallet = self.ethereum_wallet.address();
+
+        let bridge = RelayBridge::try_from_ctx(RelayCtx {
+            chain,
+            ethereum_wallet: self.ethereum_wallet.clone(),
+            chain_wallet,
+            ethereum_confirmations,
+            chain_confirmations: setup.chain_confirmations,
+        })
+        .map_err(Box::new)?;
+        let client = RelayClient::new(None).map_err(Box::new)?;
+
+        Ok(RelayHop::new(bridge, client, setup.bounds, hub_wallet))
+    }
+}
+
+/// What every corridor's service shares: the store, the pool, the gas
+/// enqueuer, the driver gate and the Ethereum wallet's deposit-send lock.
+struct SharedTransferParts<'parts> {
+    usdc: &'parts Arc<Store<UsdcRebalance>>,
+    pool: &'parts SqlitePool,
+    bot_gas_enqueuer: &'parts BotGasReceiptCostEnqueuer,
+    driver_gate: &'parts UsdcDriverGate,
+    deposit_send_lock: &'parts Arc<tokio::sync::Mutex<()>>,
 }
 
 #[cfg(test)]
@@ -304,7 +401,7 @@ mod tests {
     use st0x_event_sorcery::test_store;
     use st0x_evm::local::RawPrivateKeyWallet;
     use st0x_evm::test_chain::evm_mapping_slot;
-    use st0x_evm::{Chain, Evm, USDC_ETHEREUM};
+    use st0x_evm::{Chain, Evm, PreparedTransaction, USDC_ETHEREUM};
     use st0x_execution::{
         AlpacaAccountId, AlpacaBrokerApi, AlpacaBrokerApiCtx, AlpacaBrokerApiMode,
         AlpacaWalletService, Executor, Symbol, TimeInForce,
@@ -321,7 +418,9 @@ mod tests {
     use crate::rebalancing::usdc::{UsdcRecheckError, UsdcSettlementParams, UsdcTransferError};
     use crate::telemetry::TelemetrySender;
     use crate::test_utils::spawn_anvil;
-    use crate::usdc_rebalance::{RebalanceDirection, UsdcRebalanceCommand, UsdcRebalanceId};
+    use crate::usdc_rebalance::{
+        RebalanceDirection, UsdcRebalanceCommand, UsdcRebalanceId, record_swap_pair_for_test,
+    };
 
     #[test]
     fn to_wrapped_equities_maps_underlying_and_derivative() {
@@ -433,7 +532,7 @@ mod tests {
         UsdcSettlementParams {
             attestation_retry_deadline: rebalancing_ctx.attestation_retry_deadline,
             settlement_retry_deadline: rebalancing_ctx.settlement_retry_deadline,
-            ethereum_required_confirmations: Some(0),
+            ethereum_required_confirmations: Some(1),
             reserved_cash: None,
             #[cfg(feature = "test-support")]
             circle_api_base: st0x_bridge::cctp::CIRCLE_API_BASE.to_string(),
@@ -529,9 +628,34 @@ mod tests {
             ethereum_wallet,
             cctp_corridor: CctpCorridor::ethereum_base().unwrap(),
             settlement: make_test_settlement(&rebalancing_ctx),
+            relay_hops: robinhood_relay_hops(),
         };
 
         (services, base_wallet)
+    }
+
+    const ROBINHOOD_RELAY: UsdcCorridor = UsdcCorridor::HubRouted {
+        chain: Chain::Robinhood,
+        hop: HopKind::Relay,
+    };
+
+    fn robinhood_relay_hops() -> BTreeMap<Chain, RelayHopSetup> {
+        BTreeMap::from([(
+            Chain::Robinhood,
+            RelayHopSetup {
+                bounds: RelayHopCtx {
+                    slippage_bps: 30,
+                    max_quote_loss_bps: 50,
+                    min_transfer: Usdc::new(float!(500)),
+                    max_transfer: Usdc::new(float!(50000)),
+                    quote_max_age: std::time::Duration::from_secs(60),
+                    fill_timeout: std::time::Duration::from_secs(1800),
+                    max_refund_retries: 3,
+                    max_deposit_revert_redrives: 5,
+                },
+                chain_confirmations: 1,
+            },
+        )])
     }
 
     #[tokio::test]
@@ -578,11 +702,10 @@ mod tests {
             ethereum_wallet,
             rebalancing_ctx.cctp_corridor,
             make_test_settlement(&rebalancing_ctx),
+            BTreeMap::new(),
         );
 
-        let bridge = services
-            .corridor_bridge(UsdcCorridor::BASE_CCTP, base_wallet)
-            .unwrap();
+        let bridge = services.cctp_bridge(base_wallet).unwrap();
 
         assert_eq!(
             bridge.ethereum_usdc_balance(ethereum_holder).await.unwrap(),
@@ -674,6 +797,170 @@ mod tests {
         );
     }
 
+    /// Robinhood via Relay gets its own cash transfer service, which the
+    /// handles route its transfers to.
+    #[tokio::test]
+    async fn relay_corridor_builds_a_service() {
+        let server = MockServer::start();
+        let (services, chain_wallet) = make_services_with_mock_wallet(&server).await;
+        let robinhood_relay = UsdcCorridor::HubRouted {
+            chain: Chain::Robinhood,
+            hop: HopKind::Relay,
+        };
+
+        let pool = crate::test_utils::setup_test_db().await;
+        let usdc_store = Arc::new(test_store(pool.clone(), ()));
+
+        let handles = services
+            .into_usdc_corridor_transfers(
+                vec![corridor_endpoints(robinhood_relay, chain_wallet)],
+                &usdc_store,
+                &pool,
+                &BotGasReceiptCostEnqueuer::Disabled,
+                &UsdcDriverGate::unpaused(),
+            )
+            .unwrap();
+
+        let transfer = UsdcRebalanceId(Uuid::new_v4());
+        usdc_store
+            .send(
+                &transfer,
+                UsdcRebalanceCommand::BeginWithdrawal {
+                    direction: RebalanceDirection::BaseToAlpaca,
+                    corridor: robinhood_relay,
+                    amount: Usdc::new(float!(1)),
+                    from_block: 0,
+                },
+            )
+            .await
+            .unwrap();
+        let error = handles
+            .recheck_deposit
+            .recheck_deposit(&transfer, None)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, UsdcRecheckError::NotDepositFailed { ref id, .. } if *id == transfer),
+            "got {error:?}"
+        );
+    }
+
+    /// The CCTP pair and a Relay hop built from one set of services sign hub
+    /// sends on one Ethereum wallet record, so a Relay pair and a deposit send
+    /// take consecutive nonces, never the same one.
+    #[tokio::test]
+    async fn relay_and_cctp_hub_sends_share_one_nonce_reservation() {
+        let server = MockServer::start();
+        let anvil = spawn_anvil(Anvil::new());
+        let provider = ProviderBuilder::new().connect_http(anvil.endpoint_url());
+        let evm_private_key =
+            b256!("0x0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef");
+        let ethereum_wallet =
+            RawPrivateKeyWallet::new(&evm_private_key, provider.clone(), 1).unwrap();
+        let chain_wallet = RawPrivateKeyWallet::new(&evm_private_key, provider.clone(), 1).unwrap();
+        let holder = ethereum_wallet.address();
+        let (account_id, _account_mock) = mock_alpaca_account(&server);
+        let (broker, wallet) = make_mock_alpaca_services(&server, account_id).await;
+        let rebalancing_ctx = make_ctx();
+        let services = RebalancerServices::new(
+            broker,
+            wallet,
+            ethereum_wallet,
+            rebalancing_ctx.cctp_corridor,
+            make_test_settlement(&rebalancing_ctx),
+            robinhood_relay_hops(),
+        );
+
+        provider
+            .anvil_set_code(USDC_ETHEREUM, DeployableERC20::DEPLOYED_BYTECODE.clone())
+            .await
+            .unwrap();
+        provider
+            .anvil_set_storage_at(
+                USDC_ETHEREUM,
+                evm_mapping_slot(holder, 0),
+                U256::from(10_000_000u64).into(),
+            )
+            .await
+            .unwrap();
+
+        let cctp = services.cctp_bridge(chain_wallet.clone()).unwrap();
+        let relay = services
+            .relay_hop(ROBINHOOD_RELAY, Chain::Robinhood, chain_wallet)
+            .unwrap();
+        let recipient = Address::repeat_byte(0xA1);
+
+        let deposit_send = cctp
+            .prepare_usdc_on_ethereum(recipient, U256::from(1u64))
+            .await
+            .unwrap();
+        let relay_send = relay
+            .prepare_usdc_on_ethereum(recipient, U256::from(1u64))
+            .await
+            .unwrap();
+
+        assert_eq!(relay_send.nonce(), deposit_send.nonce() + 1);
+    }
+
+    /// The pair a Relay swap signed on the Ethereum wallet is restored once,
+    /// by the hub restore, however many services run; the pair signed on
+    /// Robinhood is restored by the Relay service alone.
+    #[tokio::test]
+    async fn prepared_pair_restored_once_on_startup() {
+        let server = MockServer::start();
+        let (services, chain_wallet) = make_services_with_mock_wallet(&server).await;
+        let pool = crate::test_utils::setup_test_db().await;
+        let usdc_store = Arc::new(test_store(pool.clone(), ()));
+
+        let handles = services
+            .into_usdc_corridor_transfers(
+                vec![
+                    corridor_endpoints(UsdcCorridor::BASE_CCTP, chain_wallet.clone()),
+                    corridor_endpoints(ROBINHOOD_RELAY, chain_wallet),
+                ],
+                &usdc_store,
+                &pool,
+                &BotGasReceiptCostEnqueuer::Disabled,
+                &UsdcDriverGate::unpaused(),
+            )
+            .unwrap();
+
+        record_swap_pair_for_test(
+            &usdc_store,
+            &UsdcRebalanceId(Uuid::new_v4()),
+            RebalanceDirection::AlpacaToBase,
+            ROBINHOOD_RELAY,
+            Some(PreparedTransaction::for_test(B256::repeat_byte(0xe1), 50)),
+            PreparedTransaction::for_test(B256::repeat_byte(0xe2), 51),
+        )
+        .await;
+        record_swap_pair_for_test(
+            &usdc_store,
+            &UsdcRebalanceId(Uuid::new_v4()),
+            RebalanceDirection::BaseToAlpaca,
+            ROBINHOOD_RELAY,
+            Some(PreparedTransaction::for_test(B256::repeat_byte(0xc1), 60)),
+            PreparedTransaction::for_test(B256::repeat_byte(0xc2), 61),
+        )
+        .await;
+
+        let hub = handles
+            .restore_deposit_sends
+            .restore_prepared_deposit_sends(&pool)
+            .await;
+        let by_chain = handles
+            .restore_deposit_sends
+            .restore_chain_signed_swaps(&pool)
+            .await;
+
+        assert_eq!(hub.restored, 2, "the Ethereum-signed pair, restored once");
+        assert_eq!(
+            by_chain.keys().copied().collect::<Vec<_>>(),
+            vec![Chain::Robinhood]
+        );
+        assert_eq!(by_chain[&Chain::Robinhood].restored, 2);
+    }
+
     /// A corridor with no bridge wired refuses startup by name rather than
     /// building a transfer that could never move cash.
     #[tokio::test]
@@ -682,7 +969,7 @@ mod tests {
         let (services, chain_wallet) = make_services_with_mock_wallet(&server).await;
         let corridor = UsdcCorridor::HubRouted {
             chain: Chain::Robinhood,
-            hop: HopKind::Relay,
+            hop: HopKind::Cctp,
         };
 
         let pool = crate::test_utils::setup_test_db().await;

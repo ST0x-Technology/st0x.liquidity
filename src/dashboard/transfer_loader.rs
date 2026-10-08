@@ -1702,6 +1702,36 @@ mod tests {
         }
     }
 
+    /// A transfer in a Relay swap state is listed from its start.
+    #[tokio::test]
+    async fn usdc_swap_states_have_a_started_at() {
+        let pool = SqlitePool::connect(":memory:").await.unwrap();
+        sqlx::migrate!().run(&pool).await.unwrap();
+        let now = Utc::now();
+
+        for state in ["SwapQuoted", "SwapDepositPrepared", "SwapDeposited"] {
+            let id = Uuid::new_v4();
+            let payload = serde_json::json!({"Live": {(state): {"initiated_at": now}}});
+            sqlx::query(
+                "INSERT INTO usdc_rebalance_view (view_id, version, payload) \
+                 VALUES (?1, 1, ?2)",
+            )
+            .bind(id.to_string())
+            .bind(payload.to_string())
+            .execute(&pool)
+            .await
+            .unwrap();
+
+            let started_at: Option<String> =
+                sqlx::query_scalar("SELECT started_at FROM usdc_rebalance_view WHERE view_id = ?1")
+                    .bind(id.to_string())
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+            assert_eq!(started_at, Some(sortable_timestamp(now)), "{state}");
+        }
+    }
+
     #[tokio::test]
     async fn load_transfers_produces_warning_for_malformed_aggregate() {
         let pool = SqlitePool::connect(":memory:").await.unwrap();
