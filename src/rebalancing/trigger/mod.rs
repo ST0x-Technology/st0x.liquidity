@@ -9564,24 +9564,28 @@ impl RebalancingService {
                 .clear_previous_inflight_mint_marker(&symbol);
         }
 
+        // Cleared while the mint still owns the slot, so a provider poll cannot
+        // write a real pending amount in between that this would then zero.
+        // Not `?`: an error must not skip the terminal cleanup below, which
+        // would latch the symbol's tracking and in-progress guard.
+        if Self::is_terminal_mint_event(&event)
+            && let Err(error) = self
+                .clear_residual_hedging_inflight(&id, &symbol, tracking.chain)
+                .await
+        {
+            error!(
+                target: "rebalance",
+                id = %id,
+                %symbol,
+                ?error,
+                "Failed to clear residual Hedging inflight after terminal mint"
+            );
+        }
+
         self.update_active_mint(&id, &symbol, tracking.chain, &event)
             .await;
 
         let is_terminal = if Self::is_terminal_mint_event(&event) {
-            // Not `?`: an error here must not skip the terminal cleanup below,
-            // which would latch the symbol's tracking and in-progress guard.
-            if let Err(error) = self
-                .clear_residual_hedging_inflight(&id, &symbol, tracking.chain)
-                .await
-            {
-                error!(
-                    target: "rebalance",
-                    id = %id,
-                    %symbol,
-                    ?error,
-                    "Failed to clear residual Hedging inflight after terminal mint"
-                );
-            }
             self.mint_tracking.write().await.remove(&id);
             self.queue_terminal_mint_reservation_release(&id, &symbol)
                 .await;
@@ -17421,6 +17425,11 @@ mod tests {
         assert!(
             !inventory.equity_venues(&symbol).unwrap().has_inflight,
             "A terminal mint must not leave the symbol blocked on inflight"
+        );
+        assert_eq!(
+            inventory.equity_available(&symbol, Venue::Hedging),
+            Some(shares(50)),
+            "Clearing a phantom residual must not credit it back to Hedging available"
         );
         drop(inventory);
         assert_eq!(
