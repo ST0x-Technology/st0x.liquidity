@@ -35,10 +35,14 @@ it prints, so a series that disagrees in every pair is reported even when
 its values move or its kind changes (for example missing in one pair and a
 different value in the next). The report shows the last pair's message.
 
+A bot liq_* name in neither PORTED nor BOT_ONLY is always a finding: the
+lists below must name everything the bot publishes.
+
 Exit status: 0 with no findings, 1 with findings, 2 when a snapshot is not
-UTF-8 Prometheus text or holds none of the ported liq_* series (a wrong
-file, an empty body, an HTML or JSON error page, or a degraded target that
-only reports liq_up).
+UTF-8 Prometheus text, holds none of the ported liq_* series (a wrong file,
+an empty body, an HTML or JSON error page, or a degraded target that only
+reports liq_up), or lacks an always-present name another snapshot on its
+side has.
 
 
 Items that port more names extend PORTED, BOT_ONLY and KNOWN_DIFFS.
@@ -66,6 +70,26 @@ PORTED = {
     "liq_asset_counter_trading",
     "liq_asset_extended_hours",
     "liq_asset_rebalancing",
+    "liq_equity_onchain_available",
+    "liq_equity_offchain_available",
+    "liq_equity_inflight_total",
+    "liq_equity_total",
+    "liq_equity_unwrapped",
+    "liq_equity_wrapped",
+    "liq_equity_ratio",
+    "liq_usdc_onchain_available",
+    "liq_usdc_onchain_inflight",
+    "liq_usdc_offchain_available",
+    "liq_usdc_offchain_gross",
+    "liq_usdc_offchain_inflight",
+    "liq_usdc_alpaca_usdc",
+    "liq_usdc_alpaca_total",
+    "liq_usdc_inflight_total",
+    "liq_usdc_inflight_ethereum_wallet",
+    "liq_usdc_inflight_base_wallet",
+    "liq_usdc_total",
+    "liq_usdc_ratio",
+    "liq_usdc_rebalanceable",
 }
 
 # Names only the bot publishes.
@@ -85,6 +109,8 @@ DROP_LIST = {
     "liq_equity_onchain_inflight",
     "liq_equity_offchain_inflight",
     "liq_usdc_withdrawable",
+    "liq_equity_ratio_deviation",
+    "liq_usdc_ratio_deviation",
     "liq_hedge_cycles_24h",
     "liq_hedge_fill_count_24h",
     "liq_failure_event_last_ts_seconds",
@@ -97,6 +123,29 @@ DROP_LIST = {
     "liq_raindex_order_vault_balance",
     "liq_raindex_order_io_ratio",
     "liq_raindex_order_created_ts_seconds",
+}
+
+# Ported names every snapshot holds once its source has been read: both sides
+# publish them unconditionally. A body that lacks one that another body on its
+# side has is partly filled. Names that can be legitimately absent (a value
+# not read yet, a price that expired, a symbol without a position) are not
+# here, so they never make a snapshot unusable.
+ALWAYS_PRESENT = {
+    "liq_bot_info",
+    "liq_bot_start_timestamp_seconds",
+    "liq_settings_info",
+    "liq_settings_equity_deviation",
+    "liq_settings_order_polling_seconds",
+    "liq_settings_inventory_poll_seconds",
+    "liq_settings_deployment_block",
+    "liq_usdc_onchain_available",
+    "liq_usdc_onchain_inflight",
+    "liq_usdc_offchain_available",
+    "liq_usdc_offchain_inflight",
+    "liq_usdc_alpaca_total",
+    "liq_usdc_inflight_total",
+    "liq_usdc_total",
+    "liq_usdc_ratio",
 }
 
 # Documented differences. ("absolute", tolerance): values may differ by up to
@@ -234,8 +283,10 @@ def type_findings(bot_text, exporter_text, dropped, known_diffs):
     return findings
 
 
-def compare_pair(bot_text, exporter_text, drop_list, known_diffs):
-    """Returns ({series: message}, not_ported_names) for one pair."""
+def compare_pair(bot_text, exporter_text, drop_list, known_diffs, bot_names):
+    """Returns ({series: message}, not_ported_names) for one pair.
+    `bot_names` holds every liq_* name the bot published in any pair, so a
+    name the bot publishes only in some pairs is still compared in all."""
     known = KNOWN_DIFFS if known_diffs else {}
     dropped = DROP_LIST if drop_list else set()
 
@@ -249,9 +300,8 @@ def compare_pair(bot_text, exporter_text, drop_list, known_diffs):
     exporter = {key: value for key, value in parse_exposition(exporter_text).items()
                 if compared(key)}
 
-    published = {name for name, _ in bot}
     not_ported = {name for name, _ in exporter
-                  if name not in PORTED and name not in published}
+                  if name not in PORTED and name not in bot_names}
     exporter = {key: value for key, value in exporter.items()
                 if key[0] not in not_ported}
 
@@ -270,24 +320,36 @@ def compare_pair(bot_text, exporter_text, drop_list, known_diffs):
 
 
 def compare(pairs, drop_list, known_diffs):
-    """Findings present in every pair, and the union of unported names."""
+    """Findings present in every pair, plus every bot liq_* name that is in
+    neither PORTED nor BOT_ONLY, and the union of unported names."""
+    bot_names = {name for bot_text, _ in pairs for name, _ in parse_exposition(bot_text)
+                 if name.startswith("liq_")}
+    unlisted = sorted(f"unlisted bot name: {name}" for name in bot_names
+                      if name not in PORTED and name not in BOT_ONLY)
     persistent = None
     latest = {}
     not_ported = set()
     for bot_text, exporter_text in pairs:
-        findings, unported = compare_pair(bot_text, exporter_text, drop_list, known_diffs)
+        findings, unported = compare_pair(
+            bot_text, exporter_text, drop_list, known_diffs, bot_names)
         series = findings.keys()
         persistent = set(series) if persistent is None else persistent & series
         latest = findings
         not_ported |= unported
-    return sorted(latest[identity] for identity in persistent or ()), sorted(not_ported)
+    persistent_findings = sorted(latest[identity] for identity in persistent or ())
+    return unlisted + persistent_findings, sorted(not_ported)
 
 
 def unusable_snapshots(paths, texts):
-    """`path: reason` for each body that is not UTF-8, does not parse, or has
-    no liq_* sample. An undecodable body is passed as None."""
+    """`path: reason` for each body that is not UTF-8, does not parse, has no
+    ported liq_* sample, or lacks an ALWAYS_PRESENT name that another body on
+    the same side has (a partly filled body, such as an exporter just after a
+    restart, would otherwise hide a finding from the every-pair
+    intersection). Bodies alternate bot, exporter. An undecodable body is
+    passed as None."""
     unusable = []
-    for path, text in zip(paths, texts):
+    always_present = {}
+    for index, (path, text) in enumerate(zip(paths, texts)):
         if text is None:
             unusable.append(f"{path}: not UTF-8 text")
             continue
@@ -302,6 +364,15 @@ def unusable_snapshots(paths, texts):
             continue
         if not any(name in PORTED for name, _ in series):
             unusable.append(f"{path}: no ported liq_* series")
+            continue
+        always_present[index] = {name for name, _ in series if name in ALWAYS_PRESENT}
+
+    for index, names in always_present.items():
+        side = {name for other, other_names in always_present.items()
+                if other % 2 == index % 2 for name in other_names}
+        missing = sorted(side - names)
+        if missing:
+            unusable.append(f"{paths[index]}: partial snapshot, missing {', '.join(missing)}")
     return unusable
 
 

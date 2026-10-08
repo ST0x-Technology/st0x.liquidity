@@ -735,6 +735,34 @@ const PORTFOLIO_EQUITY_TRANSIT_LOCATIONS: [(InFlightEquityLocation, PortfolioLoc
     ),
 ];
 
+/// One symbol's balances as the dashboard and the `liq_*` series show them:
+/// the primary chain's vault, the offchain venue, and the Base wallet.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct SymbolBalances {
+    pub(crate) symbol: Symbol,
+    pub(crate) onchain_available: FractionalShares,
+    pub(crate) onchain_inflight: FractionalShares,
+    pub(crate) offchain_available: FractionalShares,
+    pub(crate) offchain_inflight: FractionalShares,
+    pub(crate) base_wallet_unwrapped: FractionalShares,
+    pub(crate) base_wallet_wrapped: FractionalShares,
+}
+
+/// The cash balances as the dashboard and the `liq_*` series show them. The
+/// onchain fields are the primary chain's vault. `None` means not read yet.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct UsdcBalances {
+    pub(crate) onchain_available: Usdc,
+    pub(crate) onchain_inflight: Usdc,
+    pub(crate) offchain_available: Usdc,
+    pub(crate) offchain_inflight: Usdc,
+    pub(crate) offchain_gross: Option<Usdc>,
+    pub(crate) withdrawable_cash: Option<Usdc>,
+    pub(crate) alpaca_usdc: Option<Usdc>,
+    pub(crate) ethereum_wallet: Option<Usdc>,
+    pub(crate) base_wallet: Option<Usdc>,
+}
+
 /// Cross-aggregate projection tracking inventory across venues.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub(crate) struct InventoryView {
@@ -1063,7 +1091,46 @@ impl InventoryView {
     /// serialization.
     pub(crate) fn to_dto(&self) -> st0x_dto::Inventory {
         let per_symbol = self
-            .equities
+            .symbol_balances()
+            .into_iter()
+            .map(|balances| SymbolInventory {
+                symbol: balances.symbol,
+                onchain_available: balances.onchain_available,
+                onchain_inflight: balances.onchain_inflight,
+                offchain_available: balances.offchain_available,
+                offchain_inflight: balances.offchain_inflight,
+                inflight_equity: InFlightEquity {
+                    base_wallet_unwrapped: balances.base_wallet_unwrapped,
+                    base_wallet_wrapped: balances.base_wallet_wrapped,
+                },
+            })
+            .collect();
+
+        let usdc = self.usdc_balances();
+
+        st0x_dto::Inventory {
+            per_symbol,
+            usdc: UsdcInventory {
+                symbol: self.primary_chain.settlement_stable().symbol.to_string(),
+                onchain_available: usdc.onchain_available,
+                onchain_inflight: usdc.onchain_inflight,
+                offchain_available: usdc.offchain_available,
+                offchain_inflight: usdc.offchain_inflight,
+                offchain_gross: usdc.offchain_gross,
+                withdrawable_cash: usdc.withdrawable_cash,
+                alpaca_usdc: usdc.alpaca_usdc,
+                inflight_cash: InFlightCash {
+                    ethereum_wallet: usdc.ethereum_wallet,
+                    base_wallet: usdc.base_wallet,
+                },
+            },
+        }
+    }
+
+    /// Every symbol the view holds a balance or a wallet reading for, in
+    /// symbol order, as the dashboard and the `liq_*` series show it.
+    pub(crate) fn symbol_balances(&self) -> Vec<SymbolBalances> {
+        self.equities
             .keys()
             .chain(self.inflight_equity.keys().map(|(symbol, _)| symbol))
             .unique()
@@ -1085,72 +1152,51 @@ impl InventoryView {
                         venue_balances(item.offchain)
                     });
 
-                let inflight_equity = InFlightEquity {
-                    base_wallet_unwrapped: self
-                        .inflight_equity
-                        .get(&(
-                            symbol.clone(),
-                            InFlightEquityLocation::WalletUnwrapped(Chain::Base),
-                        ))
-                        .map_or(FractionalShares::ZERO, |entry| entry.amount),
-                    base_wallet_wrapped: self
-                        .inflight_equity
-                        .get(&(
-                            symbol.clone(),
-                            InFlightEquityLocation::WalletWrapped(Chain::Base),
-                        ))
-                        .map_or(FractionalShares::ZERO, |entry| entry.amount),
+                let wallet = |location| {
+                    self.inflight_equity
+                        .get(&(symbol.clone(), location))
+                        .map_or(FractionalShares::ZERO, |entry| entry.amount)
                 };
 
-                SymbolInventory {
+                SymbolBalances {
                     symbol: symbol.clone(),
                     onchain_available,
                     onchain_inflight,
                     offchain_available,
                     offchain_inflight,
-                    inflight_equity,
+                    base_wallet_unwrapped: wallet(InFlightEquityLocation::WalletUnwrapped(
+                        Chain::Base,
+                    )),
+                    base_wallet_wrapped: wallet(InFlightEquityLocation::WalletWrapped(Chain::Base)),
                 }
             })
-            .collect();
+            .collect()
+    }
 
+    /// The cash balances as the dashboard and the `liq_*` series show them.
+    pub(crate) fn usdc_balances(&self) -> UsdcBalances {
         // The primary chain's slot alone: the dashboard measures this against
         // the rebalancing target, which governs that chain's vault. Cash
         // prefunded elsewhere is beyond the rebalancer's reach, so totalling it
         // in reads as a healthy allocation while the chain that rebalances is
         // underfunded.
-        let (usdc_onchain_available, usdc_onchain_inflight) =
+        let (onchain_available, onchain_inflight) =
             venue_balances(self.usdc.onchain.get(&self.primary_chain).copied());
 
-        let (usdc_offchain_available, usdc_offchain_inflight) = venue_balances(self.usdc.offchain);
+        let (offchain_available, offchain_inflight) = venue_balances(self.usdc.offchain);
 
-        let withdrawable_cash = self.withdrawable_cash_cents.and_then(Usdc::from_cents);
+        let wallet = |location| self.inflight_cash.get(&location).map(|entry| entry.amount);
 
-        let offchain_gross = self.offchain_gross_usd_cents.and_then(Usdc::from_cents);
-
-        let inflight_cash = InFlightCash {
-            ethereum_wallet: self
-                .inflight_cash
-                .get(&InFlightCashLocation::EthereumWallet)
-                .map(|entry| entry.amount),
-            base_wallet: self
-                .inflight_cash
-                .get(&InFlightCashLocation::BaseWallet)
-                .map(|entry| entry.amount),
-        };
-
-        st0x_dto::Inventory {
-            per_symbol,
-            usdc: UsdcInventory {
-                symbol: self.primary_chain.settlement_stable().symbol.to_string(),
-                onchain_available: usdc_onchain_available,
-                onchain_inflight: usdc_onchain_inflight,
-                offchain_available: usdc_offchain_available,
-                offchain_inflight: usdc_offchain_inflight,
-                offchain_gross,
-                withdrawable_cash,
-                alpaca_usdc: self.alpaca_usdc,
-                inflight_cash,
-            },
+        UsdcBalances {
+            onchain_available,
+            onchain_inflight,
+            offchain_available,
+            offchain_inflight,
+            offchain_gross: self.offchain_gross_usd_cents.and_then(Usdc::from_cents),
+            withdrawable_cash: self.withdrawable_cash_cents.and_then(Usdc::from_cents),
+            alpaca_usdc: self.alpaca_usdc,
+            ethereum_wallet: wallet(InFlightCashLocation::EthereumWallet),
+            base_wallet: wallet(InFlightCashLocation::BaseWallet),
         }
     }
 

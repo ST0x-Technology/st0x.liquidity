@@ -1,0 +1,50 @@
+{
+  "settings": {
+    "equityTarget": 0.5,
+    "equityDeviation": 0.2,
+    "usdcTarget": 0.4,
+    "usdcDeviation": 0.1,
+    "cashReserved": "900",
+    "executionThreshold": "$2.5",
+    "assets": [],
+    "wallet": null,
+    "logLevel": "Info",
+    "serverPort": 8080,
+    "orderbook": "0x0000000000000000000000000000000000000002",
+    "deploymentBlock": 1,
+    "broker": "alpaca",
+    "orderPollingInterval": 5,
+    "inventoryPollInterval": 15
+  },
+  "inventory": {
+    "perSymbol": [
+      {
+        "symbol": "tAAPL",
+        "onchainAvailable": "0",
+        "onchainInflight": "0",
+        "offchainAvailable": "0",
+        "offchainInflight": "0",
+        "inflightEquity": {
+          "baseWalletUnwrapped": "0",
+          "baseWalletWrapped": "0"
+        }
+      }
+    ],
+    "usdc": {
+      "symbol": "USDC",
+      "onchainAvailable": "0",
+      "onchainInflight": "0",
+      "offchainAvailable": "0",
+      "offchainInflight": "0",
+      "offchainGross": null,
+      "withdrawableCash": "800",
+      "alpacaUsdc": null,
+      "inflightCash": {
+        "ethereumWallet": null,
+        "baseWallet": null
+      }
+    }
+  },
+  "positions": [],
+  "equityPrices": []
+}

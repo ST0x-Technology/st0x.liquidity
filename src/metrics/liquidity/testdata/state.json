@@ -1,0 +1,113 @@
+{
+  "settings": {
+    "equityTarget": 0.5,
+    "equityDeviation": 0.2,
+    "usdcTarget": 0.4,
+    "usdcDeviation": 0.1,
+    "cashReserved": null,
+    "executionThreshold": "$2.5",
+    "assets": [],
+    "wallet": null,
+    "logLevel": "Info",
+    "serverPort": 8080,
+    "orderbook": "0x0000000000000000000000000000000000000002",
+    "deploymentBlock": 1,
+    "broker": "alpaca",
+    "orderPollingInterval": 5,
+    "inventoryPollInterval": 15
+  },
+  "inventory": {
+    "perSymbol": [
+      {
+        "symbol": "RKLB",
+        "onchainAvailable": "30",
+        "onchainInflight": "0",
+        "offchainAvailable": "10",
+        "offchainInflight": "0",
+        "inflightEquity": {
+          "baseWalletUnwrapped": "0",
+          "baseWalletWrapped": "0"
+        }
+      },
+      {
+        "symbol": "tAAPL",
+        "onchainAvailable": "12.5",
+        "onchainInflight": "2",
+        "offchainAvailable": "37.5",
+        "offchainInflight": "0.5",
+        "inflightEquity": {
+          "baseWalletUnwrapped": "3",
+          "baseWalletWrapped": "1.25"
+        }
+      },
+      {
+        "symbol": "wtTSLA",
+        "onchainAvailable": "0",
+        "onchainInflight": "4",
+        "offchainAvailable": "0",
+        "offchainInflight": "1",
+        "inflightEquity": {
+          "baseWalletUnwrapped": "0",
+          "baseWalletWrapped": "0"
+        }
+      }
+    ],
+    "usdc": {
+      "symbol": "USDC",
+      "onchainAvailable": "2500.5",
+      "onchainInflight": "100",
+      "offchainAvailable": "1000.25",
+      "offchainInflight": "50",
+      "offchainGross": "1500.5",
+      "withdrawableCash": "800",
+      "alpacaUsdc": "12.5",
+      "inflightCash": {
+        "ethereumWallet": "3",
+        "baseWallet": null
+      }
+    }
+  },
+  "positions": [
+    {
+      "symbol": "AAPL",
+      "net": "10"
+    },
+    {
+      "symbol": "wtTSLA",
+      "net": "-3"
+    },
+    {
+      "symbol": "RKLB",
+      "net": "4"
+    }
+  ],
+  "equityPrices": [
+    {
+      "symbol": "tAAPL",
+      "status": {
+        "status": "available",
+        "priceUsd": "2.5",
+        "observedAt": "2026-10-08T00:00:00Z",
+        "expiresAt": "2099-01-01T00:00:00Z"
+      }
+    },
+    {
+      "symbol": "tSPYM",
+      "status": {
+        "status": "available",
+        "priceUsd": "7",
+        "observedAt": "2026-10-08T00:00:00Z",
+        "expiresAt": "2099-01-01T00:00:00Z"
+      }
+    },
+    {
+      "symbol": "wtTSLA",
+      "status": {
+        "status": "available",
+        "priceUsd": "9",
+        "observedAt": "2026-10-08T00:00:00Z",
+        "expiresAt": "2000-01-01T00:00:00Z"
+      }
+    }
+  ]
+}

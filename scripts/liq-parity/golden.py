@@ -40,10 +40,19 @@ def run_state(exporter, fixture):
     exporter.collect_state()
 
 
+def run_full_state(exporter, fixture):
+    """The whole WebSocket current_state seed: settings, inventory,
+    positions and equity prices."""
+    exporter.ws_seed_current_state = lambda timeout=20: fixture
+    exporter.collect_state()
+
+
 # case name -> how the fixture reaches the exporter
 CASES = {
     "settings": run_state,
     "settings-minimal": run_state,
+    "state": run_full_state,
+    "state-reserved": run_full_state,
 }
 
 
