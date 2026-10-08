@@ -1979,12 +1979,13 @@ impl OffchainOrder {
         self,
         id: &OffchainOrderId,
     ) -> Result<Trade, TradeConversionError> {
-        let (symbol, shares, direction, executor, occurred_at, outcome) = match self {
+        let (symbol, shares, direction, executor, occurred_at, price, outcome) = match self {
             Self::Filled {
                 symbol,
                 shares,
                 direction,
                 executor,
+                price,
                 filled_at,
                 ..
             } => (
@@ -1993,6 +1994,7 @@ impl OffchainOrder {
                 direction,
                 executor,
                 filled_at,
+                Some(price),
                 TradeOutcome::Filled,
             ),
             Self::Failed {
@@ -2020,6 +2022,7 @@ impl OffchainOrder {
                     direction,
                     executor,
                     failed_at,
+                    None,
                     TradeOutcome::Failed {
                         error,
                         accepted_shares: quantities.accepted,
@@ -2053,6 +2056,7 @@ impl OffchainOrder {
                     direction,
                     executor,
                     cancelled_at,
+                    None,
                     TradeOutcome::Cancelled {
                         accepted_shares: quantities.accepted,
                         filled_shares: quantities.filled,
@@ -2077,6 +2081,7 @@ impl OffchainOrder {
             direction,
             symbol,
             shares,
+            price,
             outcome,
         })
     }
@@ -4104,6 +4109,27 @@ mod tests {
     }
 
     #[test]
+    fn filled_trade_carries_the_fill_price() {
+        let filled_at = "2026-01-05T14:30:00Z".parse::<DateTime<Utc>>().unwrap();
+        let order = OffchainOrder::Filled {
+            symbol: Symbol::new("AAPL").unwrap(),
+            shares: Positive::new(FractionalShares::new(float!(2))).unwrap(),
+            direction: Direction::Sell,
+            executor: SupportedExecutor::AlpacaBrokerApi,
+            executor_order_id: ExecutorOrderId::new("filled-order"),
+            price: Usd::new(float!(199.5)),
+            placed_at: filled_at,
+            submitted_at: filled_at,
+            filled_at,
+        };
+
+        let trade = order.try_into_trade(&OffchainOrderId::new()).unwrap();
+
+        assert_eq!(trade.outcome, TradeOutcome::Filled);
+        assert_eq!(trade.price, Some(Usd::new(float!(199.5))));
+    }
+
+    #[test]
     fn failed_trade_preserves_requested_accepted_and_filled_shares() {
         let fill_time = "2026-01-05T14:30:00Z".parse::<DateTime<Utc>>().unwrap();
         let failure_time = "2026-01-06T14:32:01Z".parse::<DateTime<Utc>>().unwrap();
@@ -4130,6 +4156,7 @@ mod tests {
         let trade = order
             .try_into_trade(&OffchainOrderId::new())
             .expect("valid terminal failure should convert");
+        assert_eq!(trade.price, None);
         assert_eq!(trade.occurred_at, failure_time);
         assert!(trade.shares.inner().inner().eq(float!(2)).unwrap());
         match trade.outcome {
@@ -4294,6 +4321,7 @@ mod tests {
         };
 
         let trade = order.try_into_trade(&OffchainOrderId::new()).unwrap();
+        assert_eq!(trade.price, None);
         let TradeOutcome::Cancelled {
             filled_shares,
             remaining_shares,

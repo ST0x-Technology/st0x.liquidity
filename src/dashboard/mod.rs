@@ -545,6 +545,7 @@ mod tests {
                 st0x_float_macro::float!(1),
             ))
             .unwrap(),
+            price: None,
             outcome: st0x_dto::TradeOutcome::Filled,
         })
     }
@@ -580,6 +581,7 @@ mod tests {
             direction: Direction::Sell,
             symbol: Symbol::new("AAPL").unwrap(),
             shares: Positive::new(FractionalShares::new(float!(1))).unwrap(),
+            price: None,
             outcome: TradeOutcome::Cancelled {
                 accepted_shares: Some(Positive::new(FractionalShares::new(float!(1))).unwrap()),
                 filled_shares: Some(
@@ -614,6 +616,7 @@ mod tests {
             direction: Direction::Buy,
             symbol: Symbol::new("AAPL").unwrap(),
             shares: Positive::new(FractionalShares::new(float!(1))).unwrap(),
+            price: None,
             outcome: TradeOutcome::Filled,
         };
 
@@ -1100,6 +1103,7 @@ mod tests {
             direction: Direction::Buy,
             symbol: Symbol::new("TSLA").unwrap(),
             shares: Positive::new(FractionalShares::new(float!(1))).unwrap(),
+            price: None,
             outcome: TradeOutcome::Filled,
         };
         server
@@ -1132,6 +1136,7 @@ mod tests {
             direction: Direction::Sell,
             symbol: Symbol::new("TSLA").unwrap(),
             shares: Positive::new(FractionalShares::new(float!(1))).unwrap(),
+            price: None,
             outcome: TradeOutcome::Failed {
                 error: "broker rejected order".to_string(),
                 accepted_shares: None,
