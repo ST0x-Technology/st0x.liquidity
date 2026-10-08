@@ -4915,22 +4915,24 @@ signing a second deposit while an earlier one may still land:
   land after a reorg. Before a `SwapQuoted` re-quotes, signs or redeposits, the
   bot scans the origin chain's depository from the lowest `origin_from_block` of
   those quotes for our deposits of their order ids, so no new pair is signed and
-  nothing is redeposited while one of them is on chain. A deposit found is never
-  left behind: its order's status is read, and a fill or refund that proves is
-  adopted (`RecoverSwapCompletion` -> `SwapCompletionRecovered`). Until then the
-  transfer signs nothing, pages, and reads it again every 30 minutes. A scan
-  that fails is retried and signs nothing either.
+  nothing is redeposited from `SwapQuoted` while one of them is on chain. A
+  deposit found is never left behind: its order's status is read, and a fill or
+  refund that proves is adopted (`RecoverSwapCompletion` ->
+  `SwapCompletionRecovered`). Until then the transfer signs nothing, pages, and
+  reads it again every 30 minutes. A scan that fails is retried and signs
+  nothing either.
 - **Late adoption.** `SwapCompletionRecovered` adopts a proven late payment of a
   signed order: from `SwapQuoted`, a reverted order whose deposit the scan
   found, which leaves `reverted_quotes`; from `SwapFailed`, through
   `transfer recheck`, the failed order itself, keeping the reverted quotes
-  watched. A fill continues as any `Bridged`; a refund continues as any
-  `SwapRefunded` of that order (redeposited, re-quoted or held).
-  `transfer
-  recheck` of an unresolved escrow records a proven payment of its
-  deposited order with `ConfirmSwapFill` or `RecordSwapRefund`. Approves that
-  went out alone are sent again before a `SwapQuoted` adopts one. Superseding an
-  order adds its id to `signed_order_ids` and never drops one.
+  watched. A fill continues as any `Bridged`, and the other reverted orders are
+  no longer watched; a refund continues as any `SwapRefunded` of that order
+  (redeposited, re-quoted or held). `transfer
+  recheck` of an unresolved escrow
+  records a proven payment of its deposited order with `ConfirmSwapFill` or
+  `RecordSwapRefund`. Approves that went out alone are sent again before a
+  `SwapQuoted` adopts one. Superseding an order adds its id to
+  `signed_order_ids` and never drops one.
 
 ##### Crash-safe resume
 
@@ -7511,18 +7513,19 @@ named exemptions defined after the list:**
   nothing otherwise (`left_unchanged`); it refuses a `--deposit-tx` and every
   other Relay state. It does not move an adopted payment on: the escrow's job
   does at its next read, and after a `SwapFailed` the operator's
-  `transfer resume --kind usdc` does. A transfer Alpaca still reports pending or
-  failed refuses without touching the aggregate. A send tx that is absent from
-  Alpaca's account-wide transfer list is a separate, INCONCLUSIVE result: the
-  list may be capped, so absence is not proof the deposit never settled. The
-  recheck reports `not_detected_yet`, changes nothing, and the operator retries
-  later. Other USDC states keep their existing paths (`resume` while
-  non-terminal, `reconcile` for funds handled out-of-band rather than settled by
-  the provider). Because the USDC recheck sends from the rebalancing wallet and
-  advances the aggregate on the request task, it first quiesces the USDC
-  rebalancing driver and holds it paused for the whole recheck, refusing with
-  `503` when the driver cannot quiesce (see "Both bot-routed USDC recovery
-  routes quiesce the rebalancing driver first" below).
+  `transfer resume --kind usdc` does, as for any `Bridged` or `SwapRefunded`. A
+  transfer Alpaca still reports pending or failed refuses without touching the
+  aggregate. A send tx that is absent from Alpaca's account-wide transfer list
+  is a separate, INCONCLUSIVE result: the list may be capped, so absence is not
+  proof the deposit never settled. The recheck reports `not_detected_yet`,
+  changes nothing, and the operator retries later. Other USDC states keep their
+  existing paths (`resume` while non-terminal, `reconcile` for funds handled
+  out-of-band rather than settled by the provider). Because the USDC recheck
+  sends from the rebalancing wallet and advances the aggregate on the request
+  task, it first quiesces the USDC rebalancing driver and holds it paused for
+  the whole recheck, refusing with `503` when the driver cannot quiesce (see
+  "Both bot-routed USDC recovery routes quiesce the rebalancing driver first"
+  below).
 - `fail` -- force a stuck non-terminal operation to its clean `Failed` terminal
   so the system stops waiting on it; `--reason` required.
 - `reconcile` -- declare an already-terminal-failed operation resolved
