@@ -532,8 +532,8 @@ groups:
           summary: >-
             Production liquidity bot: portfolio snapshot is valuing on a stale mark
           description: >-
-            The bot's portfolio valuation is using a mark it last saw at the time in the log line. PnL and sizing decisions are drifting from reality until pricing serves a fresh mark. Check the pricing plane before the bot. This rule relays each line for 15 minutes and then resolves; that RESOLVED means "no new occurrence", not "fixed".
-        labels: {service: liquidity, severity: critical}
+            The daily portfolio snapshot valued a held symbol at a price more than 7 ET days old (time in the log line): neither its last onchain fill price nor its last pricing mark is newer. Only /pnl is affected: that ET day's capital is excluded until an operator sets the mark with the repair command in the log line. Trading and hedge sizing do not use it. Usually pricing stopped sending this symbol's underlying mark, or the bot restarted or reloaded config while pricing was not quoting. This rule relays each line for 15 minutes and then resolves; that RESOLVED means "no new occurrence", not "fixed".
+        labels: {service: liquidity, severity: warning}
       - uid: t0liqmrkmissprd
         title: liquidity-portfolio-mark-missing-production
         condition: C
@@ -589,8 +589,8 @@ groups:
           summary: >-
             Production liquidity bot: portfolio snapshot has no mark for a held position
           description: >-
-            The bot has no mark at all for something in its portfolio, so that position is unvalued. Usually a symbol pricing does not serve or a WebSocket that never resubscribed. Check the pricing plane before the bot. This rule relays each line for 15 minutes and then resolves; that RESOLVED means "no new occurrence", not "fixed".
-        labels: {service: liquidity, severity: critical}
+            The bot has no mark at all for something in its portfolio, so that position is unvalued. Only /pnl is affected: that ET day's capital is excluded until an operator sets the mark with the repair command in the log line. The symbol has no onchain fill price and no pricing mark this session, or it is retired or not configured at that location. Usually a symbol pricing does not serve or a WebSocket that never resubscribed: check the pricing plane before the bot. A retired or unconfigured symbol still holding a balance needs that balance moved or the symbol configured. This rule relays each line for 15 minutes and then resolves; that RESOLVED means "no new occurrence", not "fixed".
+        labels: {service: liquidity, severity: warning}
       - uid: t0liqvwdrawprd
         title: liquidity-vault-withdraw-failed-production
         condition: C
