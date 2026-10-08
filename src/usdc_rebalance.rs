@@ -7322,6 +7322,28 @@ mod tests {
         assert!(!returned.is_reconcilable_failure());
     }
 
+    /// A swap-state snapshot written before `deposit_reverts` existed reads
+    /// with no reverted deposit.
+    #[test]
+    fn swap_snapshot_without_deposit_reverts_reads_zero() {
+        for events in [
+            quoted(RebalanceDirection::BaseToAlpaca),
+            prepared_pair(RebalanceDirection::BaseToAlpaca),
+        ] {
+            let state = replay::<UsdcRebalance>(events).unwrap().unwrap();
+            let mut snapshot = to_value(&state).unwrap();
+            let fields = snapshot
+                .as_object_mut()
+                .and_then(|variant| variant.values_mut().next())
+                .and_then(serde_json::Value::as_object_mut)
+                .unwrap();
+            assert_eq!(fields.remove("deposit_reverts"), Some(json!(0)));
+
+            let legacy: UsdcRebalance = from_value(snapshot).unwrap();
+            assert_eq!(legacy, state);
+        }
+    }
+
     fn redepositing_initiated_at(state: &UsdcRebalance) -> DateTime<Utc> {
         let UsdcRebalance::Redepositing { initiated_at, .. } = state else {
             panic!("expected Redepositing, got {state:?}");
