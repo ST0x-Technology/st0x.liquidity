@@ -798,6 +798,7 @@ where
             _ => return Ok(()),
         };
         let order_id = RelayOrderId(quote.order_id);
+        let past_window = wait.is_past(self.hop.bounds.fill_timeout, Utc::now());
 
         let report = match self
             .hop
@@ -808,7 +809,7 @@ where
             Ok(report) => report,
             Err(error) => {
                 warn!(target: "rebalance", %id, %error, "Relay status read failed; reading it again later");
-                return self.payment_pending(id, deposit_tx, wait, false).await;
+                return self.payment_pending(id, deposit_tx, wait).await;
             }
         };
 
@@ -819,9 +820,9 @@ where
                     .bridge
                     .verify_fill(TO_HUB, order_id, quote.minimum_out, &report.txs)
                     .await;
-                match Self::proven_payment(id, proof)? {
+                match Self::proven_payment(id, proof, past_window)? {
                     Some(payment) => self.adopt_fill(id, payment).await,
-                    None => self.payment_pending(id, deposit_tx, wait, true).await,
+                    None => self.payment_pending(id, deposit_tx, wait).await,
                 }
             }
             IntentStatus::Refund { reason } => {
@@ -830,9 +831,9 @@ where
                     .bridge
                     .verify_refund(TO_HUB, order_id, quote.amount_in, &report.txs)
                     .await;
-                match Self::proven_payment(id, proof)? {
+                match Self::proven_payment(id, proof, past_window)? {
                     Some(payment) => self.adopt_refund(id, payment, reason).await,
-                    None => self.payment_pending(id, deposit_tx, wait, true).await,
+                    None => self.payment_pending(id, deposit_tx, wait).await,
                 }
             }
             status @ (IntentStatus::RefundFailed { .. } | IntentStatus::Failure { .. }) => {
@@ -852,16 +853,18 @@ where
             | IntentStatus::Filling
             | IntentStatus::Refunding { .. }
             | IntentStatus::NotIncluded
-            | IntentStatus::Unknown(_) => self.payment_pending(id, deposit_tx, wait, false).await,
+            | IntentStatus::Unknown(_) => self.payment_pending(id, deposit_tx, wait).await,
         }
     }
 
     /// The payment a proof established, `None` while the chain does not show
-    /// it with its confirmations yet. A payment that does not prove is
-    /// refused and paged: the transfer holds its guard.
+    /// it with its confirmations yet. A payment that does not prove, or that
+    /// the chain still does not show past the fill window, is paged and read
+    /// again slowly: the transfer holds its guard.
     fn proven_payment(
         id: &UsdcRebalanceId,
         proof: Result<SwapPayment, RelayBridgeError>,
+        past_window: bool,
     ) -> Result<Option<SwapPayment>, UsdcTransferError> {
         match proof {
             Ok(payment) => Ok(Some(payment)),
@@ -870,6 +873,13 @@ where
                 | RelayBridgeError::RefundUnverified { .. }),
             ) => {
                 error!(target: "operational_alert", alert = true, %id, %error, "The Relay payment does not prove on chain; the transfer holds its guard");
+                Err(UsdcTransferError::SwapPaymentUnverified {
+                    id: id.clone(),
+                    source: Box::new(error),
+                })
+            }
+            Err(error) if past_window => {
+                error!(target: "operational_alert", alert = true, %id, %error, "Relay names a payment the chain still does not show past the fill window; the transfer holds its guard");
                 Err(UsdcTransferError::SwapPaymentUnverified {
                     id: id.clone(),
                     source: Box::new(error),
@@ -945,28 +955,21 @@ where
         }
     }
 
-    /// Ends an attempt with no payment adopted: `RelayFillPending` within the
-    /// fill window, or past it while Relay names a payment the chain does not
-    /// show yet (`paid`), and the guard-holding `SwapEscrowUnresolved` once
-    /// the window passed with neither. An unresolved escrow is read again only
-    /// on the operator's resume.
+    /// Ends an attempt with no payment: `RelayFillPending` within the fill
+    /// window, the guard-holding `SwapEscrowUnresolved` once it has passed.
+    /// An unresolved escrow is read again only on the operator's resume.
     async fn payment_pending(
         &self,
         id: &UsdcRebalanceId,
         deposit_tx: TxHash,
         wait: PaymentWait,
-        paid: bool,
     ) -> Result<(), UsdcTransferError> {
         let PaymentWait::FillWindow { deposited_at } = wait else {
-            warn!(target: "rebalance", %id, %deposit_tx, paid, "Relay deposit still unresolved; it is read again on the next resume");
+            warn!(target: "rebalance", %id, %deposit_tx, "Relay deposit still unresolved; it is read again on the next resume");
             return Ok(());
         };
 
-        let window_end = chrono::TimeDelta::from_std(self.hop.bounds.fill_timeout)
-            .ok()
-            .and_then(|window| deposited_at.checked_add_signed(window));
-
-        if paid || window_end.is_some_and(|window_end| Utc::now() < window_end) {
+        if !wait.is_past(self.hop.bounds.fill_timeout, Utc::now()) {
             return Err(UsdcTransferError::RelayFillPending {
                 id: id.clone(),
                 deposited_at,
@@ -1035,7 +1038,12 @@ where
             submitted
         };
 
-        let deposit_block = self.confirm_vault_deposit(deposit_tx).await?;
+        let deposit_block = self
+            .confirm_vault_deposit(deposit_tx)
+            .await
+            .inspect_err(|error| {
+                error!(target: "operational_alert", alert = true, %id, %deposit_tx, %error, "The redeposit into the vault did not confirm; the transfer holds its guard at Redepositing until it confirms, or the stable is settled by hand and the transfer reconciled");
+            })?;
         self.cqrs
             .send(
                 id,
@@ -1208,6 +1216,20 @@ enum PaymentWait {
     FillWindow { deposited_at: DateTime<Utc> },
     /// Past the window: `SwapEscrowUnresolved`.
     Unresolved,
+}
+
+impl PaymentWait {
+    /// Whether the fill window of `fill_timeout` has passed at `now`. A window
+    /// end that does not fit counts as passed.
+    fn is_past(self, fill_timeout: Duration, now: DateTime<Utc>) -> bool {
+        match self {
+            Self::FillWindow { deposited_at } => chrono::TimeDelta::from_std(fill_timeout)
+                .ok()
+                .and_then(|window| deposited_at.checked_add_signed(window))
+                .is_none_or(|window_end| now >= window_end),
+            Self::Unresolved => true,
+        }
+    }
 }
 
 /// Pages that a Relay pair prepare panicked: nonces it reserved and did not
@@ -3054,6 +3076,63 @@ mod tests {
         assert_eq!(state.state_name(), "SwapEscrowUnresolved");
         assert!(state.holds_rebalance_guard());
         assert!(!state.is_reconcilable_failure());
+    }
+
+    /// A fill Relay names that the chain still does not show past the fill
+    /// window is not taken for an unresolved escrow: the transfer stays at
+    /// `SwapDeposited`, guard held, and the attempt ends paged for a slow
+    /// re-read.
+    #[tokio::test]
+    async fn unprovable_payment_past_the_fill_window_pages_and_holds() {
+        let anvil = spawn_anvil(Anvil::new());
+        let key = B256::from_slice(&anvil.keys()[0].to_bytes());
+        let wallet = anvil_wallet(anvil.endpoint_url(), &key);
+        let server = MockServer::start();
+        let relay_api = MockServer::start();
+        mock_status(
+            &relay_api,
+            json!({"status": "success", "txHashes": [TxHash::repeat_byte(0xf9)]}),
+        );
+        let store = Arc::new(test_store(setup_test_db().await, ()));
+        let transfer = relay_transfer_with_bounds(
+            &server,
+            &relay_api,
+            wallet.clone(),
+            wallet,
+            RelayEndContracts {
+                stable: Address::repeat_byte(0x51),
+                depository: Address::repeat_byte(0x52),
+            },
+            store.clone(),
+            RelayHopCtx {
+                fill_timeout: Duration::from_millis(1),
+                ..relay_bounds()
+            },
+        )
+        .await;
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        record_deposited(&store, &id).await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        let error = tokio::time::timeout(
+            Duration::from_secs(5),
+            transfer.resume_base_to_alpaca(&id, Usdc::new(float!(100)), ROBINHOOD_RELAY),
+        )
+        .await
+        .expect("the attempt ends")
+        .unwrap_err();
+
+        assert!(
+            matches!(
+                &error,
+                UsdcTransferError::SwapPaymentUnverified { source, .. }
+                    if matches!(**source, RelayBridgeError::TxNotFound { .. })
+            ),
+            "got {error:?}"
+        );
+        let state = store.load(&id).await.unwrap().unwrap();
+        assert_eq!(state.state_name(), "SwapDeposited");
+        assert!(state.holds_rebalance_guard());
     }
 
     /// The operator's resume of a deposit unresolved past its fill window

@@ -1674,15 +1674,17 @@ impl UsdcRebalance {
     /// compile time instead of silently landing in a wildcard arm.
     pub fn is_reconcilable_failure(&self) -> bool {
         match self {
-            // A Relay failure with nothing paid back, and a chain-to-Alpaca
-            // refund paid in USDC at the hub: no automated step settles
-            // either, and the operator moves the funds.
+            // A Relay failure with nothing paid back, a chain-to-Alpaca refund
+            // paid in USDC at the hub, and a redeposit that does not confirm:
+            // no automated step settles them, and the operator moves the
+            // funds.
             Self::DepositFailed { .. }
             | Self::ConversionFailed {
                 direction: RebalanceDirection::BaseToAlpaca,
                 ..
             }
             | Self::SwapFailed { .. }
+            | Self::Redepositing { .. }
             | Self::SwapRefunded {
                 direction: RebalanceDirection::BaseToAlpaca,
                 side: RefundSide::Destination,
@@ -1727,7 +1729,6 @@ impl UsdcRebalance {
             | Self::SwapDeposited { .. }
             | Self::SwapRefunded { .. }
             | Self::SwapEscrowUnresolved { .. }
-            | Self::Redepositing { .. }
             | Self::ReturnedToSource { .. }
             | Self::Bridged { .. }
             | Self::DepositInitiated { .. }
@@ -2481,6 +2482,12 @@ impl UsdcRebalance {
                 amount,
                 refunded_at: failed_at,
                 ..
+            }
+            | Self::Redepositing {
+                direction,
+                amount,
+                started_at: failed_at,
+                ..
             } => Some((*direction, *amount, *failed_at)),
             // Guard-holding in-progress states: self-recover via
             // reactor/apalis once resumed; seeding would wedge
@@ -2499,7 +2506,6 @@ impl UsdcRebalance {
             | Self::SwapDeposited { .. }
             | Self::SwapRefunded { .. }
             | Self::SwapEscrowUnresolved { .. }
-            | Self::Redepositing { .. }
             | Self::ReturnedToSource { .. }
             | Self::Bridged { .. }
             | Self::DepositInitiated { .. }
@@ -4382,8 +4388,11 @@ impl EventSourced for UsdcRebalance {
                         reconciled_at: *reconciled_at,
                     },
 
-                    // A Relay refund at the hub the operator moved on.
-                    Self::SwapRefunded { .. } if state.is_reconcilable_failure() => {
+                    // A Relay refund at the hub the operator moved on, or a
+                    // redeposit the operator settled by hand.
+                    Self::SwapRefunded { .. } | Self::Redepositing { .. }
+                        if state.is_reconcilable_failure() =>
+                    {
                         Self::Reconciled {
                             direction: *direction,
                             corridor: state.corridor(),
@@ -6477,6 +6486,12 @@ impl UsdcRebalance {
                 amount,
                 initiated_at,
                 ..
+            }
+            | Self::Redepositing {
+                direction,
+                amount,
+                initiated_at,
+                ..
             } if self.is_reconcilable_failure() => (*direction, *amount, *initiated_at),
             Self::Bridged {
                 direction,
@@ -7349,6 +7364,10 @@ mod tests {
             }
         );
         assert!(redepositing.holds_rebalance_guard());
+        assert!(
+            redepositing.is_reconcilable_failure(),
+            "a redeposit that does not confirm is settled by hand and reconciled"
+        );
 
         let error = TestHarness::<UsdcRebalance>::with(())
             .given(history.clone())
@@ -7649,6 +7668,7 @@ mod tests {
                     && history.iter().any(|event| matches!(
                         event,
                         UsdcRebalanceEvent::SwapFailed { .. }
+                            | UsdcRebalanceEvent::RedepositStarted { .. }
                             | UsdcRebalanceEvent::SwapRefunded {
                                 side: RefundSide::Destination,
                                 ..

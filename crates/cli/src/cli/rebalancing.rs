@@ -2701,6 +2701,12 @@ mod tests {
                     "0x0000000000000000000000000000000000000000000000000000000000000002"
                 ),
             },
+            UsdcTransferError::SwapPaymentUnverified {
+                id: id.clone(),
+                source: Box::new(st0x_bridge::relay::RelayBridgeError::TxNotFound {
+                    tx: b256!("0x0000000000000000000000000000000000000000000000000000000000000003"),
+                }),
+            },
             UsdcTransferError::WithdrawalPollInconclusive {
                 id,
                 initiated_at: chrono::Utc::now(),
