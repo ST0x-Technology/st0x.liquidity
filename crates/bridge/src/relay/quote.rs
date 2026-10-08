@@ -1073,6 +1073,133 @@ mod decimal {
     }
 }
 
+/// What an in-process stand-in for Relay's quote endpoint answers with.
+#[cfg(any(test, feature = "mock"))]
+#[derive(Debug, Clone, Copy)]
+pub struct TestQuote {
+    pub request_id: B256,
+    pub expected_out: U256,
+    pub minimum_out: U256,
+    /// Makes the order, and so its id, distinct from another one.
+    pub salt: B256,
+    /// Seconds from the Unix epoch until the solver may still fill.
+    pub deadline: u32,
+}
+
+/// Why [`quote_body_for_test`] could not build a quote body.
+#[cfg(any(test, feature = "mock"))]
+#[derive(Debug, thiserror::Error)]
+pub enum TestQuoteError {
+    #[error("no pinned Relay quote from {origin} to {destination}")]
+    NoFixture { origin: Chain, destination: Chain },
+    #[error("{origin} has no pinned Relay depository")]
+    NoDepository { origin: Chain },
+    #[error("the pinned quote has no {0}")]
+    Shape(&'static str),
+    #[error(transparent)]
+    Json(#[from] serde_json::Error),
+    #[error(transparent)]
+    Order(#[from] QuoteMismatch),
+}
+
+/// A quote body for `request` as Relay's API answers it, for tests that
+/// serve that API in process.
+///
+/// Built from the pinned live quote of the same direction: the request's
+/// addresses and amount, `quote`'s amounts, deadline, salt and request id,
+/// the approve and deposit calldata, and the order id its order data commits
+/// to.
+#[cfg(any(test, feature = "mock"))]
+pub fn quote_body_for_test(
+    request: &QuoteRequest,
+    quote: TestQuote,
+) -> Result<serde_json::Value, TestQuoteError> {
+    use serde_json::{Value, json};
+
+    let fixture = match (request.origin, request.destination) {
+        (Chain::Robinhood, Chain::Ethereum) => {
+            include_str!("../../relay-fixtures/quote_funded_robinhood_to_ethereum.json")
+        }
+        (Chain::Ethereum, Chain::Robinhood) => {
+            include_str!("../../relay-fixtures/quote_ethereum_to_robinhood.json")
+        }
+        (origin, destination) => {
+            return Err(TestQuoteError::NoFixture {
+                origin,
+                destination,
+            });
+        }
+    };
+    let mut body: Value = serde_json::from_str(fixture)?;
+
+    let origin_stable = request.origin.settlement_stable().address;
+    let depository = request
+        .origin
+        .relay_depository()
+        .ok_or(TestQuoteError::NoDepository {
+            origin: request.origin,
+        })?;
+    let amount = request.amount.to_string();
+    let relayer_fee = request.amount.saturating_sub(quote.expected_out);
+
+    body["requestId"] = json!(quote.request_id);
+    body["details"]["sender"] = json!(request.user);
+    body["details"]["recipient"] = json!(request.recipient);
+    body["details"]["currencyIn"]["amount"] = json!(amount);
+    body["details"]["currencyIn"]["minimumAmount"] = json!(amount);
+    body["details"]["currencyOut"]["amount"] = json!(quote.expected_out.to_string());
+    body["details"]["currencyOut"]["minimumAmount"] = json!(quote.minimum_out.to_string());
+    body["fees"]["relayer"]["amount"] = json!(relayer_fee.to_string());
+    body["fees"]["relayer"]["minimumAmount"] = json!(relayer_fee.to_string());
+
+    let order = &mut body["protocol"]["v2"]["orderData"];
+    order["salt"] = json!(quote.salt);
+    order["inputs"][0]["payment"]["amount"] = json!(amount);
+    for refund in order["inputs"][0]["refunds"]
+        .as_array_mut()
+        .ok_or(TestQuoteError::Shape("refund option"))?
+    {
+        refund["recipient"] = json!(request.refund_to);
+        refund["deadline"] = json!(quote.deadline);
+    }
+    let payment = &mut order["output"]["payments"][0];
+    payment["recipient"] = json!(request.recipient);
+    payment["expectedAmount"] = json!(quote.expected_out.to_string());
+    payment["minimumAmount"] = json!(quote.minimum_out.to_string());
+    order["output"]["deadline"] = json!(quote.deadline);
+
+    let RelayOrderId(order_id) = derive_order_id(&serde_json::from_value(order.clone())?)?;
+    body["protocol"]["v2"]["orderId"] = json!(order_id);
+    body["protocol"]["v2"]["paymentDetails"]["amount"] = json!(amount);
+
+    let approve = approveCall {
+        spender: depository,
+        amount: request.amount,
+    }
+    .abi_encode();
+    let deposit = depositErc20Call {
+        depositor: request.user,
+        token: origin_stable,
+        amount: request.amount,
+        id: order_id,
+    }
+    .abi_encode();
+    for step in body["steps"]
+        .as_array_mut()
+        .ok_or(TestQuoteError::Shape("step"))?
+    {
+        let calldata = match step["id"].as_str() {
+            Some("approve") => &approve,
+            Some("deposit") => &deposit,
+            _ => return Err(TestQuoteError::Shape("approve or deposit step")),
+        };
+        step["items"][0]["data"]["data"] = json!(Bytes::copy_from_slice(calldata));
+        step["items"][0]["data"]["from"] = json!(request.user);
+    }
+
+    Ok(body)
+}
+
 #[cfg(test)]
 pub(super) mod tests {
     use alloy::primitives::{address, b256};
@@ -1290,6 +1417,47 @@ pub(super) mod tests {
             assert_eq!(quote.order_id, RelayOrderId(order_id));
             assert_eq!(quote.amounts.expected_out, U256::from(expected_out));
             assert_eq!(quote.amounts.minimum_out, U256::from(minimum_out));
+        }
+    }
+
+    /// A quote body built for an in-process test passes every check the
+    /// client runs, in both directions, and commits to a fresh order id.
+    #[test]
+    fn built_test_quote_validates_both_ways() {
+        let wallet = address!("0x2222222222222222222222222222222222222222");
+        for (origin, destination) in [
+            (Chain::Robinhood, Chain::Ethereum),
+            (Chain::Ethereum, Chain::Robinhood),
+        ] {
+            let request = QuoteRequest {
+                origin,
+                destination,
+                amount: U256::from(100_000_000),
+                user: wallet,
+                recipient: wallet,
+                refund_to: wallet,
+                slippage: BasisPoints::new(30).unwrap(),
+                ttl: Duration::from_secs(1800),
+            };
+            let body = quote_body_for_test(
+                &request,
+                TestQuote {
+                    request_id: B256::repeat_byte(0x5e),
+                    expected_out: U256::from(99_900_000),
+                    minimum_out: U256::from(99_700_000),
+                    salt: B256::repeat_byte(0x01),
+                    deadline: 2_000_000_000,
+                },
+            )
+            .unwrap();
+
+            let quote = validate(&body, &request).unwrap();
+
+            assert_eq!(quote.request_id, RelayRequestId(B256::repeat_byte(0x5e)));
+            assert_eq!(quote.amounts.amount_in, U256::from(100_000_000));
+            assert_eq!(quote.amounts.expected_out, U256::from(99_900_000));
+            assert_eq!(quote.amounts.minimum_out, U256::from(99_700_000));
+            assert_eq!(quote.fees.relayer, U256::from(100_000));
         }
     }
 

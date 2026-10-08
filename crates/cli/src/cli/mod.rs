@@ -8,6 +8,7 @@ mod cctp;
 mod dividend;
 mod overnight;
 mod rebalancing;
+mod relay;
 mod repair;
 mod token_list;
 mod trading;
@@ -2430,6 +2431,23 @@ mod tests {
             }
             other => panic!("expected asset command, got: {other:?}"),
         }
+    }
+
+    /// `relay status <request_id>` parses the request id and runs as a simple
+    /// command: it needs neither the broker nor a wallet.
+    #[test]
+    fn relay_status_command_parses_and_classifies_as_simple() {
+        let request_id = B256::repeat_byte(0x5e);
+        let cli =
+            Cli::try_parse_from(["st0x-cli", "relay", "status", &request_id.to_string()]).unwrap();
+
+        let Ok(CommandRoute::Simple(SimpleCommand::RelayStatus {
+            request_id: classified,
+        })) = classify_command(cli.command)
+        else {
+            panic!("expected relay status to classify as a simple command");
+        };
+        assert_eq!(classified, request_id);
     }
 
     #[test]

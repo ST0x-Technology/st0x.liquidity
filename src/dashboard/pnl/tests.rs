@@ -51,7 +51,9 @@ use crate::portfolio_snapshot::EtDayRange;
 use crate::position::{Position, PositionEvent, TradeId};
 use crate::test_utils::{persist_event, setup_test_db};
 use crate::tokenized_equity_mint::{TokenizedEquityMint, TokenizedEquityMintEvent};
-use crate::usdc_rebalance::{UsdcRebalance, UsdcRebalanceEvent, UsdcRebalanceId};
+use crate::usdc_rebalance::{
+    RefundSide, SwapRecovery, UsdcRebalance, UsdcRebalanceEvent, UsdcRebalanceId,
+};
 
 fn seed_rebalance(fee: &str, timestamp: &str) -> SeedEvent {
     SeedEvent::Rebalance(
@@ -1380,6 +1382,57 @@ async fn relay_costs_reach_the_report_from_persisted_events() {
     assert_eq!(
         (relay.effect, relay.status, relay.amount_usd.as_str()),
         ("cost", "included", "0.7")
+    );
+}
+
+/// A late Relay fill adopted after the transfer stopped waiting books its
+/// relayer fee and swap cost as a first-time fill does; a late refund books
+/// nothing.
+#[tokio::test]
+async fn late_relay_fill_books_its_costs_and_a_late_refund_none() {
+    let late_fill = UsdcRebalanceEvent::SwapCompletionRecovered {
+        order_id: B256::random(),
+        deposit_tx: TxHash::random(),
+        payment: SwapRecovery::Fill {
+            fill_tx: TxHash::random(),
+            amount_received: Usdc::new(float!(99.5)),
+            fee_collected: Usdc::new(float!(0.5)),
+            relayer_fee: Usdc::new(float!(0.3)),
+        },
+        recovered_at: parse_timestamp("2026-05-15T12:01:00Z").unwrap(),
+    };
+    let late_refund = UsdcRebalanceEvent::SwapCompletionRecovered {
+        order_id: B256::random(),
+        deposit_tx: TxHash::random(),
+        payment: SwapRecovery::Refund {
+            refund_tx: TxHash::random(),
+            side: RefundSide::Origin,
+            amount_refunded: Usdc::new(float!(99)),
+        },
+        recovered_at: parse_timestamp("2026-05-15T12:02:00Z").unwrap(),
+    };
+    let pool = pnl_test_pool(
+        vec![
+            SeedEvent::Rebalance(UsdcRebalanceId(Uuid::new_v4()).to_string(), late_fill),
+            SeedEvent::Rebalance(UsdcRebalanceId(Uuid::new_v4()).to_string(), late_refund),
+        ],
+        position_rows(),
+    )
+    .await;
+
+    let report = build_pnl_report(&pool, &query(), Vec::new(), Utc::now())
+        .await
+        .unwrap();
+
+    let mut entries = report
+        .cost_entries
+        .iter()
+        .map(|entry| (entry.category, entry.effect, entry.amount_usd.as_str()))
+        .collect::<Vec<_>>();
+    entries.sort_unstable();
+    assert_eq!(
+        entries,
+        vec![("relay_fee", "cost", "0.3"), ("relay_swap", "cost", "0.2")]
     );
 }
 

@@ -7645,6 +7645,326 @@ mod tests {
         assert_eq!(*deposit_reverts, 1);
     }
 
+    /// A transfer whose deposit for order 0x0a reverted, re-quoted as 0x0b.
+    fn reverted_and_requoted(direction: RebalanceDirection) -> Vec<UsdcRebalanceEvent> {
+        [
+            prepared_pair(direction),
+            vec![
+                UsdcRebalanceEvent::SwapDepositReverted {
+                    deposit_tx: TxHash::repeat_byte(0xa2),
+                    reverted_at: Utc::now(),
+                },
+                UsdcRebalanceEvent::SwapRequoted {
+                    quote: Box::new(hundred_usdc_quote(0x0b)),
+                    quoted_at: Utc::now(),
+                },
+            ],
+        ]
+        .concat()
+    }
+
+    /// A reverted deposit's quote stays watched through the re-quote and the
+    /// next pair, its order id among the signed ones, until a payment of it
+    /// is adopted.
+    #[test]
+    fn reverted_quote_is_watched_through_the_swap_states() {
+        let requoted = reverted_and_requoted(RebalanceDirection::AlpacaToBase);
+        let state = replay::<UsdcRebalance>(requoted.clone()).unwrap().unwrap();
+        let UsdcRebalance::SwapQuoted {
+            quote,
+            reverted_quotes,
+            signed_order_ids,
+            ..
+        } = &state
+        else {
+            panic!("expected SwapQuoted, got {state:?}");
+        };
+        assert_eq!(quote.order_id, B256::repeat_byte(0x0b));
+        assert_eq!(*reverted_quotes, vec![hundred_usdc_quote(0x0a)]);
+        assert_eq!(*signed_order_ids, vec![B256::repeat_byte(0x0a)]);
+
+        let deposited = [
+            requoted,
+            vec![
+                UsdcRebalanceEvent::SwapDepositPrepared {
+                    approve: None,
+                    deposit: PreparedTransaction::for_test(TxHash::repeat_byte(0xb2), 7),
+                    prepared_at: Utc::now(),
+                },
+                UsdcRebalanceEvent::SwapDeposited {
+                    deposit_tx: TxHash::repeat_byte(0xb2),
+                    deposit_block: 10,
+                    deposited_at: Utc::now(),
+                },
+                UsdcRebalanceEvent::SwapFailed {
+                    reason: "Relay reported Failure".to_string(),
+                    failed_at: Utc::now(),
+                },
+            ],
+        ]
+        .concat();
+        let state = replay::<UsdcRebalance>(deposited).unwrap().unwrap();
+        let UsdcRebalance::SwapFailed {
+            quote,
+            reverted_quotes,
+            signed_order_ids,
+            ..
+        } = &state
+        else {
+            panic!("expected SwapFailed, got {state:?}");
+        };
+        assert_eq!(quote.order_id, B256::repeat_byte(0x0b), "the failed order");
+        assert_eq!(*reverted_quotes, vec![hundred_usdc_quote(0x0a)]);
+        assert_eq!(
+            *signed_order_ids,
+            vec![B256::repeat_byte(0x0a), B256::repeat_byte(0x0b)]
+        );
+    }
+
+    /// A late fill of a reverted order, found on chain from `SwapQuoted`,
+    /// enters `Bridged` with that order's deposit as its evidence; a refund
+    /// of it enters `SwapRefunded` on its quote and leaves the watch list.
+    /// An order that is not a reverted one, or a fill below its floor, is
+    /// refused.
+    #[tokio::test]
+    async fn late_payment_of_a_reverted_order_is_recovered_from_swap_quoted() {
+        let requoted = reverted_and_requoted(RebalanceDirection::AlpacaToBase);
+        let late_deposit = TxHash::repeat_byte(0xc2);
+
+        let events = TestHarness::<UsdcRebalance>::with(())
+            .given(requoted.clone())
+            .when(UsdcRebalanceCommand::RecoverSwapCompletion {
+                order_id: B256::repeat_byte(0x0a),
+                deposit_tx: late_deposit,
+                payment: RecoveredSwapPayment::Fill {
+                    fill_tx: TxHash::repeat_byte(0xf1),
+                    amount_received: U256::from(100_000_000u64),
+                },
+            })
+            .await
+            .events();
+        let state = replay::<UsdcRebalance>([requoted.clone(), events].concat())
+            .unwrap()
+            .unwrap();
+        let UsdcRebalance::Bridged {
+            hop,
+            amount_received,
+            ..
+        } = &state
+        else {
+            panic!("expected Bridged, got {state:?}");
+        };
+        assert_eq!(
+            *hop,
+            HopEvidence::Relay {
+                deposit_tx: late_deposit,
+                fill_tx: TxHash::repeat_byte(0xf1),
+                deposit_id: B256::repeat_byte(0x0a),
+            }
+        );
+        assert_eq!(*amount_received, Usdc::new(float!(100)));
+        assert!(state.holds_rebalance_guard());
+
+        let events = TestHarness::<UsdcRebalance>::with(())
+            .given(requoted.clone())
+            .when(UsdcRebalanceCommand::RecoverSwapCompletion {
+                order_id: B256::repeat_byte(0x0a),
+                deposit_tx: late_deposit,
+                payment: RecoveredSwapPayment::Refund {
+                    refund_tx: TxHash::repeat_byte(0xe1),
+                    side: RefundSide::Origin,
+                    amount_refunded: U256::from(99_000_000u64),
+                },
+            })
+            .await
+            .events();
+        let state = replay::<UsdcRebalance>([requoted.clone(), events].concat())
+            .unwrap()
+            .unwrap();
+        let UsdcRebalance::SwapRefunded {
+            quote,
+            deposit_tx,
+            reverted_quotes,
+            signed_order_ids,
+            amount_refunded,
+            ..
+        } = &state
+        else {
+            panic!("expected SwapRefunded, got {state:?}");
+        };
+        assert_eq!(quote.order_id, B256::repeat_byte(0x0a));
+        assert_eq!(*deposit_tx, late_deposit);
+        assert_eq!(
+            *reverted_quotes,
+            Vec::new(),
+            "the adopted order leaves the watch"
+        );
+        assert_eq!(*signed_order_ids, vec![B256::repeat_byte(0x0a)]);
+        assert_eq!(*amount_refunded, Usdc::new(float!(99)));
+
+        for (command, refused) in [
+            (
+                UsdcRebalanceCommand::RecoverSwapCompletion {
+                    order_id: B256::repeat_byte(0x0b),
+                    deposit_tx: late_deposit,
+                    payment: RecoveredSwapPayment::Fill {
+                        fill_tx: TxHash::repeat_byte(0xf1),
+                        amount_received: U256::from(100_000_000u64),
+                    },
+                },
+                "the current order was never deposited",
+            ),
+            (
+                UsdcRebalanceCommand::RecoverSwapCompletion {
+                    order_id: B256::repeat_byte(0x0a),
+                    deposit_tx: late_deposit,
+                    payment: RecoveredSwapPayment::Fill {
+                        fill_tx: TxHash::repeat_byte(0xf1),
+                        amount_received: U256::from(1u64),
+                    },
+                },
+                "below the floor",
+            ),
+        ] {
+            let error = TestHarness::<UsdcRebalance>::with(())
+                .given(requoted.clone())
+                .when(command)
+                .await
+                .then_expect_error();
+            assert!(
+                matches!(
+                    error,
+                    LifecycleError::Apply(
+                        UsdcRebalanceError::SwapOrderNotRecoverable { .. }
+                            | UsdcRebalanceError::SwapFillBelowMinimum { .. }
+                    )
+                ),
+                "{refused}: got {error:?}"
+            );
+        }
+    }
+
+    /// A late fill of the order Relay failed is adopted from `SwapFailed`,
+    /// which then moves on as any `Bridged`; a state with no failed or
+    /// reverted order refuses it.
+    #[tokio::test]
+    async fn failed_order_adopts_a_late_fill() {
+        let failed = [
+            deposited(RebalanceDirection::AlpacaToBase),
+            vec![UsdcRebalanceEvent::SwapFailed {
+                reason: "Relay reported Failure".to_string(),
+                failed_at: Utc::now(),
+            }],
+        ]
+        .concat();
+        let fill = UsdcRebalanceCommand::RecoverSwapCompletion {
+            order_id: B256::repeat_byte(0x0a),
+            deposit_tx: TxHash::repeat_byte(0xa2),
+            payment: RecoveredSwapPayment::Fill {
+                fill_tx: TxHash::repeat_byte(0xf1),
+                amount_received: U256::from(100_000_000u64),
+            },
+        };
+
+        let events = TestHarness::<UsdcRebalance>::with(())
+            .given(failed.clone())
+            .when(fill.clone())
+            .await
+            .events();
+        let state = replay::<UsdcRebalance>([failed, events].concat())
+            .unwrap()
+            .unwrap();
+        assert_eq!(state.state_name(), "Bridged");
+        assert_eq!(
+            state.direction(),
+            RebalanceDirection::AlpacaToBase,
+            "{state:?}"
+        );
+
+        let error = TestHarness::<UsdcRebalance>::with(())
+            .given(deposited(RebalanceDirection::AlpacaToBase))
+            .when(fill)
+            .await
+            .then_expect_error();
+        assert!(
+            matches!(
+                error,
+                LifecycleError::Apply(UsdcRebalanceError::InvalidCommand { .. })
+            ),
+            "got {error:?}"
+        );
+    }
+
+    /// Startup re-arms the job of every Relay state a resume moves on, in
+    /// either direction, and leaves the operator's holds alone.
+    #[test]
+    fn relay_states_a_resume_moves_on_are_resumable_at_startup() {
+        for direction in [
+            RebalanceDirection::BaseToAlpaca,
+            RebalanceDirection::AlpacaToBase,
+        ] {
+            let withdrawn = withdrawn(direction, ROBINHOOD_RELAY);
+            let refunded = |side| {
+                [
+                    deposited(direction),
+                    vec![UsdcRebalanceEvent::SwapRefunded {
+                        refund_tx: TxHash::repeat_byte(0xe1),
+                        side,
+                        amount_refunded: Usdc::new(float!(99)),
+                        refunded_at: Utc::now(),
+                    }],
+                ]
+                .concat()
+            };
+            let unresolved = [
+                deposited(direction),
+                vec![UsdcRebalanceEvent::SwapEscrowUnresolved {
+                    unresolved_at: Utc::now(),
+                }],
+            ]
+            .concat();
+            let failed = [
+                deposited(direction),
+                vec![UsdcRebalanceEvent::SwapFailed {
+                    reason: "Relay reported Failure".to_string(),
+                    failed_at: Utc::now(),
+                }],
+            ]
+            .concat();
+
+            for (events, resumable) in [
+                (withdrawn, true),
+                (quoted(direction), true),
+                (prepared_pair(direction), true),
+                (deposited(direction), true),
+                (refunded(RefundSide::Origin), true),
+                (unresolved, true),
+                (refunded(RefundSide::Destination), false),
+                (failed, false),
+            ] {
+                let state = replay::<UsdcRebalance>(events).unwrap().unwrap();
+                assert_eq!(
+                    state.is_resumable_mid_flight_data(),
+                    resumable.then(|| (direction, state.amount())),
+                    "{direction:?} {}",
+                    state.state_name()
+                );
+            }
+        }
+
+        let cctp_withdrawn = replay::<UsdcRebalance>(withdrawn(
+            RebalanceDirection::BaseToAlpaca,
+            UsdcCorridor::BASE_CCTP,
+        ))
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            cctp_withdrawn.is_resumable_mid_flight_data(),
+            None,
+            "a CCTP chain-to-Alpaca WithdrawalComplete is not re-armed"
+        );
+    }
+
     /// A redeposit starts only where the stable is in the chain wallet and no
     /// signed deposit can still land, records its vault deposit before the
     /// wait, and its confirmation is the guard-clearing `ReturnedToSource`.

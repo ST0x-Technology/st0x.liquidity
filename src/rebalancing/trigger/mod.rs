@@ -45232,4 +45232,270 @@ mod tests {
             );
         }
     }
+
+    /// A trigger that serves the Robinhood Relay corridor.
+    async fn relay_trigger() -> Arc<RebalancingService> {
+        let config = RebalancingServiceConfig {
+            usdc: UsdcCorridors::for_test(
+                OperationMode::Enabled,
+                [active_corridor(Chain::Robinhood, HopKind::Relay)],
+            )
+            .with_relay_hop(Chain::Robinhood, relay_bounds(500, 50_000)),
+            ..with_cash_on(test_config(), &[Chain::Robinhood])
+        };
+        make_trigger_with_inventory_config(InventoryView::default(), config).await
+    }
+
+    /// Commands recording a Relay transfer of 100 up to its withdrawal.
+    fn relay_withdrawn(direction: RebalanceDirection) -> Vec<UsdcRebalanceCommand> {
+        let withdrawal = match direction {
+            RebalanceDirection::BaseToAlpaca => TransferRef::OnchainTx(TxHash::repeat_byte(0x77)),
+            RebalanceDirection::AlpacaToBase => {
+                TransferRef::AlpacaId(AlpacaTransferId::from(Uuid::new_v4()))
+            }
+        };
+        vec![
+            UsdcRebalanceCommand::Initiate {
+                corridor: ROBINHOOD_RELAY,
+                direction,
+                amount: usdc(100),
+                withdrawal,
+            },
+            UsdcRebalanceCommand::ConfirmWithdrawal {
+                withdrawal_tx: Some(TxHash::repeat_byte(0x78)),
+            },
+        ]
+    }
+
+    /// The job startup re-armed for `id`, from the queue of `direction`.
+    async fn rearmed_relay_job(
+        trigger: &RebalancingService,
+        direction: RebalanceDirection,
+    ) -> (UsdcRebalanceId, UsdcCorridor) {
+        match direction {
+            RebalanceDirection::BaseToAlpaca => {
+                assert_eq!(
+                    count_pending_transfer_usdc_to_hedging_jobs(trigger).await,
+                    1
+                );
+                let job = pending_transfer_usdc_to_hedging_job(trigger).await;
+                (job.id, job.corridor)
+            }
+            RebalanceDirection::AlpacaToBase => {
+                assert_eq!(
+                    count_pending_transfer_usdc_to_market_making_jobs(trigger).await,
+                    1
+                );
+                let job = pending_transfer_usdc_to_market_making_job(trigger).await;
+                (job.id, job.corridor)
+            }
+        }
+    }
+
+    /// A Relay transfer stopped at `WithdrawalComplete` with no job row is
+    /// re-armed at startup in either direction, on its Relay corridor: the
+    /// job routes to the Relay service, whose resume takes the binding quote
+    /// and never a CCTP burn.
+    #[tokio::test]
+    async fn restart_in_withdrawal_complete_routes_to_relay_hop() {
+        for direction in [
+            RebalanceDirection::BaseToAlpaca,
+            RebalanceDirection::AlpacaToBase,
+        ] {
+            let pool = crate::test_utils::setup_test_db().await;
+            let store = test_store::<UsdcRebalance>(pool.clone(), ());
+            let id = UsdcRebalanceId(Uuid::new_v4());
+            for command in relay_withdrawn(direction) {
+                store.send(&id, command).await.unwrap();
+            }
+            let trigger = relay_trigger().await;
+
+            trigger.recover_usdc_guard(&pool, &store).await.unwrap();
+
+            assert_eq!(
+                rearmed_relay_job(&trigger, direction).await,
+                (id.clone(), ROBINHOOD_RELAY),
+                "{direction:?}"
+            );
+            assert!(trigger.usdc_guards.is_held(Chain::Robinhood));
+        }
+    }
+
+    /// Every Relay swap state a resume moves on is re-armed at startup when
+    /// its job is lost, even past a terminal job row; a refund paid at the
+    /// other end and a Relay failure stay held for the operator.
+    #[tokio::test]
+    async fn recover_usdc_guard_rearms_every_relay_swap_state() {
+        let quote = UsdcRebalanceCommand::QuoteSwap {
+            quote: Box::new(swap_quote_for_test(
+                U256::from(100_000_000u64),
+                B256::repeat_byte(0x0d),
+            )),
+        };
+        let prepare = UsdcRebalanceCommand::PrepareSwapDeposit {
+            approve: None,
+            deposit: PreparedTransaction::for_test(TxHash::repeat_byte(0xa2), 6),
+        };
+        let confirm = UsdcRebalanceCommand::ConfirmSwapDeposit {
+            deposit_tx: TxHash::repeat_byte(0xa2),
+            deposit_block: 9,
+        };
+        let refund = |side| UsdcRebalanceCommand::RecordSwapRefund {
+            refund_tx: TxHash::repeat_byte(0xe1),
+            side,
+            amount_refunded: U256::from(99_000_000u64),
+        };
+        let fail = UsdcRebalanceCommand::FailSwap {
+            reason: "Relay reported Failure".to_string(),
+        };
+
+        for direction in [
+            RebalanceDirection::BaseToAlpaca,
+            RebalanceDirection::AlpacaToBase,
+        ] {
+            for (tail, expected, rearmed) in [
+                (vec![quote.clone()], "SwapQuoted", true),
+                (
+                    vec![quote.clone(), prepare.clone()],
+                    "SwapDepositPrepared",
+                    true,
+                ),
+                (
+                    vec![quote.clone(), prepare.clone(), confirm.clone()],
+                    "SwapDeposited",
+                    true,
+                ),
+                (
+                    vec![
+                        quote.clone(),
+                        prepare.clone(),
+                        confirm.clone(),
+                        refund(RefundSide::Origin),
+                    ],
+                    "SwapRefunded",
+                    true,
+                ),
+                (
+                    vec![
+                        quote.clone(),
+                        prepare.clone(),
+                        confirm.clone(),
+                        UsdcRebalanceCommand::RecordSwapEscrowUnresolved,
+                    ],
+                    "SwapEscrowUnresolved",
+                    true,
+                ),
+                (
+                    vec![
+                        quote.clone(),
+                        prepare.clone(),
+                        confirm.clone(),
+                        refund(RefundSide::Destination),
+                    ],
+                    "SwapRefunded",
+                    false,
+                ),
+                (
+                    vec![
+                        quote.clone(),
+                        prepare.clone(),
+                        confirm.clone(),
+                        fail.clone(),
+                    ],
+                    "SwapFailed",
+                    false,
+                ),
+            ] {
+                let pool = crate::test_utils::setup_test_db().await;
+                let store = test_store::<UsdcRebalance>(pool.clone(), ());
+                let id = UsdcRebalanceId(Uuid::new_v4());
+                for command in relay_withdrawn(direction).into_iter().chain(tail) {
+                    store.send(&id, command).await.unwrap();
+                }
+                assert_eq!(
+                    store.load(&id).await.unwrap().unwrap().state_name(),
+                    expected
+                );
+                let trigger = relay_trigger().await;
+                // The job that drove it ran out of retries: a terminal row
+                // does not keep a Relay transfer from its re-arm.
+                push_terminal_relay_job_row(&trigger, &id, direction).await;
+
+                trigger.recover_usdc_guard(&pool, &store).await.unwrap();
+
+                let pending = match direction {
+                    RebalanceDirection::BaseToAlpaca => {
+                        count_pending_transfer_usdc_to_hedging_jobs(&trigger).await
+                    }
+                    RebalanceDirection::AlpacaToBase => {
+                        count_pending_transfer_usdc_to_market_making_jobs(&trigger).await
+                    }
+                };
+                assert_eq!(
+                    pending,
+                    i64::from(rearmed),
+                    "{direction:?} {expected}: re-armed {rearmed}"
+                );
+                if rearmed {
+                    assert_eq!(
+                        rearmed_relay_job(&trigger, direction).await,
+                        (id.clone(), ROBINHOOD_RELAY)
+                    );
+                }
+                assert!(
+                    trigger.usdc_guards.is_held(Chain::Robinhood),
+                    "{direction:?} {expected}: the guard stays held"
+                );
+            }
+        }
+    }
+
+    /// Pushes a job row for `id` and marks it failed with its retries spent.
+    async fn push_terminal_relay_job_row(
+        trigger: &RebalancingService,
+        id: &UsdcRebalanceId,
+        direction: RebalanceDirection,
+    ) {
+        let job_type = match direction {
+            RebalanceDirection::BaseToAlpaca => {
+                trigger
+                    .transfer_usdc_to_hedging_queue
+                    .clone()
+                    .push(TransferUsdcToHedging {
+                        corridor: ROBINHOOD_RELAY,
+                        id: id.clone(),
+                        amount: usdc(100),
+                        revert_redrive_attempts: 0,
+                        backpressure_streak: BackpressureStreak::default(),
+                    })
+                    .await
+                    .unwrap();
+                std::any::type_name::<TransferUsdcToHedging>()
+            }
+            RebalanceDirection::AlpacaToBase => {
+                trigger
+                    .transfer_usdc_to_market_making_queue
+                    .clone()
+                    .push(TransferUsdcToMarketMaking {
+                        corridor: ROBINHOOD_RELAY,
+                        id: id.clone(),
+                        amount: usdc(100),
+                        revert_redrive_attempts: 0,
+                        backpressure_streak: BackpressureStreak::default(),
+                    })
+                    .await
+                    .unwrap();
+                std::any::type_name::<TransferUsdcToMarketMaking>()
+            }
+        };
+        sqlx_apalis::query(
+            "UPDATE Jobs SET status = 'Failed', attempts = max_attempts, \
+             done_at = strftime('%s','now') \
+             WHERE job_type = ?",
+        )
+        .bind(job_type)
+        .execute(trigger.transfer_usdc_to_market_making_queue.pool())
+        .await
+        .unwrap();
+    }
 }
