@@ -4779,10 +4779,9 @@ failure:
    `RelayFillPending`, and the job queues the next attempt after 5 s for the
    first minute after the deposit and 30 s after that. Past the window, a fill
    or refund Relay names but the chain still does not show is paged and read
-   again every 30 minutes, as an unproven one is (step 7). A `failure` with
-   `DEPOSIT_REORGED` is not terminal either: the deposit may be included again
-   and filled or refunded, so the attempt waits as for any status that is not
-   terminal, and past the window the escrow holds unresolved (step 8).
+   again every 30 minutes, as an unproven one is (step 7). Within the window a
+   `failure` with `DEPOSIT_REORGED` waits as well, as the deposit may be
+   included again; past it, it is a failure (step 8).
 7. A `success` is adopted only once `verify_fill` proves its one fill tx on the
    destination chain (see `docs/relay.md`, Proofs): `ConfirmSwapFill` ->
    `RelayFillVerified` -> `Bridged` with `HopEvidence::Relay`, its
@@ -4924,11 +4923,14 @@ signing a second deposit while an earlier one may still land:
 - **Late adoption.** `SwapCompletionRecovered` adopts a proven late payment of a
   signed order: from `SwapQuoted`, a reverted order whose deposit the scan
   found, which leaves `reverted_quotes`; from `SwapFailed`, through
-  `transfer recheck`, the failed order itself. A fill continues as any
-  `Bridged`; a refund continues as any `SwapRefunded` of that order
-  (redeposited, re-quoted or held). Approves that went out alone are sent again
-  before a `SwapQuoted` adopts one. Superseding an order adds its id to
-  `signed_order_ids` and never drops one.
+  `transfer recheck`, the failed order itself, keeping the reverted quotes
+  watched. A fill continues as any `Bridged`; a refund continues as any
+  `SwapRefunded` of that order (redeposited, re-quoted or held).
+  `transfer
+  recheck` of an unresolved escrow records a proven payment of its
+  deposited order with `ConfirmSwapFill` or `RecordSwapRefund`. Approves that
+  went out alone are sent again before a `SwapQuoted` adopts one. Superseding an
+  order adds its id to `signed_order_ids` and never drops one.
 
 ##### Crash-safe resume
 
@@ -7504,18 +7506,19 @@ named exemptions defined after the list:**
   the USDC->USD conversion to the normal terminal -- clearing the stranded
   in-progress guard through the live reactor. On a Relay corridor `recheck`
   reads a held escrow again instead (`SwapEscrowUnresolved`, `SwapFailed`): the
-  status of the transfer's deposited order (see "Relay recovery"), adopting a
-  fill or refund that proves on chain (`recovered`), recording a failure Relay
-  reports for an unresolved escrow (`not_recoverable`), and changing nothing
-  otherwise (`left_unchanged`); it refuses a `--deposit-tx` and every other
-  Relay state. A transfer Alpaca still reports pending or failed refuses without
-  touching the aggregate. A send tx that is absent from Alpaca's account-wide
-  transfer list is a separate, INCONCLUSIVE result: the list may be capped, so
-  absence is not proof the deposit never settled. The recheck reports
-  `not_detected_yet`, changes nothing, and the operator retries later. Other
-  USDC states keep their existing paths (`resume` while non-terminal,
-  `reconcile` for funds handled out-of-band rather than settled by the
-  provider). Because the USDC recheck sends from the rebalancing wallet and
+  status of the transfer's deposited or failed order (see "Relay recovery"),
+  adopting a fill or refund that proves on chain (`recovered`) and changing
+  nothing otherwise (`left_unchanged`); it refuses a `--deposit-tx` and every
+  other Relay state. It does not move an adopted payment on: the escrow's job
+  does at its next read, and after a `SwapFailed` the operator's
+  `transfer resume --kind usdc` does. A transfer Alpaca still reports pending or
+  failed refuses without touching the aggregate. A send tx that is absent from
+  Alpaca's account-wide transfer list is a separate, INCONCLUSIVE result: the
+  list may be capped, so absence is not proof the deposit never settled. The
+  recheck reports `not_detected_yet`, changes nothing, and the operator retries
+  later. Other USDC states keep their existing paths (`resume` while
+  non-terminal, `reconcile` for funds handled out-of-band rather than settled by
+  the provider). Because the USDC recheck sends from the rebalancing wallet and
   advances the aggregate on the request task, it first quiesces the USDC
   rebalancing driver and holds it paused for the whole recheck, refusing with
   `503` when the driver cannot quiesce (see "Both bot-routed USDC recovery
@@ -7544,9 +7547,9 @@ effect rather than a generic intent:
 - `relay status <request_id>` -- prints Relay's status of one request (the
   `requestId` of a `SwapQuote`) as the bot reads it: the status, its fail and
   refund fail reasons, and every deposit and payment tx Relay lists. It reads
-  the API only, with no wallet, database or bot, so it is named for what it
-  reads like the `cctp` group. A status read is not proof: the bot adopts a
-  payment only once it proves on chain.
+  the API only, with no wallet or bot and no database state (it loads the usual
+  config), so it is named for what it reads like the `cctp` group. A status read
+  is not proof: the bot adopts a payment only once it proves on chain.
 - `position release-hedge` -- release a Position's stuck pending-offchain-order
   pointer so normal hedging can retry; it replaced the removed
   `fail-pending-offchain-order` command. `fail` would be the wrong verb here:
@@ -7556,10 +7559,11 @@ effect rather than a generic intent:
   transaction hash: it witnesses the fill into the `OnChainTrade` log,
   acknowledges it on the `Position`, and places the opposite-side hedge, running
   the same `witness -> enrich -> acknowledge -> mark -> settle` exactly-once
-  sequence as the automated pipeline (see ADR 0005 and ADR 0010). Unlike the two
-  commands above it belongs to no object group -- there is no stuck aggregate to
-  recover, only a missing fill to backfill. Its accounting, execution paths, and
-  hedge placement rules are in the `process-tx` standing rule below.
+  sequence as the automated pipeline (see ADR 0005 and ADR 0010). Unlike the
+  three commands above it belongs to no object group -- there is no stuck
+  aggregate to recover, only a missing fill to backfill. Its accounting,
+  execution paths, and hedge placement rules are in the `process-tx` standing
+  rule below.
 
 **Standing rules:**
 
@@ -7569,11 +7573,12 @@ effect rather than a generic intent:
   bot-routed command (such as `transfer fail` or `transfer resume`) posts to the
   running bot, which drives the same command flow through its reactor-wired
   store. No recovery command writes the `events` table directly on either path.
-  The non-mutating verb `rebuild` and the exempt `cctp` group never touch the
-  events table either: `rebuild` recomputes a read-side projection from the
-  existing event log, and `cctp` commands are pure on-chain operations with no
-  aggregate -- which is precisely why `reconcile` exists to bring the aggregate
-  back in sync after an out-of-band `cctp` action.
+  The non-mutating verb `rebuild` and the exempt `cctp` and `relay` groups never
+  touch the events table either: `rebuild` recomputes a read-side projection
+  from the existing event log, `relay status` only reads Relay's API, and `cctp`
+  commands are pure on-chain operations with no aggregate -- which is precisely
+  why `reconcile` exists to bring the aggregate back in sync after an
+  out-of-band `cctp` action.
 - **`recover` is not a CLI verb.** It historically meant three different things
   (raw mint completion, provider-truth un-failing, and on-chain mint adoption),
   so it carries no information. The raw bridge primitive is named
