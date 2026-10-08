@@ -687,7 +687,9 @@ pub(super) async fn transfer_equity_command<Writer: Write>(
 /// errors (`WithdrawalTxUnderconfirmed`, `WithdrawalScanTransient`,
 /// `SettlementCheckTransient`), a non-backpressure
 /// `WithdrawalPollInconclusive` (Alpaca unreachable),
-/// `MintRecoveryInconclusive`, and `DepositSendReconciliationPending`. The
+/// `MintRecoveryInconclusive`, `DepositSendReconciliationPending`, and the
+/// Relay waits `RelayFillPending`, `SwapDepositReverted` and
+/// `SwapPaymentUnverified`. The
 /// CLI must NOT keep redriving these itself: its process would race the
 /// bot's worker on the same aggregate (the CLI-vs-server race), so the first
 /// such outcome hands the transfer off to the running bot instead. Errors outside this set -- including
@@ -700,7 +702,10 @@ fn is_bot_resumable_wait(error: &UsdcTransferError) -> bool {
         | UsdcTransferError::WithdrawalScanTransient { .. }
         | UsdcTransferError::SettlementCheckTransient { .. }
         | UsdcTransferError::MintRecoveryInconclusive { .. }
-        | UsdcTransferError::DepositSendReconciliationPending { .. } => true,
+        | UsdcTransferError::DepositSendReconciliationPending { .. }
+        | UsdcTransferError::RelayFillPending { .. }
+        | UsdcTransferError::SwapDepositReverted { .. }
+        | UsdcTransferError::SwapPaymentUnverified { .. } => true,
         UsdcTransferError::WithdrawalPollInconclusive { source, .. } => {
             source.backpressure().is_none()
         }
@@ -1175,6 +1180,11 @@ fn classify_fail_bridging_reload(state: Option<&UsdcRebalance>) -> FailBridgingO
             | UsdcRebalance::SwapQuoted { .. }
             | UsdcRebalance::SwapDepositPrepared { .. }
             | UsdcRebalance::SwapDeposited { .. }
+            | UsdcRebalance::SwapRefunded { .. }
+            | UsdcRebalance::SwapEscrowUnresolved { .. }
+            | UsdcRebalance::SwapFailed { .. }
+            | UsdcRebalance::Redepositing { .. }
+            | UsdcRebalance::ReturnedToSource { .. }
             | UsdcRebalance::Bridged { .. }
             | UsdcRebalance::DepositInitiated { .. }
             | UsdcRebalance::DepositConfirmed { .. }
@@ -1308,8 +1318,9 @@ pub(super) async fn fail_usdc_transfer_command<Writer: Write>(
                 "fail-usdc-transfer: transfer {id} is a Relay transfer in {state:?}: the vault \
                  withdrawal moved the stable outside the vault, to the chain wallet or to \
                  Relay, and no failure path settles it. Refusing to act -- resume it with \
-                 `transfer resume` to finish the swap; only a redeposit returns the stable to \
-                 the vault."
+                 `transfer resume` to finish the swap or the redeposit, or settle a failed swap \
+                 or a refund paid at the other end with `transfer reconcile`; only a redeposit \
+                 returns the stable to the vault."
             );
         }
         // Already the pre-burn failed terminal, so there is nothing to fail
@@ -1492,6 +1503,11 @@ pub(super) async fn clear_pending_burn_command<Writer: Write>(
         | UsdcRebalance::SwapQuoted { .. }
         | UsdcRebalance::SwapDepositPrepared { .. }
         | UsdcRebalance::SwapDeposited { .. }
+        | UsdcRebalance::SwapRefunded { .. }
+        | UsdcRebalance::SwapEscrowUnresolved { .. }
+        | UsdcRebalance::SwapFailed { .. }
+        | UsdcRebalance::Redepositing { .. }
+        | UsdcRebalance::ReturnedToSource { .. }
         | UsdcRebalance::Bridged { .. }
         | UsdcRebalance::BridgingFailed { .. }
         | UsdcRebalance::DepositInitiated { .. }
@@ -2675,6 +2691,22 @@ mod tests {
                 id: id.clone(),
                 initiated_at: Utc::now(),
                 source: Box::new(CctpError::ScanInconclusive { from_block: 99 }),
+            },
+            UsdcTransferError::RelayFillPending {
+                id: id.clone(),
+                deposited_at: Utc::now(),
+            },
+            UsdcTransferError::SwapDepositReverted {
+                id: id.clone(),
+                deposit_tx: b256!(
+                    "0x0000000000000000000000000000000000000000000000000000000000000002"
+                ),
+            },
+            UsdcTransferError::SwapPaymentUnverified {
+                id: id.clone(),
+                source: Box::new(st0x_bridge::relay::RelayBridgeError::TxNotFound {
+                    tx: b256!("0x0000000000000000000000000000000000000000000000000000000000000003"),
+                }),
             },
             UsdcTransferError::WithdrawalPollInconclusive {
                 id,

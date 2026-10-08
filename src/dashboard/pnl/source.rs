@@ -25,6 +25,7 @@ use super::builder::build_pnl_response_from_rows;
 use super::ledger::{
     CCTP_FEE_SOURCE, DIRECTION_BUY_TEXT, DIRECTION_SELL_TEXT, LedgerHead, TOKENIZATION_FEE_SOURCE,
 };
+use super::parsing::parse_ledger_decimal;
 use super::query::{PnlError, PnlQuery};
 use super::response::{PnlCapitalSummary, PnlResponse};
 use super::state::{
@@ -538,7 +539,8 @@ async fn load_cost_rows(
     .fetch_all(pool)
     .await?;
 
-    rows.into_iter()
+    let mut cost_rows = rows
+        .into_iter()
         .map(
             |(event_rowid, source, aggregate_id, symbol, amount_usd, occurred_at)| {
                 let source = match source.as_str() {
@@ -563,7 +565,50 @@ async fn load_cost_rows(
                 })
             },
         )
-        .collect()
+        .collect::<Result<Vec<_>, PnlError>>()?;
+
+    cost_rows.extend(load_relay_cost_rows(pool, as_of_rowid).await?);
+    cost_rows.sort_by_key(|row| row.event_rowid);
+    Ok(cost_rows)
+}
+
+/// The Relay hop costs, one cost row per non-zero relayer fee and swap cost.
+async fn load_relay_cost_rows(
+    pool: &SqlitePool,
+    as_of_rowid: i64,
+) -> Result<Vec<CostLedgerRow>, PnlError> {
+    let rows = sqlx::query_as::<_, (i64, String, String, String, String)>(
+        "SELECT event_rowid, aggregate_id, relayer_fee_usd, swap_cost_usd, occurred_at \
+         FROM pnl_relay_cost \
+         WHERE event_rowid <= ? \
+         ORDER BY event_rowid ASC",
+    )
+    .bind(as_of_rowid)
+    .fetch_all(pool)
+    .await?;
+
+    let mut cost_rows = Vec::new();
+    for (event_rowid, aggregate_id, relayer_fee, swap_cost, occurred_at) in rows {
+        for (source, field, amount) in [
+            (CostSource::RelayFee, "relayer_fee_usd", relayer_fee),
+            (CostSource::RelaySwap, "swap_cost_usd", swap_cost),
+        ] {
+            if parse_ledger_decimal("pnl_relay_cost", event_rowid, field, &amount)?.is_zero()? {
+                continue;
+            }
+
+            cost_rows.push(CostLedgerRow {
+                event_rowid,
+                source,
+                aggregate_id: aggregate_id.clone(),
+                symbol: None,
+                amount_usd: Some(amount),
+                occurred_at: occurred_at.clone(),
+            });
+        }
+    }
+
+    Ok(cost_rows)
 }
 
 async fn load_bot_gas_rows(

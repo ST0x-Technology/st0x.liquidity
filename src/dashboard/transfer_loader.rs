@@ -1669,6 +1669,15 @@ mod tests {
                 "deposit_confirmed_at",
                 false,
             ),
+            ("SwapFailed", "BaseToAlpaca", "failed_at", true),
+            ("ReturnedToSource", "BaseToAlpaca", "returned_at", true),
+            (
+                "SwapEscrowUnresolved",
+                "BaseToAlpaca",
+                "unresolved_at",
+                false,
+            ),
+            ("Redepositing", "BaseToAlpaca", "started_at", false),
         ];
 
         for (state, direction, timestamp_field, expected_terminal) in cases {
@@ -1709,7 +1718,16 @@ mod tests {
         sqlx::migrate!().run(&pool).await.unwrap();
         let now = Utc::now();
 
-        for state in ["SwapQuoted", "SwapDepositPrepared", "SwapDeposited"] {
+        for state in [
+            "SwapQuoted",
+            "SwapDepositPrepared",
+            "SwapDeposited",
+            "SwapRefunded",
+            "SwapEscrowUnresolved",
+            "SwapFailed",
+            "Redepositing",
+            "ReturnedToSource",
+        ] {
             let id = Uuid::new_v4();
             let payload = serde_json::json!({"Live": {(state): {"initiated_at": now}}});
             sqlx::query(

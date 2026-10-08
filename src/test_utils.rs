@@ -431,6 +431,12 @@ impl AnvilRaindexChain {
         }
     }
 
+    /// A provider signing as the fixture deployer (Anvil account 1), never
+    /// the bot.
+    pub(crate) fn deployer(&self) -> impl Provider + use<> {
+        fixture_signer(self.endpoint.clone(), self.deployer_key)
+    }
+
     /// Deploys an ERC-20 with `decimals` whose whole `supply` sits in the
     /// bot's wallet.
     pub(crate) async fn deploy_bot_token(&self, decimals: u8, supply: U256) -> Address {

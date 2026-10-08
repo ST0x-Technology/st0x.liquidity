@@ -22,7 +22,8 @@ use st0x_float_macro::float;
 
 use super::builder::build_pnl_response_from_rows;
 use super::costs::{
-    AccountingBucket, AccountingEffect, CostCategory, CostEntryInternal, validated_cost_magnitude,
+    AccountingBucket, AccountingEffect, CostCategory, CostEntryInternal, build_cost_entries,
+    validated_cost_magnitude,
 };
 use super::ledger::{LedgerHead, PnlLedgerError};
 use super::parsing::{fmt_decimal, parse_timestamp};
@@ -1319,6 +1320,138 @@ async fn source_loader_includes_persisted_cost_events() {
     );
 }
 
+/// Relay costs reach the report from persisted events: a fill's relayer fee
+/// as a cost and its swap gain as revenue, a refund's shortfall as a cost,
+/// beside a CCTP fee; a zero relayer fee books nothing.
+#[tokio::test]
+async fn relay_costs_reach_the_report_from_persisted_events() {
+    let relay_fill = UsdcRebalanceEvent::RelayFillVerified {
+        fill_tx: TxHash::random(),
+        amount_received: Usdc::new(float!(99.9)),
+        fee_collected: Usdc::new(float!(0.1)),
+        relayer_fee: Usdc::new(float!(0.3)),
+        filled_at: parse_timestamp("2026-05-15T12:01:00Z").unwrap(),
+    };
+    let refund_redeposited = UsdcRebalanceEvent::ReturnedToSource {
+        deposit_tx: TxHash::random(),
+        deposit_block: None,
+        redeposit_amount: Usdc::new(float!(99.4)),
+        shortfall: Usdc::new(float!(0.6)),
+        returned_at: parse_timestamp("2026-05-15T12:02:00Z").unwrap(),
+    };
+    let pool = pnl_test_pool(
+        vec![
+            seed_rebalance("1.5", "2026-05-15T12:00:00Z"),
+            SeedEvent::Rebalance(UsdcRebalanceId(Uuid::new_v4()).to_string(), relay_fill),
+            SeedEvent::Rebalance(
+                UsdcRebalanceId(Uuid::new_v4()).to_string(),
+                refund_redeposited,
+            ),
+        ],
+        position_rows(),
+    )
+    .await;
+
+    let report = build_pnl_report(&pool, &query(), Vec::new(), Utc::now())
+        .await
+        .unwrap();
+
+    let mut entries = report
+        .cost_entries
+        .iter()
+        .map(|entry| (entry.category, entry.effect, entry.amount_usd.as_str()))
+        .collect::<Vec<_>>();
+    entries.sort_unstable();
+    assert_eq!(
+        entries,
+        vec![
+            ("cctp_fee", "cost", "1.5"),
+            ("relay_fee", "cost", "0.3"),
+            ("relay_swap", "cost", "0.6"),
+            ("relay_swap", "revenue", "0.2"),
+        ]
+    );
+    let relay = report
+        .costs
+        .coverage
+        .iter()
+        .find(|coverage| coverage.source == "Relay swap costs")
+        .unwrap();
+    assert_eq!(
+        (relay.effect, relay.status, relay.amount_usd.as_str()),
+        ("cost", "included", "0.7")
+    );
+}
+
+/// With no Relay event the Relay coverage row reads as not ingested.
+#[tokio::test]
+async fn relay_coverage_is_not_ingested_without_relay_costs() {
+    let pool = pnl_test_pool(
+        vec![seed_rebalance("1.5", "2026-05-15T12:00:00Z")],
+        position_rows(),
+    )
+    .await;
+
+    let report = build_pnl_report(&pool, &query(), Vec::new(), Utc::now())
+        .await
+        .unwrap();
+
+    let relay = report
+        .costs
+        .coverage
+        .iter()
+        .find(|coverage| coverage.source == "Relay swap costs")
+        .unwrap();
+    assert_eq!(
+        (relay.status, relay.amount_usd.as_str()),
+        ("not_ingested", "0")
+    );
+}
+
+/// A Relay fill above its fee-adjusted input nets a gain, shown as revenue.
+#[tokio::test]
+async fn relay_net_gain_shows_as_revenue_coverage() {
+    let pool = pnl_test_pool(
+        vec![SeedEvent::Rebalance(
+            UsdcRebalanceId(Uuid::new_v4()).to_string(),
+            UsdcRebalanceEvent::RelayFillVerified {
+                fill_tx: TxHash::random(),
+                amount_received: Usdc::new(float!(100.2)),
+                fee_collected: Usdc::new(float!(-0.2)),
+                relayer_fee: Usdc::new(float!(0)),
+                filled_at: parse_timestamp("2026-05-15T12:01:00Z").unwrap(),
+            },
+        )],
+        position_rows(),
+    )
+    .await;
+
+    let report = build_pnl_report(&pool, &query(), Vec::new(), Utc::now())
+        .await
+        .unwrap();
+
+    let entries = report
+        .cost_entries
+        .iter()
+        .map(|entry| (entry.category, entry.effect, entry.amount_usd.as_str()))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        entries,
+        vec![("relay_swap", "revenue", "0.2")],
+        "a zero relayer fee books nothing"
+    );
+    let relay = report
+        .costs
+        .coverage
+        .iter()
+        .find(|coverage| coverage.source == "Relay swap costs")
+        .unwrap();
+    assert_eq!(
+        (relay.effect, relay.status, relay.amount_usd.as_str()),
+        ("revenue", "included", "0.2")
+    );
+}
+
 #[tokio::test]
 async fn source_loader_includes_persisted_bot_gas_costs() {
     let pool = pnl_test_pool(
@@ -1967,6 +2100,59 @@ fn missing_cctp_fee_amount_fails_the_report() {
             reason: "cctp fee row missing amount",
         }
     ));
+}
+
+/// A Relay fill's relayer fee is a cost, and its swap row a cost when
+/// positive and a gain of its magnitude when negative.
+#[test]
+fn relay_rows_book_the_fee_as_a_cost_and_the_swap_by_its_sign() {
+    let row = |rowid, source, amount: &str| CostLedgerRow {
+        event_rowid: rowid,
+        source,
+        aggregate_id: "relay-1".to_owned(),
+        symbol: None,
+        amount_usd: Some(amount.to_owned()),
+        occurred_at: "2026-05-15T12:02:00Z".to_owned(),
+    };
+    let rows = [
+        row(21, CostSource::RelayFee, "0.3"),
+        row(21, CostSource::RelaySwap, "0.2"),
+        row(22, CostSource::RelaySwap, "-0.2"),
+    ];
+
+    let replay = build_cost_entries(&rows, &mut Vec::new()).unwrap();
+    let booked = replay
+        .entries
+        .iter()
+        .map(|entry| {
+            (
+                entry.category,
+                entry.effect,
+                fmt_decimal(entry.amount_usd.inner()).unwrap(),
+            )
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        booked,
+        vec![
+            (
+                CostCategory::RelayFee,
+                AccountingEffect::Cost,
+                "0.3".to_owned()
+            ),
+            (
+                CostCategory::RelaySwap,
+                AccountingEffect::Cost,
+                "0.2".to_owned()
+            ),
+            (
+                CostCategory::RelaySwap,
+                AccountingEffect::Revenue,
+                "0.2".to_owned()
+            ),
+        ]
+    );
 }
 
 #[test]

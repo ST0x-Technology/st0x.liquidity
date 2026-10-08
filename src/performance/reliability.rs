@@ -456,9 +456,15 @@ fn usdc_rebalance_failure(event: &UsdcRebalanceEvent) -> Option<(FailureEventTyp
         UsdcRebalanceEvent::WithdrawalFailed { failed_at, .. } => {
             Some((FailureEventType::WithdrawalFailed, *failed_at))
         }
-        UsdcRebalanceEvent::BridgingFailed { failed_at, .. } => {
-            Some((FailureEventType::BridgingFailed, *failed_at))
-        }
+        // The Relay swap is the hop, as the CCTP bridge is: a swap that failed,
+        // or ended with the stable back in its vault, counts with the
+        // bridge's failures.
+        UsdcRebalanceEvent::BridgingFailed { failed_at, .. }
+        | UsdcRebalanceEvent::SwapFailed { failed_at, .. }
+        | UsdcRebalanceEvent::ReturnedToSource {
+            returned_at: failed_at,
+            ..
+        } => Some((FailureEventType::BridgingFailed, *failed_at)),
         UsdcRebalanceEvent::DepositFailed { failed_at, .. } => {
             Some((FailureEventType::DepositFailed, *failed_at))
         }
@@ -479,6 +485,13 @@ fn usdc_rebalance_failure(event: &UsdcRebalanceEvent) -> Option<(FailureEventTyp
         | UsdcRebalanceEvent::SwapApprovePrepared { .. }
         | UsdcRebalanceEvent::SwapDepositPrepared { .. }
         | UsdcRebalanceEvent::SwapDeposited { .. }
+        | UsdcRebalanceEvent::SwapRequoted { .. }
+        | UsdcRebalanceEvent::SwapDepositReverted { .. }
+        | UsdcRebalanceEvent::RelayFillVerified { .. }
+        | UsdcRebalanceEvent::SwapRefunded { .. }
+        | UsdcRebalanceEvent::SwapEscrowUnresolved { .. }
+        | UsdcRebalanceEvent::RedepositStarted { .. }
+        | UsdcRebalanceEvent::RedepositSubmitted { .. }
         | UsdcRebalanceEvent::BridgingInitiated { .. }
         | UsdcRebalanceEvent::BridgeAttestationReceived { .. }
         | UsdcRebalanceEvent::Bridged { .. }

@@ -26,6 +26,8 @@ const CASH_CREDIT_ACTIVITY_TYPES: &[&str] = &["CSD"];
 pub(crate) enum CostCategory {
     TokenizationFee,
     CctpFee,
+    RelayFee,
+    RelaySwap,
     BotGas,
     BrokerFee,
     MarginInterest,
@@ -38,6 +40,8 @@ impl CostCategory {
         match self {
             Self::TokenizationFee => "tokenization_fee",
             Self::CctpFee => "cctp_fee",
+            Self::RelayFee => "relay_fee",
+            Self::RelaySwap => "relay_swap",
             Self::BotGas => "bot_gas",
             Self::BrokerFee => "broker_fee",
             Self::MarginInterest => "margin_interest",
@@ -137,6 +141,8 @@ pub(crate) struct CostSummaryAcc {
     pub(crate) offchain_execution_fees_usd: Float,
     pub(crate) tokenization_fees_usd: Float,
     pub(crate) cctp_fees_usd: Float,
+    pub(crate) relay_costs_usd: Float,
+    pub(crate) relay_entry_count: usize,
     pub(crate) conversion_slippage_usd: Float,
     pub(crate) oracle_write_cost_usd: Float,
     pub(crate) broker_fees_usd: Float,
@@ -165,6 +171,8 @@ impl Default for CostSummaryAcc {
             offchain_execution_fees_usd: float!(0),
             tokenization_fees_usd: float!(0),
             cctp_fees_usd: float!(0),
+            relay_costs_usd: float!(0),
+            relay_entry_count: 0,
             conversion_slippage_usd: float!(0),
             oracle_write_cost_usd: float!(0),
             broker_fees_usd: float!(0),
@@ -226,6 +234,10 @@ fn add_cost(
         }
         CostCategory::CctpFee => {
             summary.cctp_fees_usd = (summary.cctp_fees_usd + signed_amount)?;
+        }
+        CostCategory::RelayFee | CostCategory::RelaySwap => {
+            summary.relay_costs_usd = (summary.relay_costs_usd + signed_amount)?;
+            summary.relay_entry_count += 1;
         }
         CostCategory::BotGas => {
             summary.bot_gas_usd = (summary.bot_gas_usd + amount)?;
@@ -295,6 +307,12 @@ fn cost_summary_to_dto(
 ) -> Result<PnlCostSummary, PnlError> {
     let offchain_execution_fees =
         (summary.offchain_execution_fees_usd + summary.regulatory_fees_usd)?;
+    // Relay costs net of swap gains: a net gain is shown as revenue.
+    let relay_effect = if float!(0).lt(summary.relay_costs_usd)? {
+        AccountingEffect::Revenue
+    } else {
+        AccountingEffect::Cost
+    };
     Ok(PnlCostSummary {
         total_tracked_costs_usd: fmt_decimal(total_tracked_costs(summary)?)?,
         total_tracked_revenue_usd: fmt_decimal(total_tracked_revenue(summary)?)?,
@@ -356,6 +374,14 @@ fn cost_summary_to_dto(
                 "included",
                 summary.cctp_fees_usd,
                 "Read from UsdcRebalance bridge completion events as fee_collected.",
+            )?,
+            coverage(
+                "Relay swap costs",
+                AccountingBucket::Generic,
+                relay_effect,
+                included_when_observed(summary.relay_entry_count),
+                summary.relay_costs_usd,
+                "Read from UsdcRebalance Relay fills (the quote's relayer fee, and the rest of the input less the proven fill, a gain when the fill exceeds it) and from redeposits after a refund (what the refund kept back).",
             )?,
             coverage(
                 "USD/USDC reporting basis",
@@ -462,6 +488,8 @@ pub(crate) fn with_costs(
 
 #[derive(Debug, Clone, Copy)]
 struct CostEntryDefinition {
+    /// The ledger table its rows come from, for error reports.
+    table: &'static str,
     aggregate_type: &'static str,
     category: CostCategory,
     accounting_bucket: AccountingBucket,
@@ -470,6 +498,7 @@ struct CostEntryDefinition {
 }
 
 const TOKENIZATION_FEE_ENTRY: CostEntryDefinition = CostEntryDefinition {
+    table: "pnl_cost_entry",
     aggregate_type: "TokenizedEquityMint",
     category: CostCategory::TokenizationFee,
     accounting_bucket: AccountingBucket::Generic,
@@ -478,11 +507,30 @@ const TOKENIZATION_FEE_ENTRY: CostEntryDefinition = CostEntryDefinition {
 };
 
 const CCTP_FEE_ENTRY: CostEntryDefinition = CostEntryDefinition {
+    table: "pnl_cost_entry",
     aggregate_type: "UsdcRebalance",
     category: CostCategory::CctpFee,
     accounting_bucket: AccountingBucket::Generic,
     effect: AccountingEffect::Cost,
     detail: "CCTP fee_collected from bridge mint",
+};
+
+const RELAY_FEE_ENTRY: CostEntryDefinition = CostEntryDefinition {
+    table: "pnl_relay_cost",
+    aggregate_type: "UsdcRebalance",
+    category: CostCategory::RelayFee,
+    accounting_bucket: AccountingBucket::Generic,
+    effect: AccountingEffect::Cost,
+    detail: "Relay relayer fee from the accepted quote of a proven fill",
+};
+
+const RELAY_SWAP_ENTRY: CostEntryDefinition = CostEntryDefinition {
+    table: "pnl_relay_cost",
+    aggregate_type: "UsdcRebalance",
+    category: CostCategory::RelaySwap,
+    accounting_bucket: AccountingBucket::Generic,
+    effect: AccountingEffect::Cost,
+    detail: "Relay swap input less the proven fill and the relayer fee",
 };
 
 /// Converts one fee-bearing ledger row into a cost entry. The symbol was
@@ -494,7 +542,7 @@ fn ledger_cost_entry(
     amount: &str,
     warnings: &mut Vec<String>,
 ) -> Result<CostEntryInternal, PnlError> {
-    let amount_usd = parse_ledger_decimal("pnl_cost_entry", row.event_rowid, "amount_usd", amount)?;
+    let amount_usd = parse_ledger_decimal(definition.table, row.event_rowid, "amount_usd", amount)?;
     let amount_usd = validated_cost_magnitude(
         amount_usd,
         row.event_rowid,
@@ -536,6 +584,29 @@ fn ledger_cost_entry(
     })
 }
 
+/// A Relay swap row: a positive amount is a cost, a negative one (a fill
+/// above the fee-adjusted input) a gain of its magnitude.
+fn relay_swap_entry(
+    row: &CostLedgerRow,
+    amount: &str,
+    warnings: &mut Vec<String>,
+) -> Result<CostEntryInternal, PnlError> {
+    let Some(gain) = amount.strip_prefix('-') else {
+        return ledger_cost_entry(row, RELAY_SWAP_ENTRY, amount, warnings);
+    };
+
+    ledger_cost_entry(
+        row,
+        CostEntryDefinition {
+            effect: AccountingEffect::Revenue,
+            detail: "Relay fill above the swap input less the relayer fee",
+            ..RELAY_SWAP_ENTRY
+        },
+        gain,
+        warnings,
+    )
+}
+
 pub(crate) struct CostReplay {
     pub(crate) entries: Vec<CostEntryInternal>,
     pub(crate) missing_cost_observation_count: usize,
@@ -575,6 +646,12 @@ pub(crate) fn build_cost_entries(
             (CostSource::CctpFee, Some(amount)) => {
                 entries.push(ledger_cost_entry(row, CCTP_FEE_ENTRY, amount, warnings)?);
             }
+            (CostSource::RelayFee, Some(amount)) => {
+                entries.push(ledger_cost_entry(row, RELAY_FEE_ENTRY, amount, warnings)?);
+            }
+            (CostSource::RelaySwap, Some(amount)) => {
+                entries.push(relay_swap_entry(row, amount, warnings)?);
+            }
             // The ledger schema forbids this shape (`CHECK (source != 'cctp_fee'
             // OR amount_usd IS NOT NULL)`), so hitting it means a corrupt row.
             (CostSource::CctpFee, None) => {
@@ -582,6 +659,13 @@ pub(crate) fn build_cost_entries(
                     table: "pnl_cost_entry",
                     rowid: row.event_rowid,
                     reason: "cctp fee row missing amount",
+                });
+            }
+            (CostSource::RelayFee | CostSource::RelaySwap, None) => {
+                return Err(PnlError::InvalidLedgerRow {
+                    table: "pnl_relay_cost",
+                    rowid: row.event_rowid,
+                    reason: "relay cost row missing amount",
                 });
             }
         }

@@ -850,6 +850,38 @@ guard records the transfers that hold it. Who touches it, and when:
   A terminal `Failed` job row (retries exhausted) does not refuse: re-enqueueing
   that transfer is the recovery case this command exists for.
 
+### Robinhood Relay transfer held after its vault withdrawal
+
+A Robinhood->Alpaca transfer over the Relay hop that stopped at
+`WithdrawalComplete` (no binding quote recorded) or `SwapQuoted` (no deposit
+signed) has its USDG in the Robinhood wallet, outside the vault, and holds the
+Robinhood corridor guard. `fail-usdc-transfer` and `transfer reconcile` refuse
+both states. Resume it:
+
+```
+stox transfer resume --kind usdc --id <uuid> --direction to-alpaca
+```
+
+The job takes a fresh binding quote (or re-quotes an expired one) and signs the
+deposit; when Relay refuses the quote it puts the USDG back into the vault
+(`Redepositing` -> `ReturnedToSource`), which releases the guard. A transient
+quote failure (transport, rate limit) leaves the transfer where it was for the
+next resume. The other Relay holds:
+
+- `SwapEscrowUnresolved` (the fill window passed with no fill or refund) keeps
+  the guard and pages, and the bot stops reading Relay. `transfer resume` reads
+  Relay's status once more: a fill or refund it can prove is adopted, a Relay
+  failure becomes `SwapFailed`, anything else leaves it held. Resume again
+  later; the solver may fill until the order's deadline, about a week.
+- `SwapDeposited` with a fill or refund that does not prove on chain keeps the
+  guard and pages every 30 minutes; check the order with Relay's status API.
+- `SwapFailed` (Relay failed the order with nothing paid back) and a
+  `SwapRefunded` paid in USDC on Ethereum: settle the funds with Relay or move
+  the USDC by hand, then `transfer reconcile --kind usdc`.
+- `Redepositing` whose vault deposit does not confirm (dropped or reverted):
+  check the recorded deposit tx and the vault on chain, deposit the USDG by hand
+  if it is still in the Robinhood wallet, then `transfer reconcile --kind usdc`.
+
 ### Clearing a pre-burn guard latch
 
 Use `fail-usdc-transfer` when a USDC rebalance is stranded at
@@ -967,7 +999,9 @@ stox transfer reconcile --kind redemption --id <redemption-aggregate-id> \
   can lose an unrecorded one), a `BaseToAlpaca` `ConversionFailed`, and a
   `BaseToAlpaca` `Bridged` with a signed deposit send whose nonce you verified
   on chain is taken by a different mined tx (see "Base->Alpaca deposit send
-  pages"). Its `--reason` must be one of `funds-moved-manually` or
+  pages"), a Relay `SwapFailed`, a Relay `SwapRefunded` paid on Ethereum, and a
+  Relay `Redepositing` (see "Robinhood Relay transfer held after its vault
+  withdrawal"). Its `--reason` must be one of `funds-moved-manually` or
   `deposit-credited-offline`; any other value is rejected. Every other state is
   rejected, including `WithdrawalFailed` and an `AlpacaToBase`
   `ConversionFailed`, whose funds never left Alpaca.

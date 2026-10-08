@@ -11,6 +11,7 @@ use tracing::{debug, trace, warn};
 use st0x_bridge::corridor::UsdcCorridor;
 use st0x_config::RelayHopCtx;
 use st0x_evm::Chain;
+use st0x_execution::HasZero;
 use st0x_finance::{Usd, Usdc};
 
 use super::{RebalancingService, RebalancingServiceError};
@@ -258,6 +259,9 @@ pub(super) enum UsdcRebalanceStage {
     SwapQuoted,
     SwapDepositPrepared,
     SwapDeposited,
+    SwapRefunded,
+    SwapEscrowUnresolved,
+    Redepositing,
     Bridged,
     DepositInitiated,
     DepositConfirmed,
@@ -275,6 +279,9 @@ impl std::fmt::Display for UsdcRebalanceStage {
             Self::SwapQuoted => write!(formatter, "SwapQuoted"),
             Self::SwapDepositPrepared => write!(formatter, "SwapDepositPrepared"),
             Self::SwapDeposited => write!(formatter, "SwapDeposited"),
+            Self::SwapRefunded => write!(formatter, "SwapRefunded"),
+            Self::SwapEscrowUnresolved => write!(formatter, "SwapEscrowUnresolved"),
+            Self::Redepositing => write!(formatter, "Redepositing"),
             Self::Bridged => write!(formatter, "Bridged"),
             Self::DepositInitiated => write!(formatter, "DepositInitiated"),
             Self::DepositConfirmed => write!(formatter, "DepositConfirmed"),
@@ -296,10 +303,17 @@ impl UsdcRebalanceStage {
             WithdrawalConfirmed { .. } => Some(Self::WithdrawalConfirmed),
             BridgingInitiated { .. } => Some(Self::BridgingInitiated),
             BridgeAttestationReceived { .. } => Some(Self::BridgeAttestationReceived),
-            SwapQuoted { .. } => Some(Self::SwapQuoted),
+            SwapQuoted { .. } | SwapRequoted { .. } | SwapDepositReverted { .. } => {
+                Some(Self::SwapQuoted)
+            }
             SwapDepositPrepared { .. } => Some(Self::SwapDepositPrepared),
             SwapDeposited { .. } => Some(Self::SwapDeposited),
-            Bridged { .. } | BridgingCompletionRecovered { .. } => Some(Self::Bridged),
+            SwapRefunded { .. } => Some(Self::SwapRefunded),
+            SwapEscrowUnresolved { .. } => Some(Self::SwapEscrowUnresolved),
+            RedepositStarted { .. } | RedepositSubmitted { .. } => Some(Self::Redepositing),
+            Bridged { .. } | BridgingCompletionRecovered { .. } | RelayFillVerified { .. } => {
+                Some(Self::Bridged)
+            }
             DepositInitiated { .. } => Some(Self::DepositInitiated),
             DepositConfirmed { .. } | DepositCompletionRecovered { .. } => {
                 Some(Self::DepositConfirmed)
@@ -319,6 +333,8 @@ impl UsdcRebalanceStage {
             | WithdrawalFailed { .. }
             | BridgingFailed { .. }
             | DepositFailed { .. }
+            | SwapFailed { .. }
+            | ReturnedToSource { .. }
             | OperatorReconciled { .. } => None,
         }
     }
@@ -341,7 +357,17 @@ impl UsdcRebalanceStage {
             (Self::BridgeAttestationReceived, BridgeAttestationReceived { attested_at, .. }) => {
                 Some(*attested_at)
             }
-            (Self::SwapQuoted, SwapQuoted { quoted_at, .. }) => Some(*quoted_at),
+            (Self::SwapQuoted, SwapQuoted { quoted_at, .. } | SwapRequoted { quoted_at, .. }) => {
+                Some(*quoted_at)
+            }
+            (Self::SwapQuoted, SwapDepositReverted { reverted_at, .. }) => Some(*reverted_at),
+            (Self::SwapRefunded, SwapRefunded { refunded_at, .. }) => Some(*refunded_at),
+            (Self::SwapEscrowUnresolved, SwapEscrowUnresolved { unresolved_at }) => {
+                Some(*unresolved_at)
+            }
+            (Self::Redepositing, RedepositStarted { started_at, .. }) => Some(*started_at),
+            (Self::Redepositing, RedepositSubmitted { submitted_at, .. }) => Some(*submitted_at),
+            (Self::Bridged, RelayFillVerified { filled_at, .. }) => Some(*filled_at),
             (Self::SwapDepositPrepared, SwapDepositPrepared { prepared_at, .. }) => {
                 Some(*prepared_at)
             }
@@ -997,7 +1023,7 @@ impl RebalancingService {
         //   - `WithdrawalFailed` is always pre-burn (nothing left the source),
         //     so absent tracking correctly clears.
         match event {
-            DepositFailed { .. } => true,
+            DepositFailed { .. } | SwapFailed { .. } => true,
             ConversionFailed { .. } => match self.usdc_tracking.read().await.get(id) {
                 Some(tracking) => tracking.is_post_burn(),
                 None => self.durable_guard_hold(id).await,
@@ -1094,8 +1120,14 @@ impl RebalancingService {
             | BridgingInitiated { .. }
             | BridgeAttestationReceived { .. }
             | SwapQuoted { .. }
+            | SwapRequoted { .. }
+            | SwapDepositReverted { .. }
             | SwapDepositPrepared { .. }
             | SwapDeposited { .. }
+            | SwapRefunded { .. }
+            | SwapEscrowUnresolved { .. }
+            | RedepositStarted { .. }
+            | RedepositSubmitted { .. }
             | DepositInitiated { .. }
             | DepositConfirmed {
                 direction: RebalanceDirection::BaseToAlpaca,
@@ -1119,6 +1151,9 @@ impl RebalancingService {
                 amount_received, ..
             }
             | BridgingCompletionRecovered {
+                amount_received, ..
+            }
+            | RelayFillVerified {
                 amount_received, ..
             } => {
                 // `BridgingCompletionRecovered` un-fails a post-burn
@@ -1216,6 +1251,22 @@ impl RebalancingService {
                 } else {
                     self.cancel_tracked_usdc_rebalance(id).await?
                 }
+            }
+            // A Relay failure holds its guard like a post-burn failure: the
+            // classifier always preserves it.
+            SwapFailed { .. } => {
+                self.warn_if_post_burn_tracking_missing(id).await;
+                UsdcSettlementOutcome::Reconciled
+            }
+            // The stable is back in the vault it left: credit what came back
+            // and drop what a refund kept, and leave the next check to the
+            // snapshot poll, which reads the vault itself.
+            ReturnedToSource {
+                redeposit_amount, ..
+            } => {
+                self.settle_tracked_usdc_rebalance(id, Some(*redeposit_amount))
+                    .await?;
+                UsdcSettlementOutcome::DeferredToSnapshot
             }
             // Operator reconciliation of a post-burn `DepositFailed`: the minted
             // USDC left the source venue, so reconcile inflight with post-burn
@@ -1518,6 +1569,17 @@ impl RebalancingService {
         &self,
         id: &UsdcRebalanceId,
     ) -> Result<UsdcSettlementOutcome, RebalancingServiceError> {
+        self.settle_tracked_usdc_rebalance(id, None).await
+    }
+
+    /// Returns a stopped transfer's source inflight to available: all of it,
+    /// or only `returned` of it when the transfer put less back (a Relay
+    /// refund that kept fees), the rest released without a credit.
+    async fn settle_tracked_usdc_rebalance(
+        &self,
+        id: &UsdcRebalanceId,
+        returned: Option<Usdc>,
+    ) -> Result<UsdcSettlementOutcome, RebalancingServiceError> {
         let Some(tracking) = self.usdc_tracking.read().await.get(id).cloned() else {
             debug!(
                 target: "rebalance",
@@ -1536,11 +1598,19 @@ impl RebalancingService {
         let initiated_amount = tracking.initiated_amount;
         let now = Utc::now();
         let update = Box::new(move |inventory, chain| {
-            let cancelled =
-                Inventory::transfer(source_venue, TransferOp::Cancel, initiated_amount)(
+            let settled = match returned {
+                None => Inventory::transfer(source_venue, TransferOp::Cancel, initiated_amount)(
                     inventory, chain,
-                )?;
-            Inventory::with_last_rebalancing(now)(cancelled, chain)
+                )?,
+                Some(returned) => {
+                    let cancelled =
+                        Inventory::transfer(source_venue, TransferOp::Cancel, returned)(
+                            inventory, chain,
+                        )?;
+                    Inventory::set_inflight(source_venue, Usdc::ZERO)(cancelled, chain)?
+                }
+            };
+            Inventory::with_last_rebalancing(now)(settled, chain)
         });
 
         let mut inventory = self.inventory.write().await;
