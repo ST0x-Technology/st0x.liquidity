@@ -22,7 +22,11 @@ mod tests;
 
 pub(crate) use ledger::{LedgerHead, PnlLedger, PnlLedgerReactor};
 pub(crate) use query::{PnlError, PnlQuery};
-pub(crate) use response::PnlResponse;
+#[cfg(test)]
+pub(crate) use response::{
+    PnlAvailableRange, PnlCapitalSummary, PnlCostCoverage, PnlCostSummary, PnlSampleStats,
+};
+pub(crate) use response::{PnlResponse, PnlSummary, PnlSymbolSummary, PnlWindow, PnlWindowSymbol};
 #[cfg(test)]
 pub(crate) use source::{
     MAX_CONCURRENT_PNL_REPORTS, acquire_pnl_report_permit, build_pnl_report,

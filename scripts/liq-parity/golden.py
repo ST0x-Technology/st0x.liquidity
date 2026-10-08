@@ -78,6 +78,27 @@ def run_rebalance(exporter, fixture):
     exporter.collect_rebalance_timings("from", "to")
 
 
+def run_pnl(exporter, fixture):
+    """Every /pnl call, the range probe and each window, returns the
+    fixture, so each window publishes the same report under its own
+    window label."""
+    def bot_get(path, params=None, timeout=15):
+        if path != "/pnl":
+            raise RuntimeError(f"unexpected bot read {path}")
+        return fixture
+
+    exporter.bot_get = bot_get
+    exporter.collect_pnl()
+
+
+def run_pnl_window_all(exporter, fixture):
+    """One report as the `all` window, through the exporter's two PnL
+    builders, as collect_pnl combines them."""
+    exporter.REGISTRY.set_family(
+        "pnl",
+        exporter.pnl_samples(fixture, "all") + exporter.pnl_day_samples(fixture, "all"))
+
+
 # case name -> how the fixture reaches the exporter
 CASES = {
     "settings": run_state,
@@ -88,6 +109,9 @@ CASES = {
     "reliability": run_reliability,
     "infra": run_infra,
     "rebalance": run_rebalance,
+    # PnL windows and day buckets
+    "pnl": run_pnl,
+    "pnl-days": run_pnl_window_all,
 }
 
 
