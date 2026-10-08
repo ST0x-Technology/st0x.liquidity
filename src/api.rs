@@ -2485,6 +2485,9 @@ async fn reconcile_stuck_usdc_transfer(
         .map_err(ops_command_error)?;
 
     info!(%id, ?reason, "USDC transfer reconciled via API");
+    if rebalance.has_signed_swap_envelopes() {
+        error!(target: "operational_alert", alert = true, %id, "Reconciled a USDC transfer that holds signed Relay envelopes. Restart the bot to release the nonces of its signed Relay envelopes: until then, if one never mined, later sends from the wallet that signed it wait behind it");
+    }
     Ok(Json(TransferOpResponse {
         transfer_id: id.to_string(),
         outcome: "reconciled",
