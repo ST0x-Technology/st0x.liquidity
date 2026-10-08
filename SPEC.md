@@ -4803,8 +4803,10 @@ left a vault:
    reconciliation, as on CCTP).
 3. The binding quote for the credited amount (`QuoteSwap` -> `SwapQuoted`). A
    refusal pages and leaves the transfer at `WithdrawalComplete`, guard held:
-   the retry re-quotes, or the operator fails it (`fail-usdc-transfer`) and
-   reconciles the USDC at the hub. A transient failure is retried.
+   once it times out the sweep re-arms its job on every tick, which quotes and
+   pages again, until a quote is accepted or the operator fails it
+   (`fail-usdc-transfer`) and reconciles the USDC at the hub. A transient
+   failure is retried.
 4. Before the pair is signed the shared Ethereum wallet's credit ledger is
    checked against the swap's input, as before a CCTP burn: a shortfall pages
    and does not stop the transfer. The pair is signed on the shared Ethereum
@@ -4816,7 +4818,7 @@ left a vault:
    follow steps 5 and 6 above. A refused re-quote, or
    `max_deposit_revert_redrives` reverted deposits, holds the transfer at
    `SwapQuoted` with the USDC at the hub, guard held, paged, for
-   `transfer reconcile`.
+   `transfer reconcile`, once the approves that went out alone are sent again.
 6. A fill proven on the corridor chain (`ConfirmSwapFill` -> `RelayFillVerified`
    -> `Bridged`) is deposited into the chain's vault (`deposit4`) exactly as
    after a CCTP mint: `DepositInitiated`, then `DepositConfirmed`, which clears
