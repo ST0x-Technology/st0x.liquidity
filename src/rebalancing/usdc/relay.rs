@@ -16,13 +16,15 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 use tokio::sync::Mutex;
+use tokio::task::{JoinError, JoinHandle};
+use tokio::time::Instant;
 use tracing::{error, info, warn};
 
 use st0x_bridge::cctp::{AttestationResponse, CctpError, UsdcTransferStatus};
 use st0x_bridge::corridor::{HopKind, UsdcCorridor};
 use st0x_bridge::relay::{
-    BasisPoints, QuoteAmounts, QuoteBounds, QuoteFees, QuoteRequest, RelayBridge, RelayClient,
-    RelayOrderId, RelayQuote, RelayRequestId, StepTransaction,
+    BasisPoints, QuoteAmounts, QuoteBounds, QuoteFees, QuoteRequest, RelayBridge, RelayBridgeError,
+    RelayClient, RelayOrderId, RelayQuote, RelayRequestId, StepTransaction,
 };
 use st0x_bridge::{BridgeDirection, HopDirection, PreparedSwap, PreparedSwapDeposit, SwapBridge};
 use st0x_config::RelayHopCtx;
@@ -79,13 +81,16 @@ impl<Signer: Wallet> RelayHop<Signer> {
     /// Signs and persists the pair, or picks up the one already persisted;
     /// `None` once the deposit is confirmed. Read and signed under the chain
     /// wallet's prepare lock: a timed-out attempt's prepare may have
-    /// persisted a pair this one must send instead of signing anew.
+    /// persisted a pair this one must send instead of signing anew. The RPC
+    /// work under the lock is bounded by `quote_max_age`, past which the
+    /// quote is stale anyway, so a hung RPC cannot hold the lock forever.
     async fn prepare_swap_pair(
-        &self,
+        self: &Arc<Self>,
         cqrs: &Store<UsdcRebalance>,
         id: &UsdcRebalanceId,
     ) -> Result<Option<(PreparedSwapDeposit, B256)>, UsdcTransferError> {
         let _prepare = self.chain_send_prepare.lock().await;
+        let deadline = Instant::now() + self.bounds.quote_max_age;
 
         match cqrs.load(id).await? {
             Some(UsdcRebalance::SwapQuoted {
@@ -95,7 +100,7 @@ impl<Signer: Wallet> RelayHop<Signer> {
                 ..
             }) => {
                 let pair = self
-                    .sign_swap_pair(cqrs, id, &quote, quoted_at, &split_approves)
+                    .sign_swap_pair(cqrs, id, &quote, quoted_at, &split_approves, deadline)
                     .await?;
                 Ok(Some((pair, quote.order_id)))
             }
@@ -106,7 +111,8 @@ impl<Signer: Wallet> RelayHop<Signer> {
                 deposit,
                 ..
             }) => {
-                self.broadcast_split_approves(&split_approves).await?;
+                self.broadcast_split_approves(id, &split_approves, deadline)
+                    .await?;
                 Ok(Some((
                     PreparedSwapDeposit { approve, deposit },
                     quote.order_id,
@@ -149,14 +155,16 @@ impl<Signer: Wallet> RelayHop<Signer> {
     /// pair is not signed behind a nonce no node holds. An expired quote is
     /// not signed.
     async fn sign_swap_pair(
-        &self,
+        self: &Arc<Self>,
         cqrs: &Store<UsdcRebalance>,
         id: &UsdcRebalanceId,
         quote: &SwapQuote,
         quoted_at: DateTime<Utc>,
         split_approves: &[PreparedTransaction],
+        deadline: Instant,
     ) -> Result<PreparedSwapDeposit, UsdcTransferError> {
-        self.broadcast_split_approves(split_approves).await?;
+        self.broadcast_split_approves(id, split_approves, deadline)
+            .await?;
 
         // A quote resumed after downtime or retries may be stale. Nothing
         // re-quotes a recorded quote yet, so the transfer stays at
@@ -174,11 +182,7 @@ impl<Signer: Wallet> RelayHop<Signer> {
         // After a split the allowance may already cover the deposit: the
         // bridge reads it and signs an approve only when it falls short.
         let relay_quote = relay_quote(quote, split_approves.is_empty())?;
-        let prepared = self
-            .bridge
-            .prepare_deposit(TO_HUB, &relay_quote)
-            .await
-            .map_err(Box::new)?;
+        let prepared = self.sign_before(id, relay_quote, deadline).await?;
 
         match prepared {
             PreparedSwap::Deposit(pair) => {
@@ -187,30 +191,107 @@ impl<Signer: Wallet> RelayHop<Signer> {
             }
             PreparedSwap::ApproveOnly { approve } => {
                 self.persist_lone_approve(cqrs, id, &approve).await?;
-                self.bridge
-                    .broadcast_approve(TO_HUB, &approve)
-                    .await
-                    .map_err(Box::new)?;
+                // Persisted: a retry sends it again if this times out.
+                self.before(
+                    id,
+                    deadline,
+                    self.bridge.broadcast_approve(TO_HUB, &approve),
+                )
+                .await?
+                .map_err(Box::new)?;
                 warn!(target: "rebalance", %id, approve = %approve.tx_hash(), "Another send split the Relay pair; its approve went out alone");
                 Err(UsdcTransferError::SwapPairSplit { id: id.clone() })
             }
         }
     }
 
+    /// Signs the pair on a task of its own, so a timeout does not drop a
+    /// signing that holds nonces: a pair signed after `deadline` has its
+    /// nonces released, as an unpersisted pair's are, once it returns.
+    async fn sign_before(
+        self: &Arc<Self>,
+        id: &UsdcRebalanceId,
+        quote: RelayQuote,
+        deadline: Instant,
+    ) -> Result<PreparedSwap, UsdcTransferError> {
+        let hop = Arc::clone(self);
+        let mut signing =
+            tokio::spawn(async move { hop.bridge.prepare_deposit(TO_HUB, &quote).await });
+
+        match tokio::time::timeout_at(deadline, &mut signing).await {
+            Ok(Ok(prepared)) => Ok(prepared.map_err(Box::new)?),
+            Ok(Err(join_error)) => Err(prepare_panicked(id, &join_error)),
+            Err(_elapsed) => {
+                let hop = Arc::clone(self);
+                let late_id = id.clone();
+                tokio::spawn(async move { hop.discard_late_signing(&late_id, signing).await });
+                Err(self.prepare_timed_out(id))
+            }
+        }
+    }
+
+    /// Releases the nonces of a pair signed after its attempt timed out.
+    async fn discard_late_signing(
+        &self,
+        id: &UsdcRebalanceId,
+        signing: JoinHandle<Result<PreparedSwap, RelayBridgeError>>,
+    ) {
+        match signing.await {
+            Ok(Ok(prepared)) => {
+                warn!(target: "rebalance", %id, "Releasing the nonces of a Relay pair signed after its prepare timed out");
+                self.bridge.discard_prepared(TO_HUB, &prepared).await;
+            }
+            Ok(Err(error)) => {
+                warn!(target: "rebalance", %id, ?error, "A timed-out Relay pair signing failed; it holds no nonce");
+            }
+            Err(join_error) => {
+                prepare_panicked(id, &join_error);
+            }
+        }
+    }
+
+    /// `work`'s output, or [`UsdcTransferError::SwapPrepareTimedOut`] once
+    /// `deadline` passes.
+    async fn before<Output>(
+        &self,
+        id: &UsdcRebalanceId,
+        deadline: Instant,
+        work: impl Future<Output = Output>,
+    ) -> Result<Output, UsdcTransferError> {
+        tokio::time::timeout_at(deadline, work)
+            .await
+            .map_err(|_elapsed| self.prepare_timed_out(id))
+    }
+
+    fn prepare_timed_out(&self, id: &UsdcRebalanceId) -> UsdcTransferError {
+        let timeout = self.bounds.quote_max_age;
+        warn!(target: "rebalance", %id, ?timeout, "Relay pair prepare timed out; releasing the chain wallet's prepare lock");
+        UsdcTransferError::SwapPrepareTimedOut {
+            id: id.clone(),
+            timeout,
+        }
+    }
+
     /// Sends again, in nonce order, the approves that went out alone: the
-    /// pair's nonces follow theirs, and a node may have dropped them.
+    /// pair's nonces follow theirs, and a node may have dropped them. Each
+    /// is persisted, so a timeout leaves it for the retry.
     async fn broadcast_split_approves(
         &self,
+        id: &UsdcRebalanceId,
         split_approves: &[PreparedTransaction],
+        deadline: Instant,
     ) -> Result<(), UsdcTransferError> {
-        for approve in split_approves {
-            self.bridge
-                .broadcast_approve(TO_HUB, approve)
-                .await
-                .map_err(Box::new)?;
-        }
+        self.before(id, deadline, async {
+            for approve in split_approves {
+                self.bridge
+                    .broadcast_approve(TO_HUB, approve)
+                    .await
+                    .map_err(Box::new)?;
+            }
 
-        Ok(())
+            Ok(())
+        })
+        .await?
     }
 
     /// Persists the signed pair. When the write fails, the nonces are
@@ -712,10 +793,7 @@ where
 /// Pages that a Relay pair prepare panicked: nonces it reserved and did not
 /// persist are never released, so later sends from the chain wallet wait
 /// behind them until a restart.
-fn prepare_panicked(
-    id: &UsdcRebalanceId,
-    join_error: &tokio::task::JoinError,
-) -> UsdcTransferError {
+fn prepare_panicked(id: &UsdcRebalanceId, join_error: &JoinError) -> UsdcTransferError {
     error!(target: "operational_alert", alert = true, %id, %join_error, "The Relay pair prepare task panicked; nonces it reserved and did not persist stall later sends from the chain wallet until a restart");
     UsdcTransferError::SwapPrepareTaskPanicked { id: id.clone() }
 }
@@ -1925,13 +2003,17 @@ mod tests {
             .unwrap();
 
         let started = std::time::Instant::now();
-        tokio::time::timeout(
+        let error = tokio::time::timeout(
             Duration::from_secs(10),
             transfer.resume_base_to_alpaca(&id, Usdc::new(float!(100)), ROBINHOOD_RELAY),
         )
         .await
         .expect("the attempt ends")
         .unwrap_err();
+        assert!(
+            matches!(&error, UsdcTransferError::SwapPrepareTimedOut { id: timed_out, .. } if *timed_out == id),
+            "got {error:?}"
+        );
         assert!(
             started.elapsed() < Duration::from_secs(3),
             "the attempt must end at the bound, not when the signing returns"
