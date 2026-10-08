@@ -34,7 +34,7 @@ use st0x_event_sorcery::{
     EntityList, EventSourced, EventsSinceError, IdempotentReactor, Reactor, Sequenced, deps,
     events_since, head_rowid,
 };
-use st0x_execution::Direction;
+use st0x_execution::{Direction, HasZero};
 use st0x_finance::Usdc;
 use st0x_float_serde::format_float;
 
@@ -63,8 +63,6 @@ pub(crate) const DIRECTION_SELL_TEXT: &str = "Sell";
 /// migration's CHECK admits and the read side parses back.
 pub(crate) const TOKENIZATION_FEE_SOURCE: &str = "tokenization_fee";
 pub(crate) const CCTP_FEE_SOURCE: &str = "cctp_fee";
-pub(crate) const RELAY_FEE_SOURCE: &str = "relay_fee";
-pub(crate) const RELAY_SWAP_SOURCE: &str = "relay_swap";
 
 /// Event-log head returned by [`PnlLedger::catch_up`]. Holding one is proof
 /// the ledger has been caught up through that rowid, which is what makes an
@@ -185,6 +183,9 @@ impl PnlLedger {
             .execute(&mut *tx)
             .await?;
         sqlx::query("DELETE FROM pnl_cost_entry")
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM pnl_relay_cost")
             .execute(&mut *tx)
             .await?;
         sqlx::query("DELETE FROM pnl_bot_gas_cost")
@@ -587,7 +588,7 @@ async fn insert_mint_fee(
         "INSERT INTO pnl_cost_entry \
          (event_rowid, source, aggregate_id, symbol, amount_usd, occurred_at) \
          VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
-         ON CONFLICT(event_rowid, source) DO NOTHING",
+         ON CONFLICT(event_rowid) DO NOTHING",
     )
     .bind(rowid)
     .bind(TOKENIZATION_FEE_SOURCE)
@@ -615,11 +616,16 @@ async fn ingest_rebalance(
             filled_at,
             ..
         } => {
-            let swap = (fee_collected - relayer_fee)?;
-            for (source, amount) in [(RELAY_FEE_SOURCE, relayer_fee), (RELAY_SWAP_SOURCE, swap)] {
-                insert_rebalance_cost(tx, rowid, source, &id, amount, &filled_at).await?;
-            }
-            return Ok(());
+            let swap_cost = (fee_collected - relayer_fee)?;
+            return insert_relay_cost(tx, rowid, &id, relayer_fee, swap_cost, &filled_at).await;
+        }
+        // What a refund kept back is the swap's cost too.
+        UsdcRebalanceEvent::ReturnedToSource {
+            shortfall,
+            returned_at,
+            ..
+        } => {
+            return insert_relay_cost(tx, rowid, &id, Usdc::ZERO, shortfall, &returned_at).await;
         }
         UsdcRebalanceEvent::Bridged {
             fee_collected,
@@ -656,7 +662,6 @@ async fn ingest_rebalance(
         | UsdcRebalanceEvent::SwapFailed { .. }
         | UsdcRebalanceEvent::RedepositStarted { .. }
         | UsdcRebalanceEvent::RedepositSubmitted { .. }
-        | UsdcRebalanceEvent::ReturnedToSource { .. }
         | UsdcRebalanceEvent::AttestationTimedOut { .. }
         | UsdcRebalanceEvent::BridgeAttestationReceived { .. }
         | UsdcRebalanceEvent::BridgingFailed { .. }
@@ -667,20 +672,8 @@ async fn ingest_rebalance(
         | UsdcRebalanceEvent::OperatorReconciled { .. } => return Ok(()),
     };
 
-    insert_rebalance_cost(tx, rowid, CCTP_FEE_SOURCE, &id, fee_collected, &occurred_at).await
-}
-
-/// Writes one hop cost of a `UsdcRebalance` event. A zero amount produces no
-/// entry, as in today's replay; a Relay swap's amount is signed.
-async fn insert_rebalance_cost(
-    tx: &mut Transaction<'_, Sqlite>,
-    rowid: i64,
-    source: &'static str,
-    id: &UsdcRebalanceId,
-    amount: Usdc,
-    occurred_at: &DateTime<Utc>,
-) -> Result<(), PnlLedgerError> {
-    if amount.inner().is_zero()? {
+    // A zero CCTP fee produces no entry, as in today's replay.
+    if fee_collected.inner().is_zero()? {
         return Ok(());
     }
 
@@ -688,12 +681,44 @@ async fn insert_rebalance_cost(
         "INSERT INTO pnl_cost_entry \
          (event_rowid, source, aggregate_id, symbol, amount_usd, occurred_at) \
          VALUES (?1, ?2, ?3, NULL, ?4, ?5) \
-         ON CONFLICT(event_rowid, source) DO NOTHING",
+         ON CONFLICT(event_rowid) DO NOTHING",
     )
     .bind(rowid)
-    .bind(source)
+    .bind(CCTP_FEE_SOURCE)
     .bind(id.to_string())
-    .bind(format_float(&amount.inner())?)
+    .bind(format_float(&fee_collected.inner())?)
+    .bind(canonical_timestamp(&occurred_at))
+    .execute(&mut **tx)
+    .await?;
+
+    Ok(())
+}
+
+/// Writes the Relay hop costs of one `UsdcRebalance` event: the quote's
+/// relayer fee and the rest of the swap's cost, signed (a fill above the
+/// fee-adjusted input is a gain). Nothing to book produces no row.
+async fn insert_relay_cost(
+    tx: &mut Transaction<'_, Sqlite>,
+    rowid: i64,
+    id: &UsdcRebalanceId,
+    relayer_fee: Usdc,
+    swap_cost: Usdc,
+    occurred_at: &DateTime<Utc>,
+) -> Result<(), PnlLedgerError> {
+    if relayer_fee.inner().is_zero()? && swap_cost.inner().is_zero()? {
+        return Ok(());
+    }
+
+    sqlx::query(
+        "INSERT INTO pnl_relay_cost \
+         (event_rowid, aggregate_id, relayer_fee_usd, swap_cost_usd, occurred_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5) \
+         ON CONFLICT(event_rowid) DO NOTHING",
+    )
+    .bind(rowid)
+    .bind(id.to_string())
+    .bind(format_float(&relayer_fee.inner())?)
+    .bind(format_float(&swap_cost.inner())?)
     .bind(canonical_timestamp(occurred_at))
     .execute(&mut **tx)
     .await?;
@@ -802,59 +827,56 @@ mod tests {
             .unwrap()
     }
 
-    /// A Relay fill books its relayer fee and the rest of its cost apart,
-    /// from one event; a fill above the fee-adjusted input books the swap
-    /// signed, as a gain.
+    /// A Relay fill books its relayer fee and the rest of its cost in one
+    /// row, the swap's signed (a fill above the fee-adjusted input is a
+    /// gain), and a redeposit books what a refund kept back.
     #[tokio::test]
-    async fn relay_fill_books_its_relayer_fee_and_swap_cost() {
+    async fn relay_fill_and_refund_book_their_relay_costs() {
         let pool = setup_test_db().await;
-        let fills = [
-            (
-                UsdcRebalanceId(Uuid::new_v4()).to_string(),
-                float!(0.5),
-                "0.2",
-            ),
-            (
-                UsdcRebalanceId(Uuid::new_v4()).to_string(),
-                float!(0.1),
-                "-0.2",
-            ),
-        ];
-        for (id, fee_collected, _) in &fills {
-            persist_event::<UsdcRebalance>(
-                &pool,
-                id,
-                1,
-                &UsdcRebalanceEvent::RelayFillVerified {
-                    fill_tx: TxHash::repeat_byte(0xf1),
-                    amount_received: Usdc::new(float!(99.5)),
-                    fee_collected: Usdc::new(*fee_collected),
-                    relayer_fee: Usdc::new(float!(0.3)),
-                    filled_at: timestamp(7),
-                },
-            )
-            .await;
-        }
+        let gain = UsdcRebalanceId(Uuid::new_v4()).to_string();
+        let cost = UsdcRebalanceId(Uuid::new_v4()).to_string();
+        let refunded = UsdcRebalanceId(Uuid::new_v4()).to_string();
+        let fill = |fee_collected| UsdcRebalanceEvent::RelayFillVerified {
+            fill_tx: TxHash::repeat_byte(0xf1),
+            amount_received: Usdc::new(float!(99.5)),
+            fee_collected: Usdc::new(fee_collected),
+            relayer_fee: Usdc::new(float!(0.3)),
+            filled_at: timestamp(7),
+        };
+        persist_event::<UsdcRebalance>(&pool, &cost, 1, &fill(float!(0.5))).await;
+        persist_event::<UsdcRebalance>(&pool, &gain, 1, &fill(float!(0.1))).await;
+        persist_event::<UsdcRebalance>(
+            &pool,
+            &refunded,
+            1,
+            &UsdcRebalanceEvent::ReturnedToSource {
+                deposit_tx: TxHash::repeat_byte(0xd1),
+                deposit_block: None,
+                redeposit_amount: Usdc::new(float!(99.4)),
+                shortfall: Usdc::new(float!(0.6)),
+                returned_at: timestamp(8),
+            },
+        )
+        .await;
 
         PnlLedger::new(pool.clone()).catch_up().await.unwrap();
 
-        for (id, _, swap) in fills {
-            let rows: Vec<(String, Option<String>)> = sqlx::query_as(
-                "SELECT source, amount_usd FROM pnl_cost_entry WHERE aggregate_id = ?1 \
-                 ORDER BY source",
+        for (id, relayer_fee, swap_cost) in [
+            (cost, "0.3", "0.2"),
+            (gain, "0.3", "-0.2"),
+            (refunded, "0", "0.6"),
+        ] {
+            let row: (String, String) = sqlx::query_as(
+                "SELECT relayer_fee_usd, swap_cost_usd FROM pnl_relay_cost \
+                 WHERE aggregate_id = ?1",
             )
             .bind(&id)
-            .fetch_all(&pool)
+            .fetch_one(&pool)
             .await
             .unwrap();
-            assert_eq!(
-                rows,
-                vec![
-                    ("relay_fee".to_string(), Some("0.3".to_string())),
-                    ("relay_swap".to_string(), Some(swap.to_string())),
-                ]
-            );
+            assert_eq!(row, (relayer_fee.to_string(), swap_cost.to_string()));
         }
+        assert_eq!(count(&pool, "pnl_cost_entry").await, 0);
     }
 
     #[tokio::test]

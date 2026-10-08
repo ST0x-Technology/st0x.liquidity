@@ -304,6 +304,12 @@ fn cost_summary_to_dto(
 ) -> Result<PnlCostSummary, PnlError> {
     let offchain_execution_fees =
         (summary.offchain_execution_fees_usd + summary.regulatory_fees_usd)?;
+    // Relay costs net of swap gains: a net gain is shown as revenue.
+    let relay_effect = if float!(0).lt(summary.relay_costs_usd)? {
+        AccountingEffect::Revenue
+    } else {
+        AccountingEffect::Cost
+    };
     Ok(PnlCostSummary {
         total_tracked_costs_usd: fmt_decimal(total_tracked_costs(summary)?)?,
         total_tracked_revenue_usd: fmt_decimal(total_tracked_revenue(summary)?)?,
@@ -369,10 +375,10 @@ fn cost_summary_to_dto(
             coverage(
                 "Relay swap costs",
                 AccountingBucket::Generic,
-                AccountingEffect::Cost,
+                relay_effect,
                 "included",
                 summary.relay_costs_usd,
-                "Read from UsdcRebalance Relay fills: the quote's relayer fee, and the rest of the input less the proven fill as the swap's cost (a gain when the fill exceeds it).",
+                "Read from UsdcRebalance Relay fills (the quote's relayer fee, and the rest of the input less the proven fill, a gain when the fill exceeds it) and from redeposits after a refund (what the refund kept back).",
             )?,
             coverage(
                 "USD/USDC reporting basis",
