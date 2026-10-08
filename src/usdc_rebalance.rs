@@ -7772,6 +7772,88 @@ mod tests {
         }
     }
 
+    /// A refund re-quote counts once and the count rides every swap state to
+    /// the next refund; a snapshot from before the count reads zero.
+    #[test]
+    fn refund_requotes_count_through_the_swap_states() {
+        let requoted = [
+            refunded_toward_chain(RefundSide::Origin),
+            vec![UsdcRebalanceEvent::SwapRequoted {
+                quote: Box::new(swap_quote_for_test(
+                    U256::from(99_000_000u64),
+                    B256::repeat_byte(0x1e),
+                )),
+                quoted_at: Utc::now(),
+            }],
+        ]
+        .concat();
+        let prepared = [
+            requoted.clone(),
+            vec![UsdcRebalanceEvent::SwapDepositPrepared {
+                approve: None,
+                deposit: PreparedTransaction::for_test(TxHash::repeat_byte(0xa3), 7),
+                prepared_at: Utc::now(),
+            }],
+        ]
+        .concat();
+        let deposited_again = [
+            prepared.clone(),
+            vec![UsdcRebalanceEvent::SwapDeposited {
+                deposit_tx: TxHash::repeat_byte(0xa3),
+                deposit_block: 10,
+                deposited_at: Utc::now(),
+            }],
+        ]
+        .concat();
+        let unresolved = [
+            deposited_again.clone(),
+            vec![UsdcRebalanceEvent::SwapEscrowUnresolved {
+                unresolved_at: Utc::now(),
+            }],
+        ]
+        .concat();
+        let refunded_again = [
+            unresolved.clone(),
+            vec![UsdcRebalanceEvent::SwapRefunded {
+                refund_tx: TxHash::repeat_byte(0xe2),
+                side: RefundSide::Origin,
+                amount_refunded: Usdc::new(float!(98)),
+                refunded_at: Utc::now(),
+            }],
+        ]
+        .concat();
+
+        for events in [
+            requoted,
+            prepared,
+            deposited_again,
+            unresolved,
+            refunded_again,
+        ] {
+            let state = replay::<UsdcRebalance>(events).unwrap().unwrap();
+            let mut snapshot = to_value(&state).unwrap();
+            let fields = snapshot
+                .as_object_mut()
+                .and_then(|variant| variant.values_mut().next())
+                .and_then(serde_json::Value::as_object_mut)
+                .unwrap();
+            assert_eq!(
+                fields.remove("refund_requotes"),
+                Some(json!(1)),
+                "{state:?}"
+            );
+
+            let legacy: UsdcRebalance = from_value(snapshot).unwrap();
+            let mut legacy_fields = to_value(&legacy).unwrap();
+            let legacy_count = legacy_fields
+                .as_object_mut()
+                .and_then(|variant| variant.values_mut().next())
+                .and_then(serde_json::Value::as_object_mut)
+                .and_then(|fields| fields.remove("refund_requotes"));
+            assert_eq!(legacy_count, Some(json!(0)), "{legacy:?}");
+        }
+    }
+
     fn redepositing_initiated_at(state: &UsdcRebalance) -> DateTime<Utc> {
         let UsdcRebalance::Redepositing { initiated_at, .. } = state else {
             panic!("expected Redepositing, got {state:?}");
