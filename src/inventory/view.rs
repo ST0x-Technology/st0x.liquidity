@@ -3265,9 +3265,10 @@ impl InventoryView {
     /// because a stale poll could otherwise re-introduce inflight that was
     /// already cleared by a completed transfer.
     ///
-    /// Skips symbols with an active mint: the mint reactor owns their Hedging
-    /// inflight from `MintRequested` on. A poll that lists the request before
-    /// `MintAccepted` lands would otherwise count the shares a second time.
+    /// Skips symbols with an active mint, both when setting and when zeroing:
+    /// the mint reactor owns their Hedging inflight from `MintRequested` on. A
+    /// poll that lists the request before `MintAccepted` lands would otherwise
+    /// count the shares a second time.
     ///
     /// Mints are inflight at Hedging (shares leaving offchain broker toward
     /// onchain). Redemptions are inflight at MarketMaking (shares leaving
@@ -3316,8 +3317,12 @@ impl InventoryView {
 
         // Zero inflight for symbols that were in the previous poll but
         // disappeared. These are requests that completed or were rejected.
+        // An active mint owns the slot even if an earlier poll recorded it.
         for symbol in &prev_mints {
-            if !mints.contains_key(symbol) && !view.is_stale_for_symbol(symbol, fetched_at) {
+            if !mints.contains_key(symbol)
+                && !view.active_mints.contains_key(symbol)
+                && !view.is_stale_for_symbol(symbol, fetched_at)
+            {
                 view = view.update_equity(
                     symbol,
                     Inventory::set_inflight(Venue::Hedging, FractionalShares::ZERO),
