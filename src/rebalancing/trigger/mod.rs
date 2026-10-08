@@ -37137,6 +37137,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn inflight_recovery_carries_an_active_mint_the_poll_lists() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let now = Utc::now();
+        let inventory = InventoryView::default()
+            .with_equity(symbol.clone(), shares(50), shares(50))
+            .set_active_mint(symbol.clone(), Chain::Base, IssuerRequestId::generate())
+            .update_equity(
+                &symbol,
+                Inventory::transfer(Venue::Hedging, TransferOp::Start, shares(20)),
+                now,
+            )
+            .unwrap()
+            .apply_inflight_snapshot(
+                &BTreeMap::from([(symbol.clone(), shares(20))]),
+                &BTreeMap::new(),
+                now,
+                now,
+            )
+            .unwrap();
+        let trigger = make_trigger_with_inventory_and_registry(inventory, &symbol).await;
+
+        trigger
+            .on_snapshot_recovery(
+                RebalancingServiceError::Inventory(InventoryViewError::Equity(
+                    InventoryError::NegativeInflight {
+                        value: FractionalShares::new(float!(-1)),
+                    },
+                )),
+                InventorySnapshotEvent::ChainInflightRedemptions {
+                    chain: Chain::Robinhood,
+                    redemptions: BTreeMap::new(),
+                    fetched_at: now,
+                },
+            )
+            .await
+            .unwrap();
+
+        let view = trigger.inventory.read().await.clone();
+        assert_eq!(
+            view.equity_inflight(&symbol, Venue::Hedging),
+            Some(shares(20)),
+            "a Robinhood recovery must carry the listed Base mint's Hedging inflight"
+        );
+        assert_eq!(
+            view.equity_available(&symbol, Venue::Hedging),
+            Some(shares(30)),
+            "a Robinhood recovery must carry the listed Base mint's broker balance"
+        );
+    }
+
+    #[tokio::test]
     async fn recovery_path_expires_timed_out_mints_before_reapplying_inflight() {
         let symbol = Symbol::new("AAPL").unwrap();
         let fetched_at = Utc::now();
