@@ -26,6 +26,8 @@ use tracing::{debug, error, warn};
 use st0x_float_serde::format_float;
 
 pub(crate) mod inventory;
+pub(crate) mod prices;
+pub(crate) mod refresh;
 pub(crate) mod settings;
 
 /// The process-wide store `/metrics` renders, like the recorder it sits next
@@ -77,6 +79,8 @@ pub(crate) enum LiqMetric {
     UsdcChainAvailable,
     UsdcChainInflight,
     UsdcChainRatio,
+    PositionLastPriceUsd,
+    EquityExposureUsd,
     CollectorLastSuccessTsSeconds,
 }
 
@@ -84,7 +88,7 @@ impl LiqMetric {
     /// Every variant, for the catalog tests. A new variant needs an entry
     /// here and its name in the catalog test.
     #[cfg(test)]
-    pub(crate) const ALL: [Self; 42] = [
+    pub(crate) const ALL: [Self; 44] = [
         Self::BotInfo,
         Self::BotStartTimestampSeconds,
         Self::SettingsInfo,
@@ -126,6 +130,8 @@ impl LiqMetric {
         Self::UsdcChainAvailable,
         Self::UsdcChainInflight,
         Self::UsdcChainRatio,
+        Self::PositionLastPriceUsd,
+        Self::EquityExposureUsd,
         Self::CollectorLastSuccessTsSeconds,
     ];
 
@@ -172,6 +178,8 @@ impl LiqMetric {
             Self::UsdcChainAvailable => "liq_usdc_chain_available",
             Self::UsdcChainInflight => "liq_usdc_chain_inflight",
             Self::UsdcChainRatio => "liq_usdc_chain_ratio",
+            Self::PositionLastPriceUsd => "liq_position_last_price_usd",
+            Self::EquityExposureUsd => "liq_equity_exposure_usd",
             Self::CollectorLastSuccessTsSeconds => "liq_collector_last_success_ts_seconds",
         }
     }
@@ -258,6 +266,10 @@ impl LiqMetric {
             Self::UsdcChainRatio => {
                 "Vault share of itself plus gross broker cash; absent until gross is read or both 0"
             }
+            Self::PositionLastPriceUsd => {
+                "Live wrapped-token mid price in USD of each symbol with a position"
+            }
+            Self::EquityExposureUsd => "Net position times its live price, in USD",
             Self::CollectorLastSuccessTsSeconds => {
                 "Unix time each liq_ collector last published its family"
             }
@@ -287,7 +299,9 @@ impl LiqMetric {
             | Self::EquityTotal
             | Self::EquityUnwrapped
             | Self::EquityWrapped
-            | Self::EquityRatio => &["symbol"],
+            | Self::EquityRatio
+            | Self::PositionLastPriceUsd
+            | Self::EquityExposureUsd => &["symbol"],
             Self::EquityChainAvailable => &["chain", "symbol"],
             Self::UsdcCorridorTarget
             | Self::UsdcCorridorDeviation
@@ -365,6 +379,7 @@ impl LiqMetric {
             | Self::UsdcChainAvailable
             | Self::UsdcChainInflight
             | Self::UsdcChainRatio => Some(LiqFamily::Inventory),
+            Self::PositionLastPriceUsd | Self::EquityExposureUsd => Some(LiqFamily::Prices),
             Self::CollectorLastSuccessTsSeconds => None,
         }
     }
@@ -376,6 +391,7 @@ pub(crate) enum LiqFamily {
     Health,
     Settings,
     Inventory,
+    Prices,
 }
 
 impl LiqFamily {
@@ -385,6 +401,7 @@ impl LiqFamily {
             Self::Health => "health",
             Self::Settings => "settings",
             Self::Inventory => "inventory",
+            Self::Prices => "prices",
         }
     }
 }
@@ -480,6 +497,11 @@ impl LiqFamilies {
     /// in the same process) never starts below a stored generation.
     pub(crate) fn next_generation(&self) -> u64 {
         self.generations.fetch_add(1, Ordering::SeqCst) + 1
+    }
+
+    /// The last number [`Self::next_generation`] gave out.
+    pub(crate) fn current_generation(&self) -> u64 {
+        self.generations.load(Ordering::SeqCst)
     }
 
     /// Like [`Self::replace`], for a family several publishers write: each
@@ -923,13 +945,20 @@ pub(crate) mod tests {
                 "liq_usdc_chain_available",
                 "liq_usdc_chain_inflight",
                 "liq_usdc_chain_ratio",
+                "liq_position_last_price_usd",
+                "liq_equity_exposure_usd",
                 "liq_collector_last_success_ts_seconds",
             ]
         );
         assert_eq!(
-            [LiqFamily::Health, LiqFamily::Settings, LiqFamily::Inventory]
-                .map(LiqFamily::collector),
-            ["health", "settings", "inventory"]
+            [
+                LiqFamily::Health,
+                LiqFamily::Settings,
+                LiqFamily::Inventory,
+                LiqFamily::Prices,
+            ]
+            .map(LiqFamily::collector),
+            ["health", "settings", "inventory", "prices"]
         );
     }
 

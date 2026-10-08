@@ -1772,7 +1772,15 @@ write order, and the store ignores a copy older than the one it holds, so a slow
 publisher never puts older balances back. Publishing starts once boot has
 restored the inventory from its snapshots: before that the view is empty, and
 its series would read as zero balances. If boot fails to read a snapshot, the
-inventory series stay unpublished until the next start and an error is logged.
+inventory series stay unpublished until the next start and an error is logged. A
+task republishes the inventory every 60 seconds, which covers quiet periods.
+
+Every 60 seconds the same task publishes `liq_position_last_price_usd{symbol}`
+and `liq_equity_exposure_usd{symbol}` (net position times that price) for each
+symbol with a position. The price is the live, unexpired wrapped-token price
+from the pricing feed; positions and prices join on the `symbol` label. A symbol
+with a price but no position, or a position without a live price, has no series.
+If the positions fail to load, the last published prices stay.
 
 - `liq_equity_*{symbol}` and the unlabelled `liq_usdc_*` series keep the
   exporter's meaning: the onchain values are the primary chain's vault only,
