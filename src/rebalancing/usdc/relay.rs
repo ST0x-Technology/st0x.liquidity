@@ -5661,6 +5661,82 @@ mod tests {
         assert!(state.is_reconcilable_failure());
     }
 
+    /// A refund paid at the other end that a recheck adopts pages at once,
+    /// and every resume of it pages again: the stable sits outside the vault
+    /// and Alpaca, guard held, until the operator moves it.
+    #[tokio::test]
+    #[tracing_test::traced_test]
+    async fn refund_adopted_at_the_other_end_pages_on_recheck_and_resume() {
+        let rig = RelayRig::deploy().await;
+        let order_id = B256::repeat_byte(0x0d);
+        let refund_tx = rig
+            .refund_on_hub(U256::from(99_500_000_u64), order_id)
+            .await;
+        let server = MockServer::start();
+        let relay_api = MockServer::start();
+        mock_status(
+            &relay_api,
+            json!({"status": "refund", "txHashes": [refund_tx], "failReason": "SOLVER_CAPACITY_EXCEEDED"}),
+        );
+        let store = Arc::new(test_store(setup_test_db().await, ()));
+        let transfer = rig
+            .transfer(&server, &relay_api, store.clone(), relay_bounds())
+            .await;
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        record_deposited(&store, &id).await;
+        store
+            .send(
+                &id,
+                UsdcRebalanceCommand::FailSwap {
+                    reason: "Relay reported Failure".to_string(),
+                },
+            )
+            .await
+            .unwrap();
+
+        let outcome =
+            tokio::time::timeout(Duration::from_secs(60), transfer.recheck_deposit(&id, None))
+                .await
+                .expect("the recheck ends")
+                .unwrap();
+
+        assert_eq!(outcome, RecheckOutcome::Recovered);
+        let state = store.load(&id).await.unwrap().unwrap();
+        assert!(
+            matches!(
+                state,
+                UsdcRebalance::SwapRefunded {
+                    side: RefundSide::Destination,
+                    ..
+                }
+            ),
+            "{state:?}"
+        );
+        let pages = |phrase: &'static str| {
+            move |lines: &[&str]| {
+                lines
+                    .iter()
+                    .any(|line| line.contains("operational_alert") && line.contains(phrase))
+                    .then_some(())
+                    .ok_or_else(|| format!("no operational alert says {phrase:?}"))
+            }
+        };
+        logs_assert(pages(
+            "Recheck adopted a Relay refund paid at the other end",
+        ));
+
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            transfer.resume_base_to_alpaca(&id, Usdc::new(float!(100)), ROBINHOOD_RELAY),
+        )
+        .await
+        .expect("the resume ends")
+        .unwrap();
+        logs_assert(pages(
+            "the transfer holds its guard for the operator to move it",
+        ));
+    }
+
     /// `transfer recheck` of a failed order Relay still reports unpaid
     /// changes nothing; it refuses an operator deposit tx and a Relay state
     /// that is not a held escrow.
