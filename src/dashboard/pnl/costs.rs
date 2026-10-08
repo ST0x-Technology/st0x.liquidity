@@ -142,6 +142,7 @@ pub(crate) struct CostSummaryAcc {
     pub(crate) tokenization_fees_usd: Float,
     pub(crate) cctp_fees_usd: Float,
     pub(crate) relay_costs_usd: Float,
+    pub(crate) relay_entry_count: usize,
     pub(crate) conversion_slippage_usd: Float,
     pub(crate) oracle_write_cost_usd: Float,
     pub(crate) broker_fees_usd: Float,
@@ -171,6 +172,7 @@ impl Default for CostSummaryAcc {
             tokenization_fees_usd: float!(0),
             cctp_fees_usd: float!(0),
             relay_costs_usd: float!(0),
+            relay_entry_count: 0,
             conversion_slippage_usd: float!(0),
             oracle_write_cost_usd: float!(0),
             broker_fees_usd: float!(0),
@@ -235,6 +237,7 @@ fn add_cost(
         }
         CostCategory::RelayFee | CostCategory::RelaySwap => {
             summary.relay_costs_usd = (summary.relay_costs_usd + signed_amount)?;
+            summary.relay_entry_count += 1;
         }
         CostCategory::BotGas => {
             summary.bot_gas_usd = (summary.bot_gas_usd + amount)?;
@@ -376,7 +379,7 @@ fn cost_summary_to_dto(
                 "Relay swap costs",
                 AccountingBucket::Generic,
                 relay_effect,
-                "included",
+                included_when_observed(summary.relay_entry_count),
                 summary.relay_costs_usd,
                 "Read from UsdcRebalance Relay fills (the quote's relayer fee, and the rest of the input less the proven fill, a gain when the fill exceeds it) and from redeposits after a refund (what the refund kept back).",
             )?,
@@ -485,6 +488,8 @@ pub(crate) fn with_costs(
 
 #[derive(Debug, Clone, Copy)]
 struct CostEntryDefinition {
+    /// The ledger table its rows come from, for error reports.
+    table: &'static str,
     aggregate_type: &'static str,
     category: CostCategory,
     accounting_bucket: AccountingBucket,
@@ -493,6 +498,7 @@ struct CostEntryDefinition {
 }
 
 const TOKENIZATION_FEE_ENTRY: CostEntryDefinition = CostEntryDefinition {
+    table: "pnl_cost_entry",
     aggregate_type: "TokenizedEquityMint",
     category: CostCategory::TokenizationFee,
     accounting_bucket: AccountingBucket::Generic,
@@ -501,6 +507,7 @@ const TOKENIZATION_FEE_ENTRY: CostEntryDefinition = CostEntryDefinition {
 };
 
 const CCTP_FEE_ENTRY: CostEntryDefinition = CostEntryDefinition {
+    table: "pnl_cost_entry",
     aggregate_type: "UsdcRebalance",
     category: CostCategory::CctpFee,
     accounting_bucket: AccountingBucket::Generic,
@@ -509,6 +516,7 @@ const CCTP_FEE_ENTRY: CostEntryDefinition = CostEntryDefinition {
 };
 
 const RELAY_FEE_ENTRY: CostEntryDefinition = CostEntryDefinition {
+    table: "pnl_relay_cost",
     aggregate_type: "UsdcRebalance",
     category: CostCategory::RelayFee,
     accounting_bucket: AccountingBucket::Generic,
@@ -517,6 +525,7 @@ const RELAY_FEE_ENTRY: CostEntryDefinition = CostEntryDefinition {
 };
 
 const RELAY_SWAP_ENTRY: CostEntryDefinition = CostEntryDefinition {
+    table: "pnl_relay_cost",
     aggregate_type: "UsdcRebalance",
     category: CostCategory::RelaySwap,
     accounting_bucket: AccountingBucket::Generic,
@@ -533,7 +542,7 @@ fn ledger_cost_entry(
     amount: &str,
     warnings: &mut Vec<String>,
 ) -> Result<CostEntryInternal, PnlError> {
-    let amount_usd = parse_ledger_decimal("pnl_cost_entry", row.event_rowid, "amount_usd", amount)?;
+    let amount_usd = parse_ledger_decimal(definition.table, row.event_rowid, "amount_usd", amount)?;
     let amount_usd = validated_cost_magnitude(
         amount_usd,
         row.event_rowid,
@@ -654,7 +663,7 @@ pub(crate) fn build_cost_entries(
             }
             (CostSource::RelayFee | CostSource::RelaySwap, None) => {
                 return Err(PnlError::InvalidLedgerRow {
-                    table: "pnl_cost_entry",
+                    table: "pnl_relay_cost",
                     rowid: row.event_rowid,
                     reason: "relay cost row missing amount",
                 });
