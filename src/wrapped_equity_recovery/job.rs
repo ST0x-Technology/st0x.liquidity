@@ -50,6 +50,7 @@ use super::aggregate::{
     DetectionFailureDisposition, WrappedEquityRecovery, WrappedEquityRecoveryCommand,
     WrappedEquityRecoveryError, WrappedEquityRecoveryId,
 };
+use crate::alerts::AlertKind;
 #[cfg(test)]
 use crate::bot_gas::BotGasReceiptCostEnqueuer;
 use crate::bot_gas::redrive::{BotGasFailureClassifier, redrive_on_bot_gas_failure};
@@ -492,6 +493,7 @@ impl WrappedEquityRecoveryJob {
         error!(
             target: "operational_alert",
             alert = true,
+            kind = AlertKind::WrappedRecoveryValidationFailed.as_str(),
             chain = %self.chain,
             symbol = %self.symbol,
             recovery_id = %self.recovery_id,
@@ -661,6 +663,7 @@ async fn wait_or_retry_after_validation(
         error!(
             target: "operational_alert",
             alert = true,
+            kind = AlertKind::RecoveryActiveTransferOnOtherChain.as_str(),
             chain = %job.chain,
             symbol = %job.symbol,
             recovery_id = %job.recovery_id,
@@ -768,6 +771,7 @@ async fn finish(
             error!(
                 target: "operational_alert",
                 alert = true,
+                kind = AlertKind::RecoveryChainServicesMissing.as_str(),
                 chain = %job.chain,
                 symbol = %job.symbol,
                 recovery_id = %job.recovery_id,

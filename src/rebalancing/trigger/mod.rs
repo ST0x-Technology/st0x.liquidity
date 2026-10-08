@@ -59,6 +59,7 @@ use self::allocation::{
 use self::freeze::FreezeStatusReader;
 use self::usdc::UsdcRebalanceOperation;
 use self::usdc_guard::{CashGuardClaim, ClaimRefusal};
+use crate::alerts::AlertKind;
 #[cfg(test)]
 use crate::alerts::LogNotifier;
 #[cfg(test)]
@@ -1091,7 +1092,7 @@ pub(crate) struct RebalancingService {
     corridor_not_served_alerted: Arc<RwLock<HashSet<UsdcRebalanceId>>>,
     /// Every-corridor latch pages (startup's and one per runtime transfer)
     /// until each is delivered.
-    pending_latch_pages: RwLock<VecDeque<String>>,
+    pending_latch_pages: RwLock<VecDeque<(AlertKind, String)>>,
     /// Transfers whose runtime every-corridor latch page was queued.
     latch_paged: RwLock<HashSet<UsdcRebalanceId>>,
     /// Transfers whose load-error page was queued.
@@ -1906,7 +1907,11 @@ impl RebalancingService {
                 first_seen,
                 self.pending_mint_resumes.get(&symbol, chain),
             );
-            let delivery = match self.notifier.notify(&message).await {
+            let delivery = match self
+                .notifier
+                .notify(AlertKind::RecoveryHoldsSymbol, &message)
+                .await
+            {
                 Ok(()) => RecoveryHoldAlertDelivery::Delivered { at: now },
                 Err(error) => {
                     warn!(target: "rebalance", %symbol, %chain, ?error,
@@ -1975,7 +1980,7 @@ impl RebalancingService {
                     .await
                     .contains(&id)
                 {
-                    match self.notifier.notify(&format!(
+                    match self.notifier.notify(AlertKind::TransferTimeoutUncertainOutcome, &format!(
                         "Mint request {id} for {} exceeded the transfer timeout with an uncertain \
                          provider outcome. Guard and inventory preserved. Operator reconciliation required.",
                         pending_tracking.symbol,
@@ -2433,7 +2438,7 @@ impl RebalancingService {
                     let already_alerted = self.post_burn_timeout_alerted.read().await.contains(&id);
 
                     if !already_alerted {
-                        match self.notifier.notify(&format!(
+                        match self.notifier.notify(AlertKind::TimedOutAfterCctpBurn, &format!(
                             "USDC transfer {id} timed out after CCTP burn on the {} corridor and is \
                              stalled. Guard preserved. Stage: {}. Elapsed: {elapsed:?}. Manual \
                              operator action required.",
@@ -2543,12 +2548,15 @@ impl RebalancingService {
         if !self.unconfirmed_burn_hold_alerted.read().await.contains(id) {
             match self
                 .notifier
-                .notify(&format!(
-                    "USDC transfer {id} on the {} corridor stopped in {state} with no \
+                .notify(
+                    AlertKind::UsdcHeldWithoutConfirmedBurn,
+                    &format!(
+                        "USDC transfer {id} on the {} corridor stopped in {state} with no \
                      confirmed CCTP burn; its funds are off Alpaca. Guard held. Elapsed: \
                      {elapsed:?}. {recovery}",
-                    tracking.corridor,
-                ))
+                        tracking.corridor,
+                    ),
+                )
                 .await
             {
                 Ok(()) => {
@@ -2602,7 +2610,11 @@ impl RebalancingService {
              (docs/cli-ops.md).{outbound}"
         );
 
-        if let Err(error) = self.notifier.notify(&message).await {
+        if let Err(error) = self
+            .notifier
+            .notify(AlertKind::UsdcCorridorMismatch, &message)
+            .await
+        {
             self.corridor_not_served_alerted.write().await.remove(id);
             warn!(
                 target: "rebalance",
@@ -3062,9 +3074,9 @@ impl RebalancingService {
 
         let chain = tracking.chain;
         let elapsed_secs = elapsed.as_secs();
-        let message = newest_send.map_or_else(
+        let (kind, message) = newest_send.map_or_else(
             || {
-                format!(
+                let message = format!(
                     "Equity redemption {id} on {chain} has a legacy pending send to the issuer \
                      with no recorded transaction after {elapsed_secs}s. The transfer keeps its \
                      guard and inflight, and recovery will not sign again. Find the previous \
@@ -3072,7 +3084,8 @@ impl RebalancingService {
                      docs/cli-ops.md: it says what to do whether or not the transfer landed, \
                      before you close it with `stox transfer reconcile --kind redemption --id \
                      {id}`."
-                )
+                );
+                (AlertKind::RedemptionLegacyPendingSend, message)
             },
             |send| {
                 let tx_hash = send.tx_hash();
@@ -3085,7 +3098,7 @@ impl RebalancingService {
                         )
                     },
                 );
-                format!(
+                let message = format!(
                     "Equity redemption {id} on {chain} has a signed redemption transfer to the \
                      issuer whose newest copy {tx_hash} (nonce {nonce}, {fees}) has not \
                      confirmed after {elapsed_secs}s. \
@@ -3102,11 +3115,12 @@ impl RebalancingService {
                      redemption naming that self-transfer (`stox transfer reconcile --kind \
                      redemption --id {id} --superseding-tx <cancel>`), which releases its \
                      reservation and the wallet's hold on its nonce."
-                )
+                );
+                (AlertKind::RedemptionSendTimedOut, message)
             },
         );
 
-        if let Err(error) = self.notifier().notify(&message).await {
+        if let Err(error) = self.notifier().notify(kind, &message).await {
             warn!(
                 target: "rebalance",
                 %id,
@@ -8551,9 +8565,16 @@ impl RebalancingService {
         // queued and retried by the sweep until delivered; a later runtime
         // latch queues its own transfer's page behind it.
         if unclassified {
-            self.pending_latch_pages.write().await.push_back(message);
+            self.pending_latch_pages
+                .write()
+                .await
+                .push_back((AlertKind::UsdcLatchedOnEveryCorridor, message));
             self.deliver_pending_latch_pages().await;
-        } else if let Err(error) = self.notifier.notify(&message).await {
+        } else if let Err(error) = self
+            .notifier
+            .notify(AlertKind::UsdcLatchedOnStartup, &message)
+            .await
+        {
             warn!(target: "rebalance", ?error, "Failed to deliver USDC startup-stranded alert");
         }
     }
@@ -31480,7 +31501,11 @@ mod tests {
 
     #[async_trait::async_trait]
     impl crate::alerts::Notifier for FlakyNotifier {
-        async fn notify(&self, message: &str) -> Result<(), crate::alerts::NotifierError> {
+        async fn notify(
+            &self,
+            _kind: crate::alerts::AlertKind,
+            message: &str,
+        ) -> Result<(), crate::alerts::NotifierError> {
             let should_fail = self
                 .remaining_failures
                 .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
@@ -43987,9 +44012,13 @@ mod tests {
 
     #[async_trait]
     impl crate::alerts::Notifier for YieldingNotifier {
-        async fn notify(&self, message: &str) -> Result<(), crate::alerts::NotifierError> {
+        async fn notify(
+            &self,
+            kind: crate::alerts::AlertKind,
+            message: &str,
+        ) -> Result<(), crate::alerts::NotifierError> {
             tokio::task::yield_now().await;
-            self.0.notify(message).await
+            self.0.notify(kind, message).await
         }
     }
 

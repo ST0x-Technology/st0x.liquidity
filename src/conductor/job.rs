@@ -25,7 +25,7 @@ use tracing::{debug, error, warn};
 use st0x_execution::{AlpacaBrokerApiError, AlpacaWalletError, Backpressure, Permanence};
 use st0x_tokenization::{AlpacaTokenizationError, TokenizerError};
 
-use crate::alerts::Notifier;
+use crate::alerts::{AlertKind, Notifier};
 
 /// Deterministic exponential backoff for the apalis retry layer.
 /// Doubles the delay each attempt up to `max`, with no jitter (unnecessary
@@ -658,6 +658,11 @@ where
     /// a terminal failure for this job.
     const TERMINAL_FAILURE_MSG: &'static str = "Job failed after retries";
 
+    /// The alert kind of [`TERMINAL_FAILURE_MSG`](Job::TERMINAL_FAILURE_MSG):
+    /// the kind of its page unless the failure's error names a more specific
+    /// one.
+    const TERMINAL_FAILURE_KIND: AlertKind = AlertKind::JobFailedAfterRetries;
+
     /// Upper bound on a single [`perform`](Job::perform) invocation, past
     /// which the attempt fails instead of parking the worker (RAI-2218). No
     /// default: every impl states its own bound so the choice is conscious,
@@ -780,6 +785,7 @@ macro_rules! build_supervised_worker {
             $crate::conductor::job::on_terminal_failure(
                 $failure_notify,
                 <$job as $crate::conductor::job::Job<$ctx_type>>::TERMINAL_FAILURE_MSG,
+                <$job as $crate::conductor::job::Job<$ctx_type>>::TERMINAL_FAILURE_KIND,
             )
             $(, $failure_injector)?
         )
@@ -839,6 +845,7 @@ macro_rules! build_best_effort_worker {
             .on_event($crate::conductor::job::on_best_effort_terminal_failure(
                 $notifier,
                 <$job as $crate::conductor::job::Job<$ctx_type>>::TERMINAL_FAILURE_MSG,
+                <$job as $crate::conductor::job::Job<$ctx_type>>::TERMINAL_FAILURE_KIND,
             ))
             .build($crate::conductor::job::work::<$ctx_type, $job>)
     }};
@@ -1364,6 +1371,7 @@ fn attempt_is_terminal(current_attempt: usize, max_attempts: usize) -> bool {
 pub(crate) struct TerminalFailureInfo {
     pub(crate) worker: String,
     pub(crate) context: &'static str,
+    pub(crate) kind: AlertKind,
     pub(crate) source: Arc<BoxDynError>,
 }
 
@@ -1439,6 +1447,7 @@ impl TerminalFailureSignal {
 pub(crate) fn on_terminal_failure(
     failure_signal: Arc<TerminalFailureSignal>,
     error_msg: &'static str,
+    error_kind: AlertKind,
 ) -> impl Fn(&WorkerContext, &Event) + Send + Sync + 'static {
     move |ctx, event| {
         if let Event::Error(err) = event {
@@ -1447,6 +1456,7 @@ pub(crate) fn on_terminal_failure(
             failure_signal.record_and_notify(TerminalFailureInfo {
                 worker,
                 context: error_msg,
+                kind: error_kind,
                 source: Arc::clone(err),
             });
             let _ = ctx.stop();
@@ -1469,6 +1479,7 @@ pub(crate) fn on_terminal_failure(
 pub(crate) fn on_best_effort_terminal_failure(
     notifier: Arc<dyn Notifier>,
     error_msg: &'static str,
+    error_kind: AlertKind,
 ) -> impl Fn(&WorkerContext, &Event) + Send + Sync + 'static {
     let last_alerted_task = Arc::new(std::sync::Mutex::new(None::<TaskIdentity>));
 
@@ -1500,11 +1511,14 @@ pub(crate) fn on_best_effort_terminal_failure(
 
         let message =
             format!("st0x-hedge: {worker}: {error_msg}: {err}; worker and conductor will continue");
+        // The most specific known cause in the rendered error names the page,
+        // as the log extractor reads it; the job's own kind otherwise.
+        let kind = AlertKind::most_specific_in(&message).unwrap_or(error_kind);
         let notifier = Arc::clone(&notifier);
         tokio::spawn(async move {
             match tokio::time::timeout(
                 super::TERMINAL_FAILURE_ALERT_TIMEOUT,
-                notifier.notify(&message),
+                notifier.notify(kind, &message),
             )
             .await
             {
@@ -1596,7 +1610,8 @@ mod tests {
                         .retry(RetryPolicy::retries(WORKER_RETRIES).with_backoff(FAST_BACKOFF))
                         .on_event(on_best_effort_terminal_failure(
                             Arc::new(CapturingNotifier::default()),
-                            "low-budget terminal failure",
+                            "Job failed after retries",
+                            AlertKind::JobFailedAfterRetries,
                         ))
                         .build(work::<HookCtx, HookJob>)
                 });
@@ -1617,8 +1632,11 @@ mod tests {
     #[tokio::test]
     async fn best_effort_alerts_once_per_task_when_rendered_errors_match() {
         let notifier = Arc::new(CapturingNotifier::default());
-        let handler =
-            on_best_effort_terminal_failure(notifier.clone(), "test best-effort terminal failure");
+        let handler = on_best_effort_terminal_failure(
+            notifier.clone(),
+            "Job failed after retries",
+            AlertKind::JobFailedAfterRetries,
+        );
         let ctx = WorkerContext::new::<TestJob>("test-best-effort-worker");
         let first = terminal_job_event("first-task");
         let second = terminal_job_event("second-task");
@@ -1642,6 +1660,56 @@ mod tests {
             "duplicate events must collapse without collapsing distinct tasks: {messages:?}",
         );
         assert_eq!(messages[0], messages[1], "the rendered errors must match");
+        assert_eq!(
+            notifier.kinds(),
+            [
+                AlertKind::JobFailedAfterRetries,
+                AlertKind::JobFailedAfterRetries
+            ]
+        );
+    }
+
+    #[derive(Debug, thiserror::Error)]
+    #[error("Raindex vault withdraw failed: inventory vault under-funded: {0}")]
+    struct UnderFundedJobError(#[source] JobError);
+
+    /// A dead letter pages as the most specific known cause in its error, as
+    /// the log extractor reads it, not as the generic job failure.
+    #[tokio::test]
+    async fn best_effort_alert_takes_the_kind_of_the_most_specific_cause() {
+        let notifier = Arc::new(CapturingNotifier::default());
+        let handler = on_best_effort_terminal_failure(
+            notifier.clone(),
+            "Job failed after retries",
+            AlertKind::JobFailedAfterRetries,
+        );
+        let ctx = WorkerContext::new::<TestJob>("test-best-effort-worker");
+        let error: BoxDynError = Box::new(UnderFundedJobError(JobError::Injected {
+            task_identity: TaskIdentity("under-funded-task".to_owned()),
+            durably_terminal: true,
+        }));
+
+        handler(&ctx, &Event::Error(Arc::new(error)));
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while notifier.kinds().is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the dead letter must alert");
+        assert_eq!(notifier.kinds(), [AlertKind::InventoryVaultUnderFunded]);
+    }
+
+    /// The default terminal failure text carries its kind's phrase, so a
+    /// dead letter pages under that kind when its error names nothing more
+    /// specific.
+    #[test]
+    fn default_terminal_failure_message_carries_its_kind() {
+        assert_eq!(
+            AlertKind::most_specific_in(<TestJob as Job<TestCtx>>::TERMINAL_FAILURE_MSG),
+            Some(<TestJob as Job<TestCtx>>::TERMINAL_FAILURE_KIND)
+        );
     }
 
     #[derive(Debug, thiserror::Error)]
@@ -2867,6 +2935,7 @@ mod tests {
                         .on_event(on_terminal_failure(
                             failure_notify.clone(),
                             "stress test terminal failure",
+                            AlertKind::JobFailedAfterRetries,
                         ))
                         .build(work::<TestCtx, TestJob>)
                 });
@@ -3297,6 +3366,7 @@ mod tests {
                 signal.record_and_notify(TerminalFailureInfo {
                     worker: "worker-a".to_string(),
                     context: "context-a",
+                    kind: AlertKind::JobFailedAfterRetries,
                     source: source_a,
                 });
             }
@@ -3309,6 +3379,7 @@ mod tests {
                 signal.record_and_notify(TerminalFailureInfo {
                     worker: "worker-b".to_string(),
                     context: "context-b",
+                    kind: AlertKind::JobFailedAfterRetries,
                     source: source_b,
                 });
             }

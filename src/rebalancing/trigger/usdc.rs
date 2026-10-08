@@ -13,6 +13,7 @@ use st0x_evm::Chain;
 use st0x_finance::{Usd, Usdc};
 
 use super::{RebalancingService, RebalancingServiceError};
+use crate::alerts::AlertKind;
 use crate::conductor::job::{Job, JobQueue, Label, QueuePushError};
 use crate::inventory::{
     ActiveUsdcRebalance, BroadcastingInventory, Imbalance, ImbalanceThreshold, Inventory,
@@ -788,7 +789,10 @@ impl RebalancingService {
                  be read. Repair the transfer's stored events, then restart the bot; \
                  only a restart lifts this latch."
             );
-            self.pending_latch_pages.write().await.push_back(message);
+            self.pending_latch_pages
+                .write()
+                .await
+                .push_back((AlertKind::UsdcLatchedOnEveryCorridor, message));
         }
     }
 
@@ -803,7 +807,10 @@ impl RebalancingService {
                  timeout sweep retries the load every tick and unblocks once it reads; retry \
                  or restart the bot if it persists."
             );
-            self.pending_latch_pages.write().await.push_back(message);
+            self.pending_latch_pages
+                .write()
+                .await
+                .push_back((AlertKind::UsdcBlockedOnEveryCorridor, message));
         }
     }
 
@@ -848,17 +855,20 @@ impl RebalancingService {
     /// USDC event lock; a failed delivery stays queued for the next sweep.
     pub(super) async fn deliver_pending_latch_pages(&self) {
         loop {
-            let Some(message) = self.pending_latch_pages.write().await.pop_front() else {
+            let Some((kind, message)) = self.pending_latch_pages.write().await.pop_front() else {
                 return;
             };
 
-            if let Err(error) = self.notifier.notify(&message).await {
+            if let Err(error) = self.notifier.notify(kind, &message).await {
                 warn!(
                     target: "rebalance",
                     ?error,
                     "Failed to deliver an every-corridor latch page; will retry next sweep"
                 );
-                self.pending_latch_pages.write().await.push_front(message);
+                self.pending_latch_pages
+                    .write()
+                    .await
+                    .push_front((kind, message));
                 return;
             }
         }

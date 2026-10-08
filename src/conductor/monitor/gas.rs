@@ -37,7 +37,7 @@ use tracing::{error, info, warn};
 
 use st0x_evm::Chain;
 
-use crate::alerts::Notifier;
+use crate::alerts::{AlertKind, Notifier};
 use crate::native_gas::BalanceReader;
 
 /// Tracks whether the balance is currently in the low-alert state, and when the
@@ -192,7 +192,7 @@ impl GasMonitor {
                     threshold_native,
                     native_token
                 );
-                self.send(&message).await;
+                self.send_low_gas(&message).await;
             }
             // Deliberately log-only: notifying would page severity-critical
             // for good news, and because recovery resets the dedup state, a
@@ -212,10 +212,10 @@ impl GasMonitor {
         }
     }
 
-    /// Sends a notification, logging (but not propagating) a delivery failure
-    /// so a flaky notifier never crashes the supervised task.
-    async fn send(&self, message: &str) {
-        if let Err(error) = self.notifier.notify(message).await {
+    /// Sends the low-gas alert, logging (but not propagating) a delivery
+    /// failure so a flaky notifier never crashes the supervised task.
+    async fn send_low_gas(&self, message: &str) {
+        if let Err(error) = self.notifier.notify(AlertKind::LowGas, message).await {
             warn!(
                 target: "gas",
                 ?error,
@@ -280,7 +280,11 @@ mod tests {
 
     #[async_trait]
     impl Notifier for CapturingNotifier {
-        async fn notify(&self, message: &str) -> Result<(), crate::alerts::NotifierError> {
+        async fn notify(
+            &self,
+            _kind: crate::alerts::AlertKind,
+            message: &str,
+        ) -> Result<(), crate::alerts::NotifierError> {
             self.messages.lock().unwrap().push(message.to_owned());
             Ok(())
         }

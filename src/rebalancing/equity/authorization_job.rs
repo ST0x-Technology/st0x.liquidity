@@ -30,7 +30,7 @@ use tracing::{error, info, warn};
 use st0x_event_sorcery::{SendError, Store};
 use st0x_tokenization::{IssuerRequestId, TokenizationRequestId};
 
-use crate::alerts::Notifier;
+use crate::alerts::{AlertKind, Notifier};
 use crate::conductor::job::{Job, JobQueue, Label, QueuePushError};
 use crate::mint_authorization::{
     MintAuthorizationDeliverer, MintAuthorizationDelivery, SignedMintAuthorization,
@@ -115,6 +115,7 @@ impl Job<DeliverMintAuthorizationCtx> for DeliverMintAuthorization {
     const TERMINAL_FAILURE_MSG: &'static str = "Mint authorization delivery failed all retries; the orchestrator-mode \
          mint cannot proceed until the authorization reaches issuance. \
          Operator action required.";
+    const TERMINAL_FAILURE_KIND: AlertKind = AlertKind::MintAuthorizationDeliveryFailed;
 
     #[cfg(any(test, feature = "test-support"))]
     const JOB_KIND: crate::conductor::job::JobKind =
@@ -226,6 +227,7 @@ impl DeliverMintAuthorization {
             );
             notify_swallowing_failure(
                 ctx,
+                AlertKind::MintCompletesOnceIssuanceAccepts,
                 &format!(
                     "Mint authorization delivery for {} failed {} consecutive \
                      retries ({reason}). It keeps redelivering every {} minutes \
@@ -284,6 +286,7 @@ impl DeliverMintAuthorization {
         );
         notify_swallowing_failure(
             ctx,
+            AlertKind::MintAcceptedUntilIssuanceResolves,
             &format!(
                 "Mint authorization delivery for {} parked: {outcome}. The mint \
                  stays in MintAccepted until resolved on the issuance side.",
@@ -353,8 +356,12 @@ fn awaiting_delivery(
 
 /// Alert delivery failures are logged, never allowed to mask the job
 /// outcome (mirrors the USDC transfer jobs' alert handling).
-async fn notify_swallowing_failure(ctx: &DeliverMintAuthorizationCtx, message: &str) {
-    if let Err(alert_error) = ctx.notifier.notify(message).await {
+async fn notify_swallowing_failure(
+    ctx: &DeliverMintAuthorizationCtx,
+    kind: AlertKind,
+    message: &str,
+) {
+    if let Err(alert_error) = ctx.notifier.notify(kind, message).await {
         warn!(
             target: "tokenization",
             ?alert_error,
@@ -390,6 +397,14 @@ mod tests {
     use crate::rebalancing::equity::ChainEquityServices;
     use crate::rebalancing::equity::EquityTransferServices;
     use crate::vault_lookup::MockVaultLookup;
+
+    #[test]
+    fn terminal_failure_message_carries_its_kind() {
+        assert_eq!(
+            AlertKind::most_specific_in(<DeliverMintAuthorization as Job<DeliverMintAuthorizationCtx>>::TERMINAL_FAILURE_MSG),
+            Some(<DeliverMintAuthorization as Job<DeliverMintAuthorizationCtx>>::TERMINAL_FAILURE_KIND)
+        );
+    }
 
     async fn build_ctx_with_deliverer(
         deliverer: Arc<dyn MintAuthorizationDeliverer>,
