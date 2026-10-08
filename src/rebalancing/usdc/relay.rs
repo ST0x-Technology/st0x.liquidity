@@ -368,7 +368,8 @@ impl<Signer: Wallet> RelayHop<Signer> {
                 warn!(target: "rebalance", %id, ?error, "The failed Relay pair write committed; sending it");
                 Ok(())
             }
-            Ok(Some(UsdcRebalance::SwapQuoted { .. })) => {
+            // A reconciled transfer is never resumed, so nothing sends it.
+            Ok(Some(UsdcRebalance::SwapQuoted { .. } | UsdcRebalance::Reconciled { .. })) => {
                 warn!(target: "rebalance", %id, ?error, "Releasing the nonces of a Relay pair that was not persisted");
                 self.bridge
                     .discard_prepared(direction, &PreparedSwap::Deposit(pair.clone()))
@@ -410,7 +411,8 @@ impl<Signer: Wallet> RelayHop<Signer> {
             {
                 Ok(())
             }
-            Ok(Some(UsdcRebalance::SwapQuoted { .. })) => {
+            // Even persisted, a reconciled transfer's approve is never sent.
+            Ok(Some(UsdcRebalance::SwapQuoted { .. } | UsdcRebalance::Reconciled { .. })) => {
                 self.bridge
                     .discard_prepared(
                         direction,
@@ -889,6 +891,8 @@ where
                     .await?;
                 }
                 RebalanceDirection::AlpacaToBase => {
+                    self.send_split_approves_from_hub(id, &split_approves)
+                        .await?;
                     error!(target: "operational_alert", alert = true, %id, deposit_reverts, max_reverts, "Relay deposits from the hub kept reverting; the transfer holds its guard at SwapQuoted with the USDC at the hub until it is moved by hand and reconciled");
                 }
             }
@@ -929,6 +933,8 @@ where
                         .await?;
                     }
                     RebalanceDirection::AlpacaToBase => {
+                        self.send_split_approves_from_hub(id, &split_approves)
+                            .await?;
                         error!(target: "operational_alert", alert = true, %id, %error, "Relay refused the re-quote from the hub; the transfer holds its guard at SwapQuoted with the USDC at the hub until it is resumed, or moved by hand and reconciled");
                     }
                 }
@@ -1390,6 +1396,20 @@ where
             .broadcast_split_approves(id, split_approves, TO_HUB, deadline)
             .await?;
         self.redeposit(id, reason).await
+    }
+
+    /// Sends again, before a hold at the hub, the approves of a `SwapQuoted`
+    /// that went out alone: a node may have dropped them, and every later
+    /// send from the shared Ethereum wallet waits behind their nonces.
+    async fn send_split_approves_from_hub(
+        &self,
+        id: &UsdcRebalanceId,
+        split_approves: &[PreparedTransaction],
+    ) -> Result<(), UsdcTransferError> {
+        let deadline = Instant::now() + self.hop.bounds.quote_max_age;
+        self.hop
+            .broadcast_split_approves(id, split_approves, HopDirection::FromHub, deadline)
+            .await
     }
 
     /// Starts returning the stable to the vault, then finishes it.
