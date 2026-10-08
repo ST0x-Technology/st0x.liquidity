@@ -585,10 +585,7 @@ where
             hop.prepare_swap_pair(&cqrs, &task_id).await
         })
         .await
-        .map_err(|join_error| {
-            error!(target: "rebalance", %id, %join_error, "Relay pair prepare-and-persist task failed to join (panicked)");
-            UsdcTransferError::SwapPrepareTaskPanicked { id: id.clone() }
-        })?
+        .map_err(|join_error| prepare_panicked(id, &join_error))?
     }
 
     /// Reserves the nonces of every Relay envelope this corridor signed on
@@ -710,6 +707,17 @@ where
 
         restored
     }
+}
+
+/// Pages that a Relay pair prepare panicked: nonces it reserved and did not
+/// persist are never released, so later sends from the chain wallet wait
+/// behind them until a restart.
+fn prepare_panicked(
+    id: &UsdcRebalanceId,
+    join_error: &tokio::task::JoinError,
+) -> UsdcTransferError {
+    error!(target: "operational_alert", alert = true, %id, %join_error, "The Relay pair prepare task panicked; nonces it reserved and did not persist stall later sends from the chain wallet until a restart");
+    UsdcTransferError::SwapPrepareTaskPanicked { id: id.clone() }
 }
 
 /// Whether `quote`, recorded at `quoted_at`, is past its deadline or older
