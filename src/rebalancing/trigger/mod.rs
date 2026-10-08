@@ -37387,12 +37387,12 @@ mod tests {
         assert_eq!(
             view.equity_inflight(&symbol, Venue::Hedging),
             Some(shares(20)),
-            "a Robinhood recovery must carry the listed Base mint's Hedging inflight"
+            "A Robinhood recovery must carry the listed Base mint's Hedging inflight"
         );
         assert_eq!(
             view.equity_available(&symbol, Venue::Hedging),
             Some(shares(30)),
-            "a Robinhood recovery must carry the listed Base mint's broker balance"
+            "A Robinhood recovery must carry the listed Base mint's broker balance"
         );
     }
 
