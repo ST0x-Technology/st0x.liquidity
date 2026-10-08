@@ -694,7 +694,27 @@ impl StoredOperation {
             | UsdcRebalanceEvent::SwapApprovePrepared { .. }
             | UsdcRebalanceEvent::SwapDepositPrepared { .. }
             | UsdcRebalanceEvent::SwapDeposited { .. }
+            | UsdcRebalanceEvent::SwapRequoted { .. }
+            | UsdcRebalanceEvent::SwapDepositReverted { .. }
+            | UsdcRebalanceEvent::RelayFillVerified { .. }
+            | UsdcRebalanceEvent::SwapRefunded { .. }
+            | UsdcRebalanceEvent::SwapEscrowUnresolved { .. }
+            | UsdcRebalanceEvent::RedepositStarted { .. }
+            | UsdcRebalanceEvent::RedepositSubmitted { .. }
             | UsdcRebalanceEvent::AttestationTimedOut { .. } => {}
+            // A Relay failure, or the stable put back into its vault: the
+            // transfer did not move the cash.
+            UsdcRebalanceEvent::SwapFailed {
+                failed_at: ended_at,
+                ..
+            }
+            | UsdcRebalanceEvent::ReturnedToSource {
+                returned_at: ended_at,
+                ..
+            } => {
+                self.close_open_stages(*ended_at, StoredStageOutcome::Failed);
+                self.status = StoredStatus::Failed;
+            }
             UsdcRebalanceEvent::Bridged { minted_at, .. } => {
                 self.close(
                     operation_id,
@@ -977,14 +997,23 @@ fn observed_at(event: &UsdcRebalanceEvent) -> DateTime<Utc> {
         UsdcRebalanceEvent::ConversionFailed { failed_at, .. }
         | UsdcRebalanceEvent::WithdrawalFailed { failed_at, .. }
         | UsdcRebalanceEvent::BridgingFailed { failed_at, .. }
-        | UsdcRebalanceEvent::DepositFailed { failed_at, .. } => *failed_at,
+        | UsdcRebalanceEvent::DepositFailed { failed_at, .. }
+        | UsdcRebalanceEvent::SwapFailed { failed_at, .. } => *failed_at,
         UsdcRebalanceEvent::WithdrawalSubmitting { submitting_at, .. }
         | UsdcRebalanceEvent::BridgingSubmitting { submitting_at, .. } => *submitting_at,
         UsdcRebalanceEvent::DepositSendPrepared { prepared_at, .. }
         | UsdcRebalanceEvent::SwapApprovePrepared { prepared_at, .. }
         | UsdcRebalanceEvent::SwapDepositPrepared { prepared_at, .. } => *prepared_at,
-        UsdcRebalanceEvent::SwapQuoted { quoted_at, .. } => *quoted_at,
+        UsdcRebalanceEvent::SwapQuoted { quoted_at, .. }
+        | UsdcRebalanceEvent::SwapRequoted { quoted_at, .. } => *quoted_at,
         UsdcRebalanceEvent::SwapDeposited { deposited_at, .. } => *deposited_at,
+        UsdcRebalanceEvent::SwapDepositReverted { reverted_at, .. } => *reverted_at,
+        UsdcRebalanceEvent::RelayFillVerified { filled_at, .. } => *filled_at,
+        UsdcRebalanceEvent::SwapRefunded { refunded_at, .. } => *refunded_at,
+        UsdcRebalanceEvent::SwapEscrowUnresolved { unresolved_at } => *unresolved_at,
+        UsdcRebalanceEvent::RedepositStarted { started_at, .. } => *started_at,
+        UsdcRebalanceEvent::RedepositSubmitted { submitted_at, .. } => *submitted_at,
+        UsdcRebalanceEvent::ReturnedToSource { returned_at, .. } => *returned_at,
         UsdcRebalanceEvent::WithdrawalConfirmed { confirmed_at, .. } => *confirmed_at,
         UsdcRebalanceEvent::PendingBurnRecorded { recorded_at, .. } => *recorded_at,
         UsdcRebalanceEvent::DepositSendAttached { attached_at, .. } => *attached_at,
