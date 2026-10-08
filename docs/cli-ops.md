@@ -850,37 +850,50 @@ guard records the transfers that hold it. Who touches it, and when:
   A terminal `Failed` job row (retries exhausted) does not refuse: re-enqueueing
   that transfer is the recovery case this command exists for.
 
-### Robinhood Relay transfer held after its vault withdrawal
+### Robinhood Relay transfer runbook
 
-A Robinhood->Alpaca transfer over the Relay hop that stopped at
-`WithdrawalComplete` (no binding quote recorded) or `SwapQuoted` (no deposit
-signed) has its USDG in the Robinhood wallet, outside the vault, and holds the
-Robinhood corridor guard. `fail-usdc-transfer` and `transfer reconcile` refuse
-both states. Resume it:
+A Robinhood transfer over the Relay hop holds the Robinhood corridor guard from
+its withdrawal until a proven fill reaches its destination or the stable is back
+in the vault. `fail-usdc-transfer` refuses every Relay state after the
+withdrawal, since a deposit may be on chain. Read what Relay says about the
+order first (`request_id` is the `requestId` of the transfer's quote, in the
+`SwapQuoted` or `SwapRequoted` event):
 
 ```
-stox transfer resume --kind usdc --id <uuid> --direction to-alpaca
+stox relay status <request_id>
 ```
 
-The job takes a fresh binding quote (or re-quotes an expired one) and signs the
-deposit; when Relay refuses the quote it puts the USDG back into the vault
-(`Redepositing` -> `ReturnedToSource`), which releases the guard. A transient
-quote failure (transport, rate limit) leaves the transfer where it was for the
-next resume. The other Relay holds:
+It prints the status, the fail and refund fail reasons, and every deposit and
+payment tx Relay lists; it touches no wallet, database or bot. A status is not
+proof: the bot adopts a payment only once it proves on chain.
 
-- `SwapEscrowUnresolved` (the fill window passed with no fill or refund) keeps
-  the guard and pages, and the bot stops reading Relay. `transfer resume` reads
-  Relay's status once more: a fill or refund it can prove is adopted, a Relay
-  failure becomes `SwapFailed`, anything else leaves it held. Resume again
-  later; the solver may fill until the order's deadline, about a week.
-- `SwapDeposited` with a fill or refund that does not prove on chain keeps the
-  guard and pages every 30 minutes; check the order with Relay's status API.
-- `SwapFailed` (Relay failed the order with nothing paid back) and a
-  `SwapRefunded` paid in USDC on Ethereum: settle the funds with Relay or move
-  the USDC by hand, then `transfer reconcile --kind usdc`.
-- `Redepositing` whose vault deposit does not confirm (dropped or reverted):
-  check the recorded deposit tx and the vault on chain, deposit the USDG by hand
-  if it is still in the Robinhood wallet, then `transfer reconcile --kind usdc`.
+A restart re-arms the job of every Relay transfer below except `SwapFailed` and
+a destination-side `SwapRefunded`; a resume broadcasts the persisted envelopes
+again and never signs a new pair while an earlier deposit may still land.
+
+| State                                                                  | Where the stable is                     | Operator action                                                                                                                                       |
+| ---------------------------------------------------------------------- | --------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `WithdrawalComplete`, `SwapQuoted` (to Alpaca)                         | Robinhood wallet                        | `stox transfer resume --kind usdc --id <uuid> --direction to-alpaca`: re-quotes and signs, or redeposits into the vault on a refusal                  |
+| `WithdrawalComplete` (to Raindex, binding quote refused)               | Ethereum wallet                         | `transfer resume --direction to-raindex` to quote again, or `fail-usdc-transfer` then `transfer reconcile --kind usdc` once the USDC is moved by hand |
+| `SwapQuoted` (to Raindex, re-quote refused or deposits kept reverting) | Ethereum wallet                         | `transfer resume --direction to-raindex`, or move the USDC by hand and `transfer reconcile --kind usdc`                                               |
+| `SwapQuoted` paging "a deposit of an earlier order is on chain"        | with Relay                              | wait: the job reads that order every 30 minutes and adopts its fill or refund; check it with `relay status`                                           |
+| `SwapDepositPrepared`, `SwapDeposited`                                 | with Relay, or about to be              | none: the job reads Relay every 5 to 30 seconds; a payment that does not prove pages every 30 minutes, check it with `relay status`                   |
+| `SwapEscrowUnresolved` (fill window passed)                            | with Relay                              | wait: the job reads Relay every 30 minutes and adopts a late fill or refund; `stox transfer recheck --kind usdc --id <uuid>` reads it at once         |
+| `SwapFailed` (Relay failed the order, nothing paid back)               | with Relay, or back if Relay later pays | `transfer recheck --kind usdc` adopts a payment Relay made since; otherwise settle with Relay and `transfer reconcile --kind usdc`                    |
+| `SwapRefunded` on the origin (to Alpaca)                               | Robinhood wallet                        | none: the job redeposits it                                                                                                                           |
+| `SwapRefunded` on the origin (to Raindex)                              | Ethereum wallet                         | none while re-quotes are left; past `max_refund_retries` or below `min_transfer`, move the USDC by hand and `transfer reconcile --kind usdc`          |
+| `SwapRefunded` on the destination                                      | the other end's wallet                  | move it by hand, then `transfer reconcile --kind usdc`                                                                                                |
+| `Redepositing` whose vault deposit does not confirm                    | Robinhood wallet or vault               | check the recorded deposit tx and the vault, deposit the USDG by hand if it is still in the wallet, then `transfer reconcile --kind usdc`             |
+
+`transfer recheck --kind usdc` on a Relay transfer reads only
+`SwapEscrowUnresolved` and `SwapFailed`, and refuses `--deposit-tx`. It prints
+`recovered` when it adopted a payment, `not_recoverable` when Relay has since
+failed the order, and `left_unchanged` otherwise. A payment it adopted moves on
+at once (the Alpaca deposit, the vault deposit, the redeposit or the re-quote);
+if that step fails, `transfer resume` continues it. A transfer reconciled while
+it holds signed Relay envelopes keeps their nonces reserved: restart the bot, as
+the reconcile output asks, or later sends from that wallet may wait behind a
+nonce that never mined.
 
 ### Clearing a pre-burn guard latch
 
@@ -999,9 +1012,8 @@ stox transfer reconcile --kind redemption --id <redemption-aggregate-id> \
   can lose an unrecorded one), a `BaseToAlpaca` `ConversionFailed`, and a
   `BaseToAlpaca` `Bridged` with a signed deposit send whose nonce you verified
   on chain is taken by a different mined tx (see "Base->Alpaca deposit send
-  pages"), a Relay `SwapFailed`, a Relay `SwapRefunded` paid on Ethereum, and a
-  Relay `Redepositing` (see "Robinhood Relay transfer held after its vault
-  withdrawal"). Its `--reason` must be one of `funds-moved-manually` or
+  pages"), and the Relay holds the "Robinhood Relay transfer runbook" names. Its
+  `--reason` must be one of `funds-moved-manually` or
   `deposit-credited-offline`; any other value is rejected. Every other state is
   rejected, including `WithdrawalFailed` and an `AlpacaToBase`
   `ConversionFailed`, whose funds never left Alpaca.

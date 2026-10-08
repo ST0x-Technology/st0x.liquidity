@@ -4368,6 +4368,20 @@ enum RedepositReason {
     Refunded,
 }
 
+// A late payment of a signed order, as `RecoverSwapCompletion` takes it, in
+// the paying stable's smallest unit.
+enum RecoveredSwapPayment {
+    Fill { fill_tx: TxHash, amount_received: U256 },
+    Refund { refund_tx: TxHash, side: RefundSide, amount_refunded: U256 },
+}
+
+// The same payment as `SwapCompletionRecovered` records it; a fill carries the
+// fee split `RelayFillVerified` does.
+enum SwapRecovery {
+    Fill { fill_tx: TxHash, amount_received: Usdc, fee_collected: Usdc, relayer_fee: Usdc },
+    Refund { refund_tx: TxHash, side: RefundSide, amount_refunded: Usdc },
+}
+
 // The accepted Relay quote a swap deposit funds, persisted whole so a resume
 // signs exactly what was accepted. Amounts are in the stables' smallest unit.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -4515,12 +4529,16 @@ enum UsdcRebalance {
     },
     // Relay hop, chain side first (see "Relay hop"). `signed_order_ids`
     // holds every order id a deposit was ever signed for and never shrinks.
+    // `reverted_quotes` holds the quote of every signed deposit that mined and
+    // reverted, carried through every swap state up to `SwapFailed`: the
+    // escrow scan watches their order ids (see "Relay recovery").
     SwapQuoted {
         direction: RebalanceDirection,
         corridor: UsdcCorridor,
         amount: Usdc,
         quote: SwapQuote,
         signed_order_ids: Vec<B256>,
+        reverted_quotes: Vec<SwapQuote>,
         // Approves signed alone when another send split a pair; each is
         // broadcast again before a pair is signed.
         split_approves: Vec<PreparedTransaction>,
@@ -4541,6 +4559,7 @@ enum UsdcRebalance {
         amount: Usdc,
         quote: SwapQuote,
         signed_order_ids: Vec<B256>,
+        reverted_quotes: Vec<SwapQuote>,
         split_approves: Vec<PreparedTransaction>,
         // Both envelopes, signed at consecutive nonces and persisted in one
         // event before either is broadcast. `None` when the standing
@@ -4558,6 +4577,7 @@ enum UsdcRebalance {
         amount: Usdc,
         quote: SwapQuote,
         signed_order_ids: Vec<B256>,
+        reverted_quotes: Vec<SwapQuote>,
         deposit_tx: TxHash,
         deposit_block: u64,
         refund_requotes: u32,
@@ -4575,6 +4595,7 @@ enum UsdcRebalance {
         amount: Usdc,
         quote: SwapQuote,
         signed_order_ids: Vec<B256>,
+        reverted_quotes: Vec<SwapQuote>,
         deposit_tx: TxHash,
         refund_tx: TxHash,
         side: RefundSide,
@@ -4591,20 +4612,24 @@ enum UsdcRebalance {
         amount: Usdc,
         quote: SwapQuote,
         signed_order_ids: Vec<B256>,
+        reverted_quotes: Vec<SwapQuote>,
         deposit_tx: TxHash,
         refund_requotes: u32,
         initiated_at: DateTime<Utc>,
         unresolved_at: DateTime<Utc>,
     },
     // Relay reported a terminal failure with no refund paid. Guard held until
-    // `transfer reconcile`.
+    // `transfer reconcile`; `transfer recheck` adopts a late fill or refund.
     SwapFailed {
         direction: RebalanceDirection,
         corridor: UsdcCorridor,
         amount: Usdc,
+        quote: SwapQuote,
         signed_order_ids: Vec<B256>,
+        reverted_quotes: Vec<SwapQuote>,
         deposit_tx: TxHash,
         reason: String,
+        refund_requotes: u32,
         initiated_at: DateTime<Utc>,
         failed_at: DateTime<Utc>,
     },
@@ -4754,7 +4779,10 @@ failure:
    `RelayFillPending`, and the job queues the next attempt after 5 s for the
    first minute after the deposit and 30 s after that. Past the window, a fill
    or refund Relay names but the chain still does not show is paged and read
-   again every 30 minutes, as an unproven one is (step 7).
+   again every 30 minutes, as an unproven one is (step 7). A `failure` with
+   `DEPOSIT_REORGED` is not terminal either: the deposit may be included again
+   and filled or refunded, so the attempt waits as for any status that is not
+   terminal, and past the window the escrow holds unresolved (step 8).
 7. A `success` is adopted only once `verify_fill` proves its one fill tx on the
    destination chain (see `docs/relay.md`, Proofs): `ConfirmSwapFill` ->
    `RelayFillVerified` -> `Bridged` with `HopEvidence::Relay`, its
@@ -4772,9 +4800,10 @@ failure:
    guard held, paged, accepted by `transfer reconcile`. When `fill_timeout_secs`
    has passed since `SwapDeposited` with no terminal status,
    `RecordSwapEscrowUnresolved` -> `SwapEscrowUnresolved` holds the guard and
-   pages: the deposit may still fill or refund, and the solver may fill until
-   the order's deadline. The job stops reading; `transfer resume` reads Relay's
-   status once more and adopts a late fill or refund, or records `SwapFailed`.
+   pages once: the deposit may still fill or refund, and the solver may fill
+   until the order's deadline. The job keeps reading Relay's status every 30
+   minutes, without paging again, and adopts a late fill or refund, or records
+   `SwapFailed`; `transfer recheck --kind usdc` reads it at once.
 9. The redeposit returns the stable to the vault it left: `BeginRedeposit` ->
    `RedepositStarted` (`Redepositing`, from `WithdrawalComplete` or `SwapQuoted`
    with the withdrawn amount, from an origin-side `SwapRefunded` with the
@@ -4856,9 +4885,50 @@ quote resumes the same way, `--direction to-raindex`, or is failed with
 ledger an Ethereum-origin `SwapQuoted` is held credit, a persisted Ethereum pair
 is in flight, and a refund paid in Ethereum USDC (`SwapRefunded` on the Ethereum
 side) is held credit, so a Base deposit send cannot spend the USDC a Relay swap
-is about to deposit or was refunded. `transfer recheck --kind usdc` refuses
-Relay transfers in this build: a Relay `DepositFailed` is settled with
-`transfer reconcile`.
+is about to deposit or was refunded. `transfer recheck --kind usdc` reads a held
+escrow (`SwapEscrowUnresolved`, `SwapFailed`) again and adopts a late fill or
+refund (see "Relay recovery"); it refuses every other Relay state, and a Relay
+`DepositFailed` is settled with `transfer reconcile`.
+
+##### Relay recovery
+
+A Relay transfer recovers from a crash, a lost job or a late payment without
+signing a second deposit while an earlier one may still land:
+
+- **Startup re-arm.** Startup guard recovery re-arms the job of every Relay
+  transfer that has no live job row (a terminal row does not block, since the
+  resume only re-broadcasts, re-quotes or reads Relay), in either direction, at
+  `WithdrawalComplete`, `SwapQuoted`, `SwapDepositPrepared`, `SwapDeposited`, an
+  origin-side `SwapRefunded`, `SwapEscrowUnresolved` and `Redepositing`. The job
+  routes by the recorded corridor, so a `WithdrawalComplete` resumes through the
+  Relay hop (the binding quote) and never reaches a CCTP burn. A
+  destination-side `SwapRefunded` and a `SwapFailed` are holds for the operator
+  and are not re-armed.
+- **Re-broadcast, never re-sign.** The persisted envelopes are restored before
+  any other send from their wallet (see "Relay hop"), and a resume of
+  `SwapDepositPrepared` broadcasts exactly those bytes. A new pair is signed
+  only from `SwapQuoted`, after the escrow scan below found no deposit of an
+  earlier order. A nonce is released only for a pair that was never persisted
+  (`discard_prepared`). A reconciled transfer's envelopes keep their nonces
+  reserved until a restart, whose restore skips reconciled transfers: the
+  reconcile asks for that restart.
+- **Escrow scan.** A signed deposit that reverted (`reverted_quotes`) may still
+  land after a reorg. Before a `SwapQuoted` re-quotes, signs or redeposits, the
+  bot scans the origin chain's depository from the lowest `origin_from_block` of
+  those quotes for our deposits of their order ids, so no new pair is signed and
+  nothing is redeposited while one of them is on chain. A deposit found is never
+  left behind: its order's status is read, and a fill or refund that proves is
+  adopted (`RecoverSwapCompletion` -> `SwapCompletionRecovered`). Until then the
+  transfer signs nothing, pages, and reads it again every 30 minutes. A scan
+  that fails is retried and signs nothing either.
+- **Late adoption.** `SwapCompletionRecovered` adopts a proven late payment of a
+  signed order: from `SwapQuoted`, a reverted order whose deposit the scan
+  found, which leaves `reverted_quotes`; from `SwapFailed`, through
+  `transfer recheck`, the failed order itself. A fill continues as any
+  `Bridged`; a refund continues as any `SwapRefunded` of that order
+  (redeposited, re-quoted or held). Approves that went out alone are sent again
+  before a `SwapQuoted` adopts one. Superseding an order adds its id to
+  `signed_order_ids` and never drops one.
 
 ##### Crash-safe resume
 
@@ -5036,6 +5106,11 @@ enum UsdcRebalanceCommand {
     FailSwap { reason: String },
     // The fill window passed with no terminal status.
     RecordSwapEscrowUnresolved,
+    // A fill or refund proven late for a signed order: from `SwapQuoted` a
+    // reverted order whose deposit the escrow scan found on chain, from
+    // `SwapFailed` the failed order. The same floors as `ConfirmSwapFill` and
+    // `RecordSwapRefund`, against that order's quote.
+    RecoverSwapCompletion { order_id: B256, deposit_tx: TxHash, payment: RecoveredSwapPayment },
     // Returns the stable to the vault; see "Relay hop" step 9.
     BeginRedeposit { reason: RedepositReason },
     RecordRedeposit { deposit_tx: TxHash },
@@ -5166,6 +5241,15 @@ enum UsdcRebalanceEvent {
     },
     SwapEscrowUnresolved { unresolved_at: DateTime<Utc> },
     SwapFailed { reason: String, failed_at: DateTime<Utc> },
+    // A late fill (-> `Bridged`, `HopEvidence::Relay` of `order_id` and
+    // `deposit_tx`, booked by the P&L as `RelayFillVerified` is) or refund
+    // (-> `SwapRefunded` on that order's quote) of a signed order.
+    SwapCompletionRecovered {
+        order_id: B256,
+        deposit_tx: TxHash,
+        payment: SwapRecovery,
+        recovered_at: DateTime<Utc>,
+    },
     RedepositStarted {
         redeposit_amount: Usdc,
         reason: RedepositReason,
@@ -7398,8 +7482,9 @@ names were removed with no back-compat.
 - `position` -- the long-lived per-symbol Position aggregate.
 - `view` -- materialized read-side projections.
 - `cctp` -- raw wallet-level CCTP bridge primitives (touch no aggregate).
+- `relay` -- read-only Relay API lookups (touch no aggregate and no wallet).
 
-**Each command uses exactly one of six verbs (one verb = one intent), with two
+**Each command uses exactly one of six verbs (one verb = one intent), with the
 named exemptions defined after the list:**
 
 - `resume` -- drive an interrupted, non-terminal operation forward along its
@@ -7417,17 +7502,23 @@ named exemptions defined after the list:**
   when no send was recorded; no polling deadline), un-failed via
   `DepositCompletionRecovered` back to `DepositConfirmed`, and driven through
   the USDC->USD conversion to the normal terminal -- clearing the stranded
-  in-progress guard through the live reactor. A transfer Alpaca still reports
-  pending or failed refuses without touching the aggregate. A send tx that is
-  absent from Alpaca's account-wide transfer list is a separate, INCONCLUSIVE
-  result: the list may be capped, so absence is not proof the deposit never
-  settled. The recheck reports `not_detected_yet`, changes nothing, and the
-  operator retries later. Other USDC states keep their existing paths (`resume`
-  while non-terminal, `reconcile` for funds handled out-of-band rather than
-  settled by the provider). Because the USDC recheck sends from the rebalancing
-  wallet and advances the aggregate on the request task, it first quiesces the
-  USDC rebalancing driver and holds it paused for the whole recheck, refusing
-  with `503` when the driver cannot quiesce (see "Both bot-routed USDC recovery
+  in-progress guard through the live reactor. On a Relay corridor `recheck`
+  reads a held escrow again instead (`SwapEscrowUnresolved`, `SwapFailed`): the
+  status of the transfer's deposited order (see "Relay recovery"), adopting a
+  fill or refund that proves on chain (`recovered`), recording a failure Relay
+  reports for an unresolved escrow (`not_recoverable`), and changing nothing
+  otherwise (`left_unchanged`); it refuses a `--deposit-tx` and every other
+  Relay state. A transfer Alpaca still reports pending or failed refuses without
+  touching the aggregate. A send tx that is absent from Alpaca's account-wide
+  transfer list is a separate, INCONCLUSIVE result: the list may be capped, so
+  absence is not proof the deposit never settled. The recheck reports
+  `not_detected_yet`, changes nothing, and the operator retries later. Other
+  USDC states keep their existing paths (`resume` while non-terminal,
+  `reconcile` for funds handled out-of-band rather than settled by the
+  provider). Because the USDC recheck sends from the rebalancing wallet and
+  advances the aggregate on the request task, it first quiesces the USDC
+  rebalancing driver and holds it paused for the whole recheck, refusing with
+  `503` when the driver cannot quiesce (see "Both bot-routed USDC recovery
   routes quiesce the rebalancing driver first" below).
 - `fail` -- force a stuck non-terminal operation to its clean `Failed` terminal
   so the system stops waiting on it; `--reason` required.
@@ -7444,12 +7535,18 @@ named exemptions defined after the list:**
   a mandatory audit reason.
 - `rebuild` -- recompute a projection from the event log; emits no events.
 
-Three commands sit deliberately outside the six-verb set, named for their exact
+Four commands sit deliberately outside the six-verb set, named for their exact
 effect rather than a generic intent:
 
 - `cctp complete-mint` -- the `cctp` group exposes raw on-chain primitives that
   touch no aggregate, so its commands are named for the on-chain action they
   perform and are exempt from the recovery-verb vocabulary.
+- `relay status <request_id>` -- prints Relay's status of one request (the
+  `requestId` of a `SwapQuote`) as the bot reads it: the status, its fail and
+  refund fail reasons, and every deposit and payment tx Relay lists. It reads
+  the API only, with no wallet, database or bot, so it is named for what it
+  reads like the `cctp` group. A status read is not proof: the bot adopts a
+  payment only once it proves on chain.
 - `position release-hedge` -- release a Position's stuck pending-offchain-order
   pointer so normal hedging can retry; it replaced the removed
   `fail-pending-offchain-order` command. `fail` would be the wrong verb here:
