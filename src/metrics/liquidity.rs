@@ -51,6 +51,8 @@ pub(crate) enum LiqMetric {
     AssetCounterTrading,
     AssetExtendedHours,
     AssetRebalancing,
+    UsdcCorridorTarget,
+    UsdcCorridorDeviation,
     EquityOnchainAvailable,
     EquityOffchainAvailable,
     EquityInflightTotal,
@@ -58,6 +60,7 @@ pub(crate) enum LiqMetric {
     EquityUnwrapped,
     EquityWrapped,
     EquityRatio,
+    EquityChainAvailable,
     UsdcOnchainAvailable,
     UsdcOnchainInflight,
     UsdcOffchainAvailable,
@@ -71,6 +74,9 @@ pub(crate) enum LiqMetric {
     UsdcTotal,
     UsdcRatio,
     UsdcRebalanceable,
+    UsdcChainAvailable,
+    UsdcChainInflight,
+    UsdcChainRatio,
     CollectorLastSuccessTsSeconds,
 }
 
@@ -78,7 +84,7 @@ impl LiqMetric {
     /// Every variant, for the catalog tests. A new variant needs an entry
     /// here and its name in the catalog test.
     #[cfg(test)]
-    pub(crate) const ALL: [Self; 36] = [
+    pub(crate) const ALL: [Self; 42] = [
         Self::BotInfo,
         Self::BotStartTimestampSeconds,
         Self::SettingsInfo,
@@ -94,6 +100,8 @@ impl LiqMetric {
         Self::AssetCounterTrading,
         Self::AssetExtendedHours,
         Self::AssetRebalancing,
+        Self::UsdcCorridorTarget,
+        Self::UsdcCorridorDeviation,
         Self::EquityOnchainAvailable,
         Self::EquityOffchainAvailable,
         Self::EquityInflightTotal,
@@ -101,6 +109,7 @@ impl LiqMetric {
         Self::EquityUnwrapped,
         Self::EquityWrapped,
         Self::EquityRatio,
+        Self::EquityChainAvailable,
         Self::UsdcOnchainAvailable,
         Self::UsdcOnchainInflight,
         Self::UsdcOffchainAvailable,
@@ -114,6 +123,9 @@ impl LiqMetric {
         Self::UsdcTotal,
         Self::UsdcRatio,
         Self::UsdcRebalanceable,
+        Self::UsdcChainAvailable,
+        Self::UsdcChainInflight,
+        Self::UsdcChainRatio,
         Self::CollectorLastSuccessTsSeconds,
     ];
 
@@ -134,6 +146,8 @@ impl LiqMetric {
             Self::AssetCounterTrading => "liq_asset_counter_trading",
             Self::AssetExtendedHours => "liq_asset_extended_hours",
             Self::AssetRebalancing => "liq_asset_rebalancing",
+            Self::UsdcCorridorTarget => "liq_usdc_corridor_target",
+            Self::UsdcCorridorDeviation => "liq_usdc_corridor_deviation",
             Self::EquityOnchainAvailable => "liq_equity_onchain_available",
             Self::EquityOffchainAvailable => "liq_equity_offchain_available",
             Self::EquityInflightTotal => "liq_equity_inflight_total",
@@ -141,6 +155,7 @@ impl LiqMetric {
             Self::EquityUnwrapped => "liq_equity_unwrapped",
             Self::EquityWrapped => "liq_equity_wrapped",
             Self::EquityRatio => "liq_equity_ratio",
+            Self::EquityChainAvailable => "liq_equity_chain_available",
             Self::UsdcOnchainAvailable => "liq_usdc_onchain_available",
             Self::UsdcOnchainInflight => "liq_usdc_onchain_inflight",
             Self::UsdcOffchainAvailable => "liq_usdc_offchain_available",
@@ -154,6 +169,9 @@ impl LiqMetric {
             Self::UsdcTotal => "liq_usdc_total",
             Self::UsdcRatio => "liq_usdc_ratio",
             Self::UsdcRebalanceable => "liq_usdc_rebalanceable",
+            Self::UsdcChainAvailable => "liq_usdc_chain_available",
+            Self::UsdcChainInflight => "liq_usdc_chain_inflight",
+            Self::UsdcChainRatio => "liq_usdc_chain_ratio",
             Self::CollectorLastSuccessTsSeconds => "liq_collector_last_success_ts_seconds",
         }
     }
@@ -189,6 +207,12 @@ impl LiqMetric {
                  trading is disabled"
             }
             Self::AssetRebalancing => "1 when the symbol starts new rebalancing operations, else 0",
+            Self::UsdcCorridorTarget => {
+                "Target onchain share of each configured USDC corridor's chain vault"
+            }
+            Self::UsdcCorridorDeviation => {
+                "Rebalancing band half-width of each configured USDC corridor"
+            }
             Self::EquityOnchainAvailable => "Primary chain vault shares available",
             Self::EquityOffchainAvailable => "Broker shares available",
             Self::EquityInflightTotal => "Primary chain vault plus broker shares in flight",
@@ -200,6 +224,9 @@ impl LiqMetric {
             Self::EquityWrapped => "Wrapped tokens held in the Base wallet",
             Self::EquityRatio => {
                 "Primary chain vault share of available shares; 0 when nothing is available"
+            }
+            Self::EquityChainAvailable => {
+                "Wrapped vault shares on each hedged chain a snapshot read; never sum chains"
             }
             Self::UsdcOnchainAvailable => "Primary chain vault settlement stable available",
             Self::UsdcOnchainInflight => "Primary chain vault settlement stable in flight",
@@ -221,6 +248,15 @@ impl LiqMetric {
             }
             Self::UsdcRebalanceable => {
                 "Withdrawable broker cash above the reserve; absent until withdrawable is read"
+            }
+            Self::UsdcChainAvailable => {
+                "Settlement stable available in each hedged chain vault a snapshot has read"
+            }
+            Self::UsdcChainInflight => {
+                "Settlement stable in flight in each hedged chain vault a snapshot has read"
+            }
+            Self::UsdcChainRatio => {
+                "Vault share of itself plus gross broker cash; absent until gross is read or both 0"
             }
             Self::CollectorLastSuccessTsSeconds => {
                 "Unix time each liq_ collector last published its family"
@@ -252,6 +288,12 @@ impl LiqMetric {
             | Self::EquityUnwrapped
             | Self::EquityWrapped
             | Self::EquityRatio => &["symbol"],
+            Self::EquityChainAvailable => &["chain", "symbol"],
+            Self::UsdcCorridorTarget
+            | Self::UsdcCorridorDeviation
+            | Self::UsdcChainAvailable
+            | Self::UsdcChainInflight
+            | Self::UsdcChainRatio => &["chain"],
             Self::CollectorLastSuccessTsSeconds => &["collector"],
             Self::BotStartTimestampSeconds
             | Self::SettingsEquityTarget
@@ -296,7 +338,9 @@ impl LiqMetric {
             | Self::SettingsDeploymentBlock
             | Self::AssetCounterTrading
             | Self::AssetExtendedHours
-            | Self::AssetRebalancing => Some(LiqFamily::Settings),
+            | Self::AssetRebalancing
+            | Self::UsdcCorridorTarget
+            | Self::UsdcCorridorDeviation => Some(LiqFamily::Settings),
             Self::EquityOnchainAvailable
             | Self::EquityOffchainAvailable
             | Self::EquityInflightTotal
@@ -304,6 +348,7 @@ impl LiqMetric {
             | Self::EquityUnwrapped
             | Self::EquityWrapped
             | Self::EquityRatio
+            | Self::EquityChainAvailable
             | Self::UsdcOnchainAvailable
             | Self::UsdcOnchainInflight
             | Self::UsdcOffchainAvailable
@@ -316,7 +361,10 @@ impl LiqMetric {
             | Self::UsdcInflightBaseWallet
             | Self::UsdcTotal
             | Self::UsdcRatio
-            | Self::UsdcRebalanceable => Some(LiqFamily::Inventory),
+            | Self::UsdcRebalanceable
+            | Self::UsdcChainAvailable
+            | Self::UsdcChainInflight
+            | Self::UsdcChainRatio => Some(LiqFamily::Inventory),
             Self::CollectorLastSuccessTsSeconds => None,
         }
     }
@@ -849,6 +897,8 @@ pub(crate) mod tests {
                 "liq_asset_counter_trading",
                 "liq_asset_extended_hours",
                 "liq_asset_rebalancing",
+                "liq_usdc_corridor_target",
+                "liq_usdc_corridor_deviation",
                 "liq_equity_onchain_available",
                 "liq_equity_offchain_available",
                 "liq_equity_inflight_total",
@@ -856,6 +906,7 @@ pub(crate) mod tests {
                 "liq_equity_unwrapped",
                 "liq_equity_wrapped",
                 "liq_equity_ratio",
+                "liq_equity_chain_available",
                 "liq_usdc_onchain_available",
                 "liq_usdc_onchain_inflight",
                 "liq_usdc_offchain_available",
@@ -869,6 +920,9 @@ pub(crate) mod tests {
                 "liq_usdc_total",
                 "liq_usdc_ratio",
                 "liq_usdc_rebalanceable",
+                "liq_usdc_chain_available",
+                "liq_usdc_chain_inflight",
+                "liq_usdc_chain_ratio",
                 "liq_collector_last_success_ts_seconds",
             ]
         );

@@ -310,7 +310,8 @@ async fn run_bot_session_inner(
 
     let inventory = Arc::new(
         inventory::BroadcastingInventory::new(
-            inventory::InventoryView::for_primary_chain(ctx.chains.primary().chain),
+            inventory::InventoryView::for_primary_chain(ctx.chains.primary().chain)
+                .with_hedged_chains(ctx.chains.hedged().map(|hedged| hedged.chain)),
             event_sender.clone(),
         )
         .publishing_liq_metrics(metrics::liquidity::inventory::InventoryPublisher::new(
