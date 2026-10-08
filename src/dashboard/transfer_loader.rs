@@ -1709,7 +1709,16 @@ mod tests {
         sqlx::migrate!().run(&pool).await.unwrap();
         let now = Utc::now();
 
-        for state in ["SwapQuoted", "SwapDepositPrepared", "SwapDeposited"] {
+        for state in [
+            "SwapQuoted",
+            "SwapDepositPrepared",
+            "SwapDeposited",
+            "SwapRefunded",
+            "SwapEscrowUnresolved",
+            "SwapFailed",
+            "Redepositing",
+            "ReturnedToSource",
+        ] {
             let id = Uuid::new_v4();
             let payload = serde_json::json!({"Live": {(state): {"initiated_at": now}}});
             sqlx::query(

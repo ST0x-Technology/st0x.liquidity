@@ -2125,25 +2125,12 @@ impl<Signer: Wallet, B: UsdcBridgeHelper> CrossVenueCashTransfer<Signer, B> {
         // Persisting the hash first lands a crash in `DepositInitiated`, whose
         // resume arm re-verifies the recorded tx via `confirm_tx_receipt` instead of
         // re-depositing.
-        let stable = self.corridor.chain().settlement_stable();
-        let deposit_tx = match self
-            .raindex
-            .submit_deposit(stable.address, self.vault_id, amount, stable.decimals)
-            .await
-        {
-            Ok(tx) => tx,
-            Err(error) => {
-                // The submission failed before any deposit tx was broadcast
-                // (`submit_pending` only returns a hash once the tx is accepted),
-                // so nothing moved. Leave the aggregate in `Bridged` and let
-                // apalis retry the deposit from there -- re-attempting is safe and
-                // cannot double-deposit. Do NOT emit `FailDeposit`: it is invalid
-                // from `Bridged` (only valid once a deposit has been initiated),
-                // and a transient submission error is not a terminal failure.
-                warn!(target: "rebalance", "Vault deposit submission failed: {error}");
-                return Err(UsdcTransferError::Vault(error));
-            }
-        };
+        // A failed submission broadcast nothing (`submit_pending` only
+        // returns a hash once the tx is accepted), so the aggregate stays in
+        // `Bridged` for apalis to retry. Do NOT emit `FailDeposit`: it is
+        // invalid from `Bridged`, and a transient submission error is not a
+        // terminal failure.
+        let deposit_tx = self.submit_vault_deposit(amount).await?;
 
         self.cqrs
             .send(
@@ -2158,6 +2145,34 @@ impl<Signer: Wallet, B: UsdcBridgeHelper> CrossVenueCashTransfer<Signer, B> {
         // `DepositInitiated` (the hash is persisted) rather than emitting
         // `FailDeposit`: the deposit may still confirm, and the `DepositInitiated`
         // resume arm re-checks it. Propagate so apalis retries from there.
+        let block_number = self.confirm_vault_deposit(deposit_tx).await?;
+
+        info!(target: "rebalance", %deposit_tx, ?block_number, "Vault deposit submitted, recorded, and confirmed");
+        Ok(block_number)
+    }
+
+    /// Broadcasts a `deposit4` of `amount` of the corridor chain's stable into
+    /// the corridor's vault and returns its hash, before any receipt.
+    pub(super) async fn submit_vault_deposit(
+        &self,
+        amount: U256,
+    ) -> Result<TxHash, UsdcTransferError> {
+        let stable = self.corridor.chain().settlement_stable();
+        self.raindex
+            .submit_deposit(stable.address, self.vault_id, amount, stable.decimals)
+            .await
+            .inspect_err(
+                |error| warn!(target: "rebalance", %error, "Vault deposit submission failed"),
+            )
+            .map_err(UsdcTransferError::Vault)
+    }
+
+    /// Waits for the vault deposit's receipt, books its gas, and returns its
+    /// block.
+    pub(super) async fn confirm_vault_deposit(
+        &self,
+        deposit_tx: TxHash,
+    ) -> Result<Option<u64>, UsdcTransferError> {
         let receipt = self.raindex.confirm_tx_receipt(deposit_tx).await?;
 
         self.enqueue_bot_gas_cost(
@@ -2167,7 +2182,6 @@ impl<Signer: Wallet, B: UsdcBridgeHelper> CrossVenueCashTransfer<Signer, B> {
         )
         .await?;
 
-        info!(target: "rebalance", %deposit_tx, block_number = ?receipt.block_number, "Vault deposit submitted, recorded, and confirmed");
         Ok(receipt.block_number)
     }
 
@@ -2456,6 +2470,11 @@ impl<Signer: Wallet, B: UsdcBridgeHelper> CrossVenueCashTransfer<Signer, B> {
             | UsdcRebalance::SwapQuoted { .. }
             | UsdcRebalance::SwapDepositPrepared { .. }
             | UsdcRebalance::SwapDeposited { .. }
+            | UsdcRebalance::SwapRefunded { .. }
+            | UsdcRebalance::SwapEscrowUnresolved { .. }
+            | UsdcRebalance::SwapFailed { .. }
+            | UsdcRebalance::Redepositing { .. }
+            | UsdcRebalance::ReturnedToSource { .. }
             | UsdcRebalance::DepositFailed { .. }
             | UsdcRebalance::Reconciled { .. }) => {
                 let UsdcCorridor::HubRouted { hop, .. } = self.corridor;
@@ -4244,7 +4263,14 @@ impl<
             ) => Err(UsdcTransferError::PreviouslyFailedAggregate { id: id.clone() }),
 
             Some(
-                state @ (SwapQuoted { .. } | SwapDepositPrepared { .. } | SwapDeposited { .. }),
+                state @ (SwapQuoted { .. }
+                | SwapDepositPrepared { .. }
+                | SwapDeposited { .. }
+                | SwapRefunded { .. }
+                | SwapEscrowUnresolved { .. }
+                | SwapFailed { .. }
+                | Redepositing { .. }
+                | ReturnedToSource { .. }),
             ) => Err(UsdcTransferError::StateOffHop {
                 id: id.clone(),
                 state: state.state_name(),
@@ -5531,7 +5557,12 @@ impl<
             Some(
                 state @ (UsdcRebalance::SwapQuoted { .. }
                 | UsdcRebalance::SwapDepositPrepared { .. }
-                | UsdcRebalance::SwapDeposited { .. }),
+                | UsdcRebalance::SwapDeposited { .. }
+                | UsdcRebalance::SwapRefunded { .. }
+                | UsdcRebalance::SwapEscrowUnresolved { .. }
+                | UsdcRebalance::SwapFailed { .. }
+                | UsdcRebalance::Redepositing { .. }
+                | UsdcRebalance::ReturnedToSource { .. }),
             ) => Err(UsdcTransferError::StateOffHop {
                 id: id.clone(),
                 state: state.state_name(),

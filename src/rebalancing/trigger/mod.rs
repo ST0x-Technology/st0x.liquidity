@@ -1304,6 +1304,11 @@ impl RearmPolicy {
             | UsdcRebalance::SwapQuoted { .. }
             | UsdcRebalance::SwapDepositPrepared { .. }
             | UsdcRebalance::SwapDeposited { .. }
+            | UsdcRebalance::SwapRefunded { .. }
+            | UsdcRebalance::SwapEscrowUnresolved { .. }
+            | UsdcRebalance::SwapFailed { .. }
+            | UsdcRebalance::Redepositing { .. }
+            | UsdcRebalance::ReturnedToSource { .. }
             | UsdcRebalance::Bridged { .. }
             | UsdcRebalance::DepositInitiated { .. }
             | UsdcRebalance::DepositConfirmed { .. }
@@ -1358,6 +1363,11 @@ impl RearmPolicy {
             | UsdcRebalance::SwapQuoted { .. }
             | UsdcRebalance::SwapDepositPrepared { .. }
             | UsdcRebalance::SwapDeposited { .. }
+            | UsdcRebalance::SwapRefunded { .. }
+            | UsdcRebalance::SwapEscrowUnresolved { .. }
+            | UsdcRebalance::SwapFailed { .. }
+            | UsdcRebalance::Redepositing { .. }
+            | UsdcRebalance::ReturnedToSource { .. }
             | UsdcRebalance::Bridged { .. }
             | UsdcRebalance::DepositInitiated { .. }
             | UsdcRebalance::DepositConfirmed { .. }
@@ -6890,6 +6900,7 @@ impl RebalancingService {
                 direction: RebalanceDirection::AlpacaToBase,
                 ..
             }
+            | UsdcRebalance::ReturnedToSource { .. }
             | UsdcRebalance::Reconciled { .. } => true,
             UsdcRebalance::Converting { .. }
             | UsdcRebalance::ConversionComplete { .. }
@@ -6905,6 +6916,10 @@ impl RebalancingService {
             | UsdcRebalance::SwapQuoted { .. }
             | UsdcRebalance::SwapDepositPrepared { .. }
             | UsdcRebalance::SwapDeposited { .. }
+            | UsdcRebalance::SwapRefunded { .. }
+            | UsdcRebalance::SwapEscrowUnresolved { .. }
+            | UsdcRebalance::SwapFailed { .. }
+            | UsdcRebalance::Redepositing { .. }
             | UsdcRebalance::Bridged { .. }
             | UsdcRebalance::BridgingFailed { .. }
             | UsdcRebalance::DepositInitiated { .. }
@@ -9988,6 +10003,8 @@ impl RebalancingService {
                 | BridgingFailed { .. }
                 | DepositFailed { .. }
                 | ConversionFailed { .. }
+                | SwapFailed { .. }
+                | ReturnedToSource { .. }
                 | OperatorReconciled { .. }
                 | ConversionConfirmed {
                     direction: RebalanceDirection::BaseToAlpaca,
@@ -37360,6 +37377,114 @@ mod tests {
         drop(inventory);
     }
 
+    /// The Relay events after a chain-to-Alpaca withdrawal, up to a
+    /// confirmed swap deposit.
+    fn relay_swap_deposited() -> Vec<UsdcRebalanceEvent> {
+        vec![
+            UsdcRebalanceEvent::WithdrawalConfirmed {
+                confirmed_at: Utc::now(),
+                withdrawal_tx: None,
+            },
+            UsdcRebalanceEvent::SwapQuoted {
+                quote: Box::new(crate::usdc_rebalance::swap_quote_for_test(
+                    U256::from(100_000_000u64),
+                    B256::repeat_byte(0x0d),
+                )),
+                quoted_at: Utc::now(),
+            },
+            UsdcRebalanceEvent::SwapDepositPrepared {
+                approve: None,
+                deposit: PreparedTransaction::for_test(TxHash::repeat_byte(0xa2), 6),
+                prepared_at: Utc::now(),
+            },
+            UsdcRebalanceEvent::SwapDeposited {
+                deposit_tx: TxHash::repeat_byte(0xa2),
+                deposit_block: 9,
+                deposited_at: Utc::now(),
+            },
+        ]
+    }
+
+    /// A Relay transfer whose stable went back into its vault clears its
+    /// active claim and returns the reserved cash to the vault side; one Relay
+    /// failed with nothing paid back keeps its guard and claim.
+    #[tokio::test]
+    async fn relay_returned_to_source_clears_and_swap_failed_preserves() {
+        let robinhood_relay = UsdcCorridor::HubRouted {
+            chain: Chain::Robinhood,
+            hop: HopKind::Relay,
+        };
+        let refunded = [
+            UsdcRebalanceEvent::SwapRefunded {
+                refund_tx: TxHash::repeat_byte(0xe1),
+                side: crate::usdc_rebalance::RefundSide::Origin,
+                amount_refunded: usdc(99),
+                refunded_at: Utc::now(),
+            },
+            UsdcRebalanceEvent::RedepositStarted {
+                redeposit_amount: usdc(99),
+                reason: crate::usdc_rebalance::RedepositReason::Refunded,
+                started_at: Utc::now(),
+            },
+            UsdcRebalanceEvent::RedepositSubmitted {
+                deposit_tx: TxHash::repeat_byte(0xd1),
+                submitted_at: Utc::now(),
+            },
+        ];
+        let returned = UsdcRebalanceEvent::ReturnedToSource {
+            deposit_tx: TxHash::repeat_byte(0xd1),
+            deposit_block: Some(3),
+            returned_at: Utc::now(),
+        };
+        let failed = UsdcRebalanceEvent::SwapFailed {
+            reason: "Relay reported Failure".to_string(),
+            failed_at: Utc::now(),
+        };
+
+        for (terminal, clears) in [(returned, true), (failed, false)] {
+            let trigger = make_trigger_with_inventory(with_onchain_usdc(
+                InventoryView::default().with_usdc(usdc(500), usdc(500)),
+                Chain::Robinhood,
+                usdc(500),
+            ))
+            .await;
+            let id = UsdcRebalanceId(Uuid::new_v4());
+            let initiated = make_usdc_initiated_on(
+                robinhood_relay,
+                RebalanceDirection::BaseToAlpaca,
+                usdc(100),
+            );
+            let mut history = vec![initiated];
+            history.extend(relay_swap_deposited());
+            if clears {
+                history.extend(refunded.clone());
+            }
+            history.push(terminal.clone());
+            for event in history {
+                trigger.on_usdc_rebalance(id.clone(), event).await.unwrap();
+            }
+
+            let active = trigger
+                .inventory
+                .read()
+                .await
+                .active_usdc_rebalance()
+                .cloned();
+            if clears {
+                assert_eq!(active, None, "ReturnedToSource clears the active claim");
+                assert!(!trigger.usdc_tracking.read().await.contains_key(&id));
+            } else {
+                assert_eq!(
+                    active,
+                    Some(id.clone()),
+                    "SwapFailed keeps the active claim"
+                );
+                assert!(trigger.usdc_tracking.read().await.contains_key(&id));
+                assert!(trigger.usdc_guards.is_held(Chain::Robinhood));
+            }
+        }
+    }
+
     #[tokio::test]
     async fn usdc_terminal_clears_active_rebalance_id() {
         let reactor =
@@ -42875,6 +43000,77 @@ mod tests {
             fill_timeout: Duration::from_secs(1800),
             max_refund_retries: 3,
             max_deposit_revert_redrives: 5,
+        }
+    }
+
+    /// The operator's exit of a Relay transfer held after its vault
+    /// withdrawal, at `WithdrawalComplete` (no binding quote) or `SwapQuoted`
+    /// (an expired quote): `transfer resume` enqueues it for the worker,
+    /// which re-quotes or returns the stable to the vault.
+    #[tokio::test]
+    async fn manual_resume_enqueues_relay_transfers_held_after_their_withdrawal() {
+        for quoted in [false, true] {
+            let config = RebalancingServiceConfig {
+                usdc: UsdcCorridors::for_test(
+                    OperationMode::Enabled,
+                    [active_corridor(Chain::Robinhood, HopKind::Relay)],
+                )
+                .with_relay_hop(Chain::Robinhood, relay_bounds(500, 50_000)),
+                ..with_cash_on(test_config(), &[Chain::Robinhood])
+            };
+            let pool = crate::test_utils::setup_test_db().await;
+            let store = Arc::new(test_store::<UsdcRebalance>(pool.clone(), ()));
+            let trigger = make_trigger_with_inventory_config(
+                InventoryView::default().with_usdc(usdc(500), usdc(900)),
+                config,
+            )
+            .await;
+            trigger
+                .set_stores(
+                    Arc::new(test_store::<TokenizedEquityMint>(
+                        pool.clone(),
+                        crate::rebalancing::equity::EquityTransferServices::panicking(),
+                    )),
+                    Arc::new(test_store::<EquityRedemption>(
+                        pool.clone(),
+                        crate::rebalancing::equity::EquityTransferServices::panicking(),
+                    )),
+                    store.clone(),
+                )
+                .await;
+            let id = UsdcRebalanceId(Uuid::new_v4());
+            let mut commands = vec![
+                UsdcRebalanceCommand::Initiate {
+                    corridor: ROBINHOOD_RELAY,
+                    direction: RebalanceDirection::BaseToAlpaca,
+                    amount: usdc(100),
+                    withdrawal: TransferRef::OnchainTx(TxHash::repeat_byte(0x77)),
+                },
+                UsdcRebalanceCommand::ConfirmWithdrawal {
+                    withdrawal_tx: None,
+                },
+            ];
+            if quoted {
+                commands.push(UsdcRebalanceCommand::QuoteSwap {
+                    quote: Box::new(crate::usdc_rebalance::swap_quote_for_test(
+                        U256::from(100_000_000u64),
+                        B256::repeat_byte(0x0d),
+                    )),
+                });
+            }
+            for command in commands {
+                store.send(&id, command).await.unwrap();
+            }
+
+            trigger
+                .resume_usdc_transfer(&pool, &id, RebalanceDirection::BaseToAlpaca)
+                .await
+                .unwrap();
+
+            let job = pending_transfer_usdc_to_hedging_job(&trigger).await;
+            assert_eq!(job.id, id, "quoted: {quoted}");
+            assert_eq!(job.corridor, ROBINHOOD_RELAY);
+            assert!(trigger.usdc_guards.is_held(Chain::Robinhood));
         }
     }
 
