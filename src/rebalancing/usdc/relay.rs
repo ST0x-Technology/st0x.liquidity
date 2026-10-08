@@ -1458,7 +1458,7 @@ where
 
         let order_id = quote.order_id;
         error!(target: "operational_alert", alert = true, %id, deposit_tx = %deposit.tx, %order_id, block = deposit.block, "A deposit of a reverted Relay order is on chain; the transfer signs and redeposits nothing until its payment proves");
-        let Some(payment) = self.proven_order_payment(id, side, quote).await else {
+        let Some(payment) = self.proven_order_payment(id, side, quote).await? else {
             return Err(UsdcTransferError::RevertedSwapDepositLive {
                 id: id.clone(),
                 order_id,
@@ -1488,13 +1488,14 @@ where
     }
 
     /// The fill or refund of `quote`'s order that Relay reports and the chain
-    /// proves, `None` while it reports none or it does not prove yet.
+    /// proves, `None` while Relay reports none or it is not provable yet. A
+    /// payment the chain contradicts pages and is `SwapPaymentUnverified`.
     async fn proven_order_payment(
         &self,
         id: &UsdcRebalanceId,
         side: HopDirection,
         quote: &SwapQuote,
-    ) -> Option<RecoveredSwapPayment> {
+    ) -> Result<Option<RecoveredSwapPayment>, UsdcTransferError> {
         let order_id = RelayOrderId(quote.order_id);
         let report = match self
             .hop
@@ -1505,30 +1506,25 @@ where
             Ok(report) => report,
             Err(error) => {
                 warn!(target: "rebalance", %id, order_id = %quote.order_id, %error, "Relay status read failed; reading it again later");
-                return None;
+                return Ok(None);
             }
         };
 
-        let proof = match report.status {
-            IntentStatus::Success => self
-                .hop
-                .bridge
-                .verify_fill(side, order_id, quote.minimum_out, &report.txs)
-                .await
-                .map(|payment| RecoveredSwapPayment::Fill {
-                    fill_tx: payment.tx,
-                    amount_received: payment.amount,
-                }),
-            IntentStatus::Refund { .. } => self
-                .hop
-                .bridge
-                .verify_refund(side, order_id, quote.amount_in, &report.txs)
-                .await
-                .map(|payment| RecoveredSwapPayment::Refund {
-                    refund_tx: payment.tx,
-                    side: refund_side(payment.side),
-                    amount_refunded: payment.amount,
-                }),
+        let (proof, fill) = match report.status {
+            IntentStatus::Success => (
+                self.hop
+                    .bridge
+                    .verify_fill(side, order_id, quote.minimum_out, &report.txs)
+                    .await,
+                true,
+            ),
+            IntentStatus::Refund { .. } => (
+                self.hop
+                    .bridge
+                    .verify_refund(side, order_id, quote.amount_in, &report.txs)
+                    .await,
+                false,
+            ),
             status @ (IntentStatus::Waiting
             | IntentStatus::InFlight(_)
             | IntentStatus::Filling
@@ -1538,15 +1534,24 @@ where
             | IntentStatus::NotIncluded
             | IntentStatus::Unknown(_)) => {
                 info!(target: "rebalance", %id, order_id = %quote.order_id, ?status, "Relay reports no payment of the order");
-                return None;
+                return Ok(None);
             }
         };
 
-        proof
-            .inspect_err(|error| {
-                warn!(target: "rebalance", %id, order_id = %quote.order_id, %error, "The Relay payment of the order does not prove on chain yet");
-            })
-            .ok()
+        Ok(Self::proven_payment(id, proof, false)?.map(|payment| {
+            if fill {
+                RecoveredSwapPayment::Fill {
+                    fill_tx: payment.tx,
+                    amount_received: payment.amount,
+                }
+            } else {
+                RecoveredSwapPayment::Refund {
+                    refund_tx: payment.tx,
+                    side: refund_side(payment.side),
+                    amount_refunded: payment.amount,
+                }
+            }
+        }))
     }
 
     /// Moves an adopted late payment on as any other: a fill as after the
@@ -2192,6 +2197,7 @@ where
         let Some(payment) = self
             .proven_order_payment(id, hop_direction(direction), &quote)
             .await
+            .map_err(Box::new)?
         else {
             return Ok(RecheckOutcome::LeftUnchanged);
         };
@@ -5621,7 +5627,7 @@ mod tests {
 
     /// A deposit Relay still reports reorged out past the fill window is a
     /// Relay failure with nothing paid back: it holds at the reconcilable
-    /// `SwapFailed`, where a recheck can still adopt a later payment.
+    /// `SwapFailed`, guard held.
     #[tokio::test]
     async fn deposit_reorged_past_the_fill_window_fails_the_swap() {
         let anvil = spawn_anvil(Anvil::new());

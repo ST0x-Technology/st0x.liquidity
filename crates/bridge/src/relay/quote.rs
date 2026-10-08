@@ -1421,7 +1421,8 @@ pub(super) mod tests {
     }
 
     /// A quote body built for an in-process test passes every check the
-    /// client runs, in both directions, and commits to a fresh order id.
+    /// client runs, in both directions, including the order id its order
+    /// data commits to.
     #[test]
     fn built_test_quote_validates_both_ways() {
         let wallet = address!("0x2222222222222222222222222222222222222222");

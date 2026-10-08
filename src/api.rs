@@ -1969,7 +1969,8 @@ fn usdc_recheck_error_response(error: &UsdcRecheckError) -> (StatusCode, String)
         // refusal: the operator needs its message, not a generic 500.
         Transfer(transfer_error) => match transfer_error.as_ref() {
             UsdcTransferError::CorridorMismatch { .. }
-            | UsdcTransferError::CorridorNotServed { .. } => {
+            | UsdcTransferError::CorridorNotServed { .. }
+            | UsdcTransferError::SwapPaymentUnverified { .. } => {
                 (StatusCode::UNPROCESSABLE_ENTITY, error.to_string())
             }
             _ => (
