@@ -1892,27 +1892,48 @@ margin would become genuinely uncounted capital.
 
 **USD marks**: the settlement stable (USDC today) is treated as par (`1:1`),
 matching the reporting-currency assumption used elsewhere in `/pnl`. Equity
-balances are marked from the symbol's
-`Position.last_price: Option<PriceObservation>` as of capture time. A
-`PriceObservation` carries the fill-derived USD price and the time that price
-was economically observed: `OnChainOrderFilled` uses the fill's
-`block_timestamp`, and a priced `ManualPositionAdjusted` uses `adjusted_at`.
-This is distinct from `last_updated`, which is also advanced by non-price
-events. A symbol with a balance but no observed price is recorded with
-`usd_mark = NULL` -- never a fabricated zero. A missing or stale mark does not
-block the immutable balance capture; it immediately emits an error, increments
-an operational counter, and begins sending an operator alert through the
-configured alerting channel. In-process alert delivery cannot fail: the
-production notifier emits a structured ERROR log and its error type is
-uninhabited outside test builds, so getting the event to a human is the logging
-pipeline's responsibility (see "Structured log channel"). The per-symbol
-delivery event, the alert-only retry queue, and the bounded retry backoff are
-retained as a transport seam -- they are exercised only by test doubles that
-simulate a fallible notifier, and they would become load-bearing again if a
-fallible transport ever returns. Successful per-symbol delivery is still
-recorded as a retained aggregate event, and a crash in the narrow interval after
-the notifier accepts a message but before the delivery event commits may produce
-a duplicate log line rather than lose the incident.
+balances are marked at the newer, by observation time, of two prices of one
+underlying share, as of capture time; on a tie the fill wins:
+
+- the symbol's `Position.last_price: Option<PriceObservation>`. A
+  `PriceObservation` carries the fill-derived USD price and the time that price
+  was economically observed: `OnChainOrderFilled` uses the fill's
+  `block_timestamp`, and a priced `ManualPositionAdjusted` uses `adjusted_at`.
+  This is distinct from `last_updated`, which is also advanced by non-price
+  events.
+- the last underlying mark the pricing service sent this session (the midpoint
+  of the quote's underlying rates, stamped with the quote's source time). The
+  bot keeps it after the live quote expires and across pricing disconnects, so a
+  capture at ET midnight or at a weekend still finds a recent mark. It is
+  process-local: after a restart or config reload, a symbol has no pricing mark
+  until pricing quotes it again, and the fill alone values it meanwhile. It is
+  pricing's model mid, not a closing price, so it can differ from an operator's
+  repair mark (below).
+
+While pricing quotes a symbol, its mark is usually newer than the last fill, so
+in practice quoted symbols are valued at pricing's mid and a symbol that has not
+filled for weeks no longer goes stale. The staleness rule below applies to
+whichever price was chosen. For a pricing mark it detects a pricing outage only:
+the pricing service stamps every in-session publish with a fresh source time,
+even when the upstream price is unchanged, so an upstream price that stays
+frozen while pricing keeps publishing it never reads as stale. That costs at
+most a wrong capital denominator in `/pnl`, never a trade; detecting it would
+need pricing to send the market data's own observation time. A symbol with a
+balance but neither price is recorded with `usd_mark = NULL` -- never a
+fabricated zero. A missing or stale mark does not block the immutable balance
+capture; it immediately emits an error, increments an operational counter, and
+begins sending an operator alert through the configured alerting channel.
+In-process alert delivery cannot fail: the production notifier emits a
+structured ERROR log and its error type is uninhabited outside test builds, so
+getting the event to a human is the logging pipeline's responsibility (see
+"Structured log channel"). The per-symbol delivery event, the alert-only retry
+queue, and the bounded retry backoff are retained as a transport seam -- they
+are exercised only by test doubles that simulate a fallible notifier, and they
+would become load-bearing again if a fallible transport ever returns. Successful
+per-symbol delivery is still recorded as a retained aggregate event, and a crash
+in the narrow interval after the notifier accepts a message but before the
+delivery event commits may produce a duplicate log line rather than lose the
+incident.
 
 Captured marks are immutable facts, but operators may correct a missing or stale
 historical mark through the portfolio-snapshot `set` recovery command. The
@@ -7941,11 +7962,14 @@ multiple broker-specific contexts.
    environment.
 
    `Position.last_price` remains the last fill-derived observation used by the
-   trading domain and historical accounting. Dashboard pricing is a separate,
-   process-local read model streamed in the initial WebSocket state and in live
-   price updates; it does not mutate a Position or the event store. Pricing
-   transport failures are retried and degrade only dashboard USD values, not
-   hedging or rebalancing.
+   trading domain. Dashboard pricing is a separate, process-local read model
+   streamed in the initial WebSocket state and in live price updates; it does
+   not mutate a Position or the event store. The same store also supplies the
+   rebalancer's minimum-operation-size price for a never-filled symbol and the
+   daily portfolio snapshot's newer-than-fill mark (see "USD marks"). Pricing
+   transport failures are retried. They never affect hedging; they can delay a
+   never-filled symbol's rebalancing, and a snapshot taken before any mark
+   arrives falls back to the last fill.
 
 3. **Spreads**: Last realized spreads per asset (buy/sell prices and spread bps)
    and per-symbol price charts over time.
