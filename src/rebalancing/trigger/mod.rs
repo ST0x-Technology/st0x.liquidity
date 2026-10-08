@@ -44635,30 +44635,16 @@ mod tests {
         assert!(market_making_job_rows(&trigger).await.is_empty());
     }
 
-    /// A chain-to-Alpaca Relay transfer timed out at `WithdrawalComplete`:
-    /// the withdrawn stable sits in the chain wallet outside the vault, so
-    /// the sweep holds the guard instead of clearing it as a pre-burn timeout.
-    #[tokio::test]
-    async fn sweep_holds_a_timed_out_relay_withdrawal_complete() {
+    /// Sweeps a chain-to-Alpaca Robinhood Relay transfer recorded in `store`
+    /// whose tracking still reads `WithdrawalConfirmed` and is past its
+    /// timeout, whatever state the store holds.
+    async fn sweep_stale_relay_transfer(
+        pool: &SqlitePool,
+        store: Arc<Store<UsdcRebalance>>,
+        id: &UsdcRebalanceId,
+        amount: Usdc,
+    ) -> Arc<RebalancingService> {
         let now = Utc::now();
-        let pool = crate::test_utils::setup_test_db().await;
-        let store = Arc::new(test_store::<UsdcRebalance>(pool.clone(), ()));
-        let id = UsdcRebalanceId(Uuid::new_v4());
-        let amount = usdc(400);
-        for command in [
-            UsdcRebalanceCommand::Initiate {
-                direction: RebalanceDirection::BaseToAlpaca,
-                corridor: ROBINHOOD_RELAY,
-                amount,
-                withdrawal: TransferRef::OnchainTx(TxHash::repeat_byte(0x77)),
-            },
-            UsdcRebalanceCommand::ConfirmWithdrawal {
-                withdrawal_tx: None,
-            },
-        ] {
-            store.send(&id, command).await.unwrap();
-        }
-
         let config = RebalancingServiceConfig {
             usdc: UsdcCorridors::for_test(
                 OperationMode::Enabled,
@@ -44697,7 +44683,7 @@ mod tests {
             .await;
         trigger
             .usdc_guards
-            .hold(Chain::Robinhood, &id, RebalanceDirection::BaseToAlpaca);
+            .hold(Chain::Robinhood, id, RebalanceDirection::BaseToAlpaca);
         trigger.usdc_tracking.write().await.insert(
             id.clone(),
             usdc::UsdcRebalanceTracking {
@@ -44714,6 +44700,34 @@ mod tests {
             .expire_stuck_usdc_rebalances(Utc::now())
             .await
             .unwrap();
+
+        trigger
+    }
+
+    /// A chain-to-Alpaca Relay transfer timed out at `WithdrawalComplete`:
+    /// the withdrawn stable sits in the chain wallet outside the vault, so
+    /// the sweep holds the guard instead of clearing it as a pre-burn timeout.
+    #[tokio::test]
+    async fn sweep_holds_a_timed_out_relay_withdrawal_complete() {
+        let pool = crate::test_utils::setup_test_db().await;
+        let store = Arc::new(test_store::<UsdcRebalance>(pool.clone(), ()));
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let amount = usdc(400);
+        for command in [
+            UsdcRebalanceCommand::Initiate {
+                direction: RebalanceDirection::BaseToAlpaca,
+                corridor: ROBINHOOD_RELAY,
+                amount,
+                withdrawal: TransferRef::OnchainTx(TxHash::repeat_byte(0x77)),
+            },
+            UsdcRebalanceCommand::ConfirmWithdrawal {
+                withdrawal_tx: None,
+            },
+        ] {
+            store.send(&id, command).await.unwrap();
+        }
+
+        let trigger = sweep_stale_relay_transfer(&pool, store, &id, amount).await;
 
         assert!(
             trigger.usdc_guards.is_held(Chain::Robinhood),
@@ -44744,6 +44758,61 @@ mod tests {
                 .await
                 .contains(&id),
             "the sweep must page that the stable is outside the vault",
+        );
+    }
+
+    /// Stale tracking that still reads `WithdrawalConfirmed` while the store
+    /// is at `SwapDeposited`: the stable is with Relay, not in the vault, so
+    /// the sweep holds the guard instead of clearing it.
+    #[tokio::test]
+    async fn sweep_holds_a_stale_relay_transfer_at_swap_deposited() {
+        let pool = crate::test_utils::setup_test_db().await;
+        let store = Arc::new(test_store::<UsdcRebalance>(pool.clone(), ()));
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let deposit = PreparedTransaction::for_test(TxHash::repeat_byte(0xa2), 6);
+        crate::usdc_rebalance::record_swap_pair_for_test(
+            &store,
+            &id,
+            RebalanceDirection::BaseToAlpaca,
+            ROBINHOOD_RELAY,
+            None,
+            deposit.clone(),
+        )
+        .await;
+        store
+            .send(
+                &id,
+                UsdcRebalanceCommand::ConfirmSwapDeposit {
+                    deposit_tx: deposit.tx_hash(),
+                    deposit_block: 9,
+                },
+            )
+            .await
+            .unwrap();
+
+        let trigger = sweep_stale_relay_transfer(&pool, store, &id, usdc(100)).await;
+
+        assert!(
+            trigger.usdc_guards.is_held(Chain::Robinhood),
+            "the guard must stay held while the deposit is with Relay",
+        );
+        assert!(
+            !trigger
+                .timed_out_usdc_rebalances
+                .read()
+                .await
+                .contains_key(&id),
+            "the sweep must not tombstone a held transfer",
+        );
+        assert_eq!(
+            trigger
+                .inventory
+                .read()
+                .await
+                .active_usdc_rebalance()
+                .cloned(),
+            Some(id),
+            "the transfer must stay the active rebalance",
         );
     }
 }
