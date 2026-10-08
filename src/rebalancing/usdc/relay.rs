@@ -4782,4 +4782,143 @@ mod tests {
         assert!(state.is_reconcilable_failure());
         assert_eq!(rig.vault_usdg().await, U256::ZERO);
     }
+
+    /// A pair, or a lone approve, signed on the hub for a transfer the
+    /// operator reconciled meanwhile can never be persisted or sent: its
+    /// nonces are released, so later sends from the shared Ethereum wallet do
+    /// not wait behind them.
+    #[tokio::test]
+    async fn envelopes_signed_for_a_reconciled_transfer_release_their_nonces() {
+        let anvil = spawn_anvil(Anvil::new());
+        let (wallet, contracts) = funded_relay_end(&anvil).await;
+        let store = Arc::new(test_store(setup_test_db().await, ()));
+        let server = MockServer::start();
+        let relay_api = MockServer::start();
+        let transfer = relay_transfer(
+            &server,
+            &relay_api,
+            wallet.clone(),
+            wallet.clone(),
+            contracts,
+            store.clone(),
+        )
+        .await;
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let quote = exact_quote(&wallet, contracts, TOWARD_CHAIN_ORDER_ID).await;
+        record_quoted_toward_chain(&store, &id, quote.clone()).await;
+        store
+            .send(
+                &id,
+                UsdcRebalanceCommand::ReconcileStuckRebalance {
+                    reason: crate::usdc_rebalance::ReconcileReason::FundsMovedManually,
+                },
+            )
+            .await
+            .unwrap();
+        let first_nonce = wallet
+            .provider()
+            .get_transaction_count(wallet.address())
+            .await
+            .unwrap();
+
+        let PreparedSwap::Deposit(pair) = transfer
+            .hop
+            .bridge
+            .prepare_deposit(HopDirection::FromHub, &relay_quote(&quote, true).unwrap())
+            .await
+            .unwrap()
+        else {
+            panic!("expected a signed pair");
+        };
+        transfer
+            .hop
+            .persist_swap_pair(&store, &id, &pair, HopDirection::FromHub)
+            .await
+            .unwrap_err();
+        let next = wallet
+            .prepare_pending(
+                contracts.stable,
+                quote.approve.clone().unwrap().data,
+                "next",
+            )
+            .await
+            .unwrap();
+        assert_eq!(next.nonce(), first_nonce, "the pair's nonces are released");
+
+        transfer
+            .hop
+            .persist_lone_approve(&store, &id, &next, HopDirection::FromHub)
+            .await
+            .unwrap_err();
+        let after = wallet
+            .prepare_pending(contracts.stable, quote.approve.unwrap().data, "after")
+            .await
+            .unwrap();
+        assert_eq!(
+            after.nonce(),
+            first_nonce,
+            "the lone approve's nonce is released"
+        );
+    }
+
+    /// A transfer from the hub held at `SwapQuoted` sends again the approves
+    /// that went out alone before it stops: a node may have dropped them, and
+    /// every later send from the shared Ethereum wallet waits behind their
+    /// nonces.
+    #[tokio::test]
+    async fn hold_at_the_hub_sends_its_split_approves_again() {
+        let anvil = spawn_anvil(Anvil::new());
+        let (wallet, contracts) = funded_relay_end(&anvil).await;
+        let store = Arc::new(test_store(setup_test_db().await, ()));
+        let server = MockServer::start();
+        let relay_api = MockServer::start();
+        mock_quote_refused(&relay_api);
+        let transfer = relay_transfer(
+            &server,
+            &relay_api,
+            wallet.clone(),
+            wallet.clone(),
+            contracts,
+            store.clone(),
+        )
+        .await;
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let mut expired = exact_quote(&wallet, contracts, TOWARD_CHAIN_ORDER_ID).await;
+        expired.deadline = Utc::now() - chrono::Duration::minutes(1);
+        record_quoted_toward_chain(&store, &id, expired.clone()).await;
+        let approve = wallet
+            .prepare_pending(
+                contracts.stable,
+                expired.approve.unwrap().data,
+                "split approve",
+            )
+            .await
+            .unwrap();
+        store
+            .send(
+                &id,
+                UsdcRebalanceCommand::PrepareSwapApprove {
+                    approve: approve.clone(),
+                },
+            )
+            .await
+            .unwrap();
+
+        transfer
+            .resume_alpaca_to_base(&id, Usdc::new(float!(100)), ROBINHOOD_RELAY)
+            .await
+            .unwrap();
+
+        let state = store.load(&id).await.unwrap().unwrap();
+        assert_eq!(state.state_name(), "SwapQuoted", "{state:?}");
+        assert!(
+            wallet
+                .provider()
+                .get_transaction_receipt(approve.tx_hash())
+                .await
+                .unwrap()
+                .is_some(),
+            "the split approve is sent before the hold"
+        );
+    }
 }
