@@ -965,7 +965,7 @@ where
         wait: PaymentWait,
     ) -> Result<(), UsdcTransferError> {
         let PaymentWait::FillWindow { deposited_at } = wait else {
-            warn!(target: "rebalance", %id, %deposit_tx, "Relay deposit still unresolved; it is read again on the next resume");
+            error!(target: "operational_alert", alert = true, %id, %deposit_tx, "Relay deposit still unresolved past its fill window; the transfer holds its guard, and the next resume reads Relay again");
             return Ok(());
         };
 
@@ -1041,8 +1041,15 @@ where
         let deposit_block = self
             .confirm_vault_deposit(deposit_tx)
             .await
-            .inspect_err(|error| {
-                error!(target: "operational_alert", alert = true, %id, %deposit_tx, %error, "The redeposit into the vault did not confirm; the transfer holds its guard at Redepositing until it confirms, or the stable is settled by hand and the transfer reconciled");
+            .inspect_err(|error| match error {
+                UsdcTransferError::Vault(vault)
+                    if vault.is_transaction_dropped() || !vault.is_reconciliation_pending() =>
+                {
+                    error!(target: "operational_alert", alert = true, %id, %deposit_tx, %error, "The redeposit into the vault was dropped, reverted or refused; the transfer holds its guard at Redepositing until the stable is settled by hand and the transfer reconciled");
+                }
+                _ => {
+                    warn!(target: "rebalance", %id, %deposit_tx, %error, "The redeposit into the vault is not confirmed yet; retrying");
+                }
             })?;
         self.cqrs
             .send(

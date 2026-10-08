@@ -2416,8 +2416,10 @@ impl UsdcRebalance {
     /// - `BridgingFailed { direction: AlpacaToBase, burn_tx_hash: Some }`:
     ///   post-burn, no recovery job (only `BaseToAlpaca` is re-armed on
     ///   startup via `resumable_post_burn_transfer`).
+    /// - The Relay holds `SwapFailed`, a destination-side `SwapRefunded` and
+    ///   `Redepositing`: no startup re-arm, no `DepositConfirmed` path.
     ///
-    /// All three are accepted by `transition_reconcile_stuck_rebalance` (the
+    /// All of them are accepted by `transition_reconcile_stuck_rebalance` (the
     /// CLI `transfer reconcile` target), hold the guard on restart
     /// (`holds_rebalance_guard` returns `true`), and are NOT auto-re-armed:
     /// without a tracking seed the sweep has no entry to iterate and the guard
@@ -7562,6 +7564,55 @@ mod tests {
                 .unwrap()
                 .unwrap();
             assert_eq!(state.state_name(), adopted);
+        }
+    }
+
+    /// The reconcilable Relay holds seed startup tracking, so the sweep can
+    /// clear their guard after a reconcile from the CLI; the others do not.
+    #[test]
+    fn reconcilable_relay_holds_seed_guard_recovery_tracking() {
+        let after = |event| [deposited(RebalanceDirection::BaseToAlpaca), vec![event]].concat();
+        let refunded = |side| UsdcRebalanceEvent::SwapRefunded {
+            refund_tx: TxHash::repeat_byte(0xe1),
+            side,
+            amount_refunded: Usdc::new(float!(99)),
+            refunded_at: Utc::now(),
+        };
+        let redepositing = [
+            withdrawn(RebalanceDirection::BaseToAlpaca, ROBINHOOD_RELAY),
+            vec![UsdcRebalanceEvent::RedepositStarted {
+                redeposit_amount: Usdc::new(float!(100)),
+                reason: RedepositReason::QuoteRefused,
+                started_at: Utc::now(),
+            }],
+        ]
+        .concat();
+
+        for (events, seeded) in [
+            (
+                after(UsdcRebalanceEvent::SwapFailed {
+                    reason: "Relay reported Failure".to_string(),
+                    failed_at: Utc::now(),
+                }),
+                true,
+            ),
+            (after(refunded(RefundSide::Destination)), true),
+            (redepositing, true),
+            (after(refunded(RefundSide::Origin)), false),
+            (
+                after(UsdcRebalanceEvent::SwapEscrowUnresolved {
+                    unresolved_at: Utc::now(),
+                }),
+                false,
+            ),
+        ] {
+            let state = replay::<UsdcRebalance>(events).unwrap().unwrap();
+            let seed = state.guard_recovery_tracking_data();
+            assert_eq!(seed.is_some(), seeded, "{state:?}");
+            if let Some((direction, amount, _)) = seed {
+                assert_eq!(direction, RebalanceDirection::BaseToAlpaca);
+                assert_eq!(amount, Usdc::new(float!(100)));
+            }
         }
     }
 
