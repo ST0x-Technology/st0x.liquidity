@@ -41,7 +41,7 @@ class CompareTest(unittest.TestCase):
             'missing from bot: liq_asset_rebalancing{symbol="TSLA"}\n'
             "value differs: liq_settings_usdc_target bot=0.45 exporter=0.4\n"
             "not yet ported (exporter-only names, ignored): "
-            "liq_block_lag_blocks, liq_hedge_latency_ms_samples\n"
+            "liq_pending_orders_total, liq_pnl_summary_usd\n"
             "3 finding(s)\n"
         ))
 
@@ -63,8 +63,8 @@ class CompareTest(unittest.TestCase):
             "bot=1700000000.0 exporter=1700000001.9\n"
             "value differs: liq_settings_usdc_target bot=0.45 exporter=0.4\n"
             "not yet ported (exporter-only names, ignored): "
-            "liq_asset_flags, liq_block_lag_blocks, liq_equity_ratio_deviation, "
-            "liq_hedge_latency_ms_samples, liq_up\n"
+            "liq_asset_flags, liq_equity_ratio_deviation, liq_pending_orders_total, "
+            "liq_pnl_summary_usd, liq_up\n"
             "10 finding(s)\n"
         ))
 
@@ -246,14 +246,14 @@ class CompareTest(unittest.TestCase):
             [])
 
     def test_a_bot_name_published_in_one_pair_is_compared_in_every_pair(self):
-        exporter = "liq_bot_info{git_commit=\"a\"} 1\nliq_job_queue{state=\"x\"} 2\n"
+        exporter = "liq_bot_info{git_commit=\"a\"} 1\nliq_pending_orders_total 2\n"
         with_name = exporter
         without_name = "liq_bot_info{git_commit=\"a\"} 1\n"
 
         findings, not_ported = compare.compare(
             [(with_name, exporter), (without_name, exporter)], True, True)
 
-        self.assertEqual(findings, ["unlisted bot name: liq_job_queue"])
+        self.assertEqual(findings, ["unlisted bot name: liq_pending_orders_total"])
         self.assertEqual(not_ported, [])
 
     def test_a_bot_name_outside_the_lists_is_a_finding(self):

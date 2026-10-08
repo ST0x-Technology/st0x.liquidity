@@ -1,0 +1,25 @@
+# Expected exporter output for rebalance.json, written by
+# scripts/liq-parity/golden.py from t0.devops revision 226c029.
+liq_rebalance_operations{kind="usdc"} 2.0
+liq_rebalance_skipped{kind="usdc"} 0.0
+liq_rebalance_stage_ms{kind="usdc",quantile="p50",stage="conversion"} 2000.0
+liq_rebalance_stage_ms{kind="usdc",quantile="p90",stage="conversion"} 2010.0
+liq_rebalance_stage_ms{kind="usdc",quantile="p95",stage="conversion"} 2020.0
+liq_rebalance_stage_ms{kind="usdc",quantile="p99",stage="conversion"} 2030.0
+liq_rebalance_stage_ms{kind="usdc",quantile="max",stage="conversion"} 2500.0
+liq_rebalance_stage_ms_samples{kind="usdc",stage="conversion"} 2.0
+liq_rebalance_stage_ms{kind="usdc",quantile="p50",stage="attestation"} 52000.0
+liq_rebalance_stage_ms{kind="usdc",quantile="p90",stage="attestation"} 52010.0
+liq_rebalance_stage_ms{kind="usdc",quantile="p95",stage="attestation"} 52020.0
+liq_rebalance_stage_ms{kind="usdc",quantile="p99",stage="attestation"} 52030.0
+liq_rebalance_stage_ms{kind="usdc",quantile="max",stage="attestation"} 60000.0
+liq_rebalance_stage_ms_samples{kind="usdc",stage="attestation"} 2.0
+liq_attestation_last_ms{kind="usdc"} 45000.0
+liq_rebalance_operations{kind="equity"} 1.0
+liq_rebalance_skipped{kind="equity"} 1.0
+liq_rebalance_stage_ms{kind="equity",quantile="p50",stage="mint_acceptance"} 30000.0
+liq_rebalance_stage_ms{kind="equity",quantile="p90",stage="mint_acceptance"} 30010.0
+liq_rebalance_stage_ms{kind="equity",quantile="p95",stage="mint_acceptance"} 30020.0
+liq_rebalance_stage_ms{kind="equity",quantile="p99",stage="mint_acceptance"} 30030.0
+liq_rebalance_stage_ms{kind="equity",quantile="max",stage="mint_acceptance"} 30050.0
+liq_rebalance_stage_ms_samples{kind="equity",stage="mint_acceptance"} 1.0

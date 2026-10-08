@@ -92,6 +92,23 @@ PORTED = {
     "liq_usdc_rebalanceable",
     "liq_position_last_price_usd",
     "liq_equity_exposure_usd",
+    "liq_hedge_latency_ms",
+    "liq_hedge_latency_ms_samples",
+    "liq_open_exposure_fill_count",
+    "liq_open_exposure_oldest_ts_seconds",
+    "liq_failure_event_count_24h",
+    "liq_job_queue",
+    "liq_block_lag_blocks",
+    "liq_block_lag_sampled_ts_seconds",
+    "liq_poll_cycles_24h",
+    "liq_poll_errors_24h",
+    "liq_poll_skipped_ticks_24h",
+    "liq_poll_duration_ms",
+    "liq_dependency_calls_24h",
+    "liq_dependency_errors_24h",
+    "liq_dependency_latency_ms",
+    "liq_rebalance_stage_ms",
+    "liq_attestation_last_ms",
 }
 
 # Names only the bot publishes.
@@ -163,6 +180,22 @@ ALWAYS_PRESENT = {
 KNOWN_DIFFS = {
     # The exporter derives the start from integer uptime at poll time.
     "liq_bot_start_timestamp_seconds": ("absolute", 2.0),
+    # The exporter's infra collector has failed on every cycle since the bot
+    # began serving /performance/infra per chain: t0.devops 226c029
+    # exporter.py collect_infra calls poll.get() on the per-chain `poll`
+    # list, guarded() swallows the AttributeError, and the infra family is
+    # never set. So the exporter has no infra series to compare with, and
+    # the bot's carry a `chain` label the exporter never had. The golden
+    # tests pin the dependency series against the exporter instead.
+    "liq_block_lag_blocks": "ignore",
+    "liq_block_lag_sampled_ts_seconds": "ignore",
+    "liq_poll_cycles_24h": "ignore",
+    "liq_poll_errors_24h": "ignore",
+    "liq_poll_skipped_ticks_24h": "ignore",
+    "liq_poll_duration_ms": "ignore",
+    "liq_dependency_calls_24h": "ignore",
+    "liq_dependency_errors_24h": "ignore",
+    "liq_dependency_latency_ms": "ignore",
     # The endpoint the exporter reads truncates at 50,000 entries and counts
     # an exact window; the bot counts every entry in one-minute buckets.
     "liq_reliability_log_count_24h": "values",
