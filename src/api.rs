@@ -3,7 +3,6 @@
 use std::num::NonZeroUsize;
 use std::str::FromStr;
 use std::sync::Arc;
-use std::sync::LazyLock;
 use std::time::Duration;
 
 use alloy::primitives::{TxHash, U256};
@@ -85,6 +84,7 @@ use crate::rebalancing::usdc::{
     UsdcTransferError,
 };
 use crate::rebalancing::{RebalancingService, UsdcResumeError};
+use crate::startup::PROCESS_START;
 use crate::tokenized_equity_mint::{
     TokenizedEquityMint, TokenizedEquityMintCommand, TokenizedEquityMintError,
     TokenizedEquityMintEvent,
@@ -112,7 +112,6 @@ fn parse_transfer_kind_filter(value: &str) -> Result<Vec<TransferKind>, InvalidT
         .collect()
 }
 
-static STARTED_AT: LazyLock<DateTime<Utc>> = LazyLock::new(Utc::now);
 const DEFAULT_RAINDEX_ORDERS_PAGE_SIZE: u32 = 50;
 const MAX_RAINDEX_ORDERS_PAGE_SIZE: u32 = 100;
 /// Bounds the rows SQLite may need to sort and skip for one history request.
@@ -121,7 +120,7 @@ const MAX_TRANSFER_HISTORY_OFFSET: usize = 10_000;
 /// Upper bound on ERROR/WARN log entries aggregated per reliability report.
 const MAX_RELIABILITY_LOG_ENTRIES: usize = 50_000;
 
-const GIT_COMMIT: &str = match option_env!("ST0X_GIT_COMMIT") {
+pub(crate) const GIT_COMMIT: &str = match option_env!("ST0X_GIT_COMMIT") {
     Some(val) => val,
     None => "dev",
 };
@@ -246,7 +245,7 @@ impl Serialize for ProtocolTrades<'_> {
 }
 
 async fn health(State(state): State<AppState>) -> (StatusCode, Json<HealthResponse>) {
-    let uptime = Utc::now() - *STARTED_AT;
+    let uptime = Utc::now() - DateTime::<Utc>::from(*PROCESS_START);
 
     // Gated on the startup barrier: every essential run loop has
     // acknowledged before this reports healthy, and the conductor

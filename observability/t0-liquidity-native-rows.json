@@ -274,7 +274,7 @@
       {
         "id": 18,
         "type": "timeseries",
-        "title": "Hedge scans skipped, by cause",
+        "title": "Hedge scans skipped, by reason",
         "description": "Extended-hours buys the position scan dropped before enqueueing a hedge job, because reference-price resolution or crossing failed. Each one is an on-chain fill that did not get hedged on that pass.",
         "datasource": {
           "type": "stackdriver",
@@ -290,9 +290,9 @@
             "queryType": "promQL",
             "promQLQuery": {
               "projectName": "$env",
-              "expr": "sum by (cause, symbol) (increase(hedge_scan_skipped_total[1h]))",
+              "expr": "sum by (reason, symbol) (increase(hedge_scan_skipped_total[1h]))",
               "step": "60s",
-              "legendFormat": "{{cause}} \u00b7 {{symbol}}"
+              "legendFormat": "{{reason}} \u00b7 {{symbol}}"
             },
             "timeSeriesList": {
               "projectName": "",
