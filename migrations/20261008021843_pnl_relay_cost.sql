@@ -5,7 +5,7 @@
 -- signed: a fill above the fee-adjusted input is a gain. A table of its own
 -- leaves `pnl_cost_entry` and its one-row-per-event key unchanged.
 
-CREATE TABLE pnl_relay_cost (
+CREATE TABLE IF NOT EXISTS pnl_relay_cost (
     event_rowid INTEGER PRIMARY KEY,
     aggregate_id TEXT NOT NULL,
     relayer_fee_usd TEXT NOT NULL,
