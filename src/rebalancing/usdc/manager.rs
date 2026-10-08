@@ -6839,10 +6839,20 @@ pub(crate) enum UsdcRecheckError {
     NoOnchainDepositRef(UsdcRebalanceId),
     #[error(
         "rebalance {id} is in state {state}, which recheck cannot recover \
-         (recheck only verifies a failed BaseToAlpaca deposit against Alpaca)"
+         (recheck verifies a failed BaseToAlpaca deposit against Alpaca, or reads \
+         a held Relay escrow again)"
     )]
     NotDepositFailed {
         id: UsdcRebalanceId,
+        state: &'static str,
+    },
+    #[error(
+        "rebalance {id} is a Relay transfer in state {state}; a deposit tx ({tx}) \
+         applies only to a failed Alpaca deposit"
+    )]
+    DepositTxNotApplicable {
+        id: UsdcRebalanceId,
+        tx: TxHash,
         state: &'static str,
     },
     #[error(

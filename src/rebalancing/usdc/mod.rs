@@ -37,7 +37,7 @@ pub(crate) use relay::RelayHop;
 use std::collections::BTreeSet;
 use std::time::Duration;
 
-use alloy::primitives::{Address, TxHash, U256};
+use alloy::primitives::{Address, B256, TxHash, U256};
 use chrono::{DateTime, Utc};
 use itertools::Itertools;
 use rain_math_float::FloatError;
@@ -352,6 +352,24 @@ pub enum UsdcTransferError {
         id: UsdcRebalanceId,
         #[source]
         source: Box<RelayBridgeError>,
+    },
+    /// The fill window passed with no fill or refund proven: the transfer
+    /// holds its guard and the job reads Relay's status again slowly.
+    #[error("USDC rebalance {id}: Relay deposit {deposit_tx} is unresolved past its fill window")]
+    SwapEscrowUnresolved {
+        id: UsdcRebalanceId,
+        deposit_tx: TxHash,
+    },
+    /// A deposit of a reverted order is on chain with no payment proven yet:
+    /// nothing is signed or redeposited until it is.
+    #[error(
+        "USDC rebalance {id}: deposit {deposit_tx} of the reverted Relay order {order_id} is on \
+         chain; signing nothing until its payment proves"
+    )]
+    RevertedSwapDepositLive {
+        id: UsdcRebalanceId,
+        order_id: B256,
+        deposit_tx: TxHash,
     },
     #[error(
         "USDC transfer corridor mismatch: transfer {id} runs on the {recorded} corridor, \
@@ -803,6 +821,8 @@ impl UsdcTransferError {
             | Self::RelayFillPending { .. }
             | Self::SwapDepositReverted { .. }
             | Self::SwapPaymentUnverified { .. }
+            | Self::SwapEscrowUnresolved { .. }
+            | Self::RevertedSwapDepositLive { .. }
             | Self::EthereumChainMissing(_) => None,
         }
     }
@@ -880,6 +900,8 @@ impl BotGasFailureClassifier for UsdcTransferError {
             | Self::RelayFillPending { .. }
             | Self::SwapDepositReverted { .. }
             | Self::SwapPaymentUnverified { .. }
+            | Self::SwapEscrowUnresolved { .. }
+            | Self::RevertedSwapDepositLive { .. }
             | Self::EthereumChainMissing(_) => false,
         }
     }

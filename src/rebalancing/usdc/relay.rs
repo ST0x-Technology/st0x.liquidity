@@ -54,8 +54,8 @@ use super::{
 use crate::native_gas::TransferGasRoute;
 use crate::rebalancing::equity::RecheckOutcome;
 use crate::usdc_rebalance::{
-    RebalanceDirection, RedepositReason, RefundSide, SwapQuote, SwapStep, TransferRef,
-    UsdcRebalance, UsdcRebalanceCommand, UsdcRebalanceId, prepared_swap_ids,
+    RebalanceDirection, RecoveredSwapPayment, RedepositReason, RefundSide, SwapQuote, SwapStep,
+    TransferRef, UsdcRebalance, UsdcRebalanceCommand, UsdcRebalanceId, prepared_swap_ids,
 };
 
 /// One Relay corridor's hop: the bridge that signs the deposit and proves
@@ -870,6 +870,7 @@ where
             quote,
             quoted_at,
             signed_order_ids,
+            reverted_quotes,
             split_approves,
             deposit_reverts,
             ..
@@ -877,6 +878,15 @@ where
         else {
             return Ok(false);
         };
+
+        // A reverted deposit a reorg landed must be settled before anything
+        // else spends the stable: a new pair, a redeposit or a hold.
+        if self
+            .adopt_reverted_deposit(id, direction, &reverted_quotes, &split_approves)
+            .await?
+        {
+            return Ok(true);
+        }
 
         let max_reverts = self.hop.bounds.max_deposit_revert_redrives;
         if deposit_reverts >= max_reverts {
@@ -1153,6 +1163,15 @@ where
                     None => self.payment_pending(id, deposit_tx, wait).await,
                 }
             }
+            // The deposit may be included again and then filled or
+            // refunded, so a reorg is waited out like any status that is not
+            // terminal, and holds unresolved past the fill window.
+            IntentStatus::Failure {
+                reason: Some(FailReason::DepositReorged),
+            } => {
+                warn!(target: "rebalance", %id, %deposit_tx, "Relay reports the deposit reorged out; it may be included again, so the transfer keeps waiting");
+                self.payment_pending(id, deposit_tx, wait).await
+            }
             status @ (IntentStatus::RefundFailed { .. } | IntentStatus::Failure { .. }) => {
                 self.cqrs
                     .send(
@@ -1256,10 +1275,7 @@ where
         reason: Option<FailReason>,
         direction: RebalanceDirection,
     ) -> Result<(), UsdcTransferError> {
-        let side = match payment.side {
-            SwapSide::Origin => RefundSide::Origin,
-            SwapSide::Destination => RefundSide::Destination,
-        };
+        let side = refund_side(payment.side);
         self.cqrs
             .send(
                 id,
@@ -1271,21 +1287,37 @@ where
             )
             .await?;
 
+        info!(target: "rebalance", %id, refund_tx = %payment.tx, amount = %payment.amount, ?side, ?reason, "Relay refund proven");
+        self.continue_refund(id, direction, side, payment.tx, reason)
+            .await
+    }
+
+    /// Moves a recorded refund on: toward the hub an origin-side one back
+    /// into the vault, from it an origin-side one quoted again; one paid at
+    /// the other end holds for the operator.
+    async fn continue_refund(
+        &self,
+        id: &UsdcRebalanceId,
+        direction: RebalanceDirection,
+        side: RefundSide,
+        refund_tx: TxHash,
+        reason: Option<FailReason>,
+    ) -> Result<(), UsdcTransferError> {
         match (direction, side) {
             (RebalanceDirection::BaseToAlpaca, RefundSide::Origin) => {
-                warn!(target: "rebalance", %id, refund_tx = %payment.tx, amount = %payment.amount, ?reason, "Relay refunded the deposit on the origin chain; returning it to the vault");
+                warn!(target: "rebalance", %id, %refund_tx, ?reason, "Relay refunded the deposit on the origin chain; returning it to the vault");
                 self.redeposit(id, RedepositReason::Refunded).await
             }
             (RebalanceDirection::BaseToAlpaca, RefundSide::Destination) => {
-                error!(target: "operational_alert", alert = true, %id, refund_tx = %payment.tx, amount = %payment.amount, ?reason, "Relay refunded the deposit in USDC at the hub; the transfer holds its guard until the operator moves it and reconciles");
+                error!(target: "operational_alert", alert = true, %id, %refund_tx, ?reason, "Relay refunded the deposit in USDC at the hub; the transfer holds its guard until the operator moves it and reconciles");
                 Ok(())
             }
             (RebalanceDirection::AlpacaToBase, RefundSide::Origin) => {
-                warn!(target: "rebalance", %id, refund_tx = %payment.tx, amount = %payment.amount, ?reason, "Relay refunded the deposit in USDC at the hub; quoting it again");
+                warn!(target: "rebalance", %id, %refund_tx, ?reason, "Relay refunded the deposit in USDC at the hub; quoting it again");
                 self.requote_refund_toward_chain(id).await
             }
             (RebalanceDirection::AlpacaToBase, RefundSide::Destination) => {
-                error!(target: "operational_alert", alert = true, %id, refund_tx = %payment.tx, amount = %payment.amount, ?reason, "Relay refunded the deposit in the chain's stable to the chain wallet, not the vault; the transfer holds its guard until the operator moves it and reconciles");
+                error!(target: "operational_alert", alert = true, %id, %refund_tx, ?reason, "Relay refunded the deposit in the chain's stable to the chain wallet, not the vault; the transfer holds its guard until the operator moves it and reconciles");
                 Ok(())
             }
         }
@@ -1355,17 +1387,21 @@ where
     }
 
     /// Ends an attempt with no payment: `RelayFillPending` within the fill
-    /// window, the guard-holding `SwapEscrowUnresolved` once it has passed.
-    /// An unresolved escrow is read again only on the operator's resume.
+    /// window, the guard-holding `SwapEscrowUnresolved` once it has passed,
+    /// paged when it is recorded and read again slowly after.
     async fn payment_pending(
         &self,
         id: &UsdcRebalanceId,
         deposit_tx: TxHash,
         wait: PaymentWait,
     ) -> Result<(), UsdcTransferError> {
+        let unresolved = || UsdcTransferError::SwapEscrowUnresolved {
+            id: id.clone(),
+            deposit_tx,
+        };
         let PaymentWait::FillWindow { deposited_at } = wait else {
-            error!(target: "operational_alert", alert = true, %id, %deposit_tx, "Relay deposit still unresolved past its fill window; the transfer holds its guard, and the next resume reads Relay again");
-            return Ok(());
+            warn!(target: "rebalance", %id, %deposit_tx, "Relay deposit still unresolved past its fill window; the transfer holds its guard and reads Relay again later");
+            return Err(unresolved());
         };
 
         if !wait.is_past(self.hop.bounds.fill_timeout, Utc::now()) {
@@ -1378,8 +1414,170 @@ where
         self.cqrs
             .send(id, UsdcRebalanceCommand::RecordSwapEscrowUnresolved)
             .await?;
-        error!(target: "operational_alert", alert = true, %id, %deposit_tx, %deposited_at, fill_timeout = ?self.hop.bounds.fill_timeout, "Relay deposit has no fill and no refund past its fill window; the transfer holds its guard at SwapEscrowUnresolved");
-        Ok(())
+        error!(target: "operational_alert", alert = true, %id, %deposit_tx, %deposited_at, fill_timeout = ?self.hop.bounds.fill_timeout, "Relay deposit has no fill and no refund past its fill window; the transfer holds its guard at SwapEscrowUnresolved and reads Relay again every 30 minutes");
+        Err(unresolved())
+    }
+
+    /// Scans the origin chain for our deposits of `reverted` orders, one of
+    /// which a reorg may have landed: `false` when none is on chain. A found
+    /// deposit is adopted once its payment proves, after the approves that
+    /// went out alone are sent again; until then the attempt ends with
+    /// `RevertedSwapDepositLive`, signing and redepositing nothing.
+    async fn adopt_reverted_deposit(
+        &self,
+        id: &UsdcRebalanceId,
+        direction: RebalanceDirection,
+        reverted: &[SwapQuote],
+        split_approves: &[PreparedTransaction],
+    ) -> Result<bool, UsdcTransferError> {
+        let Some(from_block) = reverted.iter().map(|quote| quote.origin_from_block).min() else {
+            return Ok(false);
+        };
+        let side = hop_direction(direction);
+        let order_ids = reverted
+            .iter()
+            .map(|quote| RelayOrderId(quote.order_id))
+            .collect::<Vec<_>>();
+
+        let scan = self
+            .hop
+            .bridge
+            .find_recent_deposits(side, &order_ids, from_block)
+            .await
+            .map_err(Box::new)?;
+        let Some((deposit, quote)) = scan.deposits.iter().find_map(|deposit| {
+            let RelayOrderId(order_id) = deposit.order_id;
+            reverted
+                .iter()
+                .find(|quote| quote.order_id == order_id)
+                .map(|quote| (deposit, quote))
+        }) else {
+            info!(target: "rebalance", %id, from_block, scanned_to = scan.scanned_to, reverted = reverted.len(), "No deposit of a reverted Relay order is on chain");
+            return Ok(false);
+        };
+
+        let order_id = quote.order_id;
+        error!(target: "operational_alert", alert = true, %id, deposit_tx = %deposit.tx, %order_id, block = deposit.block, "A deposit of a reverted Relay order is on chain; the transfer signs and redeposits nothing until its payment proves");
+        let Some(payment) = self.proven_order_payment(id, side, quote).await else {
+            return Err(UsdcTransferError::RevertedSwapDepositLive {
+                id: id.clone(),
+                order_id,
+                deposit_tx: deposit.tx,
+            });
+        };
+
+        let deadline = Instant::now() + self.hop.bounds.quote_max_age;
+        self.hop
+            .broadcast_split_approves(id, split_approves, side, deadline)
+            .await?;
+        self.cqrs
+            .send(
+                id,
+                UsdcRebalanceCommand::RecoverSwapCompletion {
+                    order_id,
+                    deposit_tx: deposit.tx,
+                    payment,
+                },
+            )
+            .await?;
+        warn!(target: "rebalance", %id, %order_id, deposit_tx = %deposit.tx, ?payment, "Adopted the late payment of a reverted Relay order");
+
+        Box::pin(self.continue_after_recovery(id)).await?;
+        Ok(true)
+    }
+
+    /// The fill or refund of `quote`'s order that Relay reports and the chain
+    /// proves, `None` while it reports none or it does not prove yet.
+    async fn proven_order_payment(
+        &self,
+        id: &UsdcRebalanceId,
+        side: HopDirection,
+        quote: &SwapQuote,
+    ) -> Option<RecoveredSwapPayment> {
+        let order_id = RelayOrderId(quote.order_id);
+        let report = match self
+            .hop
+            .client
+            .status(RelayRequestId(quote.request_id))
+            .await
+        {
+            Ok(report) => report,
+            Err(error) => {
+                warn!(target: "rebalance", %id, order_id = %quote.order_id, %error, "Relay status read failed; reading it again later");
+                return None;
+            }
+        };
+
+        let proof = match report.status {
+            IntentStatus::Success => self
+                .hop
+                .bridge
+                .verify_fill(side, order_id, quote.minimum_out, &report.txs)
+                .await
+                .map(|payment| RecoveredSwapPayment::Fill {
+                    fill_tx: payment.tx,
+                    amount_received: payment.amount,
+                }),
+            IntentStatus::Refund { .. } => self
+                .hop
+                .bridge
+                .verify_refund(side, order_id, quote.amount_in, &report.txs)
+                .await
+                .map(|payment| RecoveredSwapPayment::Refund {
+                    refund_tx: payment.tx,
+                    side: refund_side(payment.side),
+                    amount_refunded: payment.amount,
+                }),
+            status @ (IntentStatus::Waiting
+            | IntentStatus::InFlight(_)
+            | IntentStatus::Filling
+            | IntentStatus::Refunding { .. }
+            | IntentStatus::RefundFailed { .. }
+            | IntentStatus::Failure { .. }
+            | IntentStatus::NotIncluded
+            | IntentStatus::Unknown(_)) => {
+                info!(target: "rebalance", %id, order_id = %quote.order_id, ?status, "Relay reports no payment of the order");
+                return None;
+            }
+        };
+
+        proof
+            .inspect_err(|error| {
+                warn!(target: "rebalance", %id, order_id = %quote.order_id, %error, "The Relay payment of the order does not prove on chain yet");
+            })
+            .ok()
+    }
+
+    /// Moves an adopted late payment on as any other: a fill as after the
+    /// hop, a refund as `continue_refund` does.
+    async fn continue_after_recovery(&self, id: &UsdcRebalanceId) -> Result<(), UsdcTransferError> {
+        match self.cqrs.load(id).await? {
+            Some(UsdcRebalance::Bridged {
+                direction: RebalanceDirection::AlpacaToBase,
+                amount_received,
+                ..
+            }) => {
+                self.continue_alpaca_to_base_from_bridged(id, amount_received)
+                    .await
+            }
+            Some(UsdcRebalance::SwapRefunded {
+                direction,
+                side,
+                refund_tx,
+                amount_refunded,
+                ..
+            }) => {
+                info!(target: "rebalance", %id, %refund_tx, %amount_refunded, "Moving the adopted Relay refund on");
+                self.continue_refund(id, direction, side, refund_tx, None)
+                    .await
+            }
+            Some(state) => self.resume_base_to_alpaca_past_hop(id, state).await,
+            None => Err(UsdcTransferError::StateOffHop {
+                id: id.clone(),
+                state: "Uninitialized",
+                hop: HopKind::Relay,
+            }),
+        }
     }
 
     /// Sends again the approves of a `SwapQuoted` that went out alone, then
@@ -1786,6 +1984,13 @@ fn quote_refused(error: &UsdcTransferError) -> bool {
     }
 }
 
+const fn refund_side(side: SwapSide) -> RefundSide {
+    match side {
+        SwapSide::Origin => RefundSide::Origin,
+        SwapSide::Destination => RefundSide::Destination,
+    }
+}
+
 fn basis_points(bps: u16) -> Result<BasisPoints, UsdcTransferError> {
     BasisPoints::new(bps).map_err(UsdcTransferError::from)
 }
@@ -1925,13 +2130,15 @@ impl<Signer> RecheckUsdcDeposit for CrossVenueCashTransfer<Signer, RelayHop<Sign
 where
     Signer: Wallet + Send + Sync + 'static,
 {
-    /// Not built for Relay yet: every recorded state is refused before any
-    /// call, the operator's deposit tx with it. A Relay `DepositFailed` is
-    /// settled with `transfer reconcile`.
+    /// Reads a held escrow again: an unresolved one as the job's slow
+    /// re-check does, a failed one by its order's status. A payment that
+    /// proves is adopted and moved on (`Recovered`); otherwise nothing
+    /// changes. Every other state, and an operator deposit tx, is refused: a
+    /// Relay `DepositFailed` is settled with `transfer reconcile`.
     async fn recheck_deposit(
         &self,
         id: &UsdcRebalanceId,
-        _operator_deposit_tx: Option<TxHash>,
+        operator_deposit_tx: Option<TxHash>,
     ) -> Result<RecheckOutcome, UsdcRecheckError> {
         let state = self
             .cqrs
@@ -1942,10 +2149,69 @@ where
         self.require_served_corridor(id, self.corridor, Some(&state))
             .map_err(Box::new)?;
 
-        Err(UsdcRecheckError::NotDepositFailed {
-            id: id.clone(),
-            state: state.state_name(),
-        })
+        if let Some(tx) = operator_deposit_tx {
+            return Err(UsdcRecheckError::DepositTxNotApplicable {
+                id: id.clone(),
+                tx,
+                state: state.state_name(),
+            });
+        }
+
+        match state {
+            UsdcRebalance::SwapEscrowUnresolved { .. } => {
+                match self.read_relay_payment(id).await {
+                    Ok(()) | Err(UsdcTransferError::SwapEscrowUnresolved { .. }) => {}
+                    Err(error) => return Err(UsdcRecheckError::Transfer(Box::new(error))),
+                }
+                // Still held, failed at Relay, or moved on with a payment.
+                Ok(
+                    match self
+                        .cqrs
+                        .load(id)
+                        .await
+                        .map_err(|error| Box::new(error.into()))?
+                    {
+                        Some(UsdcRebalance::SwapEscrowUnresolved { .. }) | None => {
+                            RecheckOutcome::LeftUnchanged
+                        }
+                        Some(UsdcRebalance::SwapFailed { .. }) => RecheckOutcome::NotRecoverable,
+                        Some(_) => RecheckOutcome::Recovered,
+                    },
+                )
+            }
+            UsdcRebalance::SwapFailed {
+                direction,
+                quote,
+                deposit_tx,
+                ..
+            } => {
+                let Some(payment) = self
+                    .proven_order_payment(id, hop_direction(direction), &quote)
+                    .await
+                else {
+                    return Ok(RecheckOutcome::LeftUnchanged);
+                };
+                self.cqrs
+                    .send(
+                        id,
+                        UsdcRebalanceCommand::RecoverSwapCompletion {
+                            order_id: quote.order_id,
+                            deposit_tx,
+                            payment,
+                        },
+                    )
+                    .await
+                    .map_err(|error| Box::new(error.into()))?;
+                warn!(target: "rebalance", %id, order_id = %quote.order_id, ?payment, "Adopted a late payment of a failed Relay order");
+
+                self.continue_after_recovery(id).await.map_err(Box::new)?;
+                Ok(RecheckOutcome::Recovered)
+            }
+            state => Err(UsdcRecheckError::NotDepositFailed {
+                id: id.clone(),
+                state: state.state_name(),
+            }),
+        }
     }
 
     async fn verify_deposit_send_superseded(

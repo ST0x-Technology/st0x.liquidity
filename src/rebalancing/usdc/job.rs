@@ -185,6 +185,11 @@ const RELAY_FILL_POLL_DELAY: Duration = Duration::from_secs(30);
 /// prove on chain: it pages on every read, so slowly.
 const SWAP_PAYMENT_UNVERIFIED_REDRIVE_DELAY: Duration = Duration::from_secs(30 * 60);
 
+/// Delay between the slow reads of a Relay escrow left unresolved past its
+/// fill window, and of a reverted deposit found on chain: the solver may pay
+/// until the order's deadline, about a week after the quote.
+const SWAP_ESCROW_RECHECK_DELAY: Duration = Duration::from_secs(30 * 60);
+
 /// When to read Relay's status again for a deposit confirmed at
 /// `deposited_at`. A deposit stamped after `now` (clock skew) counts as
 /// fresh.
@@ -441,10 +446,13 @@ where
 
 /// Re-queues, with no retry cost, a Relay transfer that is waiting on Relay
 /// or on the chain: the fill not paid yet (`RelayFillPending`), a reverted
-/// deposit the next attempt re-quotes (`SwapDepositReverted`), or a payment
-/// that does not prove (`SwapPaymentUnverified`, paged on every read). Each
-/// attempt reads Relay's status once, so the single-concurrency worker never
-/// blocks on a fill.
+/// deposit the next attempt re-quotes (`SwapDepositReverted`), a payment
+/// that does not prove (`SwapPaymentUnverified`, paged on every read), an
+/// escrow unresolved past its fill window (`SwapEscrowUnresolved`, read
+/// slowly), or a reverted order's deposit found on chain
+/// (`RevertedSwapDepositLive`, paged on every read). Each attempt reads
+/// Relay's status once, so the single-concurrency worker never blocks on a
+/// fill.
 async fn intercept_relay_wait<Ctx, TaskJob>(
     job: &TaskJob,
     job_queue: &JobQueue<TaskJob>,
@@ -475,6 +483,20 @@ where
                 warn!(target: "rebalance", error = ?notify_error, "Failed to deliver the Relay payment page");
             }
             SWAP_PAYMENT_UNVERIFIED_REDRIVE_DELAY
+        }
+        Err(UsdcTransferError::SwapEscrowUnresolved { id, deposit_tx }) => {
+            info!(target: "rebalance", %id, %deposit_tx, delay = ?SWAP_ESCROW_RECHECK_DELAY, "Relay escrow unresolved; reading its status again later");
+            SWAP_ESCROW_RECHECK_DELAY
+        }
+        Err(error @ UsdcTransferError::RevertedSwapDepositLive { .. }) => {
+            let message = format!(
+                "{error}. The transfer holds its guard; check the order with `stox relay status`. \
+                 It is read again in {SWAP_ESCROW_RECHECK_DELAY:?}."
+            );
+            if let Err(notify_error) = notifier.notify(&message).await {
+                warn!(target: "rebalance", error = ?notify_error, "Failed to deliver the reverted Relay deposit page");
+            }
+            SWAP_ESCROW_RECHECK_DELAY
         }
         Ok(()) | Err(_) => return ControlFlow::Continue(result),
     };

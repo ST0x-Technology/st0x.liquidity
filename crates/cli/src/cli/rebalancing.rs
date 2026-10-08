@@ -688,8 +688,9 @@ pub(super) async fn transfer_equity_command<Writer: Write>(
 /// `SettlementCheckTransient`), a non-backpressure
 /// `WithdrawalPollInconclusive` (Alpaca unreachable),
 /// `MintRecoveryInconclusive`, `DepositSendReconciliationPending`, and the
-/// Relay waits `RelayFillPending`, `SwapDepositReverted` and
-/// `SwapPaymentUnverified`. The
+/// Relay waits `RelayFillPending`, `SwapDepositReverted`,
+/// `SwapPaymentUnverified`, `SwapEscrowUnresolved` and
+/// `RevertedSwapDepositLive`. The
 /// CLI must NOT keep redriving these itself: its process would race the
 /// bot's worker on the same aggregate (the CLI-vs-server race), so the first
 /// such outcome hands the transfer off to the running bot instead. Errors outside this set -- including
@@ -705,7 +706,9 @@ fn is_bot_resumable_wait(error: &UsdcTransferError) -> bool {
         | UsdcTransferError::DepositSendReconciliationPending { .. }
         | UsdcTransferError::RelayFillPending { .. }
         | UsdcTransferError::SwapDepositReverted { .. }
-        | UsdcTransferError::SwapPaymentUnverified { .. } => true,
+        | UsdcTransferError::SwapPaymentUnverified { .. }
+        | UsdcTransferError::SwapEscrowUnresolved { .. }
+        | UsdcTransferError::RevertedSwapDepositLive { .. } => true,
         UsdcTransferError::WithdrawalPollInconclusive { source, .. } => {
             source.backpressure().is_none()
         }
