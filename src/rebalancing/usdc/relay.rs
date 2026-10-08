@@ -4299,19 +4299,13 @@ mod tests {
     /// holds the USDC at the hub with the guard held: there is no vault to
     /// return it to.
     #[tokio::test]
+    #[tracing_test::traced_test]
     async fn binding_quote_refused_toward_chain_holds_at_the_hub() {
         let rig = RelayRig::deploy().await;
         let withdrawal_tx = rig.withdraw_to_hub(U256::from(AMOUNT_IN)).await;
         let server = MockServer::start();
         let relay_api = MockServer::start();
-        relay_api.mock(|when, then| {
-            when.method(POST).path("/quote/v2");
-            then.status(400).json_body(json!({
-                "message": "Amount is too low",
-                "errorCode": "AMOUNT_TOO_LOW",
-                "requestId": "0x00"
-            }));
-        });
+        let quote = mock_quote_refused(&relay_api);
         let store = Arc::new(test_store(setup_test_db().await, ()));
         let transfer = rig
             .transfer(&server, &relay_api, store.clone(), relay_bounds())
@@ -4327,6 +4321,8 @@ mod tests {
         .expect("the attempt ends")
         .unwrap();
 
+        quote.assert_calls(1);
+        assert!(logs_contain("Relay refused the binding quote from the hub"));
         let state = store.load(&id).await.unwrap().unwrap();
         assert_eq!(state.state_name(), "WithdrawalComplete");
         assert!(state.holds_rebalance_guard());
@@ -4579,21 +4575,22 @@ mod tests {
         )
         .await;
 
-        let mut held = false;
-        for _ in 0..3 {
-            let attempt = tokio::time::timeout(
+        let attempt = || async {
+            tokio::time::timeout(
                 Duration::from_secs(30),
                 transfer.resume_alpaca_to_base(&id, Usdc::new(float!(100)), ROBINHOOD_RELAY),
             )
             .await
-            .expect("the attempt ends");
-            if attempt.is_ok() {
-                held = true;
-                break;
-            }
-        }
-
-        assert!(held, "the spent revert budget ends the attempt with a hold");
+            .expect("the attempt ends")
+        };
+        let reverted = attempt().await;
+        assert!(
+            matches!(reverted, Err(UsdcTransferError::SwapDepositReverted { .. })),
+            "the first deposit reverts, got {reverted:?}"
+        );
+        attempt()
+            .await
+            .expect("the spent revert budget ends the attempt with a hold");
         quote.assert_calls(0);
         let state = store.load(&id).await.unwrap().unwrap();
         let UsdcRebalance::SwapQuoted {

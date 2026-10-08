@@ -45179,7 +45179,12 @@ mod tests {
             deposit_block: 9,
         };
 
+        let reverted = UsdcRebalanceCommand::RecordSwapDepositReverted {
+            deposit_tx: deposit.tx_hash(),
+        };
+
         for (after_pair, expected) in [
+            (vec![reverted], "SwapQuoted"),
             (vec![], "SwapDepositPrepared"),
             (vec![confirm.clone()], "SwapDeposited"),
             (vec![confirm, refund], "SwapRefunded"),
