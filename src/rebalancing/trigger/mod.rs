@@ -5510,10 +5510,11 @@ impl RebalancingService {
     /// Zeroes any Hedging inflight left on `symbol` once its mint is terminal.
     ///
     /// Only mints put equity inflight at Hedging, and a symbol has at most one
-    /// active mint, so a residual here is phantom: e.g. a provider poll
-    /// hydrated on restart that already listed this mint's request. Left in
-    /// place it blocks the symbol's rebalancing and snapshots until restart.
-    /// A request still pending at the provider is restored by its next poll.
+    /// active mint, so a residual here is phantom: e.g. a snapshot-error reset
+    /// dropped `active_mints` and re-applied a poll that already listed this
+    /// mint's request. Left in place it blocks the symbol's rebalancing and
+    /// snapshots until restart. A request still pending at the provider is
+    /// restored by its next poll.
     async fn clear_residual_hedging_inflight(
         &self,
         id: &IssuerRequestId,
@@ -17297,16 +17298,27 @@ mod tests {
         .await
         .unwrap();
 
-        for event in [
-            make_mint_accepted(),
-            make_tokens_received(),
-            make_deposited_into_raindex(),
-        ] {
+        for event in [make_mint_accepted(), make_tokens_received()] {
             harness
                 .receive::<TokenizedEquityMint>(id.clone(), event)
                 .await
                 .unwrap();
         }
+
+        assert_eq!(
+            trigger
+                .inventory
+                .read()
+                .await
+                .equity_inflight(&symbol, Venue::Hedging),
+            Some(shares(0)),
+            "TokensReceived must release all of the mint's Hedging inflight"
+        );
+
+        harness
+            .receive::<TokenizedEquityMint>(id.clone(), make_deposited_into_raindex())
+            .await
+            .unwrap();
 
         apply_and_dispatch_snapshot(
             reactor.clone(),
@@ -17333,13 +17345,21 @@ mod tests {
         );
         assert_eq!(
             inventory.equity_available(&symbol, Venue::Hedging),
-            Some(shares(50))
+            Some(shares(50)),
+            "Hedging available must be debited by the mint exactly once"
         );
         drop(inventory);
+        assert!(
+            trigger
+                .divergence_gate
+                .pending_offchain_equity_reconciles()
+                .is_empty(),
+            "A correctly counted mint leaves no residual to reconcile"
+        );
     }
 
     #[tokio::test]
-    async fn terminal_mint_clears_hedging_inflight_a_hydrated_poll_left() {
+    async fn terminal_mint_clears_hedging_inflight_an_untracked_poll_left() {
         let symbol = Symbol::new("AAPL").unwrap();
         let inventory = InventoryView::default()
             .with_equity(symbol.clone(), shares(0), shares(0))
@@ -17359,10 +17379,11 @@ mod tests {
         let reactor = make_trigger_with_inventory_and_registry(inventory, &symbol).await;
         let trigger = reactor.clone();
         let harness = ReactorHarness::new(Arc::clone(&trigger));
-        let id = issuer_request_id("mint-after-hydrated-poll");
+        let id = issuer_request_id("mint-after-untracked-poll");
 
-        // Startup hydration replays a persisted poll that listed this mint's
-        // request before any active mint was restored.
+        // A poll applied while no active mint is recorded, as after a
+        // snapshot-error reset drops `active_mints`, counts the request
+        // before `MintAccepted` counts it again.
         apply_and_dispatch_snapshot(
             reactor.clone(),
             InventorySnapshotId {
@@ -17397,8 +17418,16 @@ mod tests {
             Some(shares(0)),
             "The terminal mint must zero the residual Hedging inflight"
         );
-        assert!(!inventory.equity_venues(&symbol).unwrap().has_inflight);
+        assert!(
+            !inventory.equity_venues(&symbol).unwrap().has_inflight,
+            "A terminal mint must not leave the symbol blocked on inflight"
+        );
         drop(inventory);
+        assert_eq!(
+            trigger.divergence_gate.pending_offchain_equity_reconciles(),
+            vec![symbol.clone()],
+            "Clearing a residual must force the next broker snapshot through"
+        );
     }
 
     #[tokio::test]
