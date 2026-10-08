@@ -1427,9 +1427,9 @@ impl<Signer> RecheckUsdcDeposit for CrossVenueCashTransfer<Signer, RelayHop<Sign
 where
     Signer: Wallet + Send + Sync + 'static,
 {
-    /// No Relay transfer reaches a failed Alpaca deposit in this build, so
-    /// every recorded state is refused before any call, the operator's
-    /// deposit tx with it.
+    /// Not built for Relay yet: every recorded state is refused before any
+    /// call, the operator's deposit tx with it. A Relay `DepositFailed` is
+    /// settled with `transfer reconcile`.
     async fn recheck_deposit(
         &self,
         id: &UsdcRebalanceId,
