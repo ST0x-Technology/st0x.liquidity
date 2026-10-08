@@ -524,7 +524,7 @@ where
                 ..
             }) => {
                 Self::require_base_to_alpaca(id, direction)?;
-                warn!(target: "rebalance", %id, %refund_tx, %amount_refunded, "Relay refunded the deposit in USDC at the hub; the transfer holds its guard for the operator to move it and reconcile");
+                error!(target: "operational_alert", alert = true, %id, %refund_tx, %amount_refunded, "Relay refunded the deposit in USDC at the hub; the transfer holds its guard for the operator to move it and reconcile");
                 Ok(())
             }
 
@@ -672,7 +672,7 @@ where
                 amount_refunded,
                 ..
             }) => {
-                warn!(target: "rebalance", %id, %refund_tx, %amount_refunded, "Relay refunded the deposit in the chain's stable to the chain wallet; the transfer holds its guard for the operator to move it and reconcile");
+                error!(target: "operational_alert", alert = true, %id, %refund_tx, %amount_refunded, "Relay refunded the deposit in the chain's stable to the chain wallet; the transfer holds its guard for the operator to move it and reconcile");
                 Ok(())
             }
 
@@ -2230,6 +2230,14 @@ where
             .send(id, command)
             .await
             .map_err(|error| Box::new(error.into()))?;
+        if let RecoveredSwapPayment::Refund {
+            refund_tx,
+            side: RefundSide::Destination,
+            amount_refunded,
+        } = payment
+        {
+            error!(target: "operational_alert", alert = true, %id, %refund_tx, %amount_refunded, "Recheck adopted a Relay refund paid at the other end; the transfer holds its guard until the operator moves it and reconciles");
+        }
         warn!(target: "rebalance", %id, order_id = %quote.order_id, ?payment, "Recheck adopted a late Relay payment; the transfer's job or a resume moves it on");
 
         Ok(RecheckOutcome::Recovered)
