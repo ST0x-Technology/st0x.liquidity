@@ -1,5 +1,5 @@
 //! Read-only Relay API lookups: what Relay says about one request, as the bot
-//! reads it. Touches no wallet, database or bot.
+//! reads it. Touches no wallet, bot or database state.
 
 use alloy::primitives::TxHash;
 use std::io::Write;
@@ -105,8 +105,10 @@ mod tests {
     #[tokio::test]
     async fn relay_status_of_a_waiting_request_lists_no_tx() {
         let server = MockServer::start();
-        server.mock(|when, then| {
-            when.method(GET).path("/intents/status/v3");
+        let status = server.mock(|when, then| {
+            when.method(GET)
+                .path("/intents/status/v3")
+                .query_param("requestId", B256::ZERO.to_string());
             then.status(200)
                 .json_body(json!({"status": "waiting", "quoteCreatedAt": 1}));
         });
@@ -119,14 +121,19 @@ mod tests {
             .await
             .unwrap();
 
-        let printed = String::from_utf8(stdout).unwrap();
-        assert!(
-            printed.contains("   Status: Waiting\n   Terminal: no\n"),
-            "{printed}"
-        );
-        assert!(
-            printed.contains("   Deposit txs: none\n   Fill or refund txs: none\n"),
-            "{printed}"
+        status.assert();
+        assert_eq!(
+            String::from_utf8(stdout).unwrap(),
+            format!(
+                "Relay request {}\n   \
+                 Status: Waiting\n   \
+                 Terminal: no\n   \
+                 Deposit txs: none\n   \
+                 Fill or refund txs: none\n   \
+                 A status is not proof: the bot adopts a payment only once it proves on \
+                 chain.\n",
+                B256::ZERO
+            )
         );
     }
 }
