@@ -798,8 +798,14 @@ fn prepare_panicked(id: &UsdcRebalanceId, join_error: &JoinError) -> UsdcTransfe
     UsdcTransferError::SwapPrepareTaskPanicked { id: id.clone() }
 }
 
-/// Whether `quote`, recorded at `quoted_at`, is past its deadline or older
-/// than `max_age` at `now`. An age that does not fit counts as expired.
+/// The least time a quote must have left before its deadline for its pair
+/// to be signed: the approve and deposit still have to mine on the origin
+/// chain and reach Relay's solver before the deadline.
+const QUOTE_DEADLINE_HEADROOM: chrono::TimeDelta = chrono::TimeDelta::seconds(60);
+
+/// Whether `quote`, recorded at `quoted_at`, is within
+/// [`QUOTE_DEADLINE_HEADROOM`] of its deadline or older than `max_age` at
+/// `now`. An age that does not fit counts as expired.
 fn quote_expired(
     quote: &SwapQuote,
     quoted_at: DateTime<Utc>,
@@ -809,8 +815,10 @@ fn quote_expired(
     let stale_at = chrono::TimeDelta::from_std(max_age)
         .ok()
         .and_then(|max_age| quoted_at.checked_add_signed(max_age));
+    let too_late = now.checked_add_signed(QUOTE_DEADLINE_HEADROOM);
 
-    now >= quote.deadline || stale_at.is_none_or(|stale_at| now >= stale_at)
+    too_late.is_none_or(|too_late| too_late >= quote.deadline)
+        || stale_at.is_none_or(|stale_at| now >= stale_at)
 }
 
 /// The persisted form of an accepted quote.
@@ -1849,15 +1857,16 @@ mod tests {
         assert_eq!(deposit_tx, deposit.tx_hash());
     }
 
-    /// A quote past its deadline, or older than the corridor's
-    /// `quote_max_age`, is never signed: the transfer stays at `SwapQuoted`
-    /// with its guard held and nothing is broadcast.
+    /// A quote past its deadline, too close to it to mine in time, or older
+    /// than the corridor's `quote_max_age`, is never signed: the transfer
+    /// stays at `SwapQuoted` with its guard held and nothing is broadcast.
     #[tokio::test]
     async fn expired_swap_quote_is_not_signed() {
         let past_deadline = (-chrono::Duration::minutes(1), Duration::from_secs(60));
+        let near_deadline = (chrono::Duration::seconds(30), Duration::from_secs(60));
         let too_old = (chrono::Duration::hours(1), Duration::from_millis(50));
 
-        for (deadline_in, quote_max_age) in [past_deadline, too_old] {
+        for (deadline_in, quote_max_age) in [past_deadline, near_deadline, too_old] {
             let anvil = spawn_anvil(Anvil::new());
             let (wallet, contracts) = funded_relay_end(&anvil).await;
             let store = Arc::new(test_store(setup_test_db().await, ()));
