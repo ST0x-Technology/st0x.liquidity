@@ -6936,6 +6936,30 @@ mod tests {
     }
 
     #[test]
+    fn inflight_poll_does_not_zero_a_symbol_that_became_an_active_mint() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let now = Utc::now();
+        let pending = BTreeMap::from([(symbol.clone(), shares(20))]);
+
+        // The poll records the symbol while no mint is active, as after a
+        // snapshot-error reset drops `active_mints`; the mint's next event
+        // then re-registers it.
+        let view = InventoryView::default()
+            .with_equity(symbol.clone(), shares(50), shares(50))
+            .apply_inflight_snapshot(&pending, &BTreeMap::new(), now, now)
+            .unwrap()
+            .set_active_mint(symbol.clone(), Chain::Base, IssuerRequestId::generate())
+            .apply_inflight_snapshot(&BTreeMap::new(), &BTreeMap::new(), now, now)
+            .unwrap();
+
+        assert_eq!(
+            view.equity_inflight(&symbol, Venue::Hedging),
+            Some(shares(20)),
+            "An empty poll must leave an active mint's Hedging inflight to the mint"
+        );
+    }
+
+    #[test]
     fn stranded_secondary_redemption_survives_hydration_and_provider_disappearance() {
         let symbol = Symbol::new("AAPL").unwrap();
         let now = Utc::now();
