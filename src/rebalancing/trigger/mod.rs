@@ -43120,9 +43120,10 @@ mod tests {
             0
         );
 
-        let alpaca_to_chain = run(Some(relay_bounds(1, 50_000)), 100).await;
+        let alpaca_to_chain = run(Some(relay_bounds(1, 200)), 100).await;
         let job = pending_transfer_usdc_to_market_making_job(&alpaca_to_chain).await;
         assert_eq!(job.corridor, ROBINHOOD_RELAY);
+        assert_eq!(job.amount, usdc(200));
         assert!(alpaca_to_chain.usdc_guards.is_held(Chain::Robinhood));
 
         let alpaca_to_chain_below_minimum = run(Some(relay_bounds(15_000, 50_000)), 100).await;

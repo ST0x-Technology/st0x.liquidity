@@ -4150,6 +4150,10 @@ mod tests {
         });
         tokio::time::sleep(Duration::from_millis(500)).await;
 
+        assert!(
+            !attempt.is_finished(),
+            "the attempt waits for the deposit-send lock"
+        );
         let state = store.load(&id).await.unwrap().unwrap();
         assert_eq!(
             state.state_name(),
@@ -4231,6 +4235,8 @@ mod tests {
                 json!({
                     "originChainId": 1,
                     "destinationChainId": 4663,
+                    "originCurrency": Chain::Ethereum.settlement_stable().address,
+                    "destinationCurrency": Chain::Robinhood.settlement_stable().address,
                     "amount": "99900000",
                 })
                 .to_string(),
@@ -4570,9 +4576,210 @@ mod tests {
         assert!(held, "the spent revert budget ends the attempt with a hold");
         quote.assert_calls(0);
         let state = store.load(&id).await.unwrap().unwrap();
+        let UsdcRebalance::SwapQuoted {
+            deposit_reverts, ..
+        } = &state
+        else {
+            panic!("expected SwapQuoted, got {state:?}");
+        };
+        assert_eq!(*deposit_reverts, 1, "one deposit reverted");
+        assert!(state.holds_rebalance_guard());
+        assert!(state.is_reconcilable_failure());
+        assert_eq!(rig.hub_usdc().await, U256::from(AMOUNT_IN));
+    }
+
+    /// Answers every quote with Relay's refusal of the amount.
+    fn mock_quote_refused(relay_api: &MockServer) -> httpmock::Mock<'_> {
+        relay_api.mock(|when, then| {
+            when.method(POST).path("/quote/v2");
+            then.status(400).json_body(json!({
+                "message": "Amount is too low",
+                "errorCode": "AMOUNT_TOO_LOW",
+                "requestId": "0x00"
+            }));
+        })
+    }
+
+    /// A refused pre-flight quote from the hub ends a fresh attempt before
+    /// the USD conversion: nothing is recorded and no order is placed.
+    #[tokio::test]
+    async fn preflight_quote_refused_toward_chain_moves_nothing() {
+        let anvil = spawn_anvil(Anvil::new());
+        let key = B256::from_slice(&anvil.keys()[0].to_bytes());
+        let wallet = anvil_wallet(anvil.endpoint_url(), &key);
+        let server = MockServer::start();
+        let orders = server.mock(|when, then| {
+            when.method(POST).path_includes("/orders");
+            then.status(500);
+        });
+        let relay_api = MockServer::start();
+        let quote = mock_quote_refused(&relay_api);
+        let store = Arc::new(test_store(setup_test_db().await, ()));
+        let contracts = RelayEndContracts {
+            stable: Address::repeat_byte(0x51),
+            depository: Address::repeat_byte(0x52),
+        };
+        let transfer = relay_transfer(
+            &server,
+            &relay_api,
+            wallet.clone(),
+            wallet,
+            contracts,
+            store.clone(),
+        )
+        .await;
+        let id = UsdcRebalanceId(Uuid::new_v4());
+
+        let error = transfer
+            .resume_alpaca_to_base(&id, Usdc::new(float!(1000)), ROBINHOOD_RELAY)
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                &error,
+                UsdcTransferError::RelayApi(relay)
+                    if matches!(**relay, RelayError::QuoteRefused { code: QuoteErrorCode::AmountTooLow })
+            ),
+            "got {error:?}"
+        );
+        quote.assert_calls(1);
+        orders.assert_calls(0);
+        assert_eq!(store.load(&id).await.unwrap(), None);
+    }
+
+    /// An expired quote from the hub that Relay refuses to replace holds the
+    /// transfer at `SwapQuoted` with the USDC at the hub, guard held: there
+    /// is no vault to return it to.
+    #[tokio::test]
+    async fn refused_requote_toward_chain_holds_at_the_hub() {
+        let rig = RelayRig::deploy().await;
+        rig.withdraw_to_hub(U256::from(AMOUNT_IN)).await;
+        let server = MockServer::start();
+        let relay_api = MockServer::start();
+        let quote = mock_quote_refused(&relay_api);
+        let store = Arc::new(test_store(setup_test_db().await, ()));
+        let transfer = rig
+            .transfer(&server, &relay_api, store.clone(), relay_bounds())
+            .await;
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let mut expired =
+            exact_quote(&rig.hub_wallet, rig.hub_contracts, TOWARD_CHAIN_ORDER_ID).await;
+        expired.deadline = Utc::now() - chrono::Duration::minutes(1);
+        record_quoted_toward_chain(&store, &id, expired).await;
+
+        tokio::time::timeout(
+            Duration::from_secs(30),
+            transfer.resume_alpaca_to_base(&id, Usdc::new(float!(100)), ROBINHOOD_RELAY),
+        )
+        .await
+        .expect("the attempt ends")
+        .unwrap();
+
+        assert!(quote.calls() > 0, "the expired quote is quoted again");
+        let state = store.load(&id).await.unwrap().unwrap();
         assert_eq!(state.state_name(), "SwapQuoted", "{state:?}");
         assert!(state.holds_rebalance_guard());
         assert!(state.is_reconcilable_failure());
         assert_eq!(rig.hub_usdc().await, U256::from(AMOUNT_IN));
+    }
+
+    /// A refund at the hub whose new quote Relay refuses holds at
+    /// `SwapRefunded`, guard held, for `transfer reconcile`.
+    #[tokio::test]
+    async fn refused_refund_requote_toward_chain_holds_at_the_hub() {
+        let anvil = spawn_anvil(Anvil::new());
+        let key = B256::from_slice(&anvil.keys()[0].to_bytes());
+        let wallet = anvil_wallet(anvil.endpoint_url(), &key);
+        let server = MockServer::start();
+        let relay_api = MockServer::start();
+        let quote = mock_quote_refused(&relay_api);
+        let store = Arc::new(test_store(setup_test_db().await, ()));
+        let contracts = RelayEndContracts {
+            stable: Address::repeat_byte(0x51),
+            depository: Address::repeat_byte(0x52),
+        };
+        let transfer = relay_transfer_with_bounds(
+            &server,
+            &relay_api,
+            wallet.clone(),
+            wallet,
+            contracts,
+            store.clone(),
+            RelayHopCtx {
+                min_transfer: Usdc::new(float!(10)),
+                ..relay_bounds()
+            },
+        )
+        .await;
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        record_deposited_toward_chain(&store, &id, TOWARD_CHAIN_ORDER_ID).await;
+        store
+            .send(
+                &id,
+                UsdcRebalanceCommand::RecordSwapRefund {
+                    refund_tx: TxHash::repeat_byte(0xe1),
+                    side: RefundSide::Origin,
+                    amount_refunded: U256::from(99_500_000_u64),
+                },
+            )
+            .await
+            .unwrap();
+
+        transfer
+            .resume_alpaca_to_base(&id, Usdc::new(float!(100)), ROBINHOOD_RELAY)
+            .await
+            .unwrap();
+
+        assert!(quote.calls() > 0, "the refund is quoted again");
+        let state = store.load(&id).await.unwrap().unwrap();
+        assert_eq!(state.state_name(), "SwapRefunded", "{state:?}");
+        assert!(state.holds_rebalance_guard());
+        assert!(state.is_reconcilable_failure());
+    }
+
+    /// A refund Relay pays in USDG to the chain wallet, proven on the chain,
+    /// holds at `SwapRefunded` with the guard held: the stable is in the
+    /// wallet, not the vault, and nothing is quoted again.
+    #[tokio::test]
+    async fn destination_refund_toward_chain_holds_in_the_chain_wallet() {
+        let rig = RelayRig::deploy().await;
+        let refunded = U256::from(99_500_000_u64);
+        let refund_tx = rig.refund_on_chain(refunded, TOWARD_CHAIN_ORDER_ID).await;
+        let server = MockServer::start();
+        let relay_api = MockServer::start();
+        let quote = mock_quote_unavailable(&relay_api);
+        mock_status(
+            &relay_api,
+            json!({
+                "status": "refund",
+                "txHashes": [refund_tx],
+                "failReason": "SOLVER_CAPACITY_EXCEEDED"
+            }),
+        );
+        let store = Arc::new(test_store(setup_test_db().await, ()));
+        let transfer = rig
+            .transfer(&server, &relay_api, store.clone(), relay_bounds())
+            .await;
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        record_deposited_toward_chain(&store, &id, TOWARD_CHAIN_ORDER_ID).await;
+
+        tokio::time::timeout(
+            Duration::from_secs(30),
+            transfer.resume_alpaca_to_base(&id, Usdc::new(float!(100)), ROBINHOOD_RELAY),
+        )
+        .await
+        .expect("the attempt ends")
+        .unwrap();
+
+        quote.assert_calls(0);
+        let state = store.load(&id).await.unwrap().unwrap();
+        let UsdcRebalance::SwapRefunded { side, .. } = &state else {
+            panic!("expected SwapRefunded, got {state:?}");
+        };
+        assert_eq!(*side, RefundSide::Destination);
+        assert!(state.holds_rebalance_guard());
+        assert!(state.is_reconcilable_failure());
+        assert_eq!(rig.vault_usdg().await, U256::ZERO);
     }
 }
