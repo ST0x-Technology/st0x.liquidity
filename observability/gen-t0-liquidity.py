@@ -678,27 +678,32 @@ DELTA = [
 # theme=light so the suite renders in the SPA's light look regardless of
 # the viewer's Grafana theme preference.
 # ==========================================================================
+# Each tab carries its own symbol in its label. Grafana's link buttons take
+# only seven built-in icons (external link, dashboard, question, info, bolt,
+# doc, cloud), too few to tell five tabs apart.
 TABS = [
-    ("Dashboard", "t0-liquidity"),
-    ("Orders", "t0-liquidity-orders"),
-    ("PnL", "t0-liquidity-pnl"),
-    ("Performance", "t0-liquidity-performance"),
-    ("Logs", "t0-liquidity-logs"),
+    ("Dashboard", "t0-liquidity", "📊"),
+    ("Orders", "t0-liquidity-orders", "📋"),
+    ("PnL", "t0-liquidity-pnl", "💵"),
+    ("Performance", "t0-liquidity-performance", "⚡"),
+    ("Logs", "t0-liquidity-logs", "📜"),
 ]
 
 
 def tab_links(active):
     links = []
-    for name, uid in TABS:
+    for name, uid, symbol in TABS:
         links.append({
             "type": "link",
-            "title": f"▸ {name}" if name == active else name,
+            # A no-break space: Grafana trims a plain one after the symbol.
+            "title": (f"▸ {symbol}\u00a0{name}" if name == active
+                      else f"{symbol}\u00a0{name}"),
             # autofitpanels stretches the board to the window height, like
             # the SPA's full-height layout. Only the Dashboard tab: the
             # other tabs hold too many panels to squeeze into one screen.
             "url": f"/d/{uid}/?theme=light"
                    + ("&autofitpanels" if uid == "t0-liquidity" else ""),
-            "icon": "dashboard", "targetBlank": False,
+            "targetBlank": False,
             "keepTime": True, "includeVars": True,
             "asDropdown": False, "tags": [], "tooltip": "",
         })
@@ -712,69 +717,71 @@ def tab_links(active):
 
 
 def pills(y):
-    """The SPA's header + settings bar as one thin pill row, repeated on
-    every tab like the SPA repeats its header. One grid row tall: a pill
-    with an empty title gets a hover-only header, so the value fills the
-    30px row instead of sitting under a title line.
+    """The SPA's HeaderBar and SettingsBar as one Business Text row,
+    repeated on every tab like the SPA repeats its header: the settings
+    pills (broker, Equity and USDC targets with their bands, Trigger,
+    Reserve) and a Config button on the left; the CLI recovery guide
+    button, a UTC clock, the commit, uptime, and the connection badge on
+    the right. Config and the recovery guide open the SPA's dialogs.
 
-    The SPA has no Mode or CT-assets pill, so this row has neither. A stat cannot
-    join two series into one string, so the Equity and USDC pills show
-    the target only; the band is in their descriptions."""
-    def pill(title, desc, expr, display=None, unit="short", decimals=None,
-             mappings=None, legend=None, text_mode="value_and_name", x=0,
-             w=3):
-        return {**stat(title, desc, expr, display=display, unit=unit,
-                       decimals=decimals, mappings=mappings, legend=legend,
-                       text_mode=text_mode,
-                       color_mode="none" if not mappings else "value",
-                       w=w, h=1, x=x, y=y, value_size=14),
-                **LATEST_ONLY_HIDDEN}
+    Every series carries a `k` label naming it; liquidity-panels/header.js
+    reads the rows by `k`. The commit series is its sample timestamp, so
+    the script can keep the newest commit when a deploy leaves the previous
+    one in the lookback window. The recovery guide is static data exported
+    from the SPA (liquidity-panels/recovery-guide.json) and prepended to
+    the script.
+    """
+    def named(expr, name):
+        return f'label_replace({expr}, "k", "{name}", "", "")'
 
-    return [
-        pill("", "The SPA header's connection light: is the bot process up "
-             "and answering? The exporter source reads liq_up, which is 0 "
-             "when the exporter cannot reach the bot's /health. The bot "
-             "never emits liq_up, so the bot source reads the scrape's own "
-             "up. '—' means the source is not reporting.",
-             LIQ_UP,
-             display="Bot",
-             mappings=[{"type": "value", "options": {
-                 "1": {"text": "Connected", "color": "green", "index": 0},
-                 "0": {"text": "Disconnected", "color": "red", "index": 1}}}],
-             x=0, w=3),
-        {**pill("", "Deployed commit, from /health, cut to 7 "
-                "characters like the SPA header. The stackdriver plugin "
-                "runs a range query even for an instant target, so over "
-                "the dashboard's 24h the previous commit is a second series "
-                "and its name drew over this one. PromQL also keeps a "
-                "stopped series for its 5m lookback, so topk on the sample "
-                "timestamp keeps only the commit with the newest sample, "
-                "over a 1m window.",
-                # max by drops every other label: this datasource ignores
-                # legendFormat, so the series name must be the commit alone.
-                'max by (git_commit) (topk(1, label_replace('
-                'timestamp(liq_bot_info), "git_commit", "$1", "git_commit", '
-                '"(.{7}).*")))',
-                legend="{{git_commit}}", text_mode="name", x=3, w=3),
-         "timeFrom": "1m"},
-        pill("", "Bot process uptime, from /health uptimeSeconds.",
-             "time() - max(liq_bot_start_timestamp_seconds)",
-             display="Uptime", unit="s", decimals=0, x=6, w=3),
-        pill("", "The SPA settings bar's Broker pill.",
-             "sum by (broker) (liq_settings_info)",
-             legend="{{broker}}", text_mode="name", x=9, w=3),
-        pill("", "Equity rebalance target. The SPA pill also shows the "
-             "band: target +/- liq_settings_equity_deviation.",
-             "max(liq_settings_equity_target)", display="Equity",
-             unit="percentunit", decimals=0, x=12, w=4),
-        pill("", "USDC rebalance target. The SPA pill also shows the "
-             "band: target +/- liq_settings_usdc_deviation.",
-             "max(liq_settings_usdc_target)", display="USDC",
-             unit="percentunit", decimals=0, x=16, w=4),
-        pill("", "Hedge execution threshold (settings bar 'Trigger').",
-             "max(liq_settings_execution_threshold_usd)", display="Trigger",
-             unit="currencyUSD", decimals=0, x=20, w=4),
-    ]
+    expr = " or ".join([
+        named(LIQ_UP, "up"),
+        named("time() - max(liq_bot_start_timestamp_seconds)", "uptime"),
+        named("max by (git_commit) (timestamp(liq_bot_info))", "commit"),
+        named("max by (broker, log_level, wallet_kind, wallet_address, orderbook, "
+              "turnkey_organization, server_port) (liq_settings_info)", "info"),
+        named("max(liq_settings_equity_target)", "equity_target"),
+        named("max(liq_settings_equity_deviation)", "equity_deviation"),
+        named("max(liq_settings_usdc_target)", "usdc_target"),
+        named("max(liq_settings_usdc_deviation)", "usdc_deviation"),
+        named("max(liq_settings_execution_threshold_usd)", "trigger"),
+        named("max(liq_settings_cash_reserved)", "cash_reserved"),
+        named("max(liq_settings_order_polling_seconds)", "order_polling"),
+        named("max(liq_settings_inventory_poll_seconds)", "inventory_polling"),
+        named("max(liq_settings_deployment_block)", "deployment_block"),
+    ])
+    with open(os.path.join(HERE, "liquidity-panels", "recovery-guide.json")) as f:
+        guide = json.load(f)
+    with open(os.path.join(HERE, "liquidity-panels", "header.js")) as f:
+        after_render = f"const RECOVERY_GUIDE = {json.dumps(guide)};\n\n" + f.read()
+    with open(os.path.join(HERE, "liquidity-panels", "header.css")) as f:
+        styles = f.read()
+    return [{
+        "id": nid(), "type": "marcusolsson-dynamictext-panel", "title": "",
+        "description": "The SPA header: settings pills, Config, the CLI "
+                       "recovery guide, the deployed commit, uptime, and "
+                       "whether the bot is up: the exporter's liq_up, or "
+                       "the bot scrape's up on the bot source.",
+        "datasource": CM,
+        "targets": [promql(expr, instant=True)],
+        "transparent": True,
+        "gridPos": {"h": 1, "w": 24, "x": 0, "y": y},
+        "transformations": [
+            {"id": "labelsToFields", "options": {}},
+            {"id": "merge", "options": {}},
+        ],
+        "options": {
+            "renderMode": "allRows",
+            "editor": {"format": "auto", "language": "html"},
+            "content": "<div></div>",
+            "defaultContent": "No bot data.",
+            "helpers": "",
+            "afterRender": after_render,
+            "styles": styles,
+            "wrap": False,
+        },
+        **LATEST_ONLY_HIDDEN,
+    }]
 
 
 # The SPA's PnL range buttons (1W / 1M / YTD / 1Y / All). PnL is a windowed
