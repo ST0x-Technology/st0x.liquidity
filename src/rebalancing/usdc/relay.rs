@@ -1886,6 +1886,74 @@ mod tests {
         );
     }
 
+    /// A signing that outlasts the corridor's `quote_max_age` ends the
+    /// attempt instead of holding the chain wallet's prepare lock, and the
+    /// pair it signs late is discarded, so its nonces go to the next send.
+    #[tokio::test]
+    async fn hung_swap_signing_times_out_and_releases_its_nonces() {
+        let anvil = spawn_anvil(Anvil::new());
+        let (wallet, contracts) = funded_relay_end(&anvil).await;
+        let store = Arc::new(test_store(setup_test_db().await, ()));
+        let id = UsdcRebalanceId(Uuid::new_v4());
+        let witness = Arc::new(
+            BroadcastWitness::new(wallet.clone(), store.clone(), id.clone())
+                .on_deposit_signing(OnDepositSigning::SlowAfterSigning(Duration::from_secs(3))),
+        );
+        let chain_wallet: TestWallet = witness.clone();
+        let server = MockServer::start();
+        let relay_api = MockServer::start();
+        let transfer = relay_transfer_with_bounds(
+            &server,
+            &relay_api,
+            wallet.clone(),
+            chain_wallet,
+            contracts,
+            store.clone(),
+            RelayHopCtx {
+                quote_max_age: Duration::from_secs(1),
+                ..relay_bounds()
+            },
+        )
+        .await;
+        let quote = exact_quote(&wallet, contracts, B256::repeat_byte(0x0d)).await;
+        let approve_step = quote.approve.clone().unwrap();
+        record_quoted(&store, &id, quote).await;
+        let first_nonce = wallet
+            .provider()
+            .get_transaction_count(wallet.address())
+            .await
+            .unwrap();
+
+        let started = std::time::Instant::now();
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            transfer.resume_base_to_alpaca(&id, Usdc::new(float!(100)), ROBINHOOD_RELAY),
+        )
+        .await
+        .expect("the attempt ends")
+        .unwrap_err();
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "the attempt must end at the bound, not when the signing returns"
+        );
+        assert_eq!(
+            store.load(&id).await.unwrap().unwrap().state_name(),
+            "SwapQuoted"
+        );
+        assert_eq!(witness.broadcasts(), Vec::<TxHash>::new());
+
+        tokio::time::sleep(Duration::from_secs(4)).await;
+        let next = wallet
+            .prepare_pending(contracts.stable, approve_step.data, "next send")
+            .await
+            .unwrap();
+        assert_eq!(
+            next.nonce(),
+            first_nonce,
+            "the late pair's nonces are released"
+        );
+    }
+
     /// A pair persisted after an approve went out alone is resumed in
     /// process: the lone approve is broadcast again before the pair, so the
     /// deposit is not left behind a nonce the node may not hold.
