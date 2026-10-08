@@ -17404,9 +17404,9 @@ mod tests {
         let harness = ReactorHarness::new(Arc::clone(&trigger));
         let id = issuer_request_id("mint-after-untracked-poll");
 
-        // A poll applied while no active mint is recorded, as after a
-        // snapshot-error reset drops `active_mints`, counts the request
-        // before `MintAccepted` counts it again.
+        // The provider lists a pending request the bot does not track, e.g. a
+        // CLI mint, so the poll counts it before this mint's `MintAccepted`
+        // adds its own shares.
         apply_and_dispatch_snapshot(
             reactor.clone(),
             InventorySnapshotId {
