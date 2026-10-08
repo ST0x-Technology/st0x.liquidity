@@ -17295,12 +17295,40 @@ mod tests {
         .await
         .unwrap();
 
-        for event in [make_mint_accepted(), make_tokens_received()] {
-            harness
-                .receive::<TokenizedEquityMint>(id.clone(), event)
+        harness
+            .receive::<TokenizedEquityMint>(id.clone(), make_mint_accepted())
+            .await
+            .unwrap();
+
+        // The provider drops the request from its pending list before the
+        // bot processes `TokensReceived`.
+        apply_and_dispatch_snapshot(
+            reactor.clone(),
+            snapshot_id.clone(),
+            InventorySnapshotEvent::InflightEquity {
+                mints: BTreeMap::new(),
+                redemptions: BTreeMap::new(),
+                fetched_at: Utc::now(),
+                base_redemptions_chain_scoped: true,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            trigger
+                .inventory
+                .read()
                 .await
-                .unwrap();
-        }
+                .equity_inflight(&symbol, Venue::Hedging),
+            Some(shares(30)),
+            "An empty poll must leave the active mint's Hedging inflight to the mint"
+        );
+
+        harness
+            .receive::<TokenizedEquityMint>(id.clone(), make_tokens_received())
+            .await
+            .unwrap();
 
         assert_eq!(
             trigger
