@@ -496,6 +496,7 @@ fn usdc_rebalance_failure(event: &UsdcRebalanceEvent) -> Option<(FailureEventTyp
         | UsdcRebalanceEvent::BridgeAttestationReceived { .. }
         | UsdcRebalanceEvent::Bridged { .. }
         | UsdcRebalanceEvent::BridgingCompletionRecovered { .. }
+        | UsdcRebalanceEvent::SwapCompletionRecovered { .. }
         | UsdcRebalanceEvent::DepositInitiated { .. }
         | UsdcRebalanceEvent::DepositConfirmed { .. }
         | UsdcRebalanceEvent::DepositCompletionRecovered { .. }

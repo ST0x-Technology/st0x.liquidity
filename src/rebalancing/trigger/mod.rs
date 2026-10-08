@@ -1372,6 +1372,12 @@ enum RearmPolicy {
     /// so job-budget exhaustion means the chain lost its driver, not that the
     /// transfer is unrecoverable.
     AlpacaToBaseIdempotentRedrive,
+    /// A Relay transfer after its withdrawal: re-arm whenever no LIVE job row
+    /// exists, as for `AlpacaToBaseIdempotentRedrive`. Its resume only
+    /// re-quotes, re-broadcasts the persisted envelopes, reads Relay or
+    /// finishes the redeposit, so a terminal row means only that the job was
+    /// lost, and its holds end the job without spending its budget.
+    RelayResume,
 }
 
 impl RearmPolicy {
@@ -1433,6 +1439,16 @@ impl RearmPolicy {
                 ..
             }
             | UsdcRebalance::BridgingSubmitting { .. } => Self::MidFlightPreBurn,
+            UsdcRebalance::WithdrawalComplete {
+                direction: RebalanceDirection::BaseToAlpaca,
+                ..
+            }
+            | UsdcRebalance::SwapQuoted { .. }
+            | UsdcRebalance::SwapDepositPrepared { .. }
+            | UsdcRebalance::SwapDeposited { .. }
+            | UsdcRebalance::SwapRefunded { .. }
+            | UsdcRebalance::SwapEscrowUnresolved { .. }
+            | UsdcRebalance::Redepositing { .. } => Self::RelayResume,
             // is_resumable_mid_flight_data is fully exhaustive (no
             // wildcard `None` arm). Listing every unreachable variant
             // here turns a future "added to Some but forgot to assign
@@ -1449,21 +1465,11 @@ impl RearmPolicy {
                 direction: RebalanceDirection::BaseToAlpaca,
                 ..
             }
-            | UsdcRebalance::WithdrawalComplete {
-                direction: RebalanceDirection::BaseToAlpaca,
-                ..
-            }
             | UsdcRebalance::WithdrawalFailed { .. }
             | UsdcRebalance::Bridging { .. }
             | UsdcRebalance::AwaitingAttestation { .. }
             | UsdcRebalance::Attested { .. }
-            | UsdcRebalance::SwapQuoted { .. }
-            | UsdcRebalance::SwapDepositPrepared { .. }
-            | UsdcRebalance::SwapDeposited { .. }
-            | UsdcRebalance::SwapRefunded { .. }
-            | UsdcRebalance::SwapEscrowUnresolved { .. }
             | UsdcRebalance::SwapFailed { .. }
-            | UsdcRebalance::Redepositing { .. }
             | UsdcRebalance::ReturnedToSource { .. }
             | UsdcRebalance::Bridged { .. }
             | UsdcRebalance::DepositInitiated { .. }
@@ -1473,7 +1479,7 @@ impl RearmPolicy {
             | UsdcRebalance::Reconciled { .. } => unreachable!(
                 "filtered by is_resumable_mid_flight_data; only AlpacaToBase \
                  Withdrawing/WithdrawalComplete, WithdrawalSubmitting{{BaseToAlpaca}}, \
-                 and BridgingSubmitting reach here"
+                 BridgingSubmitting, and the resumable Relay states reach here"
             ),
         }
     }
@@ -8995,9 +9001,9 @@ impl RebalancingService {
         } in candidates
         {
             let blocked = match policy {
-                RearmPolicy::RecoverableFailure | RearmPolicy::AlpacaToBaseIdempotentRedrive => {
-                    self.transfer_live_job_for_id(&id).await?
-                }
+                RearmPolicy::RecoverableFailure
+                | RearmPolicy::AlpacaToBaseIdempotentRedrive
+                | RearmPolicy::RelayResume => self.transfer_live_job_for_id(&id).await?,
                 RearmPolicy::PostBurnResumable => self.transfer_has_job_row_for_id(&id).await?,
                 RearmPolicy::MidFlightPreBurn => {
                     let live = self.transfer_live_job_for_id(&id).await?;

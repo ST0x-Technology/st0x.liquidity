@@ -1965,9 +1965,9 @@ fn replay_refusal(error: &MintError) -> Option<&TokenizedEquityMintError> {
 fn usdc_recheck_error_response(error: &UsdcRecheckError) -> (StatusCode, String) {
     use UsdcRecheckError::{
         Alpaca, AlpacaToBaseDeposit, DepositTxAmountMismatch, DepositTxBeforeMint,
-        DepositTxConflict, DepositTxLookup, DepositTxNotMined, DepositTxRead,
-        DepositTxRecordedElsewhere, DepositTxUnchecked, NoOnchainDepositRef, NotDepositFailed,
-        NotFound, Transfer,
+        DepositTxConflict, DepositTxLookup, DepositTxNotApplicable, DepositTxNotMined,
+        DepositTxRead, DepositTxRecordedElsewhere, DepositTxUnchecked, NoOnchainDepositRef,
+        NotDepositFailed, NotFound, Transfer,
     };
 
     match error {
@@ -1975,6 +1975,7 @@ fn usdc_recheck_error_response(error: &UsdcRecheckError) -> (StatusCode, String)
         AlpacaToBaseDeposit(_)
         | NoOnchainDepositRef(_)
         | NotDepositFailed { .. }
+        | DepositTxNotApplicable { .. }
         | DepositTxConflict { .. }
         | DepositTxRecordedElsewhere { .. }
         | DepositTxNotMined { .. }
