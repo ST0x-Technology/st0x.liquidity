@@ -3478,6 +3478,9 @@ impl EventSourced for UsdcRebalance {
     // events, `HopEvidence::Relay`, `deposit_reverts` on the swap states,
     // `max_quote_loss_bps` on `SwapQuote`, `first_deposit` on the swap
     // states and `short_of_floor` on `SwapRefunded`.
+    // v16: `refund_requotes` on `SwapQuoted`, `SwapDepositPrepared`,
+    // `SwapDeposited`, `SwapRefunded` and `SwapEscrowUnresolved`; older
+    // snapshots read it as 0.
     const SCHEMA_VERSION: u64 = 16;
 
     fn originate(event: &Self::Event) -> Option<Self> {
@@ -7599,8 +7602,8 @@ mod tests {
         }
     }
 
-    /// The Alpaca-to-chain holds keep the guard and are reconcilable: a
-    /// `SwapQuoted` past its revert budget and a refund either side. Every
+    /// The Alpaca-to-chain holds keep the guard and are reconcilable: any
+    /// `SwapQuoted`, live or held, and a refund either side. Every
     /// Alpaca-to-chain swap state refuses `fail-usdc-transfer` with the Relay
     /// hold.
     #[tokio::test]
