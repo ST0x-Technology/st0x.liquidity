@@ -3563,24 +3563,13 @@ impl InventoryView {
         Ok(view)
     }
 
-    /// Remove a symbol from the previous inflight mint marker set.
-    ///
-    /// Called when a new mint transfer starts (MintAccepted event) to
-    /// prevent the next inflight poll from incorrectly zeroing the new
-    /// inflight. Without this, a poll that fires before Alpaca reflects
-    /// the new pending request would see the symbol in `prev_mints` but
-    /// absent from the current poll, and zero it.
-    pub(crate) fn clear_previous_inflight_mint_marker(mut self, symbol: &Symbol) -> Self {
-        self.previous_inflight_mint_symbols.remove(symbol);
-        self
-    }
-
     /// Remove a symbol from `chain`'s previous inflight redemption markers.
     ///
     /// Called when a new redemption transfer starts
     /// (`VaultWithdrawPending` for legacy aggregates or
-    /// `VaultWithdrawSubmitting` for new aggregates) for the same reason as
-    /// [`Self::clear_previous_inflight_mint_marker`].
+    /// `VaultWithdrawSubmitting` for new aggregates), so a poll that fires
+    /// before the provider reflects the new request does not see the symbol
+    /// in the previous markers but absent from the current poll, and zero it.
     pub(crate) fn clear_previous_inflight_redemption_marker(
         mut self,
         symbol: &Symbol,
@@ -6838,7 +6827,7 @@ mod tests {
     }
 
     #[test]
-    fn clear_previous_mint_marker_prevents_incorrect_zeroing() {
+    fn active_new_mint_keeps_inflight_a_previous_poll_marker_would_zero() {
         let symbol = Symbol::new("AAPL").unwrap();
         let now = Utc::now();
 
@@ -6870,16 +6859,16 @@ mod tests {
             Some(FractionalShares::ZERO),
         );
 
-        // A new mint starts (MintAccepted sets inflight via
-        // TransferOp::Start) and clears the previous poll marker.
+        // A new mint registers as active (MintRequested), then MintAccepted
+        // sets inflight via TransferOp::Start. The previous poll marker stays.
         let view = view
+            .set_active_mint(symbol.clone(), Chain::Base, IssuerRequestId::generate())
             .update_equity(
                 &symbol,
                 Inventory::transfer(Venue::Hedging, TransferOp::Start, shares(20)),
                 now,
             )
-            .unwrap()
-            .clear_previous_inflight_mint_marker(&symbol);
+            .unwrap();
 
         assert_eq!(
             view.equity_inflight(&symbol, Venue::Hedging),
@@ -6887,7 +6876,6 @@ mod tests {
         );
 
         // Poll 2: Alpaca hasn't reflected the new request yet (empty).
-        // Without the marker clear, this would zero the new inflight.
         let view = view
             .apply_inflight_snapshot(&BTreeMap::new(), &BTreeMap::new(), now, now)
             .unwrap();
@@ -6895,8 +6883,8 @@ mod tests {
         assert_eq!(
             view.equity_inflight(&symbol, Venue::Hedging),
             Some(shares(20)),
-            "New inflight must be preserved when previous poll marker \
-             was cleared by MintAccepted"
+            "An active mint's new inflight must survive a poll that drops \
+             the symbol a previous poll recorded"
         );
     }
 

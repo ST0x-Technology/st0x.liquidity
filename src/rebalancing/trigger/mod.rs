@@ -9554,16 +9554,6 @@ impl RebalancingService {
             }
         }
 
-        // When a new mint transfer starts, clear the previous poll marker
-        // so the next inflight poll won't incorrectly zero the new inflight
-        // if Alpaca hasn't reflected the request yet.
-        if matches!(event, TokenizedEquityMintEvent::MintAccepted { .. }) {
-            let mut inventory = self.inventory.write().await;
-            *inventory = inventory
-                .clone()
-                .clear_previous_inflight_mint_marker(&symbol);
-        }
-
         // Cleared while the mint still owns the slot, so a provider poll cannot
         // write a real pending amount in between that this would then zero.
         // Not `?`: an error must not skip the terminal cleanup below, which
