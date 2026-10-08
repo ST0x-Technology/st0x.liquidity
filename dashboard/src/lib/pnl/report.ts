@@ -112,6 +112,8 @@ export type PnlCostCategory =
   | 'offchain_execution_fee'
   | 'tokenization_fee'
   | 'cctp_fee'
+  | 'relay_fee'
+  | 'relay_swap'
   | 'conversion_slippage'
   | 'oracle_write'
   | 'broker_fee'

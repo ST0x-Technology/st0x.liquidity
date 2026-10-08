@@ -22,7 +22,8 @@ use st0x_float_macro::float;
 
 use super::builder::build_pnl_response_from_rows;
 use super::costs::{
-    AccountingBucket, AccountingEffect, CostCategory, CostEntryInternal, validated_cost_magnitude,
+    AccountingBucket, AccountingEffect, CostCategory, CostEntryInternal, build_cost_entries,
+    validated_cost_magnitude,
 };
 use super::ledger::{LedgerHead, PnlLedgerError};
 use super::parsing::{fmt_decimal, parse_timestamp};
@@ -1967,6 +1968,59 @@ fn missing_cctp_fee_amount_fails_the_report() {
             reason: "cctp fee row missing amount",
         }
     ));
+}
+
+/// A Relay fill's relayer fee is a cost, and its swap row a cost when
+/// positive and a gain of its magnitude when negative.
+#[test]
+fn relay_rows_book_the_fee_as_a_cost_and_the_swap_by_its_sign() {
+    let row = |rowid, source, amount: &str| CostLedgerRow {
+        event_rowid: rowid,
+        source,
+        aggregate_id: "relay-1".to_owned(),
+        symbol: None,
+        amount_usd: Some(amount.to_owned()),
+        occurred_at: "2026-05-15T12:02:00Z".to_owned(),
+    };
+    let rows = [
+        row(21, CostSource::RelayFee, "0.3"),
+        row(21, CostSource::RelaySwap, "0.2"),
+        row(22, CostSource::RelaySwap, "-0.2"),
+    ];
+
+    let replay = build_cost_entries(&rows, &mut Vec::new()).unwrap();
+    let booked = replay
+        .entries
+        .iter()
+        .map(|entry| {
+            (
+                entry.category,
+                entry.effect,
+                fmt_decimal(entry.amount_usd.inner()).unwrap(),
+            )
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        booked,
+        vec![
+            (
+                CostCategory::RelayFee,
+                AccountingEffect::Cost,
+                "0.3".to_owned()
+            ),
+            (
+                CostCategory::RelaySwap,
+                AccountingEffect::Cost,
+                "0.2".to_owned()
+            ),
+            (
+                CostCategory::RelaySwap,
+                AccountingEffect::Revenue,
+                "0.2".to_owned()
+            ),
+        ]
+    );
 }
 
 #[test]

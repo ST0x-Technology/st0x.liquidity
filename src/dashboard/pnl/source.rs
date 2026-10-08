@@ -23,7 +23,8 @@ use crate::portfolio_snapshot::{
 
 use super::builder::build_pnl_response_from_rows;
 use super::ledger::{
-    CCTP_FEE_SOURCE, DIRECTION_BUY_TEXT, DIRECTION_SELL_TEXT, LedgerHead, TOKENIZATION_FEE_SOURCE,
+    CCTP_FEE_SOURCE, DIRECTION_BUY_TEXT, DIRECTION_SELL_TEXT, LedgerHead, RELAY_FEE_SOURCE,
+    RELAY_SWAP_SOURCE, TOKENIZATION_FEE_SOURCE,
 };
 use super::query::{PnlError, PnlQuery};
 use super::response::{PnlCapitalSummary, PnlResponse};
@@ -544,6 +545,8 @@ async fn load_cost_rows(
                 let source = match source.as_str() {
                     TOKENIZATION_FEE_SOURCE => CostSource::TokenizationFee,
                     CCTP_FEE_SOURCE => CostSource::CctpFee,
+                    RELAY_FEE_SOURCE => CostSource::RelayFee,
+                    RELAY_SWAP_SOURCE => CostSource::RelaySwap,
                     _ => {
                         return Err(PnlError::InvalidLedgerRow {
                             table: "pnl_cost_entry",
