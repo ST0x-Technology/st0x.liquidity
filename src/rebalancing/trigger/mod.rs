@@ -17580,6 +17580,68 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn mint_failing_after_inflight_snapshot_reset_restores_only_its_own_shares() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let inventory =
+            InventoryView::default().with_equity(symbol.clone(), shares(20), shares(80));
+        let reactor = make_trigger_with_inventory_and_registry(inventory, &symbol).await;
+        let trigger = reactor.clone();
+        let harness = ReactorHarness::new(Arc::clone(&trigger));
+        let id = issuer_request_id("failed-mint-across-inflight-reset");
+
+        harness
+            .receive::<TokenizedEquityMint>(id.clone(), make_mint_requested(&symbol, float!(30)))
+            .await
+            .unwrap();
+
+        trigger
+            .on_snapshot_recovery(
+                RebalancingServiceError::Inventory(InventoryViewError::Equity(
+                    InventoryError::NegativeInflight {
+                        value: FractionalShares::new(float!(-1)),
+                    },
+                )),
+                InventorySnapshotEvent::InflightEquity {
+                    mints: BTreeMap::from([(symbol.clone(), shares(30))]),
+                    redemptions: BTreeMap::new(),
+                    fetched_at: Utc::now(),
+                    base_redemptions_chain_scoped: true,
+                },
+            )
+            .await
+            .unwrap();
+
+        let accepted = harness
+            .receive::<TokenizedEquityMint>(id.clone(), make_mint_accepted())
+            .await;
+
+        harness
+            .receive::<TokenizedEquityMint>(id.clone(), make_mint_acceptance_failed())
+            .await
+            .unwrap();
+
+        let inventory = trigger.inventory.read().await;
+        assert_eq!(
+            inventory.equity_inflight(&symbol, Venue::Hedging),
+            Some(shares(0)),
+            "The failed mint must leave no Hedging inflight"
+        );
+        assert_eq!(
+            inventory.equity_available(&symbol, Venue::Hedging),
+            Some(shares(80)),
+            "The failed mint must return only the shares its own Start moved, \
+             not credit the poll's inflight as broker shares"
+        );
+        drop(inventory);
+        assert_eq!(
+            trigger.divergence_gate.pending_offchain_equity_reconciles(),
+            Vec::<Symbol>::new(),
+            "A mint that started and cancelled its own shares leaves nothing to reconcile"
+        );
+        accepted.unwrap();
+    }
+
+    #[tokio::test]
     async fn mint_acceptance_failed_via_reactor_restores_imbalance() {
         let symbol = Symbol::new("AAPL").unwrap();
         // 20 onchain, 80 offchain = imbalanced
