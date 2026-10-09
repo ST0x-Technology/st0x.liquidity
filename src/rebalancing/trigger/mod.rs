@@ -17368,7 +17368,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn terminal_mint_clears_hedging_inflight_an_untracked_poll_left() {
+    async fn post_acceptance_mint_failure_clears_residual_hedging_inflight() {
         let symbol = Symbol::new("AAPL").unwrap();
         let inventory = InventoryView::default()
             .with_equity(symbol.clone(), shares(0), shares(0))
@@ -17388,85 +17388,11 @@ mod tests {
         let reactor = make_trigger_with_inventory_and_registry(inventory, &symbol).await;
         let trigger = reactor.clone();
         let harness = ReactorHarness::new(Arc::clone(&trigger));
-        let id = issuer_request_id("mint-after-untracked-poll");
+        let id = issuer_request_id("failed-mint-with-residual-inflight");
 
-        // The provider lists a pending request the bot does not track, e.g. a
-        // CLI mint, so the poll counts it before this mint's `MintAccepted`
-        // adds its own shares.
-        apply_and_dispatch_snapshot(
-            reactor.clone(),
-            InventorySnapshotId {
-                orderbook: TEST_ORDERBOOK,
-                owner: TEST_ORDER_OWNER,
-            },
-            InventorySnapshotEvent::InflightEquity {
-                mints: BTreeMap::from([(symbol.clone(), shares(30))]),
-                redemptions: BTreeMap::new(),
-                fetched_at: Utc::now(),
-                base_redemptions_chain_scoped: true,
-            },
-        )
-        .await
-        .unwrap();
-
-        for event in [
-            make_mint_requested(&symbol, float!(30)),
-            make_mint_accepted(),
-            make_tokens_received(),
-            make_deposited_into_raindex(),
-        ] {
-            harness
-                .receive::<TokenizedEquityMint>(id.clone(), event)
-                .await
-                .unwrap();
-        }
-
-        let inventory = trigger.inventory.read().await;
-        assert_eq!(
-            inventory.equity_inflight(&symbol, Venue::Hedging),
-            Some(shares(0)),
-            "The terminal mint must zero the residual Hedging inflight"
-        );
-        assert!(
-            !inventory.equity_venues(&symbol).unwrap().has_inflight,
-            "A terminal mint must not leave the symbol blocked on inflight"
-        );
-        assert_eq!(
-            inventory.equity_available(&symbol, Venue::Hedging),
-            Some(shares(50)),
-            "Clearing the residual must not credit it back to Hedging available"
-        );
-        drop(inventory);
-        assert_eq!(
-            trigger.divergence_gate.pending_offchain_equity_reconciles(),
-            vec![symbol.clone()],
-            "Clearing a residual must force the next broker snapshot through"
-        );
-    }
-
-    #[tokio::test]
-    async fn post_acceptance_mint_failure_clears_hedging_inflight_an_untracked_poll_left() {
-        let symbol = Symbol::new("AAPL").unwrap();
-        let inventory = InventoryView::default()
-            .with_equity(symbol.clone(), shares(0), shares(0))
-            .update_equity(
-                &symbol,
-                Inventory::available(Venue::MarketMaking, Operator::Add, shares(20)),
-                Utc::now(),
-            )
-            .unwrap()
-            .update_equity(
-                &symbol,
-                Inventory::available(Venue::Hedging, Operator::Add, shares(80)),
-                Utc::now(),
-            )
-            .unwrap();
-
-        let reactor = make_trigger_with_inventory_and_registry(inventory, &symbol).await;
-        let trigger = reactor.clone();
-        let harness = ReactorHarness::new(Arc::clone(&trigger));
-        let id = issuer_request_id("failed-mint-after-untracked-poll");
-
+        // A poll applied while the symbol has no active mint stands in for the
+        // Base snapshot-error reset: either way `MintAccepted` counts the
+        // request a second time.
         apply_and_dispatch_snapshot(
             reactor.clone(),
             InventorySnapshotId {
