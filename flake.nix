@@ -271,6 +271,7 @@
               pkgs.mprocs
               pkgs.bun
               pkgs.cargo-nextest
+              foundryBin
               pkgs.openssl
               pkgs.sqlite
               pkgs.pkg-config

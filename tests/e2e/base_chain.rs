@@ -243,11 +243,15 @@ impl BaseChain<()> {
         // is a loud e2e timeout, not a silent pass.)
         // Report Base's real chain id: startup confirms the RPC is the chain
         // its registry entry names, so a default 31337 would fail every e2e.
+        // Long-running simulations otherwise retain up to 3,600 complete state
+        // snapshots under ~/.foundry/anvil/tmp and leave them behind on exit.
         let anvil = Anvil::new()
             .block_time(1)
             .chain_id(Chain::Base.chain_id())
             .arg("--slots-in-an-epoch")
             .arg("1")
+            .arg("--max-persisted-states")
+            .arg("0")
             .spawn();
 
         let key = B256::from_slice(&anvil.keys()[0].to_bytes());
