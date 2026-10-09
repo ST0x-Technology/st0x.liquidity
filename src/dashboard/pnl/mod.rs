@@ -24,10 +24,12 @@ pub(crate) use ledger::{LedgerHead, PnlLedger, PnlLedgerReactor};
 pub(crate) use query::{PnlError, PnlQuery};
 pub(crate) use response::PnlResponse;
 #[cfg(test)]
-pub(crate) use source::{MAX_CONCURRENT_PNL_REPORTS, build_pnl_report};
 pub(crate) use source::{
-    PnlReportAdmission, acquire_pnl_report_permit, build_pnl_report_with_permit,
-    pnl_report_admission, validate_pnl_snapshot_rowid,
+    MAX_CONCURRENT_PNL_REPORTS, acquire_pnl_report_permit, build_pnl_report,
+    validate_pnl_snapshot_rowid,
+};
+pub(crate) use source::{
+    PnlReportAdmission, PnlReportDeps, PnlReportError, pnl_report_admission, run_pnl_report,
 };
 
 const ATTRIBUTION_METHOD: &str = "backend_position_fill_replay_fifo";
