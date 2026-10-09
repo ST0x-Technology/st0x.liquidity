@@ -5507,9 +5507,9 @@ impl RebalancingService {
         };
     }
 
-    /// Only mints write a symbol's Hedging inflight, one at a time, so a
-    /// residual after its terminal event is this mint counted twice (a Base
-    /// snapshot-error reset). Zero it and force an offchain reconcile.
+    /// Hedging inflight holds only mint shares, and a symbol has one mint at a
+    /// time, so a residual after its terminal event is this mint counted twice
+    /// (a Base snapshot-error reset). Zero it and force an offchain reconcile.
     async fn clear_residual_hedging_inflight(
         &self,
         id: &IssuerRequestId,
