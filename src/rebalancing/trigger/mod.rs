@@ -17721,6 +17721,76 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn mint_failing_to_start_reconciles_poll_inflight_instead_of_crediting_it() {
+        let symbol = Symbol::new("AAPL").unwrap();
+        let inventory =
+            InventoryView::default().with_equity(symbol.clone(), shares(20), shares(10));
+        let reactor = make_trigger_with_inventory_and_registry(inventory, &symbol).await;
+        let trigger = reactor.clone();
+        let harness = ReactorHarness::new(Arc::clone(&trigger));
+        let id = issuer_request_id("unstarted-mint-over-poll-inflight");
+
+        // Inflight the poll wrote before the mint became active, as a restart
+        // replays a persisted poll before the mint's tracking is rebuilt.
+        apply_and_dispatch_snapshot(
+            reactor.clone(),
+            InventorySnapshotId {
+                orderbook: TEST_ORDERBOOK,
+                owner: TEST_ORDER_OWNER,
+            },
+            InventorySnapshotEvent::InflightEquity {
+                mints: BTreeMap::from([(symbol.clone(), shares(30))]),
+                redemptions: BTreeMap::new(),
+                fetched_at: Utc::now(),
+                base_redemptions_chain_scoped: true,
+            },
+        )
+        .await
+        .unwrap();
+
+        harness
+            .receive::<TokenizedEquityMint>(id.clone(), make_mint_requested(&symbol, float!(30)))
+            .await
+            .unwrap();
+
+        let accepted = harness
+            .receive::<TokenizedEquityMint>(id.clone(), make_mint_accepted())
+            .await;
+        assert!(
+            matches!(
+                accepted,
+                Err(RebalancingServiceError::Inventory(InventoryViewError::Equity(
+                    InventoryError::InsufficientAvailable { requested, available },
+                ))) if requested == shares(30) && available == shares(10)
+            ),
+            "MintAccepted must fail to start against 10 available, got {accepted:?}"
+        );
+
+        harness
+            .receive::<TokenizedEquityMint>(id.clone(), make_mint_acceptance_failed())
+            .await
+            .unwrap();
+
+        let inventory = trigger.inventory.read().await;
+        assert_eq!(
+            inventory.equity_inflight(&symbol, Venue::Hedging),
+            Some(shares(0)),
+            "The failed mint must zero the poll's Hedging inflight"
+        );
+        assert_eq!(
+            inventory.equity_available(&symbol, Venue::Hedging),
+            Some(shares(10)),
+            "A mint whose Start failed must not credit the poll's inflight as broker shares"
+        );
+        drop(inventory);
+        assert_eq!(
+            trigger.divergence_gate.pending_offchain_equity_reconciles(),
+            vec![symbol.clone()],
+            "Zeroing inflight the mint never started must force the next broker snapshot through"
+        );
+    }
+
+    #[tokio::test]
     async fn mint_acceptance_failed_via_reactor_restores_imbalance() {
         let symbol = Symbol::new("AAPL").unwrap();
         // 20 onchain, 80 offchain = imbalanced
