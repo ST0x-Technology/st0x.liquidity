@@ -1,0 +1,53 @@
+{
+  "logBuckets": [
+    {
+      "start": "2026-03-01T00:00:00Z",
+      "errors": 3,
+      "warnings": 5
+    }
+  ],
+  "logTargets": [
+    {
+      "target": "inventory",
+      "level": "WARN",
+      "count": 5,
+      "sparkline": [
+        5
+      ]
+    },
+    {
+      "target": "hedge",
+      "level": "ERROR",
+      "count": 3,
+      "sparkline": [
+        3
+      ]
+    }
+  ],
+  "failureEvents": [
+    {
+      "eventType": "OffchainOrderEvent::Failed",
+      "count": 2,
+      "lastAt": "2026-03-01T09:00:00Z"
+    },
+    {
+      "eventType": "UsdcRebalanceEvent::AttestationTimedOut",
+      "count": 1,
+      "lastAt": "2026-03-01T10:00:00Z"
+    }
+  ],
+  "jobQueues": [
+    {
+      "jobType": "PlaceHedge",
+      "pending": 1,
+      "running": 0,
+      "done": 40,
+      "failed": 2,
+      "awaitingRetry": 1,
+      "killed": 0,
+      "retried": 3,
+      "oldestPendingRunAt": "2026-03-01T11:00:00Z"
+    }
+  ],
+  "logEntriesTruncated": false
+}

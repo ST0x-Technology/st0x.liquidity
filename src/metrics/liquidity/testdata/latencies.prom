@@ -1,0 +1,32 @@
+# Expected exporter output for latencies.json, written by
+# scripts/liq-parity/golden.py from t0.devops revision 226c029.
+liq_hedge_latency_ms{quantile="p50",stage="detection"} 1200.0
+liq_hedge_latency_ms{quantile="p90",stage="detection"} 1210.0
+liq_hedge_latency_ms{quantile="p95",stage="detection"} 1220.0
+liq_hedge_latency_ms{quantile="p99",stage="detection"} 1230.0
+liq_hedge_latency_ms{quantile="max",stage="detection"} 4000.0
+liq_hedge_latency_ms_samples{stage="detection"} 7.0
+liq_hedge_latency_ms{quantile="p50",stage="decision"} -12.0
+liq_hedge_latency_ms{quantile="p90",stage="decision"} -2.0
+liq_hedge_latency_ms{quantile="p95",stage="decision"} 8.0
+liq_hedge_latency_ms{quantile="p99",stage="decision"} 18.0
+liq_hedge_latency_ms{quantile="max",stage="decision"} 40.0
+liq_hedge_latency_ms_samples{stage="decision"} 6.0
+liq_hedge_latency_ms{quantile="p50",stage="execution"} 850.0
+liq_hedge_latency_ms{quantile="p90",stage="execution"} 860.0
+liq_hedge_latency_ms{quantile="p95",stage="execution"} 870.0
+liq_hedge_latency_ms{quantile="p99",stage="execution"} 880.0
+liq_hedge_latency_ms{quantile="max",stage="execution"} 9100.0
+liq_hedge_latency_ms_samples{stage="execution"} 5.0
+liq_hedge_latency_ms{quantile="p50",stage="exposure_window"} 3400.0
+liq_hedge_latency_ms{quantile="p90",stage="exposure_window"} 3410.0
+liq_hedge_latency_ms{quantile="p95",stage="exposure_window"} 3420.0
+liq_hedge_latency_ms{quantile="p99",stage="exposure_window"} 3430.0
+liq_hedge_latency_ms{quantile="max",stage="exposure_window"} 61000.0
+liq_hedge_latency_ms_samples{stage="exposure_window"} 5.0
+liq_hedge_fill_count_24h 7.0
+liq_hedge_cycles_24h 3.0
+liq_open_exposure_fill_count{symbol="AAPL"} 2.0
+liq_open_exposure_oldest_ts_seconds{symbol="AAPL"} 1772366400.0
+liq_open_exposure_fill_count{symbol="RKLB"} 1.0
+liq_open_exposure_oldest_ts_seconds{symbol="RKLB"} 1772368215.25

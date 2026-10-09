@@ -1,0 +1,12 @@
+# Expected exporter output for infra.json, written by
+# scripts/liq-parity/golden.py from t0.devops revision 226c029.
+liq_dependency_calls_24h{dependency="broker",operation="get_order_status"} 30.0
+liq_dependency_errors_24h{dependency="broker",operation="get_order_status"} 0.0
+liq_dependency_calls_24h{dependency="rpc",operation="eth_getLogs"} 120.0
+liq_dependency_errors_24h{dependency="rpc",operation="eth_getLogs"} 2.0
+liq_dependency_latency_ms{dependency="rpc",operation="eth_getLogs",quantile="p50"} 95.0
+liq_dependency_latency_ms{dependency="rpc",operation="eth_getLogs",quantile="p90"} 105.0
+liq_dependency_latency_ms{dependency="rpc",operation="eth_getLogs",quantile="p95"} 115.0
+liq_dependency_latency_ms{dependency="rpc",operation="eth_getLogs",quantile="p99"} 125.0
+liq_dependency_latency_ms{dependency="rpc",operation="eth_getLogs",quantile="max"} 2300.0
+liq_dependency_latency_ms_samples{dependency="rpc",operation="eth_getLogs"} 120.0

@@ -1,0 +1,55 @@
+{
+  "summary": {
+    "fillCount": 7,
+    "stages": {
+      "detection": {
+        "p50Ms": 1200,
+        "p90Ms": 1210,
+        "p95Ms": 1220,
+        "p99Ms": 1230,
+        "maxMs": 4000,
+        "sampleCount": 7
+      },
+      "decision": {
+        "p50Ms": -12,
+        "p90Ms": -2,
+        "p95Ms": 8,
+        "p99Ms": 18,
+        "maxMs": 40,
+        "sampleCount": 6
+      },
+      "submission": null,
+      "execution": {
+        "p50Ms": 850,
+        "p90Ms": 860,
+        "p95Ms": 870,
+        "p99Ms": 880,
+        "maxMs": 9100,
+        "sampleCount": 5
+      },
+      "exposureWindow": {
+        "p50Ms": 3400,
+        "p90Ms": 3410,
+        "p95Ms": 3420,
+        "p99Ms": 3430,
+        "maxMs": 61000,
+        "sampleCount": 5
+      }
+    }
+  },
+  "buckets": [],
+  "cycles": [],
+  "totalCycles": 3,
+  "openExposures": [
+    {
+      "symbol": "tAAPL",
+      "fillCount": 2,
+      "oldestFillBlockTimestamp": "2026-03-01T12:00:00Z"
+    },
+    {
+      "symbol": "RKLB",
+      "fillCount": 1,
+      "oldestFillBlockTimestamp": "2026-03-01T12:30:15.250Z"
+    }
+  ]
+}

@@ -25,9 +25,10 @@ const DURATION_BUCKETS: [f64; 13] = [
 ];
 
 /// Duration histograms rendered with [`DURATION_BUCKETS`].
-const BUCKETED_HISTOGRAMS: [&str; 2] = [
+const BUCKETED_HISTOGRAMS: [&str; 3] = [
     "dependency_call_duration_seconds",
     "order_fill_poll_duration_seconds",
+    "metrics_refresh_duration_seconds",
 ];
 
 fn builder() -> Result<PrometheusBuilder, BuildError> {
@@ -257,6 +258,11 @@ pub(crate) fn setup() -> Result<PrometheusHandle, BuildError> {
         "order_fill_block_lag_sampled_timestamp_seconds",
         "Time of the poll that last set order_fill_block_lag_blocks, by chain; it stops \
          advancing while the lag is unknown"
+    );
+    metrics::describe_histogram!(
+        "metrics_refresh_duration_seconds",
+        metrics::Unit::Seconds,
+        "Time one liq_ collector took to load and build its family, by collector"
     );
     metrics::describe_counter!(
         "bot_gas_redrive_total",

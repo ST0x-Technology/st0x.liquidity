@@ -1804,6 +1804,32 @@ If the positions fail to load, the last published prices stay.
   in. It is not the corridor's trigger ratio, which uses the vault total, in
   flight included.
 
+Every 60 seconds a second task publishes the performance families from the same
+loaders as the `/performance/*` endpoints, over the last 24 hours:
+
+- `latencies`: `liq_hedge_latency_ms{stage,quantile}` (nearest-rank `p50`,
+  `p90`, `p95`, `p99` and `max`; a stage with no samples has no series),
+  `liq_hedge_latency_ms_samples{stage}`, and per open exposure
+  `liq_open_exposure_fill_count{symbol}` and
+  `liq_open_exposure_oldest_ts_seconds{symbol}`.
+- `reliability`: `liq_failure_event_count_24h{event_type}` and
+  `liq_job_queue{job_type,state}`. The job queue counts are the queue now, not a
+  window.
+- `infra`: `liq_block_lag_blocks{chain}`,
+  `liq_block_lag_sampled_ts_seconds{chain}`,
+  `liq_poll_{cycles,errors,skipped_ticks}_24h{chain}`,
+  `liq_poll_duration_ms{chain,quantile}`, and
+  `liq_dependency_{calls_24h,errors_24h}{dependency,operation}` with
+  `liq_dependency_latency_ms{dependency,operation,quantile}`. The block-lag and
+  poll series carry one `chain` per hedged chain; the exporter's unlabelled
+  versions came from a report shape the bot no longer serves.
+
+Every fifth cycle the task publishes `rebalances` over the last 30 days:
+`liq_rebalance_stage_ms{kind,stage,quantile}` (`kind` is `usdc` or `equity`) and
+`liq_attestation_last_ms{kind="usdc"}`, absent with no attestation in the
+window. A collector that fails or takes longer than 30 seconds keeps its last
+family.
+
 **Exception to financial-integrity rules.** Some ported series reproduce the
 exporter's published sentinels: a ratio with a zero denominator is published as
 0, and a missing balance component counts as 0. These follow the exporter's

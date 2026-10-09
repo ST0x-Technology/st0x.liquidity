@@ -1,0 +1,59 @@
+{
+  "usdc": {
+    "operations": [],
+    "totalOperations": 2,
+    "skippedOperations": 0,
+    "stageSummary": [
+      {
+        "stage": "conversion",
+        "stats": {
+          "p50Ms": 2000,
+          "p90Ms": 2010,
+          "p95Ms": 2020,
+          "p99Ms": 2030,
+          "maxMs": 2500,
+          "sampleCount": 2
+        }
+      },
+      {
+        "stage": "attestation",
+        "stats": {
+          "p50Ms": 52000,
+          "p90Ms": 52010,
+          "p95Ms": 52020,
+          "p99Ms": 52030,
+          "maxMs": 60000,
+          "sampleCount": 2
+        }
+      }
+    ],
+    "attestationTrend": [
+      {
+        "burnedAt": "2026-02-20T08:00:00Z",
+        "durationMs": 60000
+      },
+      {
+        "burnedAt": "2026-02-27T08:00:00Z",
+        "durationMs": 45000
+      }
+    ]
+  },
+  "equity": {
+    "operations": [],
+    "totalOperations": 1,
+    "skippedOperations": 1,
+    "stageSummary": [
+      {
+        "stage": "mint_acceptance",
+        "stats": {
+          "p50Ms": 30000,
+          "p90Ms": 30010,
+          "p95Ms": 30020,
+          "p99Ms": 30030,
+          "maxMs": 30050,
+          "sampleCount": 1
+        }
+      }
+    ]
+  }
+}
