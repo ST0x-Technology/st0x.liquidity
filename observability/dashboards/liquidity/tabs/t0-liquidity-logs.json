@@ -375,20 +375,30 @@
       "id": 85,
       "type": "table",
       "title": "Log History",
-      "description": "The bot's structured log lines, re-emitted by the exporter with real severity and target (the raw container stream is all-INFO). Filter with the level/category/target/search variables above. \u26a0\ufe0f Only the newest matching entries, about the panel's pixel width of them. Narrow the filters, or use the SPA for deep digs. DEBUG/TRACE are not shipped.",
+      "description": "The bot's structured log lines: on the exporter source as the exporter re-emits them, on the bot source the bot's own JSON lines. Filter with the level/category/target/search variables above. \u26a0\ufe0f Only the newest matching entries, about the panel's pixel width of them. Narrow the filters, or use the SPA for deep digs. DEBUG/TRACE are not shown.",
       "datasource": {
         "type": "googlecloud-logging-datasource",
         "uid": "cloudlog"
       },
       "targets": [
         {
-          "refId": "A",
+          "refId": "exporter-logs",
           "datasource": {
             "type": "googlecloud-logging-datasource",
             "uid": "cloudlog"
           },
           "projectId": "$env",
           "queryText": "logName=\"projects/$env/logs/liquidity-botlogs\" labels.level=~\"^(${level:pipe})$\" labels.target=~\"${target}\" labels.target=~\"^(${category:pipe})$\" jsonPayload.message=~\"${search}\"",
+          "queryType": "logs"
+        },
+        {
+          "refId": "bot-logs",
+          "datasource": {
+            "type": "googlecloud-logging-datasource",
+            "uid": "cloudlog"
+          },
+          "projectId": "$env",
+          "queryText": "logName=\"projects/$env/logs/liquidity-bot\" jsonPayload.level=~\"^(${level:pipe})$\" jsonPayload.target=~\"${target}\" jsonPayload.target=~\"^(${category:pipe})$\" jsonPayload.message=~\"${search}\"",
           "queryType": "logs"
         }
       ],
@@ -399,6 +409,12 @@
         "y": 2
       },
       "transformations": [
+        {
+          "id": "filterByRefId",
+          "options": {
+            "include": "${source:text}-logs"
+          }
+        },
         {
           "id": "extractFields",
           "options": {

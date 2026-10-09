@@ -32,7 +32,11 @@ The liquidity boards read `liq_*` from one source at a time, picked by the
 default) or the bot's own `/metrics` (`t0-liquidity` in production,
 `t0-liquidity-staging` in staging). The generator writes `job=~"$source"` into
 every `liq_` selector and fails on one without it, because an unpinned selector
-adds both sources together. Stage 4 of the migration makes `bot` the default
+adds both sources together. The log panels (Trades, Rebalances, the detail
+dialog, Logs) follow `Source` too: the exporter's log names, or the bot's own
+log, `liquidity-bot`, which holds rows once the bot logs JSON. Each such panel
+queries both logs and keeps the picked source's frame, and the generator fails
+on one that does not. Stage 4 of the migration makes `bot` the default
 (`SOURCE_VAR` in the generator). See `docs/observability.md`, "Board source".
 
 The header row is a Business Text panel (`marcusolsson-dynamictext-panel`): its
@@ -63,10 +67,11 @@ another chain, while the default Base target is set), so it is grey on the
 Trades and Rebalances are Grafana tables too. A row's ⓘ sets the hidden `detail`
 variable to the row's id; the `detail` panel, a second Business Text panel in
 the header row's last column, then opens that row's dialog. It reads the two
-tables' results through the Dashboard datasource (so Rebalances queries as refId
-B) and runs no query of its own, so a click opens the dialog at once. The dialog
-shows the row's status history (`status-history.js`); the bot's event timeline
-joins it once the bot logs its events. Closing the dialog clears the variable.
+tables' results through the Dashboard datasource, so a click runs no new query
+and the dialog opens at once. The dialog shows the row's status history
+(`status-history.js`), or on the bot source the row's event timeline from the
+bot's `liq_event` lines (`log-lines.js`). Closing the dialog clears the
+variable.
 
 Keep the Dashboard tab's panel heights (`TRADES_H`, `TRANSFERS_H` and the
 `native_inventory` heights in the generator) unless you check a new set on a

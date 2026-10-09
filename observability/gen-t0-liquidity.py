@@ -15,8 +15,9 @@ Data comes from the exporter sidecar on the liquidity VM
 liq_* gauges, from the bot's own /metrics, as the `source` variable picks:
 
   cloudmon  liq_* gauges via Ops Agent scrape -> managed prometheus
-  cloudlog  logNames liquidity-trades / liquidity-transfers /
-            liquidity-botlogs via Cloud Logging entries.write
+  cloudlog  the exporter's logNames liquidity-trades / liquidity-transfers /
+            liquidity-botlogs (Cloud Logging entries.write), or the bot's
+            own log, liquidity-bot (its JSON stdout)
 
 Layout mirrors the SPA's tabs as rows, in tab order: header strip,
 Dashboard (inventory tables | trades over rebalances, a 13/11 split like
@@ -71,6 +72,20 @@ LIQ_PREFIX = re.compile(r"(?<![A-Za-z0-9_:])liq_")
 
 CM = {"type": "stackdriver", "uid": "cloudmon"}
 CL = {"type": "googlecloud-logging-datasource", "uid": "cloudlog"}
+
+# The log panels follow `source` too. A Cloud Logging query cannot pick its
+# log by a variable, so each panel queries both logs, as refIds
+# exporter-<name> and bot-<name>, and its first transformation keeps the
+# frame of the source picked (pick_source). check_log_sources fails on a
+# log panel that does not. The bot's log is its stdout, with every field of a
+# JSON line at jsonPayload.<field>; it holds lines only once the bot logs
+# JSON.
+SOURCES = ("exporter", "bot")
+BOT_LOG = 'logName="projects/$env/logs/liquidity-bot"'
+EXPORTER_LOGS = ("liquidity-trades", "liquidity-transfers", "liquidity-botlogs")
+# The bot writes no order lines, so Orders reads the exporter's log on
+# either source.
+EXPORTER_ONLY_LOG = "liquidity-orders"
 
 _id = [0]
 
@@ -156,6 +171,19 @@ def promql(expr, legend=None, instant=False, ref="A", step="60s"):
 def cloudlog(query, ref="A"):
     return {"refId": ref, "datasource": CL, "projectId": "$env",
             "queryText": query, "queryType": "logs"}
+
+
+def source_targets(name, exporter_query, bot_query):
+    """One log panel's two queries: the exporter's and the bot's."""
+    return [cloudlog(exporter_query, ref=f"exporter-{name}"),
+            cloudlog(bot_query, ref=f"bot-{name}")]
+
+
+def pick_source(name):
+    """Keeps only the frame of the source picked. Grafana interpolates
+    variables in transformation options, and refIds match exactly."""
+    return {"id": "filterByRefId",
+            "options": {"include": "${source:text}-" + name}}
 
 
 def stat(title, desc, expr, display=None, unit="short", decimals=None,
@@ -411,8 +439,12 @@ def cloudlog_table(title, desc, query, columns, w=12, h=9, x=0, y=0,
                    widths=None, mappings_by_field=None, time_from=None,
                    number_columns=None, time_columns=None, time_name="Time",
                    order_override=None, time_unit="time:MMM D, HH:mm:ss",
-                   hide_time=False, dedup_by=None):
+                   hide_time=False, dedup_by=None, source=None):
     """columns: list of (raw_field, display_name).
+
+    source: (name, bot_query) for a panel that follows `source`: `query`
+      is then the exporter's, and the panel keeps the picked source's frame
+      (pick_source). Without it the panel reads only `query`.
 
     number_columns: {display_name: decimals} — the payload ships decimal
       STRINGS; convertFieldType turns them numeric so decimals apply
@@ -476,10 +508,12 @@ def cloudlog_table(title, desc, query, columns, w=12, h=9, x=0, y=0,
     return {
         "id": nid(), "type": "table", "title": title, "description": desc,
         "datasource": CL,
-        "targets": [cloudlog(query)],
+        "targets": (source_targets(source[0], query, source[1]) if source
+                    else [cloudlog(query)]),
         **({"timeFrom": time_from} if time_from else {}),
         "gridPos": {"h": h, "w": w, "x": x, "y": y},
         "transformations": [
+            *([pick_source(source[0])] if source else []),
             # `labels` is a JSON object per row; extractFields lifts each
             # key into its own column, dotted names kept verbatim (it
             # only JSON-parses strings, an object goes straight to
@@ -1255,20 +1289,24 @@ def detail_panel(x, y, trades_id, transfers_id):
     refresh, and not per click: a query filtered on one id still scans the
     whole window (about 13s for 30 days), so a click only picks the id out
     of data the browser already has and the dialog opens at once. The
-    Dashboard datasource keeps each table's refId: Trades A, Rebalances B. The queries do not use
+    Dashboard datasource keeps each table's refIds, so the script picks the
+    picked source's frames by name (<source>-trades, <source>-transfers).
+    On the bot source it also reads the newest 500 liq_event lines, the
+    event timeline. The queries do not use
     `$detail`, so a click does not re-run them; the script reads `${detail}`,
     which makes Grafana redraw the panel when the variable changes.
     liquidity-panels/detail.js builds the dialog. renderMode "data" hands
     the script both frames, where "allRows" would draw a frame picker.
     MODE_LABELS (how each recovery command runs) is prepended from
     recovery-guide.json, like the header's guide, and the per-row command
-    builders from recovery-commands.js, and the status-history order from
-    status-history.js.
+    builders from recovery-commands.js, the status-history order from
+    status-history.js, and the bot-line helpers from log-lines.js.
     """
     with open(os.path.join(HERE, "liquidity-panels", "recovery-guide.json")) as f:
         mode_labels = json.load(f)["modeLabels"]
     commands = ""
-    for module in ("recovery-commands.js", "status-history.js"):
+    for module in ("recovery-commands.js", "status-history.js",
+                   "log-lines.js"):
         with open(os.path.join(HERE, "liquidity-panels", module)) as f:
             # Its export line is for the SPA test; afterRender is not a module.
             commands += "".join(line for line in f if not line.startswith("export ")) + "\n"
@@ -1288,6 +1326,10 @@ def detail_panel(x, y, trades_id, transfers_id):
             *({"refId": ref, "panelId": panel_id, "withTransforms": False,
                "datasource": {"type": "datasource", "uid": "-- Dashboard --"}}
               for ref, panel_id in (("A", trades_id), ("B", transfers_id))),
+            # Only the bot logs its events. On the exporter source the
+            # script ignores this frame.
+            cloudlog(f'{BOT_LOG} jsonPayload.target="liq_event"',
+                     ref="bot-events"),
         ],
         "transparent": True,
         "gridPos": {"h": 1, "w": 1, "x": x, "y": y},
@@ -1304,9 +1346,10 @@ def detail_panel(x, y, trades_id, transfers_id):
     }
 
 
-def latest_status_table(title, desc, log, fields, shown, w, h, x, y,
-                        body_regex=None, number_columns=None, time_columns=(),
-                        overrides=(), sort_by=None, ref="A"):
+def latest_status_table(title, desc, logs, fields, shown, w, h, x, y,
+                        body_regex=None, bot_label_regex=None,
+                        number_columns=None, time_columns=(), overrides=(),
+                        sort_by=None):
     """A Cloud Logging table with one row per entity at its latest status,
     like the SPA's Trade History and Cross-venue Transfers cards (here
     Trades and Rebalances).
@@ -1320,17 +1363,26 @@ def latest_status_table(title, desc, log, fields, shown, w, h, x, y,
     WithdrawalComplete with confirmed_at and the BridgingSubmitting after it
     with the older initiated_at, so such a row can show withdrawing. The
     detail dialog orders a bridge's statuses by its lifecycle instead.
+    The bot writes a line per transfer status change and per terminal
+    trade status (again on a venue correction), with the same field names,
+    so the same grouping applies; its line times follow commit order.
 
     The id stays as the first column, an ⓘ that opens the row's detail
     dialog (see DETAIL_URL).
 
+    logs: (name, exporter query, bot query); the panel follows `source`
+      (pick_source), and the detail panel finds its frames by refId.
     fields: {payload leaf: column name}; the entry's own timestamp is
-      always kept, as fields["timestamp"].
+      always kept, as fields["timestamp"]. A leaf only one source writes
+      (the bot's usd) is a column on that source only.
     shown: column names in display order.
     body_regex: an extra extractFields over the entry's JSON body, with
       named groups as new columns. Grafana only treats the pattern as a
       regex when it is wrapped in slashes; without them it silently
-      returns the whole body as one "NewField" column.
+      returns the whole body as one "NewField" column. The exporter's body
+      is its JSON payload; a bot line's body is its message.
+    bot_label_regex: the same columns for the bot's frame, from its labels
+      as one JSON string.
     number_columns: {column: decimals}; the payload ships decimal strings.
     time_columns: string RFC3339 columns to turn into real time fields.
     sort_by: newest-first column; defaults to the entry timestamp.
@@ -1358,9 +1410,10 @@ def latest_status_table(title, desc, log, fields, shown, w, h, x, y,
         # 500 newest entries load in about 1.5s and still leave well over
         # the SPA's 100 rows after grouping by id.
         "maxDataPoints": 500,
-        "targets": [cloudlog(log, ref=ref)],
+        "targets": source_targets(*logs),
         "gridPos": {"h": h, "w": w, "x": x, "y": y},
         "transformations": [
+            pick_source(logs[0]),
             # `labels` is a JSON object per row; extractFields lifts each
             # key into its own column, dotted names kept verbatim.
             {"id": "extractFields",
@@ -1371,6 +1424,20 @@ def latest_status_table(title, desc, log, fields, shown, w, h, x, y,
                             "regExp": f"/{body_regex}/",
                             "replace": False, "keepTime": False}}]
               if body_regex else []),
+            # The regexp extractor reads only strings, so the bot's labels
+            # become their JSON text first. `filter` applies a step to the
+            # bot's frame alone.
+            *([{"id": step, "filter": {"id": "byRefId",
+                                       "options": f"bot-{logs[0]}"},
+                "options": options}
+               for step, options in (
+                   ("convertFieldType", {"conversions": [
+                       {"targetField": "labels",
+                        "destinationType": "string"}]}),
+                   ("extractFields", {"source": "labels", "format": "regexp",
+                                      "regExp": f"/{bot_label_regex}/",
+                                      "replace": False, "keepTime": False}))]
+              if bot_label_regex else []),
             {"id": "filterFieldsByName",
              "options": {"include": {"names": list(raw) + body_columns}}},
             # convertFieldType matches Field.name, which organize's rename
@@ -1440,25 +1507,42 @@ def column(name, px, mappings=None, color_text=False):
             "properties": properties}
 
 
+TRANSFER_TYPES = "alpaca_to_base|base_to_alpaca|equity_mint|equity_redemption"
+
+
+def usd_column(px):
+    """The bot's `usd` in dollars, blank when the line has no value."""
+    return {"matcher": {"id": "byName", "options": "USD"},
+            "properties": [{"id": "custom.width", "value": px},
+                           {"id": "unit", "value": "currencyUSD"},
+                           {"id": "decimals", "value": 2}]}
+
+
 panels.append(latest_status_table(
     "Trades",
     "Direct Raindex fills, fills routed through supported adapters such as "
     "Bebop, and the corresponding Alpaca hedge trades placed to offset "
     "exposure. One row per trade at its latest status; its ⓘ "
     "opens the details. Built from the newest 500 status entries, so a "
-    "busy period can push older rows out of the 30-day window.",
-    'logName="projects/$env/logs/liquidity-trades"',
+    "busy period can push older rows out of the 30-day window. USD, "
+    "shares times the fill price, is on the bot source only. There, Last "
+    "updated is when the bot logged the terminal status, which is later "
+    "than the fill for a fill it caught up on; the dialog shows the fill "
+    "time.",
+    ("trades", 'logName="projects/$env/logs/liquidity-trades"',
+     f'{BOT_LOG} jsonPayload.target="liq_trade"'),
     # One timestamp, first: when the row last changed status.
     fields={"timestamp": "Last updated", "symbol": "Asset", "venue": "Venue",
-            "direction": "Side", "shares": "Size", "status": "Status"},
-    shown=["Last updated", "Asset", "Venue", "Side", "Size", "Status"],
+            "direction": "Side", "shares": "Size", "usd": "USD",
+            "status": "Status"},
+    shown=["Last updated", "Asset", "Venue", "Side", "Size", "USD", "Status"],
     w=11, h=TRADES_H, x=13, y=1,
-    number_columns={"Size": 3},
+    number_columns={"Size": 3, "USD": 2},
     overrides=[
         column("Last updated", 185), column("Asset", 85),
         column("Venue", 115, VENUE_MAPPINGS, color_text=True),
         column("Side", 75, SIDE_MAPPINGS, color_text=True),
-        column("Size", 100),
+        column("Size", 100), usd_column(110),
         column("Status", None, STATUS_CAP_MAPPINGS, color_text=True),
     ],
 ))
@@ -1473,33 +1557,36 @@ panels.append(latest_status_table(
     "stamps each status with the transfer's updatedAt, which is not always "
     "later than the one before (bridging starts from initiated_at). "
     "Built from the newest 500 status entries, so a busy period can push "
-    "older rows out of the 30-day window.",
-    'logName="projects/$env/logs/liquidity-transfers"',
+    "older rows out of the 30-day window. USD, an equity transfer at its "
+    "mark when the status changed or a bridge's amount, is on the bot "
+    "source only.",
+    ("transfers", 'logName="projects/$env/logs/liquidity-transfers"',
+     f'{BOT_LOG} jsonPayload.target="liq_transfer"'),
     # One timestamp, first: when the row last changed status. The start
     # time is in the row's detail dialog.
     fields={"timestamp": "Last updated", "symbol": "Asset",
-            "amount": "Amount", "status": "Status"},
-    shown=["Last updated", "Type", "Asset", "Amount", "Status"],
+            "amount": "Amount", "usd": "USD", "status": "Status"},
+    shown=["Last updated", "Type", "Asset", "Amount", "USD", "Status"],
     # Type reads the direction for a USDC bridge and the kind for an equity
     # transfer, like the SPA's transferTypeLabel. A bridge's kind is
     # usdc_bridge and an equity transfer's direction is "", so each row can
-    # match only one alternative, whatever the body's key order.
-    body_regex='"(?:direction|kind)":"(?<Type>alpaca_to_base|base_to_alpaca'
-               '|equity_mint|equity_redemption)"',
+    # match only one alternative, whatever the key order.
+    body_regex='"(?:direction|kind)":"(?<Type>' + TRANSFER_TYPES + ')"',
+    # The same in the bot's labels. Their JSON text escapes the quotes if
+    # the plugin ships them as a string, hence the optional backslashes.
+    bot_label_regex=(r'"jsonPayload\.(?:direction|kind)\\?":\\?"(?<Type>'
+                     + TRANSFER_TYPES + ')'),
     w=11, h=TRANSFERS_H, x=13, y=1 + TRADES_H,
-    number_columns={"Amount": 3},
+    number_columns={"Amount": 3, "USD": 2},
     overrides=[
         column("Last updated", 185), column("Type", 165, TYPE_MAPPINGS),
         # A USDC bridge carries no symbol; the SPA's Asset column reads
         # "USDC" for it.
         column("Asset", 80, [{"type": "special", "options": {
             "match": "empty", "result": {"text": "USDC", "index": 0}}}]),
-        column("Amount", 115),
+        column("Amount", 115), usd_column(110),
         column("Status", None, STATUS_DOT_MAPPINGS, color_text=True),
     ],
-    # B, not A: the detail panel reads both tables through the Dashboard
-    # datasource, which keeps each table's refId.
-    ref="B",
 ))
 panels.append(detail_panel(
     x=23, y=0,
@@ -2088,20 +2175,28 @@ panels = []
 panels += pills(0)
 panels.append(cloudlog_table(
     "Log History",
-    "The bot's structured log lines, re-emitted by the exporter with real "
-    "severity and target (the raw container stream is all-INFO). Filter "
-    "with the level/category/target/search variables above. ⚠️ Only the "
-    "newest matching entries, about the panel's pixel width of them. "
-    "Narrow the filters, or use the SPA for deep digs. DEBUG/TRACE are "
-    "not shipped.",
+    "The bot's structured log lines: on the exporter source as the "
+    "exporter re-emits them, on the bot source the bot's own JSON lines. "
+    "Filter with the level/category/target/search variables above. ⚠️ "
+    "Only the newest matching entries, about the panel's pixel width of "
+    "them. Narrow the filters, or use the SPA for deep digs. DEBUG/TRACE "
+    "are not shown.",
     'logName="projects/$env/logs/liquidity-botlogs" '
     'labels.level=~"^(${level:pipe})$" labels.target=~"${target}" '
     'labels.target=~"^(${category:pipe})$" '
     'jsonPayload.message=~"${search}"',
     # The message is the log-lines frame's `body`; level/target are
-    # leaves in `labels` like every other payload field.
+    # leaves in `labels` like every other payload field. The bot's lines
+    # have the same names, so one set of columns serves both sources.
     columns=[("jsonPayload.level", "Level"), ("jsonPayload.target", "Target"),
              ("body", "Message")],
+    # The level filter also keeps out the bot's DEBUG and TRACE lines,
+    # which its stdout holds and the exporter never shipped.
+    source=("logs",
+            f'{BOT_LOG} jsonPayload.level=~"^(${{level:pipe}})$" '
+            'jsonPayload.target=~"${target}" '
+            'jsonPayload.target=~"^(${category:pipe})$" '
+            'jsonPayload.message=~"${search}"'),
     w=24, h=19, x=0, y=2,
     widths={"Time": 170, "Level": 70, "Target": 220},
     mappings_by_field={"Level": [
@@ -2238,6 +2333,57 @@ def check_liq_pinned(boards):
             f"{LIQ_JOB_MATCHER}")
 
 
+def board_panels(node):
+    """Every panel in a board, rows' collapsed panels included."""
+    for panel in node.get("panels", []):
+        yield panel
+        yield from board_panels(panel)
+
+
+def log_source_problems(panel):
+    """Why a panel's Cloud Logging queries do not follow `source`, if they
+    do not. Allowed: a pair exporter-<name> and bot-<name> under
+    pick_source(<name>); the detail script's bot-events, which it reads on
+    the bot source only; and the exporter-only Orders log."""
+    targets = [target for target in panel.get("targets", [])
+               if target.get("datasource", panel.get("datasource")) == CL]
+    names = {}
+    problems = []
+    for target in targets:
+        source, _, name = target.get("refId", "").partition("-")
+        query = target.get("queryText", "")
+        if source not in SOURCES:
+            if f"logs/{EXPORTER_ONLY_LOG}" not in query:
+                problems.append(f"refId {target.get('refId')} is not "
+                                "exporter-<name> or bot-<name>")
+            continue
+        names.setdefault(name, set()).add(source)
+        reads_bot = query.startswith(BOT_LOG)
+        reads_exporter = any(f"logs/{log}\"" in query
+                             for log in EXPORTER_LOGS)
+        if (source == "bot") != reads_bot or (source == "bot") == reads_exporter:
+            problems.append(f"{target['refId']} reads the wrong log: {query}")
+    for name, sources in names.items():
+        if sources == set(SOURCES):
+            if (panel.get("transformations") or [None])[0] != pick_source(name):
+                problems.append(f"{name} does not start with pick_source")
+        elif not (sources == {"bot"} and name == "events"
+                  and panel["type"] == "marcusolsson-dynamictext-panel"):
+            problems.append(f"{name} has only {sorted(sources)}")
+    return problems
+
+
+def check_log_sources(boards):
+    failures = [(board["uid"], panel.get("title"), problem)
+                for board in boards
+                for panel in board_panels(board)
+                for problem in log_source_problems(panel)]
+    for uid, title, problem in failures:
+        print(f"{uid}: panel {title!r}: {problem}", file=sys.stderr)
+    if failures:
+        raise SystemExit(f"{len(failures)} log queries do not follow source")
+
+
 def board_path(root, board):
     # A board's directory IS its Grafana folder (the provider builds folders
     # from the directory tree). The main board sits in dashboards/liquidity/,
@@ -2320,6 +2466,7 @@ def check_bar_cells():
 
 check_bar_cells()
 check_liq_pinned(dashboards)
+check_log_sources(dashboards)
 if sys.argv[1:] == ["--check"]:
     check_committed(dashboards)
 elif sys.argv[1:]:
