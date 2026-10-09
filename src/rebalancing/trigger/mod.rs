@@ -8770,8 +8770,9 @@ impl RebalancingService {
                         tokenization_request_id,
                         stage,
                         last_progress_at,
-                        // Only an accepted mint can still fail, and its inflight
-                        // is restored below as its own, so the failure cancels it.
+                        // An accepted mint's inflight is restored below as its
+                        // own, so a later failure cancels it; a requested mint
+                        // started nothing.
                         hedging_start: match stage {
                             MintTrackingStage::Requested => HedgingStart::NotStarted,
                             MintTrackingStage::Accepted

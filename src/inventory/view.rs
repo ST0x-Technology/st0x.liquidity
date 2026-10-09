@@ -2179,7 +2179,8 @@ impl InventoryView {
     /// state. The poll never writes an active mint's Hedging inflight, and the
     /// mint debits Hedging available on `MintAccepted`, so that symbol keeps
     /// its whole Hedging balance and watermark: no poll restores the
-    /// inflight, and a dropped balance would fail the mint's own `Start`.
+    /// inflight, and a dropped balance would fail the mint's own `Start`. A
+    /// forced broker snapshot applied after the reset still overwrites it.
     /// Every other field is intentionally defaulted, which is why this uses
     /// functional-update syntax rather than an exhaustive literal: a future
     /// field should default here unless it is guard state.

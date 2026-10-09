@@ -6393,7 +6393,8 @@ transfer dispatch. It does not calculate cross-venue inventory imbalances.
     inflight. The poll still records the symbol, so recovering another chain's
     failed provider snapshot carries its broker balance. A snapshot-error reset
     keeps the active mints and redemptions and each active mint's whole Hedging
-    balance: they come from aggregate events, and no poll would restore them
+    balance: they come from aggregate events, and no poll would restore them. A
+    forced broker snapshot applied by that recovery still overwrites the balance
   - **Ownership**: determined by active rebalancing aggregate IDs --
     `issuer_request_id` / `tokenization_request_id` for mints,
     `tokenization_request_id` / `redemption_tx` for redemptions -- not by
