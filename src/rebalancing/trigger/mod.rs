@@ -3837,10 +3837,10 @@ impl RebalancingService {
         };
 
         // The recovery reset below drops inflight state that the reconcile
-        // arms revalidate, so a forced
-        // retry would pass vacuously against empty state. Drop the event
-        // instead: the poller's read-back keeps the gate and counter, and
-        // the next quiet poll re-escalates with a fresh reading.
+        // arms revalidate, so a forced retry would pass vacuously against
+        // empty state. Drop the event instead: the poller's read-back keeps
+        // the gate and counter, and the next quiet poll re-escalates with a
+        // fresh reading.
         if matches!(
             &event,
             OnchainEquityReconciled { .. } | OnchainUsdcReconciled { .. }
@@ -17702,9 +17702,10 @@ mod tests {
             .await
             .unwrap();
 
-        let accepted = harness
+        harness
             .receive::<TokenizedEquityMint>(id.clone(), make_mint_accepted())
-            .await;
+            .await
+            .unwrap();
 
         harness
             .receive::<TokenizedEquityMint>(id.clone(), make_mint_acceptance_failed())
@@ -17729,7 +17730,6 @@ mod tests {
             Vec::<Symbol>::new(),
             "A mint that started and cancelled its own shares leaves nothing to reconcile"
         );
-        accepted.unwrap();
     }
 
     #[tokio::test]

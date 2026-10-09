@@ -2176,14 +2176,13 @@ impl InventoryView {
     /// uninitialized (they are not delta-owned and nothing blocks their
     /// repopulation). The active mints and redemptions come from their
     /// aggregates' events, not from snapshots, so they survive like the guard
-    /// state. An active mint is the only writer of its symbol's Hedging
-    /// inflight and debits Hedging available on `MintAccepted`, so that
-    /// symbol keeps its whole Hedging balance and watermark: no poll restores
-    /// the inflight, and a dropped balance would fail the mint's own `Start`.
-    /// Every other field is intentionally
-    /// defaulted, which is why this uses functional-update syntax rather than
-    /// an exhaustive literal: a future field should default here unless it is
-    /// guard state.
+    /// state. The poll never writes an active mint's Hedging inflight, and the
+    /// mint debits Hedging available on `MintAccepted`, so that symbol keeps
+    /// its whole Hedging balance and watermark: no poll restores the
+    /// inflight, and a dropped balance would fail the mint's own `Start`.
+    /// Every other field is intentionally defaulted, which is why this uses
+    /// functional-update syntax rather than an exhaustive literal: a future
+    /// field should default here unless it is guard state.
     pub(crate) fn reset_preserving_offchain_order_state(&self) -> Self {
         let mut equities: HashMap<Symbol, Inventory<FractionalShares>> = self
             .equities
@@ -6577,6 +6576,55 @@ mod tests {
             Some(shares(100)),
             "a snapshot predating the preserved applied-fill time must still \
              be rejected after the reset — the preserved balance stays"
+        );
+    }
+
+    #[test]
+    fn reset_keeps_active_transfers_and_the_active_mint_hedging_watermark() {
+        let aapl = Symbol::new("AAPL").unwrap();
+        let tsla = Symbol::new("TSLA").unwrap();
+        let fetched_at = Utc::now();
+        let mint_id = IssuerRequestId::generate();
+        let redemption_id = RedemptionAggregateId::generate();
+
+        let view = InventoryView::default()
+            .with_equity(aapl.clone(), shares(20), shares(80))
+            .with_equity(tsla.clone(), shares(10), shares(50))
+            .apply_snapshot_event(
+                &InventorySnapshotEvent::OffchainEquity {
+                    positions: BTreeMap::from([(aapl.clone(), shares(100))]),
+                    fetched_at,
+                },
+                fetched_at,
+            )
+            .unwrap()
+            .set_active_mint(aapl.clone(), Chain::Base, mint_id.clone())
+            .set_active_redemption(tsla.clone(), Chain::Base, redemption_id.clone());
+
+        let reset = view.reset_preserving_offchain_order_state();
+
+        assert_eq!(reset.active_mint(&aapl), Some(&mint_id));
+        assert_eq!(reset.active_redemption(&tsla), Some(&redemption_id));
+        assert_eq!(
+            reset.equity_available(&aapl, Venue::Hedging),
+            Some(shares(100)),
+            "the active mint's Hedging balance must survive the reset"
+        );
+
+        let stale = reset
+            .apply_snapshot_event(
+                &InventorySnapshotEvent::OffchainEquity {
+                    positions: BTreeMap::from([(aapl.clone(), shares(50))]),
+                    fetched_at: fetched_at - Duration::seconds(1),
+                },
+                fetched_at,
+            )
+            .unwrap();
+        assert_eq!(
+            stale.equity_available(&aapl, Venue::Hedging),
+            Some(shares(100)),
+            "a broker snapshot older than the kept watermark must not overwrite \
+             the balance the mint will debit"
         );
     }
 
