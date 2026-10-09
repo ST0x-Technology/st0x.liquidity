@@ -12,6 +12,7 @@ use rain_math_float::Float;
 use tracing::warn;
 
 use st0x_config::{BrokerCtx, Ctx, ExecutionThreshold, OperationMode};
+use st0x_evm::Chain;
 use st0x_finance::{Positive, Symbol};
 
 use super::{
@@ -49,6 +50,7 @@ pub(crate) struct SettingsInput {
     usdc_target: Option<Float>,
     usdc_deviation: Option<Float>,
     cash_reserved: Option<Float>,
+    usdc_corridors: Vec<CorridorInput>,
     /// `None` for a share-count threshold: the series is dollars only.
     execution_threshold_usd: Option<Float>,
     assets: Vec<AssetInput>,
@@ -60,6 +62,15 @@ pub(crate) struct SettingsInput {
     broker: &'static str,
     order_polling_seconds: u64,
     inventory_poll_seconds: u64,
+}
+
+/// One `[rebalancing.usdc.corridors.<chain>]` band, listed whatever the USDC
+/// mode: disabling the mode stops new transfers, not the tables.
+#[derive(Debug)]
+struct CorridorInput {
+    chain: Chain,
+    target: Float,
+    deviation: Float,
 }
 
 #[derive(Debug)]
@@ -139,6 +150,15 @@ impl SettingsInput {
             usdc_target: usdc_band.map(|band| band.target),
             usdc_deviation: usdc_band.map(|band| band.deviation),
             cash_reserved: cash_reserved(ctx),
+            usdc_corridors: rebalancing
+                .usdc
+                .configured()
+                .map(|usdc| CorridorInput {
+                    chain: usdc.corridor.chain(),
+                    target: usdc.threshold.target,
+                    deviation: usdc.threshold.deviation,
+                })
+                .collect(),
             execution_threshold_usd,
             assets,
             wallet: ctx.wallet_meta.as_ref().map(|meta| WalletInput {
@@ -235,6 +255,22 @@ pub(crate) fn settings_samples(input: &SettingsInput) -> Vec<LiqSample> {
         push_sample(&mut samples, metric, vec![], integer_value(value));
     }
 
+    for corridor in &input.usdc_corridors {
+        let labels = vec![("chain", corridor.chain.as_str().to_string())];
+        push_sample(
+            &mut samples,
+            LiqMetric::UsdcCorridorTarget,
+            labels.clone(),
+            float_value(corridor.target),
+        );
+        push_sample(
+            &mut samples,
+            LiqMetric::UsdcCorridorDeviation,
+            labels,
+            float_value(corridor.deviation),
+        );
+    }
+
     for asset in &input.assets {
         asset_samples(&mut samples, asset);
     }
@@ -313,10 +349,13 @@ mod tests {
     use alloy::primitives::address;
     use serde_json::Value;
 
+    use st0x_bridge::corridor::{HopKind, UsdcCorridor};
     use st0x_config::{
-        ChainEquityAsset, EquityHedgePolicy, RebalancingMode, create_test_ctx_with_order_owner,
+        ChainEquityAsset, EquityHedgePolicy, ImbalanceThreshold, RebalancingMode, UsdcCorridorCtx,
+        UsdcCorridors, create_test_ctx_with_order_owner,
     };
     use st0x_finance::Usd;
+    use st0x_float_macro::float;
 
     use super::*;
     use crate::dashboard::settings_from_ctx;
@@ -334,6 +373,8 @@ mod tests {
             usdc_target: settings.usdc_target.map(decimal),
             usdc_deviation: settings.usdc_deviation.map(decimal),
             cash_reserved: settings.cash_reserved.map(Usd::inner),
+            // The dashboard settings carry one band, not each corridor's.
+            usdc_corridors: Vec::new(),
             execution_threshold_usd: Float::parse(
                 settings
                     .execution_threshold
@@ -718,10 +759,14 @@ mod tests {
         }
         assert!(ctx.rebalancing.allocation.targets.contains_key(&primary));
 
-        let from_ctx = render(
+        // The dashboard settings carry one USDC band, not each corridor's.
+        let from_ctx: BTreeMap<SeriesKey, f64> = render(
             settings_samples(&SettingsInput::from_ctx(&ctx)),
             LiqFamily::Settings,
-        );
+        )
+        .into_iter()
+        .filter(|((name, _), _)| !name.starts_with("liq_usdc_corridor_"))
+        .collect();
         let from_dashboard = render(
             settings_samples(&input_from_dto(&settings_from_ctx(&ctx))),
             LiqFamily::Settings,
@@ -735,6 +780,111 @@ mod tests {
         assert_eq!(
             from_ctx.get(&series("liq_asset_counter_trading", &[("symbol", "AAPL")])),
             Some(&0.0)
+        );
+    }
+
+    fn corridor(chain: Chain, hop: HopKind, target: Float, deviation: Float) -> UsdcCorridorCtx {
+        UsdcCorridorCtx {
+            corridor: UsdcCorridor::HubRouted { chain, hop },
+            threshold: ImbalanceThreshold { target, deviation },
+        }
+    }
+
+    fn corridor_series(ctx: &Ctx) -> BTreeMap<SeriesKey, f64> {
+        render(
+            settings_samples(&SettingsInput::from_ctx(ctx)),
+            LiqFamily::Settings,
+        )
+        .into_iter()
+        .filter(|((name, _), _)| name.starts_with("liq_usdc_corridor_"))
+        .collect()
+    }
+
+    /// Each corridor table gets its own band, labelled by chain, while the
+    /// single USDC band stays the primary chain's.
+    #[test]
+    fn every_usdc_corridor_band_is_published_by_chain() {
+        let mut ctx = create_test_ctx_with_order_owner(address!(
+            "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        ));
+        assert_eq!(ctx.chains.primary().chain, Chain::Base);
+        ctx.rebalancing.usdc = UsdcCorridors::for_test(
+            OperationMode::Enabled,
+            [
+                corridor(Chain::HyperEvm, HopKind::Relay, float!(0.25), float!(0.125)),
+                corridor(Chain::Base, HopKind::Cctp, float!(0.5), float!(0.3)),
+            ],
+        );
+
+        assert_eq!(
+            corridor_series(&ctx),
+            BTreeMap::from([
+                (
+                    series("liq_usdc_corridor_target", &[("chain", "base")]),
+                    0.5
+                ),
+                (
+                    series("liq_usdc_corridor_deviation", &[("chain", "base")]),
+                    0.3
+                ),
+                (
+                    series("liq_usdc_corridor_target", &[("chain", "hyperevm")]),
+                    0.25
+                ),
+                (
+                    series("liq_usdc_corridor_deviation", &[("chain", "hyperevm")]),
+                    0.125
+                ),
+            ])
+        );
+        let rendered = render(
+            settings_samples(&SettingsInput::from_ctx(&ctx)),
+            LiqFamily::Settings,
+        );
+        assert_eq!(
+            rendered.get(&series("liq_settings_usdc_target", &[])),
+            Some(&0.5)
+        );
+    }
+
+    /// USDC mode disabled stops new transfers, not the corridor tables: their
+    /// bands are still published, while the single USDC band is absent.
+    #[test]
+    fn usdc_corridor_bands_are_published_while_usdc_mode_is_disabled() {
+        let mut ctx = create_test_ctx_with_order_owner(address!(
+            "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        ));
+        ctx.rebalancing.usdc = UsdcCorridors::for_test(
+            OperationMode::Disabled,
+            [corridor(
+                Chain::Base,
+                HopKind::Cctp,
+                float!(0.5),
+                float!(0.3),
+            )],
+        );
+
+        assert_eq!(
+            corridor_series(&ctx),
+            BTreeMap::from([
+                (
+                    series("liq_usdc_corridor_target", &[("chain", "base")]),
+                    0.5
+                ),
+                (
+                    series("liq_usdc_corridor_deviation", &[("chain", "base")]),
+                    0.3
+                ),
+            ])
+        );
+        let rendered = render(
+            settings_samples(&SettingsInput::from_ctx(&ctx)),
+            LiqFamily::Settings,
+        );
+        assert_eq!(rendered.get(&series("liq_settings_usdc_target", &[])), None);
+        assert_eq!(
+            rendered.get(&series("liq_settings_usdc_deviation", &[])),
+            None
         );
     }
 
