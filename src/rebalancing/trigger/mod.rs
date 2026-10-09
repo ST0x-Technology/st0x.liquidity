@@ -508,6 +508,16 @@ fn stale_snapshot_age(fetched_at: Option<DateTime<Utc>>, bound: Duration) -> Opt
     )
 }
 
+/// Whether this process moved a mint's shares from Hedging available into
+/// Hedging inflight. Inflight the provider poll wrote before the mint became
+/// active is not the mint's own, so only a started mint cancels its shares
+/// back to available.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HedgingStart {
+    NotStarted,
+    Started,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MintTrackingStage {
     Requested,
@@ -541,6 +551,7 @@ struct MintTracking {
     tokenization_request_id: Option<TokenizationRequestId>,
     stage: MintTrackingStage,
     last_progress_at: DateTime<Utc>,
+    hedging_start: HedgingStart,
 }
 
 impl MintTracking {
@@ -563,6 +574,7 @@ impl MintTracking {
             tokenization_request_id: None,
             stage: MintTrackingStage::Requested,
             last_progress_at: *requested_at,
+            hedging_start: HedgingStart::NotStarted,
         })
     }
 
@@ -5309,7 +5321,7 @@ impl RebalancingService {
     fn mint_inventory_update(
         event: &TokenizedEquityMintEvent,
         quantity: FractionalShares,
-        stage: MintTrackingStage,
+        hedging_start: HedgingStart,
     ) -> Option<EquityInventoryUpdate> {
         use TokenizedEquityMintEvent::*;
 
@@ -5317,27 +5329,20 @@ impl RebalancingService {
             MintAccepted { .. } => {
                 Some(Self::start_equity_transfer_update(Venue::Hedging, quantity))
             }
-            // Cancel the Hedging inflight that `MintAccepted` started -- but ONLY
-            // if acceptance actually happened. The operator force-fail from
-            // `MintRequested` (RAI-999) emits this same event PRE-acceptance,
-            // where no inflight was ever started; cancelling there would be an
-            // unmatched Cancel. Gating on the tracking stage makes this honour
-            // SPEC's "no balance change for a pre-acceptance force-fail" rule by
-            // construction -- independent of process topology (the CLI's
-            // separate-process write also keeps it off this reactor today, but
-            // this guard is what keeps it correct if `transfer fail` is ever
-            // routed through the running bot). `track_mint_progress` does not
-            // advance the stage on `MintAcceptanceFailed`, so the stage here is
-            // `Requested` for a pre-acceptance fail and `Accepted` otherwise.
-            MintAcceptanceFailed { .. } => match stage {
-                MintTrackingStage::Requested => None,
-                MintTrackingStage::Accepted
-                | MintTrackingStage::TokensReceived
-                | MintTrackingStage::WrapSubmitted
-                | MintTrackingStage::TokensWrapped
-                | MintTrackingStage::VaultDepositSubmitted => Some(
-                    Self::cancel_equity_transfer_update(Venue::Hedging, quantity),
-                ),
+            // Cancel only the Hedging inflight this mint's own `Start` moved.
+            // A pre-acceptance operator force-fail (RAI-999) started nothing, so
+            // a Cancel there would be unmatched; SPEC's "no balance change for a
+            // pre-acceptance force-fail" holds by construction. A `Start` that
+            // failed also moved nothing: any inflight on the symbol was written
+            // by a poll before the mint became active, and crediting it would
+            // invent broker shares. The terminal residual clear zeroes it and
+            // forces a reconcile instead.
+            MintAcceptanceFailed { .. } => match hedging_start {
+                HedgingStart::NotStarted => None,
+                HedgingStart::Started => Some(Self::cancel_equity_transfer_update(
+                    Venue::Hedging,
+                    quantity,
+                )),
             },
             // TokensReceived completes the normal mint; ProviderCompletionRecovered
             // completes a recovered one. rebuild_mint_tracking_for_recovery restores
@@ -5509,10 +5514,11 @@ impl RebalancingService {
     }
 
     /// Hedging inflight holds only mint shares, and a symbol has one mint at a
-    /// time, so a residual after its terminal event is this mint counted twice.
-    /// The poll skips an active mint's symbol and a snapshot-error reset keeps
-    /// the active mint and its Hedging balance, so this is a guard: zero the
-    /// residual and force an offchain reconcile.
+    /// time. The poll skips an active mint's symbol and a snapshot-error reset
+    /// keeps the active mint, so a residual after its terminal event is poll
+    /// inflight written before the mint became active (a restart replaying a
+    /// persisted poll, or a provider still listing the previous mint). Zero it
+    /// and force an offchain reconcile.
     async fn clear_residual_hedging_inflight(
         &self,
         id: &IssuerRequestId,
@@ -8764,6 +8770,16 @@ impl RebalancingService {
                         tokenization_request_id,
                         stage,
                         last_progress_at,
+                        // An accepted mint's inflight is restored below as its
+                        // own, so a later failure cancels it.
+                        hedging_start: match stage {
+                            MintTrackingStage::Requested => HedgingStart::NotStarted,
+                            MintTrackingStage::Accepted
+                            | MintTrackingStage::TokensReceived
+                            | MintTrackingStage::WrapSubmitted
+                            | MintTrackingStage::TokensWrapped
+                            | MintTrackingStage::VaultDepositSubmitted => HedgingStart::Started,
+                        },
                     },
                 );
 
@@ -8992,6 +9008,7 @@ impl RebalancingService {
                 tokenization_request_id: Some(tokenization_request_id),
                 stage: MintTrackingStage::Accepted,
                 last_progress_at: Utc::now(),
+                hedging_start: HedgingStart::Started,
             },
         );
         Ok(match recovery_guard {
@@ -9518,7 +9535,7 @@ impl RebalancingService {
         let symbol = tracking.symbol;
 
         let settlement =
-            match Self::mint_inventory_update(&event, tracking.quantity, tracking.stage) {
+            match Self::mint_inventory_update(&event, tracking.quantity, tracking.hedging_start) {
                 Some(update) => {
                     self.apply_equity_update_or_defer(
                         &symbol,
@@ -9530,6 +9547,13 @@ impl RebalancingService {
                 }
                 None => EquitySettlementOutcome::Reconciled,
             };
+
+        // Reached only when the `Start` above succeeded; a failed one returned.
+        if let TokenizedEquityMintEvent::MintAccepted { .. } = event
+            && let Some(tracking) = self.mint_tracking.write().await.get_mut(&id)
+        {
+            tracking.hedging_start = HedgingStart::Started;
+        }
 
         // Defense-in-depth: a recovered mint must clear its Hedging in-flight via
         // the completion above. A residual in-flight means recovery double-counted
@@ -10136,55 +10160,42 @@ mod tests {
     }
 
     #[test]
-    fn mint_inventory_update_skips_cancel_for_pre_acceptance_fail() {
-        // RAI-999: a pre-acceptance force-fail (tracking stage still Requested)
-        // started no Hedging inflight, so it must produce NO inventory update --
-        // a Cancel there would be unmatched. (The post-acceptance Cancel path is
-        // covered end-to-end by `recover_mint_clears_hedging_inflight`.)
+    fn mint_inventory_update_skips_cancel_for_unstarted_mint() {
+        // A pre-acceptance force-fail (RAI-999) or a failed `Start` moved no
+        // shares into Hedging inflight, so a Cancel there would be unmatched or
+        // would credit poll inflight as broker shares.
         let event = TokenizedEquityMintEvent::MintAcceptanceFailed {
             reason: "operator force-fail".to_string(),
             failed_at: Utc::now(),
         };
         let quantity = FractionalShares::new(float!(10));
 
-        let update = RebalancingService::mint_inventory_update(
-            &event,
-            quantity,
-            MintTrackingStage::Requested,
-        );
+        let update =
+            RebalancingService::mint_inventory_update(&event, quantity, HedgingStart::NotStarted);
         assert!(
             update.is_none(),
-            "pre-acceptance MintAcceptanceFailed must not produce an inventory update"
+            "an unstarted MintAcceptanceFailed must not produce an inventory update"
         );
     }
 
     #[test]
-    fn mint_inventory_update_cancels_for_post_acceptance_fail() {
-        // Once acceptance happened `MintAccepted` started a Hedging inflight, so
-        // every later `MintAcceptanceFailed` (operator force-fail or poll-driven)
-        // MUST cancel it. This pins the cancel arms in place: the pre-acceptance
-        // skip test alone would still pass if they were collapsed to `None`. The
-        // end-to-end cancel effect lives in `recover_mint_clears_hedging_inflight`
-        // (a distant file); this guards the match wiring locally.
+    fn mint_inventory_update_cancels_for_started_mint() {
+        // Once `MintAccepted` started a Hedging inflight, a later
+        // `MintAcceptanceFailed` MUST cancel it. This pins the cancel arm: the
+        // unstarted skip test alone would still pass if it collapsed to `None`.
+        // The end-to-end cancel effect lives in `recover_mint_clears_hedging_inflight`.
         let event = TokenizedEquityMintEvent::MintAcceptanceFailed {
             reason: "operator force-fail".to_string(),
             failed_at: Utc::now(),
         };
         let quantity = FractionalShares::new(float!(10));
 
-        for stage in [
-            MintTrackingStage::Accepted,
-            MintTrackingStage::TokensReceived,
-            MintTrackingStage::WrapSubmitted,
-            MintTrackingStage::TokensWrapped,
-            MintTrackingStage::VaultDepositSubmitted,
-        ] {
-            let update = RebalancingService::mint_inventory_update(&event, quantity, stage);
-            assert!(
-                update.is_some(),
-                "post-acceptance MintAcceptanceFailed (stage {stage}) must cancel the Hedging inflight"
-            );
-        }
+        let update =
+            RebalancingService::mint_inventory_update(&event, quantity, HedgingStart::Started);
+        assert!(
+            update.is_some(),
+            "a started MintAcceptanceFailed must cancel the Hedging inflight"
+        );
     }
 
     fn test_config() -> RebalancingServiceConfig {
@@ -11833,6 +11844,7 @@ mod tests {
                 tokenization_request_id: Some(tok.clone()),
                 stage: MintTrackingStage::Accepted,
                 last_progress_at: Utc::now(),
+                hedging_start: HedgingStart::Started,
             },
         );
         let failed = TokenizedEquityMint::Failed {
@@ -36547,6 +36559,7 @@ mod tests {
                 tokenization_request_id: None,
                 stage: MintTrackingStage::Accepted,
                 last_progress_at: now - ChronoDuration::minutes(5),
+                hedging_start: HedgingStart::Started,
             },
         );
 
@@ -36608,6 +36621,7 @@ mod tests {
                 tokenization_request_id: None,
                 stage: MintTrackingStage::TokensReceived,
                 last_progress_at: now - ChronoDuration::minutes(5),
+                hedging_start: HedgingStart::Started,
             },
         );
 
@@ -36673,6 +36687,7 @@ mod tests {
                 tokenization_request_id: None,
                 stage: MintTrackingStage::Accepted,
                 last_progress_at: now - ChronoDuration::minutes(5),
+                hedging_start: HedgingStart::Started,
             },
         );
 
@@ -36750,6 +36765,7 @@ mod tests {
                 tokenization_request_id: None,
                 stage: MintTrackingStage::Accepted,
                 last_progress_at: now - ChronoDuration::minutes(5),
+                hedging_start: HedgingStart::Started,
             },
         );
 
@@ -37738,6 +37754,7 @@ mod tests {
                 tokenization_request_id: None,
                 stage: MintTrackingStage::Accepted,
                 last_progress_at: fetched_at - ChronoDuration::minutes(5),
+                hedging_start: HedgingStart::Started,
             },
         );
 
@@ -41652,6 +41669,7 @@ mod tests {
                 tokenization_request_id: None,
                 stage: MintTrackingStage::Requested,
                 last_progress_at: Utc::now(),
+                hedging_start: HedgingStart::NotStarted,
             },
         );
         let cooldown =
@@ -42373,6 +42391,7 @@ mod tests {
                     tokenization_request_id: None,
                     stage: MintTrackingStage::TokensReceived,
                     last_progress_at: now - ChronoDuration::hours(2),
+                    hedging_start: HedgingStart::Started,
                 },
             );
 
@@ -42443,6 +42462,7 @@ mod tests {
                 tokenization_request_id: None,
                 stage: MintTrackingStage::Requested,
                 last_progress_at: now - ChronoDuration::hours(2),
+                hedging_start: HedgingStart::NotStarted,
             },
         );
         trigger.equity_in_progress.write().unwrap().insert(
@@ -42520,6 +42540,7 @@ mod tests {
                 tokenization_request_id: None,
                 stage: MintTrackingStage::Requested,
                 last_progress_at: now - ChronoDuration::hours(2),
+                hedging_start: HedgingStart::NotStarted,
             },
         );
         trigger.equity_in_progress.write().unwrap().insert(
@@ -42781,6 +42802,7 @@ mod tests {
                 tokenization_request_id: None,
                 stage: MintTrackingStage::Accepted,
                 last_progress_at: Utc::now(),
+                hedging_start: HedgingStart::Started,
             },
         );
 
@@ -42844,6 +42866,7 @@ mod tests {
                 tokenization_request_id: None,
                 stage: MintTrackingStage::Accepted,
                 last_progress_at: Utc::now(),
+                hedging_start: HedgingStart::Started,
             },
         );
 
@@ -42907,6 +42930,7 @@ mod tests {
                 tokenization_request_id: None,
                 stage: MintTrackingStage::Accepted,
                 last_progress_at: Utc::now(),
+                hedging_start: HedgingStart::Started,
             },
         );
 
@@ -43290,6 +43314,7 @@ mod tests {
                 tokenization_request_id: None,
                 stage: MintTrackingStage::Accepted,
                 last_progress_at: Utc::now(),
+                hedging_start: HedgingStart::Started,
             },
         );
         {

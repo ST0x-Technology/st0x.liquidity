@@ -6279,17 +6279,20 @@ transfer dispatch. It does not calculate cross-venue inventory imbalances.
   await retry or manual recovery)
 - `TokenizedEquityMintEvent::MintRejected` - No balance change (rejected before
   shares left Alpaca)
-- `TokenizedEquityMintEvent::MintAcceptanceFailed` - When emitted after
-  `MintAccepted`, reconciles the started inflight back to Alpaca available. When
-  emitted by an operator force-fail from `MintRequested` (pre-acceptance), no
-  inflight was ever started, so there is no balance change
+- `TokenizedEquityMintEvent::MintAcceptanceFailed` - When `MintAccepted` started
+  the mint's inflight, reconciles it back to Alpaca available. When emitted by
+  an operator force-fail from `MintRequested` (pre-acceptance), or when
+  `MintAccepted` failed to start the inflight, the mint moved no shares, so
+  there is no balance change
 - Every terminal mint event (`DepositedIntoRaindex`, `MintRejected`,
   `MintAcceptanceFailed`, `RaindexDepositFailed`, `WrappingFailed`,
   `OperatorReconciled`) also zeroes any Hedging inflight still left on the
   symbol and, when it zeroes a non-zero amount, forces an offchain equity
   reconcile. Hedging inflight holds only mint shares, and a symbol has one mint
-  at a time, so a residual there is the finished mint counted twice. No known
-  path leaves one; this is a guard
+  at a time, so a residual there is inflight a provider poll wrote before the
+  mint became active (a restart replaying a persisted poll, or a provider still
+  listing the previous mint), counted on top of the mint's own or never started
+  by it
 - `EquityRedemptionEvent::WithdrawnFromRaindex` - Moves tokens to inflight
   (leaving Raindex vault)
 - `EquityRedemptionEvent::TokensUnwrapped` - Exact-match unwraps, including
